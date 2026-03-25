@@ -474,6 +474,10 @@ export const oauthAccessTokensTable = pgTable(
       .references(() => usersTable.id, { onDelete: "cascade" }),
     scope: text("scope").notNull().default("admin"),
     expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
+    refresh_token: text("refresh_token"),
+    refresh_token_expires_at: timestamp("refresh_token_expires_at", {
+      withTimezone: true,
+    }),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -482,5 +486,6 @@ export const oauthAccessTokensTable = pgTable(
     index("oauth_access_tokens_client_id_idx").on(table.client_id),
     index("oauth_access_tokens_user_id_idx").on(table.user_id),
     index("oauth_access_tokens_expires_at_idx").on(table.expires_at),
+    index("oauth_access_tokens_refresh_token_idx").on(table.refresh_token),
   ],
 );

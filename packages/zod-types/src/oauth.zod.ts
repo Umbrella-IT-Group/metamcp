@@ -58,6 +58,8 @@ export const OAuthAccessTokenSchema = z.object({
   user_id: z.string(),
   scope: z.string(),
   expires_at: z.date(),
+  refresh_token: z.string().nullable(),
+  refresh_token_expires_at: z.date().nullable(),
   created_at: z.date(),
 });
 
