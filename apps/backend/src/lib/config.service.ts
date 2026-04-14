@@ -111,7 +111,13 @@ export const configService = {
       ConfigKeyEnum.Enum.SESSION_LIFETIME,
     );
     if (!config?.value) {
-      return null; // No session lifetime set - infinite sessions
+      // Fallback to env var (milliseconds), then null (infinite sessions)
+      const envLifetime = process.env.SESSION_LIFETIME;
+      if (envLifetime) {
+        const parsed = parseInt(envLifetime, 10);
+        return isNaN(parsed) ? null : parsed;
+      }
+      return null;
     }
     const lifetime = parseInt(config.value, 10);
     return isNaN(lifetime) ? null : lifetime;
