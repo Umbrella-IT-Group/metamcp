@@ -545,6 +545,56 @@ export class McpServerPool {
   }
 
   /**
+   * Drop the pooled backend connection(s) for a given (sessionId, serverUuid).
+   *
+   * Used when the backend MCP server reports our Mcp-Session-Id is unknown
+   * (e.g. after the backend container restarts and loses its in-memory session
+   * registry). Both the active session and the paired idle session share the
+   * backend's session registry, so both are closed — if the backend forgot
+   * the active session, it has forgotten the idle one too. No replacement is
+   * created here; the next `getSession` call will establish a fresh
+   * connection (and therefore a fresh backend session) on demand.
+   */
+  async invalidateServerConnection(
+    sessionId: string,
+    serverUuid: string,
+  ): Promise<void> {
+    const activeForSession = this.activeSessions[sessionId];
+    const activeClient = activeForSession?.[serverUuid];
+    if (activeClient) {
+      try {
+        await activeClient.cleanup();
+      } catch (error) {
+        console.error(
+          `Error cleaning up invalidated active session ${sessionId}/${serverUuid}:`,
+          error,
+        );
+      }
+      delete activeForSession[serverUuid];
+      this.sessionToServers[sessionId]?.delete(serverUuid);
+    }
+
+    const idleClient = this.idleSessions[serverUuid];
+    if (idleClient) {
+      try {
+        await idleClient.cleanup();
+      } catch (error) {
+        console.error(
+          `Error cleaning up invalidated idle session for ${serverUuid}:`,
+          error,
+        );
+      }
+      delete this.idleSessions[serverUuid];
+    }
+
+    this.creatingIdleSessions.delete(serverUuid);
+
+    console.warn(
+      `Invalidated pooled backend connection for server ${serverUuid} (session ${sessionId})`,
+    );
+  }
+
+  /**
    * Handle server process crash
    */
   async handleServerCrash(
