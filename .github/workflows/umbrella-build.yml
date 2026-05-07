@@ -57,7 +57,10 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # mcp-host-prod is amd64-only; arm64 cross-build doubles CI time
+          # for an artifact nothing consumes. Re-add if we ever publish for
+          # a community arm64 host.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
