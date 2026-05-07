@@ -142,3 +142,68 @@ app.get("/health", (req, res) => {
     status: "ok",
   });
 });
+
+// Umbrella fork: deep health check that rolls up per-backend-MCP state.
+// Use case: external probes (Grafana, Cloudflare Healthchecks) want to
+// know whether the gateway plus its backends are reachable as a unit,
+// not just whether the gateway process is alive. Docker healthcheck
+// keeps using the cheap /health above; this is the operational view.
+//
+// Returns 200 always. The aggregate `healthy` boolean tells the prober
+// whether to alarm; the per-server detail tells the operator where to
+// look when it flips. Status returns 200 not 503 because liveness is
+// distinct from rollup health — Kubernetes-style probes can map both.
+app.get("/health/upstream", async (req, res) => {
+  try {
+    const { mcpServersRepository } = await import("./db/repositories");
+    const { mcpServerPool } = await import("./lib/metamcp/mcp-server-pool");
+    const { serverErrorTracker } = await import(
+      "./lib/metamcp/server-error-tracker"
+    );
+
+    const servers = await mcpServersRepository.findAll();
+    const pool = mcpServerPool.getPoolStatus();
+    const perServer = pool.perServerCounts ?? {};
+
+    const details = await Promise.all(
+      servers.map(async (s) => {
+        const inError = await serverErrorTracker.isServerInErrorState(s.uuid);
+        const connectionCount = perServer[s.uuid] ?? 0;
+        return {
+          uuid: s.uuid,
+          name: s.name,
+          in_error: inError,
+          connection_count: connectionCount,
+          // A server is "reachable" if it isn't in the error state and
+          // it has at least one live connection in the pool, or if it
+          // hasn't been needed yet (zero connections + no error). Pool
+          // emptiness alone is not unhealthy — we cold-start lazily.
+          reachable: !inError,
+        };
+      }),
+    );
+
+    const totalServers = details.length;
+    const errored = details.filter((d) => d.in_error).length;
+    const healthy = errored === 0;
+
+    res.json({
+      status: "ok",
+      healthy,
+      total_servers: totalServers,
+      errored_servers: errored,
+      pool: {
+        idle: pool.idle,
+        active: pool.active,
+        max_connections_per_server: pool.maxConnectionsPerServer,
+      },
+      servers: details,
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      healthy: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
