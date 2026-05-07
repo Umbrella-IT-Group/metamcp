@@ -1,5 +1,7 @@
 # 🚀 MetaMCP (MCP Aggregator, Orchestrator, Middleware, Gateway in one docker) <!-- omit in toc -->
 
+> **Umbrella IT Group fork.** This repo is a maintained downstream of [`metatool-ai/metamcp`](https://github.com/metatool-ai/metamcp). The deployable line is the [`umbrella`](https://github.com/Umbrella-IT-Group/metamcp/tree/umbrella) branch — `main` mirrors upstream. We carry community PRs upstream isn't reviewing (OAuth refresh tokens, session lifecycle fixes, subprocess cleanup, header forwarding) plus our own targeted patches. See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the cherry-pick log, remotes, and rebase cadence. MIT-licensed and unchanged from upstream; copyright preserved.
+
 <div align="center">
 
 <div align="center">
