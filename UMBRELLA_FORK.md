@@ -38,11 +38,11 @@ Track every commit we pull in. When upstream merges the same patch, we drop ours
 
 | Date | Source | Upstream PR | Commit on `umbrella` | Notes |
 |---|---|---|---|---|
-| 2026-05-07 | `loris-av` | [#276](https://github.com/metatool-ai/metamcp/pull/276) | (filled at cherry-pick time) | OAuth refresh-token grant + SESSION_LIFETIME + MAX_TOTAL_CONNECTIONS env vars. We patch on top to bump TTL defaults and make access/refresh TTLs env-configurable too. |
-| 2026-05-07 | `UmbrellaITSolutions` | [#283](https://github.com/metatool-ai/metamcp/pull/283) | (filled at cherry-pick time) | Re-init backend session on HTTP 404 "Session not found". Our PR. |
-| 2026-05-07 | `tremlin` | [#273](https://github.com/metatool-ai/metamcp/pull/273) | (filled at cherry-pick time) | Subprocess leak fix — addresses upstream issues #128/#162 OOM cluster. We add tests on top. |
-| 2026-05-07 | `BTForIT` | [#260](https://github.com/metatool-ai/metamcp/pull/260) | (filled at cherry-pick time) | Touch session timestamps on access for idle-based cleanup. |
-| 2026-05-07 | `BenjaminAronsson` | [#256](https://github.com/metatool-ai/metamcp/pull/256) | (filled at cherry-pick time) | Per-server client header forwarding. Migration `0014_dapper_jigsaw.sql` renumbered to `0015` to land after #276's `0014_oauth_refresh_token.sql`. |
+| 2026-05-07 | `loris-av` | [#276](https://github.com/metatool-ai/metamcp/pull/276) | `f446ce3`, `69e4b4f`, `138668a` (squashed into PR #1 on `umbrella`) | OAuth refresh-token grant + MAX_TOTAL_CONNECTIONS + SESSION_LIFETIME env vars. Umbrella patch on top: env-configurable TTLs (24h access / 365d refresh / 30d session). |
+| 2026-05-07 | `UmbrellaITSolutions` | [#283](https://github.com/metatool-ai/metamcp/pull/283) | `1f1c937` | Re-init backend session on HTTP 404 "Session not found". Our PR. |
+| 2026-05-07 | `tremlin` | [#273](https://github.com/metatool-ai/metamcp/pull/273) | `dcbe7bb`, `b63d709` | Subprocess leak fix — addresses upstream issues #128/#162 OOM cluster. Includes graceful SIGTERM + concurrency-safe creating-idle-sessions guard. |
+| 2026-05-07 | `BTForIT` | [#260](https://github.com/metatool-ai/metamcp/pull/260) | `7a0535a`, `7289173`, `0cc901c`, `909ab61` | Per-server connection cap, cold-start warmup, idle-based session timestamps, admin reset/shutdown API. The `cee1356` per-server-cap commit conflicted with #273's concurrency guard — resolved by running cap check before entering critical section. |
+| **DEFERRED** | `BenjaminAronsson` | [#256](https://github.com/metatool-ai/metamcp/pull/256) | — | Per-server client header forwarding (12 commits, conflicts with #273 + #260 in `mcp-server-pool.ts`). Deferred to Phase 2.5. Migration `0014_dapper_jigsaw.sql` will need renumbering to `0015` to land after #276's `0014_oauth_refresh_token.sql`. |
 
 ## Our own patches (no upstream PR)
 
