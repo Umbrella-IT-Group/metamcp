@@ -11,8 +11,34 @@ import {
 
 const tokenRouter = express.Router();
 
-const ACCESS_TOKEN_EXPIRY = 3600; // 1 hour
-const REFRESH_TOKEN_EXPIRY = 7 * 24 * 3600; // 7 days
+// Umbrella fork: TTLs are env-var configurable. Defaults are tuned for max
+// connectivity from clients that lack revoke-friendly UX (e.g. Claude.ai
+// connectors): 24h access tokens with 365d refresh tokens. Refresh tokens
+// rotate on every use (single-use), so a stolen refresh self-reveals when
+// the legit client redeems the rotated copy and gets `invalid_grant`.
+function readTtl(envName: string, fallbackSeconds: number): number {
+  const raw = process.env[envName];
+  if (!raw) return fallbackSeconds;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  logger.warn(
+    `[oauth] ${envName}=${raw} is not a positive integer; using default ${fallbackSeconds}s`,
+  );
+  return fallbackSeconds;
+}
+
+const ACCESS_TOKEN_EXPIRY = readTtl(
+  "OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+  24 * 60 * 60, // 24h default (was 1h upstream)
+);
+const REFRESH_TOKEN_EXPIRY = readTtl(
+  "OAUTH_REFRESH_TOKEN_TTL_SECONDS",
+  365 * 24 * 60 * 60, // 365d default (was 7d in PR #276)
+);
+
+logger.info(
+  `[oauth] token TTLs: access=${ACCESS_TOKEN_EXPIRY}s refresh=${REFRESH_TOKEN_EXPIRY}s`,
+);
 
 /**
  * Issue a new access token + refresh token pair and store them.

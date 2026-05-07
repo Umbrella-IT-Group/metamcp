@@ -108,9 +108,26 @@ export const auth = betterAuth({
       requireEmailVerification: false,
     },
   },
+  // Umbrella fork: session lifetime is env-var configurable so we can pull
+  // Entra-SSO re-auth out of the daily path. Defaults bumped from 7d/1d to
+  // 30d/7d (max-connectivity policy). The OAuth refresh-token TTL is the
+  // outer ceiling; this is the inner one (the cookie that gates
+  // /oauth/authorize). See UMBRELLA_FORK.md.
   session: {
-    expiresIn: 60 * 60 * 24 * 7, // 7 days
-    updateAge: 60 * 60 * 24, // 1 day (how often to update the session)
+    expiresIn: (() => {
+      const raw = process.env.BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS;
+      const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+      return Number.isFinite(parsed) && parsed > 0
+        ? parsed
+        : 60 * 60 * 24 * 30; // 30 days
+    })(),
+    updateAge: (() => {
+      const raw = process.env.BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS;
+      const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+      return Number.isFinite(parsed) && parsed > 0
+        ? parsed
+        : 60 * 60 * 24 * 7; // 7 days (sliding refresh)
+    })(),
   },
   user: {
     additionalFields: {
