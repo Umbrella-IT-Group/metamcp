@@ -158,18 +158,20 @@ export default function SidebarLayout({
   return (
     <SidebarProvider>
       <Sidebar>
+        {/* Umbrella IT Group fork — see UMBRELLA_FORK.md. Sidebar brand
+            replaced with the Umbrella wordmark. Original MetaMCP logo
+            stays committed in /favicon.ico for browser-tab branding so
+            an eventual upstream contribution can keep that path. */}
         <SidebarHeader className="flex flex-col justify-center items-center px-2 py-4">
           <div className="flex items-center justify-center w-full mb-2">
-            <div className="flex items-center gap-4">
-              <Image
-                src="/favicon.ico"
-                alt="MetaMCP Logo"
-                width={256}
-                height={256}
-                className="h-12 w-12"
-              />
-              <h2 className="text-2xl font-semibold">MetaMCP</h2>
-            </div>
+            <Image
+              src="/umbrella-wordmark.png"
+              alt="Umbrella IT Group"
+              width={2001}
+              height={658}
+              priority
+              className="h-12 w-auto object-contain"
+            />
           </div>
         </SidebarHeader>
 

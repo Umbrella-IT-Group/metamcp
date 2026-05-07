@@ -17,10 +17,14 @@ const geistMono = localFont({
   variable: "--font-geist-mono",
 });
 
+// Umbrella IT Group fork — see UMBRELLA_FORK.md for fork rationale.
+// Branded for our private deployment; upstream metadata kept in
+// upstream/main so a clean rebase reverts cleanly if we ever go
+// non-private.
 export const metadata: Metadata = {
-  title: "MetaMCP",
+  title: "Umbrella MCP Gateway",
   description:
-    "MetaMCP is dev platform for dynamically configuring and deploying MCPs",
+    "Umbrella IT Group's MCP gateway — aggregates Autotask, IT Glue, CIPP, registry and more into curated namespaces for AI tooling.",
 };
 
 interface RootLayoutProps {
