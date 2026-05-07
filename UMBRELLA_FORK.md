@@ -48,12 +48,23 @@ Track every commit we pull in. When upstream merges the same patch, we drop ours
 
 These are Umbrella-specific deltas. Each one should eventually be either upstreamed or replaced by an upstream alternative.
 
-| Date | Description | Files | Notes |
-|---|---|---|---|
-| 2026-05-07 | Make access + refresh TTLs env-configurable; bump defaults to 24h / 365d | `apps/backend/src/routers/oauth/token.ts` | `OAUTH_ACCESS_TOKEN_TTL_SECONDS`, `OAUTH_REFRESH_TOKEN_TTL_SECONDS` env vars. Defaults match Umbrella's max-connectivity policy. |
-| 2026-05-07 | Make better-auth session lifetime env-configurable; bump defaults to 30d / 7d | `apps/backend/src/auth.ts` | `BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS`, `BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS`. |
+| Date | Fork PR | Description | Files | Upstream candidate? |
+|---|---|---|---|---|
+| 2026-05-07 | [#1](https://github.com/Umbrella-IT-Group/metamcp/pull/1) | Make access + refresh TTLs env-configurable; bump defaults to 24h / 365d | `apps/backend/src/routers/oauth/token.ts` | Yes — wait for upstream PR #276 to merge first, then file the env-var overlay. |
+| 2026-05-07 | [#1](https://github.com/Umbrella-IT-Group/metamcp/pull/1) | Make better-auth session lifetime env-configurable; bump defaults to 30d / 7d | `apps/backend/src/auth.ts` | Yes — already filed as [metatool-ai/metamcp#286](https://github.com/metatool-ai/metamcp/pull/286). |
+| 2026-05-07 | [#3](https://github.com/Umbrella-IT-Group/metamcp/pull/3) | Drop arm64 cross-build from CI | `.github/workflows/umbrella-build.yml` | No — Umbrella-specific deploy target. |
+| 2026-05-07 | [#4](https://github.com/Umbrella-IT-Group/metamcp/pull/4) | Add `0014_oauth_refresh_token` entry to drizzle journal that PR #276 cherry-pick missed | `apps/backend/drizzle/meta/_journal.json` | Yes — once upstream PR #276 merges, journal needs this entry. |
+| 2026-05-07 | [#5](https://github.com/Umbrella-IT-Group/metamcp/pull/5) | Make `0014_oauth_refresh_token.sql` migration idempotent (`ADD COLUMN IF NOT EXISTS`) | `apps/backend/drizzle/0014_oauth_refresh_token.sql` | Yes — defends any deployer from hash-mismatch crash-loop. |
+| 2026-05-07 | [#6](https://github.com/Umbrella-IT-Group/metamcp/pull/6) | `/health/upstream` rollup endpoint with per-backend-MCP reachability | `apps/backend/src/index.ts` | Yes — clean addition, useful for any operator. |
+| 2026-05-07 | [#7](https://github.com/Umbrella-IT-Group/metamcp/pull/7) | Replace MetaMCP brand with Umbrella IT Group wordmark on sidebar + browser-tab metadata | `apps/frontend/app/[locale]/(sidebar)/layout.tsx`, `apps/frontend/app/layout.tsx`, `apps/frontend/public/umbrella-wordmark.png` | No — Umbrella-specific. |
+| 2026-05-07 | [#8](https://github.com/Umbrella-IT-Group/metamcp/pull/8) | Proxy `/health/*` paths to backend (was 404 on `/health/upstream` because rewrite was exact-match only) | `apps/frontend/next.config.js` | Yes — pairs with #6 if that's upstreamed. |
+| 2026-05-07 | [#9](https://github.com/Umbrella-IT-Group/metamcp/pull/9) | Copy `apps/frontend/public/` in Dockerfile (Next.js 15 standalone doesn't auto-copy) + use square `Umbrella Bug` brandmark | `Dockerfile`, `apps/frontend/app/[locale]/(sidebar)/layout.tsx`, `apps/frontend/public/umbrella-bug.png`, `apps/frontend/public/umbrella-logo-full.png` | Dockerfile fix yes, sidebar text no. |
 
-Candidates to upstream: both. Mostly a one-line ENV-fallback pattern — non-breaking, opinion-free. File alongside our other PRs once stable.
+**Upstream PRs filed back from this fork:**
+
+| Date | Upstream PR | What |
+|---|---|---|
+| 2026-05-07 | [metatool-ai/metamcp#286](https://github.com/metatool-ai/metamcp/pull/286) | Better-auth session env-var fallback. Branched off plain `main`, no dependency on #276. Awaiting maintainer review (upstream is largely unattended; may sit indefinitely). |
 
 ## How to update the fork against upstream
 
