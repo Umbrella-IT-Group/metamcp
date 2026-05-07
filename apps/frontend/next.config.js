@@ -13,6 +13,12 @@ const nextConfig = {
         source: "/health",
         destination: `${backendUrl}/health`,
       },
+      // Umbrella fork: /health/upstream rollup endpoint also lives on
+      // the backend; needs a rewrite or Next.js 404s on the path.
+      {
+        source: "/health/:path*",
+        destination: `${backendUrl}/health/:path*`,
+      },
       // OAuth endpoints - proxy all oauth paths
       {
         source: "/oauth/:path*",
