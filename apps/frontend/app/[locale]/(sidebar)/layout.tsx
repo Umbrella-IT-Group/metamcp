@@ -159,19 +159,23 @@ export default function SidebarLayout({
     <SidebarProvider>
       <Sidebar>
         {/* Umbrella IT Group fork — see UMBRELLA_FORK.md. Sidebar brand
-            replaced with the Umbrella wordmark. Original MetaMCP logo
-            stays committed in /favicon.ico for browser-tab branding so
-            an eventual upstream contribution can keep that path. */}
+            uses the square color "Umbrella Bug" brandmark + the
+            "Umbrella IT" text. Square asset renders crisply in the
+            sidebar at any size; the previous wordmark-only attempt
+            relied on a 3:1 aspect ratio that didn't fit. */}
         <SidebarHeader className="flex flex-col justify-center items-center px-2 py-4">
-          <div className="flex items-center justify-center w-full mb-2">
+          <div className="flex items-center justify-center w-full mb-2 gap-3">
             <Image
-              src="/umbrella-wordmark.png"
+              src="/umbrella-bug.png"
               alt="Umbrella IT Group"
-              width={2001}
-              height={658}
+              width={256}
+              height={256}
               priority
-              className="h-12 w-auto object-contain"
+              className="h-10 w-10"
             />
+            <h2 className="text-xl font-semibold leading-tight">
+              Umbrella IT
+            </h2>
           </div>
         </SidebarHeader>
 

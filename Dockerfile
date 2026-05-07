@@ -74,6 +74,12 @@ RUN adduser --system --uid 1001 --home /home/nextjs nextjs && \
 
 # Copy built applications
 COPY --from=builder --chown=nextjs:nodejs /app/apps/frontend/.next ./apps/frontend/.next
+# Umbrella fork: Next.js standalone mode does NOT auto-copy public/ into
+# the runtime layer, so static assets in apps/frontend/public/ (including
+# Umbrella branding PNGs) 404 unless we copy them here. Upstream gets
+# away with this because they don't put anything in public/ that the
+# runtime serves — favicon.ico lives in app/ as a Next 15 special file.
+COPY --from=builder --chown=nextjs:nodejs /app/apps/frontend/public ./apps/frontend/public
 COPY --from=builder --chown=nextjs:nodejs /app/apps/frontend/package.json ./apps/frontend/
 COPY --from=builder --chown=nextjs:nodejs /app/apps/backend/dist ./apps/backend/dist
 COPY --from=builder --chown=nextjs:nodejs /app/apps/backend/package.json ./apps/backend/
