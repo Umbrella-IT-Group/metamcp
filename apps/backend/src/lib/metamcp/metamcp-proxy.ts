@@ -385,41 +385,83 @@ export const createServer = async (
               params.name || session.client.getServerVersion()?.name || "";
 
             if (sanitizeName(serverName) === serverPrefix) {
-              // Found the server, now check if it has this tool with pagination
-              try {
-                let foundTool = false;
+              // Found the server, now check if it has this tool with pagination.
+              // If the cached session is stale (backend restarted between when
+              // we last connected and now), `tools/list` returns the same
+              // -32600 / "Session not found" envelope as `tools/call`. Engage
+              // the same recovery path: invalidate the pool entry, re-acquire
+              // a fresh session, retry once. Without this the dynamic-find
+              // path silently swallows the failure (logs error, continues to
+              // next server) and the agent gets `Unknown tool` instead of
+              // either a successful tool call or a real not-found error.
+              const listToolsOnce = async (
+                activeSession: ConnectedClient,
+              ): Promise<z.infer<typeof ListToolsResultSchema>[]> => {
+                const pages: z.infer<typeof ListToolsResultSchema>[] = [];
                 let cursor: string | undefined = undefined;
                 let hasMore = true;
-
-                while (hasMore && !foundTool) {
-                  const result: z.infer<typeof ListToolsResultSchema> =
-                    await session.client.request(
+                while (hasMore) {
+                  const page: z.infer<typeof ListToolsResultSchema> =
+                    await activeSession.client.request(
                       {
                         method: "tools/list",
-                        params: { cursor: cursor },
+                        params: { cursor },
                       },
                       ListToolsResultSchema,
                     );
+                  pages.push(page);
+                  cursor = page.nextCursor;
+                  hasMore = !!page.nextCursor;
+                }
+                return pages;
+              };
 
-                  if (
-                    result.tools?.some(
-                      (tool: Tool) => tool.name === originalToolName,
-                    )
-                  ) {
-                    foundTool = true;
-                    // Tool exists, populate mappings for future use and use it
-                    clientForTool = session;
-                    serverUuid = mcpServerUuid;
-                    toolToClient[name] = session;
-                    toolToServerUuid[name] = mcpServerUuid;
-                    break;
+              const matchOnPages = (
+                pages: z.infer<typeof ListToolsResultSchema>[],
+              ): boolean =>
+                pages.some((page) =>
+                  page.tools?.some(
+                    (tool: Tool) => tool.name === originalToolName,
+                  ),
+                );
+
+              try {
+                let activeSession = session;
+                let pages: z.infer<typeof ListToolsResultSchema>[];
+                try {
+                  pages = await listToolsOnce(activeSession);
+                } catch (error) {
+                  if (!isBackendSessionLostError(error)) {
+                    throw error;
                   }
-
-                  cursor = result.nextCursor;
-                  hasMore = !!result.nextCursor;
+                  logger.warn(
+                    `Backend reported session lost for server ${mcpServerUuid} on dynamic tools/list while routing tool "${name}"; invalidating pool and retrying once.`,
+                  );
+                  await mcpServerPool.invalidateServerConnection(
+                    sessionId,
+                    mcpServerUuid,
+                  );
+                  const fresh = await mcpServerPool.getSession(
+                    sessionId,
+                    mcpServerUuid,
+                    params,
+                    namespaceUuid,
+                  );
+                  if (!fresh) {
+                    throw new Error(
+                      `Failed to re-initialize session for server ${mcpServerUuid} after backend session loss during dynamic tool routing`,
+                    );
+                  }
+                  activeSession = fresh;
+                  pages = await listToolsOnce(activeSession);
                 }
 
-                if (foundTool) {
+                if (matchOnPages(pages)) {
+                  // Tool exists, populate mappings for future use and use it
+                  clientForTool = activeSession;
+                  serverUuid = mcpServerUuid;
+                  toolToClient[name] = activeSession;
+                  toolToServerUuid[name] = mcpServerUuid;
                   break;
                 }
               } catch (error) {
