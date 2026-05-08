@@ -6,7 +6,7 @@ import {
   OAuthClient,
   OAuthClientCreateInput,
 } from "@repo/zod-types";
-import { eq, lt, and, isNotNull } from "drizzle-orm";
+import { eq, lt, and, isNull } from "drizzle-orm";
 
 import { db } from "../index";
 import {
@@ -144,7 +144,7 @@ export class OAuthRepository {
         .where(
           and(
             lt(oauthAccessTokensTable.expires_at, now),
-            isNotNull(oauthAccessTokensTable.refresh_token).not(),
+            isNull(oauthAccessTokensTable.refresh_token),
           ),
         ),
     ]);
