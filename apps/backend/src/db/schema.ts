@@ -489,3 +489,40 @@ export const oauthAccessTokensTable = pgTable(
     index("oauth_access_tokens_refresh_token_idx").on(table.refresh_token),
   ],
 );
+
+// MCP Sessions table — persists Streamable HTTP session metadata so that
+// metamcp restarts don't force every consumer to re-initialize. When a
+// request arrives with an unknown `Mcp-Session-Id` (in-memory transport
+// map empty after restart), the router queries this table and lazily
+// recreates the transport from the stored namespace + auth principal +
+// init params. See `apps/backend/src/routers/public-metamcp/streamable-http.ts`
+// for the recovery path and `mcp-sessions.repo.ts` for the access layer.
+//
+// auth_principal is a constant-time-compared SHA-256 of the original
+// bearer token (or API key). Raw tokens are never stored. If the client
+// rotates / revokes its token, the lazy-recovery path refuses and the
+// client must initialize a fresh session.
+export const mcpSessionsTable = pgTable(
+  "mcp_sessions",
+  {
+    session_id: text("session_id").primaryKey(),
+    namespace_uuid: uuid("namespace_uuid").notNull(),
+    endpoint_name: text("endpoint_name").notNull(),
+    auth_principal: text("auth_principal").notNull(),
+    auth_method: text("auth_method").notNull(),
+    init_params: jsonb("init_params")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    created_at: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    last_seen_at: timestamp("last_seen_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("mcp_sessions_last_seen_at_idx").on(table.last_seen_at),
+    index("mcp_sessions_namespace_uuid_idx").on(table.namespace_uuid),
+  ],
+);
