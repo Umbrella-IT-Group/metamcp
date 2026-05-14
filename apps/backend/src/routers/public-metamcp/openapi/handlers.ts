@@ -5,6 +5,7 @@ import {
   ListToolsResultSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 import logger from "@/utils/logger";
 
@@ -26,6 +27,7 @@ import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
 } from "../../../lib/metamcp/metamcp-middleware/tool-overrides.functional";
+import { isRecoverableBackendError } from "../../../lib/metamcp/session-error";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
 // Original List Tools Handler (adapted from metamcp-proxy.ts)
@@ -55,20 +57,21 @@ export const createOriginalListToolsHandler = (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
-        try {
-          // Get configurable timeout values to bypass MCP SDK default enforcement
-          const resetTimeoutOnProgress =
-            await configService.getMcpResetTimeoutOnProgress();
-          const timeout = await configService.getMcpTimeout();
-          const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
 
-          const mcpRequestOptions: RequestOptions = {
-            resetTimeoutOnProgress,
-            timeout,
-            maxTotalTimeout,
-          };
+        // Get configurable timeout values to bypass MCP SDK default enforcement
+        const resetTimeoutOnProgress =
+          await configService.getMcpResetTimeoutOnProgress();
+        const timeout = await configService.getMcpTimeout();
+        const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
 
-          const result = await session.client.request(
+        const mcpRequestOptions: RequestOptions = {
+          resetTimeoutOnProgress,
+          timeout,
+          maxTotalTimeout,
+        };
+
+        const listOnce = (active: ConnectedClient) =>
+          active.client.request(
             {
               method: "tools/list",
               params: { _meta: request.params?._meta },
@@ -76,6 +79,45 @@ export const createOriginalListToolsHandler = (
             ListToolsResultSchema,
             mcpRequestOptions,
           );
+
+        try {
+          let activeSession = session;
+          let result: z.infer<typeof ListToolsResultSchema>;
+          try {
+            result = await listOnce(activeSession);
+          } catch (error) {
+            if (!isRecoverableBackendError(error)) {
+              throw error;
+            }
+            // 2026-05-14 regression mirror — the OpenAPI tools/list
+            // path also needs PR #13/#15/#16's recovery cascade. Without
+            // it, a single backend restart leaves the namespace's tool
+            // catalog empty until metamcp itself bounces. Invalidate
+            // the stale pool entry, re-acquire a fresh session, retry
+            // once.
+            logger.warn(
+              `OpenAPI bridge: backend connection lost for server ${mcpServerUuid} on tools/list; invalidating pool and retrying once. (envelope: ${
+                error instanceof Error ? error.message : String(error)
+              })`,
+            );
+            await mcpServerPool.invalidateServerConnection(
+              context.sessionId,
+              mcpServerUuid,
+            );
+            const fresh = await mcpServerPool.getSession(
+              context.sessionId,
+              mcpServerUuid,
+              params,
+              context.namespaceUuid,
+            );
+            if (!fresh) {
+              throw new Error(
+                `OpenAPI bridge: failed to re-initialize session for server ${mcpServerUuid} after backend session loss during tools/list`,
+              );
+            }
+            activeSession = fresh;
+            result = await listOnce(activeSession);
+          }
 
           const toolsWithSource =
             result.tools?.map((tool) => {
@@ -147,21 +189,22 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       throw new Error(`Unknown tool: ${name}`);
     }
 
-    try {
-      // Get configurable timeout values to bypass MCP SDK default enforcement
-      const resetTimeoutOnProgress =
-        await configService.getMcpResetTimeoutOnProgress();
-      const timeout = await configService.getMcpTimeout();
-      const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+    const targetServerUuid = toolToServerUuid[name];
 
-      const mcpRequestOptions: RequestOptions = {
-        resetTimeoutOnProgress,
-        timeout,
-        maxTotalTimeout,
-      };
+    // Get configurable timeout values to bypass MCP SDK default enforcement
+    const resetTimeoutOnProgress =
+      await configService.getMcpResetTimeoutOnProgress();
+    const timeout = await configService.getMcpTimeout();
+    const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
 
-      // Use the correct schema for tool calls with timeout options
-      const result = await targetSession.client.request(
+    const mcpRequestOptions: RequestOptions = {
+      resetTimeoutOnProgress,
+      timeout,
+      maxTotalTimeout,
+    };
+
+    const callOnce = (session: ConnectedClient) =>
+      session.client.request(
         {
           method: "tools/call",
           params: {
@@ -176,16 +219,79 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         mcpRequestOptions,
       );
 
-      // Cast the result to CallToolResult type
-      return result as CallToolResult;
+    try {
+      return (await callOnce(targetSession)) as CallToolResult;
     } catch (error) {
-      logger.error(
-        `Error calling tool "${name}" through ${
-          targetSession.client.getServerVersion()?.name || "unknown"
-        }:`,
-        error,
+      // 2026-05-14 regression — the OpenAPI bridge had its own fork of
+      // the tools/call handler that pre-dated PR #13/#15/#16's recovery
+      // wiring in `metamcp-proxy.ts`. Tara + any OpenAPI consumer
+      // (registry-sync worker, external integration) hit this handler
+      // and got bare `Error POSTing ... HTTP 404 ... Session not found`
+      // pass-through with zero invalidation. Mirror the
+      // Streamable-HTTP path's recovery cascade here: detect the
+      // session-lost / transport-lost envelope, invalidate the pooled
+      // ConnectedClient (PR #16 makes this cascade across every
+      // session's slot for the same serverUuid), re-acquire a fresh
+      // session via the pool, retry once. Logs are tagged "OpenAPI
+      // bridge" so operators can split this recovery from the
+      // Streamable-HTTP one when investigating.
+      if (!isRecoverableBackendError(error)) {
+        logger.error(
+          `Error calling tool "${name}" through ${
+            targetSession.client.getServerVersion()?.name || "unknown"
+          }:`,
+          error,
+        );
+        throw error;
+      }
+
+      logger.warn(
+        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+          error instanceof Error ? error.message : String(error)
+        })`,
       );
-      throw error;
+
+      await mcpServerPool.invalidateServerConnection(
+        context.sessionId,
+        targetServerUuid,
+      );
+      delete toolToClient[name];
+      delete toolToServerUuid[name];
+
+      const serverParamsAfter = await getMcpServers(context.namespaceUuid);
+      const paramsForServer = serverParamsAfter[targetServerUuid];
+      if (!paramsForServer) {
+        throw new Error(
+          `Cannot re-initialize OpenAPI session: server ${targetServerUuid} no longer present in namespace ${context.namespaceUuid}`,
+        );
+      }
+
+      const freshSession = await mcpServerPool.getSession(
+        context.sessionId,
+        targetServerUuid,
+        paramsForServer,
+        context.namespaceUuid,
+      );
+      if (!freshSession) {
+        throw new Error(
+          `OpenAPI bridge: failed to re-initialize session for server ${targetServerUuid} after backend session loss`,
+        );
+      }
+
+      toolToClient[name] = freshSession;
+      toolToServerUuid[name] = targetServerUuid;
+
+      try {
+        return (await callOnce(freshSession)) as CallToolResult;
+      } catch (retryError) {
+        logger.error(
+          `OpenAPI bridge: error calling tool "${name}" through ${
+            freshSession.client.getServerVersion()?.name || "unknown"
+          } after session re-initialize:`,
+          retryError,
+        );
+        throw retryError;
+      }
     }
   };
 };
