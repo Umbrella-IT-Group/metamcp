@@ -343,7 +343,6 @@ streamableHttpRouter.get(
 
     try {
       logger.info(`Looking up existing session: ${sessionId}`);
-      logger.info(`Available sessions:`, sessionManager.getSessionIds());
 
       const authReq = req as ApiKeyAuthenticatedRequest;
       let transport = sessionManager.getSession(sessionId);
@@ -358,7 +357,19 @@ streamableHttpRouter.get(
           res.status(401).end("Unauthorized");
           return;
         } else {
-          res.status(404).end("Session not found");
+          // Stale or expired sessionId. Per MCP Streamable HTTP spec the
+          // client MUST start a new session in response to HTTP 404 on a
+          // sessioned request. Surface a header-flag for clients that
+          // honor the contract, and keep the response body minimal
+          // (the previous body dumped the full active-session list into
+          // logs/clients — info leak + not actionable).
+          res
+            .status(404)
+            .setHeader("Mcp-Session-Reinitialize-Required", "true")
+            .end(
+              "Session expired or unknown. Initialize a new MCP session " +
+                "(send `initialize` without an `Mcp-Session-Id` header).",
+            );
           return;
         }
       }
@@ -527,12 +538,37 @@ streamableHttpRouter.post(
             logger.error(
               `Transport not found for sessionId ${sessionId} and no recoverable persisted row.`,
             );
-            res.status(404).json({
-              error: "Session not found",
-              message: `Transport not found for sessionId ${sessionId}`,
-              available_sessions: sessionManager.getSessionIds(),
-              timestamp: new Date().toISOString(),
-            });
+            // Stale or expired sessionId. The prior response embedded
+            // `available_sessions: sessionManager.getSessionIds()` —
+            // a mild info leak of every live session UUID into client
+            // logs + zero diagnostic value to the caller (the caller
+            // just learns their own ID isn't in the list, which the
+            // 404 already conveyed).
+            //
+            // Per MCP Streamable HTTP spec the client MUST start a new
+            // session in response to HTTP 404 on a sessioned request.
+            // The `Mcp-Session-Reinitialize-Required` header signals
+            // that explicitly for spec-conformant clients; the body
+            // message guides anyone reading it manually.
+            //
+            // Background: 2026-05-15 sub-agent validation run on the
+            // CIPP MCP namespace hit this path 100% — Claude Code's
+            // MCP connector held a sessionId rotated out by the server,
+            // and the harness didn't auto-reinitialize on 404. Until
+            // the client side honors reinit, this is the cleanest
+            // server-side signal we can hand it. Task #29 has the
+            // full background.
+            res
+              .status(404)
+              .setHeader("Mcp-Session-Reinitialize-Required", "true")
+              .json({
+                error: "Session not found",
+                message:
+                  "Session expired or unknown. Initialize a new MCP " +
+                  "session (send `initialize` without an " +
+                  "`Mcp-Session-Id` header).",
+                timestamp: new Date().toISOString(),
+              });
             return;
           }
         }
