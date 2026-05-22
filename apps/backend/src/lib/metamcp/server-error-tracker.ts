@@ -137,6 +137,18 @@ export class ServerErrorTracker {
   }
 
   /**
+   * Mark a connection success. Today this is equivalent to clearing
+   * the per-server crash counter — once we know the server can be
+   * reached, the prior crash history is no longer load-bearing for
+   * the circuit-breaker decision. Kept as a distinct method so the
+   * pool layer (and tests) can express intent: "this is a success
+   * signal", not "manual operator reset".
+   */
+  markSuccess(serverUuid: string): void {
+    this.crashAttempts.delete(serverUuid);
+  }
+
+  /**
    * Reset all crash attempts (e.g., on startup for a clean slate)
    */
   resetAllAttempts(): void {

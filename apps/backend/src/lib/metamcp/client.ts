@@ -17,6 +17,76 @@ const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
 
 /**
+ * Reason that a remote transport drop fired the `onTransportDrop`
+ * callback. `close` means the SDK's `Transport.onclose` fired (the
+ * remote dropped us cleanly or the socket EOF'd); `error` means the
+ * SDK's `Transport.onerror` fired (network-layer failure surfaced
+ * out-of-band, not necessarily fatal but treated as a drop signal).
+ *
+ * Mirrors the STDIO `onProcessCrash` callback shape so the pool layer
+ * can pivot on a single recovery path regardless of transport kind.
+ */
+export type TransportDropReason = "close" | "error";
+
+/**
+ * Callback fired when an HTTP/SSE transport drops asynchronously.
+ * Sibling to `onProcessCrash` (which covers STDIO). The pool wires
+ * this to its `invalidateServerConnection` cascade so a watchtower
+ * restart on a backend MCP container can be detected and recovered
+ * BEFORE the next request hits the dead pool entry.
+ *
+ * Will NOT fire during a normal `cleanup()` shutdown — `cleanup()`
+ * sets a `closing` flag that suppresses the callback so caller-driven
+ * teardown is distinguishable from remote drops.
+ */
+export type TransportDropCallback = (
+  reason: TransportDropReason,
+  error?: Error,
+) => void;
+
+/**
+ * Exponential-backoff schedule for reconnect attempts in
+ * `connectMetaMcpClient`. Replaces the pre-PR #20 fixed `waitFor = 5000`
+ * sleep which was too slow for fast watchtower bounces (3-8s) and
+ * unnecessarily fast for cold-start cycles (the backend container
+ * takes 20-30s to be ready to accept SSE). The schedule starts at
+ * 1s, doubles each attempt, and caps at 30s.
+ *
+ * Default schedule (attempts 0..6): 1s, 2s, 4s, 8s, 16s, 30s, 30s ...
+ * Plus a small ±250ms uniform jitter to avoid synchronized retry
+ * thundering when multiple servers bounce at once (watchtower
+ * batches updates across a docker-compose project).
+ *
+ * Tunable via env: `MCP_RECONNECT_BACKOFF_INITIAL_MS`,
+ * `MCP_RECONNECT_BACKOFF_MAX_MS`, `MCP_RECONNECT_BACKOFF_MULTIPLIER`.
+ */
+const RECONNECT_BACKOFF_INITIAL_MS = parseInt(
+  process.env.MCP_RECONNECT_BACKOFF_INITIAL_MS || "1000",
+  10,
+);
+const RECONNECT_BACKOFF_MAX_MS = parseInt(
+  process.env.MCP_RECONNECT_BACKOFF_MAX_MS || "30000",
+  10,
+);
+const RECONNECT_BACKOFF_MULTIPLIER = parseFloat(
+  process.env.MCP_RECONNECT_BACKOFF_MULTIPLIER || "2",
+);
+
+/**
+ * Compute the backoff delay (ms) for a given zero-indexed attempt
+ * number using the configured exponential schedule + uniform jitter.
+ * Exported for unit tests; not part of the public API.
+ */
+export const computeReconnectBackoffMs = (attempt: number): number => {
+  const base = Math.min(
+    RECONNECT_BACKOFF_MAX_MS,
+    RECONNECT_BACKOFF_INITIAL_MS *
+      Math.pow(RECONNECT_BACKOFF_MULTIPLIER, attempt),
+  );
+  return base + Math.random() * 250;
+};
+
+/**
  * A subscriber invoked when the backend MCP server emits
  * `notifications/tools/list_changed`. The proxy layer (and the pool
  * invalidation path) attach subscribers here to fan that signal out to
@@ -32,6 +102,14 @@ export interface ConnectedClient {
   client: Client;
   cleanup: () => Promise<void>;
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void;
+  /**
+   * Sibling to `onProcessCrash` for HTTP/SSE backends. Fired when the
+   * SDK transport reports an async drop (`onclose` or `onerror`) that
+   * we did NOT initiate via `cleanup()`. The pool layer wires this to
+   * `invalidateServerConnection` to detect watchtower-driven container
+   * restarts BEFORE the next request hits the dead pool entry.
+   */
+  onTransportDrop?: TransportDropCallback;
   /**
    * Set of fan-out subscribers for upstream `tools/list_changed` propagation.
    * Populated by the proxy layer (one per upstream `Server` that this
@@ -185,9 +263,8 @@ export const createMetaMcpClient = (
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
+  onTransportDrop?: TransportDropCallback,
 ): Promise<ConnectedClient | undefined> => {
-  const waitFor = 5000;
-
   // Get max attempts from server error tracker instead of hardcoding
   const maxAttempts = await serverErrorTracker.getServerMaxAttempts(
     serverParams.uuid,
@@ -248,6 +325,82 @@ export const connectMetaMcpClient = async (
         };
       }
 
+      // HTTP/SSE parity with STDIO's `onprocesscrash`: wire `onclose` +
+      // `onerror` on the SDK Transport so we detect watchtower-driven
+      // backend restarts BEFORE the next request trips PR #13/#16's
+      // recovery cascade. Idle pool entries that sit dead because no
+      // request hit them are the failure mode this closes.
+      //
+      // Defensive: the SDK may invoke `onclose` after we've already
+      // torn down via `cleanup()`. The `closing` flag (set inside
+      // cleanup) lets us distinguish "we asked it to close" from "the
+      // remote dropped us", so we don't double-fire the cascade
+      // during normal shutdown.
+      let closing = false;
+      const isHttpTransport =
+        transport instanceof SSEClientTransport ||
+        transport instanceof StreamableHTTPClientTransport;
+      if (isHttpTransport) {
+        const previousOnClose = transport.onclose;
+        transport.onclose = () => {
+          // Chain to any SDK-internal handler first so the SDK can do
+          // its own bookkeeping (Client.connect() may register one).
+          try {
+            previousOnClose?.();
+          } catch (chainError) {
+            logger.warn(
+              `Chained onclose handler threw for server ${serverParams.name} (${serverParams.uuid}):`,
+              chainError,
+            );
+          }
+          if (closing) {
+            return;
+          }
+          logger.info(
+            `Transport closed unexpectedly for server ${serverParams.name} (${serverParams.uuid})`,
+          );
+          if (onTransportDrop) {
+            try {
+              onTransportDrop("close");
+            } catch (cbError) {
+              logger.warn(
+                `onTransportDrop(close) threw for server ${serverParams.name} (${serverParams.uuid}):`,
+                cbError,
+              );
+            }
+          }
+        };
+
+        const previousOnError = transport.onerror;
+        transport.onerror = (transportError: Error) => {
+          try {
+            previousOnError?.(transportError);
+          } catch (chainError) {
+            logger.warn(
+              `Chained onerror handler threw for server ${serverParams.name} (${serverParams.uuid}):`,
+              chainError,
+            );
+          }
+          if (closing) {
+            return;
+          }
+          logger.warn(
+            `Transport error for server ${serverParams.name} (${serverParams.uuid}):`,
+            transportError,
+          );
+          if (onTransportDrop) {
+            try {
+              onTransportDrop("error", transportError);
+            } catch (cbError) {
+              logger.warn(
+                `onTransportDrop(error) threw for server ${serverParams.name} (${serverParams.uuid}):`,
+                cbError,
+              );
+            }
+          }
+        };
+      }
+
       await client.connect(transport);
 
       // Subscriber set for upstream `tools/list_changed` fan-out. Created
@@ -280,6 +433,12 @@ export const connectMetaMcpClient = async (
       return {
         client,
         cleanup: async () => {
+          // Mark closing BEFORE we tear the transport down so any
+          // `onclose` the SDK fires synchronously during `transport.close()`
+          // sees the flag and suppresses the drop callback. Without this,
+          // every normal session shutdown would spuriously trigger the
+          // recovery cascade.
+          closing = true;
           // Clear subscribers first so any late `list_changed` arrival
           // during transport teardown can't trigger fan-out against a
           // half-closed proxy server.
@@ -295,6 +454,15 @@ export const connectMetaMcpClient = async (
           // Notify the pool about the crash
           if (onProcessCrash) {
             onProcessCrash(exitCode, signal);
+          }
+        },
+        onTransportDrop: (reason, dropError) => {
+          logger.warn(
+            `Transport drop detected for server ${serverParams.name} (${serverParams.uuid}): reason=${reason}`,
+            dropError,
+          );
+          if (onTransportDrop) {
+            onTransportDrop(reason, dropError);
           }
         },
         listChangedSubscribers,
@@ -333,7 +501,16 @@ export const connectMetaMcpClient = async (
       count++;
       retry = count < maxAttempts;
       if (retry) {
-        await sleep(waitFor);
+        // Exponential backoff with jitter. See
+        // `computeReconnectBackoffMs` doc comment for the schedule.
+        // `count - 1` because `count` was just incremented past the
+        // failed attempt — the next sleep should reflect the NEXT
+        // attempt's index (0-based: first retry waits 1s, not 2s).
+        const delay = computeReconnectBackoffMs(count - 1);
+        logger.info(
+          `Reconnect attempt ${count + 1}/${maxAttempts} for server ${serverParams.name} (${serverParams.uuid}) in ${Math.round(delay)}ms`,
+        );
+        await sleep(delay);
       }
     }
   }

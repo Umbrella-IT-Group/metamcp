@@ -51,6 +51,20 @@ export class McpServerPool {
   // Background idle sessions by namespace: namespaceUuid -> any
   private backgroundIdleSessionsByNamespace: Map<string, any> = new Map();
 
+  // Per-server timestamp of the most recent successful connection.
+  // Used by the recovery-reset path: if a transport drop produces a
+  // SUCCESSFUL reconnect within `MCP_RECOVERY_RESET_THRESHOLD_MS` of
+  // the last success, we treat the drop as transient (watchtower
+  // bounce / network blip) and clear the error tracker count so the
+  // sticky circuit breaker doesn't accumulate against legitimate
+  // bounces. If the gap exceeds the threshold, the bounce is treated
+  // as a genuine failure cluster and the tracker count is preserved.
+  private serverLastSuccessAt: Record<string, number> = {};
+
+  // Time-since-success threshold (ms) for the recovery reset path.
+  // Tunable via `MCP_RECOVERY_RESET_THRESHOLD_MS`; default 5 min.
+  private readonly recoveryResetThresholdMs: number;
+
   // Default number of idle sessions per server UUID
   private readonly defaultIdleCount: number;
 
@@ -74,6 +88,10 @@ export class McpServerPool {
     this.defaultIdleCount = defaultIdleCount;
     this.maxTotalConnections = maxTotalConnections;
     this.maxConnectionsPerServer = maxConnectionsPerServer;
+    this.recoveryResetThresholdMs = parseInt(
+      process.env.MCP_RECOVERY_RESET_THRESHOLD_MS || "300000",
+      10,
+    );
     this.startCleanupTimer();
     this.startHealthCheckTimer();
   }
@@ -305,12 +323,89 @@ export class McpServerPool {
           });
         }
       },
+      (reason, dropError) => {
+        // HTTP/SSE parity with STDIO's `onProcessCrash`. Watchtower
+        // restarts of the backend container leave our pooled
+        // ConnectedClient with a dead socket; this callback fires
+        // when the SDK Transport reports the drop (`onclose` or
+        // `onerror`). We schedule the same cascade invalidation
+        // PR #16 wired for the request-path recovery — fan out
+        // `list_changed` (PR #19) and drop every pool slot for this
+        // serverUuid so the next getSession spawns a fresh
+        // connection. The async wrapper avoids blocking the SDK's
+        // notification dispatcher on cleanup latency.
+        this.handleTransportDrop(params.uuid, reason, dropError).catch(
+          (error) => {
+            logger.error(
+              `Error handling transport drop for ${params.uuid}:`,
+              error,
+            );
+          },
+        );
+      },
     );
     if (!connectedClient) {
       return undefined;
     }
 
+    // Mark this serverUuid as having a recent successful connection.
+    // Used by the recovery-reset threshold: if the next failure-then-
+    // success cycle lands within the threshold, we'll clear the
+    // circuit breaker accumulation.
+    this.markServerSuccess(params.uuid);
+
     return connectedClient;
+  }
+
+  /**
+   * Record that a server connection successfully established. Used
+   * by the recovery-reset path: a drop followed by a quick success
+   * means watchtower / network bounce, not real failure.
+   */
+  private markServerSuccess(serverUuid: string): void {
+    this.serverLastSuccessAt[serverUuid] = Date.now();
+    serverErrorTracker.markSuccess(serverUuid);
+  }
+
+  /**
+   * Handle an HTTP/SSE transport drop callback. Mirrors the recovery
+   * path used by `metamcp-proxy.ts`'s on-request recovery: cascade
+   * invalidate every pool slot for the affected serverUuid (which
+   * also fires `listChangedSubscribers` from PR #19) and, if we had
+   * a recent success, reset the error tracker so a transient bounce
+   * doesn't accumulate the circuit breaker count.
+   */
+  private async handleTransportDrop(
+    serverUuid: string,
+    reason: "close" | "error",
+    error?: Error,
+  ): Promise<void> {
+    logger.warn(
+      `Transport drop for server ${serverUuid}: reason=${reason}`,
+      error,
+    );
+
+    // Recovery-reset: if the most recent success was within the
+    // threshold, this is a transient bounce — clear the accumulated
+    // crash attempts so the sticky circuit breaker can't refuse
+    // future reconnects after a few bounces in a row. If the gap
+    // exceeds the threshold (sustained failure), preserve the count.
+    const lastSuccess = this.serverLastSuccessAt[serverUuid];
+    if (
+      lastSuccess !== undefined &&
+      Date.now() - lastSuccess <= this.recoveryResetThresholdMs
+    ) {
+      logger.info(
+        `Resetting error tracker attempts for ${serverUuid} (transient drop within ${this.recoveryResetThresholdMs}ms of last success)`,
+      );
+      serverErrorTracker.resetServerAttempts(serverUuid);
+    }
+
+    // Cascade invalidate across every session's slot for this
+    // serverUuid. The `<transport-drop>` sentinel session-id is for
+    // log readability — invalidateServerConnection iterates ALL
+    // sessions, the parameter is only used in the log line.
+    await this.invalidateServerConnection("<transport-drop>", serverUuid);
   }
 
   /**

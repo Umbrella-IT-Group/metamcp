@@ -41,6 +41,11 @@ vi.mock("../../db/repositories/mcp-servers.repo", () => ({
 vi.mock("./server-error-tracker", () => ({
   serverErrorTracker: {
     recordServerCrash: vi.fn(),
+    resetServerAttempts: vi.fn(),
+    markSuccess: vi.fn(),
+    getServerAttempts: vi.fn().mockReturnValue(0),
+    isServerInErrorState: vi.fn().mockResolvedValue(false),
+    resetServerErrorState: vi.fn(),
   },
 }));
 
@@ -287,5 +292,111 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
 
     expect(targetSub).toHaveBeenCalledTimes(1);
     expect(bystanderSub).not.toHaveBeenCalled();
+  });
+});
+
+// -------------------------------------------------------------------
+// Transport-drop cascade (PR #20)
+//
+// HTTP/SSE backends gain `onclose`/`onerror` callbacks that mirror
+// STDIO's `onProcessCrash`. The pool wires those callbacks to a
+// private `handleTransportDrop` that:
+//   1. Cascade-invalidates every pool slot for the affected serverUuid
+//      (reusing PR #16's path — which fires PR #19 list_changed
+//      subscribers on the way out).
+//   2. Resets the error-tracker count IF the last success was within
+//      the recovery-reset threshold (transient bounce, not real
+//      failure).
+// -------------------------------------------------------------------
+
+describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, FakeClient>>;
+    idleSessions: Record<string, FakeClient>;
+    serverLastSuccessAt: Record<string, number>;
+    handleTransportDrop: (
+      serverUuid: string,
+      reason: "close" | "error",
+      error?: Error,
+    ) => Promise<void>;
+  };
+
+  beforeEach(async () => {
+    const trackerModule = await import("./server-error-tracker");
+    vi.mocked(trackerModule.serverErrorTracker.resetServerAttempts).mockClear();
+    vi.mocked(trackerModule.serverErrorTracker.markSuccess).mockClear();
+
+    pool = new McpServerPool();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.serverLastSuccessAt = {};
+  });
+
+  it("cascade-invalidates every pool slot on transport drop", async () => {
+    const clientA = makeFakeClient();
+    const clientB = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-1": clientA as never };
+    internals.activeSessions["session-B"] = { "server-1": clientB as never };
+
+    await internals.handleTransportDrop("server-1", "close");
+
+    expect(clientA.cleanup).toHaveBeenCalledTimes(1);
+    expect(clientB.cleanup).toHaveBeenCalledTimes(1);
+    expect(internals.activeSessions["session-A"]?.["server-1"]).toBeUndefined();
+    expect(internals.activeSessions["session-B"]?.["server-1"]).toBeUndefined();
+  });
+
+  it("fires listChangedSubscribers on transport drop (PR #19 synergy)", async () => {
+    // End-to-end: a transport drop should produce the same upstream
+    // list_changed fan-out as PR #16's invalidation path. Without
+    // this, watchtower-restart cycles would leave consumers unaware
+    // their tools moved.
+    const stale = makeFakeClient();
+    const subscriber = vi.fn();
+    stale.listChangedSubscribers.add(subscriber);
+    internals.activeSessions["session-A"] = { "server-1": stale as never };
+
+    await internals.handleTransportDrop("server-1", "close");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(subscriber).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets error tracker when drop occurs within recovery threshold", async () => {
+    const trackerModule = await import("./server-error-tracker");
+    // Last success was 10ms ago — well within the 5min default.
+    internals.serverLastSuccessAt["server-1"] = Date.now() - 10;
+
+    await internals.handleTransportDrop("server-1", "close");
+
+    expect(
+      vi.mocked(trackerModule.serverErrorTracker.resetServerAttempts),
+    ).toHaveBeenCalledWith("server-1");
+  });
+
+  it("does NOT reset error tracker when last success was beyond threshold", async () => {
+    const trackerModule = await import("./server-error-tracker");
+    // Last success was 10 min ago — exceeds default 5min threshold.
+    internals.serverLastSuccessAt["server-1"] = Date.now() - 10 * 60 * 1000;
+
+    await internals.handleTransportDrop("server-1", "close");
+
+    expect(
+      vi.mocked(trackerModule.serverErrorTracker.resetServerAttempts),
+    ).not.toHaveBeenCalled();
+  });
+
+  it("does NOT reset error tracker when there is no recorded success", async () => {
+    // Server never connected successfully — drop is a real failure
+    // signal and the circuit breaker should accumulate normally.
+    const trackerModule = await import("./server-error-tracker");
+
+    await internals.handleTransportDrop("server-1", "error", new Error("boom"));
+
+    expect(
+      vi.mocked(trackerModule.serverErrorTracker.resetServerAttempts),
+    ).not.toHaveBeenCalled();
   });
 });
