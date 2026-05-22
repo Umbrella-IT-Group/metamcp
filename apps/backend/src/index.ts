@@ -1,6 +1,7 @@
 import express from "express";
 
 import { auth } from "./auth";
+import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -86,6 +87,25 @@ app.use("/trpc", trpcRouter);
 async function start(): Promise<void> {
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
+
+  // Auto-nuke pre-deploy `mcp_sessions` rows when the advertised
+  // capability set has changed since the last boot. Runs after
+  // migrations (`initializeOnStartup`) so the `capability_hash`
+  // column is guaranteed to exist, and before `app.listen()` so the
+  // first inbound request can't race the cleanup. Errors are
+  // logged + swallowed inside the helper; the gateway never fails to
+  // start because of a transient DB issue here. See
+  // `lib/metamcp/session-auto-nuke.ts` for the Anthropic-client
+  // workaround scope this closes.
+  try {
+    await autoNukeStaleSessions();
+  } catch (err) {
+    // Defence-in-depth: the helper itself already try/catches every
+    // DB call. This outer guard exists so any future refactor that
+    // throws out of the helper (e.g. a constructor error) still
+    // doesn't crash the gateway on boot.
+    logger.error("Auto-nuke: unexpected error (ignored):", err);
+  }
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);
