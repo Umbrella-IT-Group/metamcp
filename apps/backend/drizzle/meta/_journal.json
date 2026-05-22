@@ -120,6 +120,13 @@
       "when": 1779811200000,
       "tag": "0016_mcp_session_boot_id",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1779897600000,
+      "tag": "0017_mcp_session_capability_hash",
+      "breakpoints": true
     }
   ]
 }

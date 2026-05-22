@@ -527,6 +527,15 @@ export const mcpSessionsTable = pgTable(
     // (cross-restart row whose negotiated capability set may now be
     // stale). See `lib/metamcp/gateway-boot-id.ts`.
     gateway_boot_id: uuid("gateway_boot_id"),
+    // PR #23: SHA-256 of the upstream-advertised capability set at
+    // session init. Used alongside `gateway_boot_id` so lazy-recovery
+    // refuses only when capabilities actually changed across a
+    // restart (different boot_id AND different hash), not on every
+    // capability-neutral restart (different boot_id, same hash —
+    // safe to recover). Nullable for backwards-compat with rows
+    // persisted before this column existed. See
+    // `lib/metamcp/gateway-boot-id.ts#shouldRefuseRecovery`.
+    capability_hash: text("capability_hash"),
   },
   (table) => [
     index("mcp_sessions_last_seen_at_idx").on(table.last_seen_at),

@@ -27,6 +27,7 @@ import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { ConnectedClient } from "./client";
 import { getMcpServers } from "./fetch-metamcp";
+import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { mcpServerPool } from "./mcp-server-pool";
 import {
   createFilterCallToolMiddleware,
@@ -128,16 +129,13 @@ export const createServer = async (
       version: "1.0.0",
     },
     {
-      capabilities: {
-        prompts: {},
-        resources: {},
-        // Advertise `listChanged: true` so spec-conformant upstream
-        // clients (Claude Code, Claude.ai connectors) actually act on
-        // `notifications/tools/list_changed`. Without this capability
-        // declaration the notification is silently ignored even when
-        // emitted, defeating the whole propagation chain.
-        tools: { listChanged: true },
-      },
+      // Capabilities live in `gateway-capabilities.ts` as a single
+      // source of truth — the same object is hashed into
+      // `GATEWAY_CAPABILITY_HASH` (PR #23) and stamped onto every
+      // persisted session row, so lazy-recovery can refuse only when
+      // the advertised set actually changed across a restart. Mutate
+      // the constant, not this declaration.
+      capabilities: GATEWAY_CAPABILITIES,
     },
   );
 

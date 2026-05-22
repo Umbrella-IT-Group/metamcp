@@ -44,6 +44,12 @@ export interface PersistedMcpSession {
   // lazy-recovery path treats null as "no metadata to compare, allow"
   // (pruner reaps these within `MCP_SESSION_TTL_DAYS`).
   gateway_boot_id: string | null;
+  // PR #23: SHA-256 of the upstream-advertised capability set at
+  // session init. Null when the row was persisted by a metamcp
+  // version prior to PR #23 — the lazy-recovery path's combined
+  // predicate handles the null branches conservatively. See
+  // `lib/metamcp/gateway-boot-id.ts#shouldRefuseRecovery`.
+  capability_hash: string | null;
 }
 
 export interface PersistMcpSessionInput {
@@ -57,6 +63,10 @@ export interface PersistMcpSessionInput {
   // the router so post-deploy rows are always stamped — only pre-PR-22
   // rows in the table have null stamps.
   gateway_boot_id: string;
+  // PR #23: SHA-256 of the upstream-advertised capability set.
+  // Required on every persist call so post-deploy rows are always
+  // stamped — only pre-PR-23 rows in the table have null hashes.
+  capability_hash: string;
 }
 
 export class McpSessionsRepository {
@@ -77,6 +87,7 @@ export class McpSessionsRepository {
         auth_method: input.auth_method,
         init_params: input.init_params ?? {},
         gateway_boot_id: input.gateway_boot_id,
+        capability_hash: input.capability_hash,
       })
       .onConflictDoNothing({ target: mcpSessionsTable.session_id });
   }
@@ -106,6 +117,7 @@ export class McpSessionsRepository {
       created_at: row.created_at,
       last_seen_at: row.last_seen_at,
       gateway_boot_id: row.gateway_boot_id,
+      capability_hash: row.capability_hash,
     };
   }
 

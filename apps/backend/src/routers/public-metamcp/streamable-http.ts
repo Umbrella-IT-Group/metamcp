@@ -14,7 +14,8 @@ import logger from "@/utils/logger";
 
 import {
   GATEWAY_BOOT_ID,
-  shouldRefuseRecoveryForBootIdMismatch,
+  GATEWAY_CAPABILITY_HASH,
+  shouldRefuseRecovery,
 } from "../../lib/metamcp/gateway-boot-id";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
@@ -127,39 +128,49 @@ async function recoverPersistedSession(
     return { status: "not_found" };
   }
 
-  // PR #22: capability-cache mismatch defense across gateway restarts.
-  // MCP `initialize` negotiates server capabilities once per session.
-  // When metamcp is upgraded with new capabilities (e.g., PR #19's
-  // `tools: { listChanged: true }`), pre-upgrade rows in `mcp_sessions`
-  // carry a `gateway_boot_id` from the prior process. Recovering them
-  // hands the client a transport whose negotiated capability set
-  // doesn't match what the current process actually advertises — so
-  // clients with cached `listChanged: false` silently ignore the new
-  // `notifications/tools/list_changed` we now emit. Result: stale
-  // tool surfaces indefinitely.
+  // PR #22 + PR #23: capability-cache mismatch defense across gateway
+  // restarts. MCP `initialize` negotiates server capabilities once per
+  // session. When metamcp is upgraded with new capabilities (e.g., PR
+  // #19's `tools: { listChanged: true }`), pre-upgrade rows in
+  // `mcp_sessions` carry stamps from the prior process. Recovering
+  // them hands the client a transport whose negotiated capability set
+  // doesn't match what the current process advertises — clients with
+  // cached `listChanged: false` silently ignore the new
+  // `notifications/tools/list_changed` we now emit, leaving stale tool
+  // surfaces.
   //
-  // Capability changes within a single process lifetime are impossible
-  // (capabilities are baked into `new Server({...})` at proxy
-  // construction). A boot_id match is therefore sufficient to skip
-  // the forced re-init; a mismatch means we crossed a restart and
-  // the client must re-negotiate.
+  // PR #22 used `gateway_boot_id` alone as the refusal trigger. That
+  // forced a client re-initialize on every metamcp restart, including
+  // capability-neutral restarts (OAuth fixes, dep bumps, transport
+  // tweaks). The Anthropic MCP connector doesn't honor the spec's
+  // HTTP-404 → start-new-session contract (already documented in
+  // UMBRELLA_FORK.md for PR #18); it wraps the 404 +
+  // `Mcp-Session-Reinitialize-Required` response as
+  // `-32600 "Anthropic Proxy: Invalid content from server"` and breaks
+  // claude.ai sessions until manual `/mcp reconnect`.
   //
-  // The `!== null` guard handles the deploy-day transition: rows
-  // persisted by metamcp versions prior to PR #22 have null stamps
-  // and there's no metadata to compare against. Treat null as "allow"
-  // — the pruner reaps these within `MCP_SESSION_TTL_DAYS` (default 7),
-  // so the null branch is finite and self-clearing. Sessions persisted
-  // post-PR-22 always carry a stamp.
+  // PR #23 narrows the refusal: refuse only when the stored boot_id
+  // differs AND the stored capability_hash also differs. Two metamcp
+  // processes built from the same source declare identical capabilities
+  // (baked into `new Server({...})`) and therefore produce identical
+  // hashes — recovery is safe across same-image restarts.
+  // `shouldRefuseRecovery` encodes the full truth table (see
+  // `gateway-boot-id.ts` for the decision matrix and null-branch
+  // handling for pre-PR-22 / PR #22-only rows).
   if (
-    shouldRefuseRecoveryForBootIdMismatch(
-      stored.gateway_boot_id,
-      GATEWAY_BOOT_ID,
+    shouldRefuseRecovery(
+      {
+        gateway_boot_id: stored.gateway_boot_id,
+        capability_hash: stored.capability_hash,
+      },
+      { bootId: GATEWAY_BOOT_ID, capabilityHash: GATEWAY_CAPABILITY_HASH },
     )
   ) {
     logger.info(
       `Lazy recovery: refusing recovery for session ${sessionId} — ` +
-        `stored boot_id=${stored.gateway_boot_id} != current ${GATEWAY_BOOT_ID}. ` +
-        `Capability cache may be stale post-restart; client must re-initialize.`,
+        `stored boot_id=${stored.gateway_boot_id} (current ${GATEWAY_BOOT_ID}), ` +
+        `stored capability_hash=${stored.capability_hash} (current ${GATEWAY_CAPABILITY_HASH}). ` +
+        `Capability set changed across restart; client must re-initialize.`,
     );
     return { status: "not_found" };
   }
@@ -517,6 +528,7 @@ streamableHttpRouter.post(
               auth_method: authMethod,
               init_params: {},
               gateway_boot_id: GATEWAY_BOOT_ID,
+              capability_hash: GATEWAY_CAPABILITY_HASH,
             })
             .catch((error: unknown) =>
               logger.warn(

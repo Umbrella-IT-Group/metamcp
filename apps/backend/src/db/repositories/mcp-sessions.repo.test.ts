@@ -62,6 +62,7 @@ vi.mock("../schema", () => ({
     created_at: { name: "created_at" },
     last_seen_at: { name: "last_seen_at" },
     gateway_boot_id: { name: "gateway_boot_id" },
+    capability_hash: { name: "capability_hash" },
   },
 }));
 
@@ -82,6 +83,7 @@ describe("McpSessionsRepository", () => {
       auth_principal: "deadbeef".repeat(8),
       auth_method: "api_key",
       gateway_boot_id: "11111111-1111-1111-1111-111111111111",
+      capability_hash: "c".repeat(64),
     });
 
     expect(insertChain.values).toHaveBeenCalledWith(
@@ -93,6 +95,7 @@ describe("McpSessionsRepository", () => {
         auth_method: "api_key",
         init_params: {},
         gateway_boot_id: "11111111-1111-1111-1111-111111111111",
+        capability_hash: "c".repeat(64),
       }),
     );
     expect(insertChain.onConflictDoNothing).toHaveBeenCalledWith(
@@ -120,6 +123,7 @@ describe("McpSessionsRepository", () => {
         created_at: created,
         last_seen_at: lastSeen,
         gateway_boot_id: "22222222-2222-2222-2222-222222222222",
+        capability_hash: "d".repeat(64),
       },
     ]);
     const result = await mcpSessionsRepository.findById("abc");
@@ -133,6 +137,7 @@ describe("McpSessionsRepository", () => {
       created_at: created,
       last_seen_at: lastSeen,
       gateway_boot_id: "22222222-2222-2222-2222-222222222222",
+      capability_hash: "d".repeat(64),
     });
   });
 
@@ -150,10 +155,39 @@ describe("McpSessionsRepository", () => {
         created_at: created,
         last_seen_at: lastSeen,
         gateway_boot_id: null,
+        capability_hash: null,
       },
     ]);
     const result = await mcpSessionsRepository.findById("legacy");
     expect(result?.gateway_boot_id).toBeNull();
+    expect(result?.capability_hash).toBeNull();
+  });
+
+  it("findById() preserves null capability_hash on PR #22-only row", async () => {
+    // A row persisted between PR #22 (boot_id stamped) and PR #23
+    // (capability_hash stamped) round-trips with a non-null boot_id
+    // and a null hash. The router-side predicate handles the asymmetry.
+    const created = new Date("2026-05-21T20:00:00Z");
+    const lastSeen = new Date("2026-05-21T20:30:00Z");
+    selectChain.limit.mockResolvedValueOnce([
+      {
+        session_id: "pr22-only",
+        namespace_uuid: "ns",
+        endpoint_name: "ep",
+        auth_principal: "hash",
+        auth_method: "api_key",
+        init_params: {},
+        created_at: created,
+        last_seen_at: lastSeen,
+        gateway_boot_id: "33333333-3333-3333-3333-333333333333",
+        capability_hash: null,
+      },
+    ]);
+    const result = await mcpSessionsRepository.findById("pr22-only");
+    expect(result?.gateway_boot_id).toBe(
+      "33333333-3333-3333-3333-333333333333",
+    );
+    expect(result?.capability_hash).toBeNull();
   });
 
   it("touch() issues an UPDATE setting last_seen_at to NOW()", async () => {
