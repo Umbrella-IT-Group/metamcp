@@ -2,39 +2,64 @@
  * One-shot session nuke at metamcp boot, gated on detection of a
  * capability change relative to the persisted `mcp_sessions` rows.
  *
- * Why this exists (Anthropic-client workaround on top of PR #22/#23):
+ * ============================================================
+ * READ FIRST IF YOU'RE STUMBLING ON THIS FILE
+ * ============================================================
  *
- *   PR #22 added a per-process `gateway_boot_id` stamp; PR #23 layered
- *   a `capability_hash` stamp + the combined `shouldRefuseRecovery`
- *   predicate. Together they correctly refuse lazy-recovery of any
- *   pre-deploy session whose negotiated capability set is stale —
- *   spec-conformant clients respond to the resulting HTTP 404 +
- *   `Mcp-Session-Reinitialize-Required` header by starting a fresh
- *   session (per MCP transport spec).
+ * **Persistent sessions are the default + desired behavior.** PR #15
+ * (`feat/lazy-session-recovery`) intentionally survives a metamcp
+ * restart without forcing the consumer to reconnect: persisted rows
+ * in `mcp_sessions` let the router rebuild the transport against the
+ * same `Mcp-Session-Id` the client already has cached. 95%+ of
+ * metamcp restarts (OAuth tweaks, dep bumps, transport-disconnect
+ * detector work, lint sweeps, env-only changes) preserve the
+ * advertised MCP server-capability set, and those restarts stay
+ * fully transparent to consumers. This module does NOT touch those.
  *
- *   Anthropic's claude.ai MCP connector currently doesn't honor that
- *   contract — it wraps the 404 + reinit-required response as
- *   `-32600 "Anthropic Proxy: Invalid content from server"` (already
- *   documented for PR #18). Result: a session WEDGES until the row is
- *   manually `DELETE`d from `mcp_sessions`.
+ * The narrow case this module exists for: a deploy that ACTUALLY
+ * changes the gateway's advertised MCP capabilities. Example: PR #19
+ * added `tools: { listChanged: true }` to the upstream `Server`. MCP
+ * `initialize` negotiates capabilities ONCE per session — a recovered
+ * session keeps its pre-deploy cached capability set forever. PR #22
+ * + PR #23 added stamps (`gateway_boot_id` + `capability_hash`) and
+ * a `shouldRefuseRecovery` predicate that correctly returns 404 +
+ * `Mcp-Session-Reinitialize-Required` when capabilities changed
+ * across the restart. Spec-conformant clients respond by issuing a
+ * fresh `initialize`.
  *
- *   This module automates the workaround. On boot, if the persisted
- *   table contains ANY row whose `capability_hash` differs from the
- *   current process's `GATEWAY_CAPABILITY_HASH` (or is NULL — pre-PR-23
- *   row), every non-matching row is deleted in one statement. The
- *   client's NEXT request after the restart then hits the new-session
- *   POST path on the streamable-http router instead of the lazy-
- *   recovery refuse path, so the Anthropic-side 404 mishandling
- *   surfaces at most once (rather than indefinitely).
+ * Anthropic's claude.ai MCP connector doesn't honor that spec
+ * contract (already documented for PR #18) — it wraps the 404 +
+ * reinit-required response as `-32600 "Anthropic Proxy: Invalid
+ * content from server"`. Result: claude.ai sessions WEDGE
+ * indefinitely after a capability-changing deploy until the row is
+ * manually `DELETE`d from `mcp_sessions`.
  *
- *   PR #23's `shouldRefuseRecovery` would have refused these rows
- *   anyway — the nuke is strictly a proactive form of the same
- *   decision. No row that this module deletes was recoverable by the
- *   existing lazy-recovery logic.
+ * This module automates that manual workaround for the narrow case
+ * only: on boot, if `mcp_sessions` contains any row whose
+ * `capability_hash` differs from the current process's
+ * `GATEWAY_CAPABILITY_HASH` (or is NULL — pre-PR-23 row), every
+ * non-matching row is deleted in a single statement. The client's
+ * NEXT request hits the new-session POST path instead of the
+ * lazy-recovery refuse path, surfacing the Anthropic-side 404
+ * mishandling at most once rather than indefinitely.
  *
- * Idempotency: re-running on a clean table (i.e. all rows already
- * stamped with the current hash, or the table is empty) is a no-op.
- * Two restarts in a row do not loop.
+ * **PR #23's `shouldRefuseRecovery` would have refused these rows
+ * anyway** — the nuke is strictly a proactive form of the same
+ * decision, only triggered for the rows that were guaranteed
+ * unrecoverable. Rows whose capability_hash matches the current
+ * process (i.e., 95%+ of restarts) are never touched.
+ *
+ * Remove this module when Anthropic's MCP connector ships
+ * spec-compliant 404 handling. Counterpart IDEAS entry in the
+ * operator's COWORK repo tracks the upstream-fix expectation.
+ *
+ * ============================================================
+ * Operational behaviour
+ * ============================================================
+ *
+ * Idempotency: re-running on a clean table (every row already
+ * stamped with the current hash, or table empty) is a no-op. Two
+ * restarts in a row do not loop.
  *
  * Env knob: `MCP_AUTO_NUKE_ON_CAPABILITY_CHANGE` (default "true").
  * Set to "false" for forensic-debugging boots where preserving stale
@@ -42,7 +67,7 @@
  *
  * Failure mode: any DB error is logged and swallowed — auto-nuke is
  * a workaround, not a correctness gate. Callers route this through
- * the existing startup try/catch (see `lib/startup.ts`) so a
+ * the existing startup try/catch (`apps/backend/src/index.ts`) so a
  * transient DB error doesn't crash the gateway.
  */
 

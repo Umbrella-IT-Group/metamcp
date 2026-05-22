@@ -88,15 +88,29 @@ async function start(): Promise<void> {
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 
-  // Auto-nuke pre-deploy `mcp_sessions` rows when the advertised
-  // capability set has changed since the last boot. Runs after
-  // migrations (`initializeOnStartup`) so the `capability_hash`
-  // column is guaranteed to exist, and before `app.listen()` so the
-  // first inbound request can't race the cleanup. Errors are
-  // logged + swallowed inside the helper; the gateway never fails to
-  // start because of a transient DB issue here. See
-  // `lib/metamcp/session-auto-nuke.ts` for the Anthropic-client
-  // workaround scope this closes.
+  // Auto-nuke pre-deploy `mcp_sessions` rows ONLY when the advertised
+  // MCP server-capability set has changed since the last boot.
+  // Capability-neutral restarts (OAuth fixes, dep bumps, transport-
+  // disconnect detector tweaks, lint sweeps — i.e. 95%+ of deploys)
+  // preserve persistent sessions per PR #15's lazy-recovery design —
+  // this helper is a no-op against them and DOES NOT touch those
+  // rows.
+  //
+  // The narrow exception (capability-changing deploys like PR #19)
+  // exists because MCP `initialize` negotiates capabilities once per
+  // session AND Anthropic's claude.ai MCP connector doesn't honor
+  // the spec's "client MUST start a new session on 404" requirement
+  // (already documented for PR #18). PR #22 + #23 add the detection;
+  // this module + PR #24 add the proactive cleanup so wedged claude.ai
+  // sessions surface the issue at most once rather than indefinitely.
+  // Full rationale: `lib/metamcp/session-auto-nuke.ts` file-top.
+  //
+  // Runs after migrations (`initializeOnStartup`) so the
+  // `capability_hash` column is guaranteed to exist, and before
+  // `app.listen()` so the first inbound request can't race the
+  // cleanup. Errors are logged + swallowed inside the helper; the
+  // gateway never fails to start because of a transient DB issue
+  // here.
   try {
     await autoNukeStaleSessions();
   } catch (err) {
