@@ -131,10 +131,79 @@ export const createServer = async (
       capabilities: {
         prompts: {},
         resources: {},
-        tools: {},
+        // Advertise `listChanged: true` so spec-conformant upstream
+        // clients (Claude Code, Claude.ai connectors) actually act on
+        // `notifications/tools/list_changed`. Without this capability
+        // declaration the notification is silently ignored even when
+        // emitted, defeating the whole propagation chain.
+        tools: { listChanged: true },
       },
     },
   );
+
+  // Subscribers we've registered on backend `ConnectedClient`s for this
+  // upstream `Server`. We track them so the `server.onclose` hook below
+  // can detach them — the `ConnectedClient` outlives this `Server` (it's
+  // pooled), so leaving subscribers attached would leak fan-out targets
+  // pointing at a closed proxy server.
+  const registeredSubscriptions = new Set<{
+    client: ConnectedClient;
+    subscriber: () => Promise<void>;
+  }>();
+
+  /**
+   * Attach a subscriber to the backend client that:
+   *   1. Invalidates the tools-sync cache for this server so the next
+   *      `tools/list` re-syncs to DB.
+   *   2. Emits `notifications/tools/list_changed` upstream.
+   *
+   * Idempotent: the `ConnectedClient.listChangedSubscribers` field is a
+   * `Set`, but each `createServer` call gets its own subscriber closure
+   * (different `server` instance), so we de-dupe per upstream-server by
+   * tracking subscribers we've already attached for this proxy server.
+   */
+  const registerListChangedSubscriber = (
+    session: ConnectedClient,
+    mcpServerUuid: string,
+  ): void => {
+    // De-dupe: don't attach a second subscriber to the same client from
+    // this same upstream `Server` instance. (Different upstream Servers
+    // legitimately each get their own subscriber.)
+    for (const entry of registeredSubscriptions) {
+      if (entry.client === session) {
+        return;
+      }
+    }
+
+    const subscriber = async (): Promise<void> => {
+      toolsSyncCache.clear(mcpServerUuid);
+      try {
+        await server.notification({
+          method: "notifications/tools/list_changed",
+          params: {},
+        });
+      } catch (notifyError) {
+        logger.warn(
+          `Failed to forward tools/list_changed upstream for server ${mcpServerUuid}:`,
+          notifyError,
+        );
+      }
+    };
+
+    session.listChangedSubscribers.add(subscriber);
+    registeredSubscriptions.add({ client: session, subscriber });
+  };
+
+  // Detach all subscribers when this upstream Server closes — otherwise
+  // they outlive the proxy server (the backend ConnectedClient is pooled
+  // and keeps the subscriber set alive). The `Server` exposes `onclose`
+  // from the underlying `Protocol`; we install our hook here.
+  server.onclose = () => {
+    for (const { client, subscriber } of registeredSubscriptions) {
+      client.listChangedSubscribers.delete(subscriber);
+    }
+    registeredSubscriptions.clear();
+  };
 
   // Create the handler context
   const handlerContext: MetaMCPHandlerContext = {
@@ -211,6 +280,14 @@ export const createServer = async (
           console.log(`[DEBUG-TOOLS] ❌ No session for: ${params.name}`);
           return;
         }
+
+        // Attach our `list_changed` fan-out subscriber on every
+        // `getSession`. Idempotent via the per-upstream-Server dedupe
+        // check inside the helper. Catches:
+        //   - First contact with this backend (no subscriber yet).
+        //   - Backend restart cycle: pool invalidation hands us a fresh
+        //     ConnectedClient whose subscriber set is empty.
+        registerListChangedSubscriber(session, mcpServerUuid);
 
         // Now check for self-referencing using the actual MCP server name
         const serverVersion = session.client.getServerVersion();
@@ -377,6 +454,12 @@ export const createServer = async (
           );
 
           if (session) {
+            // Idempotent — see registerListChangedSubscriber dedupe note.
+            // Required here too: tools discovered only via dynamic-find
+            // never hit the `originalListToolsHandler` `getSession`, so
+            // without this they'd never get a subscriber attached.
+            registerListChangedSubscriber(session, mcpServerUuid);
+
             const capabilities = session.client.getServerCapabilities();
             if (!capabilities?.tools) continue;
 
@@ -454,6 +537,7 @@ export const createServer = async (
                       `Failed to re-initialize session for server ${mcpServerUuid} after backend session loss during dynamic tool routing`,
                     );
                   }
+                  registerListChangedSubscriber(fresh, mcpServerUuid);
                   activeSession = fresh;
                   pages = await listToolsOnce(activeSession);
                 }
@@ -563,6 +647,7 @@ export const createServer = async (
         );
       }
 
+      registerListChangedSubscriber(freshSession, serverUuid);
       toolToClient[name] = freshSession;
 
       try {

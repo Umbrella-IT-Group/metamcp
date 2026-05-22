@@ -803,47 +803,104 @@ export class McpServerPool {
     // affected serverUuid. The next `getSession` call then has no stale
     // candidates to reuse and must `createNewConnection`, producing the
     // fresh transport the recovery path expects.
-    const cleanupPromises: Promise<void>[] = [];
+    // Collect every doomed ConnectedClient FIRST (before any cleanup
+    // call) so we can snapshot + fire their `listChangedSubscribers`
+    // BEFORE cleanup wipes the subscriber set. This catches the
+    // watchtower-restart cycle: backend container restarts → existing
+    // connection produces a recoverable error → we land here → fire
+    // subscribers before tearing down so every upstream consumer
+    // (Claude Code, Claude.ai) learns the tool list is suspect and
+    // re-fetches on next interaction. Without this, a fresh
+    // ConnectedClient appears in the pool but no upstream notification
+    // is ever emitted (backend FastMCP doesn't emit on its own startup;
+    // that's a separate, future PR).
+    const doomedClients: { client: ConnectedClient; sid: string }[] = [];
 
     for (const [sid, sessionServers] of Object.entries(this.activeSessions)) {
       const cachedClient = sessionServers[serverUuid];
       if (!cachedClient) {
         continue;
       }
-      // Fire all cleanups concurrently; we await the batch below. Each
-      // cleanup is wrapped so one cleanup failure doesn't short-circuit
-      // the rest — we WANT every stale slot dropped from the map.
-      cleanupPromises.push(
-        (async () => {
-          try {
-            await cachedClient.cleanup();
-          } catch (error) {
-            console.error(
-              `Error cleaning up invalidated active session ${sid}/${serverUuid}:`,
-              error,
-            );
-          }
-        })(),
-      );
-      delete sessionServers[serverUuid];
-      this.sessionToServers[sid]?.delete(serverUuid);
+      doomedClients.push({ client: cachedClient, sid });
     }
 
     const idleClient = this.idleSessions[serverUuid];
     if (idleClient) {
-      cleanupPromises.push(
-        (async () => {
-          try {
-            await idleClient.cleanup();
-          } catch (error) {
-            console.error(
-              `Error cleaning up invalidated idle session for ${serverUuid}:`,
+      doomedClients.push({ client: idleClient, sid: "<idle>" });
+    }
+
+    // Fire `list_changed` subscribers on every doomed client BEFORE we
+    // start any cleanup. `cleanup()` clears the subscriber set, so we
+    // MUST snapshot first or the fan-out targets would already be gone
+    // by the time the cleanup promise's first synchronous frame runs.
+    // Errors from individual subscribers are isolated by the proxy-side
+    // try/catch; we additionally guard here so a misbehaving subscriber
+    // can't break the invalidation cascade.
+    for (const { client: doomed } of doomedClients) {
+      const subscribers = Array.from(doomed.listChangedSubscribers);
+      // Clear immediately so the upcoming cleanup() can't double-fire
+      // a subscriber that we already invoked here.
+      doomed.listChangedSubscribers.clear();
+      for (const subscriber of subscribers) {
+        try {
+          // Don't await — these emit upstream notifications and we
+          // don't want to block the invalidation/cleanup cascade on
+          // upstream-client send latency. The proxy-side handler is
+          // already async and wraps its own errors.
+          Promise.resolve(subscriber()).catch((error) => {
+            logger.warn(
+              `list_changed subscriber threw during invalidation of ${serverUuid}:`,
               error,
             );
-          }
-        })(),
-      );
-      delete this.idleSessions[serverUuid];
+          });
+        } catch (error) {
+          logger.warn(
+            `list_changed subscriber threw synchronously during invalidation of ${serverUuid}:`,
+            error,
+          );
+        }
+      }
+    }
+
+    // Now run cleanup. Each cleanup is wrapped so one cleanup failure
+    // doesn't short-circuit the rest — we WANT every stale slot dropped
+    // from the map.
+    const cleanupPromises: Promise<void>[] = [];
+
+    for (const { client: cachedClient, sid } of doomedClients) {
+      if (sid === "<idle>") {
+        cleanupPromises.push(
+          (async () => {
+            try {
+              await cachedClient.cleanup();
+            } catch (error) {
+              console.error(
+                `Error cleaning up invalidated idle session for ${serverUuid}:`,
+                error,
+              );
+            }
+          })(),
+        );
+        delete this.idleSessions[serverUuid];
+      } else {
+        cleanupPromises.push(
+          (async () => {
+            try {
+              await cachedClient.cleanup();
+            } catch (error) {
+              console.error(
+                `Error cleaning up invalidated active session ${sid}/${serverUuid}:`,
+                error,
+              );
+            }
+          })(),
+        );
+        const sessionServers = this.activeSessions[sid];
+        if (sessionServers) {
+          delete sessionServers[serverUuid];
+        }
+        this.sessionToServers[sid]?.delete(serverUuid);
+      }
     }
 
     // Drop the in-flight idle-creation guard. Any pending

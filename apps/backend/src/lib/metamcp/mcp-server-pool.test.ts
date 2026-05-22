@@ -46,14 +46,20 @@ vi.mock("./server-error-tracker", () => ({
 
 import { McpServerPool } from "./mcp-server-pool";
 
-type FakeClient = { cleanup: ReturnType<typeof vi.fn>; closed: boolean };
+type FakeClient = {
+  cleanup: ReturnType<typeof vi.fn>;
+  closed: boolean;
+  listChangedSubscribers: Set<() => void | Promise<void>>;
+};
 
 function makeFakeClient(): FakeClient {
   const fake: FakeClient = {
     cleanup: vi.fn(async () => {
       fake.closed = true;
+      fake.listChangedSubscribers.clear();
     }),
     closed: false,
+    listChangedSubscribers: new Set(),
   };
   return fake;
 }
@@ -192,5 +198,94 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
     await expect(
       pool.invalidateServerConnection("session-A", "server-1"),
     ).resolves.not.toThrow();
+  });
+
+  // ---------------------------------------------------------------
+  // list_changed fan-out on invalidation
+  //
+  // When the pool drops a ConnectedClient (recoverable backend error
+  // surfaced via PR #13's detector OR a watchtower-restart cycle), we
+  // fire the client's `listChangedSubscribers` BEFORE running cleanup.
+  // metamcp-proxy.ts registers those subscribers; they invalidate
+  // tools-sync-cache and emit `notifications/tools/list_changed`
+  // upstream. Without this, the gateway swaps in a fresh
+  // ConnectedClient but the consumer (Claude Code, Claude.ai) never
+  // learns the tool list might have changed.
+  // ---------------------------------------------------------------
+  it("fires listChangedSubscribers on every doomed client before cleanup", async () => {
+    const stale = makeFakeClient();
+    const subscriberA = vi.fn();
+    const subscriberB = vi.fn();
+    stale.listChangedSubscribers.add(subscriberA);
+    stale.listChangedSubscribers.add(subscriberB);
+    internals.activeSessions["session-A"] = { "server-1": stale as never };
+
+    await pool.invalidateServerConnection("session-A", "server-1");
+    // Allow the fire-and-forget promise scheduled by the cascade to
+    // resolve before we assert.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(subscriberA).toHaveBeenCalledTimes(1);
+    expect(subscriberB).toHaveBeenCalledTimes(1);
+    expect(stale.cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires subscribers across active AND idle clients for the same serverUuid", async () => {
+    const active = makeFakeClient();
+    const idle = makeFakeClient();
+    const activeSub = vi.fn();
+    const idleSub = vi.fn();
+    active.listChangedSubscribers.add(activeSub);
+    idle.listChangedSubscribers.add(idleSub);
+    internals.activeSessions["session-A"] = { "server-1": active as never };
+    internals.idleSessions["server-1"] = idle as never;
+
+    await pool.invalidateServerConnection("session-A", "server-1");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(activeSub).toHaveBeenCalledTimes(1);
+    expect(idleSub).toHaveBeenCalledTimes(1);
+  });
+
+  it("isolates a throwing subscriber so cleanup still completes", async () => {
+    // A bad subscriber must not strand the invalidation cascade. We
+    // log-and-continue (see invalidateServerConnection body).
+    const stale = makeFakeClient();
+    stale.listChangedSubscribers.add(() => {
+      throw new Error("subscriber blew up");
+    });
+    const healthySubscriber = vi.fn();
+    stale.listChangedSubscribers.add(healthySubscriber);
+    internals.activeSessions["session-A"] = { "server-1": stale as never };
+
+    await expect(
+      pool.invalidateServerConnection("session-A", "server-1"),
+    ).resolves.not.toThrow();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(healthySubscriber).toHaveBeenCalledTimes(1);
+    expect(stale.cleanup).toHaveBeenCalled();
+    expect(internals.activeSessions["session-A"]?.["server-1"]).toBeUndefined();
+  });
+
+  it("does not fire subscribers on clients for other serverUuids", async () => {
+    // Watchtower restarting `server-1` must not trigger fan-out on
+    // healthy `server-2` clients.
+    const target = makeFakeClient();
+    const bystander = makeFakeClient();
+    const targetSub = vi.fn();
+    const bystanderSub = vi.fn();
+    target.listChangedSubscribers.add(targetSub);
+    bystander.listChangedSubscribers.add(bystanderSub);
+    internals.activeSessions["session-A"] = {
+      "server-1": target as never,
+      "server-2": bystander as never,
+    };
+
+    await pool.invalidateServerConnection("session-A", "server-1");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(targetSub).toHaveBeenCalledTimes(1);
+    expect(bystanderSub).not.toHaveBeenCalled();
   });
 });

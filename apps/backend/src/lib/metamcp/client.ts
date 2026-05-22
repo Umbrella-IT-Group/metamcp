@@ -3,6 +3,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
@@ -15,10 +16,32 @@ import { resolveEnvVariables } from "./utils";
 const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
 
+/**
+ * A subscriber invoked when the backend MCP server emits
+ * `notifications/tools/list_changed`. The proxy layer (and the pool
+ * invalidation path) attach subscribers here to fan that signal out to
+ * upstream MetaMCP `Server` instances.
+ *
+ * Subscribers MUST be tolerant of being called multiple times (Set
+ * semantics on the field already dedupe identical references; idempotent
+ * subscriber bodies handle the over-fire case from pool invalidation).
+ */
+export type ListChangedSubscriber = () => Promise<void> | void;
+
 export interface ConnectedClient {
   client: Client;
   cleanup: () => Promise<void>;
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void;
+  /**
+   * Set of fan-out subscribers for upstream `tools/list_changed` propagation.
+   * Populated by the proxy layer (one per upstream `Server` that this
+   * backend client is feeding). Cleared by `cleanup`. The pool's
+   * `invalidateServerConnection` fires every subscriber here once before
+   * dropping the client, so that consumers see a `list_changed` signal
+   * on the watchtower-restart cycle even when the backend doesn't emit
+   * one itself.
+   */
+  listChangedSubscribers: Set<ListChangedSubscriber>;
 }
 
 /**
@@ -227,11 +250,42 @@ export const connectMetaMcpClient = async (
 
       await client.connect(transport);
 
+      // Subscriber set for upstream `tools/list_changed` fan-out. Created
+      // BEFORE the notification handler is registered so the handler can
+      // close over a stable reference without TDZ risk.
+      const listChangedSubscribers = new Set<ListChangedSubscriber>();
+
+      // Register a notification handler that fans `notifications/tools/list_changed`
+      // out to every subscriber attached by the proxy/pool layer. Subscribers
+      // that throw must NOT prevent siblings from running — they're independent
+      // upstream `Server` instances and one rejection shouldn't strand the others.
+      client.setNotificationHandler(
+        ToolListChangedNotificationSchema,
+        async () => {
+          for (const subscriber of listChangedSubscribers) {
+            try {
+              await subscriber();
+            } catch (subscriberError) {
+              logger.warn(
+                `list_changed subscriber threw for server ${serverParams.name} (${serverParams.uuid}):`,
+                subscriberError,
+              );
+            }
+          }
+        },
+      );
+
+      const capturedTransport = transport;
+      const capturedClient = client;
       return {
         client,
         cleanup: async () => {
-          await transport!.close();
-          await client!.close();
+          // Clear subscribers first so any late `list_changed` arrival
+          // during transport teardown can't trigger fan-out against a
+          // half-closed proxy server.
+          listChangedSubscribers.clear();
+          await capturedTransport.close();
+          await capturedClient.close();
         },
         onProcessCrash: (exitCode, signal) => {
           logger.warn(
@@ -243,6 +297,7 @@ export const connectMetaMcpClient = async (
             onProcessCrash(exitCode, signal);
           }
         },
+        listChangedSubscribers,
       };
     } catch (error) {
       metamcpLogStore.addLog(
