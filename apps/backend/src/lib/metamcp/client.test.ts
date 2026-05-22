@@ -17,9 +17,25 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ListChangedSubscriber } from "./client";
+// Importing `computeReconnectBackoffMs` (a value, not just a type) pulls
+// in `client.ts`'s full module-load chain — including server-error-tracker
+// → db/repositories → db/index, which throws on missing DATABASE_URL.
+// Stub the db side to keep this a pure unit test.
+vi.mock("../../db/repositories/index", () => ({
+  mcpServersRepository: {},
+}));
+vi.mock("../../db/repositories/oauth-sessions.repo", () => ({
+  oauthSessionsRepository: {},
+}));
+vi.mock("../config.service", () => ({
+  configService: {
+    getMcpMaxAttempts: vi.fn().mockResolvedValue(3),
+  },
+}));
+
+import { computeReconnectBackoffMs, ListChangedSubscriber } from "./client";
 
 /**
  * Build a Client/Server pair via InMemoryTransport and install the
@@ -175,5 +191,43 @@ describe("ConnectedClient list_changed fan-out", () => {
     await fireListChanged(rig.backendServer);
 
     expect(calls).toEqual(["b"]);
+  });
+});
+
+// -------------------------------------------------------------------
+// Exponential backoff schedule (PR #20)
+//
+// Replaces the pre-PR #20 fixed 5s reconnect sleep. See
+// `computeReconnectBackoffMs` doc in client.ts for the rationale.
+// -------------------------------------------------------------------
+
+describe("computeReconnectBackoffMs — exponential backoff schedule", () => {
+  it("follows the documented 1s, 2s, 4s, 8s, 16s, 30s-cap schedule", () => {
+    // Strip jitter by pinning Math.random to 0.
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      expect(computeReconnectBackoffMs(0)).toBe(1000);
+      expect(computeReconnectBackoffMs(1)).toBe(2000);
+      expect(computeReconnectBackoffMs(2)).toBe(4000);
+      expect(computeReconnectBackoffMs(3)).toBe(8000);
+      expect(computeReconnectBackoffMs(4)).toBe(16000);
+      expect(computeReconnectBackoffMs(5)).toBe(30000); // hit cap
+      expect(computeReconnectBackoffMs(6)).toBe(30000); // stay at cap
+      expect(computeReconnectBackoffMs(20)).toBe(30000); // way past cap
+    } finally {
+      randomSpy.mockRestore();
+    }
+  });
+
+  it("adds positive jitter on top of the base delay", () => {
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(1);
+    try {
+      // base 1000 + max jitter 250 = 1250
+      expect(computeReconnectBackoffMs(0)).toBe(1250);
+      // base 30000 + max jitter 250 = 30250 (cap covers the base, jitter rides above)
+      expect(computeReconnectBackoffMs(10)).toBe(30250);
+    } finally {
+      randomSpy.mockRestore();
+    }
   });
 });
