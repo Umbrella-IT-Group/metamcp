@@ -520,6 +520,13 @@ export const mcpSessionsTable = pgTable(
     last_seen_at: timestamp("last_seen_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    // PR #22: gateway process UUID stamped at session init. Nullable
+    // for backwards-compat with rows persisted before this column
+    // existed; the lazy-recovery path treats null as "allow" (pre-PR
+    // row, no metadata to compare) and treats mismatch as "refuse"
+    // (cross-restart row whose negotiated capability set may now be
+    // stale). See `lib/metamcp/gateway-boot-id.ts`.
+    gateway_boot_id: uuid("gateway_boot_id"),
   },
   (table) => [
     index("mcp_sessions_last_seen_at_idx").on(table.last_seen_at),

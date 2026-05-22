@@ -39,6 +39,11 @@ export interface PersistedMcpSession {
   init_params: Record<string, unknown>;
   created_at: Date;
   last_seen_at: Date;
+  // PR #22: gateway process UUID stamped at session init. Null when the
+  // row was persisted by a metamcp version prior to PR #22 — the
+  // lazy-recovery path treats null as "no metadata to compare, allow"
+  // (pruner reaps these within `MCP_SESSION_TTL_DAYS`).
+  gateway_boot_id: string | null;
 }
 
 export interface PersistMcpSessionInput {
@@ -48,6 +53,10 @@ export interface PersistMcpSessionInput {
   auth_principal: string;
   auth_method: string;
   init_params?: Record<string, unknown>;
+  // PR #22: gateway process UUID. Required on every persist call from
+  // the router so post-deploy rows are always stamped — only pre-PR-22
+  // rows in the table have null stamps.
+  gateway_boot_id: string;
 }
 
 export class McpSessionsRepository {
@@ -67,6 +76,7 @@ export class McpSessionsRepository {
         auth_principal: input.auth_principal,
         auth_method: input.auth_method,
         init_params: input.init_params ?? {},
+        gateway_boot_id: input.gateway_boot_id,
       })
       .onConflictDoNothing({ target: mcpSessionsTable.session_id });
   }
@@ -95,6 +105,7 @@ export class McpSessionsRepository {
       init_params: row.init_params as Record<string, unknown>,
       created_at: row.created_at,
       last_seen_at: row.last_seen_at,
+      gateway_boot_id: row.gateway_boot_id,
     };
   }
 

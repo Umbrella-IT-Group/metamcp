@@ -61,6 +61,7 @@ vi.mock("../schema", () => ({
     init_params: { name: "init_params" },
     created_at: { name: "created_at" },
     last_seen_at: { name: "last_seen_at" },
+    gateway_boot_id: { name: "gateway_boot_id" },
   },
 }));
 
@@ -80,6 +81,7 @@ describe("McpSessionsRepository", () => {
       endpoint_name: "autotask",
       auth_principal: "deadbeef".repeat(8),
       auth_method: "api_key",
+      gateway_boot_id: "11111111-1111-1111-1111-111111111111",
     });
 
     expect(insertChain.values).toHaveBeenCalledWith(
@@ -90,6 +92,7 @@ describe("McpSessionsRepository", () => {
         auth_principal: "deadbeef".repeat(8),
         auth_method: "api_key",
         init_params: {},
+        gateway_boot_id: "11111111-1111-1111-1111-111111111111",
       }),
     );
     expect(insertChain.onConflictDoNothing).toHaveBeenCalledWith(
@@ -116,6 +119,7 @@ describe("McpSessionsRepository", () => {
         init_params: { foo: "bar" },
         created_at: created,
         last_seen_at: lastSeen,
+        gateway_boot_id: "22222222-2222-2222-2222-222222222222",
       },
     ]);
     const result = await mcpSessionsRepository.findById("abc");
@@ -128,7 +132,28 @@ describe("McpSessionsRepository", () => {
       init_params: { foo: "bar" },
       created_at: created,
       last_seen_at: lastSeen,
+      gateway_boot_id: "22222222-2222-2222-2222-222222222222",
     });
+  });
+
+  it("findById() preserves null gateway_boot_id (pre-PR-22 row)", async () => {
+    const created = new Date("2026-05-14T17:00:00Z");
+    const lastSeen = new Date("2026-05-14T17:30:00Z");
+    selectChain.limit.mockResolvedValueOnce([
+      {
+        session_id: "legacy",
+        namespace_uuid: "ns",
+        endpoint_name: "ep",
+        auth_principal: "hash",
+        auth_method: "api_key",
+        init_params: {},
+        created_at: created,
+        last_seen_at: lastSeen,
+        gateway_boot_id: null,
+      },
+    ]);
+    const result = await mcpSessionsRepository.findById("legacy");
+    expect(result?.gateway_boot_id).toBeNull();
   });
 
   it("touch() issues an UPDATE setting last_seen_at to NOW()", async () => {

@@ -12,6 +12,10 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
+import {
+  GATEWAY_BOOT_ID,
+  shouldRefuseRecoveryForBootIdMismatch,
+} from "../../lib/metamcp/gateway-boot-id";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
   AuthMethod,
@@ -120,6 +124,43 @@ async function recoverPersistedSession(
     stored.namespace_uuid !== authReq.namespaceUuid ||
     stored.endpoint_name !== authReq.endpointName
   ) {
+    return { status: "not_found" };
+  }
+
+  // PR #22: capability-cache mismatch defense across gateway restarts.
+  // MCP `initialize` negotiates server capabilities once per session.
+  // When metamcp is upgraded with new capabilities (e.g., PR #19's
+  // `tools: { listChanged: true }`), pre-upgrade rows in `mcp_sessions`
+  // carry a `gateway_boot_id` from the prior process. Recovering them
+  // hands the client a transport whose negotiated capability set
+  // doesn't match what the current process actually advertises — so
+  // clients with cached `listChanged: false` silently ignore the new
+  // `notifications/tools/list_changed` we now emit. Result: stale
+  // tool surfaces indefinitely.
+  //
+  // Capability changes within a single process lifetime are impossible
+  // (capabilities are baked into `new Server({...})` at proxy
+  // construction). A boot_id match is therefore sufficient to skip
+  // the forced re-init; a mismatch means we crossed a restart and
+  // the client must re-negotiate.
+  //
+  // The `!== null` guard handles the deploy-day transition: rows
+  // persisted by metamcp versions prior to PR #22 have null stamps
+  // and there's no metadata to compare against. Treat null as "allow"
+  // — the pruner reaps these within `MCP_SESSION_TTL_DAYS` (default 7),
+  // so the null branch is finite and self-clearing. Sessions persisted
+  // post-PR-22 always carry a stamp.
+  if (
+    shouldRefuseRecoveryForBootIdMismatch(
+      stored.gateway_boot_id,
+      GATEWAY_BOOT_ID,
+    )
+  ) {
+    logger.info(
+      `Lazy recovery: refusing recovery for session ${sessionId} — ` +
+        `stored boot_id=${stored.gateway_boot_id} != current ${GATEWAY_BOOT_ID}. ` +
+        `Capability cache may be stale post-restart; client must re-initialize.`,
+    );
     return { status: "not_found" };
   }
 
@@ -475,6 +516,7 @@ streamableHttpRouter.post(
               auth_principal: principal,
               auth_method: authMethod,
               init_params: {},
+              gateway_boot_id: GATEWAY_BOOT_ID,
             })
             .catch((error: unknown) =>
               logger.warn(
