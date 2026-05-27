@@ -276,12 +276,19 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
-    // Check connection limit before attempting to create
+    // Check connection limit before attempting to create. At the cap,
+    // evict the least-valuable slot (oldest idle, else oldest active) and
+    // retry instead of hard-refusing — a hard refuse permanently locks out
+    // a backend that needs to reconnect after a restart and deadlocks the
+    // pool until a manual `docker restart metamcp`. See evictOneForCapacity.
     if (!this.canCreateConnection()) {
-      logger.warn(
-        `Skipping connection for server ${params.name} (${params.uuid}) - connection limit reached`,
-      );
-      return undefined;
+      const freed = await this.evictOneForCapacity(params.uuid);
+      if (!freed || !this.canCreateConnection()) {
+        logger.warn(
+          `Skipping connection for server ${params.name} (${params.uuid}) - connection limit reached`,
+        );
+        return undefined;
+      }
     }
 
     logger.info(
@@ -714,6 +721,95 @@ export class McpServerPool {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Free ONE pool slot when at the global cap, so a server that needs a
+   * fresh connection is never permanently locked out.
+   *
+   * Why this exists: `maxTotalConnections` was a HARD refuse. Under
+   * persistent sessions (`sessionLifetime === null`) `cleanupExpiredSessions`
+   * no-ops, and `cleanupSession` RECYCLES active connections back into the
+   * idle pool rather than destroying them — so the idle pool grows
+   * unbounded until `getTotalConnectionCount` hits the cap. Once full,
+   * `canCreateConnection` refused EVERY new connection, including the
+   * recreation a backend needs after its container restarts (Watchtower).
+   * The pool then deadlocked until a manual `docker restart metamcp`
+   * (observed 2026-05-27: autotask wedged on "connection limit reached"
+   * for 8+ minutes after a redeploy).
+   *
+   * Eviction reclaims capacity by DESTROYING (not recycling) the
+   * least-valuable slot: an idle session first (no upstream client depends
+   * on it — and idle is where the recycled surplus accumulates), else the
+   * oldest-touched active connection. Returns true if a slot was freed.
+   * Note: we destroy directly here; `cleanupSession` would recycle the
+   * connection back to idle and free nothing.
+   */
+  private async evictOneForCapacity(forServerUuid: string): Promise<boolean> {
+    // 1. Prefer an idle session. Avoid evicting the server we're about to
+    //    (re)connect; fall back to any idle slot if it's the only one.
+    const idleUuids = Object.keys(this.idleSessions);
+    const idleTarget =
+      idleUuids.find((uuid) => uuid !== forServerUuid) ?? idleUuids[0];
+    if (idleTarget) {
+      const client = this.idleSessions[idleTarget];
+      // Drop the map entry synchronously so the slot is freed before the
+      // (async) cleanup and a concurrent count sees the reduced total.
+      delete this.idleSessions[idleTarget];
+      logger.warn(
+        `Pool at cap (${this.maxTotalConnections}); destroying idle session for ${idleTarget} to admit ${forServerUuid}`,
+      );
+      try {
+        await client?.cleanup();
+      } catch (error) {
+        logger.error(
+          `Error destroying idle session ${idleTarget} during capacity eviction:`,
+          error,
+        );
+      }
+      return true;
+    }
+
+    // 2. No idle slots — every slot is an in-use active connection. Destroy
+    //    the oldest-touched active connection for some OTHER server (LRU by
+    //    session timestamp). Disruptive, but bounded to one slot, and the
+    //    evicted session re-establishes on its next request.
+    let oldestSid: string | undefined;
+    let oldestUuid: string | undefined;
+    let oldestTs = Infinity;
+    for (const [sid, servers] of Object.entries(this.activeSessions)) {
+      const ts = this.sessionTimestamps[sid] ?? Infinity;
+      if (ts >= oldestTs) continue;
+      for (const uuid of Object.keys(servers)) {
+        if (uuid === forServerUuid) continue;
+        oldestTs = ts;
+        oldestSid = sid;
+        oldestUuid = uuid;
+        break;
+      }
+    }
+    if (oldestSid && oldestUuid) {
+      const client = this.activeSessions[oldestSid]?.[oldestUuid];
+      if (client) {
+        delete this.activeSessions[oldestSid][oldestUuid];
+        this.sessionToServers[oldestSid]?.delete(oldestUuid);
+        logger.warn(
+          `Pool at cap (${this.maxTotalConnections}) with no idle slots; ` +
+            `destroying oldest active connection ${oldestSid}/${oldestUuid} to admit ${forServerUuid}`,
+        );
+        try {
+          await client.cleanup();
+        } catch (error) {
+          logger.error(
+            `Error destroying active connection ${oldestSid}/${oldestUuid} during capacity eviction:`,
+            error,
+          );
+        }
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**

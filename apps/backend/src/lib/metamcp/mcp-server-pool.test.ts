@@ -400,3 +400,106 @@ describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
     ).not.toHaveBeenCalled();
   });
 });
+
+// -------------------------------------------------------------------
+// Capacity eviction (LRU at the global cap)
+//
+// Before this, `maxTotalConnections` was a HARD refuse. Under
+// persistent sessions (sessionLifetime=null) cleanupExpiredSessions
+// no-ops and cleanupSession RECYCLES active→idle, so the idle pool
+// grows until the cap is hit — then EVERY new connection is refused,
+// including the recreation a backend needs after a Watchtower restart.
+// The pool deadlocked on "connection limit reached" until a manual
+// `docker restart metamcp` (observed 2026-05-27, autotask wedged 8+min).
+//
+// evictOneForCapacity reclaims one slot by DESTROYING (not recycling)
+// the least-valuable connection: idle first, then oldest active.
+// -------------------------------------------------------------------
+describe("McpServerPool.evictOneForCapacity — LRU eviction at the cap", () => {
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, FakeClient>>;
+    idleSessions: Record<string, FakeClient>;
+    sessionToServers: Record<string, Set<string>>;
+    sessionTimestamps: Record<string, number>;
+    evictOneForCapacity: (forServerUuid: string) => Promise<boolean>;
+  };
+
+  beforeEach(() => {
+    pool = new McpServerPool();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.sessionTimestamps = {};
+  });
+
+  it("destroys an idle session and frees the slot (preferring a server other than the one being admitted)", async () => {
+    const idleSelf = makeFakeClient();
+    const idleOther = makeFakeClient();
+    internals.idleSessions["server-1"] = idleSelf as never;
+    internals.idleSessions["server-2"] = idleOther as never;
+
+    const freed = await internals.evictOneForCapacity("server-1");
+
+    expect(freed).toBe(true);
+    // Evicts server-2's idle (not the server we're admitting); destroys it.
+    expect(idleOther.cleanup).toHaveBeenCalledTimes(1);
+    expect(internals.idleSessions["server-2"]).toBeUndefined();
+    expect(internals.idleSessions["server-1"]).toBe(idleSelf);
+  });
+
+  it("falls back to the only idle slot even if it's the admitted server's", async () => {
+    const idleSelf = makeFakeClient();
+    internals.idleSessions["server-1"] = idleSelf as never;
+
+    const freed = await internals.evictOneForCapacity("server-1");
+
+    expect(freed).toBe(true);
+    expect(idleSelf.cleanup).toHaveBeenCalledTimes(1);
+    expect(internals.idleSessions["server-1"]).toBeUndefined();
+  });
+
+  it("destroys the oldest-touched active connection when no idle slots exist", async () => {
+    const cOld = makeFakeClient();
+    const cNew = makeFakeClient();
+    internals.activeSessions["session-old"] = { "server-2": cOld as never };
+    internals.activeSessions["session-new"] = { "server-3": cNew as never };
+    internals.sessionToServers["session-old"] = new Set(["server-2"]);
+    internals.sessionToServers["session-new"] = new Set(["server-3"]);
+    internals.sessionTimestamps["session-old"] = 1000;
+    internals.sessionTimestamps["session-new"] = 2000;
+
+    const freed = await internals.evictOneForCapacity("server-1");
+
+    expect(freed).toBe(true);
+    // Oldest (session-old) destroyed; newer untouched.
+    expect(cOld.cleanup).toHaveBeenCalledTimes(1);
+    expect(cNew.cleanup).not.toHaveBeenCalled();
+    expect(
+      internals.activeSessions["session-old"]?.["server-2"],
+    ).toBeUndefined();
+    expect(internals.sessionToServers["session-old"]?.has("server-2")).toBe(
+      false,
+    );
+    expect(internals.activeSessions["session-new"]?.["server-3"]).toBe(cNew);
+  });
+
+  it("never evicts the server being admitted, and returns false when nothing else is evictable", async () => {
+    const cSelf = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-1": cSelf as never };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+    internals.sessionTimestamps["session-A"] = 1000;
+
+    const freed = await internals.evictOneForCapacity("server-1");
+
+    expect(freed).toBe(false);
+    expect(cSelf.cleanup).not.toHaveBeenCalled();
+    expect(internals.activeSessions["session-A"]?.["server-1"]).toBe(cSelf);
+  });
+
+  it("returns false when the pool is empty (nothing to evict)", async () => {
+    const freed = await internals.evictOneForCapacity("server-1");
+    expect(freed).toBe(false);
+  });
+});
