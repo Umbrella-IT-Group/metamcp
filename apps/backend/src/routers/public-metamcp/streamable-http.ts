@@ -23,6 +23,10 @@ import {
   hashAuthPrincipal,
   principalMatches,
 } from "../../lib/metamcp/session-auth";
+import {
+  assertRecoveryHydrationContract,
+  hydrateRecoveredTransport,
+} from "../../lib/metamcp/transport-recovery-hydration";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 
 const streamableHttpRouter = express.Router();
@@ -71,6 +75,10 @@ function extractRawTokenForPrincipal(req: express.Request): string | null {
   }
   return null;
 }
+
+// Fail-loud at boot if the SDK internals the recovery hydration depends
+// on changed shape across an upgrade. See transport-recovery-hydration.ts.
+assertRecoveryHydrationContract();
 
 /**
  * Lazy-recover an in-memory transport for a sessionId that's missing
@@ -210,8 +218,25 @@ async function recoverPersistedSession(
       );
     },
   });
-  sessionManager.addSession(sessionId, transport);
   await mcpServerInstance.server.connect(transport);
+
+  // Restore the SDK session state the (skipped) `initialize` handshake
+  // would have set. Without this the rebuilt transport stays
+  // `_initialized=false` and rejects the client's first request with
+  // 400 {-32000 "Server not initialized"} → relayed as -32600. See
+  // `hydrateRecoveredTransport` for the full rationale.
+  if (!hydrateRecoveredTransport(transport, sessionId)) {
+    // SDK internal shape changed — don't cache a transport we can't
+    // prove is serviceable. Fall back to the 404 reinit path.
+    await transport.close().catch((error: unknown) =>
+      logger.warn(
+        `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
+        error,
+      ),
+    );
+    return { status: "not_found" };
+  }
+  sessionManager.addSession(sessionId, transport);
   // Best-effort touch; failure is non-fatal — pruner only deletes
   // genuinely stale rows.
   mcpSessionsRepository
