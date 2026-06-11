@@ -84,6 +84,7 @@ These are Umbrella-specific deltas. Each one should eventually be either upstrea
 | Date | Upstream PR | What |
 |---|---|---|
 | 2026-05-07 | [metatool-ai/metamcp#286](https://github.com/metatool-ai/metamcp/pull/286) | Better-auth session env-var fallback. Branched off plain `main`, no dependency on #276. Awaiting maintainer review (upstream is largely unattended; may sit indefinitely). |
+| 2026-06-11 | [metatool-ai/metamcp#310](https://github.com/metatool-ai/metamcp/pull/310) | Ports fork PR #28 onto upstream main: cascade `invalidateServerConnection` (upstream had none), `requestWithSessionRecovery` helper, all four aggregate list handlers wired with retry + DEGRADED tripwire. Includes #293's detectors as its base commit (helper depends on them) — if #293 merges first this rebases clean; if this merges, close #293. Branch `upstream-pr/list-handler-recovery`. |
 | 2026-05-14 | [metatool-ai/metamcp#293](https://github.com/metatool-ai/metamcp/pull/293) | Adds the recovery-error detectors (`isBackendSessionLostError` + `isBackendTransportLostError` + `isRecoverableBackendError`) that fork PRs #12 + #13 ship. Standalone file contribution — no `metamcp-proxy.ts` rewiring; the recovery callsite is in companion upstream PR #283. Either order works. Awaiting maintainer review. |
 
 ## How to update the fork against upstream
