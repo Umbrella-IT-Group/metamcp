@@ -1096,7 +1096,7 @@ export class McpServerPool {
             try {
               await cachedClient.cleanup();
             } catch (error) {
-              console.error(
+              logger.error(
                 `Error cleaning up invalidated idle session for ${serverUuid}:`,
                 error,
               );
@@ -1110,7 +1110,7 @@ export class McpServerPool {
             try {
               await cachedClient.cleanup();
             } catch (error) {
-              console.error(
+              logger.error(
                 `Error cleaning up invalidated active session ${sid}/${serverUuid}:`,
                 error,
               );
@@ -1136,12 +1136,12 @@ export class McpServerPool {
     await Promise.all(cleanupPromises);
 
     if (cleanupPromises.length > 0) {
-      console.warn(
+      logger.warn(
         `Invalidated ${cleanupPromises.length} pooled backend connection(s) for server ${serverUuid} ` +
           `(triggered by session ${sessionId}; cascaded across every active + idle slot for this serverUuid)`,
       );
     } else {
-      console.warn(
+      logger.warn(
         `Invalidated pooled backend connection for server ${serverUuid} (session ${sessionId}) — no clients were cached`,
       );
     }

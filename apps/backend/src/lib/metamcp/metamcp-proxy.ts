@@ -215,7 +215,7 @@ export const createServer = async (
     request,
     context,
   ) => {
-    console.log(
+    logger.debug(
       "[DEBUG-TOOLS] 🔍 tools/list called for namespace:",
       namespaceUuid,
     );
@@ -239,7 +239,7 @@ export const createServer = async (
     // We'll filter servers during processing after getting sessions to check actual MCP server names
     const allServerEntries = Object.entries(serverParams);
 
-    console.log(
+    logger.debug(
       `[DEBUG-TOOLS] 📋 Processing ${allServerEntries.length} servers`,
     );
 
@@ -252,7 +252,7 @@ export const createServer = async (
       poolStatus.active === 0 &&
       allServerEntries.length > 0
     ) {
-      console.log(
+      logger.debug(
         `[DEBUG-TOOLS] ⚠️ Cold start: 0 idle, 0 active sessions but ${allServerEntries.length} servers registered. Warming up...`,
       );
       for (const [uuid] of allServerEntries) {
@@ -260,18 +260,20 @@ export const createServer = async (
       }
       await mcpServerPool.ensureIdleSessions(serverParams, namespaceUuid);
       const afterStatus = mcpServerPool.getPoolStatus();
-      console.log(
+      logger.debug(
         `[DEBUG-TOOLS] ✅ Pool warmup complete: ${afterStatus.idle} idle, ${afterStatus.active} active`,
       );
     }
 
     await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
-        console.log(`[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`);
+        logger.debug(
+          `[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`,
+        );
 
         // Skip if we've already visited this server to prevent circular references
         if (visitedServers.has(mcpServerUuid)) {
-          console.log(
+          logger.debug(
             `[DEBUG-TOOLS] ⏭️  Skipping already visited: ${params.name}`,
           );
           return;
@@ -385,7 +387,7 @@ export const createServer = async (
             },
           });
 
-          console.log(
+          logger.debug(
             `[DEBUG-TOOLS] ⏱️  Fetched ${allServerTools.length} tools from ${serverName} in ${(performance.now() - toolFetchStart).toFixed(2)}ms`,
           );
 
@@ -400,7 +402,7 @@ export const createServer = async (
               toolNames,
             );
 
-            console.log(
+            logger.debug(
               `[DEBUG-TOOLS] 🔍 Hash check for ${serverName}: ${hasChanged ? "CHANGED" : "UNCHANGED"}`,
             );
 
@@ -451,7 +453,7 @@ export const createServer = async (
     );
 
     const totalTime = performance.now() - startTime;
-    console.log(
+    logger.debug(
       `[DEBUG-TOOLS] ✅ tools/list completed in ${totalTime.toFixed(2)}ms, returning ${allTools.length} tools`,
     );
 

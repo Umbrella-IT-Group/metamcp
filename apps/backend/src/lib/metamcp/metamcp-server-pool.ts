@@ -609,6 +609,10 @@ export class MetaMcpServerPool {
     if (age === undefined) return false;
 
     const sessionLifetime = await configService.getSessionLifetime();
+    // null lifetime = persistent sessions (the default). Without this
+    // guard `age > null` coerces to `age > 0` and every session reads
+    // as expired the moment it's a millisecond old.
+    if (sessionLifetime === null) return false;
     return age > sessionLifetime;
   }
 }

@@ -1,9 +1,6 @@
 import express from "express";
 
-import {
-  ApiKeyAuthenticatedRequest,
-  authenticateApiKey,
-} from "@/middleware/api-key-oauth.middleware";
+import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import logger from "@/utils/logger";
 
@@ -29,7 +26,7 @@ adminRouter.post(
   "/:endpoint_name/admin/reset-errors",
   lookupEndpoint,
   authenticateApiKey,
-  async (req: ApiKeyAuthenticatedRequest, res) => {
+  async (req, res) => {
     try {
       const { serverUuid } = req.body || {};
       const resetResults: string[] = [];
@@ -38,9 +35,7 @@ adminRouter.post(
         // Reset specific server
         await serverErrorTracker.resetServerErrorState(serverUuid);
         resetResults.push(serverUuid);
-        logger.info(
-          `Admin API: Reset error state for server ${serverUuid}`,
-        );
+        logger.info(`Admin API: Reset error state for server ${serverUuid}`);
       } else {
         // Reset all servers in ERROR state
         const allServers = await mcpServersRepository.findAll();
@@ -96,7 +91,7 @@ adminRouter.get(
   "/:endpoint_name/admin/error-status",
   lookupEndpoint,
   authenticateApiKey,
-  async (req: ApiKeyAuthenticatedRequest, res) => {
+  async (req, res) => {
     try {
       const allServers = await mcpServersRepository.findAll();
       const serverStatuses = allServers.map((s) => ({

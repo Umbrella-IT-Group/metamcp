@@ -51,6 +51,11 @@ vi.mock("./server-error-tracker", () => ({
 
 import { McpServerPool } from "./mcp-server-pool";
 
+// Bypass the private-constructor discipline once, file-wide, without a
+// TS2673 per instantiation. Tests poke internals; the singleton
+// accessor would leak state across describes.
+const PoolConstructor = McpServerPool as unknown as new () => McpServerPool;
+
 type FakeClient = {
   cleanup: ReturnType<typeof vi.fn>;
   closed: boolean;
@@ -79,7 +84,7 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
   };
 
   beforeEach(() => {
-    pool = new McpServerPool();
+    pool = new PoolConstructor();
 
     internals = pool as any;
     internals.activeSessions = {};
@@ -327,7 +332,7 @@ describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
     vi.mocked(trackerModule.serverErrorTracker.resetServerAttempts).mockClear();
     vi.mocked(trackerModule.serverErrorTracker.markSuccess).mockClear();
 
-    pool = new McpServerPool();
+    pool = new PoolConstructor();
     internals = pool as never;
     internals.activeSessions = {};
     internals.idleSessions = {};
@@ -426,7 +431,7 @@ describe("McpServerPool.evictOneForCapacity — LRU eviction at the cap", () => 
   };
 
   beforeEach(() => {
-    pool = new McpServerPool();
+    pool = new PoolConstructor();
     internals = pool as never;
     internals.activeSessions = {};
     internals.idleSessions = {};
@@ -526,10 +531,6 @@ describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sw
     return fake;
   }
 
-  // Bypass the private-constructor discipline without adding a TS2673
-  // per instantiation (the older describes above predate this cast).
-  const PoolCtor = McpServerPool as unknown as new () => McpServerPool;
-
   let pool: McpServerPool;
   let internals: {
     activeSessions: Record<string, Record<string, PingableFakeClient>>;
@@ -542,7 +543,7 @@ describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sw
   };
 
   beforeEach(() => {
-    pool = new PoolCtor();
+    pool = new PoolConstructor();
 
     internals = pool as never;
     internals.activeSessions = {};
@@ -647,7 +648,7 @@ describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sw
     const prev = process.env.MCP_ACTIVE_HEALTH_CHECK;
     process.env.MCP_ACTIVE_HEALTH_CHECK = "false";
     try {
-      const gatedPool = new PoolCtor();
+      const gatedPool = new PoolConstructor();
       const gated = gatedPool as never as typeof internals;
       gated.activeSessions = {};
       gated.idleSessions = {};
@@ -686,8 +687,6 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
   // connections. Observed as the unkillable "No session for: autotask"
   // loop in incident 2026-06-11.
 
-  const PoolCtor2 = McpServerPool as unknown as new () => McpServerPool;
-
   type ProbeInternals = {
     activeSessions: Record<string, unknown>;
     idleSessions: Record<string, unknown>;
@@ -708,7 +707,7 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
   let createIdleSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
-    pool = new PoolCtor2();
+    pool = new PoolConstructor();
 
     internals = pool as never;
     internals.activeSessions = {};
@@ -763,7 +762,7 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
     const prev = process.env.MCP_ERROR_PROBE_INTERVAL_MS;
     process.env.MCP_ERROR_PROBE_INTERVAL_MS = "0";
     try {
-      const gatedPool = new PoolCtor2();
+      const gatedPool = new PoolConstructor();
       const gated = gatedPool as never as ProbeInternals;
       gated.activeSessions = {};
       gated.idleSessions = {};
