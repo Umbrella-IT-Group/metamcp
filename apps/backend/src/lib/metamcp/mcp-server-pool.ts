@@ -64,6 +64,18 @@ export class McpServerPool {
   // debugging of a live pool.
   private readonly activeHealthCheckEnabled: boolean;
 
+  // Last half-open probe per ERROR-gated server, keyed by serverUuid.
+  // The ERROR circuit breaker (DB error_status) is otherwise sticky
+  // forever: nothing on the request path resets it once the pool holds
+  // any live connection for any OTHER server (the cold-start warmup's
+  // idle===0 && active===0 guard never fires), so an ERROR-gated
+  // backend stays excluded until an admin reset or a process restart.
+  private lastErrorProbeAt: Record<string, number> = {};
+
+  // Half-open probe interval (ms) for ERROR-gated servers, env
+  // `MCP_ERROR_PROBE_INTERVAL_MS`; default 5 min; <= 0 disables.
+  private readonly errorProbeIntervalMs: number;
+
   // Per-server timestamp of the most recent successful connection.
   // Used by the recovery-reset path: if a transport drop produces a
   // SUCCESSFUL reconnect within `MCP_RECOVERY_RESET_THRESHOLD_MS` of
@@ -107,6 +119,10 @@ export class McpServerPool {
     );
     this.activeHealthCheckEnabled =
       (process.env.MCP_ACTIVE_HEALTH_CHECK || "true").toLowerCase() !== "false";
+    this.errorProbeIntervalMs = parseInt(
+      process.env.MCP_ERROR_PROBE_INTERVAL_MS || "300000",
+      10,
+    );
     this.startCleanupTimer();
     this.startHealthCheckTimer();
   }
@@ -1356,6 +1372,28 @@ export class McpServerPool {
         if (!isError) {
           // Not in error and no idle session - try to create one
           this.createIdleSessionAsync(serverUuid, params);
+        } else if (this.errorProbeIntervalMs > 0) {
+          // Half-open probe. The ERROR gate (DB error_status) blocks
+          // every connectMetaMcpClient attempt and nothing on the
+          // request path resets it while other servers keep the pool
+          // non-empty — observed as the unkillable
+          // `No session for: autotask` loop (incident 2026-06-11).
+          // Instead of staying open forever, let one reconnect attempt
+          // through per probe interval: reset the gate and warm an
+          // idle session. If the backend is genuinely back this heals
+          // the server; if it's still down, STDIO crash-counting
+          // re-trips the breaker after maxAttempts, and HTTP/SSE
+          // connect failures leave the server unconnected for the next
+          // probe — bounded retries either way.
+          const lastProbe = this.lastErrorProbeAt[serverUuid] ?? 0;
+          if (Date.now() - lastProbe >= this.errorProbeIntervalMs) {
+            this.lastErrorProbeAt[serverUuid] = Date.now();
+            logger.warn(
+              `Half-open probe for ERROR-gated server ${serverUuid}: resetting error state and attempting reconnect (probe interval ${this.errorProbeIntervalMs}ms)`,
+            );
+            await serverErrorTracker.resetServerErrorState(serverUuid);
+            this.createIdleSessionAsync(serverUuid, params);
+          }
         }
       }
     }

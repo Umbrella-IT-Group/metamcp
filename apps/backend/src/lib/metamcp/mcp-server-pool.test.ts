@@ -677,3 +677,127 @@ describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sw
     }
   });
 });
+
+describe("McpServerPool half-open ERROR-gate probe", () => {
+  // The DB error_status gate is otherwise sticky forever: once a server
+  // is marked ERROR, connectMetaMcpClient refuses every attempt and the
+  // only request-path reset (cold-start warmup) requires the WHOLE pool
+  // to be empty — which never happens while other namespaces hold live
+  // connections. Observed as the unkillable "No session for: autotask"
+  // loop in incident 2026-06-11.
+
+  const PoolCtor2 = McpServerPool as unknown as new () => McpServerPool;
+
+  type ProbeInternals = {
+    activeSessions: Record<string, unknown>;
+    idleSessions: Record<string, unknown>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+    serverParamsCache: Record<string, unknown>;
+    lastErrorProbeAt: Record<string, number>;
+    errorProbeIntervalMs: number;
+    checkIdleSessionHealth: () => Promise<void>;
+  };
+
+  let pool: McpServerPool;
+  let internals: ProbeInternals;
+  let tracker: {
+    isServerInErrorState: ReturnType<typeof vi.fn>;
+    resetServerErrorState: ReturnType<typeof vi.fn>;
+  };
+  let createIdleSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    pool = new PoolCtor2();
+
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+    internals.serverParamsCache = {
+      "server-err": { uuid: "server-err", name: "errored-backend" },
+    };
+    internals.lastErrorProbeAt = {};
+
+    tracker = (await import("./server-error-tracker"))
+      .serverErrorTracker as never;
+    tracker.isServerInErrorState.mockReset().mockResolvedValue(true);
+    tracker.resetServerErrorState.mockReset();
+
+    createIdleSpy = vi.fn();
+    (
+      pool as never as { createIdleSessionAsync: unknown }
+    ).createIdleSessionAsync = createIdleSpy;
+  });
+
+  it("probes an ERROR-gated server once the interval has elapsed", async () => {
+    await internals.checkIdleSessionHealth();
+
+    expect(tracker.resetServerErrorState).toHaveBeenCalledTimes(1);
+    expect(tracker.resetServerErrorState).toHaveBeenCalledWith("server-err");
+    expect(createIdleSpy).toHaveBeenCalledWith(
+      "server-err",
+      internals.serverParamsCache["server-err"],
+    );
+  });
+
+  it("does not re-probe within the interval", async () => {
+    await internals.checkIdleSessionHealth();
+    await internals.checkIdleSessionHealth();
+
+    expect(tracker.resetServerErrorState).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-probes after the interval has elapsed again", async () => {
+    await internals.checkIdleSessionHealth();
+    // Simulate the probe interval passing.
+    internals.lastErrorProbeAt["server-err"] =
+      Date.now() - internals.errorProbeIntervalMs - 1;
+    await internals.checkIdleSessionHealth();
+
+    expect(tracker.resetServerErrorState).toHaveBeenCalledTimes(2);
+  });
+
+  it("MCP_ERROR_PROBE_INTERVAL_MS=0 disables the probe", async () => {
+    const prev = process.env.MCP_ERROR_PROBE_INTERVAL_MS;
+    process.env.MCP_ERROR_PROBE_INTERVAL_MS = "0";
+    try {
+      const gatedPool = new PoolCtor2();
+      const gated = gatedPool as never as ProbeInternals;
+      gated.activeSessions = {};
+      gated.idleSessions = {};
+      gated.sessionToServers = {};
+      gated.creatingIdleSessions = new Set();
+      gated.serverParamsCache = {
+        "server-err": { uuid: "server-err", name: "errored-backend" },
+      };
+      gated.lastErrorProbeAt = {};
+      (
+        gatedPool as never as { createIdleSessionAsync: unknown }
+      ).createIdleSessionAsync = vi.fn();
+
+      await gated.checkIdleSessionHealth();
+
+      expect(tracker.resetServerErrorState).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) {
+        delete process.env.MCP_ERROR_PROBE_INTERVAL_MS;
+      } else {
+        process.env.MCP_ERROR_PROBE_INTERVAL_MS = prev;
+      }
+    }
+  });
+
+  it("non-ERROR servers keep the plain idle-rebuild path, no gate reset", async () => {
+    tracker.isServerInErrorState.mockResolvedValue(false);
+
+    await internals.checkIdleSessionHealth();
+
+    expect(tracker.resetServerErrorState).not.toHaveBeenCalled();
+    expect(createIdleSpy).toHaveBeenCalledWith(
+      "server-err",
+      internals.serverParamsCache["server-err"],
+    );
+  });
+});
