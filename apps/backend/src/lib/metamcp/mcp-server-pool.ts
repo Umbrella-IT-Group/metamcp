@@ -1306,10 +1306,12 @@ export class McpServerPool {
    * Servers in ERROR state whose crash counters have been reset are retried.
    */
   private async checkIdleSessionHealth(): Promise<void> {
+    // NOTE: no early return on an empty idle map. Zero idle sessions is
+    // precisely the state a fully-zombied or fully-capped pool is in -
+    // bailing here would skip the ERROR-state recreation loop and the
+    // active-session sweep below, i.e. the health check would go blind
+    // exactly when the pool is at its sickest.
     const serverUuids = Object.keys(this.idleSessions);
-    if (serverUuids.length === 0) {
-      return;
-    }
 
     for (const serverUuid of serverUuids) {
       const client = this.idleSessions[serverUuid];
