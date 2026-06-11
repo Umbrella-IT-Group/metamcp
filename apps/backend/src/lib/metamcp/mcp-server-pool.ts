@@ -51,6 +51,19 @@ export class McpServerPool {
   // Background idle sessions by namespace: namespaceUuid -> any
   private backgroundIdleSessionsByNamespace: Map<string, any> = new Map();
 
+  // Consecutive health-sweep ping failures for ACTIVE pooled
+  // connections, keyed by serverUuid. Eviction requires 2 consecutive
+  // failed sweeps so one slow ping (e.g. a backend briefly saturated
+  // by a long tool call) can't tear down a healthy connection set.
+  // Cleared on any successful sweep and on eviction.
+  private activePingFailures: Record<string, number> = {};
+
+  // Env kill-switch for the active-session health sweep
+  // (`MCP_ACTIVE_HEALTH_CHECK=false`). Default on. Same posture as
+  // MCP_AUTO_NUKE_ON_CAPABILITY_CHANGE: disable only for forensic
+  // debugging of a live pool.
+  private readonly activeHealthCheckEnabled: boolean;
+
   // Per-server timestamp of the most recent successful connection.
   // Used by the recovery-reset path: if a transport drop produces a
   // SUCCESSFUL reconnect within `MCP_RECOVERY_RESET_THRESHOLD_MS` of
@@ -92,6 +105,8 @@ export class McpServerPool {
       process.env.MCP_RECOVERY_RESET_THRESHOLD_MS || "300000",
       10,
     );
+    this.activeHealthCheckEnabled =
+      (process.env.MCP_ACTIVE_HEALTH_CHECK || "true").toLowerCase() !== "false";
     this.startCleanupTimer();
     this.startHealthCheckTimer();
   }
@@ -1340,6 +1355,74 @@ export class McpServerPool {
           // Not in error and no idle session - try to create one
           this.createIdleSessionAsync(serverUuid, params);
         }
+      }
+    }
+
+    // ACTIVE connections need the sweep too. Idle StreamableHTTP
+    // transports hold no socket between requests, so a Watchtower swap
+    // of the backend container kills every pooled client WITHOUT firing
+    // the onclose/onerror drop detectors from PR #20. At the per-server
+    // cap every slot is active: the idle loop above sees nothing, the
+    // cap can block idle recreation, and getSession's cap-reuse branch
+    // hands the zombies out blind — indefinitely (incident 2026-06-11,
+    // Umbrella-MCP-Server#229).
+    if (this.activeHealthCheckEnabled) {
+      await this.checkActiveSessionHealth();
+    }
+  }
+
+  /**
+   * Ping every distinct ACTIVE pooled connection (the cap-reuse branch
+   * shares one ConnectedClient across many sessionIds — ping each
+   * object once, not once per session). A server whose connections fail
+   * ping on TWO consecutive sweeps gets the full PR #16 cascade:
+   * invalidateServerConnection (fires PR #19 list_changed subscribers),
+   * error-state reset, and an async idle-session rebuild — the same
+   * treatment the idle health check has always given dead idle slots.
+   */
+  private async checkActiveSessionHealth(): Promise<void> {
+    const clientsByServer: Record<string, Set<ConnectedClient>> = {};
+    for (const sessionServers of Object.values(this.activeSessions)) {
+      for (const [serverUuid, client] of Object.entries(sessionServers)) {
+        (clientsByServer[serverUuid] ??= new Set()).add(client);
+      }
+    }
+
+    for (const [serverUuid, clientSet] of Object.entries(clientsByServer)) {
+      const clients = Array.from(clientSet);
+      const results = await Promise.allSettled(
+        clients.map((c) => c.client.ping({ timeout: 5000 })),
+      );
+      const deadCount = results.filter((r) => r.status === "rejected").length;
+
+      if (deadCount === 0) {
+        delete this.activePingFailures[serverUuid];
+        continue;
+      }
+
+      const failures = (this.activePingFailures[serverUuid] ?? 0) + 1;
+      this.activePingFailures[serverUuid] = failures;
+
+      if (failures < 2) {
+        logger.warn(
+          `Active session health check: ${deadCount}/${clients.length} connection(s) for server ${serverUuid} failed ping (strike 1 of 2; evicting on the next consecutive failure)`,
+        );
+        continue;
+      }
+
+      delete this.activePingFailures[serverUuid];
+      logger.warn(
+        `Active session health check failed on two consecutive sweeps for server ${serverUuid} (${deadCount}/${clients.length} dead); cascade-invalidating every pooled connection and rebuilding`,
+      );
+
+      await this.invalidateServerConnection("<health-check>", serverUuid);
+
+      // Mirror the dead-idle path: clear the error gate so the rebuild
+      // isn't refused, then warm a fresh idle session in the background.
+      await serverErrorTracker.resetServerErrorState(serverUuid);
+      const params = this.serverParamsCache[serverUuid];
+      if (params) {
+        this.createIdleSessionAsync(serverUuid, params);
       }
     }
   }

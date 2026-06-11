@@ -503,3 +503,177 @@ describe("McpServerPool.evictOneForCapacity — LRU eviction at the cap", () => 
     expect(freed).toBe(false);
   });
 });
+
+describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sweep", () => {
+  // Active StreamableHTTP connections to a swapped backend container die
+  // silently (no socket, no onclose/onerror). At the per-server cap every
+  // slot is active, so the idle health check sees nothing and the
+  // cap-reuse branch in getSession serves the zombies forever
+  // (incident 2026-06-11). The sweep pings distinct active clients and
+  // cascade-invalidates after two consecutive failed sweeps.
+
+  type PingableFakeClient = FakeClient & {
+    client: { ping: ReturnType<typeof vi.fn> };
+  };
+
+  function makePingableClient(alive: boolean): PingableFakeClient {
+    const fake = makeFakeClient() as PingableFakeClient;
+    fake.client = {
+      ping: alive
+        ? vi.fn().mockResolvedValue({})
+        : vi.fn().mockRejectedValue(new Error("Not connected")),
+    };
+    return fake;
+  }
+
+  // Bypass the private-constructor discipline without adding a TS2673
+  // per instantiation (the older describes above predate this cast).
+  const PoolCtor = McpServerPool as unknown as new () => McpServerPool;
+
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, PingableFakeClient>>;
+    idleSessions: Record<string, PingableFakeClient>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+    serverParamsCache: Record<string, unknown>;
+    activePingFailures: Record<string, number>;
+    checkActiveSessionHealth: () => Promise<void>;
+  };
+
+  beforeEach(() => {
+    pool = new PoolCtor();
+
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+    internals.serverParamsCache = {};
+    internals.activePingFailures = {};
+  });
+
+  it("leaves healthy active connections alone and clears the failure counter", async () => {
+    const healthy = makePingableClient(true);
+    internals.activeSessions["session-A"] = { "server-1": healthy };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+    internals.activePingFailures["server-1"] = 1; // prior strike
+
+    await internals.checkActiveSessionHealth();
+
+    expect(healthy.client.ping).toHaveBeenCalledTimes(1);
+    expect(healthy.cleanup).not.toHaveBeenCalled();
+    expect(internals.activePingFailures["server-1"]).toBeUndefined();
+    expect(internals.activeSessions["session-A"]["server-1"]).toBe(healthy);
+  });
+
+  it("first failed sweep is strike one — no eviction yet", async () => {
+    const dead = makePingableClient(false);
+    internals.activeSessions["session-A"] = { "server-1": dead };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+
+    await internals.checkActiveSessionHealth();
+
+    expect(dead.cleanup).not.toHaveBeenCalled();
+    expect(internals.activePingFailures["server-1"]).toBe(1);
+    expect(internals.activeSessions["session-A"]["server-1"]).toBe(dead);
+  });
+
+  it("second consecutive failed sweep cascade-invalidates every slot for the server", async () => {
+    const deadA = makePingableClient(false);
+    const deadB = makePingableClient(false);
+    internals.activeSessions["session-A"] = { "server-1": deadA };
+    internals.activeSessions["session-B"] = { "server-1": deadB };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+    internals.sessionToServers["session-B"] = new Set(["server-1"]);
+
+    await internals.checkActiveSessionHealth(); // strike 1
+    await internals.checkActiveSessionHealth(); // strike 2 → evict
+
+    expect(deadA.cleanup).toHaveBeenCalledTimes(1);
+    expect(deadB.cleanup).toHaveBeenCalledTimes(1);
+    expect(internals.activeSessions["session-A"]?.["server-1"]).toBeUndefined();
+    expect(internals.activeSessions["session-B"]?.["server-1"]).toBeUndefined();
+    expect(internals.activePingFailures["server-1"]).toBeUndefined();
+  });
+
+  it("a healthy sweep between failures resets the strike counter", async () => {
+    const flaky = makePingableClient(false);
+    internals.activeSessions["session-A"] = { "server-1": flaky };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+
+    await internals.checkActiveSessionHealth(); // strike 1
+    flaky.client.ping = vi.fn().mockResolvedValue({}); // backend recovers
+    await internals.checkActiveSessionHealth(); // healthy → reset
+    flaky.client.ping = vi.fn().mockRejectedValue(new Error("Not connected"));
+    await internals.checkActiveSessionHealth(); // strike 1 again, NOT 2
+
+    expect(flaky.cleanup).not.toHaveBeenCalled();
+    expect(internals.activePingFailures["server-1"]).toBe(1);
+  });
+
+  it("pings a cap-reuse-shared client once, not once per session", async () => {
+    const shared = makePingableClient(true);
+    internals.activeSessions["session-A"] = { "server-1": shared };
+    internals.activeSessions["session-B"] = { "server-1": shared };
+    internals.activeSessions["session-C"] = { "server-1": shared };
+
+    await internals.checkActiveSessionHealth();
+
+    expect(shared.client.ping).toHaveBeenCalledTimes(1);
+  });
+
+  it("only invalidates the failing server, not its healthy neighbors", async () => {
+    const dead = makePingableClient(false);
+    const healthy = makePingableClient(true);
+    internals.activeSessions["session-A"] = {
+      "server-dead": dead,
+      "server-ok": healthy,
+    };
+    internals.sessionToServers["session-A"] = new Set([
+      "server-dead",
+      "server-ok",
+    ]);
+
+    await internals.checkActiveSessionHealth(); // strike 1
+    await internals.checkActiveSessionHealth(); // strike 2 → evict dead only
+
+    expect(dead.cleanup).toHaveBeenCalledTimes(1);
+    expect(healthy.cleanup).not.toHaveBeenCalled();
+    expect(internals.activeSessions["session-A"]["server-ok"]).toBe(healthy);
+  });
+
+  it("MCP_ACTIVE_HEALTH_CHECK=false disables the sweep from the timer path", async () => {
+    const prev = process.env.MCP_ACTIVE_HEALTH_CHECK;
+    process.env.MCP_ACTIVE_HEALTH_CHECK = "false";
+    try {
+      const gatedPool = new PoolCtor();
+      const gated = gatedPool as never as typeof internals;
+      gated.activeSessions = {};
+      gated.idleSessions = {};
+      gated.sessionToServers = {};
+      gated.creatingIdleSessions = new Set();
+      gated.serverParamsCache = {};
+      gated.activePingFailures = {};
+
+      const dead = makePingableClient(false);
+      gated.activeSessions["session-A"] = { "server-1": dead };
+
+      await (
+        gatedPool as never as { checkIdleSessionHealth: () => Promise<void> }
+      ).checkIdleSessionHealth();
+      await (
+        gatedPool as never as { checkIdleSessionHealth: () => Promise<void> }
+      ).checkIdleSessionHealth();
+
+      expect(dead.client.ping).not.toHaveBeenCalled();
+      expect(dead.cleanup).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) {
+        delete process.env.MCP_ACTIVE_HEALTH_CHECK;
+      } else {
+        process.env.MCP_ACTIVE_HEALTH_CHECK = prev;
+      }
+    }
+  });
+});
