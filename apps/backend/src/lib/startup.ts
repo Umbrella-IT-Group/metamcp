@@ -98,9 +98,18 @@ export async function initializeIdleServers() {
       );
     }
 
-    // Ensure idle servers for all namespaces (MetaMCP server pool)
+    // Ensure idle servers for all namespaces (MetaMCP server pool).
+    // includeInactiveServers MUST be false: idle servers are keyed only
+    // by namespaceUuid and the conversion in getServer/getOpenApiServer
+    // never checks the flag, so a true-flavored idle server warmed here
+    // would serve INACTIVE backends' tools to the first public session
+    // per namespace after every boot — for the session's whole lifetime
+    // under persistent sessions. Every consumer that converts idle
+    // servers (sse.ts, streamable-http.ts, getOpenApiServer) asks for
+    // false; nothing in the codebase consumes a true-flavored idle
+    // server.
     if (namespaceUuids.length > 0) {
-      await metaMcpServerPool.ensureIdleServers(namespaceUuids, true);
+      await metaMcpServerPool.ensureIdleServers(namespaceUuids, false);
       console.log(
         "✅ Successfully initialized idle servers for all namespaces",
       );
