@@ -46,9 +46,22 @@ vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn().mockImplementation(async () => fakeServerParams),
 }));
 
-const { invalidateServerConnectionMock, getSessionMock } = vi.hoisted(() => ({
-  invalidateServerConnectionMock: vi.fn(),
-  getSessionMock: vi.fn(),
+const { invalidateServerConnectionMock, getSessionMock, loggerErrorMock } =
+  vi.hoisted(() => ({
+    invalidateServerConnectionMock: vi.fn(),
+    getSessionMock: vi.fn(),
+    loggerErrorMock: vi.fn(),
+  }));
+
+// Real logger writes to console; mock it so the DEGRADED-tripwire
+// tests can assert on the emitted lines.
+vi.mock("@/utils/logger", () => ({
+  default: {
+    error: loggerErrorMock,
+    warn: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+  },
 }));
 
 vi.mock("../../../lib/metamcp/mcp-server-pool", () => ({
@@ -80,7 +93,10 @@ vi.mock(
 // purposes — we test originalCallToolHandler / createOriginalListToolsHandler
 // directly, so the middleware composition isn't exercised here.
 
-import { createOriginalCallToolHandler } from "./handlers";
+import {
+  createOriginalCallToolHandler,
+  createOriginalListToolsHandler,
+} from "./handlers";
 
 type FakeClient = {
   request: ReturnType<typeof vi.fn>;
@@ -210,5 +226,80 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
     ).rejects.toThrow(/failed to re-initialize/);
 
     expect(invalidateServerConnectionMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
+  // Parity with metamcp-proxy.ts's PR #28 tripwire. The Grafana alert
+  // greps `DEGRADED for namespace`; before this, OpenAPI-path
+  // degradation (Tara, n8n, registry-sync) never produced the line.
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    loggerErrorMock.mockClear();
+  });
+
+  it("logs No-session + DEGRADED when getSession returns null", async () => {
+    getSessionMock.mockResolvedValue(null);
+
+    const handler = createOriginalListToolsHandler();
+    const result = await handler(
+      { method: "tools/list", params: {} },
+      { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+    );
+
+    expect(result.tools).toEqual([]);
+    const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
+    expect(
+      messages.some((m) => m.includes("No session for server autotask")),
+    ).toBe(true);
+    expect(
+      messages.some((m) =>
+        m.includes(
+          "tools/list DEGRADED for namespace ns-1 (OpenAPI bridge): 1/1 backend server(s) failed (autotask); returning 0 tools",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("counts a non-recoverable per-server failure in the DEGRADED line", async () => {
+    const broken = makeFakeSession(
+      vi.fn().mockRejectedValue(new Error("boom: schema validation failed")),
+    );
+    getSessionMock.mockResolvedValue(broken);
+
+    const handler = createOriginalListToolsHandler();
+    const result = await handler(
+      { method: "tools/list", params: {} },
+      { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+    );
+
+    expect(result.tools).toEqual([]);
+    const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
+    expect(
+      messages.some((m) =>
+        m.includes("tools/list DEGRADED for namespace ns-1 (OpenAPI bridge)"),
+      ),
+    ).toBe(true);
+  });
+
+  it("stays silent when every backend answers", async () => {
+    const healthy = makeFakeSession(
+      vi.fn().mockResolvedValue({
+        tools: [{ name: "resolve_id", description: "d", inputSchema: {} }],
+      }),
+    );
+    getSessionMock.mockResolvedValue(healthy);
+
+    const handler = createOriginalListToolsHandler();
+    const result = await handler(
+      { method: "tools/list", params: {} },
+      { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+    );
+
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools[0].name).toBe("autotask__resolve_id");
+    const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
+    expect(messages.some((m) => m.includes("DEGRADED"))).toBe(false);
   });
 });

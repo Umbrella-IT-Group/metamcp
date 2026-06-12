@@ -40,16 +40,30 @@ export const createOriginalListToolsHandler = (
       includeInactiveServers,
     );
     const allTools: Tool[] = [];
+    // Mirrors metamcp-proxy.ts's PR #28 tripwire: every backend that
+    // contributes zero tools because of a failure (not because it has
+    // no tools capability) is recorded here so the namespace-level
+    // DEGRADED line below fires. Without this, OpenAPI-path
+    // degradation was invisible to the Grafana rule that greps
+    // "DEGRADED for namespace".
+    const failedServers: string[] = [];
+    const allServerEntries = Object.entries(serverParams);
 
     await Promise.allSettled(
-      Object.entries(serverParams).map(async ([mcpServerUuid, params]) => {
+      allServerEntries.map(async ([mcpServerUuid, params]) => {
         const session = await mcpServerPool.getSession(
           context.sessionId,
           mcpServerUuid,
           params,
           context.namespaceUuid,
         );
-        if (!session) return;
+        if (!session) {
+          logger.error(
+            `OpenAPI bridge: No session for server ${params.name || mcpServerUuid} (${mcpServerUuid}) during tools/list — pool returned null (ERROR-gated, at cap, or connect failed); server excluded from namespace response`,
+          );
+          failedServers.push(params.name || mcpServerUuid);
+          return;
+        }
 
         const capabilities = session.client.getServerCapabilities();
         if (!capabilities?.tools) return;
@@ -132,9 +146,19 @@ export const createOriginalListToolsHandler = (
           allTools.push(...toolsWithSource);
         } catch (error) {
           logger.error(`Error fetching tools from: ${serverName}`, error);
+          failedServers.push(serverName || mcpServerUuid);
         }
       }),
     );
+
+    if (failedServers.length > 0) {
+      // Same log shape as metamcp-proxy.ts so the Grafana alert rule
+      // (`|= "DEGRADED for namespace"`) catches both consumer paths;
+      // the "OpenAPI bridge" suffix splits them when investigating.
+      logger.error(
+        `tools/list DEGRADED for namespace ${context.namespaceUuid} (OpenAPI bridge): ${failedServers.length}/${allServerEntries.length} backend server(s) failed (${failedServers.join(", ")}); returning ${allTools.length} tools`,
+      );
+    }
 
     return { tools: allTools };
   };
