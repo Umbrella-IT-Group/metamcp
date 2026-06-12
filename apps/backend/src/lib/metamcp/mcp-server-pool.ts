@@ -13,6 +13,14 @@ export interface McpServerPoolStatus {
   idleServerUuids: string[];
   perServerCounts?: Record<string, number>;
   maxConnectionsPerServer?: number;
+  // Per-server connect/health telemetry for /health/upstream. A serverUuid
+  // present in lastConnectFailureAt means its MOST RECENT connect attempt
+  // failed (the stamp is cleared on every successful connect), so
+  // "zero connections + a failure stamp" distinguishes a down backend
+  // from one that simply hasn't been needed yet.
+  lastConnectFailureAt?: Record<string, number>;
+  lastConnectSuccessAt?: Record<string, number>;
+  pingFailures?: Record<string, number>;
 }
 
 export class McpServerPool {
@@ -85,6 +93,16 @@ export class McpServerPool {
   // bounces. If the gap exceeds the threshold, the bounce is treated
   // as a genuine failure cluster and the tracker count is preserved.
   private serverLastSuccessAt: Record<string, number> = {};
+
+  // Per-server timestamp of the most recent FAILED connect attempt.
+  // Cleared on every successful connect, so an entry here means the
+  // latest attempt to reach this backend failed. HTTP/SSE backends
+  // never trip the ERROR circuit breaker (crash counting is
+  // STDIO-only), so without this stamp a hard-down HTTP backend reads
+  // "reachable" on /health/upstream forever — the endpoint's only
+  // signal was `!in_error`. Surfaced via getPoolStatus for the
+  // external uptime probe.
+  private lastConnectFailureAt: Record<string, number> = {};
 
   // Time-since-success threshold (ms) for the recovery reset path.
   // Tunable via `MCP_RECOVERY_RESET_THRESHOLD_MS`; default 5 min.
@@ -383,6 +401,11 @@ export class McpServerPool {
       },
     );
     if (!connectedClient) {
+      // connectMetaMcpClient swallows its own errors and resolves
+      // undefined, so this is the single chokepoint where every
+      // failed connect attempt (cold start, sweep-triggered rebuild,
+      // half-open probe) lands. Stamp it for /health/upstream.
+      this.lastConnectFailureAt[params.uuid] = Date.now();
       return undefined;
     }
 
@@ -402,6 +425,7 @@ export class McpServerPool {
    */
   private markServerSuccess(serverUuid: string): void {
     this.serverLastSuccessAt[serverUuid] = Date.now();
+    delete this.lastConnectFailureAt[serverUuid];
     serverErrorTracker.markSuccess(serverUuid);
   }
 
@@ -723,6 +747,9 @@ export class McpServerPool {
       idleServerUuids: Object.keys(this.idleSessions),
       perServerCounts,
       maxConnectionsPerServer: this.maxConnectionsPerServer,
+      lastConnectFailureAt: { ...this.lastConnectFailureAt },
+      lastConnectSuccessAt: { ...this.serverLastSuccessAt },
+      pingFailures: { ...this.activePingFailures },
     };
   }
 

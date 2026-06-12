@@ -800,3 +800,81 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
     );
   });
 });
+
+describe("McpServerPool connect-failure stamp — /health/upstream truthfulness", () => {
+  // HTTP/SSE backends never trip the ERROR circuit breaker (crash
+  // counting is STDIO-only), so before this stamp a hard-down HTTP
+  // backend read `reachable: true` on /health/upstream forever. The
+  // pool stamps every failed connect attempt and clears the stamp on
+  // success; the endpoint reads it via getPoolStatus.
+
+  type StampInternals = {
+    lastConnectFailureAt: Record<string, number>;
+    serverLastSuccessAt: Record<string, number>;
+    serverParamsCache: Record<string, unknown>;
+    createNewConnection: (
+      params: { uuid: string; name: string },
+      namespaceUuid?: string,
+    ) => Promise<unknown>;
+    markServerSuccess: (serverUuid: string) => void;
+  };
+
+  let pool: McpServerPool;
+  let internals: StampInternals;
+  let connectMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    connectMock = (await import("./client"))
+      .connectMetaMcpClient as unknown as ReturnType<typeof vi.fn>;
+    connectMock.mockReset();
+  });
+
+  it("stamps lastConnectFailureAt when connectMetaMcpClient resolves undefined", async () => {
+    connectMock.mockResolvedValue(undefined);
+
+    const result = await internals.createNewConnection({
+      uuid: "server-down",
+      name: "down-backend",
+    });
+
+    expect(result).toBeUndefined();
+    expect(internals.lastConnectFailureAt["server-down"]).toBeTypeOf("number");
+  });
+
+  it("clears the failure stamp on a successful connect", async () => {
+    internals.lastConnectFailureAt["server-flap"] = 12345;
+    connectMock.mockResolvedValue({ client: {}, cleanup: vi.fn() });
+
+    const result = await internals.createNewConnection({
+      uuid: "server-flap",
+      name: "flapping-backend",
+    });
+
+    expect(result).toBeDefined();
+    expect(internals.lastConnectFailureAt["server-flap"]).toBeUndefined();
+    expect(internals.serverLastSuccessAt["server-flap"]).toBeTypeOf("number");
+  });
+
+  it("exposes failure/success stamps via getPoolStatus", () => {
+    internals.lastConnectFailureAt["server-a"] = 111;
+    internals.serverLastSuccessAt["server-b"] = 222;
+
+    const status = pool.getPoolStatus();
+
+    expect(status.lastConnectFailureAt).toEqual({ "server-a": 111 });
+    expect(status.lastConnectSuccessAt).toEqual({ "server-b": 222 });
+    expect(status.pingFailures).toEqual({});
+  });
+
+  it("getPoolStatus returns copies, not live references", () => {
+    internals.lastConnectFailureAt["server-a"] = 111;
+
+    const status = pool.getPoolStatus();
+    const stamps = status.lastConnectFailureAt as Record<string, number>;
+    stamps["server-a"] = 999;
+
+    expect(internals.lastConnectFailureAt["server-a"]).toBe(111);
+  });
+});

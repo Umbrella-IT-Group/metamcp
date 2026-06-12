@@ -198,34 +198,53 @@ app.get("/health/upstream", async (req, res) => {
     const servers = await mcpServersRepository.findAll();
     const pool = mcpServerPool.getPoolStatus();
     const perServer = pool.perServerCounts ?? {};
+    const lastFailureAt = pool.lastConnectFailureAt ?? {};
+    const lastSuccessAt = pool.lastConnectSuccessAt ?? {};
+    const pingFailures = pool.pingFailures ?? {};
 
     const details = await Promise.all(
       servers.map(async (s) => {
         const inError = await serverErrorTracker.isServerInErrorState(s.uuid);
         const connectionCount = perServer[s.uuid] ?? 0;
+        const failedAt = lastFailureAt[s.uuid];
+        const succeededAt = lastSuccessAt[s.uuid];
+        // A server is "reachable" unless (a) the ERROR circuit breaker
+        // tripped, or (b) it holds zero live connections AND its most
+        // recent connect attempt failed (the pool clears the failure
+        // stamp on every successful connect). Case (b) is how a
+        // hard-down HTTP/SSE backend looks — those never trip ERROR
+        // because crash counting is STDIO-only. Zero connections with
+        // NO failure stamp is just lazy cold-start: not unhealthy.
+        const reachable =
+          !inError && !(connectionCount === 0 && failedAt !== undefined);
         return {
           uuid: s.uuid,
           name: s.name,
           in_error: inError,
           connection_count: connectionCount,
-          // A server is "reachable" if it isn't in the error state and
-          // it has at least one live connection in the pool, or if it
-          // hasn't been needed yet (zero connections + no error). Pool
-          // emptiness alone is not unhealthy — we cold-start lazily.
-          reachable: !inError,
+          reachable,
+          last_connect_failure_at: failedAt
+            ? new Date(failedAt).toISOString()
+            : null,
+          last_connect_success_at: succeededAt
+            ? new Date(succeededAt).toISOString()
+            : null,
+          ping_failures: pingFailures[s.uuid] ?? 0,
         };
       }),
     );
 
     const totalServers = details.length;
     const errored = details.filter((d) => d.in_error).length;
-    const healthy = errored === 0;
+    const unreachable = details.filter((d) => !d.reachable).length;
+    const healthy = unreachable === 0;
 
     res.json({
       status: "ok",
       healthy,
       total_servers: totalServers,
       errored_servers: errored,
+      unreachable_servers: unreachable,
       pool: {
         idle: pool.idle,
         active: pool.active,
