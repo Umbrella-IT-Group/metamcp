@@ -59,7 +59,7 @@ export default function McpServersPage() {
       url: "",
       bearerToken: "",
       headers: "",
-      user_id: undefined, // Default to private (current user)
+      user_id: null, // Default to public
     },
   });
 

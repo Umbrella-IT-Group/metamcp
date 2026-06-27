@@ -74,7 +74,7 @@ export default function NamespacesPage() {
         form.reset({
           name: "",
           description: "",
-          user_id: undefined, // Default to "For myself" (Private)
+          user_id: null, // Default to public (Everyone)
         });
         setSelectedServerUuids([]);
         setServerSearchQuery("");
@@ -102,7 +102,7 @@ export default function NamespacesPage() {
       name: "",
       description: "",
       mcpServerUuids: [],
-      user_id: undefined, // Default to "For myself" (Private)
+      user_id: null, // Default to public (Everyone)
     },
   });
 
@@ -308,7 +308,7 @@ export default function NamespacesPage() {
                       form.reset({
                         name: "",
                         description: "",
-                        user_id: undefined, // Default to "For myself" (Private)
+                        user_id: null, // Default to public (Everyone)
                       });
                       setSelectedServerUuids([]);
                       setServerSearchQuery("");

@@ -38,7 +38,7 @@ export const endpointsImplementations = {
 
       // Determine user ownership based on input.user_id or default to current user
       const effectiveUserId =
-        input.user_id !== undefined ? input.user_id : userId;
+        input.user_id !== undefined ? input.user_id : null;
       const isPublicEndpoint = effectiveUserId === null;
 
       // Validate namespace accessibility and relationship rules
@@ -83,7 +83,7 @@ export const endpointsImplementations = {
         client_max_rate_seconds: input.clientMaxRateSeconds,
         client_max_rate_strategy: input.clientMaxRateStrategy,
         client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
-        enable_oauth: input.enableOauth ?? false,
+        enable_oauth: input.enableOauth ?? true,
         use_query_param_auth: input.useQueryParamAuth ?? false,
         user_id: effectiveUserId,
       });

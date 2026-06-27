@@ -123,7 +123,7 @@ export function EditEndpoint({
       clientMaxRateSeconds: undefined,
       clientMaxRateStrategy: "ip",
       clientMaxRateStrategyKey: "",
-      enableOauth: false,
+      enableOauth: true,
       useQueryParamAuth: false,
     },
   });
@@ -206,7 +206,7 @@ export function EditEndpoint({
       description: "",
       namespaceUuid: "",
       enableApiKeyAuth: true,
-      enableOauth: false,
+      enableOauth: true,
       useQueryParamAuth: false,
     });
     setSelectedNamespaceUuid("");

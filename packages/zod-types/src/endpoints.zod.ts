@@ -71,7 +71,7 @@ export const CreateEndpointRequestSchema = z.object({
     .optional(),
   clientMaxRateStrategy: z.string().optional(),
   clientMaxRateStrategyKey: z.string().optional(),
-  enableOauth: z.boolean().default(false),
+  enableOauth: z.boolean().default(true),
   useQueryParamAuth: z.boolean().default(false),
   createMcpServer: z.boolean().default(true),
   user_id: z.string().nullable().optional(),
@@ -198,7 +198,7 @@ export const EndpointCreateInputSchema = z.object({
   client_max_rate_seconds: z.number().nullable().optional(),
   client_max_rate_strategy: z.string().nullable().optional(),
   client_max_rate_strategy_key: z.string().nullable().optional(),
-  enable_oauth: z.boolean().optional().default(false),
+  enable_oauth: z.boolean().optional().default(true),
   use_query_param_auth: z.boolean().optional().default(false),
   user_id: z.string().nullable().optional(),
 });

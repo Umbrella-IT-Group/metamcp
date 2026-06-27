@@ -79,10 +79,10 @@ export default function EndpointsPage() {
           clientMaxRateSeconds: undefined,
           clientMaxRateStrategy: "ip",
           clientMaxRateStrategyKey: "",
-          enableOauth: false,
+          enableOauth: true,
           useQueryParamAuth: false,
           createMcpServer: true,
-          user_id: undefined, // Default to "For myself" (Private)
+          user_id: null, // Default to public (Everyone)
         });
         setSelectedNamespaceUuid("");
         setSelectedNamespaceName("");
@@ -124,10 +124,10 @@ export default function EndpointsPage() {
       clientMaxRateStrategy: "ip",
       clientMaxRateStrategyKey: "",
       enableApiKeyAuth: true,
-      enableOauth: false,
+      enableOauth: true,
       useQueryParamAuth: false,
       createMcpServer: true,
-      user_id: undefined, // Default to "For myself" (Private)
+      user_id: null, // Default to public (Everyone)
     },
   });
 
@@ -193,10 +193,10 @@ export default function EndpointsPage() {
       clientMaxRateSeconds: undefined,
       clientMaxRateStrategy: "ip",
       clientMaxRateStrategyKey: "",
-      enableOauth: false,
+      enableOauth: true,
       useQueryParamAuth: false,
       createMcpServer: true,
-      user_id: undefined, // Default to "For myself" (Private)
+      user_id: null, // Default to public (Everyone)
     });
     setSelectedNamespaceUuid("");
     setSelectedNamespaceName("");

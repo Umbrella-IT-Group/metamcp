@@ -33,7 +33,7 @@ export const mcpServersImplementations = {
     try {
       // Determine user ownership based on input.user_id or default to current user
       const effectiveUserId =
-        input.user_id !== undefined ? input.user_id : userId;
+        input.user_id !== undefined ? input.user_id : null;
 
       const createdServer = await mcpServersRepository.create({
         ...input,
