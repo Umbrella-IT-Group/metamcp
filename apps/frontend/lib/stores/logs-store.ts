@@ -48,7 +48,7 @@ export const useLogsStore = create<LogsState>()(
         set({ isLoading: true });
 
         const response = await vanillaTrpcClient.frontend.logs.get.query({
-          limit: 500,
+          limit: 1000,
         });
 
         if (response.success) {

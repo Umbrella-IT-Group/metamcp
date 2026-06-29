@@ -2,6 +2,11 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+// Import the specific repo file (not the ../../db/repositories barrel): the
+// barrel pulls in sibling repos whose module-load reaches db/index, which the
+// pool unit test can't satisfy (no DATABASE_URL). server-error-tracker is
+// fully mocked in that test, so this is the only live db import the pool has.
+import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverErrorTracker } from "./server-error-tracker";
@@ -1354,6 +1359,47 @@ export class McpServerPool {
     // bailing here would skip the ERROR-state recreation loop and the
     // active-session sweep below, i.e. the health check would go blind
     // exactly when the pool is at its sickest.
+
+    // PRUNE deleted servers FIRST. A server removed from the registry (rename,
+    // UI delete, CI-sync prune, direct DB) leaves its serverParamsCache entry
+    // behind; the ERROR-gated recreation loop below then reconnects to a
+    // backend that no longer exists — a zombie reconnect every sweep, forever
+    // (observed 2026-06-29: the renamed `endpoints` server logged 297 failed
+    // reconnects in 40 min, flooding the Live Logs view). The registry is the
+    // source of truth; any pooled uuid absent from it is dead. One indexed
+    // findAll() per 60s sweep. Guarded so a unit-test repo mock (no findAll)
+    // or a transient DB blip can't take the health sweep down.
+    if (typeof mcpServersRepository.findAll === "function") {
+      try {
+        const registered = new Set(
+          (await mcpServersRepository.findAll()).map((s) => s.uuid),
+        );
+        const pooled = new Set<string>([
+          ...Object.keys(this.serverParamsCache),
+          ...Object.keys(this.idleSessions),
+        ]);
+        for (const serverUuid of pooled) {
+          if (registered.has(serverUuid)) continue;
+          logger.info(
+            `Pruning pool state for server ${serverUuid} — no longer in the registry`,
+          );
+          // Evicts idle session + params cache + creation guards and bumps the
+          // generation so an in-flight create can't repopulate it.
+          await this.cleanupIdleSession(serverUuid);
+          delete this.lastErrorProbeAt[serverUuid];
+          delete this.activePingFailures[serverUuid];
+          await serverErrorTracker
+            .resetServerErrorState(serverUuid)
+            .catch(() => {});
+        }
+      } catch (error) {
+        logger.warn(
+          "Pool prune (registry reconciliation) skipped this sweep:",
+          error,
+        );
+      }
+    }
+
     const serverUuids = Object.keys(this.idleSessions);
 
     for (const serverUuid of serverUuids) {

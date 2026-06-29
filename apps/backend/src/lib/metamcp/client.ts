@@ -359,6 +359,13 @@ export const connectMetaMcpClient = async (
           logger.info(
             `Transport closed unexpectedly for server ${serverParams.name} (${serverParams.uuid})`,
           );
+          metamcpLogStore.record({
+            category: "connection",
+            serverName: serverParams.name,
+            serverUuid: serverParams.uuid,
+            level: "warn",
+            message: "Transport closed unexpectedly (backend drop)",
+          });
           if (onTransportDrop) {
             try {
               onTransportDrop("close");
@@ -388,6 +395,14 @@ export const connectMetaMcpClient = async (
             `Transport error for server ${serverParams.name} (${serverParams.uuid}):`,
             transportError,
           );
+          metamcpLogStore.record({
+            category: "connection",
+            serverName: serverParams.name,
+            serverUuid: serverParams.uuid,
+            level: "warn",
+            message: "Transport error (backend drop)",
+            error: transportError,
+          });
           if (onTransportDrop) {
             try {
               onTransportDrop("error", transportError);
@@ -402,6 +417,15 @@ export const connectMetaMcpClient = async (
       }
 
       await client.connect(transport);
+
+      metamcpLogStore.record({
+        category: "connection",
+        serverName: serverParams.name,
+        serverUuid: serverParams.uuid,
+        level: "info",
+        message:
+          count > 0 ? `Connected after ${count + 1} attempts` : "Connected",
+      });
 
       // Subscriber set for upstream `tools/list_changed` fan-out. Created
       // BEFORE the notification handler is registered so the handler can
@@ -468,12 +492,14 @@ export const connectMetaMcpClient = async (
         listChangedSubscribers,
       };
     } catch (error) {
-      metamcpLogStore.addLog(
-        "client",
-        "error",
-        `Error connecting to MetaMCP client (attempt ${count + 1}/${maxAttempts})`,
+      metamcpLogStore.record({
+        category: "connection",
+        serverName: serverParams.name,
+        serverUuid: serverParams.uuid,
+        level: "error",
+        message: `Connect attempt ${count + 1}/${maxAttempts} failed`,
         error,
-      );
+      });
 
       // CRITICAL FIX: Clean up transport/process on connection failure
       // This prevents orphaned processes from accumulating

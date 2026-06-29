@@ -1,16 +1,27 @@
 import { z } from "zod";
 
+export const MetaMcpLogCategorySchema = z.enum([
+  "connection",
+  "tool_call",
+  "server",
+  "system",
+]);
+
 export const MetaMcpLogEntrySchema = z.object({
   id: z.string(),
   timestamp: z.date(),
+  category: MetaMcpLogCategorySchema,
   serverName: z.string(),
+  serverUuid: z.string().optional(),
   level: z.enum(["error", "info", "warn"]),
   message: z.string(),
+  toolName: z.string().optional(),
+  durationMs: z.number().optional(),
   error: z.string().optional(),
 });
 
 export const GetLogsRequestSchema = z.object({
-  limit: z.number().int().positive().max(1000).optional(),
+  limit: z.number().int().positive().max(2000).optional(),
 });
 
 export const GetLogsResponseSchema = z.object({
@@ -24,6 +35,7 @@ export const ClearLogsResponseSchema = z.object({
   message: z.string(),
 });
 
+export type MetaMcpLogCategory = z.infer<typeof MetaMcpLogCategorySchema>;
 export type MetaMcpLogEntry = z.infer<typeof MetaMcpLogEntrySchema>;
 export type GetLogsRequest = z.infer<typeof GetLogsRequestSchema>;
 export type GetLogsResponse = z.infer<typeof GetLogsResponseSchema>;

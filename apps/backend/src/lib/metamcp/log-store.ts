@@ -1,61 +1,91 @@
 import logger from "@/utils/logger";
 
+// Event class for a log entry. Lets the Live Logs view show real activity
+// (connections, tool calls) and filter by kind — not just connection errors.
+//   connection — backend connect attempt / success / transport drop
+//   tool_call  — a tools/call proxied to a backend (name, duration, ok/fail)
+//   server     — backend-emitted output (stderr) or a server config error
+//   system     — gateway lifecycle / pool events
+export type MetaMcpLogCategory =
+  | "connection"
+  | "tool_call"
+  | "server"
+  | "system";
+
 export interface MetaMcpLogEntry {
   id: string;
   timestamp: Date;
+  category: MetaMcpLogCategory;
   serverName: string;
+  serverUuid?: string;
   level: "error" | "info" | "warn";
   message: string;
+  toolName?: string;
+  durationMs?: number;
   error?: string;
+}
+
+function normalizeError(error?: unknown): string | undefined {
+  if (!error) return undefined;
+  return error instanceof Error ? error.message : String(error);
 }
 
 class MetaMcpLogStore {
   private logs: MetaMcpLogEntry[] = [];
-  private readonly maxLogs = 1000; // Keep only the last 1000 logs
+  // Ring buffer: keep only the newest maxLogs entries. Bumped 1000 -> 2000
+  // because tool_call events (added 2026-06-29) churn the buffer faster than
+  // the old connection-error-only stream did.
+  private readonly maxLogs = 2000;
   private readonly listeners: Set<(log: MetaMcpLogEntry) => void> = new Set();
 
-  addLog(
-    serverName: string,
-    level: MetaMcpLogEntry["level"],
-    message: string,
-    error?: unknown,
-  ) {
+  /**
+   * Structured entry point — prefer this for new call sites. Carries the event
+   * category plus optional server identity, tool name, and duration so the
+   * Live Logs view surfaces real activity and can filter by category.
+   */
+  record(entry: {
+    category: MetaMcpLogCategory;
+    serverName: string;
+    level: MetaMcpLogEntry["level"];
+    message: string;
+    serverUuid?: string;
+    toolName?: string;
+    durationMs?: number;
+    error?: unknown;
+  }): void {
     const logEntry: MetaMcpLogEntry = {
       id: crypto.randomUUID(),
       timestamp: new Date(),
-      serverName,
-      level,
-      message,
-      error: error
-        ? error instanceof Error
-          ? error.message
-          : String(error)
-        : undefined,
+      category: entry.category,
+      serverName: entry.serverName,
+      serverUuid: entry.serverUuid,
+      level: entry.level,
+      message: entry.message,
+      toolName: entry.toolName,
+      durationMs: entry.durationMs,
+      error: normalizeError(entry.error),
     };
 
-    // Add to logs array
     this.logs.push(logEntry);
-
-    // Keep only the last maxLogs entries
     if (this.logs.length > this.maxLogs) {
       this.logs = this.logs.slice(-this.maxLogs);
     }
 
-    // Also log to console for debugging
-    const fullMessage = `[MetaMCP][${serverName}] ${message}`;
-    switch (level) {
+    // Mirror to stdout — Promtail ships this to Loki/Grafana, the durable
+    // system of record. The in-memory store is the fast, ephemeral view.
+    const fullMessage = `[MetaMCP][${entry.category}][${entry.serverName}] ${entry.message}`;
+    switch (entry.level) {
       case "error":
-        logger.error(fullMessage, error || "");
+        logger.error(fullMessage, entry.error || "");
         break;
       case "warn":
-        logger.warn(fullMessage, error || "");
+        logger.warn(fullMessage, entry.error || "");
         break;
       case "info":
-        logger.info(fullMessage, error || "");
+        logger.info(fullMessage, entry.error || "");
         break;
     }
 
-    // Notify listeners
     this.listeners.forEach((listener) => {
       try {
         listener(logEntry);
@@ -63,6 +93,20 @@ class MetaMcpLogStore {
         logger.error("Error notifying log listener:", err);
       }
     });
+  }
+
+  /**
+   * Legacy positional entry point. Retained for existing call sites; defaults
+   * the category to "server" (these were all backend-emitted stderr / config
+   * errors). New code should call record().
+   */
+  addLog(
+    serverName: string,
+    level: MetaMcpLogEntry["level"],
+    message: string,
+    error?: unknown,
+  ): void {
+    this.record({ category: "server", serverName, level, message, error });
   }
 
   getLogs(limit?: number): MetaMcpLogEntry[] {

@@ -30,6 +30,7 @@ import { getMcpServers } from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { requestWithSessionRecovery } from "./list-handler-recovery";
 import { mcpServerPool } from "./mcp-server-pool";
+import { createAuditingMiddleware } from "./metamcp-middleware/auditing.functional";
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
@@ -733,6 +734,8 @@ export const createServer = async (
   )(originalListToolsHandler);
 
   const callToolWithMiddleware = compose(
+    // Outermost: records every call (incl. denied) to the Live Logs store.
+    createAuditingMiddleware(),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
@@ -740,7 +743,6 @@ export const createServer = async (
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     // Add more middleware here as needed
-    // createAuditingMiddleware(),
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);
 
