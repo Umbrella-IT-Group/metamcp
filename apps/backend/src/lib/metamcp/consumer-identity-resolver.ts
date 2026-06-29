@@ -11,7 +11,14 @@ import { eq } from "drizzle-orm";
 
 import { db } from "../../db/index";
 import { apiKeysTable, usersTable } from "../../db/schema";
-import { ClientIdentity } from "./session-client-registry";
+
+export interface ClientIdentity {
+  /** Human-readable label: api-key name (e.g. "Tara connector") or OAuth user email. */
+  name: string;
+  /** Stable id: api_keys.uuid or the OAuth user_id. */
+  id?: string;
+  method?: "api_key" | "oauth";
+}
 
 export interface RequestAuthIdentity {
   authMethod?: string;

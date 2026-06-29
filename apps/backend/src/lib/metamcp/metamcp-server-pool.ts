@@ -4,11 +4,16 @@ import logger from "@/utils/logger";
 
 import { configService } from "../config.service";
 import { mcpServerPool } from "./mcp-server-pool";
+import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middleware";
 import { createServer } from "./metamcp-proxy";
 
 export interface MetaMcpServerInstance {
   server: Server;
   cleanup: () => Promise<void>;
+  // The proxy's handler context. The router stamps `clientName` onto it after
+  // acquiring the instance so the audit middleware can attribute tool calls to
+  // the calling consumer (see metamcp-proxy.createServer return).
+  handlerContext: MetaMCPHandlerContext;
 }
 
 export interface MetaMcpServerPoolStatus {
@@ -205,6 +210,7 @@ export class MetaMcpServerPool {
       this.idleServers[namespaceUuid] = {
         server: newServer.server,
         cleanup: newServer.cleanup,
+        handlerContext: newServer.handlerContext,
       };
       logger.info(`Created idle MetaMCP server for namespace ${namespaceUuid}`);
     } finally {
@@ -242,6 +248,7 @@ export class MetaMcpServerPool {
           const wrappedServer: MetaMcpServerInstance = {
             server: newServer.server,
             cleanup: newServer.cleanup,
+            handlerContext: newServer.handlerContext,
           };
           this.idleServers[namespaceUuid] = wrappedServer;
           logger.info(

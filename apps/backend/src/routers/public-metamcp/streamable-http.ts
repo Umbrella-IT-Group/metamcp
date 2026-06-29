@@ -25,7 +25,6 @@ import {
   hashAuthPrincipal,
   principalMatches,
 } from "../../lib/metamcp/session-auth";
-import { setSessionClientIdentity } from "../../lib/metamcp/session-client-registry";
 import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
@@ -213,6 +212,11 @@ async function recoverPersistedSession(
     );
     return { status: "not_found" };
   }
+  // Re-stamp the consumer identity onto the rebuilt instance's context so
+  // post-restart tool calls stay attributed (the registry/in-memory state is
+  // gone after a restart; authReq is the re-validated current caller).
+  const recoveredIdentity = await resolveClientIdentity(authReq);
+  mcpServerInstance.handlerContext.clientName = recoveredIdentity?.name;
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
     onsessioninitialized: async (sid) => {
@@ -497,12 +501,6 @@ streamableHttpRouter.post(
           `Generated new session ID: ${newSessionId} for endpoint: ${endpointName}`,
         );
 
-        // Register the consumer identity for this session so tool_call logs
-        // can show who's calling (audit middleware reads it by sessionId).
-        if (clientIdentity) {
-          setSessionClientIdentity(newSessionId, clientIdentity);
-        }
-
         // Get or create MetaMCP server instance from the pool
         const mcpServerInstance = await metaMcpServerPool.getServer(
           newSessionId,
@@ -511,6 +509,12 @@ streamableHttpRouter.post(
         if (!mcpServerInstance) {
           throw new Error("Failed to get MetaMCP server instance from pool");
         }
+
+        // Stamp the calling consumer onto the (possibly idle-warmed) instance's
+        // handler context so the audit middleware attributes tool calls to it.
+        // Idle servers carry a placeholder sessionId, so we can't key by
+        // sessionId — we set it directly on the instance we just acquired.
+        mcpServerInstance.handlerContext.clientName = clientIdentity?.name;
 
         logger.info(
           `Using MetaMCP server instance for public endpoint session ${newSessionId} (endpoint: ${endpointName})`,
@@ -615,12 +619,6 @@ streamableHttpRouter.post(
       logger.info(`Available session IDs:`, sessionManager.getSessionIds());
       logger.info(`Looking for sessionId: ${sessionId}`);
       try {
-        // Refresh the consumer identity for this session on every request so
-        // it survives a metamcp restart (lazy-recovered sessions repopulate it
-        // here on their first post-restart call).
-        if (clientIdentity) {
-          setSessionClientIdentity(sessionId, clientIdentity);
-        }
         logger.info(`Looking up existing session: ${sessionId}`);
         logger.info(`Available sessions:`, sessionManager.getSessionIds());
 

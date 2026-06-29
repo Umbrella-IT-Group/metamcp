@@ -1223,5 +1223,10 @@ export const createServer = async (
     await mcpServerPool.cleanupSession(sessionId);
   };
 
-  return { server, cleanup };
+  // Expose handlerContext so the caller can stamp the consumer identity onto
+  // it AFTER acquiring the (possibly idle-warmed) instance. The handler
+  // closures read context.clientName by reference at call time, so a late set
+  // is seen by the audit middleware — this is how the Streamable-HTTP path
+  // attaches "who" without the pool knowing the consumer at warm time.
+  return { server, cleanup, handlerContext };
 };
