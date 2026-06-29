@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const MetaMcpLogCategorySchema = z.enum([
   "connection",
+  "client",
   "tool_call",
   "server",
   "system",
@@ -17,6 +18,7 @@ export const MetaMcpLogEntrySchema = z.object({
   message: z.string(),
   toolName: z.string().optional(),
   durationMs: z.number().optional(),
+  clientName: z.string().optional(),
   error: z.string().optional(),
 });
 

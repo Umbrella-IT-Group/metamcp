@@ -32,6 +32,13 @@ const CATEGORIES = [
     dot: "bg-emerald-400",
   },
   {
+    key: "client",
+    tag: "CLIENT",
+    label: "Client sessions",
+    text: "text-fuchsia-400",
+    dot: "bg-fuchsia-400",
+  },
+  {
     key: "connection",
     tag: "CONN",
     label: "Connections",
@@ -266,6 +273,11 @@ export default function LiveLogsPage() {
                         <span className={messageColor(log.level)}>
                           {log.message}
                         </span>
+                        {log.clientName && (
+                          <span className="text-cyan-300 ml-2">
+                            ← {log.clientName}
+                          </span>
+                        )}
                         {log.error && (
                           <span className="text-red-400 ml-2">
                             — {log.error}

@@ -324,11 +324,16 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
 export const createMiddlewareEnabledHandlers = (
   sessionId: string,
   namespaceUuid: string,
+  clientName?: string,
 ) => {
-  // Create the handler context
+  // Create the handler context. OpenAPI is stateless (one deterministic
+  // sessionId per namespace shared across consumers), so the calling
+  // consumer's identity rides the per-call context here rather than the
+  // session registry — no cross-consumer race.
   const handlerContext: MetaMCPHandlerContext = {
     namespaceUuid,
     sessionId,
+    clientName,
   };
 
   // Create original handlers

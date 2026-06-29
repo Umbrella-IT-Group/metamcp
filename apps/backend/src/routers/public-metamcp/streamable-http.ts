@@ -12,17 +12,20 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
+import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
   shouldRefuseRecovery,
 } from "../../lib/metamcp/gateway-boot-id";
+import { metamcpLogStore } from "../../lib/metamcp/log-store";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
   AuthMethod,
   hashAuthPrincipal,
   principalMatches,
 } from "../../lib/metamcp/session-auth";
+import { setSessionClientIdentity } from "../../lib/metamcp/session-client-registry";
 import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
@@ -228,12 +231,14 @@ async function recoverPersistedSession(
   if (!hydrateRecoveredTransport(transport, sessionId)) {
     // SDK internal shape changed — don't cache a transport we can't
     // prove is serviceable. Fall back to the 404 reinit path.
-    await transport.close().catch((error: unknown) =>
-      logger.warn(
-        `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
-        error,
-      ),
-    );
+    await transport
+      .close()
+      .catch((error: unknown) =>
+        logger.warn(
+          `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
+          error,
+        ),
+      );
     return { status: "not_found" };
   }
   sessionManager.addSession(sessionId, transport);
@@ -474,6 +479,12 @@ streamableHttpRouter.post(
     logger.info(`Authentication method: ${authReq.authMethod || "none"}`);
     logger.info(`Session ID: ${sessionId || "new session"}`);
 
+    // Resolve the calling consumer once (api-key name / OAuth user email) so
+    // the audit middleware + client-connect event can show WHO. Registered
+    // against the per-consumer sessionId below (per branch) for the middleware
+    // to read via the session-client registry.
+    const clientIdentity = await resolveClientIdentity(authReq);
+
     if (!sessionId) {
       try {
         logger.info(
@@ -485,6 +496,12 @@ streamableHttpRouter.post(
         logger.info(
           `Generated new session ID: ${newSessionId} for endpoint: ${endpointName}`,
         );
+
+        // Register the consumer identity for this session so tool_call logs
+        // can show who's calling (audit middleware reads it by sessionId).
+        if (clientIdentity) {
+          setSessionClientIdentity(newSessionId, clientIdentity);
+        }
 
         // Get or create MetaMCP server instance from the pool
         const mcpServerInstance = await metaMcpServerPool.getServer(
@@ -505,6 +522,15 @@ streamableHttpRouter.post(
           onsessioninitialized: async (sessionId) => {
             try {
               logger.info(`Session initialized for sessionId: ${sessionId}`);
+              // Client-facing session open — distinct from the gateway→backend
+              // connection events in client.ts. This is the "who connected".
+              metamcpLogStore.record({
+                category: "client",
+                serverName: endpointName,
+                level: "info",
+                message: "client connected",
+                clientName: clientIdentity?.name,
+              });
             } catch (error) {
               logger.error(
                 `Error initializing public endpoint session ${sessionId}:`,
@@ -589,6 +615,12 @@ streamableHttpRouter.post(
       logger.info(`Available session IDs:`, sessionManager.getSessionIds());
       logger.info(`Looking for sessionId: ${sessionId}`);
       try {
+        // Refresh the consumer identity for this session on every request so
+        // it survives a metamcp restart (lazy-recovered sessions repopulate it
+        // here on their first post-restart call).
+        if (clientIdentity) {
+          setSessionClientIdentity(sessionId, clientIdentity);
+        }
         logger.info(`Looking up existing session: ${sessionId}`);
         logger.info(`Available sessions:`, sessionManager.getSessionIds());
 

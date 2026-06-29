@@ -3,6 +3,7 @@ import express from "express";
 
 import logger from "@/utils/logger";
 
+import { resolveClientIdentity } from "../../../lib/metamcp/consumer-identity-resolver";
 import { metaMcpServerPool } from "../../../lib/metamcp/metamcp-server-pool";
 import { createMiddlewareEnabledHandlers } from "./handlers";
 import { ToolExecutionRequest } from "./types";
@@ -27,9 +28,17 @@ export const executeToolWithMiddleware = async (
     // Use deterministic session ID for OpenAPI endpoints
     const sessionId = `openapi_${namespaceUuid}`;
 
+    // Resolve the calling consumer (api-key name / OAuth user) so the
+    // tool_call log shows WHO called it. Carried on the per-call context.
+    const clientIdentity = await resolveClientIdentity(req);
+
     // Create middleware-enabled handlers
     const { handlerContext, callToolWithMiddleware } =
-      createMiddlewareEnabledHandlers(sessionId, namespaceUuid);
+      createMiddlewareEnabledHandlers(
+        sessionId,
+        namespaceUuid,
+        clientIdentity?.name,
+      );
 
     // Use middleware-enabled call tool handler
     const callToolRequest: CallToolRequest = {

@@ -9,6 +9,13 @@ import {
 export interface MetaMCPHandlerContext {
   namespaceUuid: string;
   sessionId: string;
+  // Authenticated consumer driving this request, when known at context-build
+  // time (the OpenAPI bridge sets it per-call). The Streamable-HTTP path builds
+  // its context at idle-warm time before any client exists, so it leaves this
+  // undefined and the audit middleware falls back to the session-client
+  // registry keyed by sessionId.
+  clientName?: string;
+  clientId?: string;
 }
 
 // Handler function types

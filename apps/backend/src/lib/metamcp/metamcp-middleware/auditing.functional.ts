@@ -1,4 +1,5 @@
 import { metamcpLogStore } from "../log-store";
+import { getSessionClientIdentity } from "../session-client-registry";
 import { parseToolName } from "../tool-name-parser";
 import { CallToolMiddleware } from "./functional-middleware";
 
@@ -25,6 +26,11 @@ export function createAuditingMiddleware(): CallToolMiddleware {
     // call arrives without the gateway prefix.
     const serverName = parsed?.serverName ?? "unknown";
     const toolName = parsed?.originalToolName ?? fullName;
+    // Who is calling. OpenAPI sets it on the per-call context (race-free);
+    // Streamable-HTTP carries it in the session-client registry keyed by the
+    // per-consumer sessionId.
+    const clientName =
+      context.clientName ?? getSessionClientIdentity(context.sessionId)?.name;
 
     try {
       const result = await handler(request, context);
@@ -36,6 +42,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         message: `${toolName} (${durationMs}ms)`,
         toolName,
         durationMs,
+        clientName,
       });
       return result;
     } catch (error) {
@@ -47,6 +54,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         message: `${toolName} failed (${durationMs}ms)`,
         toolName,
         durationMs,
+        clientName,
         error,
       });
       throw error;

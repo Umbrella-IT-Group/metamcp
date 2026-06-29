@@ -1,13 +1,15 @@
 import logger from "@/utils/logger";
 
 // Event class for a log entry. Lets the Live Logs view show real activity
-// (connections, tool calls) and filter by kind — not just connection errors.
-//   connection — backend connect attempt / success / transport drop
+// (connections, tool calls, who's connecting) and filter by kind.
+//   connection — gateway↔backend connect attempt / success / transport drop
+//   client     — a CONSUMER (claude.ai/Tara/n8n) opened a session at an endpoint
 //   tool_call  — a tools/call proxied to a backend (name, duration, ok/fail)
 //   server     — backend-emitted output (stderr) or a server config error
 //   system     — gateway lifecycle / pool events
 export type MetaMcpLogCategory =
   | "connection"
+  | "client"
   | "tool_call"
   | "server"
   | "system";
@@ -22,6 +24,10 @@ export interface MetaMcpLogEntry {
   message: string;
   toolName?: string;
   durationMs?: number;
+  // The authenticated consumer that drove this event (api-key name or OAuth
+  // user email). Present on tool_call + client events; absent on internal
+  // gateway↔backend connection/server events (no consumer involved).
+  clientName?: string;
   error?: string;
 }
 
@@ -51,6 +57,7 @@ class MetaMcpLogStore {
     serverUuid?: string;
     toolName?: string;
     durationMs?: number;
+    clientName?: string;
     error?: unknown;
   }): void {
     const logEntry: MetaMcpLogEntry = {
@@ -63,6 +70,7 @@ class MetaMcpLogStore {
       message: entry.message,
       toolName: entry.toolName,
       durationMs: entry.durationMs,
+      clientName: entry.clientName,
       error: normalizeError(entry.error),
     };
 
@@ -73,7 +81,8 @@ class MetaMcpLogStore {
 
     // Mirror to stdout — Promtail ships this to Loki/Grafana, the durable
     // system of record. The in-memory store is the fast, ephemeral view.
-    const fullMessage = `[MetaMCP][${entry.category}][${entry.serverName}] ${entry.message}`;
+    const who = entry.clientName ? ` ← ${entry.clientName}` : "";
+    const fullMessage = `[MetaMCP][${entry.category}][${entry.serverName}] ${entry.message}${who}`;
     switch (entry.level) {
       case "error":
         logger.error(fullMessage, entry.error || "");
