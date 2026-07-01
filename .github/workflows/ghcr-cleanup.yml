@@ -1,0 +1,33 @@
+name: GHCR cleanup
+
+# Manual-only retention sweep for this fork's GHCR packages. No schedule —
+# fire it by hand when the package listing gets noisy. Defaults to a
+# dry-run and keeps a generous 20 tagged versions per package so it can't
+# touch the `:latest` pointer that mcp-host-prod's compose fragment pulls
+# (see Umbrella-MCP-Server/metamcp/compose.fragment.yml). See
+# UMBRELLA_FORK.md for context on the two packages this repo pushes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only"
+        type: boolean
+        default: true
+
+permissions:
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          owner: Umbrella-IT-Group
+          packages: metamcp,metamcp-docker-per-mcp
+          delete-untagged: true
+          keep-n-tagged: 20
+          exclude-tags: latest
+          dry-run: ${{ inputs.dry_run }}
+          token: ${{ secrets.GITHUB_TOKEN }}

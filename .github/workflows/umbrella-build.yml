@@ -9,9 +9,36 @@ on:
   push:
     branches:
       - umbrella
+    # Only rebuild when something that actually feeds the Docker image
+    # changes. Cross-checked against every Dockerfile COPY + the turbo
+    # pipeline's globalDependencies (none outside apps/**, packages/**).
+    # Docs (*.md, docs/**) are also .dockerignore'd, so they never touch
+    # the build output either.
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - ".dockerignore"
+      - ".github/workflows/umbrella-build.yml"
   pull_request:
     branches:
       - umbrella
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - ".dockerignore"
+      - ".github/workflows/umbrella-build.yml"
   workflow_dispatch:
 
 env:
@@ -64,8 +91,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=metamcp-umbrella
+          cache-to: type=gha,mode=max,scope=metamcp-umbrella
 
       - uses: actions/attest-build-provenance@v1
         with:
