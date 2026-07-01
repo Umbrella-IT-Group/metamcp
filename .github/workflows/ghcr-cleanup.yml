@@ -25,7 +25,7 @@ jobs:
       - uses: dataaxiom/ghcr-cleanup-action@v1
         with:
           owner: Umbrella-IT-Group
-          packages: metamcp,metamcp-docker-per-mcp
+          packages: metamcp
           delete-untagged: true
           keep-n-tagged: 20
           exclude-tags: latest
