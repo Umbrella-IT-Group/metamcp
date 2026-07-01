@@ -5,7 +5,7 @@ name: GHCR cleanup
 # dry-run and keeps a generous 20 tagged versions per package so it can't
 # touch the `:latest` pointer that mcp-host-prod's compose fragment pulls
 # (see Umbrella-MCP-Server/metamcp/compose.fragment.yml). See
-# UMBRELLA_FORK.md for context on the two packages this repo pushes.
+# UMBRELLA_FORK.md for context on the `metamcp` package this repo pushes.
 
 on:
   workflow_dispatch:
