@@ -44,8 +44,14 @@ import {
 } from "../lib/m365/config";
 import { constantTimeEquals, encryptRefreshToken } from "../lib/m365/crypto";
 import { m365MintService } from "../lib/m365/mint-service";
+import { securityHeaders } from "./oauth/utils";
 
 const m365Router = express.Router();
+
+// Same header hardening the sibling oauthRouter applies (X-Frame-Options,
+// nosniff, referrer policy) — these routes render HTML on a
+// session-cookie-bearing origin.
+m365Router.use(securityHeaders);
 
 // ---------------------------------------------------------------------------
 // PKCE + state store (in-process; single-container deployment)
@@ -110,12 +116,39 @@ function notConfiguredResponse(res: express.Response): void {
   });
 }
 
-/** Tiny self-contained HTML page (no external assets). */
-function htmlPage(title: string, body: string): string {
-  return `<!DOCTYPE html>
+/**
+ * HTML-escape a value before interpolation into a page. Every dynamic
+ * value rendered by these routes (Entra error strings, UPNs, emails)
+ * MUST pass through this — `/m365/callback?error=...` is reachable
+ * pre-auth, so unescaped interpolation is reflected XSS on a
+ * session-cookie-bearing origin.
+ */
+export function escapeHtml(value: unknown): string {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Tiny self-contained HTML page (no external assets). Callers must
+ * escape dynamic values via `escapeHtml` — titles here are static. */
+function sendHtml(
+  res: express.Response,
+  status: number,
+  title: string,
+  body: string,
+): void {
+  // Belt-and-braces beyond escaping: no scripts, no external loads.
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; style-src 'unsafe-inline'",
+  );
+  res.status(status).send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>${title}</title>
 <style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1a1a2e}h1{font-size:1.4rem}code{background:#f0f0f5;padding:.1rem .3rem;border-radius:4px}</style>
-</head><body><h1>${title}</h1>${body}</body></html>`;
+</head><body><h1>${title}</h1>${body}</body></html>`);
 }
 
 // ---------------------------------------------------------------------------
@@ -173,26 +206,22 @@ m365Router.get("/m365/callback", async (req, res) => {
     logger.warn(
       `M365 broker: Entra returned error on callback: ${error} — ${error_description}`,
     );
-    res
-      .status(400)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          `<p>Microsoft reported: <code>${error}</code>.</p><p>Close this tab and start again from <code>/m365/enroll</code>.</p>`,
-        ),
-      );
+    sendHtml(
+      res,
+      400,
+      "Microsoft 365 connection failed",
+      `<p>Microsoft reported: <code>${escapeHtml(error)}</code>.</p><p>Close this tab and start again from <code>/m365/enroll</code>.</p>`,
+    );
     return;
   }
 
   if (!code || !state) {
-    res
-      .status(400)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          "<p>Missing authorization code or state. Start again from <code>/m365/enroll</code>.</p>",
-        ),
-      );
+    sendHtml(
+      res,
+      400,
+      "Microsoft 365 connection failed",
+      "<p>Missing authorization code or state. Start again from <code>/m365/enroll</code>.</p>",
+    );
     return;
   }
 
@@ -207,14 +236,12 @@ m365Router.get("/m365/callback", async (req, res) => {
     }
   }
   if (!pending) {
-    res
-      .status(400)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          "<p>This enrollment link expired or was already used. Start again from <code>/m365/enroll</code>.</p>",
-        ),
-      );
+    sendHtml(
+      res,
+      400,
+      "Microsoft 365 connection failed",
+      "<p>This enrollment link expired or was already used. Start again from <code>/m365/enroll</code>.</p>",
+    );
     return;
   }
 
@@ -226,14 +253,12 @@ m365Router.get("/m365/callback", async (req, res) => {
     logger.warn(
       `M365 broker: callback session mismatch (flow user ${pending.userId}, session user ${user?.id ?? "none"})`,
     );
-    res
-      .status(403)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          "<p>Your gateway session changed during enrollment. Sign in and start again from <code>/m365/enroll</code>.</p>",
-        ),
-      );
+    sendHtml(
+      res,
+      403,
+      "Microsoft 365 connection failed",
+      "<p>Your gateway session changed during enrollment. Sign in and start again from <code>/m365/enroll</code>.</p>",
+    );
     return;
   }
 
@@ -263,14 +288,12 @@ m365Router.get("/m365/callback", async (req, res) => {
     tokenBody = (await tokenResponse.json()) as typeof tokenBody;
   } catch (fetchError) {
     logger.error("M365 broker: code exchange fetch failed:", fetchError);
-    res
-      .status(502)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          "<p>Could not reach the Microsoft identity platform. Try again shortly.</p>",
-        ),
-      );
+    sendHtml(
+      res,
+      502,
+      "Microsoft 365 connection failed",
+      "<p>Could not reach the Microsoft identity platform. Try again shortly.</p>",
+    );
     return;
   }
 
@@ -278,18 +301,16 @@ m365Router.get("/m365/callback", async (req, res) => {
     logger.error(
       `M365 broker: code exchange rejected for user ${user.id}: ${tokenBody.error} — ${tokenBody.error_description?.split("\n")[0]}`,
     );
-    res
-      .status(400)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          `<p>The code exchange was rejected${tokenBody.error ? ` (<code>${tokenBody.error}</code>)` : ""}. ${
-            tokenBody.refresh_token
-              ? ""
-              : "No refresh token was issued — check that <code>offline_access</code> is consented."
-          }</p>`,
-        ),
-      );
+    sendHtml(
+      res,
+      400,
+      "Microsoft 365 connection failed",
+      `<p>The code exchange was rejected${tokenBody.error ? ` (<code>${escapeHtml(tokenBody.error)}</code>)` : ""}. ${
+        tokenBody.refresh_token
+          ? ""
+          : "No refresh token was issued — check that <code>offline_access</code> is consented."
+      }</p>`,
+    );
     return;
   }
 
@@ -317,6 +338,38 @@ m365Router.get("/m365/callback", async (req, res) => {
     );
   }
 
+  // Audit-visibility: a re-enrollment that lands on a DIFFERENT
+  // Microsoft account than the one previously stored is legal (the
+  // user may genuinely switch accounts) but worth a loud trace — it is
+  // the account-grafting shape the session⇄state binding defends
+  // against, so log when it happens through the legitimate path too.
+  try {
+    const existing = await m365TokensRepository.findByUserId(user.id);
+    if (
+      existing &&
+      existing.entra_oid &&
+      entraOid &&
+      existing.entra_oid !== entraOid
+    ) {
+      logger.warn(
+        `M365 broker: re-enrollment for user ${user.id} switched Microsoft accounts (oid ${existing.entra_oid} → ${entraOid}, upn ${existing.entra_upn ?? "?"} → ${entraUpn ?? "?"})`,
+      );
+      logger.info(
+        JSON.stringify({
+          event: "m365_enroll_account_switch",
+          user_id: user.id,
+          previous_oid: existing.entra_oid,
+          new_oid: entraOid,
+        }),
+      );
+    }
+  } catch (lookupError) {
+    logger.warn(
+      `M365 broker: pre-enrollment row lookup failed for user ${user.id} (continuing):`,
+      lookupError,
+    );
+  }
+
   try {
     await m365TokensRepository.upsertEnrollment({
       user_id: user.id,
@@ -336,14 +389,12 @@ m365Router.get("/m365/callback", async (req, res) => {
       `M365 broker: failed to persist enrollment for user ${user.id}:`,
       dbError,
     );
-    res
-      .status(500)
-      .send(
-        htmlPage(
-          "Microsoft 365 connection failed",
-          "<p>The gateway could not store your credential. The operator has been signaled in logs.</p>",
-        ),
-      );
+    sendHtml(
+      res,
+      500,
+      "Microsoft 365 connection failed",
+      "<p>The gateway could not store your credential. The operator has been signaled in logs.</p>",
+    );
     return;
   }
 
@@ -359,11 +410,11 @@ m365Router.get("/m365/callback", async (req, res) => {
       outcome: "connected",
     }),
   );
-  res.send(
-    htmlPage(
-      "Microsoft 365 connected",
-      `<p>Your Microsoft 365 account${entraUpn ? ` (<code>${entraUpn}</code>)` : ""} is now connected for <code>${user.email}</code>.</p><p>You can close this tab and return to Claude — retry the tool call that sent you here.</p>`,
-    ),
+  sendHtml(
+    res,
+    200,
+    "Microsoft 365 connected",
+    `<p>Your Microsoft 365 account${entraUpn ? ` (<code>${escapeHtml(entraUpn)}</code>)` : ""} is now connected for <code>${escapeHtml(user.email)}</code>.</p><p>You can close this tab and return to Claude — retry the tool call that sent you here.</p>`,
   );
 });
 

@@ -35,7 +35,11 @@ vi.mock("../config.service", () => ({
   },
 }));
 
-import { computeReconnectBackoffMs, ListChangedSubscriber } from "./client";
+import {
+  computeReconnectBackoffMs,
+  createMetaMcpClient,
+  ListChangedSubscriber,
+} from "./client";
 
 /**
  * Build a Client/Server pair via InMemoryTransport and install the
@@ -229,5 +233,78 @@ describe("computeReconnectBackoffMs — exponential backoff schedule", () => {
     } finally {
       randomSpy.mockRestore();
     }
+  });
+});
+
+describe("createMetaMcpClient — STREAMABLE_HTTP transport option wiring", () => {
+  // The M365 injected-fetch wiring restructured this branch; these
+  // cases pin the four header/injection combinations so non-injected
+  // servers provably keep their pre-change transport shape. Reading
+  // SDK privates (_requestInit/_fetch) follows the precedent set by
+  // transport-recovery-hydration.ts.
+  const baseParams = {
+    uuid: "srv-uuid",
+    name: "some-server",
+    description: "",
+    type: "STREAMABLE_HTTP",
+    url: "http://backend:3000/mcp",
+    created_at: new Date().toISOString(),
+    status: "active",
+  };
+  const asParams = (over: Record<string, unknown>) =>
+    ({ ...baseParams, ...over }) as never;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  function transportInternals(params: Record<string, unknown>) {
+    const { client, transport } = createMetaMcpClient(asParams(params));
+    expect(client).toBeDefined();
+    expect(transport).toBeDefined();
+    const internals = transport as unknown as {
+      _requestInit?: RequestInit;
+      _fetch?: unknown;
+    };
+    return internals;
+  }
+
+  it("no headers, non-injected server: no requestInit, no custom fetch", () => {
+    vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
+    const internals = transportInternals({ name: "autotask" });
+    expect(internals._requestInit).toBeUndefined();
+    expect(internals._fetch).toBeUndefined();
+  });
+
+  it("bearer/header server, non-injected: requestInit carries auth, no custom fetch", () => {
+    vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
+    const internals = transportInternals({
+      name: "autotask",
+      bearerToken: "static-token",
+      headers: { "X-Custom": "yes" },
+    });
+    const headers = internals._requestInit?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer static-token");
+    expect(headers["X-Custom"]).toBe("yes");
+    expect(internals._fetch).toBeUndefined();
+  });
+
+  it("injected server: custom fetch installed even with no headers", () => {
+    vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
+    const internals = transportInternals({ name: "m365" });
+    expect(internals._requestInit).toBeUndefined();
+    expect(typeof internals._fetch).toBe("function");
+  });
+
+  it("injected server with headers: both requestInit and custom fetch present", () => {
+    vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
+    const internals = transportInternals({
+      name: "m365",
+      headers: { "X-Custom": "yes" },
+    });
+    expect(
+      (internals._requestInit?.headers as Record<string, string>)["X-Custom"],
+    ).toBe("yes");
+    expect(typeof internals._fetch).toBe("function");
   });
 });

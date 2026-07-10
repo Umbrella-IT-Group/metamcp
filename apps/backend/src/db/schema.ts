@@ -566,7 +566,9 @@ export const m365UserTokensTable = pgTable(
       .unique()
       .references(() => usersTable.id, { onDelete: "cascade" }),
     // Entra object id + tenant of the enrolled account — audit surface
-    // and a guard against cross-account enrollment confusion.
+    // only (not enforced): a re-enrollment overwrites them, and the
+    // callback route logs an m365_enroll_account_switch event when the
+    // oid changes rather than blocking the legitimate account switch.
     entra_oid: text("entra_oid").notNull(),
     tenant_id: text("tenant_id").notNull(),
     entra_upn: text("entra_upn"),

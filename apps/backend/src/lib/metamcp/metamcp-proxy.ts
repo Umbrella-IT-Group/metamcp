@@ -763,6 +763,12 @@ export const createServer = async (
       // isError tool result carrying the enrollment URL (+ best-effort
       // SEP-1036 URL elicitation) instead of an opaque -32603 so the
       // consumer can actually resolve it. See design doc §4.3.
+      //
+      // Deliberately tools/call-only: the m365 backends (softeria
+      // scaffold, then servers/m365) expose tools exclusively, and
+      // their list/discovery requests run unauthenticated by design —
+      // the other handlers can never hit a mint. Revisit if an
+      // injected server ever grows prompts/resources.
       if (isM365BrokerError(error)) {
         return buildM365BrokerErrorResult(error, server);
       }
