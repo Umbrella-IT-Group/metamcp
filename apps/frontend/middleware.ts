@@ -54,6 +54,12 @@ export async function middleware(request: NextRequest) {
     pathname.startsWith("/service") ||
     pathname.startsWith("/health") ||
     pathname.startsWith("/fe-oauth") ||
+    // Umbrella fork: M365 broker routes live on the backend behind a
+    // next.config.js rewrite; without this skip the i18n branch 307s
+    // /m365/* to /en/m365/* before the rewrite runs (Entra redirects
+    // to the EXACT registered callback URI, so that redirect breaks
+    // enrollment).
+    pathname.startsWith("/m365") ||
     pathname.includes(".")
   ) {
     return NextResponse.next();
@@ -127,6 +133,6 @@ export async function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     // Skip all internal paths (_next, etc.)
-    "/((?!_next|api/|trpc|mcp-proxy|metamcp|oauth|fe-oauth|\\.well-known|service|health|.*\\..*).*)",
+    "/((?!_next|api/|trpc|mcp-proxy|metamcp|oauth|fe-oauth|\\.well-known|service|health|m365|.*\\..*).*)",
   ],
 };
