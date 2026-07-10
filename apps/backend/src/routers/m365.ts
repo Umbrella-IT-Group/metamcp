@@ -5,8 +5,10 @@
  *   GET  /m365/callback   Entra redirect target (code exchange + store)
  *   GET  /m365/status     connection status for the signed-in user
  *   POST /m365/disconnect delete the stored grant (user-side revocation)
- *   GET  /m365/me         TEMP: mint + Graph /me echo (live e2e check;
- *                         remove after the PR 2 pilot drills)
+ *
+ * (The TEMP GET /m365/me mint-and-echo route used for the pilot's live
+ * e2e checks was removed 2026-07-10 once the soak board's P1 gate
+ * cleared — verification now goes through the real MCP tool surface.)
  *
  * All routes are better-auth SESSION-gated: the browser must hold a
  * signed-in gateway session (Entra SSO or email/password). `/enroll`
@@ -457,46 +459,6 @@ m365Router.post("/m365/disconnect", async (req, res) => {
   // grant unusable BY THIS GATEWAY immediately; org-side kill switch is
   // Entra account disable / revokeSignInSessions (design doc §5.6).
   res.json({ disconnected: deleted });
-});
-
-// TEMPORARY live e2e check for the morning gate: proves session →
-// stored grant → mint → Graph round-trip without any MCP machinery.
-// Remove with the PR 2 pilot drills.
-m365Router.get("/m365/me", async (req, res) => {
-  if (!isM365BrokerConfigured()) return notConfiguredResponse(res);
-  const user = await getSessionUser(req);
-  if (!user) {
-    res.status(401).json({ error: "authentication_required" });
-    return;
-  }
-  try {
-    const accessToken = await m365MintService.getAccessToken(user.id);
-    const graphResponse = await fetch(
-      "https://graph.microsoft.com/v1.0/me?$select=displayName,userPrincipalName,mail",
-      { headers: { Authorization: `Bearer ${accessToken}` } },
-    );
-    const profile = (await graphResponse.json()) as Record<string, unknown>;
-    res.status(graphResponse.ok ? 200 : 502).json({
-      graph_status: graphResponse.status,
-      profile,
-    });
-  } catch (error) {
-    const isBroker = error instanceof Error && error.name === "M365BrokerError";
-    const code = isBroker
-      ? (error as { code?: string }).code
-      : "internal_error";
-    const enrollUrl = isBroker
-      ? (error as { enrollUrl?: string }).enrollUrl
-      : undefined;
-    if (!isBroker) {
-      logger.error("M365 broker: /m365/me failed unexpectedly:", error);
-    }
-    res.status(isBroker ? 409 : 500).json({
-      error: code,
-      message: error instanceof Error ? error.message : String(error),
-      ...(enrollUrl ? { enroll_url: enrollUrl } : {}),
-    });
-  }
 });
 
 export default m365Router;
