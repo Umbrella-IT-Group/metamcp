@@ -8,6 +8,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
@@ -226,13 +227,20 @@ export const createMetaMcpClient = (
 
     const hasHeaders = Object.keys(headers).length > 0;
 
-    if (!hasHeaders) {
+    // M365 delegated broker: servers configured for per-user Graph
+    // token injection get a custom fetch that stamps a freshly minted
+    // per-user Authorization onto EVERY outgoing request (and strips
+    // any connection-level credential). Request-scoped — survives pool
+    // idle-handoff/cap-reuse without cross-user token leakage. See
+    // `lib/m365/injected-fetch.ts` for the invariant.
+    const injectedFetch = getInjectedFetchForServer(serverParams.name);
+
+    if (!hasHeaders && !injectedFetch) {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl));
     } else {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
-        requestInit: {
-          headers,
-        },
+        ...(hasHeaders ? { requestInit: { headers } } : {}),
+        ...(injectedFetch ? { fetch: injectedFetch } : {}),
       });
     }
   } else {

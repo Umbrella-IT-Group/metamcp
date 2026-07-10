@@ -12,6 +12,7 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
+import { runWithM365UserContext } from "../../lib/m365/request-context";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
   GATEWAY_BOOT_ID,
@@ -38,6 +39,32 @@ const sessionManager =
   new SessionLifetimeManagerImpl<StreamableHTTPServerTransport>(
     "StreamableHTTP",
   );
+
+/**
+ * Dispatch a transport request inside the M365 request-scoped user
+ * context (AsyncLocalStorage). For OAuth-authenticated consumers the
+ * context carries their better-auth user id down through the proxy and
+ * pooled backend client into the M365 injected fetch, which mints and
+ * stamps that user's Graph access token onto the backend request. For
+ * API-key consumers (no per-user M365 identity) the dispatch runs with
+ * NO context, so the injected fetch fail-closes (no Authorization
+ * header) rather than ever acting as someone. No-op for servers without
+ * delegated injection. See `lib/m365/request-context.ts`.
+ */
+function handleRequestWithUserContext(
+  authReq: ApiKeyAuthenticatedRequest,
+  transport: StreamableHTTPServerTransport,
+  req: express.Request,
+  res: express.Response,
+): Promise<void> {
+  const context =
+    authReq.authMethod === "oauth" && authReq.oauthUserId
+      ? { userId: authReq.oauthUserId }
+      : undefined;
+  return runWithM365UserContext(context, () =>
+    transport.handleRequest(req, res),
+  );
+}
 
 /**
  * Map the auth method recorded by the middleware (`api_key` | `oauth`)
@@ -460,7 +487,7 @@ streamableHttpRouter.get(
         }
       }
       logger.info(`Handling GET for session ${sessionId}`);
-      await transport.handleRequest(req, res);
+      await handleRequestWithUserContext(authReq, transport, req, res);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
       res.status(500).json(error);
@@ -598,7 +625,7 @@ streamableHttpRouter.post(
         }
 
         // Now handle the request - server is guaranteed to be ready
-        await transport.handleRequest(req, res);
+        await handleRequestWithUserContext(authReq, transport, req, res);
       } catch (error) {
         logger.error("Error in public endpoint /mcp POST route:", error);
 
@@ -682,7 +709,7 @@ streamableHttpRouter.post(
           }
         }
         logger.info(`Handling POST for session ${sessionId}`);
-        await transport.handleRequest(req, res);
+        await handleRequestWithUserContext(authReq, transport, req, res);
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);
 

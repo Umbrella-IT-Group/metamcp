@@ -542,3 +542,43 @@ export const mcpSessionsTable = pgTable(
     index("mcp_sessions_namespace_uuid_idx").on(table.namespace_uuid),
   ],
 );
+
+// M365 delegated-token broker: per-user Entra refresh-token custody.
+//
+// One row per enrolled gateway user. `rt_ciphertext` is an
+// AES-256-GCM envelope (`lib/m365/crypto.ts`) — plaintext refresh
+// tokens are NEVER stored (deliberately separate from better-auth's
+// `accounts` table, which persists provider tokens unencrypted).
+// `kek_id` mirrors the envelope header for SQL-side visibility during
+// KEK rotation. Row deletion cascades with the user (FK) and is the
+// primary revocation surface (`/m365/disconnect`); Entra-side disable /
+// revokeSignInSessions is the org kill switch. `status` values:
+// `active`, `reauth_required` (refresh grant rejected — row kept for
+// audit, mint path treats it as missing).
+export const m365UserTokensTable = pgTable(
+  "m365_user_tokens",
+  {
+    uuid: uuid("uuid")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    user_id: text("user_id")
+      .notNull()
+      .unique()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    // Entra object id + tenant of the enrolled account — audit surface
+    // and a guard against cross-account enrollment confusion.
+    entra_oid: text("entra_oid").notNull(),
+    tenant_id: text("tenant_id").notNull(),
+    entra_upn: text("entra_upn"),
+    rt_ciphertext: text("rt_ciphertext").notNull(),
+    kek_id: text("kek_id").notNull(),
+    scopes_granted: text("scopes_granted").notNull(),
+    status: text("status").notNull().default("active"),
+    created_at: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    rotated_at: timestamp("rotated_at", { withTimezone: true }),
+    last_used_at: timestamp("last_used_at", { withTimezone: true }),
+  },
+  (table) => [index("m365_user_tokens_status_idx").on(table.status)],
+);

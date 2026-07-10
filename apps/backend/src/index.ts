@@ -3,6 +3,7 @@ import express from "express";
 import { auth } from "./auth";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
+import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
 import publicEndpointsRouter from "./routers/public-metamcp";
@@ -74,6 +75,11 @@ app.use(async (req, res, next) => {
   }
   next();
 });
+
+// Umbrella fork: M365 delegated-token broker enrollment routes
+// (better-auth session-gated; boots cleanly when the broker env is
+// absent — routes answer 503 not_configured until the secrets land).
+app.use(m365Router);
 
 // Mount public endpoints routes (must be before JSON middleware to handle raw streams)
 app.use("/metamcp", publicEndpointsRouter);

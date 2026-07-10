@@ -34,6 +34,14 @@ const nextConfig = {
         source: "/api/auth/:path*",
         destination: `${backendUrl}/api/auth/:path*`,
       },
+      // Umbrella fork: M365 delegated-token broker enrollment routes
+      // (enroll/callback/status/disconnect) live on the backend; the
+      // Entra redirect URI points at the public domain, which lands
+      // here first — same rewrite requirement as /health.
+      {
+        source: "/m365/:path*",
+        destination: `${backendUrl}/m365/:path*`,
+      },
       // Register endpoint for dynamic client registration
       {
         source: "/register",
