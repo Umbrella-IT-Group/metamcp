@@ -25,7 +25,7 @@
     "@modelcontextprotocol/sdk": "1.16.0",
     "@repo/trpc": "workspace:*",
     "@repo/zod-types": "workspace:*",
-    "@trpc/server": "^11.4.1",
+    "@trpc/server": "^11.18.0",
     "basic-auth": "^2.0.1",
     "better-auth": "^1.6.23",
     "cors": "^2.8.5",
