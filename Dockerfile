@@ -48,9 +48,17 @@ COPY . .
 # Build all packages and apps
 RUN pnpm build
 
-RUN sed -i -e "s/30000/600000/" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js"
+# Raise Next's proxy-request timeout 30s -> 600s (long-running MCP tool
+# calls stream through the frontend's rewrite proxy). The pnpm store path
+# encodes next's exact version + peer suffix, so it MUST be globbed — the
+# hardcoded 15.5.12 path silently outlived a next bump and broke three
+# consecutive image builds (2026-07-11). Fails the build loudly if the
+# expected pair of files stops matching.
+RUN set -e; \
+    files=$(find node_modules/.pnpm -name proxy-request.js -path '*/next/dist/*' | sort); \
+    count=$(printf '%s\n' "$files" | grep -c . || true); \
+    if [ "$count" -lt 2 ]; then echo "ERROR: expected >=2 next proxy-request.js files (dist + dist/esm), found $count" >&2; exit 1; fi; \
+    printf '%s\n' "$files" | while read -r f; do sed -i -e "s/30000/600000/" "$f"; done
 
 # Production runner stage
 FROM base AS runner
