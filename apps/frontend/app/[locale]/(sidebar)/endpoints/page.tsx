@@ -81,7 +81,7 @@ export default function EndpointsPage() {
           clientMaxRateStrategyKey: "",
           enableOauth: true,
           useQueryParamAuth: false,
-          createMcpServer: true,
+          createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
           user_id: null, // Default to public (Everyone)
         });
         setSelectedNamespaceUuid("");
@@ -126,7 +126,7 @@ export default function EndpointsPage() {
       enableApiKeyAuth: true,
       enableOauth: true,
       useQueryParamAuth: false,
-      createMcpServer: true,
+      createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
       user_id: null, // Default to public (Everyone)
     },
   });
@@ -195,7 +195,7 @@ export default function EndpointsPage() {
       clientMaxRateStrategyKey: "",
       enableOauth: true,
       useQueryParamAuth: false,
-      createMcpServer: true,
+      createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
       user_id: null, // Default to public (Everyone)
     });
     setSelectedNamespaceUuid("");
