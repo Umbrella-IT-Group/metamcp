@@ -584,3 +584,38 @@ export const m365UserTokensTable = pgTable(
   },
   (table) => [index("m365_user_tokens_status_idx").on(table.status)],
 );
+
+// Tool-call audit log (fork feature — Umbrella TASKLIST "Tool-call audit
+// logging" SPEC): one row per proxied tools/call so "who called what when"
+// is SQL-queryable instead of a Loki grep. Raw params are NEVER stored —
+// `params_hash` is a sha256 of the JSON-serialized arguments. Written
+// fire-and-forget by the auditing middleware (an audit-write failure must
+// never fail the tool call); pruned after TOOL_AUDIT_RETENTION_DAYS
+// (default 90) by the oauth cleanup interval. `client_name` is the resolved
+// consumer identity (api-key name / OAuth user email) rather than the
+// SPEC's raw user_id — api-key consumers have no user row.
+export const toolCallAuditTable = pgTable(
+  "tool_call_audit",
+  {
+    uuid: uuid("uuid")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    called_at: timestamp("called_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    client_name: text("client_name"),
+    namespace_uuid: text("namespace_uuid"),
+    session_id: text("session_id"),
+    server_name: text("server_name").notNull(),
+    tool_name: text("tool_name").notNull(),
+    params_hash: text("params_hash"),
+    success: boolean("success").notNull(),
+    error_code: text("error_code"),
+    latency_ms: integer("latency_ms"),
+  },
+  (table) => [
+    index("tool_call_audit_called_at_idx").on(table.called_at),
+    index("tool_call_audit_tool_name_idx").on(table.tool_name),
+    index("tool_call_audit_client_name_idx").on(table.client_name),
+  ],
+);
