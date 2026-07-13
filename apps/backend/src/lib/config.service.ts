@@ -116,14 +116,14 @@ export const configService = {
    */
   async getMcpToolCallReconnectWarmupTimeout(): Promise<number> {
     const config = await configRepo.getConfig(
-      ConfigKeyEnum.Enum.MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT,
+      ConfigKeyEnum.enum.MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT,
     );
     return config?.value ? parseInt(config.value, 10) : 5000;
   },
 
   async setMcpToolCallReconnectWarmupTimeout(timeout: number): Promise<void> {
     await configRepo.setConfig(
-      ConfigKeyEnum.Enum.MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT,
+      ConfigKeyEnum.enum.MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT,
       timeout.toString(),
       "Per-attempt hard cap (ms) for the tools/call reconnect-window warmup",
     );
