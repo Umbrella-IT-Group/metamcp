@@ -6,6 +6,8 @@ import {
   DeleteMcpServerResponseSchema,
   GetMcpServerResponseSchema,
   ListMcpServersResponseSchema,
+  ReconnectMcpServerRequestSchema,
+  ReconnectMcpServerResponseSchema,
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
@@ -45,6 +47,10 @@ export const createMcpServersRouter = (
       input: z.infer<typeof UpdateMcpServerRequestSchema>,
       userId: string,
     ) => Promise<z.infer<typeof UpdateMcpServerResponseSchema>>;
+    reconnect: (
+      input: z.infer<typeof ReconnectMcpServerRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof ReconnectMcpServerResponseSchema>>;
   },
 ) => {
   return router({
@@ -93,6 +99,15 @@ export const createMcpServersRouter = (
       .output(UpdateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.update(input, ctx.user.id);
+      }),
+
+    // Protected: Reconnect MCP server (drop pooled upstream connection so
+    // tools re-list on next request — no gateway restart required)
+    reconnect: protectedProcedure
+      .input(ReconnectMcpServerRequestSchema)
+      .output(ReconnectMcpServerResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.reconnect(input, ctx.user.id);
       }),
   });
 };

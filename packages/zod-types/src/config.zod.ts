@@ -10,6 +10,12 @@ export const ConfigKeyEnum = z.enum([
   "MCP_MAX_TOTAL_TIMEOUT",
   "MCP_MAX_ATTEMPTS",
   "SESSION_LIFETIME",
+  // Hard cap (ms) per warmup attempt when a tools/call lands in the
+  // reconnect window (invalidateServerConnection tears the pooled
+  // client down before the replacement exists) and has to wait for the
+  // owning server to reconnect before falling back to "Unknown tool".
+  // See config.service.ts's getMcpToolCallReconnectWarmupTimeout.
+  "MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT",
 ]);
 
 // Config schema

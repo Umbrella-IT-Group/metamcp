@@ -11,14 +11,22 @@
  * sends `initialize` exactly ONCE per client session and a reconnecting
  * client won't send it again.
  *
- * In `@modelcontextprotocol/sdk` 1.16.0 the transport flips
- * `_initialized=true` and assigns `sessionId` ONLY inside the
- * initialize-request branch (`server/streamableHttp.js:337-338`). A
- * rebuilt-but-not-initialized transport therefore rejects the client's
- * first real request in `validateSession`:
+ * As of `@modelcontextprotocol/sdk` 1.29.0 the Node
+ * `StreamableHTTPServerTransport` is a thin wrapper that delegates all
+ * session state to an inner `_webStandardTransport`
+ * (`WebStandardStreamableHTTPServerTransport`). That inner transport
+ * flips `_initialized=true` and assigns `sessionId` ONLY inside the
+ * initialize-request branch of `server/webStandardStreamableHttp.js`
+ * (`this.sessionId = this.sessionIdGenerator?.(); this._initialized =
+ * true`). A rebuilt-but-not-initialized transport therefore rejects the
+ * client's first real request in the inner `validateSession`:
  *
  *     if (!this._initialized) -> 400 {-32000 "Bad Request: Server not
- *     initialized"}   (server/streamableHttp.js:442)
+ *     initialized"}   (webStandardStreamableHttp.js validateSession)
+ *
+ * (In SDK 1.16 these same fields lived directly on the Node transport;
+ * 1.29 moved them one level down into `_webStandardTransport`, so the
+ * hydration and its contract check reach through that wrapper.)
  *
  * The Anthropic claude.ai MCP connector relays that 400 as
  * `-32600 "Anthropic Proxy: Invalid content from server"`, wedging the
@@ -44,9 +52,16 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import logger from "@/utils/logger";
 
 /** SDK-internal fields the hydration depends on (private in the SDK). */
-interface TransportInternals {
+interface WebStandardTransportInternals {
   _initialized?: unknown;
   sessionId?: unknown;
+}
+/**
+ * The Node transport is a wrapper; the initialize state the handshake sets
+ * lives on the inner `_webStandardTransport` since SDK 1.29.
+ */
+interface TransportInternals {
+  _webStandardTransport?: WebStandardTransportInternals;
 }
 
 /**
@@ -62,19 +77,22 @@ export function hydrateRecoveredTransport(
   transport: StreamableHTTPServerTransport,
   sessionId: string,
 ): boolean {
-  const internals = transport as unknown as TransportInternals;
-  // A fresh transport has `_initialized === false`. Anything else means
-  // the SDK renamed/removed the field — bail loudly.
-  if (typeof internals._initialized !== "boolean") {
+  const inner = (transport as unknown as TransportInternals)
+    ._webStandardTransport;
+  // A fresh transport's inner web-standard transport has
+  // `_initialized === false`. A missing wrapper or non-boolean field means
+  // the SDK renamed/removed the internals — bail loudly.
+  if (!inner || typeof inner._initialized !== "boolean") {
     logger.error(
-      "SDK shape change: StreamableHTTPServerTransport._initialized is not a " +
-        "boolean on a fresh transport; cannot hydrate recovered session " +
-        `${sessionId}. Update hydrateRecoveredTransport for the new SDK shape.`,
+      "SDK shape change: StreamableHTTPServerTransport._webStandardTransport." +
+        "_initialized is not a boolean on a fresh transport; cannot hydrate " +
+        `recovered session ${sessionId}. Update hydrateRecoveredTransport for ` +
+        "the new SDK shape.",
     );
     return false;
   }
-  internals._initialized = true;
-  internals.sessionId = sessionId;
+  inner._initialized = true;
+  inner.sessionId = sessionId;
   return true;
 }
 
@@ -92,20 +110,21 @@ export function assertRecoveryHydrationContract(): boolean {
   const probe = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => "contract-probe",
   });
-  const internals = probe as unknown as Record<string, unknown>;
-  // `_initialized` is the gate field validateSession checks and the SDK
-  // sets it (=false) in the constructor, so it must be a boolean on a
-  // fresh transport. `sessionId` is NOT declared until an `initialize`
-  // request assigns it, so it's legitimately absent here — we only ever
-  // assign it (always valid on a JS object), never read the SDK's value,
-  // so it isn't part of the contract.
-  const ok = typeof internals._initialized === "boolean";
+  const inner = (probe as unknown as TransportInternals)._webStandardTransport;
+  // `_initialized` is the gate field the inner validateSession checks and
+  // the SDK sets it (=false) in the web-standard transport's constructor,
+  // so it must be a boolean on a fresh transport. `sessionId` is NOT
+  // declared until an `initialize` request assigns it, so it's legitimately
+  // absent here — we only ever assign it (always valid on a JS object),
+  // never read the SDK's value, so it isn't part of the contract.
+  const ok = !!inner && typeof inner._initialized === "boolean";
   if (!ok) {
     logger.error(
       "STARTUP CONTRACT VIOLATION: StreamableHTTPServerTransport no longer " +
-        "exposes a boolean `_initialized` internal. Lazy session recovery will " +
-        "refuse all recoveries until hydrateRecoveredTransport is updated for " +
-        "the new SDK shape (currently pinned @modelcontextprotocol/sdk 1.16.0).",
+        "exposes `_webStandardTransport._initialized` as a boolean internal. " +
+        "Lazy session recovery will refuse all recoveries until " +
+        "hydrateRecoveredTransport is updated for the new SDK shape " +
+        "(currently pinned @modelcontextprotocol/sdk 1.29.0).",
     );
   }
   return ok;

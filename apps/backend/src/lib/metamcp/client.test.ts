@@ -65,11 +65,9 @@ async function buildRig() {
   const client = new Client(
     { name: "test-metamcp-client", version: "0.0.0" },
     {
-      capabilities: {
-        prompts: {},
-        resources: { subscribe: true },
-        tools: {},
-      },
+      // Mirror connectMetaMcpClient: no client-side capabilities advertised
+      // (prompts/resources/tools are server capabilities, stripped by SDK 1.29).
+      capabilities: {},
     },
   );
 

@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
+import { namespacesRepository } from "../../../db/repositories/namespaces.repo";
 import { configService } from "../../../lib/config.service";
 import { ConnectedClient } from "../../../lib/metamcp";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
@@ -28,6 +29,7 @@ import {
   createToolOverridesListToolsMiddleware,
 } from "../../../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { isRecoverableBackendError } from "../../../lib/metamcp/session-error";
+import { acquireSessionWithBoundedWarmup } from "../../../lib/metamcp/tool-call-warmup";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
 // Original List Tools Handler (adapted from metamcp-proxy.ts)
@@ -206,6 +208,61 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         toolToClient[name] = session;
         toolToServerUuid[name] = mcpServerUuid;
         break;
+      }
+    }
+
+    // Reconnect-window fallback (mirrors metamcp-proxy.ts's
+    // originalCallToolHandler). The loop above only reaches the
+    // name-prefix check when `getSession` already has a live
+    // connection — during an upstream reconnect,
+    // `invalidateServerConnection` tears the pooled client down and
+    // fires `list_changed` BEFORE the replacement exists
+    // (mcp-server-pool.ts), so a call landing in that gap sees
+    // `getSession` return `undefined` for the owning server too and
+    // falls straight to "Unknown tool" (tool-execution.ts maps that to
+    // a literal HTTP 404) despite the tool being real.
+    //
+    // Resolve the owning server from the DB `toolsTable` (last known
+    // good, from the last successful tools/list sync) without needing
+    // a live session, then give that one server a short, bounded
+    // chance to come back. Skip the wait entirely when the DB has no
+    // record of this tool — that's genuinely unknown, not a reconnect
+    // race, and must still 404 immediately.
+    if (!targetSession) {
+      const candidates =
+        await namespacesRepository.findServersForNamespaceToolName(
+          context.namespaceUuid,
+          originalToolName,
+        );
+      const match = candidates.find(
+        (candidate) =>
+          sanitizeName(candidate.serverName || "") === serverPrefix,
+      );
+      const paramsForMatch = match ? serverParams[match.serverUuid] : undefined;
+
+      // No `paramsForMatch` means the server isn't in the
+      // active/non-error namespace set right now (already filtered out
+      // of `serverParams` above) — removed/disabled, not mid-reconnect.
+      if (match && paramsForMatch) {
+        const warmupTimeoutMs =
+          await configService.getMcpToolCallReconnectWarmupTimeout();
+        const warmedSession = await acquireSessionWithBoundedWarmup({
+          pool: mcpServerPool,
+          sessionId: context.sessionId,
+          serverUuid: match.serverUuid,
+          params: paramsForMatch,
+          namespaceUuid: context.namespaceUuid,
+          timeoutMs: warmupTimeoutMs,
+        });
+
+        if (
+          warmedSession &&
+          warmedSession.client.getServerCapabilities()?.tools
+        ) {
+          targetSession = warmedSession;
+          toolToClient[name] = warmedSession;
+          toolToServerUuid[name] = match.serverUuid;
+        }
       }
     }
 

@@ -6,12 +6,20 @@ import {
   ListToolsResultSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Tool } from "@repo/zod-types";
-import { AlertTriangle, Database, RefreshCw, Wrench } from "lucide-react";
+import { AlertTriangle, Database, Plug, RefreshCw, Wrench } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { z } from "zod";
 
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useTranslations } from "@/hooks/useTranslations";
 import { trpc } from "@/lib/trpc";
 
@@ -49,6 +57,7 @@ export function ToolManagement({
 }: ToolManagementProps) {
   const [mcpTools, setMcpTools] = useState<MCPTool[]>([]);
   const [loading, setLoading] = useState(false);
+  const [reconnectDialogOpen, setReconnectDialogOpen] = useState(false);
   const hasInitiallyFetched = useRef(false);
   const { t } = useTranslations();
 
@@ -145,6 +154,32 @@ export function ToolManagement({
     }
   }, [makeRequest, mcpServerUuid, saveToolsMutation, t]);
 
+  // Reconnect the server: drop the gateway's pooled upstream connection so the
+  // tool list re-lists on the next request. Unlike Refresh Tools (which
+  // re-lists over the SAME warm pooled connection and so cannot bust a
+  // rename-rotted list), this forces a fresh connection server-side.
+  const reconnectMutation = trpc.frontend.mcpServers.reconnect.useMutation({
+    onSuccess: (response) => {
+      if (response.success) {
+        toast.success(t("mcp-servers:tools.reconnectSuccess"));
+        setReconnectDialogOpen(false);
+        // Re-list over the now-fresh pooled connection so the table reflects
+        // the current upstream tool set immediately.
+        fetchMCPTools();
+      } else {
+        toast.error(response.error || t("mcp-servers:tools.reconnectError"), {
+          description: response.message,
+        });
+      }
+    },
+    onError: (error) => {
+      console.error("Error reconnecting server:", error);
+      toast.error(t("mcp-servers:tools.reconnectError"), {
+        description: error.message,
+      });
+    },
+  });
+
   // Auto-fetch tools when component mounts - but only once
   useEffect(() => {
     if (!hasInitiallyFetched.current) {
@@ -191,6 +226,19 @@ export function ToolManagement({
           <Button
             variant="outline"
             size="sm"
+            onClick={() => setReconnectDialogOpen(true)}
+            disabled={reconnectMutation.isPending}
+          >
+            <Plug
+              className={`h-4 w-4 mr-2 ${
+                reconnectMutation.isPending ? "animate-pulse" : ""
+              }`}
+            />
+            {t("mcp-servers:tools.reconnectServer")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
             onClick={fetchMCPTools}
             disabled={loading}
           >
@@ -201,6 +249,37 @@ export function ToolManagement({
           </Button>
         </div>
       </div>
+
+      {/* Reconnect confirmation dialog */}
+      <Dialog open={reconnectDialogOpen} onOpenChange={setReconnectDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {t("mcp-servers:tools.reconnectConfirmTitle")}
+            </DialogTitle>
+            <DialogDescription>
+              {t("mcp-servers:tools.reconnectConfirmDescription")}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setReconnectDialogOpen(false)}
+              disabled={reconnectMutation.isPending}
+            >
+              {t("common:cancel")}
+            </Button>
+            <Button
+              onClick={() => reconnectMutation.mutate({ uuid: mcpServerUuid })}
+              disabled={reconnectMutation.isPending}
+            >
+              {reconnectMutation.isPending
+                ? t("mcp-servers:tools.reconnecting")
+                : t("mcp-servers:tools.reconnectServer")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Unified Tools Table */}
       <div className="rounded-lg border">

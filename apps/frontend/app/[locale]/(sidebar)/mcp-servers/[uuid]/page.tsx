@@ -142,7 +142,7 @@ export default function McpServerDetailPage({
   // MCP Connection setup - only enable when server data is loaded and not in error state
   const connection = useConnection({
     mcpServerUuid: uuid,
-    transportType: server?.type || McpServerTypeEnum.Enum.STDIO,
+    transportType: server?.type || McpServerTypeEnum.enum.STDIO,
     command: server?.command || "",
     args: server?.args?.join(" ") || "",
     url: server?.url || "",
@@ -157,7 +157,7 @@ export default function McpServerDetailPage({
     enabled: Boolean(
       server &&
         !isLoading &&
-        server.error_status !== McpServerErrorStatusEnum.Enum.ERROR,
+        server.error_status !== McpServerErrorStatusEnum.enum.ERROR,
     ),
   });
 
@@ -167,7 +167,7 @@ export default function McpServerDetailPage({
       connection &&
       server &&
       !isLoading &&
-      server.error_status !== McpServerErrorStatusEnum.Enum.ERROR &&
+      server.error_status !== McpServerErrorStatusEnum.enum.ERROR &&
       connection.connectionStatus === "disconnected"
     ) {
       connection.connect();
@@ -188,7 +188,7 @@ export default function McpServerDetailPage({
 
   // Handle manual connect/disconnect
   const handleConnectionToggle = () => {
-    if (server?.error_status === McpServerErrorStatusEnum.Enum.ERROR) {
+    if (server?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
       // Don't allow connection if server is in error state
       return;
     }
@@ -202,7 +202,7 @@ export default function McpServerDetailPage({
   // Get connection status display info
   const getConnectionStatusInfo = () => {
     // If server is in error state, show error status
-    if (server?.error_status === McpServerErrorStatusEnum.Enum.ERROR) {
+    if (server?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
       return {
         text: t("mcp-servers:detail.serverError"),
         color: "text-destructive",
@@ -501,13 +501,13 @@ export default function McpServerDetailPage({
                     <Badge
                       variant={
                         server.error_status ===
-                        McpServerErrorStatusEnum.Enum.ERROR
+                        McpServerErrorStatusEnum.enum.ERROR
                           ? "destructive"
                           : "success"
                       }
                     >
                       {server.error_status ===
-                      McpServerErrorStatusEnum.Enum.ERROR
+                      McpServerErrorStatusEnum.enum.ERROR
                         ? t("mcp-servers:detail.error")
                         : t("mcp-servers:detail.noError")}
                     </Badge>
@@ -693,7 +693,7 @@ export default function McpServerDetailPage({
             <h3 className="text-lg font-semibold mb-4">
               {t("mcp-servers:detail.toolsManagement")}
             </h3>
-            {server.error_status === McpServerErrorStatusEnum.Enum.ERROR ? (
+            {server.error_status === McpServerErrorStatusEnum.enum.ERROR ? (
               <div className="space-y-4">
                 <div className="rounded-lg border border-dashed p-8 text-center">
                   <div className="flex flex-col items-center justify-center mx-auto max-w-md">
