@@ -4,6 +4,13 @@ name: Umbrella — Build & Push (umbrella branch)
 # Builds and publishes the deployable line on every push to `umbrella`.
 # Image lands at ghcr.io/umbrella-it-group/metamcp:<sha> + :latest.
 # Watchtower on mcp-host-prod (scope=umbrella) picks up :latest within ~5 min.
+#
+# Also runs build-only (no login, no push, no tags) on PRs targeting
+# `umbrella` — this is the only build check a PR gets before merge. Until
+# 2026-07-13 the pull_request trigger below existed but the job's `if` only
+# ever matched push events, so no PR ever ran the build (this is why
+# Dependabot PR #54's break reached the prod image unseen). See
+# fix/ci-pr-build-check-20260713.
 
 on:
   push:
@@ -53,7 +60,12 @@ jobs:
   # these never get noticed there. Tracked as a follow-up — see
   # UMBRELLA_FORK.md "Our own patches" backlog.
   build-and-push:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/umbrella'
+    # push-to-umbrella: unchanged — full build + push. pull_request-to-umbrella:
+    # same job, same build, but every registry-touching step below is gated
+    # off via its own `if` so a PR only ever proves the image builds.
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/umbrella') ||
+      github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -66,13 +78,18 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Login, tag metadata, and attestation only make sense on the push
+      # path — a PR build never touches the registry, so there's nothing
+      # to authenticate, tag, or attest.
       - uses: docker/login-action@v3
+        if: github.event_name == 'push'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
+        if: github.event_name == 'push'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -88,13 +105,18 @@ jobs:
           # for an artifact nothing consumes. Re-add if we ever publish for
           # a community arm64 host.
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # PR builds verify the Dockerfile still produces an image; empty
+          # tags/labels/cache-to below just drop the corresponding docker
+          # buildx flag (confirmed against build-push-action's own arg
+          # builder), so a PR run stays untagged and never writes cache.
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ github.event_name == 'push' && steps.meta.outputs.tags || '' }}
+          labels: ${{ github.event_name == 'push' && steps.meta.outputs.labels || '' }}
           cache-from: type=gha,scope=metamcp-umbrella
-          cache-to: type=gha,mode=max,scope=metamcp-umbrella
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=metamcp-umbrella' || '' }}
 
       - uses: actions/attest-build-provenance@v1
+        if: github.event_name == 'push'
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
