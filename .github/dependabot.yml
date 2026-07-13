@@ -1,0 +1,41 @@
+# Dependabot configuration for the Umbrella fork.
+#
+# No config file existed before this one — "Dependabot security updates"
+# (the alert-driven PRs, e.g. #48/#49/#50/#53/#54) already run without any
+# dependabot.yml, since that feature is a repo Security-settings toggle,
+# not file-driven. This file's only job is grouping: without it, N
+# vulnerable packages in one ecosystem open N separate security PRs
+# (exactly what #48 through #53 were — five sequential PRs to clear one
+# wave of alerts). The `groups` + `applies-to: security-updates` block
+# below collapses a whole ecosystem's security fixes into a single PR per
+# scan, without touching how scheduled *version* updates behave (that's
+# the default ungrouped `version-updates` behavior, left alone here).
+#
+# `directory: "/"` is correct for the npm entry even though this is a
+# pnpm workspace with dependencies under apps/*/package.json and
+# packages/*/package.json — Dependabot resolves the whole workspace from
+# the root pnpm-lock.yaml and already opens alert/security PRs against
+# the individual workspace manifests (see PR #54's branch name,
+# dependabot/npm_and_yarn/apps/frontend/modelcontextprotocol/sdk-1.26.0)
+# without any per-app directory entries.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
