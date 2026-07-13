@@ -1,9 +1,18 @@
 import { z } from "zod";
 
-export const McpServerTypeEnum = z.enum(["STDIO", "SSE", "STREAMABLE_HTTP"]);
-export const McpServerStatusEnum = z.enum(["ACTIVE", "INACTIVE"]);
+// zod 4 types z.enum(...).options as a plain string[] rather than the
+// readonly literal tuple zod 3 produced. Drizzle's pgEnum needs a non-empty
+// literal tuple ([string, ...string[]]) to infer its column as the literal
+// union, so we keep the values as `as const` tuples and build both the zod
+// enum and the drizzle pgEnum from the same single source of truth.
+export const MCP_SERVER_TYPES = ["STDIO", "SSE", "STREAMABLE_HTTP"] as const;
+export const MCP_SERVER_STATUSES = ["ACTIVE", "INACTIVE"] as const;
+export const MCP_SERVER_ERROR_STATUSES = ["NONE", "ERROR"] as const;
 
-export const McpServerErrorStatusEnum = z.enum(["NONE", "ERROR"]);
+export const McpServerTypeEnum = z.enum(MCP_SERVER_TYPES);
+export const McpServerStatusEnum = z.enum(MCP_SERVER_STATUSES);
+
+export const McpServerErrorStatusEnum = z.enum(MCP_SERVER_ERROR_STATUSES);
 
 // Define the form schema (includes UI-specific fields)
 export const createServerFormSchema = z
@@ -29,7 +38,7 @@ export const createServerFormSchema = z
   .refine(
     (data) => {
       // Command is required for stdio type
-      if (data.type === McpServerTypeEnum.Enum.STDIO) {
+      if (data.type === McpServerTypeEnum.enum.STDIO) {
         return data.command && data.command.trim() !== "";
       }
       return true;
@@ -43,8 +52,8 @@ export const createServerFormSchema = z
     (data) => {
       // URL is required for SSE and Streamable HTTP types
       if (
-        data.type === McpServerTypeEnum.Enum.SSE ||
-        data.type === McpServerTypeEnum.Enum.STREAMABLE_HTTP
+        data.type === McpServerTypeEnum.enum.SSE ||
+        data.type === McpServerTypeEnum.enum.STREAMABLE_HTTP
       ) {
         if (!data.url || data.url.trim() === "") {
           return false;
@@ -91,7 +100,7 @@ export const EditServerFormSchema = z
   .refine(
     (data) => {
       // Command is required for stdio type
-      if (data.type === McpServerTypeEnum.Enum.STDIO) {
+      if (data.type === McpServerTypeEnum.enum.STDIO) {
         return data.command && data.command.trim() !== "";
       }
       return true;
@@ -105,8 +114,8 @@ export const EditServerFormSchema = z
     (data) => {
       // URL is required for SSE and Streamable HTTP types
       if (
-        data.type === McpServerTypeEnum.Enum.SSE ||
-        data.type === McpServerTypeEnum.Enum.STREAMABLE_HTTP
+        data.type === McpServerTypeEnum.enum.SSE ||
+        data.type === McpServerTypeEnum.enum.STREAMABLE_HTTP
       ) {
         if (!data.url || data.url.trim() === "") {
           return false;
@@ -146,10 +155,10 @@ export const CreateMcpServerRequestSchema = z
     type: McpServerTypeEnum,
     command: z.string().optional(),
     args: z.array(z.string()).optional(),
-    env: z.record(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
     url: z.string().optional(),
     bearerToken: z.string().optional(),
-    headers: z.record(z.string()).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
     user_id: z.string().nullable().optional(),
   })
   .refine(
@@ -184,11 +193,11 @@ export const McpServerSchema = z.object({
   type: McpServerTypeEnum,
   command: z.string().nullable(),
   args: z.array(z.string()),
-  env: z.record(z.string()),
+  env: z.record(z.string(), z.string()),
   url: z.string().nullable(),
   created_at: z.string(),
   bearerToken: z.string().nullable(),
-  headers: z.record(z.string()),
+  headers: z.record(z.string(), z.string()),
   user_id: z.string().nullable(),
   error_status: McpServerErrorStatusEnum.optional(),
 });
@@ -216,9 +225,9 @@ export const BulkImportMcpServerSchema = z
   .object({
     command: z.string().optional(),
     args: z.array(z.string()).optional(),
-    env: z.record(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
     url: z.string().optional(),
-    headers: z.record(z.string()).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
     description: z.string().optional(),
     type: z
       .string()
@@ -242,10 +251,10 @@ export const BulkImportMcpServerSchema = z
   })
   .refine(
     (data) => {
-      const serverType = data.type || McpServerTypeEnum.Enum.STDIO;
+      const serverType = data.type || McpServerTypeEnum.enum.STDIO;
 
       // For STDIO type, URL can be empty
-      if (serverType === McpServerTypeEnum.Enum.STDIO) {
+      if (serverType === McpServerTypeEnum.enum.STDIO) {
         return true;
       }
 
@@ -269,7 +278,7 @@ export const BulkImportMcpServerSchema = z
   );
 
 export const BulkImportMcpServersRequestSchema = z.object({
-  mcpServers: z.record(BulkImportMcpServerSchema),
+  mcpServers: z.record(z.string(), BulkImportMcpServerSchema),
 });
 
 export const BulkImportMcpServersResponseSchema = z.object({
@@ -328,10 +337,10 @@ export const UpdateMcpServerRequestSchema = z
     type: McpServerTypeEnum,
     command: z.string().optional(),
     args: z.array(z.string()).optional(),
-    env: z.record(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
     url: z.string().optional(),
     bearerToken: z.string().optional(),
-    headers: z.record(z.string()).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
     user_id: z.string().nullable().optional(),
   })
   .refine(
@@ -398,10 +407,10 @@ export const McpServerCreateInputSchema = z.object({
   type: McpServerTypeEnum,
   command: z.string().nullable().optional(),
   args: z.array(z.string()).optional(),
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
   url: z.string().nullable().optional(),
   bearerToken: z.string().nullable().optional(),
-  headers: z.record(z.string()).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   user_id: z.string().nullable().optional(),
 });
 
@@ -422,10 +431,10 @@ export const McpServerUpdateInputSchema = z.object({
   type: McpServerTypeEnum.optional(),
   command: z.string().nullable().optional(),
   args: z.array(z.string()).optional(),
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
   url: z.string().nullable().optional(),
   bearerToken: z.string().nullable().optional(),
-  headers: z.record(z.string()).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   user_id: z.string().nullable().optional(),
 });
 
@@ -440,12 +449,12 @@ export const DatabaseMcpServerSchema = z.object({
   type: McpServerTypeEnum,
   command: z.string().nullable(),
   args: z.array(z.string()),
-  env: z.record(z.string()),
+  env: z.record(z.string(), z.string()),
   url: z.string().nullable(),
   error_status: McpServerErrorStatusEnum,
   created_at: z.date(),
   bearerToken: z.string().nullable(),
-  headers: z.record(z.string()),
+  headers: z.record(z.string(), z.string()),
   user_id: z.string().nullable(),
 });
 

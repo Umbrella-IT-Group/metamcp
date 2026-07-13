@@ -258,11 +258,13 @@ export const createMetaMcpClient = (
       version: "2.0.0",
     },
     {
-      capabilities: {
-        prompts: {},
-        resources: { subscribe: true },
-        tools: {},
-      },
+      // prompts/resources/tools are SERVER capabilities; they were never
+      // valid on a client. SDK <=1.16 tolerated them, but SDK 1.29's
+      // ClientCapabilities schema strips unknown keys, so advertising them
+      // was always inert. An empty object is the exact wire-equivalent and
+      // keeps metamcp's downstream client advertising no client-side
+      // capabilities, as before.
+      capabilities: {},
     },
   );
   return { client, transport };

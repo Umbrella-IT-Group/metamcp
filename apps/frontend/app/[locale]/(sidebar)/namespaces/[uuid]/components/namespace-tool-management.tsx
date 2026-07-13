@@ -214,11 +214,11 @@ export function NamespaceToolManagement({
   // Calculate counts
   const serverCount = servers.length;
   const activeServerCount = servers.filter(
-    (s) => s.status === ToolStatusEnum.Enum.ACTIVE,
+    (s) => s.status === ToolStatusEnum.enum.ACTIVE,
   ).length;
   const savedToolCount = namespaceTools.length;
   const activeToolCount = namespaceTools.filter(
-    (t) => t.status === ToolStatusEnum.Enum.ACTIVE,
+    (t) => t.status === ToolStatusEnum.enum.ACTIVE,
   ).length;
   const mcpToolCount = mcpTools.length;
 

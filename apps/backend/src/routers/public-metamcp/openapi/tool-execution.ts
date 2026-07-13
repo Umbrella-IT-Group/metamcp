@@ -56,9 +56,16 @@ export const executeToolWithMiddleware = async (
 
     // Check if the result indicates an error (from middleware)
     if (result.isError) {
+      // SDK 1.29 types content as a discriminated ContentBlock union; .text
+      // only exists on the text variant, so narrow before reading it.
+      const firstBlock = result.content?.[0];
+      const errorMessage =
+        firstBlock?.type === "text" && firstBlock.text
+          ? firstBlock.text
+          : "Tool is inactive";
       return res.status(403).json({
         error: "Tool access denied",
-        message: result.content?.[0]?.text || "Tool is inactive",
+        message: errorMessage,
         timestamp: new Date().toISOString(),
       });
     }

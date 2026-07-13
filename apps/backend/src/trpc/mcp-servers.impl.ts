@@ -375,7 +375,7 @@ export const mcpServersImplementations = {
       }
 
       // Reset error status for stdio servers when they are updated
-      if (updatedServer.type === McpServerTypeEnum.Enum.STDIO) {
+      if (updatedServer.type === McpServerTypeEnum.enum.STDIO) {
         try {
           await serverErrorTracker.resetServerErrorState(updatedServer.uuid);
           logger.info(

@@ -11,6 +11,8 @@ const issueCodeToTranslationKey: Record<string, string> = {
   required_error: "validation:required",
   invalid_type: "validation:invalidFormat",
   invalid_string: "validation:invalidFormat",
+  // zod 4 renamed the string-format issue code invalid_string -> invalid_format
+  invalid_format: "validation:invalidFormat",
   too_small: "validation:minLength",
   too_big: "validation:maxLength",
   invalid_url: "validation:urlFormat",
@@ -58,22 +60,24 @@ export function translateZodIssue(
 
   // Handle specific issue codes with parameters
   switch (issue.code) {
+    // zod 4 dropped .type on too_small/too_big issues; guard on the bound
+    // property directly instead of the removed .type discriminant.
     case "too_small":
-      if (issue.type === "string") {
+      if ("minimum" in issue) {
         return t("validation:minLength", { min: issue.minimum });
       }
       break;
     case "too_big":
-      if (issue.type === "string") {
+      if ("maximum" in issue) {
         return t("validation:maxLength", { max: issue.maximum });
       }
       break;
-    case "invalid_string":
-      if (issue.validation === "email") {
-        return t("validation:email");
-      }
-      if (issue.validation === "url") {
-        return t("validation:urlFormat");
+    // zod 4 renamed invalid_string -> invalid_format and exposes the format
+    // name on issue.format (was issue.validation in zod 3).
+    case "invalid_format":
+      if ("format" in issue) {
+        if (issue.format === "email") return t("validation:email");
+        if (issue.format === "url") return t("validation:urlFormat");
       }
       break;
     case "custom":

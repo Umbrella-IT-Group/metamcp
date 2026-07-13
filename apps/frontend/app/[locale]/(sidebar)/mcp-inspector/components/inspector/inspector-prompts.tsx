@@ -229,12 +229,19 @@ export function InspectorPrompts({
               <div className="font-mono text-xs break-all">
                 URI: {message.content.resource?.uri}
               </div>
-              {message.content.resource?.text ? (
+              {/* SDK 1.29 types resource as a TextResourceContents |
+                  BlobResourceContents discriminated union; narrow with `in`
+                  before reading text/blob (was a merged shape under 1.16). */}
+              {message.content.resource &&
+              "text" in message.content.resource &&
+              message.content.resource.text ? (
                 <div className="mt-1 text-sm">
                   {String(message.content.resource.text)}
                 </div>
               ) : null}
-              {message.content.resource?.blob ? (
+              {message.content.resource &&
+              "blob" in message.content.resource &&
+              message.content.resource.blob ? (
                 <div className="mt-1 text-xs">
                   [
                   {t("inspector:promptsComponent.binaryData", {

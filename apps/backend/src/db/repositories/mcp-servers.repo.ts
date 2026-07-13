@@ -257,9 +257,9 @@ export class McpServersRepository {
     const updated = await db
       .update(mcpServersTable)
       .set({
-        error_status: McpServerErrorStatusEnum.Enum.NONE,
+        error_status: McpServerErrorStatusEnum.enum.NONE,
       })
-      .where(eq(mcpServersTable.error_status, McpServerErrorStatusEnum.Enum.ERROR))
+      .where(eq(mcpServersTable.error_status, McpServerErrorStatusEnum.enum.ERROR))
       .returning();
 
     return updated.length;

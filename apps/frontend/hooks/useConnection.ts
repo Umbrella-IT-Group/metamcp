@@ -114,7 +114,7 @@ export function useConnection({
       enabled: enabled,
     });
 
-  const pushHistory = useMemoizedFn((request: object, response?: object) => {
+  const pushHistory = useMemoizedFn((request: object, response?: unknown) => {
     setRequestHistory((prev) => [
       ...prev,
       {
@@ -124,6 +124,11 @@ export function useConnection({
     ]);
   });
 
+  // useMemoizedFn (ahooks) erases the generic <T> from the wrapped function's
+  // type, collapsing makeRequest's return to Promise<unknown> and breaking
+  // schema-inferred call sites (zod 4 tightened output<T> from any to
+  // unknown). The memoized function's runtime behavior is unchanged, so we
+  // cast back to the real generic signature it implements.
   const makeRequest = useMemoizedFn(
     async <T extends z.ZodType>(
       request: ClientRequest,
@@ -187,7 +192,11 @@ export function useConnection({
         throw e;
       }
     },
-  );
+  ) as <T extends z.ZodType>(
+    request: ClientRequest,
+    schema: T,
+    options?: RequestOptions & { suppressToast?: boolean },
+  ) => Promise<z.output<T>>;
 
   const handleCompletion = useMemoizedFn(
     async (
@@ -408,7 +417,7 @@ export function useConnection({
           };
         } else {
           switch (transportType) {
-            case McpServerTypeEnum.Enum.STDIO:
+            case McpServerTypeEnum.enum.STDIO:
               mcpProxyServerUrl = new URL(
                 `/mcp-proxy/server/stdio`,
                 getAppUrl(),
@@ -443,7 +452,7 @@ export function useConnection({
               };
               break;
 
-            case McpServerTypeEnum.Enum.SSE:
+            case McpServerTypeEnum.enum.SSE:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/sse`, getAppUrl());
               mcpProxyServerUrl.searchParams.append("url", url);
               transportOptions = {
@@ -472,7 +481,7 @@ export function useConnection({
               };
               break;
 
-            case McpServerTypeEnum.Enum.STREAMABLE_HTTP:
+            case McpServerTypeEnum.enum.STREAMABLE_HTTP:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
               mcpProxyServerUrl.searchParams.append("url", url);
               transportOptions = {
@@ -542,7 +551,7 @@ export function useConnection({
         try {
           const transport = isMetaMCP
             ? new SSEClientTransport(mcpProxyServerUrl, transportOptions)
-            : transportType === McpServerTypeEnum.Enum.STREAMABLE_HTTP
+            : transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP
               ? new StreamableHTTPClientTransport(mcpProxyServerUrl, {
                   sessionId: undefined,
                   ...transportOptions,
@@ -617,7 +626,7 @@ export function useConnection({
   const disconnect = useMemoizedFn(async () => {
     try {
       if (
-        transportType === McpServerTypeEnum.Enum.STREAMABLE_HTTP &&
+        transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP &&
         clientTransport
       ) {
         await (
