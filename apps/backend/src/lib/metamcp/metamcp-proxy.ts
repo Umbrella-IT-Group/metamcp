@@ -23,6 +23,7 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
+import { namespacesRepository } from "../../db/repositories/namespaces.repo";
 import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
@@ -49,6 +50,7 @@ import {
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
 import { isRecoverableBackendError } from "./session-error";
+import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
 import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
@@ -616,6 +618,69 @@ export const createServer = async (
                 );
                 continue;
               }
+            }
+          }
+        }
+
+        // Reconnect-window fallback: the loop above only reaches the
+        // name-prefix check when `mcpServerPool.getSession` already has
+        // (or can immediately mint) a live connection. During an
+        // upstream reconnect, `invalidateServerConnection` tears the
+        // pooled client down and fires `list_changed` BEFORE the
+        // replacement connection exists (mcp-server-pool.ts) — a call
+        // landing in that gap sees `getSession` return `undefined` for
+        // the owning server too, so the loop never even checks its name
+        // and this would otherwise fall straight to "Unknown tool"
+        // despite the tool being real (Umbrella-MCP-Server tools/call
+        // 404 during reconnect).
+        //
+        // Use the DB `toolsTable` (populated by the last successful
+        // tools/list sync) as last-known-good routing to find the
+        // owning server WITHOUT needing a live session, then give that
+        // one server a short, bounded chance to come back. Skip
+        // entirely — no wait — when the DB has no record of this tool:
+        // that's a genuinely unknown tool, not a reconnect race, and it
+        // must still 404 immediately.
+        if (!clientForTool) {
+          const candidates =
+            await namespacesRepository.findServersForNamespaceToolName(
+              namespaceUuid,
+              originalToolName,
+            );
+          const match = candidates.find(
+            (candidate) =>
+              sanitizeName(candidate.serverName || "") === serverPrefix,
+          );
+          const paramsForMatch = match
+            ? serverParams[match.serverUuid]
+            : undefined;
+
+          // No `paramsForMatch` means the server isn't in the
+          // active/non-error namespace set right now (getMcpServers
+          // already filtered it out above) — it was removed or
+          // disabled, not mid-reconnect. Don't wait for something that
+          // isn't coming back.
+          if (match && paramsForMatch) {
+            const warmupTimeoutMs =
+              await configService.getMcpToolCallReconnectWarmupTimeout();
+            const warmedSession = await acquireSessionWithBoundedWarmup({
+              pool: mcpServerPool,
+              sessionId,
+              serverUuid: match.serverUuid,
+              params: paramsForMatch,
+              namespaceUuid,
+              timeoutMs: warmupTimeoutMs,
+            });
+
+            if (
+              warmedSession &&
+              warmedSession.client.getServerCapabilities()?.tools
+            ) {
+              registerListChangedSubscriber(warmedSession, match.serverUuid);
+              clientForTool = warmedSession;
+              serverUuid = match.serverUuid;
+              toolToClient[name] = warmedSession;
+              toolToServerUuid[name] = match.serverUuid;
             }
           }
         }

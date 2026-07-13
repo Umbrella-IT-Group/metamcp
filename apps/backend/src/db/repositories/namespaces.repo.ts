@@ -277,6 +277,46 @@ export class NamespacesRepository {
     return toolsData;
   }
 
+  /**
+   * Last-known-good routing for the tools/call reconnect-window fix
+   * (see metamcp-proxy.ts / openapi/handlers.ts originalCallToolHandler).
+   * Looks up which server(s) the DB currently associates a tool name
+   * with inside a namespace, using the rows written by the last
+   * successful tools/list sync — independent of whether a live pooled
+   * session exists right now. Returns every match rather than one row:
+   * the same original tool name can legitimately exist on more than one
+   * backend server in a namespace, disambiguated only by the
+   * server-name prefix on the call side, so callers must filter by
+   * `sanitizeName(serverName) === serverPrefix` themselves.
+   */
+  async findServersForNamespaceToolName(
+    namespaceUuid: string,
+    toolName: string,
+  ): Promise<Array<{ serverUuid: string; serverName: string | null }>> {
+    const rows = await db
+      .select({
+        serverUuid: toolsTable.mcp_server_uuid,
+        serverName: mcpServersTable.name,
+      })
+      .from(toolsTable)
+      .innerJoin(
+        namespaceToolMappingsTable,
+        eq(toolsTable.uuid, namespaceToolMappingsTable.tool_uuid),
+      )
+      .innerJoin(
+        mcpServersTable,
+        eq(toolsTable.mcp_server_uuid, mcpServersTable.uuid),
+      )
+      .where(
+        and(
+          eq(namespaceToolMappingsTable.namespace_uuid, namespaceUuid),
+          eq(toolsTable.name, toolName),
+        ),
+      );
+
+    return rows;
+  }
+
   async deleteByUuid(uuid: string): Promise<DatabaseNamespace | undefined> {
     const [deletedNamespace] = await db
       .delete(namespacesTable)

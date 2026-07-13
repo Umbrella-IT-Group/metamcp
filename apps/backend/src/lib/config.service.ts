@@ -106,6 +106,29 @@ export const configService = {
     );
   },
 
+  /**
+   * Per-attempt hard cap (ms) for the bounded reconnect-window warmup
+   * on the tools/call path (metamcp-proxy.ts / openapi/handlers.ts).
+   * Default 5s: long enough to catch the common watchtower-bounce
+   * reconnect, short enough that a genuinely dead upstream still fails
+   * fast instead of hanging the caller on `client.ts`'s much longer
+   * (up to 30s+ per hop) internal reconnect backoff.
+   */
+  async getMcpToolCallReconnectWarmupTimeout(): Promise<number> {
+    const config = await configRepo.getConfig(
+      ConfigKeyEnum.Enum.MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT,
+    );
+    return config?.value ? parseInt(config.value, 10) : 5000;
+  },
+
+  async setMcpToolCallReconnectWarmupTimeout(timeout: number): Promise<void> {
+    await configRepo.setConfig(
+      ConfigKeyEnum.Enum.MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT,
+      timeout.toString(),
+      "Per-attempt hard cap (ms) for the tools/call reconnect-window warmup",
+    );
+  },
+
   async getSessionLifetime(): Promise<number | null> {
     const config = await configRepo.getConfig(
       ConfigKeyEnum.Enum.SESSION_LIFETIME,
