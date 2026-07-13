@@ -382,6 +382,29 @@ export type UpdateMcpServerResponse = z.infer<
   typeof UpdateMcpServerResponseSchema
 >;
 
+// Reconnect: force-drop the gateway's pooled upstream connection(s) for a
+// server so every downstream consumer re-lists its tools on the next request.
+// The full cascade (active + idle slots) is what busts a warm pooled
+// connection still serving its connect-time tool list after an upstream
+// rename/add — the update path's idle-only refresh cannot.
+export const ReconnectMcpServerRequestSchema = z.object({
+  uuid: z.string().uuid(),
+});
+
+export const ReconnectMcpServerResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string().optional(),
+  error: z.string().optional(),
+});
+
+export type ReconnectMcpServerRequest = z.infer<
+  typeof ReconnectMcpServerRequestSchema
+>;
+
+export type ReconnectMcpServerResponse = z.infer<
+  typeof ReconnectMcpServerResponseSchema
+>;
+
 // Repository-specific schemas
 export const McpServerCreateInputSchema = z.object({
   name: z

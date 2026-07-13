@@ -7,6 +7,8 @@ import {
   GetMcpServerResponseSchema,
   ListMcpServersResponseSchema,
   McpServerTypeEnum,
+  ReconnectMcpServerRequestSchema,
+  ReconnectMcpServerResponseSchema,
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
@@ -459,6 +461,114 @@ export const mcpServersImplementations = {
       };
     } catch (error) {
       logger.error("Error updating MCP server:", error);
+      return {
+        success: false as const,
+        message:
+          error instanceof Error ? error.message : "Internal server error",
+      };
+    }
+  },
+
+  reconnect: async (
+    input: z.infer<typeof ReconnectMcpServerRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof ReconnectMcpServerResponseSchema>> => {
+    try {
+      // Check if server exists and user has permission to act on it
+      const server = await mcpServersRepository.findByUuid(input.uuid);
+
+      if (!server) {
+        return {
+          success: false as const,
+          message: "MCP server not found",
+        };
+      }
+
+      // Only server owner can reconnect their own servers, only admin can
+      // reconnect public servers — same trust boundary as update/delete.
+      if (server.user_id && server.user_id !== userId) {
+        return {
+          success: false as const,
+          message: "Access denied: You can only reconnect servers you own",
+        };
+      }
+
+      // Full pooled-connection cascade. Unlike the update path's
+      // invalidateIdleSession (which rebuilds only the idle spare and leaves
+      // live consumers on their stale connections), invalidateServerConnection
+      // tears down EVERY active and idle slot for this serverUuid and fires
+      // the list_changed subscribers, so a warm pooled connection still
+      // serving its connect-time tool list after an upstream rename/add is
+      // dropped and every downstream consumer re-lists on its next request.
+      // This is the exact recovery cascade the transport-drop detector already
+      // runs in prod; it creates no replacement — the next getSession
+      // establishes a fresh connection (and fresh backend session) on demand.
+      // The sessionId arg is logging-only; the cascade sweeps all sessions.
+      await mcpServerPool.invalidateServerConnection(
+        "<reconnect-trigger>",
+        server.uuid,
+      );
+
+      // Clear the STDIO error circuit breaker so an ERROR-gated server can
+      // actually rebuild on the next request — a gateway restart clears this
+      // state too, and reconnect is the restart's replacement. Mirrors the
+      // reset the active-session health sweep runs right after its own
+      // invalidateServerConnection cascade. Best-effort: a reset failure must
+      // not fail the reconnect (the connections are already dropped), so it is
+      // logged, not thrown.
+      await serverErrorTracker
+        .resetServerErrorState(server.uuid)
+        .catch((error) => {
+          logger.error(
+            `Error resetting error state during reconnect of ${server.name} (${server.uuid}):`,
+            error,
+          );
+        });
+
+      // Refresh the idle MetaMCP + OpenAPI aggregations and drop the tool
+      // override caches for every namespace that includes this server, so the
+      // aggregated endpoints re-list too. Best-effort fan-out: the primary
+      // cascade above already dropped the connections and fired list_changed,
+      // so a namespace-refresh failure is logged but does not fail the
+      // reconnect.
+      const affectedNamespaceUuids =
+        await namespaceMappingsRepository.findNamespacesByServerUuid(
+          server.uuid,
+        );
+
+      if (affectedNamespaceUuids.length > 0) {
+        const [idleResult, openApiResult] = await Promise.allSettled([
+          metaMcpServerPool.invalidateIdleServers(affectedNamespaceUuids),
+          metaMcpServerPool.invalidateOpenApiSessions(affectedNamespaceUuids),
+        ]);
+        if (idleResult.status === "rejected") {
+          logger.error(
+            `Error invalidating idle MetaMCP servers during reconnect of ${server.uuid}:`,
+            idleResult.reason,
+          );
+        }
+        if (openApiResult.status === "rejected") {
+          logger.error(
+            `Error invalidating OpenAPI sessions during reconnect of ${server.uuid}:`,
+            openApiResult.reason,
+          );
+        }
+
+        affectedNamespaceUuids.forEach((namespaceUuid) => {
+          clearOverrideCache(namespaceUuid);
+        });
+      }
+
+      logger.info(
+        `Reconnected MCP server ${server.name} (${server.uuid}): dropped ${affectedNamespaceUuids.length} namespace aggregation(s); tools re-list on next request`,
+      );
+
+      return {
+        success: true as const,
+        message: "Server reconnected — tools re-list on the next request",
+      };
+    } catch (error) {
+      logger.error("Error reconnecting MCP server:", error);
       return {
         success: false as const,
         message:
