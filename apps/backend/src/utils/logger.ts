@@ -58,8 +58,11 @@ export class Logger {
   public static readonly defaultLogFilePath = "app.log";
   public static readonly defaultErrorFilePath = "error.log";
 
-  private logFile: WriteStream;
-  private errorFile: WriteStream;
+  // Nullable: openStream() falls back to console-only logging (never
+  // throws) when the file can't be opened, so a stream can legitimately be
+  // absent for the life of the process.
+  private logFile: WriteStream | null;
+  private errorFile: WriteStream | null;
   private consoleMode: "all" | "info" | "errors-only" | "none";
 
   // Rotation bookkeeping. app.log grew 98MB in 25h in prod with no external
@@ -124,9 +127,26 @@ export class Logger {
   // orphan the buffered line. Owning the fd up front makes rename + reopen
   // race-free while keeping non-blocking stream writes. openSync(...,"a")
   // creates the file if absent; the stream's autoClose closes the fd on end.
-  private static openStream(filePath: string): WriteStream {
-    const fd = openSync(filePath, "a");
-    return createWriteStream(filePath, { fd });
+  //
+  // NEVER THROWS: a missing/read-only log directory must not crash boot —
+  // this runs synchronously at module import for the default `logger`
+  // export below, so a throw here is a boot crash for an observability
+  // sink, not the app itself. On failure, log ONE diagnostic line and
+  // return null; customLog() forces every line for a null stream straight
+  // to the console (bypassing consoleMode) so nothing is silently lost,
+  // just not persisted to disk (2026-07-14 audit finding).
+  private static openStream(filePath: string): WriteStream | null {
+    try {
+      const fd = openSync(filePath, "a");
+      return createWriteStream(filePath, { fd });
+    } catch (err) {
+      console.error(
+        `[LOGGER] failed to open ${filePath}: ${
+          err instanceof Error ? err.message : String(err)
+        } — file logging disabled for this stream, falling back to console-only`,
+      );
+      return null;
+    }
   }
 
   private formatDate(date: Date): string {
@@ -147,24 +167,34 @@ export class Logger {
     const formattedMessage = `[${level}] ${this.formatDate(new Date())} | ${logMessage}\n`;
 
     const outputStream = target === "log" ? this.logFile : this.errorFile;
-    outputStream.write(formattedMessage);
+    if (outputStream) {
+      outputStream.write(formattedMessage);
 
-    // Track bytes written and roll a single generation once we cross the
-    // threshold. The message that tips the file over is kept in the file
-    // being rotated; the next write lands in the fresh file.
-    const written = Buffer.byteLength(formattedMessage);
-    if (target === "log") {
-      this.logBytes += written;
-      if (this.logBytes > this.maxSizeBytes) this.rotate("log");
-    } else {
-      this.errorBytes += written;
-      if (this.errorBytes > this.maxSizeBytes) this.rotate("error");
+      // Track bytes written and roll a single generation once we cross the
+      // threshold. The message that tips the file over is kept in the file
+      // being rotated; the next write lands in the fresh file.
+      const written = Buffer.byteLength(formattedMessage);
+      if (target === "log") {
+        this.logBytes += written;
+        if (this.logBytes > this.maxSizeBytes) this.rotate("log");
+      } else {
+        this.errorBytes += written;
+        if (this.errorBytes > this.maxSizeBytes) this.rotate("error");
+      }
     }
 
     // Console mirroring is threshold-based: each mode mirrors its own level
     // AND everything more severe (see CONSOLE_FLOOR). File writes above are
-    // unaffected by the console mode.
-    if (SEVERITY_RANK[level] >= CONSOLE_FLOOR[this.consoleMode]) {
+    // unaffected by the console mode. EXCEPTION: if the file sink never
+    // opened (openStream's fallback), every line is forced to the console
+    // regardless of consoleMode — an operator who chose "none"/"errors-only"
+    // did so assuming file logging works; if it doesn't, silently dropping
+    // logs is a worse failure than ignoring their console preference.
+    const forceConsole = outputStream === null;
+    if (
+      forceConsole ||
+      SEVERITY_RANK[level] >= CONSOLE_FLOOR[this.consoleMode]
+    ) {
       const trimmed = formattedMessage.trim();
       if (level === "INFO") {
         console.info(trimmed);
@@ -182,36 +212,75 @@ export class Logger {
   // reopen a fresh <name>. Kept dependency-free and crash-safe: a rotation
   // failure must NEVER throw into the logging call path — a logger that
   // crashes the request it was recording is strictly worse than an oversized
-  // file. On failure we swallow, emit one console line, and reset the counter
-  // so a persistent fault yields one line per size-window, not one per write.
+  // file. Every exit path resets the byte counter so a persistent fault
+  // yields one console line per size-window, not one per write.
+  //
+  // Reopen-failure recovery (2026-07-14 audit finding): `Logger.openStream`
+  // never throws (it returns null on failure), so "rename succeeded, reopen
+  // failed" shows up as `fresh === null`, not a caught exception. If we left
+  // `<name>` renamed away in that case, `old`'s fd would keep writing fine
+  // (an fd tracks the inode, not the path) but every LATER rotation attempt
+  // would renameSync a path that no longer exists — ENOENT, forever,
+  // silently. So on reopen failure we rename `<name>.1` back to `<name>`,
+  // restoring filesystem consistency; `old` keeps logging uninterrupted
+  // either way since it's still bound to the inode.
   private rotate(target: "log" | "error"): void {
     const filePath = target === "log" ? this.logFilePath : this.errorFilePath;
+    const old = target === "log" ? this.logFile : this.errorFile;
+    if (!old) {
+      // Nothing to rotate — this stream's file sink never opened (see
+      // openStream's console-only fallback). Byte tracking never triggers
+      // this call for a null stream, but guard rather than throw.
+      return;
+    }
+
     try {
-      const old = target === "log" ? this.logFile : this.errorFile;
       // POSIX rename is atomic and overwrites any existing <name>.1. The old
       // fd follows the inode to <name>.1, so buffered writes still flush there.
       renameSync(filePath, `${filePath}.1`);
-      // Fresh file + fd bound synchronously — no async-open race with the
-      // rename above.
-      const fresh = Logger.openStream(filePath);
+    } catch (err) {
+      this.logRotationError(`log rotation failed for ${filePath}`, err);
+      this.resetRotationCounter(target);
+      return; // rename never happened — `old` keeps writing at the original path.
+    }
+
+    // Fresh file + fd bound synchronously — no async-open race with the
+    // rename above.
+    const fresh = Logger.openStream(filePath);
+    if (fresh) {
       if (target === "log") {
         this.logFile = fresh;
       } else {
         this.errorFile = fresh;
       }
       old.end();
-    } catch (err) {
-      console.error(
-        `[LOGGER] log rotation failed for ${filePath}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    } finally {
-      if (target === "log") {
-        this.logBytes = 0;
-      } else {
-        this.errorBytes = 0;
+    } else {
+      try {
+        renameSync(`${filePath}.1`, filePath);
+      } catch (restoreErr) {
+        this.logRotationError(
+          `log rotation restore failed for ${filePath} — a later rotation may ENOENT`,
+          restoreErr,
+        );
       }
+      // this.logFile / this.errorFile intentionally left pointing at `old`
+      // — it's still the live, writable stream regardless of the filename
+      // dance above.
+    }
+    this.resetRotationCounter(target);
+  }
+
+  private logRotationError(context: string, err: unknown): void {
+    console.error(
+      `[LOGGER] ${context}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  private resetRotationCounter(target: "log" | "error"): void {
+    if (target === "log") {
+      this.logBytes = 0;
+    } else {
+      this.errorBytes = 0;
     }
   }
 
@@ -223,8 +292,8 @@ export class Logger {
     this.customLog("error", "ERROR", ...args);
 
   public close(): void {
-    this.logFile.end();
-    this.errorFile.end();
+    this.logFile?.end();
+    this.errorFile?.end();
   }
 }
 

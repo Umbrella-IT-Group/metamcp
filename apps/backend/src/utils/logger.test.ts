@@ -7,9 +7,16 @@
  *     app.log carried 278 cap-refusal WARNs (old "info" mode mirrored ONLY
  *     level==="INFO").
  *  2. Size-based, dependency-free, crash-safe log rotation.
+ *  3. Boot-safe file open — a missing/read-only log directory falls back to
+ *     console-only logging instead of crashing the process at module import
+ *     (2026-07-14 audit follow-up; see logger.ts openStream()).
  *
  * These exercise the real filesystem (temp dir) and real WriteStreams —
  * the unit under test is the rotation + mirror logic, not a mock of it.
+ * The rotate()-reopen-failure recovery path (item A3) needs `fs.openSync`
+ * itself to fail mid-rotation, which needs a module mock — that lives in
+ * its own file, `logger-rotation-reopen-failure.test.ts`, so this file's
+ * other suites stay real-filesystem, mock-free.
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "fs";
@@ -269,5 +276,69 @@ describe("Logger — size-based rotation", () => {
     expect(readFileSync(`${logPath}.1`, "utf8")).toContain("preexisting-line");
 
     second.close();
+  });
+});
+
+describe("Logger — boot-safe file open (missing/read-only log dir)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "logger-openfail-"));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("never throws at construction, and falls back to console-only for the broken stream(s)", () => {
+    const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const consoleInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    // Opening a DIRECTORY for append-write fails with EISDIR — portable,
+    // and unlike a chmod-based test, doesn't depend on running as
+    // non-root (a permission test would silently pass through under root,
+    // which CI sometimes runs as).
+    const brokenLogPath = dir; // the directory itself, not a file in it
+    // A path whose PARENT directory doesn't exist fails with ENOENT —
+    // covers the "missing log dir" half of the audit finding, distinct
+    // from the "read-only dir" (EISDIR) half above.
+    const brokenErrorPath = join(dir, "nonexistent-subdir", "error.log");
+
+    let logger: Logger | undefined;
+    expect(() => {
+      logger = new Logger({
+        logFilePath: brokenLogPath,
+        errorFilePath: brokenErrorPath,
+        // Explicit "none" is the adversarial case: the fallback must
+        // override even an operator's explicit request for console
+        // silence, because the alternative is losing every log line with
+        // zero signal that logging is broken at all.
+        shouldConsoleLog: "none",
+      });
+    }).not.toThrow();
+
+    // One diagnostic line per broken stream, naming the path and reason.
+    const openFailLines = consoleErr.mock.calls.filter((c) =>
+      String(c[0]).includes("file logging disabled"),
+    );
+    expect(openFailLines.length).toBe(2);
+    expect(
+      openFailLines.some((c) => String(c[0]).includes(brokenLogPath)),
+    ).toBe(true);
+    expect(
+      openFailLines.some((c) => String(c[0]).includes(brokenErrorPath)),
+    ).toBe(true);
+
+    // Logging still reaches the console despite shouldConsoleLog: "none" —
+    // P6, no swallowed errors just because the file sink is down.
+    logger?.info("still visible despite mode=none");
+    expect(consoleInfo).toHaveBeenCalled();
+    expect(
+      consoleInfo.mock.calls.some((c) =>
+        String(c[0]).includes("still visible despite mode=none"),
+      ),
+    ).toBe(true);
+
+    logger?.close(); // must not throw on a null stream either
   });
 });

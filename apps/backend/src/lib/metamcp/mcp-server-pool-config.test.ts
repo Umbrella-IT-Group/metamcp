@@ -8,10 +8,20 @@
  * from the pool's own fields — the single source of truth — so the payload
  * can never drift from a re-parse with different defaults.
  *
- * These tests exercise the CONSTRUCTOR's env-parse (the "same source" the
- * getter reports). NOTE: the exported singleton is built via getInstance(),
- * which currently passes hardcoded caps and bypasses this env-parse — that
- * discrepancy is a separate pool-lane defect, out of scope here.
+ * SCOPE, CORRECTED (2026-07-14 coordinator audit): the tests below build the
+ * pool via the raw private constructor (`PoolConstructor`), which exercises
+ * the CONSTRUCTOR's env-parse in isolation. That is NOT the path prod runs.
+ * Prod builds the singleton via `getInstance()`, which — independently
+ * confirmed by audit (mcp-server-pool.ts:212-224, dead since commit
+ * 806c2b2) — passes hardcoded `100`/`5` and never reaches the constructor's
+ * env-parse defaults at all. So "surfaces env-set values" below proves the
+ * env-parse EXPRESSIONS are correct, NOT that the prod complaint (env sets
+ * 50, payload showed 5) is fixed — it wasn't, until the hardcoding itself
+ * was removed. That removal + the getInstance-level regression test (the
+ * one that actually stands in for prod) ship in the stacked PR
+ * `fix-pool-cap-env` (branches off this one; see UMBRELLA_FORK.md). The
+ * constructor-path cases here still earn their keep as a narrower unit for
+ * the env-parse logic itself — kept, just no longer overclaiming scope.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -78,7 +88,7 @@ describe("McpServerPool.getPoolConfig — truthful caps for /health/upstream", (
     }
   });
 
-  it("reports the fork defaults when env is unset (5 per server, 100 total)", () => {
+  it("[constructor env-parse] reports the fork defaults when env is unset (5 per server, 100 total)", () => {
     pool = new PoolConstructor();
     expect(pool.getPoolConfig()).toEqual({
       maxConnectionsPerServer: 5,
@@ -86,7 +96,7 @@ describe("McpServerPool.getPoolConfig — truthful caps for /health/upstream", (
     });
   });
 
-  it("surfaces env-set values (the prod complaint: env sets 50, payload must reflect it)", () => {
+  it("[constructor env-parse only — NOT the prod path, see file header] surfaces env-set values", () => {
     process.env.MAX_CONNECTIONS_PER_SERVER = "50";
     process.env.MAX_TOTAL_CONNECTIONS = "250";
     pool = new PoolConstructor();
