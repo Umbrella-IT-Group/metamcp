@@ -44,7 +44,7 @@ function makeSweeper(
 describe("PublicSessionSweeper — idle reaping", () => {
   it("reaps a session idle beyond the TTL, exactly once", async () => {
     const { sweeper, reap, clock } = makeSweeper();
-    sweeper.touch("sess-idle");
+    sweeper.beginTracking("sess-idle");
 
     // Not yet past TTL — no reap.
     clock.advance(TTL_MS); // exactly TTL, strictly-greater check → survives
@@ -69,7 +69,7 @@ describe("PublicSessionSweeper — idle reaping", () => {
 
   it("never reaps a recently-active session", async () => {
     const { sweeper, reap, clock } = makeSweeper();
-    sweeper.touch("sess-active");
+    sweeper.beginTracking("sess-active");
 
     // A request lands just before the sweep — activity is fresh.
     clock.advance(TTL_MS * 5);
@@ -83,6 +83,7 @@ describe("PublicSessionSweeper — idle reaping", () => {
 
   it("never reaps a session with an in-flight request, even when its stamp is old", async () => {
     const { sweeper, reap, clock } = makeSweeper();
+    sweeper.beginTracking("sess-longcall"); // session exists in memory
     sweeper.markInFlight("sess-longcall"); // request arrives; in-flight = 1
 
     // The call runs far longer than the idle TTL.
@@ -108,6 +109,7 @@ describe("PublicSessionSweeper — idle reaping", () => {
 
   it("counts overlapping in-flight requests (settle once ≠ idle)", async () => {
     const { sweeper, clock } = makeSweeper();
+    sweeper.beginTracking("sess");
     sweeper.markInFlight("sess"); // 1
     sweeper.markInFlight("sess"); // 2
     sweeper.markSettled("sess"); // back to 1 — still in-flight
@@ -120,10 +122,11 @@ describe("PublicSessionSweeper — idle reaping", () => {
 
   it("reaps some and keeps others in the same sweep", async () => {
     const { sweeper, reap, clock } = makeSweeper();
-    sweeper.touch("old-1");
-    sweeper.touch("old-2");
+    sweeper.beginTracking("old-1");
+    sweeper.beginTracking("old-2");
     clock.advance(TTL_MS + 1);
-    sweeper.touch("fresh"); // fresh at sweep time
+    sweeper.beginTracking("fresh"); // fresh at sweep time
+    sweeper.beginTracking("busy");
     sweeper.markInFlight("busy"); // in-flight, stamp is old-ish but guarded
 
     const result = await sweeper.sweepOnce();
@@ -136,18 +139,101 @@ describe("PublicSessionSweeper — idle reaping", () => {
   });
 });
 
+describe("PublicSessionSweeper — sequential recheck-before-reap (snapshot-to-reap race)", () => {
+  // Foreman review item 2 (PR #72 fixes round): sweepOnce snapshots
+  // candidates once, but must re-check each one's current state
+  // immediately before reaping it — not just at snapshot time — so a
+  // request that lands while an EARLIER candidate's reap is still
+  // awaiting real I/O can't have a LATER candidate's transport closed out
+  // from under it. This only has teeth with sequential processing: while
+  // "A"'s reap is gated open (simulating real async I/O), a "request"
+  // lands on "B" (still queued, not yet reaped) and must save it.
+  it("a session that becomes active again while an earlier candidate is mid-reap is saved by the recheck", async () => {
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const reap = vi.fn().mockImplementation(async (sessionId: string) => {
+      if (sessionId === "A") {
+        await gateA; // hold A's reap open — the real-I/O window
+      }
+    });
+    const { sweeper, clock } = makeSweeper({ reapSession: reap });
+    sweeper.beginTracking("A");
+    sweeper.beginTracking("B");
+    clock.advance(TTL_MS + 1); // both idle-eligible at snapshot time
+
+    const sweepPromise = sweeper.sweepOnce(); // snapshots [A, B]; starts A's (gated) reap
+
+    // While A's reap is still pending, a real request lands on B.
+    sweeper.markInFlight("B");
+
+    releaseA();
+    const result = await sweepPromise;
+    // markInFlight leaves B in-flight — settle it so state is clean for
+    // the assertions below (mirrors a request that has now finished).
+    sweeper.markSettled("B");
+
+    expect(reap).toHaveBeenCalledWith("A");
+    expect(reap).not.toHaveBeenCalledWith("B"); // recheck caught the request
+    expect(result.reaped).toBe(1);
+    expect(result.failed).toBe(0);
+    // B's tracking is untouched by the sweep — not forgotten mid-request.
+    expect(sweeper.getLastActivity("B")).toBeDefined();
+  });
+
+  it("a session touched (not just in-flight) between snapshot and its own reap is also saved", async () => {
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const reap = vi.fn().mockImplementation(async (sessionId: string) => {
+      if (sessionId === "A") {
+        await gateA;
+      }
+    });
+    const { sweeper, clock } = makeSweeper({ reapSession: reap });
+    sweeper.beginTracking("A");
+    sweeper.beginTracking("B");
+    clock.advance(TTL_MS + 1);
+
+    const sweepPromise = sweeper.sweepOnce();
+    sweeper.touch("B"); // a settled request re-stamps activity, no in-flight
+
+    releaseA();
+    const result = await sweepPromise;
+
+    expect(reap).not.toHaveBeenCalledWith("B");
+    expect(result.reaped).toBe(1);
+  });
+});
+
 describe("PublicSessionSweeper — last-activity tracking", () => {
-  it("touch updates the stamp to now", () => {
+  it("beginTracking seeds a fresh entry unconditionally", () => {
     const { sweeper, clock } = makeSweeper();
-    sweeper.touch("s");
+    expect(sweeper.getLastActivity("s")).toBeUndefined();
+    sweeper.beginTracking("s");
+    expect(sweeper.getLastActivity("s")).toBe(clock.now());
+  });
+
+  it("touch updates the stamp to now for an already-tracked session", () => {
+    const { sweeper, clock } = makeSweeper();
+    sweeper.beginTracking("s");
     expect(sweeper.getLastActivity("s")).toBe(clock.now());
     clock.advance(1234);
     sweeper.touch("s");
     expect(sweeper.getLastActivity("s")).toBe(clock.now());
   });
 
-  it("markInFlight and markSettled both stamp activity", () => {
+  it("touch is a no-op for a session that was never tracked", () => {
+    const { sweeper } = makeSweeper();
+    sweeper.touch("never-seeded");
+    expect(sweeper.getLastActivity("never-seeded")).toBeUndefined();
+  });
+
+  it("markInFlight and markSettled both stamp activity on a tracked session", () => {
     const { sweeper, clock } = makeSweeper();
+    sweeper.beginTracking("s");
     sweeper.markInFlight("s");
     expect(sweeper.getLastActivity("s")).toBe(clock.now());
     clock.advance(500);
@@ -155,14 +241,63 @@ describe("PublicSessionSweeper — last-activity tracking", () => {
     expect(sweeper.getLastActivity("s")).toBe(clock.now());
   });
 
+  it("markInFlight is a no-op for an untracked session — no dangling in-flight entry", () => {
+    const { sweeper } = makeSweeper();
+    sweeper.markInFlight("ghost");
+    expect(sweeper.getInFlight("ghost")).toBe(0);
+    expect(sweeper.getLastActivity("ghost")).toBeUndefined();
+  });
+
   it("forget drops all tracking for a session", () => {
     const { sweeper } = makeSweeper();
+    sweeper.beginTracking("s");
     sweeper.markInFlight("s");
     expect(sweeper.getLastActivity("s")).toBeDefined();
     expect(sweeper.getInFlight("s")).toBe(1);
     sweeper.forget("s");
     expect(sweeper.getLastActivity("s")).toBeUndefined();
     expect(sweeper.getInFlight("s")).toBe(0);
+  });
+
+  // Foreman review item 3 (PR #72 fixes round): a trailing markSettled
+  // that lands AFTER a concurrent forget() (e.g. a client DELETE racing
+  // an in-flight request) must not resurrect a zombie tracking entry for
+  // a session whose transport/pool state is already gone.
+  it("markSettled after a concurrent forget() does not resurrect the entry", () => {
+    const { sweeper } = makeSweeper();
+    sweeper.beginTracking("s");
+    sweeper.markInFlight("s"); // request starts; in-flight = 1
+
+    // A concurrent DELETE tears the session down mid-request.
+    sweeper.forget("s");
+    expect(sweeper.getLastActivity("s")).toBeUndefined();
+    expect(sweeper.getInFlight("s")).toBe(0);
+
+    // The original request's dispatch finally settles.
+    sweeper.markSettled("s");
+
+    // Must still be gone — not resurrected.
+    expect(sweeper.getLastActivity("s")).toBeUndefined();
+    expect(sweeper.getInFlight("s")).toBe(0);
+  });
+
+  it("touch after a concurrent forget() does not resurrect the entry", () => {
+    const { sweeper } = makeSweeper();
+    sweeper.beginTracking("s");
+    sweeper.forget("s");
+    sweeper.touch("s"); // a trailing request-arrival stamp
+    expect(sweeper.getLastActivity("s")).toBeUndefined();
+  });
+
+  it("beginTracking re-seeds after a forget (lazy-recovery re-tracking)", () => {
+    const { sweeper, clock } = makeSweeper();
+    sweeper.beginTracking("s");
+    sweeper.forget("s");
+    expect(sweeper.getLastActivity("s")).toBeUndefined();
+
+    clock.advance(10);
+    sweeper.beginTracking("s"); // recovery path re-seeds
+    expect(sweeper.getLastActivity("s")).toBe(clock.now());
   });
 });
 
@@ -175,7 +310,7 @@ describe("PublicSessionSweeper — released-connection accounting", () => {
     const { sweeper, clock } = makeSweeper({
       measureActiveConnections: measure,
     });
-    sweeper.touch("s");
+    sweeper.beginTracking("s");
     clock.advance(TTL_MS + 1);
 
     const result = await sweeper.sweepOnce();
@@ -192,7 +327,7 @@ describe("PublicSessionSweeper — released-connection accounting", () => {
     const { sweeper, clock } = makeSweeper({
       measureActiveConnections: measure,
     });
-    sweeper.touch("s");
+    sweeper.beginTracking("s");
     clock.advance(TTL_MS + 1);
     const result = await sweeper.sweepOnce();
     expect(result.released).toBe(0);
@@ -201,7 +336,7 @@ describe("PublicSessionSweeper — released-connection accounting", () => {
   it("does not probe connection count when there is nothing to reap", async () => {
     const measure = vi.fn().mockReturnValue(7);
     const { sweeper } = makeSweeper({ measureActiveConnections: measure });
-    sweeper.touch("s"); // fresh
+    sweeper.beginTracking("s"); // fresh
     const result = await sweeper.sweepOnce();
     expect(result.reaped).toBe(0);
     expect(measure).not.toHaveBeenCalled();
@@ -212,7 +347,7 @@ describe("PublicSessionSweeper — reap failure tolerance", () => {
   it("still forgets a session whose reap rejects, and reports the failure", async () => {
     const reap = vi.fn().mockRejectedValue(new Error("cleanup boom"));
     const { sweeper, clock } = makeSweeper({ reapSession: reap });
-    sweeper.touch("bad");
+    sweeper.beginTracking("bad");
     clock.advance(TTL_MS + 1);
 
     const result = await sweeper.sweepOnce();
@@ -237,7 +372,7 @@ describe("PublicSessionSweeper — re-entrancy guard", () => {
       await gate; // hold the first sweep open
     });
     const { sweeper, clock } = makeSweeper({ reapSession: reap });
-    sweeper.touch("s");
+    sweeper.beginTracking("s");
     clock.advance(TTL_MS + 1);
 
     const first = sweeper.sweepOnce(); // starts, hangs inside reap
@@ -259,7 +394,7 @@ describe("PublicSessionSweeper — TTL / disable semantics", () => {
       {},
       { ttlMs: 0, intervalMs: INTERVAL_MS },
     );
-    sweeper.touch("s");
+    sweeper.beginTracking("s");
     clock.advance(10_000_000);
     const result = await sweeper.sweepOnce();
     expect(result.reaped).toBe(0);
@@ -311,7 +446,7 @@ describe("PublicSessionSweeper — timer lifecycle", () => {
       { ttlMs: TTL_MS, intervalMs: INTERVAL_MS },
       { reapSession: reap, now: clock.now },
     );
-    sweeper.touch("s");
+    sweeper.beginTracking("s");
     clock.advance(TTL_MS + 1); // make "s" idle-eligible
     sweeper.start();
 
@@ -407,11 +542,11 @@ describe("PublicSessionSweeper — stats surface", () => {
       measureActiveConnections: measure,
     });
 
-    sweeper.touch("a");
+    sweeper.beginTracking("a");
     clock.advance(TTL_MS + 1);
     await sweeper.sweepOnce(); // reaps "a"
 
-    sweeper.touch("b");
+    sweeper.beginTracking("b");
     clock.advance(TTL_MS + 1);
     await sweeper.sweepOnce(); // reaps "b"
 

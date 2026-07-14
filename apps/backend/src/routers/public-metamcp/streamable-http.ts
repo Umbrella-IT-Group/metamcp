@@ -47,16 +47,24 @@ const sessionManager =
 // `configService.getSessionLifetime()`, which is null in prod (persistent
 // sessions never expire) so it never fires — that is exactly why public
 // sessions accumulated to backend-pool exhaustion (2026-07-14 incident,
-// METAMCP-POOL-1). The sweeper reuses `cleanupSession` (defined below), the
-// SAME path a client DELETE runs; reaped consumers reconnect transparently
-// via the fork's lazy session-recovery path. `measureActiveConnections`
-// samples the backend pool's active count so a sweep can report how many
-// connections it released.
-const publicSessionSweeper = PublicSessionSweeper.fromEnv("StreamableHTTP", {
-  reapSession: (sessionId: string) => cleanupSession(sessionId),
-  measureActiveConnections: () =>
-    metaMcpServerPool.getMcpServerPoolStatus().active,
-});
+// METAMCP-POOL-1). The sweeper reuses `reapIdleSession` (defined below) — a
+// ROW-PRESERVING cleanup variant, NOT the same variant a client DELETE uses
+// (`cleanupSession`, which also drops the `mcp_sessions` row). See
+// `reapIdleSession`'s own doc comment for why that distinction is load-
+// bearing. `measureActiveConnections` samples the backend pool's active
+// count so a sweep can report how many connections it released.
+// Exported for testing — `streamable-http.test.ts` uses this to seed/
+// inspect tracking state directly (e.g. asserting `dispatchTracked` holds
+// a session in-flight for the duration of a simulated open GET stream).
+// The router itself never imports this from outside the module.
+export const publicSessionSweeper = PublicSessionSweeper.fromEnv(
+  "StreamableHTTP",
+  {
+    reapSession: (sessionId: string) => reapIdleSession(sessionId),
+    measureActiveConnections: () =>
+      metaMcpServerPool.getMcpServerPoolStatus().active,
+  },
+);
 
 /**
  * Run the transport dispatch while marking the session in-flight so the
@@ -64,8 +72,26 @@ const publicSessionSweeper = PublicSessionSweeper.fromEnv("StreamableHTTP", {
  * outlives the idle TTL is live use, not idleness). markInFlight /
  * markSettled also stamp last-activity at request arrival + completion,
  * which is how "any request updates the stamp" is satisfied.
+ *
+ * Known blind spot (accepted, not fixed here): the GET handler below uses
+ * this same wrapper to serve a standalone SSE stream (a client opens a
+ * long-lived GET with no body to receive server-initiated notifications
+ * per the MCP Streamable HTTP spec). `handleRequestWithUserContext`'s
+ * promise doesn't resolve until that stream closes, so `markInFlight` is
+ * called once at stream-open and `markSettled` only fires when the stream
+ * ends — for as long as the promise is pending, the sweeper's in-flight
+ * guard correctly treats the session as live. But if the CLIENT dies
+ * without a clean TCP close (process killed, network path silently drops
+ * packets — no FIN/RST reaches this process), Node has no way to know the
+ * peer is gone without OS-level keepalive probing or an app-level
+ * heartbeat, neither of which this transport does today. The request
+ * handler stays pending indefinitely, in-flight never clears, and the
+ * abandoned session is never reaped — a false negative in the exact
+ * scenario this sweeper exists to catch. Follow-up (not this PR):
+ * `SO_KEEPALIVE` on the underlying socket, or an app-level SSE heartbeat
+ * that lets a missed-heartbeat threshold force-settle the dispatch.
  */
-async function dispatchTracked(
+export async function dispatchTracked(
   authReq: ApiKeyAuthenticatedRequest,
   transport: StreamableHTTPServerTransport,
   req: express.Request,
@@ -168,7 +194,7 @@ assertRecoveryHydrationContract();
  * The recovered transport is added to `sessionManager` so subsequent
  * requests in the same metamcp lifetime skip the DB hop entirely.
  */
-async function recoverPersistedSession(
+export async function recoverPersistedSession(
   sessionId: string,
   authReq: ApiKeyAuthenticatedRequest,
 ): Promise<
@@ -313,6 +339,15 @@ async function recoverPersistedSession(
     return { status: "not_found" };
   }
   sessionManager.addSession(sessionId, transport);
+  // Resume idle-TTL tracking for the recovered session. Required whether
+  // this recovery followed a sweep reap (the reap's forget() dropped
+  // tracking; without this the recovered session would never be
+  // TTL-swept again if abandoned a second time) or a gateway restart (the
+  // sweeper's in-memory map is empty after boot regardless of cause).
+  // beginTracking() is the unconditional seed — see its doc comment for
+  // why touch()/markInFlight() further down (in dispatchTracked) are
+  // deliberately guarded and would no-op here without this call.
+  publicSessionSweeper.beginTracking(sessionId);
   // Best-effort touch; failure is non-fatal — pruner only deletes
   // genuinely stale rows.
   mcpSessionsRepository
@@ -329,11 +364,43 @@ async function recoverPersistedSession(
   return { status: "recovered", transport };
 }
 
-// Cleanup function for a specific session
-const cleanupSession = async (
+/**
+ * Shared teardown for a StreamableHTTP session: close the transport, drop
+ * it from `sessionManager` + the idle-TTL sweeper's tracking, and release
+ * its MetaMCP/backend pool connections. `deleteRow` controls whether the
+ * persisted `mcp_sessions` row is ALSO dropped — this is the one axis on
+ * which the two public wrappers below (`cleanupSession`, `reapIdleSession`)
+ * differ, and the distinction is load-bearing (foreman review, PR #72
+ * fixes round):
+ *
+ *   - `deleteRow: true` (client DELETE, the age-based `sessionLifetime`
+ *     cleanup timer) — the session is explicitly over. A later reuse of
+ *     the same sessionId must NOT lazy-recover, so the row goes too.
+ *
+ *   - `deleteRow: false` (idle-TTL sweep reap) — the ROW MUST SURVIVE.
+ *     An earlier version of this sweeper reaped via the row-deleting
+ *     variant, which made a reaped session's next request 404 instead of
+ *     lazily recovering. Spec-conformant SDK clients handle that cleanly
+ *     (they just re-`initialize`), but the Anthropic/claude.ai connector
+ *     wraps the 404 as `-32600 "Anthropic Proxy: Invalid content from
+ *     server"` and stays broken until a manual `/mcp reconnect` — the
+ *     exact failure mode PR #22/#23's capability-hash refusal narrowing
+ *     exists to avoid (see `recoverPersistedSession` above). Preserving
+ *     the row lets `recoverPersistedSession` rebuild the transport
+ *     transparently on the consumer's next request. Accepted tradeoff:
+ *     reaped rows linger in `mcp_sessions` until the age-based
+ *     `MCP_SESSION_TTL_DAYS` pruner (`runMcpSessionPrune`, default 7
+ *     days) catches them — rows are tiny (session_id / namespace /
+ *     endpoint / a principal hash, no session state), so that lingering
+ *     window is a storage non-issue, not a security concern (the
+ *     principal hash still gates recovery). A dedicated shorter purge for
+ *     specifically sweep-reaped rows is a named follow-up, not this PR.
+ */
+const cleanupSessionInternal = async (
   sessionId: string,
-  transport?: StreamableHTTPServerTransport,
-) => {
+  transport: StreamableHTTPServerTransport | undefined,
+  { deleteRow }: { deleteRow: boolean },
+): Promise<void> => {
   logger.info(`Cleaning up StreamableHTTP session ${sessionId}`);
 
   try {
@@ -358,19 +425,24 @@ const cleanupSession = async (
     // Clean up MetaMCP server pool session
     await metaMcpServerPool.cleanupSession(sessionId);
 
-    // Drop the persisted row so a future DELETE-then-reuse can't lazy-
-    // recover a session the client explicitly tore down. Best-effort —
-    // pruner reaps stragglers.
-    mcpSessionsRepository
-      .delete(sessionId)
-      .catch((error: unknown) =>
-        logger.warn(
-          `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
-          error,
-        ),
-      );
+    if (deleteRow) {
+      // Drop the persisted row so a future DELETE-then-reuse can't lazy-
+      // recover a session the client explicitly tore down. Best-effort —
+      // pruner reaps stragglers.
+      mcpSessionsRepository
+        .delete(sessionId)
+        .catch((error: unknown) =>
+          logger.warn(
+            `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
+            error,
+          ),
+        );
+    }
 
-    logger.info(`Session ${sessionId} cleanup completed successfully`);
+    logger.info(
+      `Session ${sessionId} cleanup completed successfully` +
+        (deleteRow ? "" : " (mcp_sessions row preserved for lazy recovery)"),
+    );
   } catch (error) {
     logger.error(`Error during cleanup of session ${sessionId}:`, error);
     // Even if cleanup fails, remove the session from manager to prevent memory leaks
@@ -380,6 +452,20 @@ const cleanupSession = async (
     throw error;
   }
 };
+
+// Explicit client DELETE + the age-based sessionLifetime cleanup timer:
+// the session is genuinely over, so the persisted row goes too.
+export const cleanupSession = async (
+  sessionId: string,
+  transport?: StreamableHTTPServerTransport,
+): Promise<void> =>
+  cleanupSessionInternal(sessionId, transport, { deleteRow: true });
+
+// Idle-TTL sweep reap: row-PRESERVING variant. See
+// `cleanupSessionInternal`'s doc comment for why this must not delete the
+// `mcp_sessions` row.
+export const reapIdleSession = async (sessionId: string): Promise<void> =>
+  cleanupSessionInternal(sessionId, undefined, { deleteRow: false });
 
 /**
  * Periodic pruner for the `mcp_sessions` table. Runs on boot + every
@@ -626,10 +712,11 @@ streamableHttpRouter.post(
 
         // Store transport reference
         sessionManager.addSession(newSessionId, transport);
-        // Track the session for idle-TTL sweeping from birth (dispatchTracked
-        // re-stamps on every request; this covers the session even before its
-        // first dispatch settles).
-        publicSessionSweeper.touch(newSessionId);
+        // Seed idle-TTL tracking for the new session (dispatchTracked's
+        // markInFlight/touch calls are guarded to no-op on an untracked
+        // session — see their doc comments — so this unconditional seed is
+        // required before the first dispatch, not just a convenience).
+        publicSessionSweeper.beginTracking(newSessionId);
 
         logger.info(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,

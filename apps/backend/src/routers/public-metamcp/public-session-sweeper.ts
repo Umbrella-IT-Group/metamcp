@@ -18,15 +18,37 @@ import logger from "@/utils/logger";
  *
  * This sweeper reaps on a DIFFERENT axis than that age-based timer:
  * last-request IDLE time, not session CREATION age. A reaped session's
- * consumer reconnects transparently on its next request (the fork's
- * lazy session-recovery path rebuilds the transport — verified live). The
- * reap runs the SAME cleanup path a client `DELETE` runs (injected as
- * `reapSession`); it introduces NO new teardown mechanism.
+ * consumer reconnects transparently on its next request via the fork's
+ * lazy session-recovery path (`recoverPersistedSession` in
+ * `streamable-http.ts`) — which requires the `mcp_sessions` ROW to still
+ * exist. `reapSession` (injected by the caller) MUST be a row-preserving
+ * teardown variant (close transport, drop in-memory session state,
+ * release pool connections — skip the DB row delete), not the same
+ * variant a client `DELETE` uses. Foreman review (PR #72 fixes round)
+ * caught an earlier version of this PR wired to the row-DELETING variant,
+ * which made a reaped session's next request 404 instead of lazily
+ * recovering — harmless for spec-conformant clients (they just
+ * re-`initialize`), but the Anthropic/claude.ai connector wraps that 404
+ * as `-32600 "Anthropic Proxy: Invalid content from server"` and stays
+ * broken until a manual `/mcp reconnect`, exactly the failure mode PR
+ * #22/#23's capability-hash refusal narrowing exists to avoid. See
+ * `streamable-http.ts`'s `reapIdleSession` for the row-preserving variant
+ * and its accepted-tradeoff note (reaped rows linger until the
+ * `MCP_SESSION_TTL_DAYS` pruner catches them).
  *
  * Conventions mirror the PR #70 tool-definition sweep in
  * `mcp-server-pool.ts`: env-tunable interval, a single-in-flight
  * re-entrancy guard, cleanup on dispose, and WARN/INFO discipline (one
  * INFO line only when a sweep actually reaps something, debug otherwise).
+ *
+ * Known blind spot (accepted, not fixed here): a half-open TCP connection
+ * — client process died or a network path silently dropped packets
+ * without FIN/RST — keeps an open standalone GET stream's `dispatchTracked`
+ * call pending indefinitely from Node's perspective, so the in-flight
+ * guard below never releases and the session is never reaped even though
+ * no real client is listening. See the comment on `dispatchTracked` in
+ * `streamable-http.ts` for the full writeup and the named follow-up
+ * (SO_KEEPALIVE / an app-level SSE heartbeat).
  */
 
 // 24h default. Long-idle-but-real consumers (e.g. Hermes/Tara connecting a
@@ -178,19 +200,57 @@ export class PublicSessionSweeper {
     );
   }
 
-  /** Stamp last-activity = now for a session. Cheap; called on every request. */
-  touch(sessionId: string): void {
+  /**
+   * Seed tracking for a session at the two legitimate "this session now
+   * exists in memory" moments: fresh creation and lazy recovery after a
+   * reap. Unconditional by design — `touch()` / `markInFlight()` /
+   * `markSettled()` below are deliberately guarded (foreman review, PR
+   * #72 fixes round) so a trailing call that lands after `forget()` has
+   * already run (a request racing a concurrent DELETE, or a reap's own
+   * teardown) can't resurrect a zombie tracking entry for a session
+   * whose transport/pool state is already gone. `beginTracking` is the
+   * one call site allowed to create a fresh entry from nothing.
+   */
+  beginTracking(sessionId: string): void {
     this.lastActivity.set(sessionId, this.now());
   }
 
-  /** Mark a request arriving on a session (increments in-flight + stamps activity). */
+  /**
+   * Stamp last-activity = now for a session. No-op if the session isn't
+   * currently tracked — a request that lands after `forget()` has
+   * already run (concurrent DELETE, or the tail of a reap) must not
+   * resurrect a tracking entry for a session that no longer has a live
+   * transport/pool state behind it. Use `beginTracking` to seed a new
+   * entry.
+   */
+  touch(sessionId: string): void {
+    if (!this.lastActivity.has(sessionId)) return;
+    this.lastActivity.set(sessionId, this.now());
+  }
+
+  /**
+   * Mark a request arriving on a session (increments in-flight + stamps
+   * activity). No-op entirely — including the in-flight increment — for
+   * a session that isn't tracked, so a request racing a concurrent
+   * `forget()` can't leave a dangling in-flight count with no
+   * corresponding activity entry.
+   */
   markInFlight(sessionId: string): void {
+    if (!this.lastActivity.has(sessionId)) return;
     this.inFlight.set(sessionId, (this.inFlight.get(sessionId) ?? 0) + 1);
     this.touch(sessionId);
   }
 
-  /** Mark a request completing on a session (decrements in-flight + re-stamps activity). */
+  /**
+   * Mark a request completing on a session (decrements in-flight +
+   * re-stamps activity). No-op if the session isn't tracked: a trailing
+   * `markSettled` that lands after a concurrent DELETE's `forget()` has
+   * already run must not resurrect the entry — the un-guarded version of
+   * this method previously did exactly that (foreman review, PR #72
+   * fixes round).
+   */
   markSettled(sessionId: string): void {
+    if (!this.lastActivity.has(sessionId)) return;
     const remaining = (this.inFlight.get(sessionId) ?? 0) - 1;
     if (remaining > 0) {
       this.inFlight.set(sessionId, remaining);
@@ -228,7 +288,26 @@ export class PublicSessionSweeper {
   /**
    * One reap pass. Reaps every tracked session idle beyond the TTL that has
    * no in-flight request. Runs the injected `reapSession` (= the DELETE
-   * cleanup path) per victim, tolerating per-victim failure.
+   * cleanup path, row-preserving variant) per candidate, tolerating
+   * per-candidate failure.
+   *
+   * Candidates are processed SEQUENTIALLY, with a recheck (still idle
+   * beyond TTL AND still no in-flight request) evaluated fresh
+   * immediately before each individual `reapSession` call — not just
+   * once at snapshot time (foreman review, PR #72 fixes round). The
+   * initial scan below is a snapshot; a real request can land on any
+   * not-yet-reaped candidate while an EARLIER candidate's reap is
+   * awaiting real I/O (transport close, backend pool teardown), and
+   * sequential processing is what makes that window real (a fire-all-
+   * concurrently batch kicks off every reap in the same synchronous
+   * tick, before any request has a chance to interleave). The recheck
+   * means a session that became live again since the snapshot is
+   * skipped instead of having its transport torn down under a request
+   * that's using it. Accepted tradeoff: a large reap batch (e.g. the
+   * first sweep after this ships, against an existing idle-session
+   * backlog) takes longer wall-clock than a parallel-fire batch would —
+   * correctness under concurrent traffic matters more here than sweep
+   * throughput, and steady-state batches are small.
    */
   async sweepOnce(): Promise<SweepResult> {
     const empty: SweepResult = {
@@ -244,18 +323,18 @@ export class PublicSessionSweeper {
       const now = this.now();
       const scanned = this.lastActivity.size;
 
-      // Collect victims into an array BEFORE reaping — reapSession →
-      // cleanupSession → forget() mutates lastActivity mid-loop otherwise.
-      const victims: string[] = [];
+      // Snapshot candidates BEFORE reaping — reaping mutates lastActivity
+      // (via forget()) mid-loop otherwise.
+      const candidates: string[] = [];
       for (const [sessionId, last] of this.lastActivity) {
         if ((this.inFlight.get(sessionId) ?? 0) > 0) continue; // never reap in-flight
-        if (now - last > this.ttlMs) victims.push(sessionId);
+        if (now - last > this.ttlMs) candidates.push(sessionId);
       }
 
       this.totalSweeps += 1;
       this.lastSweepAt = now;
 
-      if (victims.length === 0) {
+      if (candidates.length === 0) {
         this.lastReapedCount = 0;
         this.lastReleasedCount = 0;
         logger.debug(
@@ -266,35 +345,72 @@ export class PublicSessionSweeper {
       }
 
       const before = this.safeMeasure();
-      const results = await Promise.allSettled(
-        victims.map((sessionId) => this.reapSession(sessionId)),
-      );
-      const failed = results.filter((r) => r.status === "rejected").length;
+      let reaped = 0;
+      let failed = 0;
 
-      // Drop tracking for every victim even on reap failure. cleanupSession
-      // logs its own error and still tears down the maps it can; a session
-      // we can't reap must not be re-selected every tick forever (same
-      // map-consistency-over-cleanup rule as metamcp-server-pool
-      // .cleanupSession). forget() may already have run inside a successful
-      // reap — deleting an absent key is a no-op.
-      for (const sessionId of victims) this.forget(sessionId);
+      for (const sessionId of candidates) {
+        // Recheck against CURRENT state, not the snapshot above — this is
+        // the fix for the snapshot-to-reap race (see method doc).
+        const stillInFlight = (this.inFlight.get(sessionId) ?? 0) > 0;
+        const last = this.lastActivity.get(sessionId);
+        if (
+          stillInFlight ||
+          last === undefined || // forgotten by something else since the snapshot
+          this.now() - last <= this.ttlMs // touched again since the snapshot
+        ) {
+          continue; // saved by the recheck — leave its tracking alone
+        }
+        try {
+          await this.reapSession(sessionId);
+          reaped += 1;
+        } catch (error) {
+          failed += 1;
+          logger.warn(
+            `Public-session sweep (${this.name}): reap failed for session ${sessionId}.`,
+            error,
+          );
+        }
+        // Forget regardless of success. cleanupSession logs its own error
+        // and still tears down what it can; a session we can't fully reap
+        // must not be re-selected every tick forever (same
+        // map-consistency-over-cleanup rule as metamcp-server-pool
+        // .cleanupSession). forget() may already have run inside a
+        // successful reap — deleting an absent key is a no-op.
+        this.forget(sessionId);
+      }
 
+      // Sampled once before and once after the whole batch, so this is a
+      // best-effort DELTA, not a per-session audit trail — concurrent
+      // traffic (new sessions connecting, other pool activity) during the
+      // batch can shift the count independently of this sweep's own
+      // reaps. Logged with a leading "~" for exactly that reason.
       const after = this.safeMeasure();
       const released = Math.max(0, before - after);
-      const reaped = victims.length - failed;
 
       this.lastReapedCount = reaped;
       this.lastReleasedCount = released;
       this.totalReaped += reaped;
       this.totalConnectionsReleased += released;
 
-      logger.info(
-        `Public-session sweep (${this.name}): reaped ${reaped} idle public ` +
-          `session(s) (ttl ${this.ttlMs / 1000}s), released ${released} ` +
-          `backend connection(s)` +
-          (failed > 0 ? `; ${failed} reap(s) failed (see prior errors)` : "") +
-          ".",
-      );
+      if (reaped > 0 || failed > 0) {
+        logger.info(
+          `Public-session sweep (${this.name}): reaped ${reaped} idle public ` +
+            `session(s) (ttl ${this.ttlMs / 1000}s), released ~${released} ` +
+            `backend connection(s)` +
+            (failed > 0
+              ? `; ${failed} reap(s) failed (see prior errors)`
+              : "") +
+            ".",
+        );
+      } else {
+        // Every candidate was saved by the pre-reap recheck — nothing
+        // actually happened, so this stays at debug per the "INFO only
+        // when a sweep reaps something" discipline.
+        logger.debug(
+          `Public-session sweep (${this.name}): all ${candidates.length} ` +
+            `candidate(s) became active again before their recheck; nothing reaped.`,
+        );
+      }
 
       return { scanned, reaped, released, failed };
     } finally {
