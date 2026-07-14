@@ -887,9 +887,28 @@ describe("McpServerPool connect-failure stamp — /health/upstream truthfulness"
 // process, and the SDK standalone GET stream (the only push channel) dies
 // and exhausts its auto-reconnect before the replacement boots — so no
 // push notification survives an update. The sweep is the pull signal: it
-// re-lists tools over an existing pooled connection, compares the
-// full-definition hash (Track A3) to the last synced baseline, and on a
-// change runs the SAME invalidation cascade a transport drop uses.
+// re-lists tools over an existing pooled connection and compares the
+// full-definition hash (Track A3) against a baseline the SWEEP ITSELF
+// owns (`toolsSweepLastHash`), never `toolsSyncCache`. Review findings
+// (2026-07-14) on the first cut, which compared against `toolsSyncCache`
+// directly:
+//   - Finding 1 (high): an idle-only server has zero
+//     `listChangedSubscribers`, so the invalidation fan-out reaches no
+//     one and `toolsSyncCache` never updates downstream. Comparing
+//     against that frozen cache re-detected the SAME already-handled
+//     change every ~60s tick, forever — invalidate → health-check timer
+//     recreates the idle connection → re-detect — on exactly the
+//     Watchtower-replace scenario the sweep targets.
+//   - Finding 2 (medium): `tools.impl.sync` overwrites `toolsSyncCache`
+//     with the namespace-FILTERED tool set whenever
+//     `filterOutOverrideTools` drops a tool, while the sweep always lists
+//     the UNFILTERED set — a permanent false-drift mismatch even for
+//     servers with active consumers.
+// A sweep-owned baseline (seed silently on first observation, update on
+// every tick, invalidate only when the new hash differs from the sweep's
+// OWN prior observation) makes both impossible: it always compares
+// unfiltered-vs-unfiltered, and updating immediately on detection makes
+// the invalidate fire exactly once per real change.
 // -------------------------------------------------------------------
 describe("McpServerPool.sweepToolDefinitions — periodic tools/list drift sweep", () => {
   type RequestableFakeClient = FakeClient & {
@@ -928,6 +947,7 @@ describe("McpServerPool.sweepToolDefinitions — periodic tools/list drift sweep
     idleSessions: Record<string, RequestableFakeClient>;
     serverParamsCache: Record<string, unknown>;
     toolsSweepInProgress: boolean;
+    toolsSweepLastHash: Record<string, string>;
     sweepToolDefinitions: () => Promise<void>;
   };
 
@@ -946,64 +966,55 @@ describe("McpServerPool.sweepToolDefinitions — periodic tools/list drift sweep
     void pool.cleanupAll();
   });
 
-  it("detects a drifted hash and fires the invalidation cascade", async () => {
-    toolsSyncCache.update("server-1", baseline);
-    const client = makeRequestableClient(drifted);
+  it("seeds silently on first observation — no invalidate fires from the seed tick", async () => {
+    // No toolsSyncCache entry either — proves the sweep no longer gates on
+    // (or needs) the shared cache to decide whether to re-list a server.
+    const client = makeRequestableClient(baseline);
+    internals.activeSessions["session-A"] = { "server-1": client };
+    const invalidate = vi.spyOn(pool, "invalidateServerConnection");
+
+    await internals.sweepToolDefinitions();
+
+    expect(client.client.request).toHaveBeenCalledTimes(1);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(internals.toolsSweepLastHash["server-1"]).toBeDefined();
+  });
+
+  it("fires on the tick where the listed tools actually change, not the seed tick", async () => {
+    const client = makeRequestableClient(baseline);
     internals.activeSessions["session-A"] = { "server-1": client };
     const invalidate = vi
       .spyOn(pool, "invalidateServerConnection")
       .mockResolvedValue();
 
-    await internals.sweepToolDefinitions();
+    await internals.sweepToolDefinitions(); // seed, no fire
+    expect(invalidate).not.toHaveBeenCalled();
 
-    expect(client.client.request).toHaveBeenCalledTimes(1);
+    client.client.request = vi
+      .fn()
+      .mockResolvedValue({ tools: drifted, nextCursor: undefined });
+    await internals.sweepToolDefinitions(); // real change → fire
+
+    expect(invalidate).toHaveBeenCalledTimes(1);
     expect(invalidate).toHaveBeenCalledWith("<tools-sweep>", "server-1");
   });
 
-  it("is a no-op when the hash is unchanged", async () => {
-    toolsSyncCache.update("server-1", baseline);
-    const client = makeRequestableClient(baseline); // identical defs
+  it("is a no-op across ticks when tools are unchanged", async () => {
+    const client = makeRequestableClient(baseline);
     internals.activeSessions["session-A"] = { "server-1": client };
     const invalidate = vi.spyOn(pool, "invalidateServerConnection");
 
     await internals.sweepToolDefinitions();
+    await internals.sweepToolDefinitions();
+    await internals.sweepToolDefinitions();
 
-    expect(client.client.request).toHaveBeenCalledTimes(1);
+    expect(client.client.request).toHaveBeenCalledTimes(3);
     expect(invalidate).not.toHaveBeenCalled();
   });
 
-  it("does NOT update the cache on a detected change (leaves the resync to the re-list path)", async () => {
-    toolsSyncCache.update("server-1", baseline);
-    const client = makeRequestableClient(drifted);
-    internals.activeSessions["session-A"] = { "server-1": client };
-    vi.spyOn(pool, "invalidateServerConnection").mockResolvedValue();
-
-    await internals.sweepToolDefinitions();
-
-    // Baseline is still the OLD hash, so the consumer-driven re-list that the
-    // fan-out triggers will detect the change and run the DB resync + update.
-    expect(toolsSyncCache.hasChanged("server-1", drifted)).toBe(true);
-  });
-
-  it("skips a server with no established baseline (never re-lists it)", async () => {
-    // No toolsSyncCache.update → nothing to drift from; the next
-    // consumer-driven tools/list will populate the baseline instead.
-    const client = makeRequestableClient(drifted);
-    internals.activeSessions["session-A"] = { "server-x": client };
-    const invalidate = vi.spyOn(pool, "invalidateServerConnection");
-
-    await internals.sweepToolDefinitions();
-
-    expect(client.client.request).not.toHaveBeenCalled();
-    expect(invalidate).not.toHaveBeenCalled();
-  });
-
-  it("isolates a per-server tools/list failure and still sweeps its neighbors", async () => {
-    toolsSyncCache.update("server-bad", baseline);
-    toolsSyncCache.update("server-good", baseline);
-    const bad = makeRequestableClient([]);
-    bad.client.request = vi.fn().mockRejectedValue(new Error("mid-restart"));
-    const good = makeRequestableClient(drifted);
+  it("isolates a per-server tools/list failure and still fires for its neighbor's real change", async () => {
+    const bad = makeRequestableClient(baseline);
+    const good = makeRequestableClient(baseline);
     internals.activeSessions["session-A"] = {
       "server-bad": bad,
       "server-good": good,
@@ -1012,14 +1023,25 @@ describe("McpServerPool.sweepToolDefinitions — periodic tools/list drift sweep
       .spyOn(pool, "invalidateServerConnection")
       .mockResolvedValue();
 
+    await internals.sweepToolDefinitions(); // both seed
+
+    bad.client.request = vi.fn().mockRejectedValue(new Error("mid-restart"));
+    good.client.request = vi
+      .fn()
+      .mockResolvedValue({ tools: drifted, nextCursor: undefined });
+
     await expect(internals.sweepToolDefinitions()).resolves.not.toThrow();
 
     expect(invalidate).toHaveBeenCalledWith("<tools-sweep>", "server-good");
     expect(invalidate).not.toHaveBeenCalledWith("<tools-sweep>", "server-bad");
+    // The failed server's baseline is untouched (never re-hashed), not
+    // corrupted by the failed attempt.
+    expect(internals.toolsSweepLastHash["server-bad"]).toBe(
+      toolsSyncCache.hashTools(baseline),
+    );
   });
 
   it("skips an overlapping tick while a sweep is still in flight", async () => {
-    toolsSyncCache.update("server-1", baseline);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -1043,17 +1065,123 @@ describe("McpServerPool.sweepToolDefinitions — periodic tools/list drift sweep
   });
 
   it("uses an idle connection when the server has no active slot", async () => {
-    toolsSyncCache.update("server-1", baseline);
-    const idle = makeRequestableClient(drifted);
+    const idle = makeRequestableClient(baseline);
     internals.idleSessions["server-1"] = idle;
     const invalidate = vi
       .spyOn(pool, "invalidateServerConnection")
       .mockResolvedValue();
 
-    await internals.sweepToolDefinitions();
+    await internals.sweepToolDefinitions(); // seed
+    expect(invalidate).not.toHaveBeenCalled();
+
+    idle.client.request = vi
+      .fn()
+      .mockResolvedValue({ tools: drifted, nextCursor: undefined });
+    await internals.sweepToolDefinitions(); // real change → fire
 
     expect(idle.client.request).toHaveBeenCalledTimes(1);
     expect(invalidate).toHaveBeenCalledWith("<tools-sweep>", "server-1");
+  });
+
+  // -----------------------------------------------------------------
+  // Review-requested regression coverage (2026-07-14)
+  // -----------------------------------------------------------------
+
+  it("(a) multi-tick idle-only, zero subscribers: one real change produces exactly ONE invalidate, quiet after", async () => {
+    // Idle-only: no active session, and makeFakeClient()'s
+    // listChangedSubscribers set is empty — the exact Finding 1 shape.
+    // With the OLD toolsSyncCache-compared design this would refire every
+    // tick forever because nothing ever updates the shared cache for an
+    // idle-only server.
+    const idle = makeRequestableClient(baseline);
+    internals.idleSessions["server-1"] = idle;
+    const invalidate = vi
+      .spyOn(pool, "invalidateServerConnection")
+      .mockResolvedValue();
+
+    await internals.sweepToolDefinitions(); // tick 1: seed, no fire
+    expect(invalidate).not.toHaveBeenCalled();
+
+    idle.client.request = vi
+      .fn()
+      .mockResolvedValue({ tools: drifted, nextCursor: undefined });
+    await internals.sweepToolDefinitions(); // tick 2: the one real change
+    expect(invalidate).toHaveBeenCalledTimes(1);
+
+    // Tools stay drifted (unchanged from tick 2's observation) for every
+    // subsequent tick — no downstream consumer ever touches toolsSyncCache
+    // since there are no subscribers to notify.
+    await internals.sweepToolDefinitions(); // tick 3
+    await internals.sweepToolDefinitions(); // tick 4
+    await internals.sweepToolDefinitions(); // tick 5
+
+    expect(invalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("(b) baseline independence: a stale/filtered toolsSyncCache entry does not cause the sweep to fire when the listed set is unchanged", async () => {
+    // Simulates tools.impl.sync (Finding 2): the shared cache holds a
+    // namespace-FILTERED hash that permanently disagrees with the
+    // UNFILTERED set the sweep lists. If the sweep compared against
+    // toolsSyncCache this would read as permanent drift on every tick.
+    const filteredAway: SweepTool[] = []; // e.g. every tool got filtered out
+    toolsSyncCache.update("server-1", filteredAway);
+    expect(toolsSyncCache.hasChanged("server-1", baseline)).toBe(true); // sanity: shared cache disagrees
+
+    const client = makeRequestableClient(baseline);
+    internals.activeSessions["session-A"] = { "server-1": client };
+    const invalidate = vi.spyOn(pool, "invalidateServerConnection");
+
+    await internals.sweepToolDefinitions(); // seed
+    await internals.sweepToolDefinitions(); // same unfiltered tools again
+    await internals.sweepToolDefinitions(); // and again
+
+    expect(client.client.request).toHaveBeenCalledTimes(3);
+    expect(invalidate).not.toHaveBeenCalled();
+    // The shared cache's disagreement is untouched by the sweep — proof
+    // it never wrote to or read from toolsSyncCache's stateful surface.
+    expect(toolsSyncCache.hasChanged("server-1", baseline)).toBe(true);
+  });
+
+  it("(c) a non-advancing tools/list cursor trips the pagination guard, and the NEXT tick still runs", async () => {
+    const client = makeRequestableClient([]);
+    client.client.request = vi.fn().mockResolvedValue({
+      tools: [{ name: "stuck", description: "d", inputSchema: {} }],
+      nextCursor: "same-cursor", // identical every response: non-advancing
+    });
+    internals.activeSessions["session-A"] = { "server-1": client };
+
+    await expect(internals.sweepToolDefinitions()).resolves.not.toThrow();
+
+    // First request: cursor=undefined -> nextCursor="same-cursor" (no match
+    // yet, page 1). Second request: cursor="same-cursor" -> nextCursor=
+    // "same-cursor" again (matches the cursor just sent) -> guard trips,
+    // pagination stops. Never loops.
+    expect(client.client.request).toHaveBeenCalledTimes(2);
+    expect(internals.toolsSweepInProgress).toBe(false);
+
+    // The in-flight guard was released cleanly by the completed (not
+    // hung) sweep — a subsequent tick runs too, proving no permanent wedge.
+    client.client.request.mockClear();
+    await internals.sweepToolDefinitions();
+    expect(client.client.request).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps pagination at the hard page limit even when the cursor keeps advancing", async () => {
+    let page = 0;
+    const client = makeRequestableClient([]);
+    client.client.request = vi.fn().mockImplementation(async () => {
+      page++;
+      return { tools: [], nextCursor: `page-${page}` }; // always advances, never terminates on its own
+    });
+    internals.activeSessions["session-A"] = { "server-1": client };
+
+    await expect(internals.sweepToolDefinitions()).resolves.not.toThrow();
+
+    // TOOLS_SWEEP_MAX_PAGES (50) is the backstop for this shape — the
+    // non-advancing-cursor check above can't catch an always-different
+    // cursor, so a hard cap is the only thing that stops it.
+    expect(client.client.request).toHaveBeenCalledTimes(50);
+    expect(internals.toolsSweepInProgress).toBe(false);
   });
 });
 

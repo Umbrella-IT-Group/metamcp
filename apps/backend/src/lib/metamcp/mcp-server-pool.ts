@@ -22,6 +22,15 @@ import { toolsSyncCache } from "./tools-sync-cache";
 // the sweep already isolates per-server failures, this just caps the wait.
 const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
 
+// Hard backstop on tools/list pagination during a sweep. Paired with the
+// non-advancing-cursor check in listToolsForSweep: that check catches a
+// backend replaying the SAME cursor, this catches any other shape of
+// infinite/very-long pagination. Without a cap, an unbounded loop here
+// would wedge the sweep permanently — toolsSweepInProgress only clears in
+// sweepToolDefinitions's `finally`, so every future tick would be skipped
+// by the in-flight guard forever.
+const TOOLS_SWEEP_MAX_PAGES = 50;
+
 export interface McpServerPoolStatus {
   idle: number;
   active: number;
@@ -82,6 +91,25 @@ export class McpServerPool {
   // that fires while the previous sweep is still awaiting backends is
   // skipped rather than overlapped.
   private toolsSweepInProgress = false;
+
+  // Sweep-owned per-server baseline: the full-definition hash (Track A3's
+  // toolsSyncCache.hashTools, used here as a pure function only — never the
+  // shared cache's stateful hasChanged/update) that the SWEEP itself last
+  // observed for each serverUuid. Deliberately independent of
+  // toolsSyncCache's own state (review findings, 2026-07-14):
+  //   - An idle-only server has zero listChangedSubscribers, so the
+  //     invalidation fan-out reaches no one and nothing downstream ever
+  //     touches toolsSyncCache. Comparing against that frozen cache would
+  //     re-detect the SAME already-handled change every tick, forever.
+  //   - tools.impl.sync overwrites toolsSyncCache with the
+  //     NAMESPACE-FILTERED tool set whenever filterOutOverrideTools drops a
+  //     tool, while the sweep always lists the UNFILTERED set — a
+  //     permanent false-drift mismatch even for servers with active
+  //     consumers.
+  // Owning a separate baseline makes both impossible: always
+  // unfiltered-vs-unfiltered, and updating it the moment a change is
+  // observed makes the invalidate fire exactly ONCE per real change.
+  private toolsSweepLastHash: Record<string, string> = {};
 
   // Sweep interval in ms. <= 0 disables the sweep entirely (no timer).
   private readonly toolsSweepIntervalMs: number;
@@ -1441,6 +1469,10 @@ export class McpServerPool {
           await this.cleanupIdleSession(serverUuid);
           delete this.lastErrorProbeAt[serverUuid];
           delete this.activePingFailures[serverUuid];
+          // Same per-server-telemetry cleanup category as the two maps
+          // above: a deregistered server's sweep baseline must not linger
+          // and be compared against if the serverUuid is ever reused.
+          delete this.toolsSweepLastHash[serverUuid];
           await serverErrorTracker
             .resetServerErrorState(serverUuid)
             .catch(() => {});
@@ -1597,11 +1629,26 @@ export class McpServerPool {
    * Periodic PULL sweep for tool-definition drift.
    *
    * For every backend that already has a live pooled connection, re-list
-   * its tools over that existing connection and, if the full-definition
-   * hash has drifted from the last synced baseline, run the SAME
-   * invalidation cascade a transport drop uses
+   * its tools over that existing connection and compare the full-definition
+   * hash (Track A3's `hashTools`) against the SWEEP's OWN prior observation
+   * for that server (`toolsSweepLastHash`) — not `toolsSyncCache`. On a
+   * genuine change, run the SAME invalidation cascade a transport drop uses
    * (`invalidateServerConnection` → `list_changed` fan-out → consumer
    * re-list → DB resync). No new propagation mechanism.
+   *
+   * Why the sweep owns its own baseline instead of reading `toolsSyncCache`
+   * (review findings, 2026-07-14 — see the field doc on `toolsSweepLastHash`
+   * for the full detail): that cache is shared with, and can be silently
+   * frozen or overwritten by, the consumer-driven proxy/tools.impl DB-sync
+   * path. Comparing against it directly made the sweep either re-fire the
+   * same detected change forever (idle-only servers, whose invalidation
+   * fan-out reaches no subscribers) or never fire at all (servers where
+   * `tools.impl.sync` cached a namespace-FILTERED hash against the sweep's
+   * UNFILTERED list). Owning a separate baseline — seeded on first sight,
+   * updated on every tick, compared only to its own prior value — makes
+   * both failure modes structurally impossible: the invalidate fires
+   * exactly once per real change, independent of whether anything
+   * downstream reacts to it.
    *
    * Why a pull sweep exists at all: prod backends deliver tool updates as
    * container REPLACES that kill the process, and the SDK's standalone GET
@@ -1613,10 +1660,10 @@ export class McpServerPool {
    * (name-only hashing missed exactly that).
    *
    * Guard rails: at most one sweep runs at a time (an overlapping tick is
-   * skipped); a per-server tools/list failure is logged and never aborts
-   * the loop or crashes the timer; we never open a NEW connection just to
-   * sweep — a server with no live connection gets fresh tools at its next
-   * connect anyway.
+   * skipped); a per-server failure (tools/list OR the invalidate cascade)
+   * is logged and never aborts the loop or crashes the timer; we never open
+   * a NEW connection just to sweep — a server with no live connection gets
+   * fresh tools at its next connect anyway.
    */
   private async sweepToolDefinitions(): Promise<void> {
     if (this.toolsSweepInProgress) {
@@ -1630,9 +1677,11 @@ export class McpServerPool {
     try {
       // One existing pooled client per server. Active slots are preferred
       // because they carry the `listChangedSubscribers` a detected change
-      // must fan out to; an idle slot is a valid fallback for detection.
-      // Every connection to a backend serves the same tool list, so one
-      // client per server is enough and cheapest.
+      // can fan out to; an idle slot is a valid fallback for detection —
+      // the sweep-owned baseline (not the subscriber fan-out) is what makes
+      // detection correct even when there's no one to notify. Every
+      // connection to a backend serves the same tool list, so one client
+      // per server is enough and cheapest.
       const clientByServer = new Map<string, ConnectedClient>();
       for (const sessionServers of Object.values(this.activeSessions)) {
         for (const [serverUuid, client] of Object.entries(sessionServers)) {
@@ -1647,43 +1696,56 @@ export class McpServerPool {
         }
       }
 
-      // Only servers with an established baseline hash can be compared: a
-      // never-synced server has nothing to drift FROM (hasChanged would read
-      // "no cache" as changed and churn every tick), and its next
-      // consumer-driven tools/list populates the baseline on the normal proxy
-      // path. Snapshot once per sweep, not once per server.
-      const baselined = new Set(toolsSyncCache.getStats().servers);
-
       let swept = 0;
       let changed = 0;
 
       for (const [serverUuid, client] of clientByServer) {
-        if (!baselined.has(serverUuid)) {
-          continue;
-        }
         try {
           const tools = await this.listToolsForSweep(client);
           swept++;
-          if (toolsSyncCache.hasChanged(serverUuid, tools)) {
+
+          // Pure hashing utility only — deliberately not toolsSyncCache's
+          // stateful hasChanged/update (see the class-field doc above).
+          const newHash = toolsSyncCache.hashTools(tools);
+          const priorHash = this.toolsSweepLastHash[serverUuid];
+          // Update on EVERY tick, seed included, so the baseline always
+          // reflects what the sweep itself last observed. Doing this before
+          // the invalidate call below is what makes the fan-out exactly-
+          // once per change: the NEXT tick's comparison is against the
+          // hash we just observed, not the (possibly still-stale) hash a
+          // downstream consumer may or may not have picked up.
+          this.toolsSweepLastHash[serverUuid] = newHash;
+
+          if (priorHash === undefined) {
+            // First observation of this server since the sweep started (or
+            // since it was pruned on deregistration) — nothing to compare
+            // against yet. Seed only; firing here would treat "the sweep
+            // just started watching this server" as if it just changed.
+            continue;
+          }
+
+          if (newHash !== priorHash) {
             changed++;
             const serverName =
               this.serverParamsCache[serverUuid]?.name || serverUuid;
-            // One INFO line per detected change (prod LOG_LEVEL=info surfaces
-            // INFO in docker logs). Deliberately do NOT update the cache here:
-            // leaving the stale hash in place lets the consumer's re-list
-            // (triggered by the fan-out inside invalidateServerConnection)
-            // detect the change and run the DB resync + cache update on the
-            // normal proxy path. Updating here would suppress that resync.
+            // One INFO line per detected change (prod LOG_LEVEL=info
+            // surfaces INFO in docker logs).
             logger.info(
               `tool definitions changed for ${serverName}, resyncing`,
             );
+            // Fire even when this client has zero listChangedSubscribers
+            // (idle-only server, no consumer currently attached) — it still
+            // primes a fresh connection for whenever a consumer shows up,
+            // and the baseline update above already guarantees this can't
+            // refire on the next tick regardless of whether anyone reacted.
             await this.invalidateServerConnection("<tools-sweep>", serverUuid);
           }
         } catch (error) {
-          // A single backend's tools/list failure (slow, mid-restart, gone)
-          // must never abort the sweep or crash the interval callback.
+          // A single backend's failure — tools/list OR the invalidate
+          // cascade — must never abort the sweep or crash the interval
+          // callback.
           logger.debug(
-            `Tool-definition sweep: tools/list failed for ${serverUuid}, skipping this tick:`,
+            `Tool-definition sweep: iteration failed for ${serverUuid}, skipping this tick:`,
             error,
           );
         }
@@ -1707,15 +1769,25 @@ export class McpServerPool {
   /**
    * Fetch the FULL tool list (all pages) over an existing pooled client,
    * bounded by a per-request timeout. Pagination mirrors metamcp-proxy's
-   * tools/list loop so the hash input matches the cached baseline exactly —
+   * tools/list loop so the hash input matches what a consumer would see —
    * a first-page-only read would diverge from a multi-page baseline and
    * false-positive every sweep. Runs as an ordinary JSON-RPC request over
    * the shared transport, so it multiplexes with in-flight tool calls
    * rather than blocking them.
+   *
+   * Guarded against a misbehaving backend that never terminates pagination:
+   * a `nextCursor` identical to the cursor just requested stops the loop
+   * immediately (the exact "returns a constant nextCursor" failure shape),
+   * and TOOLS_SWEEP_MAX_PAGES is a backstop for any other infinite/very-long
+   * pagination shape. Without this, `toolsSweepInProgress` only clears in
+   * `sweepToolDefinitions`'s `finally` — an unbounded loop here would wedge
+   * the sweep permanently, with every future tick skipped by the in-flight
+   * guard.
    */
   private async listToolsForSweep(client: ConnectedClient): Promise<Tool[]> {
     const pages: Tool[] = [];
     let cursor: string | undefined = undefined;
+    let pageCount = 0;
 
     do {
       const result: z.infer<typeof ListToolsResultSchema> =
@@ -1728,8 +1800,23 @@ export class McpServerPool {
       if (result.tools && result.tools.length > 0) {
         pages.push(...result.tools);
       }
+      pageCount++;
 
-      cursor = result.nextCursor;
+      const nextCursor = result.nextCursor;
+      if (nextCursor !== undefined && nextCursor === cursor) {
+        logger.warn(
+          "Tool-definition sweep: backend returned a non-advancing tools/list cursor, stopping pagination early",
+        );
+        break;
+      }
+      if (pageCount >= TOOLS_SWEEP_MAX_PAGES) {
+        logger.warn(
+          `Tool-definition sweep: hit the ${TOOLS_SWEEP_MAX_PAGES}-page cap while paginating tools/list, stopping pagination early`,
+        );
+        break;
+      }
+
+      cursor = nextCursor;
     } while (cursor);
 
     return pages;
