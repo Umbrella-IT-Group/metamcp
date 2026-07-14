@@ -19,7 +19,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 // Define the namespaces router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -95,24 +95,24 @@ export const createNamespacesRouter = (
         return await implementations.getTools(input, ctx.user.id);
       }),
 
-    // Protected: Create namespace
-    create: protectedProcedure
+    // Admin only: Create namespace
+    create: adminProcedure
       .input(CreateNamespaceRequestSchema)
       .output(CreateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.create(input, ctx.user.id);
       }),
 
-    // Protected: Delete namespace
-    delete: protectedProcedure
+    // Admin only: Delete namespace
+    delete: adminProcedure
       .input(z.object({ uuid: z.string() }))
       .output(DeleteNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.delete(input, ctx.user.id);
       }),
 
-    // Protected: Update namespace
-    update: protectedProcedure
+    // Admin only: Update namespace
+    update: adminProcedure
       .input(UpdateNamespaceRequestSchema)
       .output(UpdateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
