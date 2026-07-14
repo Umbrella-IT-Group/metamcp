@@ -213,20 +213,57 @@ export class McpServerPool {
   }
 
   /**
-   * Get the singleton instance
+   * Get the singleton instance.
+   *
+   * FIX (2026-07-14 audit finding, confirmed independently): this used to
+   * hardcode `100` for maxTotalConnections and default
+   * maxConnectionsPerServer to a literal `5`, both supplied unconditionally
+   * — so the constructor's own MAX_TOTAL_CONNECTIONS /
+   * MAX_CONNECTIONS_PER_SERVER env-parse defaults, just above, were dead
+   * code since this method's introduction (commit 806c2b2): every value
+   * getting an explicit argument, even the caller's default, means
+   * `parseInt(...) || "100"` never runs. Two real incidents trace to this:
+   * the 2026-07-14
+   * MAX_TOTAL_CONNECTIONS=400 cap raise (Umbrella-MCP-Server PR #406) never
+   * took effect — the pool silently kept enforcing 100 — and the 2026-05-08
+   * MAX_CONNECTIONS_PER_SERVER=50 change likewise never took effect (pool
+   * enforced 5). All three params are now optional with NO default here, so
+   * an omitted/undefined argument falls through to the constructor's own
+   * default expression instead of this method silently overriding it.
+   * Explicit arguments (used by tests) still win — only the previously-
+   * hardcoded values changed to "don't override unless asked".
    */
   static getInstance(
-    defaultIdleCount: number = 1,
-    maxConnectionsPerServer: number = 5,
+    defaultIdleCount?: number,
+    maxTotalConnections?: number,
+    maxConnectionsPerServer?: number,
   ): McpServerPool {
     if (!McpServerPool.instance) {
       McpServerPool.instance = new McpServerPool(
         defaultIdleCount,
-        100,
+        maxTotalConnections,
         maxConnectionsPerServer,
       );
     }
     return McpServerPool.instance;
+  }
+
+  /**
+   * TEST-ONLY escape hatch: clears the cached singleton so the NEXT
+   * getInstance() call re-runs the constructor (and its env-parse) against
+   * whatever process.env the test has set up. Production code never calls
+   * this — the entire point of getInstance() is one pool for the process's
+   * lifetime. Exists because a singleton with no reset seam is untestable
+   * across more than one env configuration per process, and the
+   * getInstance()-hardcoded-caps bug above could only be regression-tested
+   * by exercising getInstance() itself (a raw `new` via the private-
+   * constructor cast, the pattern used elsewhere in this test suite,
+   * bypasses getInstance() entirely and would have missed this bug too).
+   * Callers must cleanupAll() the outgoing instance themselves first — this
+   * only clears the reference, it doesn't tear down timers/sessions.
+   */
+  static resetInstanceForTests(): void {
+    McpServerPool.instance = null;
   }
 
   /**
