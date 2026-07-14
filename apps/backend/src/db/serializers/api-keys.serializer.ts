@@ -49,4 +49,31 @@ export class ApiKeysSerializer {
       created_at: dbApiKey.created_at,
     };
   }
+
+  // Admin cross-user view. Drops the full `key` secret — an admin listing must
+  // never hand back every user's raw key — and emits only a non-reversible
+  // prefix (scheme tag + first few chars) for identification.
+  static serializeAdminApiKeyList(
+    dbApiKeys: Array<{
+      uuid: string;
+      name: string;
+      key: string;
+      created_at: Date;
+      last_used_at: Date | null;
+      is_active: boolean;
+      user_id: string | null;
+      owner_email: string | null;
+    }>,
+  ) {
+    return dbApiKeys.map((apiKey) => ({
+      uuid: apiKey.uuid,
+      name: apiKey.name,
+      key_prefix: `${apiKey.key.slice(0, 10)}…`,
+      user_id: apiKey.user_id,
+      owner_email: apiKey.owner_email,
+      created_at: apiKey.created_at,
+      last_used_at: apiKey.last_used_at,
+      is_active: apiKey.is_active,
+    }));
+  }
 }

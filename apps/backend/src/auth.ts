@@ -135,6 +135,20 @@ export const auth = betterAuth({
         type: "boolean",
         defaultValue: false,
       },
+      // RBAC role surfaced into the session user so both the backend
+      // (adminProcedure reads ctx.user.role) and the frontend (nav/mint
+      // gating reads session.user.role) get it without a second query.
+      // `input: false` is the security boundary: better-auth will NOT accept
+      // a client-supplied role on sign-up or user-update, so a member can
+      // never self-promote to admin — role is set only by the DB default
+      // ('member') and the seed migration / a direct DB update. Sessions are
+      // read fresh from the DB per request here (no cookie-cache configured),
+      // so a demotion takes effect immediately.
+      role: {
+        type: "string",
+        defaultValue: "member",
+        input: false,
+      },
     },
   },
   advanced: {

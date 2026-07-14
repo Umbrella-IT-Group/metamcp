@@ -6,7 +6,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 // Define the OAuth router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -30,8 +30,9 @@ export const createOAuthRouter = (
         return await implementations.get(input);
       }),
 
-    // Protected: Upsert OAuth session
-    upsert: protectedProcedure
+    // Admin only: Upsert OAuth session — writes upstream MCP-server OAuth
+    // client credentials/tokens, a server-config surface, not a per-user one.
+    upsert: adminProcedure
       .input(UpsertOAuthSessionRequestSchema)
       .output(UpsertOAuthSessionResponseSchema)
       .mutation(async ({ input }) => {

@@ -2,8 +2,16 @@
 
 import { CreateApiKeyFormSchema } from "@repo/zod-types";
 import { format } from "date-fns";
-import { Copy, Eye, EyeOff, Key, Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
+import {
+  Copy,
+  Eye,
+  EyeOff,
+  Key,
+  Plus,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -47,6 +55,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useTranslations } from "@/hooks/useTranslations";
+import { authClient } from "@/lib/auth-client";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
@@ -63,11 +72,28 @@ export default function ApiKeysPage() {
   } | null>(null);
   const { t } = useTranslations();
 
+  // Current session role. Read from the better-auth session (role is surfaced
+  // via user.additionalFields — see apps/backend/src/auth.ts). Members never
+  // see the admin cross-user section or the 'everyone' mint option; the
+  // backend enforces the same boundary regardless of the UI.
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    authClient.getSession().then((session) => {
+      const role = (session?.data?.user as { role?: string } | undefined)?.role;
+      setIsAdmin(role === "admin");
+    });
+  }, []);
+
   const { data: apiKeys, refetch } = trpc.frontend.apiKeys.list.useQuery();
+  // Admin-only cross-user listing. `enabled: isAdmin` keeps members from ever
+  // firing the adminProcedure query (which would FORBIDDEN anyway).
+  const { data: allApiKeys, refetch: refetchAll } =
+    trpc.frontend.apiKeys.listAll.useQuery(undefined, { enabled: isAdmin });
   const createMutation = trpc.frontend.apiKeys.create.useMutation({
     onSuccess: (data) => {
       setNewApiKey(data.key);
       refetch();
+      if (isAdmin) refetchAll();
       toast.success(t("api-keys:apiKeyCreated"));
     },
     onError: (error) => {
@@ -79,6 +105,7 @@ export default function ApiKeysPage() {
     onSuccess: (data) => {
       if (data.success) {
         refetch();
+        if (isAdmin) refetchAll();
         toast.success(t("api-keys:apiKeyDeleted"));
         setDeleteDialogOpen(false);
         setApiKeyToDelete(null);
@@ -242,9 +269,14 @@ export default function ApiKeysPage() {
                       <SelectItem value="private">
                         {t("api-keys:forMyself")}
                       </SelectItem>
-                      <SelectItem value="public">
-                        {t("api-keys:everyone")}
-                      </SelectItem>
+                      {/* Minting a public ('everyone') key is admin-only —
+                          the backend rejects it for members regardless, so
+                          the option is simply hidden for non-admins. */}
+                      {isAdmin && (
+                        <SelectItem value="public">
+                          {t("api-keys:everyone")}
+                        </SelectItem>
+                      )}
                     </SelectContent>
                   </Select>
                   <p className="text-xs text-muted-foreground mt-1">
@@ -394,6 +426,121 @@ export default function ApiKeysPage() {
           </TableBody>
         </Table>
       </div>
+
+      {/* Admin-only: every API key across all users. Rendered only for
+          admins (the listAll query is adminProcedure-gated; members never
+          fetch it). This is the "admin section" — there is no separate admin
+          nav route, so hiding it here is what keeps admin surfaces out of a
+          member's view. */}
+      {isAdmin && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5 text-primary" />
+            <h2 className="text-xl font-semibold tracking-tight">
+              All API Keys
+            </h2>
+            <Badge variant="outline">Admin</Badge>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Every API key across all users, including keys you do not own. Only
+            administrators can see and revoke these.
+          </p>
+          <div className="rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t("common:name")}</TableHead>
+                  <TableHead>Key</TableHead>
+                  <TableHead>Owner</TableHead>
+                  <TableHead>{t("api-keys:created")}</TableHead>
+                  <TableHead>Last used</TableHead>
+                  <TableHead>{t("common:status")}</TableHead>
+                  <TableHead className="w-[100px]">
+                    {t("common:actions")}
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {allApiKeys?.apiKeys?.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={7} className="text-center py-12">
+                      <p className="text-muted-foreground">
+                        {t("api-keys:noApiKeys")}
+                      </p>
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  allApiKeys?.apiKeys?.map((apiKey) => (
+                    <TableRow key={apiKey.uuid}>
+                      <TableCell className="font-medium">
+                        {apiKey.name}
+                      </TableCell>
+                      <TableCell>
+                        <code className="text-sm font-mono break-all">
+                          {apiKey.key_prefix}
+                        </code>
+                      </TableCell>
+                      <TableCell>
+                        {apiKey.owner_email ?? (
+                          <Badge
+                            variant="outline"
+                            className="bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-300 border-green-200 dark:border-green-800"
+                          >
+                            {t("api-keys:public")}
+                          </Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {format(new Date(apiKey.created_at), "MMM d, yyyy")}
+                      </TableCell>
+                      <TableCell>
+                        {apiKey.last_used_at ? (
+                          format(
+                            new Date(apiKey.last_used_at),
+                            "MMM d, yyyy HH:mm",
+                          )
+                        ) : (
+                          <span className="text-muted-foreground">Never</span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Badge
+                          variant={apiKey.is_active ? "default" : "secondary"}
+                          className={
+                            apiKey.is_active
+                              ? "bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-200 border-green-200 dark:border-green-800"
+                              : "bg-red-100 dark:bg-red-900/20 text-red-800 dark:text-red-200 border-red-200 dark:border-red-800"
+                          }
+                        >
+                          {apiKey.is_active
+                            ? t("common:active")
+                            : t("common:inactive")}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() =>
+                            handleDeleteClick({
+                              uuid: apiKey.uuid,
+                              name: apiKey.name,
+                            })
+                          }
+                          disabled={deleteMutation.isPending}
+                          title={t("api-keys:delete")}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </div>
+      )}
 
       {/* Delete Confirmation Dialog */}
       <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>

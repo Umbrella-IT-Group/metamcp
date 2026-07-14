@@ -5,7 +5,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 // Define the logs router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -27,10 +27,9 @@ export const createLogsRouter = (
         return await implementations.getLogs(input);
       }),
 
-    // Protected: Clear all logs
-    clear: protectedProcedure
-      .output(ClearLogsResponseSchema)
-      .mutation(async () => {
-        return await implementations.clearLogs();
-      }),
+    // Admin only: Clear all logs — a destructive, gateway-wide operational
+    // action, not a per-user one.
+    clear: adminProcedure.output(ClearLogsResponseSchema).mutation(async () => {
+      return await implementations.clearLogs();
+    }),
   });
