@@ -163,6 +163,15 @@ const gracefulShutdown = async (signal: string) => {
     const { metaMcpServerPool } = await import(
       "./lib/metamcp/metamcp-server-pool"
     );
+    // Track A4 (METAMCP-POOL-1): clear the public-session idle-TTL
+    // sweeper's timer on shutdown, same dispose discipline as PR #70's
+    // tools sweep (`toolsSweepTimer` cleared in `mcp-server-pool.ts`'s
+    // `cleanupAll`) — a sync call, no need for the Promise.allSettled
+    // below.
+    const { stopPublicSessionSweeper } = await import(
+      "./routers/public-metamcp/streamable-http"
+    );
+    stopPublicSessionSweeper();
     await Promise.allSettled([
       mcpServerPool.cleanupAll(),
       metaMcpServerPool.cleanupAll(),

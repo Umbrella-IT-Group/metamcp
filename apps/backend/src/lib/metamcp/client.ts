@@ -8,8 +8,15 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import {
+  isM365BrokerError,
+  M365BrokerError,
+  M365BrokerErrorCode,
+} from "../m365/errors";
 import { getInjectedFetchForServer } from "../m365/injected-fetch";
+import { recordConnectBrokerFailure } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
+import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
 import { resolveEnvVariables } from "./utils";
@@ -270,11 +277,49 @@ export const createMetaMcpClient = (
   return { client, transport };
 };
 
+/**
+ * Test-only injection seam. Production callers (the pool) omit `deps` and
+ * get the real transport factory; unit tests supply a fake `createClient`
+ * so the retry loop, the `closing` guard and the M365 broker
+ * short-circuit are exercisable without live network I/O or a real SDK
+ * transport. Mirrors the injectable-deps convention already used by
+ * `makeM365InjectedFetch` and `buildM365BrokerErrorResult`.
+ */
+export interface ConnectMetaMcpClientDeps {
+  createClient?: typeof createMetaMcpClient;
+}
+
+/**
+ * M365 broker codes that represent a DETERMINISTIC per-user identity
+ * rejection on the connect-time mint — retrying can never change this
+ * user's outcome, so a connect that hits one of these short-circuits to a
+ * single attempt (see the catch block below). Deliberately every code
+ * EXCEPT `mint_failed`: mint-service throws `mint_failed` for TRANSIENT
+ * operational failures — the token-endpoint being unreachable
+ * (mint-service.ts's network-error catch) or answering 5xx / a
+ * non-grant error (mint-service.ts's `classifyRefreshFailure`, the
+ * ">=500 || !body.error" and "invalid_client/invalid_request" branches).
+ * Pre-Track-A5 those retried with the normal backoff schedule — free
+ * resilience against a brief Entra blip — and that must be preserved, not
+ * collapsed into the same one-attempt short-circuit as the deterministic
+ * codes.
+ */
+const NON_RETRYABLE_M365_BROKER_CODES: ReadonlySet<M365BrokerErrorCode> =
+  new Set([
+    "credential_missing",
+    "credential_expired",
+    "credential_revoked",
+    "mfa_required",
+    "not_configured",
+  ]);
+
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
   onTransportDrop?: TransportDropCallback,
+  deps: ConnectMetaMcpClientDeps = {},
 ): Promise<ConnectedClient | undefined> => {
+  const createClient = deps.createClient ?? createMetaMcpClient;
   // Get max attempts from server error tracker instead of hardcoding
   const maxAttempts = await serverErrorTracker.getServerMaxAttempts(
     serverParams.uuid,
@@ -289,6 +334,17 @@ export const connectMetaMcpClient = async (
   while (retry) {
     let transport: Transport | undefined;
     let client: Client | undefined;
+    // Hoisted to loop scope (was declared inside the try) so the catch
+    // block can set it before its cleanup `transport.close()` — that
+    // intentional teardown must not masquerade as an unexpected backend
+    // drop (see the catch below). Reset each attempt: a fresh transport
+    // starts un-closing.
+    let closing = false;
+    // When the `initialize` handshake completed. `undefined` = never
+    // established, which lets the drop handlers tell an established-then-
+    // dropped socket (container replace) from a connect-time failure
+    // (backend down) that the connect-attempt log already covers.
+    let connectedAt: number | undefined;
 
     try {
       // Check if server is already in error state before attempting connection
@@ -303,7 +359,7 @@ export const connectMetaMcpClient = async (
       }
 
       // Create fresh client and transport for each attempt
-      const result = createMetaMcpClient(serverParams);
+      const result = createClient(serverParams);
       client = result.client;
       transport = result.transport;
 
@@ -341,12 +397,18 @@ export const connectMetaMcpClient = async (
       // recovery cascade. Idle pool entries that sit dead because no
       // request hit them are the failure mode this closes.
       //
-      // Defensive: the SDK may invoke `onclose` after we've already
-      // torn down via `cleanup()`. The `closing` flag (set inside
-      // cleanup) lets us distinguish "we asked it to close" from "the
-      // remote dropped us", so we don't double-fire the cascade
-      // during normal shutdown.
-      let closing = false;
+      // Two guards keep these handlers from firing spurious "backend
+      // drop" noise:
+      //   - `closing`: the SDK may invoke `onclose` after WE tore the
+      //     transport down (normal `cleanup()`, or the connect-failure
+      //     cleanup in the catch below). An intentional close is not a
+      //     drop, so suppress it.
+      //   - `connectedAt === undefined`: a transport that never finished
+      //     `initialize` isn't an established connection that "dropped" —
+      //     it's a connect-time failure, already surfaced by the
+      //     connect-attempt log in the catch (with the unwrapped cause).
+      //     Firing the drop path here would double-log it and invalidate
+      //     a pool entry that doesn't exist yet.
       const isHttpTransport =
         transport instanceof SSEClientTransport ||
         transport instanceof StreamableHTTPClientTransport;
@@ -363,18 +425,19 @@ export const connectMetaMcpClient = async (
               chainError,
             );
           }
-          if (closing) {
+          if (closing || connectedAt === undefined) {
             return;
           }
+          const age = formatConnectionAge(connectedAt);
           logger.info(
-            `Transport closed unexpectedly for server ${serverParams.name} (${serverParams.uuid})`,
+            `Transport closed unexpectedly for server ${serverParams.name} (${serverParams.uuid}) — ${age}`,
           );
           metamcpLogStore.record({
             category: "connection",
             serverName: serverParams.name,
             serverUuid: serverParams.uuid,
             level: "warn",
-            message: "Transport closed unexpectedly (backend drop)",
+            message: `Transport closed unexpectedly (backend drop, ${age})`,
           });
           if (onTransportDrop) {
             try {
@@ -398,11 +461,13 @@ export const connectMetaMcpClient = async (
               chainError,
             );
           }
-          if (closing) {
+          if (closing || connectedAt === undefined) {
             return;
           }
+          const age = formatConnectionAge(connectedAt);
+          const detail = describeConnectError(transportError);
           logger.warn(
-            `Transport error for server ${serverParams.name} (${serverParams.uuid}):`,
+            `Transport error for server ${serverParams.name} (${serverParams.uuid}) — ${detail} (${age}):`,
             transportError,
           );
           metamcpLogStore.record({
@@ -410,7 +475,7 @@ export const connectMetaMcpClient = async (
             serverName: serverParams.name,
             serverUuid: serverParams.uuid,
             level: "warn",
-            message: "Transport error (backend drop)",
+            message: `Transport error (backend drop, ${detail}, ${age})`,
             error: transportError,
           });
           if (onTransportDrop) {
@@ -427,6 +492,9 @@ export const connectMetaMcpClient = async (
       }
 
       await client.connect(transport);
+      // Handshake complete — from here a transport close/error is a real
+      // drop of an established connection, not a connect-time failure.
+      connectedAt = Date.now();
 
       metamcpLogStore.record({
         category: "connection",
@@ -502,14 +570,73 @@ export const connectMetaMcpClient = async (
         listChangedSubscribers,
       };
     } catch (error) {
-      metamcpLogStore.record({
-        category: "connection",
-        serverName: serverParams.name,
-        serverUuid: serverParams.uuid,
-        level: "error",
-        message: `Connect attempt ${count + 1}/${maxAttempts} failed`,
-        error,
-      });
+      // Set the closing guard BEFORE the cleanup close below so an
+      // intentional teardown of a transport that DID establish (a throw
+      // after `connectedAt` was set) isn't logged as an unexpected drop.
+      // The connectedAt guard on the handlers covers the more common
+      // never-established case. Fixes the connect-failure cleanup that
+      // used to close without any guard and logged its own close as a
+      // "backend drop" twice per attempt.
+      closing = true;
+
+      const brokerError = isM365BrokerError(error) ? error : undefined;
+      const nonRetryableBroker =
+        brokerError !== undefined &&
+        NON_RETRYABLE_M365_BROKER_CODES.has(brokerError.code);
+
+      if (nonRetryableBroker) {
+        // brokerError is narrowed non-undefined by nonRetryableBroker.
+        const deterministicError = brokerError as M365BrokerError;
+        // A DETERMINISTIC per-user identity state, not a backend fault.
+        // Retrying can never resolve it and only produces the
+        // "Connect attempt N/N failed" storm the operator saw, so
+        // short-circuit after one attempt. Latch the error into the
+        // request-scoped sink: the outer tools/call handler drains it and
+        // answers the consumer with the enrollment prompt — the same
+        // surface the warm tool-call path already presents. See
+        // recordConnectBrokerFailure + m365/broker-error-result.ts.
+        recordConnectBrokerFailure({
+          serverName: serverParams.name,
+          error: deterministicError,
+        });
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "info",
+          message: `M365 enrollment required for the connecting user (${deterministicError.code}) — non-retryable; delivering enrollment prompt to caller`,
+        });
+      } else if (brokerError) {
+        // mint_failed: a TRANSIENT operational failure inside mint-service
+        // (network error reaching the token endpoint, or a 5xx / non-grant
+        // response). Falls through to the normal retry-with-backoff below
+        // like any other connect failure — see
+        // NON_RETRYABLE_M365_BROKER_CODES's doc comment for why this code
+        // is excluded from the short-circuit. Logged with the typed
+        // message (not describeConnectError, which is for untyped
+        // network/undici throws) so an operator sees the actionable
+        // "try again shortly" text, not a bare stack.
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "error",
+          message: `Connect attempt ${count + 1}/${maxAttempts} failed — M365 token mint failed (mint_failed): ${brokerError.message}`,
+          error: brokerError,
+        });
+      } else {
+        // Unwrap undici's nested `.cause` so the log names the actionable
+        // leaf (connect ECONNREFUSED 172.18.0.13:3000) rather than the
+        // generic "fetch failed" / "terminated" wrapper.
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "error",
+          message: `Connect attempt ${count + 1}/${maxAttempts} failed — ${describeConnectError(error)}`,
+          error,
+        });
+      }
 
       // CRITICAL FIX: Clean up transport/process on connection failure
       // This prevents orphaned processes from accumulating
@@ -529,13 +656,34 @@ export const connectMetaMcpClient = async (
       if (client) {
         try {
           await client.close();
-        } catch (cleanupError) {
-          // Client may not be fully initialized, ignore
+        } catch {
+          // Client may not be fully initialized, ignore.
         }
+      }
+
+      // Non-retryable: one attempt only. The pool sees `undefined`
+      // exactly as it does for any failed connect (unchanged contract);
+      // the latched enrollment prompt is what reaches the consumer.
+      if (nonRetryableBroker) {
+        return undefined;
       }
 
       count++;
       retry = count < maxAttempts;
+
+      if (brokerError && !retry) {
+        // mint_failed exhausted every retry. Latch it (same sink the
+        // non-retryable branch uses) so the consumer still gets the typed
+        // "try again shortly" enrollment-adjacent message via
+        // buildM365BrokerErrorResult instead of a generic connect
+        // failure / "Unknown tool" — the informative payload shouldn't be
+        // thrown away just because this code happened to be retryable.
+        recordConnectBrokerFailure({
+          serverName: serverParams.name,
+          error: brokerError,
+        });
+      }
+
       if (retry) {
         // Exponential backoff with jitter. See
         // `computeReconnectBackoffMs` doc comment for the schedule.
