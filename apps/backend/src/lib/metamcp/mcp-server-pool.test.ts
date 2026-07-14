@@ -16,7 +16,7 @@
  * unit-under-test here is the invalidation surface.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // `mcp-server-pool.ts` instantiates a `connectMetaMcpClient` -driven
 // pool at module load time. Stub the heavy imports so the unit test
@@ -50,6 +50,7 @@ vi.mock("./server-error-tracker", () => ({
 }));
 
 import { McpServerPool } from "./mcp-server-pool";
+import { toolsSyncCache } from "./tools-sync-cache";
 
 // Bypass the private-constructor discipline once, file-wide, without a
 // TS2673 per instantiation. Tests poke internals; the singleton
@@ -876,5 +877,220 @@ describe("McpServerPool connect-failure stamp — /health/upstream truthfulness"
     stamps["server-a"] = 999;
 
     expect(internals.lastConnectFailureAt["server-a"]).toBe(111);
+  });
+});
+
+// -------------------------------------------------------------------
+// Periodic tool-definition sweep (Track A2)
+//
+// Prod backends deliver tool updates as container replaces that kill the
+// process, and the SDK standalone GET stream (the only push channel) dies
+// and exhausts its auto-reconnect before the replacement boots — so no
+// push notification survives an update. The sweep is the pull signal: it
+// re-lists tools over an existing pooled connection, compares the
+// full-definition hash (Track A3) to the last synced baseline, and on a
+// change runs the SAME invalidation cascade a transport drop uses.
+// -------------------------------------------------------------------
+describe("McpServerPool.sweepToolDefinitions — periodic tools/list drift sweep", () => {
+  type RequestableFakeClient = FakeClient & {
+    client: { request: ReturnType<typeof vi.fn> };
+  };
+
+  type SweepTool = {
+    name: string;
+    description?: string | null;
+    inputSchema?: unknown;
+  };
+
+  // A fake ConnectedClient whose tools/list returns `tools` in a single
+  // (unpaginated) page. The sweep passes ListToolsResultSchema + a timeout
+  // to request(); the mock ignores both and returns the shape directly.
+  function makeRequestableClient(tools: SweepTool[]): RequestableFakeClient {
+    const fake = makeFakeClient() as RequestableFakeClient;
+    fake.client = {
+      request: vi.fn().mockResolvedValue({ tools, nextCursor: undefined }),
+    };
+    return fake;
+  }
+
+  const baseline: SweepTool[] = [
+    { name: "search", description: "old", inputSchema: { type: "object" } },
+  ];
+  // Same name + schema, reworded description — the exact drift name-only
+  // hashing missed and A3's full-def hash now catches.
+  const drifted: SweepTool[] = [
+    { name: "search", description: "NEW", inputSchema: { type: "object" } },
+  ];
+
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, RequestableFakeClient>>;
+    idleSessions: Record<string, RequestableFakeClient>;
+    serverParamsCache: Record<string, unknown>;
+    toolsSweepInProgress: boolean;
+    sweepToolDefinitions: () => Promise<void>;
+  };
+
+  beforeEach(() => {
+    toolsSyncCache.clear();
+    pool = new PoolConstructor();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.serverParamsCache = {};
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    // Stop the real interval this pool started so it can't fire mid-suite.
+    void pool.cleanupAll();
+  });
+
+  it("detects a drifted hash and fires the invalidation cascade", async () => {
+    toolsSyncCache.update("server-1", baseline);
+    const client = makeRequestableClient(drifted);
+    internals.activeSessions["session-A"] = { "server-1": client };
+    const invalidate = vi
+      .spyOn(pool, "invalidateServerConnection")
+      .mockResolvedValue();
+
+    await internals.sweepToolDefinitions();
+
+    expect(client.client.request).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith("<tools-sweep>", "server-1");
+  });
+
+  it("is a no-op when the hash is unchanged", async () => {
+    toolsSyncCache.update("server-1", baseline);
+    const client = makeRequestableClient(baseline); // identical defs
+    internals.activeSessions["session-A"] = { "server-1": client };
+    const invalidate = vi.spyOn(pool, "invalidateServerConnection");
+
+    await internals.sweepToolDefinitions();
+
+    expect(client.client.request).toHaveBeenCalledTimes(1);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("does NOT update the cache on a detected change (leaves the resync to the re-list path)", async () => {
+    toolsSyncCache.update("server-1", baseline);
+    const client = makeRequestableClient(drifted);
+    internals.activeSessions["session-A"] = { "server-1": client };
+    vi.spyOn(pool, "invalidateServerConnection").mockResolvedValue();
+
+    await internals.sweepToolDefinitions();
+
+    // Baseline is still the OLD hash, so the consumer-driven re-list that the
+    // fan-out triggers will detect the change and run the DB resync + update.
+    expect(toolsSyncCache.hasChanged("server-1", drifted)).toBe(true);
+  });
+
+  it("skips a server with no established baseline (never re-lists it)", async () => {
+    // No toolsSyncCache.update → nothing to drift from; the next
+    // consumer-driven tools/list will populate the baseline instead.
+    const client = makeRequestableClient(drifted);
+    internals.activeSessions["session-A"] = { "server-x": client };
+    const invalidate = vi.spyOn(pool, "invalidateServerConnection");
+
+    await internals.sweepToolDefinitions();
+
+    expect(client.client.request).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("isolates a per-server tools/list failure and still sweeps its neighbors", async () => {
+    toolsSyncCache.update("server-bad", baseline);
+    toolsSyncCache.update("server-good", baseline);
+    const bad = makeRequestableClient([]);
+    bad.client.request = vi.fn().mockRejectedValue(new Error("mid-restart"));
+    const good = makeRequestableClient(drifted);
+    internals.activeSessions["session-A"] = {
+      "server-bad": bad,
+      "server-good": good,
+    };
+    const invalidate = vi
+      .spyOn(pool, "invalidateServerConnection")
+      .mockResolvedValue();
+
+    await expect(internals.sweepToolDefinitions()).resolves.not.toThrow();
+
+    expect(invalidate).toHaveBeenCalledWith("<tools-sweep>", "server-good");
+    expect(invalidate).not.toHaveBeenCalledWith("<tools-sweep>", "server-bad");
+  });
+
+  it("skips an overlapping tick while a sweep is still in flight", async () => {
+    toolsSyncCache.update("server-1", baseline);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const client = makeRequestableClient(baseline);
+    client.client.request = vi.fn().mockImplementation(async () => {
+      await gate; // hang until released to hold the first sweep open
+      return { tools: baseline, nextCursor: undefined };
+    });
+    internals.activeSessions["session-A"] = { "server-1": client };
+
+    const first = internals.sweepToolDefinitions(); // starts, hangs on request
+    await internals.sweepToolDefinitions(); // second tick → guard skips it
+
+    // The second call returned without issuing its own tools/list.
+    expect(client.client.request).toHaveBeenCalledTimes(1);
+
+    release();
+    await first;
+    expect(client.client.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses an idle connection when the server has no active slot", async () => {
+    toolsSyncCache.update("server-1", baseline);
+    const idle = makeRequestableClient(drifted);
+    internals.idleSessions["server-1"] = idle;
+    const invalidate = vi
+      .spyOn(pool, "invalidateServerConnection")
+      .mockResolvedValue();
+
+    await internals.sweepToolDefinitions();
+
+    expect(idle.client.request).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith("<tools-sweep>", "server-1");
+  });
+});
+
+describe("McpServerPool tool-sweep timer lifecycle", () => {
+  it("TOOLS_SWEEP_INTERVAL_SECONDS=0 disables the sweep (no timer)", () => {
+    const prev = process.env.TOOLS_SWEEP_INTERVAL_SECONDS;
+    process.env.TOOLS_SWEEP_INTERVAL_SECONDS = "0";
+    try {
+      const gatedPool = new PoolConstructor();
+      expect(
+        (gatedPool as never as { toolsSweepTimer: unknown }).toolsSweepTimer,
+      ).toBeNull();
+      void gatedPool.cleanupAll();
+    } finally {
+      if (prev === undefined) {
+        delete process.env.TOOLS_SWEEP_INTERVAL_SECONDS;
+      } else {
+        process.env.TOOLS_SWEEP_INTERVAL_SECONDS = prev;
+      }
+    }
+  });
+
+  it("schedules a timer at the default interval and clears it on cleanupAll (clean shutdown)", async () => {
+    const prev = process.env.TOOLS_SWEEP_INTERVAL_SECONDS;
+    delete process.env.TOOLS_SWEEP_INTERVAL_SECONDS; // default 60s
+    try {
+      const timedPool = new PoolConstructor();
+      const timerRef = timedPool as never as { toolsSweepTimer: unknown };
+      expect(timerRef.toolsSweepTimer).not.toBeNull();
+
+      await timedPool.cleanupAll();
+
+      expect(timerRef.toolsSweepTimer).toBeNull();
+    } finally {
+      if (prev !== undefined) {
+        process.env.TOOLS_SWEEP_INTERVAL_SECONDS = prev;
+      }
+    }
   });
 });

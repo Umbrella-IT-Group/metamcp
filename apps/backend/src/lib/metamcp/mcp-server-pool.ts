@@ -1,4 +1,9 @@
+import {
+  ListToolsResultSchema,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import { ServerParameters } from "@repo/zod-types";
+import { z } from "zod";
 
 import logger from "@/utils/logger";
 
@@ -10,6 +15,12 @@ import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverErrorTracker } from "./server-error-tracker";
+import { toolsSyncCache } from "./tools-sync-cache";
+
+// Per-server tools/list timeout for the periodic sweep. Bounds a single
+// backend's re-list so a slow or mid-restart server can't stall the sweep;
+// the sweep already isolates per-server failures, this just caps the wait.
+const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
 
 export interface McpServerPoolStatus {
   idle: number;
@@ -60,6 +71,20 @@ export class McpServerPool {
 
   // Health check timer for idle sessions
   private healthCheckTimer: NodeJS.Timeout | null = null;
+
+  // Periodic tool-definition drift sweep timer. Re-lists tools over an
+  // existing pooled connection and fires the invalidation cascade when the
+  // full-definition hash has changed. Null when disabled
+  // (TOOLS_SWEEP_INTERVAL_SECONDS <= 0).
+  private toolsSweepTimer: NodeJS.Timeout | null = null;
+
+  // Re-entrancy guard: at most one sweep runs at a time. An interval tick
+  // that fires while the previous sweep is still awaiting backends is
+  // skipped rather than overlapped.
+  private toolsSweepInProgress = false;
+
+  // Sweep interval in ms. <= 0 disables the sweep entirely (no timer).
+  private readonly toolsSweepIntervalMs: number;
 
   // Background idle sessions by namespace: namespaceUuid -> any
   private backgroundIdleSessionsByNamespace: Map<string, any> = new Map();
@@ -146,8 +171,11 @@ export class McpServerPool {
       process.env.MCP_ERROR_PROBE_INTERVAL_MS || "300000",
       10,
     );
+    this.toolsSweepIntervalMs =
+      parseInt(process.env.TOOLS_SWEEP_INTERVAL_SECONDS || "60", 10) * 1000;
     this.startCleanupTimer();
     this.startHealthCheckTimer();
+    this.startToolsSweepTimer();
   }
 
   /**
@@ -723,6 +751,12 @@ export class McpServerPool {
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
+    }
+
+    // Clear tool-definition sweep timer
+    if (this.toolsSweepTimer) {
+      clearInterval(this.toolsSweepTimer);
+      this.toolsSweepTimer = null;
     }
 
     logger.info("Cleaned up all MCP server pool sessions");
@@ -1349,6 +1383,25 @@ export class McpServerPool {
   }
 
   /**
+   * Start the periodic tool-definition drift sweep.
+   *
+   * `TOOLS_SWEEP_INTERVAL_SECONDS <= 0` disables the sweep — no timer is
+   * scheduled. `NaN > 0` is false, so a malformed value also disables it
+   * rather than scheduling a broken interval.
+   */
+  private startToolsSweepTimer(): void {
+    if (!(this.toolsSweepIntervalMs > 0)) {
+      logger.info(
+        "Tool-definition sweep disabled (TOOLS_SWEEP_INTERVAL_SECONDS <= 0)",
+      );
+      return;
+    }
+    this.toolsSweepTimer = setInterval(async () => {
+      await this.sweepToolDefinitions();
+    }, this.toolsSweepIntervalMs);
+  }
+
+  /**
    * Check health of idle sessions by pinging them.
    * Dead sessions are cleaned up and recreated.
    * Servers in ERROR state whose crash counters have been reset are retried.
@@ -1538,6 +1591,148 @@ export class McpServerPool {
         this.createIdleSessionAsync(serverUuid, params);
       }
     }
+  }
+
+  /**
+   * Periodic PULL sweep for tool-definition drift.
+   *
+   * For every backend that already has a live pooled connection, re-list
+   * its tools over that existing connection and, if the full-definition
+   * hash has drifted from the last synced baseline, run the SAME
+   * invalidation cascade a transport drop uses
+   * (`invalidateServerConnection` → `list_changed` fan-out → consumer
+   * re-list → DB resync). No new propagation mechanism.
+   *
+   * Why a pull sweep exists at all: prod backends deliver tool updates as
+   * container REPLACES that kill the process, and the SDK's standalone GET
+   * stream — the only push channel — dies and exhausts its auto-reconnect
+   * before the replacement container finishes booting, so no push
+   * notification survives an update. A periodic re-list is the only
+   * reliable signal, and Track A3's full-definition hash is what lets it
+   * detect a schema/description change that kept every tool name identical
+   * (name-only hashing missed exactly that).
+   *
+   * Guard rails: at most one sweep runs at a time (an overlapping tick is
+   * skipped); a per-server tools/list failure is logged and never aborts
+   * the loop or crashes the timer; we never open a NEW connection just to
+   * sweep — a server with no live connection gets fresh tools at its next
+   * connect anyway.
+   */
+  private async sweepToolDefinitions(): Promise<void> {
+    if (this.toolsSweepInProgress) {
+      logger.debug(
+        "Tool-definition sweep skipped: previous sweep still in progress",
+      );
+      return;
+    }
+    this.toolsSweepInProgress = true;
+
+    try {
+      // One existing pooled client per server. Active slots are preferred
+      // because they carry the `listChangedSubscribers` a detected change
+      // must fan out to; an idle slot is a valid fallback for detection.
+      // Every connection to a backend serves the same tool list, so one
+      // client per server is enough and cheapest.
+      const clientByServer = new Map<string, ConnectedClient>();
+      for (const sessionServers of Object.values(this.activeSessions)) {
+        for (const [serverUuid, client] of Object.entries(sessionServers)) {
+          if (!clientByServer.has(serverUuid)) {
+            clientByServer.set(serverUuid, client);
+          }
+        }
+      }
+      for (const [serverUuid, client] of Object.entries(this.idleSessions)) {
+        if (!clientByServer.has(serverUuid)) {
+          clientByServer.set(serverUuid, client);
+        }
+      }
+
+      // Only servers with an established baseline hash can be compared: a
+      // never-synced server has nothing to drift FROM (hasChanged would read
+      // "no cache" as changed and churn every tick), and its next
+      // consumer-driven tools/list populates the baseline on the normal proxy
+      // path. Snapshot once per sweep, not once per server.
+      const baselined = new Set(toolsSyncCache.getStats().servers);
+
+      let swept = 0;
+      let changed = 0;
+
+      for (const [serverUuid, client] of clientByServer) {
+        if (!baselined.has(serverUuid)) {
+          continue;
+        }
+        try {
+          const tools = await this.listToolsForSweep(client);
+          swept++;
+          if (toolsSyncCache.hasChanged(serverUuid, tools)) {
+            changed++;
+            const serverName =
+              this.serverParamsCache[serverUuid]?.name || serverUuid;
+            // One INFO line per detected change (prod LOG_LEVEL=info surfaces
+            // INFO in docker logs). Deliberately do NOT update the cache here:
+            // leaving the stale hash in place lets the consumer's re-list
+            // (triggered by the fan-out inside invalidateServerConnection)
+            // detect the change and run the DB resync + cache update on the
+            // normal proxy path. Updating here would suppress that resync.
+            logger.info(
+              `tool definitions changed for ${serverName}, resyncing`,
+            );
+            await this.invalidateServerConnection("<tools-sweep>", serverUuid);
+          }
+        } catch (error) {
+          // A single backend's tools/list failure (slow, mid-restart, gone)
+          // must never abort the sweep or crash the interval callback.
+          logger.debug(
+            `Tool-definition sweep: tools/list failed for ${serverUuid}, skipping this tick:`,
+            error,
+          );
+        }
+      }
+
+      logger.debug(
+        `Tool-definition sweep: ${swept} server(s) checked, ${changed} changed`,
+      );
+    } catch (error) {
+      // Defensive: the sweep body should never throw, but the timer callback
+      // must survive it if it does.
+      logger.warn(
+        "Tool-definition sweep aborted with an unexpected error:",
+        error,
+      );
+    } finally {
+      this.toolsSweepInProgress = false;
+    }
+  }
+
+  /**
+   * Fetch the FULL tool list (all pages) over an existing pooled client,
+   * bounded by a per-request timeout. Pagination mirrors metamcp-proxy's
+   * tools/list loop so the hash input matches the cached baseline exactly —
+   * a first-page-only read would diverge from a multi-page baseline and
+   * false-positive every sweep. Runs as an ordinary JSON-RPC request over
+   * the shared transport, so it multiplexes with in-flight tool calls
+   * rather than blocking them.
+   */
+  private async listToolsForSweep(client: ConnectedClient): Promise<Tool[]> {
+    const pages: Tool[] = [];
+    let cursor: string | undefined = undefined;
+
+    do {
+      const result: z.infer<typeof ListToolsResultSchema> =
+        await client.client.request(
+          { method: "tools/list", params: { cursor } },
+          ListToolsResultSchema,
+          { timeout: TOOLS_SWEEP_REQUEST_TIMEOUT_MS },
+        );
+
+      if (result.tools && result.tools.length > 0) {
+        pages.push(...result.tools);
+      }
+
+      cursor = result.nextCursor;
+    } while (cursor);
+
+    return pages;
   }
 
   /**
