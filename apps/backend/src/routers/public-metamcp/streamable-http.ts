@@ -31,6 +31,7 @@ import {
   hydrateRecoveredTransport,
 } from "../../lib/metamcp/transport-recovery-hydration";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
+import { PublicSessionSweeper } from "./public-session-sweeper";
 
 const streamableHttpRouter = express.Router();
 
@@ -39,6 +40,45 @@ const sessionManager =
   new SessionLifetimeManagerImpl<StreamableHTTPServerTransport>(
     "StreamableHTTP",
   );
+
+// Idle-TTL sweeper for public-endpoint sessions. This reaps on a DIFFERENT
+// axis than the age-based `sessionManager.startCleanupTimer` below: last
+// request IDLE time, not session CREATION age. The age-based timer keys off
+// `configService.getSessionLifetime()`, which is null in prod (persistent
+// sessions never expire) so it never fires — that is exactly why public
+// sessions accumulated to backend-pool exhaustion (2026-07-14 incident,
+// METAMCP-POOL-1). The sweeper reuses `cleanupSession` (defined below), the
+// SAME path a client DELETE runs; reaped consumers reconnect transparently
+// via the fork's lazy session-recovery path. `measureActiveConnections`
+// samples the backend pool's active count so a sweep can report how many
+// connections it released.
+const publicSessionSweeper = PublicSessionSweeper.fromEnv("StreamableHTTP", {
+  reapSession: (sessionId: string) => cleanupSession(sessionId),
+  measureActiveConnections: () =>
+    metaMcpServerPool.getMcpServerPoolStatus().active,
+});
+
+/**
+ * Run the transport dispatch while marking the session in-flight so the
+ * idle-TTL sweeper never reaps it mid-request (a long tool call that
+ * outlives the idle TTL is live use, not idleness). markInFlight /
+ * markSettled also stamp last-activity at request arrival + completion,
+ * which is how "any request updates the stamp" is satisfied.
+ */
+async function dispatchTracked(
+  authReq: ApiKeyAuthenticatedRequest,
+  transport: StreamableHTTPServerTransport,
+  req: express.Request,
+  res: express.Response,
+  sessionId: string,
+): Promise<void> {
+  publicSessionSweeper.markInFlight(sessionId);
+  try {
+    await handleRequestWithUserContext(authReq, transport, req, res);
+  } finally {
+    publicSessionSweeper.markSettled(sessionId);
+  }
+}
 
 /**
  * Dispatch a transport request inside the M365 request-scoped user
@@ -311,6 +351,10 @@ const cleanupSession = async (
     // Remove from session manager
     sessionManager.removeSession(sessionId);
 
+    // Drop idle-TTL tracking so a reaped/DELETEd session isn't re-selected
+    // by a later sweep.
+    publicSessionSweeper.forget(sessionId);
+
     // Clean up MetaMCP server pool session
     await metaMcpServerPool.cleanupSession(sessionId);
 
@@ -331,6 +375,7 @@ const cleanupSession = async (
     logger.error(`Error during cleanup of session ${sessionId}:`, error);
     // Even if cleanup fails, remove the session from manager to prevent memory leaks
     sessionManager.removeSession(sessionId);
+    publicSessionSweeper.forget(sessionId);
     logger.info(`Removed orphaned session ${sessionId} due to cleanup error`);
     throw error;
   }
@@ -437,6 +482,7 @@ streamableHttpRouter.get("/health/sessions", (req, res) => {
     },
     metaMcpPoolStatus: poolStatus,
     totalActiveSessions: sessionIds.length + poolStatus.active,
+    publicSessionSweeper: publicSessionSweeper.getStats(),
   });
 });
 
@@ -487,7 +533,7 @@ streamableHttpRouter.get(
         }
       }
       logger.info(`Handling GET for session ${sessionId}`);
-      await handleRequestWithUserContext(authReq, transport, req, res);
+      await dispatchTracked(authReq, transport, req, res, sessionId);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
       res.status(500).json(error);
@@ -580,6 +626,10 @@ streamableHttpRouter.post(
 
         // Store transport reference
         sessionManager.addSession(newSessionId, transport);
+        // Track the session for idle-TTL sweeping from birth (dispatchTracked
+        // re-stamps on every request; this covers the session even before its
+        // first dispatch settles).
+        publicSessionSweeper.touch(newSessionId);
 
         logger.info(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,
@@ -625,7 +675,7 @@ streamableHttpRouter.post(
         }
 
         // Now handle the request - server is guaranteed to be ready
-        await handleRequestWithUserContext(authReq, transport, req, res);
+        await dispatchTracked(authReq, transport, req, res, newSessionId);
       } catch (error) {
         logger.error("Error in public endpoint /mcp POST route:", error);
 
@@ -709,7 +759,7 @@ streamableHttpRouter.post(
           }
         }
         logger.info(`Handling POST for session ${sessionId}`);
-        await handleRequestWithUserContext(authReq, transport, req, res);
+        await dispatchTracked(authReq, transport, req, res, sessionId);
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);
 
@@ -785,5 +835,14 @@ streamableHttpRouter.delete(
 sessionManager.startCleanupTimer(async (sessionId, transport) => {
   await cleanupSession(sessionId, transport);
 });
+
+// Arm the idle-TTL sweeper (structural fix for the 2026-07-14 pool-cap
+// saturation — see the sweeper's file header). No-op when either env knob
+// disables it.
+publicSessionSweeper.start();
+
+export function stopPublicSessionSweeper(): void {
+  publicSessionSweeper.stop();
+}
 
 export default streamableHttpRouter;
