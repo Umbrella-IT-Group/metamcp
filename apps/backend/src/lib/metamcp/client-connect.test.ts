@@ -104,6 +104,9 @@ describe("connectMetaMcpClient — M365 broker short-circuit", () => {
   });
 
   it("makes exactly one attempt, latches the enrollment prompt, logs no backend drop", async () => {
+    // credential_missing is a DETERMINISTIC identity code, unlike
+    // mint_failed (see the sibling describe block below) — it must stay
+    // one-attempt even after mint_failed was carved out to retry.
     const brokerError = new M365BrokerError(
       "credential_missing",
       "No stored M365 grant for this user.",
@@ -141,6 +144,71 @@ describe("connectMetaMcpClient — M365 broker short-circuit", () => {
     expect(messages.some((m) => m.includes("Connect attempt"))).toBe(false);
     expect(messages.some((m) => m.includes("backend drop"))).toBe(false);
     expect(onTransportDrop).not.toHaveBeenCalled();
+  });
+});
+
+describe("connectMetaMcpClient — M365 mint_failed is retried like a transient failure", () => {
+  let recordSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    recordSpy = vi
+      .spyOn(metamcpLogStore, "record")
+      .mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("retries up to maxAttempts (not a one-attempt short-circuit) then latches on exhaustion", async () => {
+    // mint_failed is thrown by mint-service for TRANSIENT operational
+    // failures (token-endpoint unreachable, 5xx) — unlike the deterministic
+    // identity codes, this must keep the pre-PR retry-with-backoff
+    // resilience, not collapse into the one-attempt short-circuit.
+    const brokerError = new M365BrokerError(
+      "mint_failed",
+      "Microsoft identity platform returned 503 — try again shortly.",
+    );
+    const client = makeFakeClient(async () => {
+      throw brokerError;
+    });
+    const transport = makeFakeTransport();
+    const createClient = vi.fn(() => ({ client, transport }));
+    const onTransportDrop = vi.fn();
+
+    let latched: ReturnType<typeof takeConnectBrokerFailure> | undefined;
+    vi.useFakeTimers();
+    const pending = runWithM365UserContext({ userId: "ray" }, async () => {
+      const r = await connectMetaMcpClient(params, undefined, onTransportDrop, {
+        createClient,
+      });
+      latched = takeConnectBrokerFailure();
+      return r;
+    });
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(result).toBeUndefined();
+    // maxAttempts (mocked) = 3 — full retry loop, not one attempt.
+    expect(createClient).toHaveBeenCalledTimes(3);
+    expect(client.connect).toHaveBeenCalledTimes(3);
+    expect(onTransportDrop).not.toHaveBeenCalled();
+
+    // Latched only once retries are exhausted, carrying the actionable
+    // "try again shortly" broker message rather than a generic connect
+    // failure / "Unknown tool".
+    expect(latched?.serverName).toBe("m365");
+    expect(latched?.error).toBe(brokerError);
+    expect(latched?.error.code).toBe("mint_failed");
+
+    // Every attempt logged with the typed mint_failed message, not the
+    // generic cause-unwrap path (there's no undici cause to unwrap here).
+    const messages = recordedMessages(recordSpy);
+    const attemptLogs = messages.filter((m) => m.includes("Connect attempt"));
+    expect(attemptLogs.length).toBe(3);
+    expect(attemptLogs[0]).toContain("mint_failed");
+    expect(messages.some((m) => m.includes("backend drop"))).toBe(false);
   });
 });
 

@@ -8,7 +8,11 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
-import { isM365BrokerError } from "../m365/errors";
+import {
+  isM365BrokerError,
+  M365BrokerError,
+  M365BrokerErrorCode,
+} from "../m365/errors";
 import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { recordConnectBrokerFailure } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
@@ -285,6 +289,30 @@ export interface ConnectMetaMcpClientDeps {
   createClient?: typeof createMetaMcpClient;
 }
 
+/**
+ * M365 broker codes that represent a DETERMINISTIC per-user identity
+ * rejection on the connect-time mint — retrying can never change this
+ * user's outcome, so a connect that hits one of these short-circuits to a
+ * single attempt (see the catch block below). Deliberately every code
+ * EXCEPT `mint_failed`: mint-service throws `mint_failed` for TRANSIENT
+ * operational failures — the token-endpoint being unreachable
+ * (mint-service.ts's network-error catch) or answering 5xx / a
+ * non-grant error (mint-service.ts's `classifyRefreshFailure`, the
+ * ">=500 || !body.error" and "invalid_client/invalid_request" branches).
+ * Pre-Track-A5 those retried with the normal backoff schedule — free
+ * resilience against a brief Entra blip — and that must be preserved, not
+ * collapsed into the same one-attempt short-circuit as the deterministic
+ * codes.
+ */
+const NON_RETRYABLE_M365_BROKER_CODES: ReadonlySet<M365BrokerErrorCode> =
+  new Set([
+    "credential_missing",
+    "credential_expired",
+    "credential_revoked",
+    "mfa_required",
+    "not_configured",
+  ]);
+
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
@@ -552,13 +580,16 @@ export const connectMetaMcpClient = async (
       closing = true;
 
       const brokerError = isM365BrokerError(error) ? error : undefined;
+      const nonRetryableBroker =
+        brokerError !== undefined &&
+        NON_RETRYABLE_M365_BROKER_CODES.has(brokerError.code);
 
-      if (brokerError) {
-        // An M365 broker rejection on the initialize-handshake mint
-        // (credential_missing / expired / revoked / mfa_required /
-        // not_configured) is a DETERMINISTIC per-user identity state, not
-        // a backend fault. Retrying can never resolve it and only produces
-        // the "Connect attempt N/N failed" storm the operator saw, so
+      if (nonRetryableBroker) {
+        // brokerError is narrowed non-undefined by nonRetryableBroker.
+        const deterministicError = brokerError as M365BrokerError;
+        // A DETERMINISTIC per-user identity state, not a backend fault.
+        // Retrying can never resolve it and only produces the
+        // "Connect attempt N/N failed" storm the operator saw, so
         // short-circuit after one attempt. Latch the error into the
         // request-scoped sink: the outer tools/call handler drains it and
         // answers the consumer with the enrollment prompt — the same
@@ -566,14 +597,32 @@ export const connectMetaMcpClient = async (
         // recordConnectBrokerFailure + m365/broker-error-result.ts.
         recordConnectBrokerFailure({
           serverName: serverParams.name,
-          error: brokerError,
+          error: deterministicError,
         });
         metamcpLogStore.record({
           category: "connection",
           serverName: serverParams.name,
           serverUuid: serverParams.uuid,
           level: "info",
-          message: `M365 enrollment required for the connecting user (${brokerError.code}) — non-retryable; delivering enrollment prompt to caller`,
+          message: `M365 enrollment required for the connecting user (${deterministicError.code}) — non-retryable; delivering enrollment prompt to caller`,
+        });
+      } else if (brokerError) {
+        // mint_failed: a TRANSIENT operational failure inside mint-service
+        // (network error reaching the token endpoint, or a 5xx / non-grant
+        // response). Falls through to the normal retry-with-backoff below
+        // like any other connect failure — see
+        // NON_RETRYABLE_M365_BROKER_CODES's doc comment for why this code
+        // is excluded from the short-circuit. Logged with the typed
+        // message (not describeConnectError, which is for untyped
+        // network/undici throws) so an operator sees the actionable
+        // "try again shortly" text, not a bare stack.
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "error",
+          message: `Connect attempt ${count + 1}/${maxAttempts} failed — M365 token mint failed (mint_failed): ${brokerError.message}`,
+          error: brokerError,
         });
       } else {
         // Unwrap undici's nested `.cause` so the log names the actionable
@@ -615,12 +664,26 @@ export const connectMetaMcpClient = async (
       // Non-retryable: one attempt only. The pool sees `undefined`
       // exactly as it does for any failed connect (unchanged contract);
       // the latched enrollment prompt is what reaches the consumer.
-      if (brokerError) {
+      if (nonRetryableBroker) {
         return undefined;
       }
 
       count++;
       retry = count < maxAttempts;
+
+      if (brokerError && !retry) {
+        // mint_failed exhausted every retry. Latch it (same sink the
+        // non-retryable branch uses) so the consumer still gets the typed
+        // "try again shortly" enrollment-adjacent message via
+        // buildM365BrokerErrorResult instead of a generic connect
+        // failure / "Unknown tool" — the informative payload shouldn't be
+        // thrown away just because this code happened to be retryable.
+        recordConnectBrokerFailure({
+          serverName: serverParams.name,
+          error: brokerError,
+        });
+      }
+
       if (retry) {
         // Exponential backoff with jitter. See
         // `computeReconnectBackoffMs` doc comment for the schedule.

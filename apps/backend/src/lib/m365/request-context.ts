@@ -76,7 +76,12 @@ export function getM365UserContext(): M365UserContext | undefined {
  * they can't produce a broker error anyway, and the connect just resolves
  * `undefined` as before. Last write wins if two servers were probed in
  * one request (only the injected m365 server can produce this, and the
- * outer handler gates delivery on the requested tool's owner).
+ * outer handler gates delivery on the requested tool's owner). The slot
+ * is a SINGLE field, not keyed by server — fine today because
+ * `M365_INJECTED_SERVER_NAMES` names exactly one server (`m365`) in
+ * prod; if that env var ever grows to inject more than one server, this
+ * needs to become a map keyed by `serverName` so two servers probed in
+ * the same request can't clobber each other's latched failure.
  */
 export function recordConnectBrokerFailure(
   failure: ConnectBrokerFailure,

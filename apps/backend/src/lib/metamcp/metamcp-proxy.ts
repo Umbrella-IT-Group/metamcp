@@ -28,8 +28,8 @@ import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
 import { isM365BrokerError } from "../m365/errors";
-import { takeConnectBrokerFailure } from "../m365/request-context";
 import { ConnectedClient } from "./client";
+import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import { getMcpServers } from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { requestWithSessionRecovery } from "./list-handler-recovery";
@@ -835,23 +835,17 @@ export const createServer = async (
         return buildM365BrokerErrorResult(error, server);
       }
 
-      // COLD path (Track A5): the mint failed on the backend `initialize`
-      // handshake during a fresh connect. That throw is swallowed by the
-      // pool's connect path (resolves undefined) and by dynamic-find's
-      // catch-and-continue, so it reaches here as a generic "Unknown
-      // tool" rather than the typed error the warm path gets. If THIS
-      // request latched a broker failure (client.ts records it into the
-      // request-scoped sink) for the server that owns the requested tool,
-      // surface the same enrollment result. Gate on ownership: routing an
-      // unrelated tool can incidentally probe-connect the m365 backend
-      // and latch a failure, and that must not hijack the real tool's
-      // error. Only the injected m365 server can ever latch here.
-      const latched = takeConnectBrokerFailure();
-      if (latched) {
-        const parsed = parseToolName(request.params.name);
-        if (parsed && parsed.serverName === sanitizeName(latched.serverName)) {
-          return buildM365BrokerErrorResult(latched.error, server);
-        }
+      // COLD path (Track A5): see cold-connect-broker-fallback.ts for the
+      // full rationale — drains any broker failure client.ts latched
+      // during this request's cold connect and, if it belongs to the
+      // server that owns the requested tool, answers with the same
+      // enrollment result the WARM path above returns.
+      const coldFallback = resolveColdConnectBrokerFallback(
+        request.params.name,
+        server,
+      );
+      if (coldFallback) {
+        return coldFallback;
       }
       throw error;
     }
