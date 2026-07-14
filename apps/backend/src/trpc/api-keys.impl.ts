@@ -71,6 +71,15 @@ export const apiKeysImplementations = {
     }
   },
 
+  // Deliberate: this member-facing list returns the FULL key value for
+  // public ('everyone') keys, not just a prefix. That is the intended
+  // "copy the shared key to configure your client" feature — a public key
+  // exists to be handed to every consumer (Tara/n8n/Claude) in the first
+  // place, so masking it here would only make the UI less useful without
+  // reducing exposure (the secret is already distributed). This does NOT
+  // apply to the admin cross-user view (listAll, below) — that one stays
+  // prefix-masked because it also surfaces every user's PRIVATE keys, which
+  // must never be reconstructable from an admin listing.
   list: async (
     userId: string,
   ): Promise<z.infer<typeof ListApiKeysResponseSchema>> => {

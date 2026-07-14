@@ -3,7 +3,7 @@ import {
   GetToolsByMcpServerUuidRequestSchema,
 } from "@repo/zod-types";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 export const createToolsRouter = <
   TImplementations extends {
@@ -22,15 +22,21 @@ export const createToolsRouter = <
         return implementations.getByMcpServerUuid(input);
       }),
 
-    // Protected: Save tools to database (upsert only, no cleanup)
-    create: protectedProcedure
+    // Admin only: Save tools to database (upsert only, no cleanup). Curation
+    // class, same rationale as namespaces.updateToolStatus — writes to the
+    // shared tools catalog. NOTE: namespaces.refreshTools (member-accessible)
+    // does NOT route through this procedure — it calls
+    // toolsRepository.bulkUpsert directly from namespaces.impl.ts, bypassing
+    // tRPC entirely, so this gate has no effect on that member-facing path.
+    create: adminProcedure
       .input(CreateToolRequestSchema)
       .mutation(async ({ input }) => {
         return implementations.create(input);
       }),
 
-    // Protected: Sync tools with cleanup (removes obsolete tools)
-    sync: protectedProcedure
+    // Admin only: Sync tools with cleanup (removes obsolete tools). Same
+    // rationale and refreshTools independence as create() above.
+    sync: adminProcedure
       .input(CreateToolRequestSchema)
       .mutation(async ({ input }) => {
         return implementations.sync(input);
