@@ -84,16 +84,17 @@ export const toolsImplementations = {
         };
       }
 
-      // Check if tools changed using hash
-      const toolNames = input.tools.map((tool) => tool.name);
+      // Check if tools changed using a hash over the FULL definitions
+      // (name + description + inputSchema) — a schema/description-only change
+      // keeps names identical, so a name-only hash would skip the sync.
       const hasChanged = toolsSyncCache.hasChanged(
         input.mcpServerUuid,
-        toolNames,
+        input.tools,
       );
 
       if (hasChanged) {
-        // Update cache
-        toolsSyncCache.update(input.mcpServerUuid, toolNames);
+        // Update cache with the full definitions
+        toolsSyncCache.update(input.mcpServerUuid, input.tools);
 
         // Perform sync with cleanup
         const { upserted, deleted } = await toolsRepository.syncTools({

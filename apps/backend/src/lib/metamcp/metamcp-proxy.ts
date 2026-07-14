@@ -401,10 +401,12 @@ export const createServer = async (
           // Filter out tools that are overrides of existing tools to prevent duplicates
           try {
             // PERFORMANCE OPTIMIZATION: Check hash FIRST to avoid expensive operations
-            const toolNames = allServerTools.map((tool) => tool.name);
+            // Hash the FULL definitions (name + description + inputSchema); a
+            // schema/description-only change keeps every name identical, so a
+            // name-only hash would skip the resync (see tools-sync-cache.ts).
             const hasChanged = toolsSyncCache.hasChanged(
               mcpServerUuid,
-              toolNames,
+              allServerTools,
             );
 
             logger.debug(
@@ -419,8 +421,8 @@ export const createServer = async (
               );
 
               if (toolsToSave.length > 0) {
-                // Update cache
-                toolsSyncCache.update(mcpServerUuid, toolNames);
+                // Update cache with the full definitions we just observed
+                toolsSyncCache.update(mcpServerUuid, allServerTools);
 
                 // Sync with cleanup
                 await toolsImplementations.sync({
