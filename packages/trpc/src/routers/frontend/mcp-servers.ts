@@ -13,7 +13,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 // Define the MCP servers router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -69,40 +69,45 @@ export const createMcpServersRouter = (
         return await implementations.get(input, ctx.user.id);
       }),
 
-    // Protected: Create MCP server
-    create: protectedProcedure
+    // Admin only: Create MCP server
+    create: adminProcedure
       .input(CreateMcpServerRequestSchema)
       .output(CreateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.create(input, ctx.user.id);
       }),
 
-    // Protected: Bulk import MCP servers
-    bulkImport: protectedProcedure
+    // Admin only: Bulk import MCP servers. Gated even though the brief names
+    // "create/update/delete" — bulkImport is a create path, so leaving it on
+    // protectedProcedure would let a member mint servers and bypass the
+    // create gate entirely, defeating the control.
+    bulkImport: adminProcedure
       .input(BulkImportMcpServersRequestSchema)
       .output(BulkImportMcpServersResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.bulkImport(input, ctx.user.id);
       }),
 
-    // Protected: Delete MCP server
-    delete: protectedProcedure
+    // Admin only: Delete MCP server
+    delete: adminProcedure
       .input(z.object({ uuid: z.string() }))
       .output(DeleteMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.delete(input, ctx.user.id);
       }),
 
-    // Protected: Update MCP server
-    update: protectedProcedure
+    // Admin only: Update MCP server
+    update: adminProcedure
       .input(UpdateMcpServerRequestSchema)
       .output(UpdateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.update(input, ctx.user.id);
       }),
 
-    // Protected: Reconnect MCP server (drop pooled upstream connection so
-    // tools re-list on next request — no gateway restart required)
+    // Protected (deliberate): Reconnect MCP server (drop pooled upstream
+    // connection so tools re-list on next request — no gateway restart
+    // required). Operational nudge, not a config mutation — do not fold into
+    // the RBAC gate above.
     reconnect: protectedProcedure
       .input(ReconnectMcpServerRequestSchema)
       .output(ReconnectMcpServerResponseSchema)

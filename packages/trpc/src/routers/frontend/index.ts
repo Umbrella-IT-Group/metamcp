@@ -14,6 +14,7 @@ export { createOAuthRouter };
 export { createToolsRouter };
 export { createApiKeysRouter };
 export { createConfigRouter };
+export { createLogsRouter };
 
 export const createFrontendRouter = (implementations: {
   mcpServers: Parameters<typeof createMcpServersRouter>[0];

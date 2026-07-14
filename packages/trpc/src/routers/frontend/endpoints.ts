@@ -9,7 +9,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 // Define the endpoints router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -57,24 +57,24 @@ export const createEndpointsRouter = (
         return await implementations.get(input, ctx.user.id);
       }),
 
-    // Protected: Create endpoint
-    create: protectedProcedure
+    // Admin only: Create endpoint
+    create: adminProcedure
       .input(CreateEndpointRequestSchema)
       .output(CreateEndpointResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.create(input, ctx.user.id);
       }),
 
-    // Protected: Delete endpoint
-    delete: protectedProcedure
+    // Admin only: Delete endpoint
+    delete: adminProcedure
       .input(z.object({ uuid: z.string() }))
       .output(DeleteEndpointResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.delete(input, ctx.user.id);
       }),
 
-    // Protected: Update endpoint
-    update: protectedProcedure
+    // Admin only: Update endpoint
+    update: adminProcedure
       .input(UpdateEndpointRequestSchema)
       .output(UpdateEndpointResponseSchema)
       .mutation(async ({ input, ctx }) => {

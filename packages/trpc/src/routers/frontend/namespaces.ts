@@ -19,7 +19,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { protectedProcedure, router } from "../../trpc";
+import { adminProcedure, protectedProcedure, router } from "../../trpc";
 
 // Define the namespaces router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -95,55 +95,63 @@ export const createNamespacesRouter = (
         return await implementations.getTools(input, ctx.user.id);
       }),
 
-    // Protected: Create namespace
-    create: protectedProcedure
+    // Admin only: Create namespace
+    create: adminProcedure
       .input(CreateNamespaceRequestSchema)
       .output(CreateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.create(input, ctx.user.id);
       }),
 
-    // Protected: Delete namespace
-    delete: protectedProcedure
+    // Admin only: Delete namespace
+    delete: adminProcedure
       .input(z.object({ uuid: z.string() }))
       .output(DeleteNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.delete(input, ctx.user.id);
       }),
 
-    // Protected: Update namespace
-    update: protectedProcedure
+    // Admin only: Update namespace
+    update: adminProcedure
       .input(UpdateNamespaceRequestSchema)
       .output(UpdateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.update(input, ctx.user.id);
       }),
 
-    // Protected: Update server status within namespace
-    updateServerStatus: protectedProcedure
+    // Admin only: Update server status within namespace. This is namespace
+    // CURATION — it changes which servers' tools an agent sees through the
+    // namespace, the same "destructive update" class as create/update/delete
+    // above, so it gets the same gate.
+    updateServerStatus: adminProcedure
       .input(UpdateNamespaceServerStatusRequestSchema)
       .output(UpdateNamespaceServerStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateServerStatus(input, ctx.user.id);
       }),
 
-    // Protected: Update tool status within namespace
-    updateToolStatus: protectedProcedure
+    // Admin only: Update tool status within namespace. Curation, same
+    // reasoning as updateServerStatus.
+    updateToolStatus: adminProcedure
       .input(UpdateNamespaceToolStatusRequestSchema)
       .output(UpdateNamespaceToolStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateToolStatus(input, ctx.user.id);
       }),
 
-    // Protected: Update tool overrides within namespace
-    updateToolOverrides: protectedProcedure
+    // Admin only: Update tool overrides within namespace. Curation, same
+    // reasoning as updateServerStatus.
+    updateToolOverrides: adminProcedure
       .input(UpdateNamespaceToolOverridesRequestSchema)
       .output(UpdateNamespaceToolOverridesResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateToolOverrides(input, ctx.user.id);
       }),
 
-    // Protected: Refresh tools from MetaMCP connection
+    // Protected (deliberate): re-lists tools over the existing pooled
+    // connection — an operational nudge, not a config mutation (it changes
+    // no row a member couldn't already read). Do not fold into the RBAC
+    // gate above.
     refreshTools: protectedProcedure
       .input(RefreshNamespaceToolsRequestSchema)
       .output(RefreshNamespaceToolsResponseSchema)
