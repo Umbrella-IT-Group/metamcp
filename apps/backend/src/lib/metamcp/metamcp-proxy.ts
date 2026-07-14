@@ -29,6 +29,7 @@ import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
 import { isM365BrokerError } from "../m365/errors";
 import { ConnectedClient } from "./client";
+import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import { getMcpServers } from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { requestWithSessionRecovery } from "./list-handler-recovery";
@@ -824,20 +825,27 @@ export const createServer = async (
     try {
       return await callToolWithMiddleware(request, handlerContext);
     } catch (error) {
-      // M365 delegated broker: a mint failure inside the injected
-      // fetch (no enrollment, expired grant, CA challenge, ...)
-      // surfaces here as a typed error. Answer with a structured
-      // isError tool result carrying the enrollment URL (+ best-effort
-      // SEP-1036 URL elicitation) instead of an opaque -32603 so the
-      // consumer can actually resolve it. See design doc §4.3.
-      //
-      // Deliberately tools/call-only: the m365 backends (softeria
-      // scaffold, then servers/m365) expose tools exclusively, and
-      // their list/discovery requests run unauthenticated by design —
-      // the other handlers can never hit a mint. Revisit if an
-      // injected server ever grows prompts/resources.
+      // WARM path: a mint failure inside the injected fetch on the
+      // tools/call request itself (no enrollment, expired grant, CA
+      // challenge, ...) propagates here as a typed error. Answer with a
+      // structured isError tool result carrying the enrollment URL (+
+      // best-effort SEP-1036 URL elicitation) instead of an opaque
+      // -32603 so the consumer can actually resolve it. Design doc §4.3.
       if (isM365BrokerError(error)) {
         return buildM365BrokerErrorResult(error, server);
+      }
+
+      // COLD path (Track A5): see cold-connect-broker-fallback.ts for the
+      // full rationale — drains any broker failure client.ts latched
+      // during this request's cold connect and, if it belongs to the
+      // server that owns the requested tool, answers with the same
+      // enrollment result the WARM path above returns.
+      const coldFallback = resolveColdConnectBrokerFallback(
+        request.params.name,
+        server,
+      );
+      if (coldFallback) {
+        return coldFallback;
       }
       throw error;
     }
