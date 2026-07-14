@@ -10,8 +10,13 @@ ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "role" text DEFAULT 'member' NOT NU
 -- Seed the operator as the first admin. Idempotent by email (users.email is
 -- UNIQUE, so this touches at most one row) — re-running only re-asserts the
 -- role. This account already exists in prod, so the UPDATE promotes it on the
--- first apply. On a fresh database where the row does not exist yet it affects
--- zero rows (the account is later created as the 'member' default and must be
--- promoted by re-running this or a manual UPDATE) — an intentional no-op, not
--- a failure.
+-- first apply.
+--
+-- FRESH INSTALL: on a virgin database this row does not exist yet, so the
+-- UPDATE matches zero rows — an intentional no-op, not a failure. NO ADMIN
+-- EXISTS on that install until someone is promoted after sign-up (every new
+-- account starts 'member' per the column default above). Prod is unaffected
+-- — the alex@umbrellaitgroup.com row already exists there. Promote manually
+-- with `UPDATE users SET role = 'admin' WHERE email = '<address>';` or by
+-- re-running this statement with the email edited.
 UPDATE "users" SET "role" = 'admin' WHERE "email" = 'alex@umbrellaitgroup.com';

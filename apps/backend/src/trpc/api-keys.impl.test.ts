@@ -219,8 +219,9 @@ describe("api-keys update — admin ownership bypass", () => {
 
 describe("api-keys delete — member scoped vs admin bypass", () => {
   it("member revoke of another user's key is rejected (owner-scoped repo throws not-found)", async () => {
-    // The owner-scoped delete() WHERE (uuid AND own-or-public) matches no row
-    // for a foreign private key, so the real repo throws not-found.
+    // The owner-scoped delete() WHERE (uuid AND user_id === caller, only —
+    // see api-keys.repo.member-scope.test.ts) matches no row for a foreign
+    // private key, so the real repo throws not-found.
     repoMock.delete.mockRejectedValue(
       new Error("Failed to delete API key or API key not found"),
     );
@@ -251,5 +252,91 @@ describe("api-keys delete — member scoped vs admin bypass", () => {
     expect(result.success).toBe(true);
     expect(repoMock.deleteAsAdmin).toHaveBeenCalledWith("foreign-key");
     expect(repoMock.delete).not.toHaveBeenCalled();
+  });
+});
+
+// BLOCKER fix (independent security review, 2026-07-14): a public
+// ('everyone') key's uuid is visible to any member via their own `list`
+// query. Before the fix, the member-scoped update()/delete() WHERE matched
+// public keys too (`isNull(user_id)` branch), so a member could deactivate
+// or DELETE a key every other consumer depends on. Post-fix, the member path
+// routes through the SAME owner-only repo methods as the "foreign private
+// key" cases above — a public key's user_id is null, which never equals a
+// caller's id, so the real repo throws not-found exactly like a foreign
+// private key would. These tests pin that outcome explicitly by name so the
+// public-key case can't silently regress even if the general
+// foreign-key-rejection tests above are ever weakened.
+describe("api-keys — public key isolation from members (BLOCKER fix)", () => {
+  it("member cannot deactivate a public key (owner-scoped repo throws not-found)", async () => {
+    repoMock.update.mockRejectedValue(
+      new Error("Failed to update API key or API key not found"),
+    );
+
+    await expect(
+      apiKeysImplementations.update(
+        { uuid: "public-key", is_active: false },
+        "member-1",
+        false,
+      ),
+    ).rejects.toThrow("Failed to update API key or API key not found");
+    expect(repoMock.update).toHaveBeenCalledWith("public-key", "member-1", {
+      name: undefined,
+      is_active: false,
+    });
+    expect(repoMock.updateAsAdmin).not.toHaveBeenCalled();
+  });
+
+  it("member cannot delete a public key (owner-scoped repo throws not-found, no-op response)", async () => {
+    repoMock.delete.mockRejectedValue(
+      new Error("Failed to delete API key or API key not found"),
+    );
+
+    const result = await apiKeysImplementations.delete(
+      { uuid: "public-key" },
+      "member-1",
+      false,
+    );
+
+    expect(result.success).toBe(false);
+    expect(repoMock.delete).toHaveBeenCalledWith("public-key", "member-1");
+    expect(repoMock.deleteAsAdmin).not.toHaveBeenCalled();
+  });
+
+  it("admin can still deactivate a public key", async () => {
+    repoMock.updateAsAdmin.mockResolvedValue({
+      uuid: "public-key",
+      name: "shared",
+      key: "sk_mt_x",
+      created_at: new Date(),
+      is_active: false,
+    });
+
+    const result = await apiKeysImplementations.update(
+      { uuid: "public-key", is_active: false },
+      "admin-1",
+      true,
+    );
+
+    expect(result.is_active).toBe(false);
+    expect(repoMock.updateAsAdmin).toHaveBeenCalledWith("public-key", {
+      name: undefined,
+      is_active: false,
+    });
+  });
+
+  it("admin can still delete a public key", async () => {
+    repoMock.deleteAsAdmin.mockResolvedValue({
+      uuid: "public-key",
+      name: "shared",
+    });
+
+    const result = await apiKeysImplementations.delete(
+      { uuid: "public-key" },
+      "admin-1",
+      true,
+    );
+
+    expect(result.success).toBe(true);
+    expect(repoMock.deleteAsAdmin).toHaveBeenCalledWith("public-key");
   });
 });

@@ -236,6 +236,14 @@ export class ApiKeysRepository {
     }
   }
 
+  // Member-scoped update: uuid AND owned-by-this-user ONLY. Deliberately does
+  // NOT match public (user_id IS NULL) keys — a member who lists public keys
+  // has their UUIDs, and an `or(eq(user_id, userId), isNull(user_id))` WHERE
+  // here would let any member deactivate or rename a key every other
+  // consumer depends on. Public keys can only be mutated through
+  // updateAsAdmin. A member's attempt against a public (or another user's)
+  // uuid matches zero rows and falls into the same not-found path as any
+  // other uuid that doesn't belong to them.
   async update(uuid: string, userId: string, input: ApiKeyUpdateInput) {
     const [updatedApiKey] = await db
       .update(apiKeysTable)
@@ -243,12 +251,7 @@ export class ApiKeysRepository {
         ...(input.name && { name: input.name }),
         ...(input.is_active !== undefined && { is_active: input.is_active }),
       })
-      .where(
-        and(
-          eq(apiKeysTable.uuid, uuid),
-          or(eq(apiKeysTable.user_id, userId), isNull(apiKeysTable.user_id)),
-        ),
-      )
+      .where(and(eq(apiKeysTable.uuid, uuid), eq(apiKeysTable.user_id, userId)))
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
@@ -264,15 +267,15 @@ export class ApiKeysRepository {
     return updatedApiKey;
   }
 
+  // Member-scoped delete: uuid AND owned-by-this-user ONLY. Same reasoning as
+  // update() above — a public key is not deletable through this path, only
+  // through deleteAsAdmin. Without this, any member could DELETE a key every
+  // other consumer (Tara/n8n/Claude) authenticates with, using a uuid they
+  // can read off their own `list` query.
   async delete(uuid: string, userId: string) {
     const [deletedApiKey] = await db
       .delete(apiKeysTable)
-      .where(
-        and(
-          eq(apiKeysTable.uuid, uuid),
-          or(eq(apiKeysTable.user_id, userId), isNull(apiKeysTable.user_id)),
-        ),
-      )
+      .where(and(eq(apiKeysTable.uuid, uuid), eq(apiKeysTable.user_id, userId)))
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
@@ -286,8 +289,9 @@ export class ApiKeysRepository {
   }
 
   // Admin bypass of the ownership WHERE: an admin may rename / activate /
-  // deactivate ANY key by uuid, including other users' private keys. Members
-  // go through update(), which keeps the owner-or-public ownership filter.
+  // deactivate ANY key by uuid, including public keys and other users'
+  // private keys. Members go through update(), which is scoped to their OWN
+  // keys only — a public key can be mutated exclusively through this method.
   async updateAsAdmin(uuid: string, input: ApiKeyUpdateInput) {
     const [updatedApiKey] = await db
       .update(apiKeysTable)
@@ -312,7 +316,9 @@ export class ApiKeysRepository {
   }
 
   // Admin bypass of the ownership WHERE: an admin may delete / revoke ANY key
-  // by uuid. Members go through delete(), which keeps the ownership filter.
+  // by uuid, including public keys. Members go through delete(), which is
+  // scoped to their OWN keys only — a public key can be deleted exclusively
+  // through this method.
   async deleteAsAdmin(uuid: string) {
     const [deletedApiKey] = await db
       .delete(apiKeysTable)
