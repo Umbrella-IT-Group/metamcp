@@ -85,6 +85,25 @@ export const ListApiKeysResponseSchema = z.object({
   ),
 });
 
+// Admin-only cross-user key view. Deliberately omits the full `key` secret —
+// listing every user's raw key would be an exfiltration surface — and returns
+// only a non-reversible prefix for identification. owner_email is null for a
+// public ('everyone') key; last_used_at is null for a key never used.
+export const AdminApiKeyItemSchema = z.object({
+  uuid: z.string().uuid(),
+  name: z.string(),
+  key_prefix: z.string(),
+  user_id: z.string().nullable(),
+  owner_email: z.string().nullable(),
+  created_at: z.date(),
+  last_used_at: z.date().nullable(),
+  is_active: z.boolean(),
+});
+
+export const ListAllApiKeysResponseSchema = z.object({
+  apiKeys: z.array(AdminApiKeyItemSchema),
+});
+
 export const ValidateApiKeyRequestSchema = z.object({
   key: z.string(),
 });
@@ -117,6 +136,10 @@ export type UpdateApiKeyResponse = z.infer<typeof UpdateApiKeyResponseSchema>;
 export type DeleteApiKeyRequest = z.infer<typeof DeleteApiKeyRequestSchema>;
 export type DeleteApiKeyResponse = z.infer<typeof DeleteApiKeyResponseSchema>;
 export type ListApiKeysResponse = z.infer<typeof ListApiKeysResponseSchema>;
+export type AdminApiKeyItem = z.infer<typeof AdminApiKeyItemSchema>;
+export type ListAllApiKeysResponse = z.infer<
+  typeof ListAllApiKeysResponseSchema
+>;
 export type ValidateApiKeyRequest = z.infer<typeof ValidateApiKeyRequestSchema>;
 export type ValidateApiKeyResponse = z.infer<
   typeof ValidateApiKeyResponseSchema
