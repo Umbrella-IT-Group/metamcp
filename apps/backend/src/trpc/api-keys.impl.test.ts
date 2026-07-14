@@ -61,7 +61,11 @@ beforeEach(() => {
 describe("api-keys create — mint RBAC gate", () => {
   it("rejects a member minting a public ('everyone') key with FORBIDDEN and no write", async () => {
     await expect(
-      apiKeysImplementations.create({ name: "shared", user_id: null }, "member-1", false),
+      apiKeysImplementations.create(
+        { name: "shared", user_id: null },
+        "member-1",
+        false,
+      ),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
     expect(repoMock.create).not.toHaveBeenCalled();
   });
@@ -156,9 +160,7 @@ describe("api-keys listAll — admin cross-user view", () => {
     expect(result.apiKeys[0].owner_email).toBe("alice@example.com");
     expect(result.apiKeys[1].owner_email).toBeNull(); // public key
     // The full secret must NOT leak; only a non-reversible prefix is exposed.
-    expect(
-      (result.apiKeys[0] as Record<string, unknown>).key,
-    ).toBeUndefined();
+    expect((result.apiKeys[0] as Record<string, unknown>).key).toBeUndefined();
     expect(result.apiKeys[0].key_prefix).toBe("sk_mt_AAAA…");
     expect(result.apiKeys[0].key_prefix.length).toBeLessThan(
       "sk_mt_AAAAAAAAAAAAAAAA".length,

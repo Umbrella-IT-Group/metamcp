@@ -104,8 +104,10 @@ export const createMcpServersRouter = (
         return await implementations.update(input, ctx.user.id);
       }),
 
-    // Protected: Reconnect MCP server (drop pooled upstream connection so
-    // tools re-list on next request — no gateway restart required)
+    // Protected (deliberate): Reconnect MCP server (drop pooled upstream
+    // connection so tools re-list on next request — no gateway restart
+    // required). Operational nudge, not a config mutation — do not fold into
+    // the RBAC gate above.
     reconnect: protectedProcedure
       .input(ReconnectMcpServerRequestSchema)
       .output(ReconnectMcpServerResponseSchema)

@@ -119,31 +119,39 @@ export const createNamespacesRouter = (
         return await implementations.update(input, ctx.user.id);
       }),
 
-    // Protected: Update server status within namespace
-    updateServerStatus: protectedProcedure
+    // Admin only: Update server status within namespace. This is namespace
+    // CURATION — it changes which servers' tools an agent sees through the
+    // namespace, the same "destructive update" class as create/update/delete
+    // above, so it gets the same gate.
+    updateServerStatus: adminProcedure
       .input(UpdateNamespaceServerStatusRequestSchema)
       .output(UpdateNamespaceServerStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateServerStatus(input, ctx.user.id);
       }),
 
-    // Protected: Update tool status within namespace
-    updateToolStatus: protectedProcedure
+    // Admin only: Update tool status within namespace. Curation, same
+    // reasoning as updateServerStatus.
+    updateToolStatus: adminProcedure
       .input(UpdateNamespaceToolStatusRequestSchema)
       .output(UpdateNamespaceToolStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateToolStatus(input, ctx.user.id);
       }),
 
-    // Protected: Update tool overrides within namespace
-    updateToolOverrides: protectedProcedure
+    // Admin only: Update tool overrides within namespace. Curation, same
+    // reasoning as updateServerStatus.
+    updateToolOverrides: adminProcedure
       .input(UpdateNamespaceToolOverridesRequestSchema)
       .output(UpdateNamespaceToolOverridesResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateToolOverrides(input, ctx.user.id);
       }),
 
-    // Protected: Refresh tools from MetaMCP connection
+    // Protected (deliberate): re-lists tools over the existing pooled
+    // connection — an operational nudge, not a config mutation (it changes
+    // no row a member couldn't already read). Do not fold into the RBAC
+    // gate above.
     refreshTools: protectedProcedure
       .input(RefreshNamespaceToolsRequestSchema)
       .output(RefreshNamespaceToolsResponseSchema)
