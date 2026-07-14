@@ -152,6 +152,15 @@ export const usersTable = pgTable("users", {
   email: text("email").notNull().unique(),
   emailVerified: boolean("email_verified").notNull().default(false),
   image: text("image"),
+  // RBAC role: 'admin' | 'member'. Gates administrative tRPC mutations
+  // (MCP-server / namespace / endpoint create-update-delete + all API-key
+  // administration) through `adminProcedure`. NOT NULL default 'member' so
+  // every pre-existing and future account is least-privilege until it is
+  // explicitly promoted — migration 0020 seeds alex@umbrellaitgroup.com to
+  // 'admin'. Surfaced into the better-auth session via `user.additionalFields`
+  // in auth.ts with `input: false`, so a user cannot self-escalate by
+  // sending a role on sign-up / update.
+  role: text("role").notNull().default("member"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -379,6 +388,13 @@ export const apiKeysTable = pgTable(
       .notNull()
       .defaultNow(),
     is_active: boolean("is_active").notNull().default(true),
+    // Last time this key authenticated a public-endpoint request. Written
+    // fire-and-forget and throttled (only when NULL or >=15 min stale) by
+    // `validateApiKey` so the hot auth path never pays a write per request
+    // and a failed timestamp write can never fail the request. Nullable: a
+    // key that has never authenticated reads NULL. Surfaced only in the
+    // admin cross-user key view — the owner-scoped list does not expose it.
+    last_used_at: timestamp("last_used_at", { withTimezone: true }),
   },
   (table) => [
     index("api_keys_user_id_idx").on(table.user_id),

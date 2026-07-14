@@ -141,6 +141,20 @@
       "when": 1783814400000,
       "tag": "0019_tool_call_audit",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1784592000000,
+      "tag": "0020_users_role",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1784678400000,
+      "tag": "0021_api_keys_last_used_at",
+      "breakpoints": true
     }
   ]
 }
