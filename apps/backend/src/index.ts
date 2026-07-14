@@ -203,6 +203,7 @@ app.get("/health/upstream", async (req, res) => {
 
     const servers = await mcpServersRepository.findAll();
     const pool = mcpServerPool.getPoolStatus();
+    const poolConfig = mcpServerPool.getPoolConfig();
     const perServer = pool.perServerCounts ?? {};
     const lastFailureAt = pool.lastConnectFailureAt ?? {};
     const lastSuccessAt = pool.lastConnectSuccessAt ?? {};
@@ -254,7 +255,13 @@ app.get("/health/upstream", async (req, res) => {
       pool: {
         idle: pool.idle,
         active: pool.active,
-        max_connections_per_server: pool.maxConnectionsPerServer,
+        total: pool.idle + pool.active,
+        // Effective caps the pool actually enforces (from getPoolConfig, the
+        // single source of truth), NOT a re-parse of env with local defaults.
+        // The prior payload reported only the per-server cap and never the
+        // global cap, so an operator debugging saturation could not see it.
+        max_connections_per_server: poolConfig.maxConnectionsPerServer,
+        max_total_connections: poolConfig.maxTotalConnections,
       },
       servers: details,
     });
