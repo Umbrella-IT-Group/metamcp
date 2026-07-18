@@ -1,0 +1,19 @@
+-- Promote the CI / GitHub-Actions sync service account to admin. The
+-- `metamcp-sync` workflow (Umbrella-MCP-Server) signs in as
+-- engineers@umbrellaitgroup.com (METAMCP_ADMIN_EMAIL) and drives the
+-- admin-gated tRPC mutations added in 0020 / #68 (mcpServers.update,
+-- namespaces/endpoints/api-keys CRUD). 0020 promotes ONLY alex@, so without
+-- this the sync account defaults to 'member' and every registration sync fails
+-- with FORBIDDEN "This action requires an administrator role." (observed on
+-- prod 2026-07-17: frontend.mcpServers.update 403 on the autotask server row).
+--
+-- Applied live on prod 2026-07-17 via break-glass; this migration CODIFIES it
+-- so a database rebuild re-asserts the CI account's admin role instead of
+-- silently regressing the sync. Keep this list in sync with the accounts the
+-- CI actually uses; add a new statement rather than editing this one.
+--
+-- Idempotent by email (users.email is UNIQUE → touches at most one row);
+-- re-running only re-asserts the role. FRESH INSTALL: the row may not exist yet
+-- (better-auth creates it on first sign-in), so this matches zero rows — an
+-- intentional no-op, re-asserted on the account's next boot after sign-up.
+UPDATE "users" SET "role" = 'admin' WHERE "email" = 'engineers@umbrellaitgroup.com';
