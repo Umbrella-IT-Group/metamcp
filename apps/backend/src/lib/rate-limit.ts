@@ -185,7 +185,13 @@ export class SlidingWindowRateLimiting {
             );
             limiter = this.limiters.get(key);
           } else {
-            if (!limiter.has(key)) {
+            // `limiter` is keyed by namespace_uuid (set above), not by the
+            // client key -- checking `.has(key)` here almost never matched,
+            // so this branch silently replaced the already-tracked
+            // SlidingWindowRateLimiter (and its accumulated request
+            // history) on every call, and the client rate limit was never
+            // enforced. Ported fix from upstream metamcp PR #258.
+            if (!limiter.has(namespace_uuid)) {
               limiter.set(
                 namespace_uuid,
                 new SlidingWindowRateLimiter(
