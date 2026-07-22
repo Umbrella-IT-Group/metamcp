@@ -12,6 +12,20 @@ import { getServerSpecificKey, SESSION_KEYS } from "./constants";
 import { getAppUrl } from "./env";
 import { vanillaTrpcClient } from "./trpc";
 
+// base64url (RFC 4648 §5) encoding of a byte array: classic base64 via btoa,
+// then trimmed/replaced to the url-safe variant. Browser-only — state() runs
+// in the browser path of the SDK's auth(), so no Node fallback is needed.
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
 // OAuth client provider that works with a specific MCP server
 class DbOAuthClientProvider implements OAuthClientProvider {
   private mcpServerUuid: string;
@@ -160,6 +174,39 @@ class DbOAuthClientProvider implements OAuthClientProvider {
 
   redirectToAuthorization(authorizationUrl: URL) {
     window.location.href = authorizationUrl.href;
+  }
+
+  // RFC 6749 §10.12 CSRF defence: generate a per-flow random `state`, persist
+  // it server-side (oauth_sessions.expected_state), and return it for inclusion
+  // in the upstream's /authorize URL. The MCP SDK invokes this once per
+  // authorize attempt (auth.js: `provider.state ? await provider.state() : …`)
+  // and copies the return value into the authorization URL. On the callback the
+  // backend compares the echoed value to the persisted one (oauth.validateState)
+  // and clears the column on a match.
+  async state(): Promise<string> {
+    // 16 random bytes → ~22 base64url chars, well over the ~128-bit entropy
+    // bar in RFC 6749 §10.10.
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const stateValue = base64UrlEncode(bytes);
+
+    if (await this.serverExists()) {
+      try {
+        await vanillaTrpcClient.frontend.oauth.upsert.mutate({
+          mcp_server_uuid: this.mcpServerUuid,
+          expected_state: stateValue,
+        });
+      } catch (error) {
+        // Best-effort persistence. If the upsert fails the upstream redirect
+        // still carries `stateValue`, but callback validation then falls
+        // through the back-compat NULL branch — the CSRF check degrades to
+        // "skipped" rather than rejecting the flow. Logged so a sustained
+        // persistence failure (CSRF layer silently off) is visible.
+        console.error("Error persisting expected_state to database:", error);
+      }
+    }
+
+    return stateValue;
   }
 
   async saveCodeVerifier(codeVerifier: string) {

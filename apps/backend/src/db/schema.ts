@@ -100,6 +100,15 @@ export const oauthSessionsTable = pgTable(
       .default(sql`'{}'::jsonb`),
     tokens: jsonb("tokens").$type<OAuthTokens>(),
     code_verifier: text("code_verifier"),
+    // CSRF defence (RFC 6749 §10.12). A per-flow random nonce minted by
+    // DbOAuthClientProvider.state() at the authorize-redirect step, persisted
+    // here, and compared against the upstream's echoed `state` at the callback
+    // (oauth.validateState) before the client-side token exchange runs. Cleared
+    // on a successful match so a replay cannot reuse the same code+state pair.
+    // Nullable: rows from before this column existed, and rows already cleared,
+    // both read NULL. NEVER serialized to the frontend — the OAuth session
+    // serializer omits it.
+    expected_state: text("expected_state"),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

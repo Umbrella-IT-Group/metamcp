@@ -1,0 +1,12 @@
+-- OAuth CSRF defence (RFC 6749 §10.12): add oauth_sessions.expected_state, a
+-- per-flow random nonce minted by DbOAuthClientProvider.state() at the
+-- authorize redirect and validated against the upstream's echoed `state` at the
+-- callback (oauth.validateState) before the client-side token exchange runs. A
+-- successful match clears the column (one-shot) so a code+state pair can't be
+-- replayed. Nullable — in-flight flows started before this column existed read
+-- NULL and take the validator's back-compat accept branch; the column is seeded
+-- and enforced on their next authorize attempt.
+--
+-- Idempotent (ADD COLUMN IF NOT EXISTS) per fork convention. Ordering-safe
+-- relative to 0022 (independent object, no shared row/column).
+ALTER TABLE "oauth_sessions" ADD COLUMN IF NOT EXISTS "expected_state" text;

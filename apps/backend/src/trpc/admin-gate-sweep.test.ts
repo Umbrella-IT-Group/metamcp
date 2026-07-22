@@ -107,6 +107,7 @@ describe("oauth.upsert — admin gate", () => {
         },
         message: "ok",
       }),
+      validateState: vi.fn().mockResolvedValue({ valid: true }),
     });
 
   const upsertInput = {
@@ -121,6 +122,23 @@ describe("oauth.upsert — admin gate", () => {
 
     await expect(
       router.createCaller(memberCtx).upsert(upsertInput),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("validateState — admin allowed, member FORBIDDEN", async () => {
+    const router = buildRouter();
+    const stateInput = {
+      mcp_server_uuid: "11111111-1111-4111-8111-111111111111",
+      state: "nonce",
+    };
+
+    const adminResult = await router
+      .createCaller(adminCtx)
+      .validateState(stateInput);
+    expect(adminResult.valid).toBe(true);
+
+    await expect(
+      router.createCaller(memberCtx).validateState(stateInput),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });

@@ -3,6 +3,8 @@ import {
   GetOAuthSessionResponseSchema,
   UpsertOAuthSessionRequestSchema,
   UpsertOAuthSessionResponseSchema,
+  ValidateOAuthStateRequestSchema,
+  ValidateOAuthStateResponseSchema,
 } from "@repo/zod-types";
 import { z } from "zod";
 
@@ -19,6 +21,9 @@ export const createOAuthRouter = (
     upsert: (
       input: z.infer<typeof UpsertOAuthSessionRequestSchema>,
     ) => Promise<z.infer<typeof UpsertOAuthSessionResponseSchema>>;
+    validateState: (
+      input: z.infer<typeof ValidateOAuthStateRequestSchema>,
+    ) => Promise<z.infer<typeof ValidateOAuthStateResponseSchema>>;
   },
 ) => {
   return router({
@@ -37,6 +42,18 @@ export const createOAuthRouter = (
       .output(UpsertOAuthSessionResponseSchema)
       .mutation(async ({ input }) => {
         return await implementations.upsert(input);
+      }),
+
+    // Admin only: CSRF state validation at the OAuth callback. Gated the same
+    // as upsert because it reads and clears the same server-config surface
+    // (oauth_sessions.expected_state) that upsert seeds — the connecting user
+    // who minted the nonce is the admin who validates it. Mutation because a
+    // successful match clears the nonce (one-shot).
+    validateState: adminProcedure
+      .input(ValidateOAuthStateRequestSchema)
+      .output(ValidateOAuthStateResponseSchema)
+      .mutation(async ({ input }) => {
+        return await implementations.validateState(input);
       }),
   });
 };

@@ -23,6 +23,9 @@ const OAuthCallback = () => {
 
       const params = new URLSearchParams(window.location.search);
       const code = params.get("code");
+      // Echoed by the upstream authorization server (RFC 6749 §4.1.2). Used
+      // for the server-side CSRF check below before the code is exchanged.
+      const state = params.get("state");
       const serverUrl = sessionStorage.getItem(SESSION_KEYS.SERVER_URL);
       const mcpServerUuid = sessionStorage.getItem(
         SESSION_KEYS.MCP_SERVER_UUID,
@@ -35,6 +38,24 @@ const OAuthCallback = () => {
       }
 
       try {
+        // RFC 6749 §10.12 CSRF defence. Validate the echoed `state` against the
+        // per-flow nonce persisted at authorize time BEFORE completing the
+        // exchange — auth() below redeems the code client-side, so a forged
+        // callback must be rejected here or the code would be exchanged.
+        const stateResult =
+          await vanillaTrpcClient.frontend.oauth.validateState.mutate({
+            mcp_server_uuid: mcpServerUuid,
+            state: state ?? undefined,
+          });
+
+        if (!stateResult.valid) {
+          console.error(
+            `OAuth state validation failed: ${stateResult.error} — ${stateResult.error_description}`,
+          );
+          window.location.href = "/mcp-servers";
+          return;
+        }
+
         // Create auth provider with existing server UUID and URL
         const authProvider = createAuthProvider(mcpServerUuid, serverUrl);
 

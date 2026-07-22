@@ -130,13 +130,39 @@ export const GetOAuthSessionResponseSchema = z.union([
   }),
 ]);
 
-// Upsert OAuth Session Request - all fields optional for updates
+// Upsert OAuth Session Request - all fields optional for updates.
+// `expected_state` is the CSRF-defence per-flow nonce written by the
+// frontend's DbOAuthClientProvider.state() and validated server-side at
+// oauth.validateState. Optional (omit = "do not touch"); the one-shot clear
+// after validation is a dedicated repo method, NOT a null write.
 export const UpsertOAuthSessionRequestSchema = z.object({
   mcp_server_uuid: z.string().uuid(),
   client_information: OAuthClientInformationSchema.optional(),
   tokens: OAuthTokensSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
+  expected_state: z.string().optional(),
 });
+
+// Validate OAuth State Request - CSRF check at the callback. `state` is the
+// value echoed back by the upstream authorization server; the backend compares
+// it to the persisted `expected_state` and clears the column on a match.
+export const ValidateOAuthStateRequestSchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+  state: z.string().optional(),
+});
+
+// Validate OAuth State Response - a discriminated result the callback gates on
+// before completing the token exchange.
+export const ValidateOAuthStateResponseSchema = z.union([
+  z.object({
+    valid: z.literal(true),
+  }),
+  z.object({
+    valid: z.literal(false),
+    error: z.string(),
+    error_description: z.string(),
+  }),
+]);
 
 // Upsert OAuth Session Response
 export const UpsertOAuthSessionResponseSchema = z.union([
@@ -151,12 +177,15 @@ export const UpsertOAuthSessionResponseSchema = z.union([
   }),
 ]);
 
-// Repository-specific schemas
+// Repository-specific schemas. `expected_state` mirrors the upsert contract:
+// omitted means "leave the column alone"; clearing goes through the dedicated
+// repo method, not a null write here.
 export const OAuthSessionCreateInputSchema = z.object({
   mcp_server_uuid: z.string(),
   client_information: OAuthClientInformationSchema.optional(),
   tokens: OAuthTokensSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
+  expected_state: z.string().optional(),
 });
 
 export const OAuthSessionUpdateInputSchema = z.object({
@@ -164,6 +193,7 @@ export const OAuthSessionUpdateInputSchema = z.object({
   client_information: OAuthClientInformationSchema.optional(),
   tokens: OAuthTokensSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
+  expected_state: z.string().optional(),
 });
 
 // Export repository types
@@ -181,6 +211,10 @@ export const DatabaseOAuthSessionSchema = z.object({
   client_information: OAuthClientInformationSchema.nullable(),
   tokens: OAuthTokensSchema.nullable(),
   code_verifier: z.string().nullable(),
+  // Per-flow CSRF nonce. Nullable on the DB read side: rows from before this
+  // column was added, and rows where validation already cleared the value,
+  // both carry NULL. NEVER serialized to the frontend.
+  expected_state: z.string().nullable(),
   created_at: z.date(),
   updated_at: z.date(),
 });
