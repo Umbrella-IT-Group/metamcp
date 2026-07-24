@@ -1,15 +1,34 @@
 name: Build and Push to GHCR
 
+# This is UPSTREAM's tag publisher (0 runs on this fork in 2 months, per
+# GH Actions run history). We deliberately do NOT delete this file — that
+# keeps future upstream-merge diffs small — but its trigger is defused
+# below. Its main-branch tag path pushes :latest — on this fork, the
+# umbrella-build.yml push-to-`umbrella` path is the ONLY thing allowed to
+# write :latest, because that's the image Watchtower pulls onto
+# mcp-host-prod. Any semver tag reachable from our `main` (which mirrors
+# upstream's `main`) would fire this workflow and overwrite the umbrella
+# deploy image out from under Watchtower with an untested upstream build.
+# Triggers are pinned to workflow_dispatch only until/unless this fork
+# adopts its own tag-based release process. See UMBRELLA_FORK.md.
+#
+# workflow_dispatch alone doesn't close the hole: the "Check branch for
+# tag" step's `git merge-base --is-ancestor` check trivially passes when
+# manually dispatched with ref=main (a commit is always its own ancestor),
+# so a stray "Run workflow" click on the default branch would still walk
+# the on-main path and push :latest. confirm_overwrite_latest forces an
+# explicit opt-in before the job runs at all.
 on:
-  push:
-    tags: 
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-test'
-      - 'v[0-9]+.[0-9]+.[0-9]+-test'
-      - '[0-9]+.[0-9]+.[0-9]+-docker-per-mcp'
-      - 'v[0-9]+.[0-9]+.[0-9]+-docker-per-mcp'
   workflow_dispatch:
+    inputs:
+      confirm_overwrite_latest:
+        description: "Overwrite the umbrella :latest deploy image with an upstream build? (Watchtower will pull it onto mcp-host-prod.)"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+        required: true
 
 env:
   REGISTRY: ghcr.io
@@ -17,6 +36,7 @@ env:
 
 jobs:
   build-and-push:
+    if: inputs.confirm_overwrite_latest == 'yes'
     runs-on: ubuntu-latest
     permissions:
       contents: read

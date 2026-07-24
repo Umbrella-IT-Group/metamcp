@@ -48,6 +48,27 @@ on:
       - ".github/workflows/umbrella-build.yml"
   workflow_dispatch:
 
+# Two pushes to `umbrella` in quick succession used to run fully in
+# parallel with no ordering guarantee — 2026-07-22 saw runs 29887722138
+# and 29887724437 both build and push :latest concurrently, so whichever
+# finished last "won" regardless of which push was actually newer.
+# Grouping by ref serializes runs on the same ref instead of letting them
+# race. PR check runs still cancel-in-progress — a new commit makes the
+# prior check's result moot, so there's nothing lost by killing it. The
+# push-to-umbrella path is different: it's the only path that publishes
+# :latest, so it QUEUES instead of cancelling. Cancelling gives no grace
+# period, so a cancel landing between the registry push and the :latest
+# manifest update can race the manifest write, and a canceled run also
+# silently drops that commit's own :sha tag + attestation (never written
+# at all — not merely superseded). Queuing means every push to umbrella
+# still gets its own completed :sha tag and attestation even if a later
+# push finishes after it and reclaims :latest first. Reviewer note: a
+# superseded :sha tag (one :latest has moved past) stays valid and
+# retained in the registry — only a canceled run's tag is actually gone.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
