@@ -165,6 +165,17 @@ To deploy a hotfix:
 3. Watchtower polls every 5 min; container restart picks up the new image.
 4. If you need it instantly, mint a break-glass session and run `docker compose up -d --no-deps metamcp` from `mcp-host-prod`.
 
+### Repo visibility (operator standing decision, 2026-07-21)
+
+This repo is **PUBLIC**, deliberately. GitHub Actions minutes are billed
+per-job on private repos but free on public ones — flipping to public on
+2026-07-21 took this fork's ~253 min/mo of Actions usage to $0. Flipping
+back to private re-arms roughly that same ~250-400 min/mo of billing (the
+range accounts for cherry-pick/dependency-sweep months running heavier
+than quiet months). Any future call to make this repo private again should
+weigh that cost explicitly, not flip it as a routine hygiene pass — check
+here first.
+
 ## Upstreaming our work
 
 When we write a patch that's not Umbrella-specific (env-var fallbacks, bug fixes, etc.):

@@ -48,6 +48,19 @@ on:
       - ".github/workflows/umbrella-build.yml"
   workflow_dispatch:
 
+# Two pushes to `umbrella` in quick succession used to run fully in
+# parallel with no ordering guarantee — 2026-07-22 saw runs 29887722138
+# and 29887724437 both build and push :latest concurrently, so whichever
+# finished last "won" regardless of which push was actually newer.
+# Grouping by ref means the second push cancels the first's in-flight
+# run instead of racing it, so :latest always reflects the LATEST push,
+# not whichever build happened to finish last. PR check runs get the
+# same benefit for free: a new commit on a PR cancels that PR's own
+# stale check instead of leaving it to run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
