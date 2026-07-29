@@ -343,10 +343,22 @@ export async function recoverPersistedSession(
   // namespace + endpoint the request is targeting. The DB row could
   // be stale-but-not-yet-pruned, and a different consumer with a
   // valid credential for endpoint B should not be able to reclaim
-  // a session that was created against endpoint A.
+  // a session that was created against endpoint A. Routed through
+  // `bindingMatches` — the SAME predicate `getBoundSession` and
+  // `resolveDeletableSession` use — so the endpoint-binding check
+  // exists exactly once file-wide and cannot drift between the three
+  // legs.
   if (
-    stored.namespace_uuid !== authReq.namespaceUuid ||
-    stored.endpoint_name !== authReq.endpointName
+    !bindingMatches(
+      {
+        namespaceUuid: stored.namespace_uuid,
+        endpointName: stored.endpoint_name,
+      },
+      {
+        namespaceUuid: authReq.namespaceUuid,
+        endpointName: authReq.endpointName,
+      },
+    )
   ) {
     return { status: "not_found" };
   }
