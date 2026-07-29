@@ -56,9 +56,8 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
   const tableIs = (table: unknown, name: string) =>
     // drizzle stores the SQL name under a symbol; compare via the table's
     // own Symbol.for key to avoid importing drizzle internals here.
-    (
-      table as { [key: symbol]: unknown }
-    )?.[Symbol.for("drizzle:Name")] === name;
+    (table as { [key: symbol]: unknown })?.[Symbol.for("drizzle:Name")] ===
+    name;
 
   const insertChain = (table: unknown) => ({
     values: (values: Record<string, unknown>) => {
@@ -128,11 +127,7 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
 });
 vi.mock("../db", () => ({ db: dbMock }));
 
-import {
-  apiKeysTable,
-  endpointsTable,
-  namespacesTable,
-} from "../db/schema";
+import { apiKeysTable, endpointsTable, namespacesTable } from "../db/schema";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
 
 const BOOTSTRAP_ENV_KEYS = [
@@ -282,9 +277,9 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
 
     await initializeEnvironmentConfiguration();
 
-    const logCalls = (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
-      (call) => String(call[0]),
-    );
+    const logCalls = (
+      console.log as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.map((call) => String(call[0]));
     const createdLine = logCalls.find((line) =>
       line.includes('Created private API key "tara-scoped"'),
     );
@@ -316,9 +311,9 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
 
     await initializeEnvironmentConfiguration();
 
-    const logCalls = (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
-      (call) => String(call[0]),
-    );
+    const logCalls = (
+      console.log as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.map((call) => String(call[0]));
     const createdLine = logCalls.find((line) =>
       line.includes('Created private API key "unrelated-key"'),
     );
@@ -330,9 +325,9 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
 
 describe("ensureUser early-return credential loss — preserved keys warned loudly", () => {
   function warnLines(): string[] {
-    return (
-      console.warn as unknown as ReturnType<typeof vi.fn>
-    ).mock.calls.map((call) => String(call[0]));
+    return (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
   }
 
   it("warns with preserved-key count + names (never values) when Better Auth sign-up fails after the keys were deleted", async () => {
