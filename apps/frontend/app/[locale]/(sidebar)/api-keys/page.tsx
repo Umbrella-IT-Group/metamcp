@@ -76,12 +76,29 @@ export default function ApiKeysPage() {
   // via user.additionalFields — see apps/backend/src/auth.ts). Members never
   // see the admin cross-user section or the 'everyone' mint option; the
   // backend enforces the same boundary regardless of the UI.
+  //
+  // roleLoaded gates the create-button header: isAdmin starts false, so
+  // without it every ADMIN saw a flash of the false "Only administrators
+  // can create API keys." claim while the session fetch was in flight —
+  // and a FAILED fetch pinned that false claim permanently (the promise
+  // had no .catch). Until the role genuinely resolves, the header renders
+  // a neutral disabled button that claims nothing about the viewer; on
+  // fetch failure it stays neutral rather than asserting a role we never
+  // learned. Fail-closed either way — the backend enforces the boundary.
   const [isAdmin, setIsAdmin] = useState(false);
+  const [roleLoaded, setRoleLoaded] = useState(false);
   useEffect(() => {
-    authClient.getSession().then((session) => {
-      const role = (session?.data?.user as { role?: string } | undefined)?.role;
-      setIsAdmin(role === "admin");
-    });
+    authClient
+      .getSession()
+      .then((session) => {
+        const role = (session?.data?.user as { role?: string } | undefined)
+          ?.role;
+        setIsAdmin(role === "admin");
+        setRoleLoaded(true);
+      })
+      .catch(() => {
+        // Role unknown — keep the neutral loading state (see comment above).
+      });
   }, []);
 
   const { data: apiKeys, refetch } = trpc.frontend.apiKeys.list.useQuery();
@@ -220,8 +237,15 @@ export default function ApiKeysPage() {
             new key must carry an (admin-gated) endpoint scope, so a member
             create always fails server-side. Rather than show a dialog that
             can only error, non-admins get a disabled button + an explanatory
-            line. The backend enforces this regardless of the UI. */}
-        {!isAdmin ? (
+            line. The backend enforces this regardless of the UI. While the
+            role is still resolving, the button is neutrally disabled with
+            NO admin-only claim (see the roleLoaded comment above). */}
+        {!roleLoaded ? (
+          <Button disabled aria-busy="true">
+            <Plus className="h-4 w-4 mr-2" />
+            {t("api-keys:createApiKey")}
+          </Button>
+        ) : !isAdmin ? (
           <div className="flex flex-col items-end gap-1">
             <Button disabled title={t("api-keys:createAdminOnly")}>
               <Plus className="h-4 w-4 mr-2" />
