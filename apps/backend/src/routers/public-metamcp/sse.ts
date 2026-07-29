@@ -40,7 +40,10 @@ export function resolveSseMessageSession(
   | { outcome: "ok"; transport: Transport }
   | { outcome: "not_found"; crossEndpoint: boolean } {
   const transport = manager.getSession(sessionId);
-  if (!transport || !bindingMatches(manager.getSessionBinding(sessionId), target)) {
+  if (
+    !transport ||
+    !bindingMatches(manager.getSessionBinding(sessionId), target)
+  ) {
     return { outcome: "not_found", crossEndpoint: transport !== undefined };
   }
   return { outcome: "ok", transport };
