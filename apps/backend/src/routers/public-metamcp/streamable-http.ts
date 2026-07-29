@@ -853,7 +853,9 @@ streamableHttpRouter.post(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,
         );
         logger.info(`Stored transport for sessionId: ${newSessionId}`);
-        logger.info(`Current stored sessions:`, sessionManager.getSessionIds());
+        // Deliberately count-only: dumping getSessionIds() here leaked every
+        // live Mcp-Session-Id into the logs on each new session (the exact
+        // class the round-1 commit stripped from the HTTP payloads).
         logger.info(
           `Total active sessions: ${sessionManager.getSessionCount()}`,
         );
@@ -911,11 +913,11 @@ streamableHttpRouter.post(
       // logger.info(
       //   `Received POST message for public endpoint ${endpointName} -> namespace ${namespaceUuid} sessionId ${sessionId}`,
       // );
-      logger.info(`Available session IDs:`, sessionManager.getSessionIds());
-      logger.info(`Looking for sessionId: ${sessionId}`);
+      // Count only — session-id lists never belong in request-path logs
+      // (see the round-1 payload/DELETE-log sweep this completes).
+      logger.debug(`Active sessions: ${sessionManager.getSessionCount()}`);
       try {
         logger.info(`Looking up existing session: ${sessionId}`);
-        logger.info(`Available sessions:`, sessionManager.getSessionIds());
 
         let transport = getBoundSession(sessionId, authReq);
         if (!transport) {
