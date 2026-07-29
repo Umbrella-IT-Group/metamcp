@@ -13,8 +13,38 @@ import logger from "@/utils/logger";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
   bindingMatches,
+  SessionBinding,
+  SessionLifetimeManager,
   SessionLifetimeManagerImpl,
 } from "../../lib/session-lifetime-manager";
+
+/**
+ * Pure resolver for the `/message` leg's endpoint-binding guard — the SSE
+ * twin of streamable-http's `getBoundSession`. The message must target the
+ * SAME endpoint the SSE stream was opened on: resolving by sessionId alone
+ * would let a caller authenticated for endpoint A post messages into
+ * endpoint B's transport. A missing session and a cross-endpoint session
+ * both resolve to `not_found` so the route's 404 never signals the id is
+ * live elsewhere; `crossEndpoint` exists ONLY to drive the server-side
+ * warn log, never the response shape. Takes the manager as a parameter so
+ * the guard is unit-testable against a seeded manager (`sse.test.ts`).
+ */
+export function resolveSseMessageSession(
+  manager: Pick<
+    SessionLifetimeManager<Transport>,
+    "getSession" | "getSessionBinding"
+  >,
+  sessionId: string,
+  target: SessionBinding,
+):
+  | { outcome: "ok"; transport: Transport }
+  | { outcome: "not_found"; crossEndpoint: boolean } {
+  const transport = manager.getSession(sessionId);
+  if (!transport || !bindingMatches(manager.getSessionBinding(sessionId), target)) {
+    return { outcome: "not_found", crossEndpoint: transport !== undefined };
+  }
+  return { outcome: "ok", transport };
+}
 
 const sseRouter = express.Router();
 
@@ -123,21 +153,13 @@ sseRouter.post(
     try {
       const sessionId = req.query.sessionId as string;
 
-      const transport = sessionManager.getSession(
-        sessionId,
-      ) as SSEServerTransport;
-      // Endpoint-binding guard: the message must target the SAME endpoint the
-      // SSE stream was opened on. Resolving by sessionId alone would let a
-      // caller authenticated for endpoint A post messages into endpoint B's
-      // transport. A missing session and a cross-endpoint session both return
-      // an identical 404 so the response never signals the id is live
-      // elsewhere.
-      const binding = sessionManager.getSessionBinding(sessionId);
-      if (
-        !transport ||
-        !bindingMatches(binding, { namespaceUuid, endpointName })
-      ) {
-        if (transport) {
+      // Endpoint-binding guard — see resolveSseMessageSession's doc comment.
+      const resolution = resolveSseMessageSession(sessionManager, sessionId, {
+        namespaceUuid,
+        endpointName,
+      });
+      if (resolution.outcome === "not_found") {
+        if (resolution.crossEndpoint) {
           logger.warn(
             `SSE message for session ${sessionId} on endpoint ${endpointName} ` +
               `rejected — session bound to a different endpoint.`,
@@ -146,7 +168,10 @@ sseRouter.post(
         res.status(404).end("Session not found");
         return;
       }
-      await transport.handlePostMessage(req, res);
+      await (resolution.transport as SSEServerTransport).handlePostMessage(
+        req,
+        res,
+      );
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);
       res.status(500).json(error);

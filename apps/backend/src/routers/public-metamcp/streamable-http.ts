@@ -77,6 +77,64 @@ export function getBoundSession(
   return transport;
 }
 
+/**
+ * Endpoint-binding guard for the DELETE leg, extracted as a pure resolver
+ * (the teardown twin of `getBoundSession`): only the endpoint that OWNS a
+ * session may tear it down. Without it a key scoped to endpoint A could
+ * DELETE endpoint B's live session AND its persisted recovery row
+ * (`cleanupSession` deletes the row) — a cross-endpoint denial of service.
+ * Checks the in-memory binding first; if the session isn't resident,
+ * verifies the persisted row's binding (same `bindingMatches` predicate)
+ * before allowing the delete. A lookup failure is treated as absent —
+ * fail-closed, never delete on unknown state. Every non-deletable case
+ * collapses into the ONE `not_found` outcome, so the route's single 404
+ * response cannot reveal that the id is live on another endpoint.
+ */
+export async function resolveDeletableSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): Promise<{ outcome: "deletable" } | { outcome: "not_found" }> {
+  const target = {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+  };
+  const inMemoryTransport = sessionManager.getSession(sessionId);
+  if (inMemoryTransport) {
+    if (!bindingMatches(sessionManager.getSessionBinding(sessionId), target)) {
+      logger.warn(
+        `DELETE for session ${sessionId} on endpoint ${target.endpointName} ` +
+          `rejected — session bound to a different endpoint.`,
+      );
+      return { outcome: "not_found" };
+    }
+    return { outcome: "deletable" };
+  }
+
+  let stored;
+  try {
+    stored = await mcpSessionsRepository.findById(sessionId);
+  } catch (lookupError) {
+    logger.warn(
+      `mcp_sessions lookup failed during DELETE for session ${sessionId}; treating as not found.`,
+      lookupError,
+    );
+    stored = null;
+  }
+  if (
+    !stored ||
+    !bindingMatches(
+      {
+        namespaceUuid: stored.namespace_uuid,
+        endpointName: stored.endpoint_name,
+      },
+      target,
+    )
+  ) {
+    return { outcome: "not_found" };
+  }
+  return { outcome: "deletable" };
+}
+
 const streamableHttpRouter = express.Router();
 
 // Session lifetime manager for StreamableHTTP sessions
@@ -953,57 +1011,17 @@ streamableHttpRouter.delete(
 
     if (sessionId) {
       try {
-        // Endpoint-binding guard: only the endpoint that OWNS this session
-        // may tear it down. Without it a key scoped to endpoint A could
-        // DELETE endpoint B's live session AND its persisted recovery row
-        // (`cleanupSession` deletes the row) — a cross-endpoint denial of
-        // service. Check the in-memory binding first; if the session isn't
-        // resident, verify the persisted row's binding before deleting it. A
-        // session that belongs to another endpoint (or does not exist for
-        // this one) 404s WITHOUT revealing that the id is live elsewhere.
-        const inMemoryTransport = sessionManager.getSession(sessionId);
-        if (inMemoryTransport) {
-          const binding = sessionManager.getSessionBinding(sessionId);
-          if (!bindingMatches(binding, { namespaceUuid, endpointName })) {
-            logger.warn(
-              `DELETE for session ${sessionId} on endpoint ${endpointName} ` +
-                `rejected — session bound to a different endpoint.`,
-            );
-            res.status(404).json({
-              error: "Session not found",
-              message: "Session expired or unknown.",
-              timestamp: new Date().toISOString(),
-            });
-            return;
-          }
-        } else {
-          let stored;
-          try {
-            stored = await mcpSessionsRepository.findById(sessionId);
-          } catch (lookupError) {
-            logger.warn(
-              `mcp_sessions lookup failed during DELETE for session ${sessionId}; treating as not found.`,
-              lookupError,
-            );
-            stored = null;
-          }
-          if (
-            !stored ||
-            !bindingMatches(
-              {
-                namespaceUuid: stored.namespace_uuid,
-                endpointName: stored.endpoint_name,
-              },
-              { namespaceUuid, endpointName },
-            )
-          ) {
-            res.status(404).json({
-              error: "Session not found",
-              message: "Session expired or unknown.",
-              timestamp: new Date().toISOString(),
-            });
-            return;
-          }
+        // Endpoint-binding guard — see resolveDeletableSession's doc
+        // comment. Single 404 site: absent, cross-endpoint, and
+        // lookup-failure all collapse into the same response shape.
+        const resolution = await resolveDeletableSession(sessionId, authReq);
+        if (resolution.outcome === "not_found") {
+          res.status(404).json({
+            error: "Session not found",
+            message: "Session expired or unknown.",
+            timestamp: new Date().toISOString(),
+          });
+          return;
         }
 
         logger.info(`Starting cleanup for session ${sessionId}`);
