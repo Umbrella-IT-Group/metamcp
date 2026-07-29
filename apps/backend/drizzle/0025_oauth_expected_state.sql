@@ -8,5 +8,11 @@
 -- and enforced on their next authorize attempt.
 --
 -- Idempotent (ADD COLUMN IF NOT EXISTS) per fork convention. Ordering-safe
--- relative to 0022 (independent object, no shared row/column).
+-- relative to 0024 (independent object, no shared row/column).
+--
+-- Numbered 0025 (was 0023 when this branch was cut): #84 and #85 landed
+-- 0023/0024 on umbrella first. The rename alone is NOT enough — drizzle
+-- applies only journal entries whose `when` exceeds the max already applied,
+-- so this entry's `when` must stay STRICTLY above 0024's 1785283200000 or
+-- prod silently skips it and expected_state never materializes.
 ALTER TABLE "oauth_sessions" ADD COLUMN IF NOT EXISTS "expected_state" text;
