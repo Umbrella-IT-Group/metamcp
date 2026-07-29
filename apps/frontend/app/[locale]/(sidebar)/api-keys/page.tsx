@@ -8,10 +8,11 @@ import {
   EyeOff,
   Key,
   Plus,
+  RefreshCw,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -79,15 +80,20 @@ export default function ApiKeysPage() {
   //
   // roleLoaded gates the create-button header: isAdmin starts false, so
   // without it every ADMIN saw a flash of the false "Only administrators
-  // can create API keys." claim while the session fetch was in flight —
-  // and a FAILED fetch pinned that false claim permanently (the promise
-  // had no .catch). Until the role genuinely resolves, the header renders
-  // a neutral disabled button that claims nothing about the viewer; on
-  // fetch failure it stays neutral rather than asserting a role we never
-  // learned. Fail-closed either way — the backend enforces the boundary.
+  // can create API keys." claim while the session fetch was in flight.
+  // Until the role genuinely resolves, the header renders a neutral
+  // disabled button that claims nothing about the viewer. A FAILED fetch
+  // no longer pins that state forever: roleError swaps the neutral
+  // spinner-button for an explicit error line + retry, so a transient
+  // auth-endpoint blip doesn't leave an admin staring at a permanently
+  // "loading" create button. Still fail-closed throughout — no admin
+  // surface renders until the role actually resolves, and the backend
+  // enforces the boundary regardless.
   const [isAdmin, setIsAdmin] = useState(false);
   const [roleLoaded, setRoleLoaded] = useState(false);
-  useEffect(() => {
+  const [roleError, setRoleError] = useState(false);
+  const loadRole = useCallback(() => {
+    setRoleError(false);
     authClient
       .getSession()
       .then((session) => {
@@ -97,9 +103,13 @@ export default function ApiKeysPage() {
         setRoleLoaded(true);
       })
       .catch(() => {
-        // Role unknown — keep the neutral loading state (see comment above).
+        // Role unknown — surface it and offer a retry (see comment above).
+        setRoleError(true);
       });
   }, []);
+  useEffect(() => {
+    loadRole();
+  }, [loadRole]);
 
   const { data: apiKeys, refetch } = trpc.frontend.apiKeys.list.useQuery();
   // Admin-only cross-user listing. `enabled: isAdmin` keeps members from ever
@@ -265,10 +275,22 @@ export default function ApiKeysPage() {
             role is still resolving, the button is neutrally disabled with
             NO admin-only claim (see the roleLoaded comment above). */}
         {!roleLoaded ? (
-          <Button disabled aria-busy="true">
-            <Plus className="h-4 w-4 mr-2" />
-            {t("api-keys:createApiKey")}
-          </Button>
+          roleError ? (
+            <div className="flex flex-col items-end gap-1">
+              <Button variant="outline" onClick={loadRole}>
+                <RefreshCw className="h-4 w-4 mr-2" />
+                {t("api-keys:retryRoleLoad")}
+              </Button>
+              <p className="text-xs text-destructive">
+                {t("api-keys:roleLoadError")}
+              </p>
+            </div>
+          ) : (
+            <Button disabled aria-busy="true">
+              <Plus className="h-4 w-4 mr-2" />
+              {t("api-keys:createApiKey")}
+            </Button>
+          )
         ) : !isAdmin ? (
           <div className="flex flex-col items-end gap-1">
             <Button disabled title={t("api-keys:createAdminOnly")}>

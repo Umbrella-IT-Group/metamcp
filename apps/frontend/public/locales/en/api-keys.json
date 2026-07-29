@@ -43,5 +43,7 @@
   "actsAsUser": "Acts as user (M365 identity)",
   "actsAsUserPlaceholder": "better-auth user id — leave empty for no identity",
   "actsAsUserDescription": "Optional, administrators only. Requests authenticated by this key run delegated M365 calls as this user. Requires a specific endpoint scope; without a binding the key stays fail-closed (no delegated identity).",
-  "actsAsBadge": "Acts as"
+  "actsAsBadge": "Acts as",
+  "roleLoadError": "Couldn't determine your permissions.",
+  "retryRoleLoad": "Retry"
 }
