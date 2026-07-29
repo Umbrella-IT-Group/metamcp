@@ -113,7 +113,7 @@
     "updateFailed": "Update Failed",
     "updateFailedDescription": "Failed to update endpoint",
     "requireScopedApiKeyLabel": "Require Endpoint-Scoped API Keys",
-    "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys"
+    "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys. Applies to API-key auth only — OAuth access is unaffected."
   },
   "list": {
     "title": "Endpoints",
@@ -137,6 +137,7 @@
     "editEndpoint": "Edit endpoint",
     "deleteConfirmTitle": "Delete Endpoint",
     "deleteConfirmDescription": "Are you sure you want to delete the endpoint \"{{name}}\"? This action cannot be undone and will make the endpoint inaccessible.",
+    "deleteConfirmScopedKeyWarning": "Any API keys scoped to this endpoint will also be permanently deleted.",
     "deleting": "Deleting...",
     "deleteSuccess": "Endpoint deleted successfully",
     "deleteError": "Failed to delete endpoint",
@@ -151,5 +152,5 @@
     "noResults": "No results."
   },
   "requireScopedApiKey": "Require Endpoint-Scoped API Keys",
-  "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys"
+  "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys. Applies to API-key auth only — OAuth access is unaffected."
 }

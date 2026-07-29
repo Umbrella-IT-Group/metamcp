@@ -216,176 +216,195 @@ export default function ApiKeysPage() {
             <p className="text-muted-foreground">{t("api-keys:description")}</p>
           </div>
         </div>
-        <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-          <DialogTrigger asChild>
-            <Button>
+        {/* Minting is admin-only since the migration 0023 scope rules: every
+            new key must carry an (admin-gated) endpoint scope, so a member
+            create always fails server-side. Rather than show a dialog that
+            can only error, non-admins get a disabled button + an explanatory
+            line. The backend enforces this regardless of the UI. */}
+        {!isAdmin ? (
+          <div className="flex flex-col items-end gap-1">
+            <Button disabled title={t("api-keys:createAdminOnly")}>
               <Plus className="h-4 w-4 mr-2" />
               {t("api-keys:createApiKey")}
             </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>{t("api-keys:createApiKey")}</DialogTitle>
-              <DialogDescription>
-                {t("api-keys:createApiKeyDescription")}
-              </DialogDescription>
-            </DialogHeader>
-            {newApiKey ? (
-              <div className="space-y-4">
-                <div className="p-4 bg-muted rounded-lg">
-                  <p className="text-sm font-medium mb-2">
-                    {t("api-keys:newApiKey")}
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
-                      {newApiKey}
-                    </code>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => copyToClipboard(newApiKey)}
-                    >
-                      <Copy className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-                <Button
-                  onClick={() => {
-                    setNewApiKey(null);
-                    handleCreateSuccess();
-                  }}
-                  className="w-full"
-                >
-                  {t("api-keys:done")}
-                </Button>
-              </div>
-            ) : (
-              <form
-                onSubmit={form.handleSubmit(onSubmit)}
-                className="space-y-4"
-              >
-                <div>
-                  <label className="text-sm font-medium">
-                    {t("api-keys:name")}
-                  </label>
-                  <Input
-                    {...form.register("name")}
-                    placeholder={t("api-keys:namePlaceholder")}
-                  />
-                  {form.formState.errors.name && (
-                    <p className="text-sm text-destructive mt-1">
-                      {form.formState.errors.name.message}
+            <p className="text-xs text-muted-foreground">
+              {t("api-keys:createAdminOnly")}
+            </p>
+          </div>
+        ) : (
+          <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="h-4 w-4 mr-2" />
+                {t("api-keys:createApiKey")}
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>{t("api-keys:createApiKey")}</DialogTitle>
+                <DialogDescription>
+                  {t("api-keys:createApiKeyDescription")}
+                </DialogDescription>
+              </DialogHeader>
+              {newApiKey ? (
+                <div className="space-y-4">
+                  <div className="p-4 bg-muted rounded-lg">
+                    <p className="text-sm font-medium mb-2">
+                      {t("api-keys:newApiKey")}
                     </p>
-                  )}
-                </div>
-                <div>
-                  <Label htmlFor="ownership" className="text-sm font-medium">
-                    {t("api-keys:ownership")}
-                  </Label>
-                  <Select
-                    value={
-                      form.watch("user_id") === null ? "public" : "private"
-                    }
-                    onValueChange={(value) => {
-                      form.setValue(
-                        "user_id",
-                        value === "public" ? null : undefined,
-                      );
+                    <div className="flex items-center gap-2">
+                      <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
+                        {newApiKey}
+                      </code>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => copyToClipboard(newApiKey)}
+                      >
+                        <Copy className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
+                  <Button
+                    onClick={() => {
+                      setNewApiKey(null);
+                      handleCreateSuccess();
                     }}
+                    className="w-full"
                   >
-                    <SelectTrigger>
-                      <SelectValue placeholder={t("api-keys:ownership")} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="private">
-                        {t("api-keys:forMyself")}
-                      </SelectItem>
-                      {/* Minting a public ('everyone') key is admin-only —
+                    {t("api-keys:done")}
+                  </Button>
+                </div>
+              ) : (
+                <form
+                  onSubmit={form.handleSubmit(onSubmit)}
+                  className="space-y-4"
+                >
+                  <div>
+                    <label className="text-sm font-medium">
+                      {t("api-keys:name")}
+                    </label>
+                    <Input
+                      {...form.register("name")}
+                      placeholder={t("api-keys:namePlaceholder")}
+                    />
+                    {form.formState.errors.name && (
+                      <p className="text-sm text-destructive mt-1">
+                        {form.formState.errors.name.message}
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <Label htmlFor="ownership" className="text-sm font-medium">
+                      {t("api-keys:ownership")}
+                    </Label>
+                    <Select
+                      value={
+                        form.watch("user_id") === null ? "public" : "private"
+                      }
+                      onValueChange={(value) => {
+                        form.setValue(
+                          "user_id",
+                          value === "public" ? null : undefined,
+                        );
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder={t("api-keys:ownership")} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="private">
+                          {t("api-keys:forMyself")}
+                        </SelectItem>
+                        {/* Minting a public ('everyone') key is admin-only —
                           the backend rejects it for members regardless, so
                           the option is simply hidden for non-admins. */}
-                      {isAdmin && (
-                        <SelectItem value="public">
-                          {t("api-keys:everyone")}
-                        </SelectItem>
-                      )}
-                    </SelectContent>
-                  </Select>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    {t("api-keys:ownershipDescription")}
-                  </p>
-                </div>
-                <div>
-                  <Label htmlFor="scope" className="text-sm font-medium">
-                    {t("api-keys:scope")}
-                  </Label>
-                  <Select
-                    value={
-                      form.watch("all_endpoints") === true
-                        ? "__all__"
-                        : (form.watch("endpoint_uuid") ?? "")
-                    }
-                    onValueChange={(value) => {
-                      if (value === "__all__") {
-                        form.setValue("all_endpoints", true);
-                        form.setValue("endpoint_uuid", undefined);
-                      } else {
-                        form.setValue("endpoint_uuid", value);
-                        form.setValue("all_endpoints", undefined);
+                        {isAdmin && (
+                          <SelectItem value="public">
+                            {t("api-keys:everyone")}
+                          </SelectItem>
+                        )}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t("api-keys:ownershipDescription")}
+                    </p>
+                  </div>
+                  <div>
+                    <Label htmlFor="scope" className="text-sm font-medium">
+                      {t("api-keys:scope")}
+                    </Label>
+                    <Select
+                      value={
+                        form.watch("all_endpoints") === true
+                          ? "__all__"
+                          : (form.watch("endpoint_uuid") ?? "")
                       }
-                      form.clearErrors("endpoint_uuid");
-                    }}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder={t("api-keys:selectEndpoint")} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {availableEndpoints.map((endpoint) => (
-                        <SelectItem key={endpoint.uuid} value={endpoint.uuid}>
-                          {endpoint.name}
-                        </SelectItem>
-                      ))}
-                      {/* Gateway-wide keys are the explicit escape hatch and
+                      onValueChange={(value) => {
+                        if (value === "__all__") {
+                          form.setValue("all_endpoints", true);
+                          form.setValue("endpoint_uuid", undefined);
+                        } else {
+                          form.setValue("endpoint_uuid", value);
+                          form.setValue("all_endpoints", undefined);
+                        }
+                        form.clearErrors("endpoint_uuid");
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue
+                          placeholder={t("api-keys:selectEndpoint")}
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {availableEndpoints.map((endpoint) => (
+                          <SelectItem key={endpoint.uuid} value={endpoint.uuid}>
+                            {endpoint.name}
+                          </SelectItem>
+                        ))}
+                        {/* Gateway-wide keys are the explicit escape hatch and
                           admin-only — the backend rejects the flag for
                           members regardless, so the option is hidden. */}
-                      {isAdmin && (
-                        <SelectItem value="__all__">
-                          {t("api-keys:allEndpoints")}
-                        </SelectItem>
-                      )}
-                    </SelectContent>
-                  </Select>
-                  {form.formState.errors.endpoint_uuid && (
-                    <p className="text-sm text-destructive mt-1">
-                      {form.formState.errors.endpoint_uuid.message}
+                        {isAdmin && (
+                          <SelectItem value="__all__">
+                            {t("api-keys:allEndpoints")}
+                          </SelectItem>
+                        )}
+                      </SelectContent>
+                    </Select>
+                    {form.formState.errors.endpoint_uuid && (
+                      <p className="text-sm text-destructive mt-1">
+                        {form.formState.errors.endpoint_uuid.message}
+                      </p>
+                    )}
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t("api-keys:scopeDescription")}
                     </p>
-                  )}
-                  <p className="text-xs text-muted-foreground mt-1">
-                    {t("api-keys:scopeDescription")}
-                  </p>
-                </div>
-                <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => setCreateDialogOpen(false)}
-                    className="flex-1"
-                  >
-                    {t("api-keys:cancel")}
-                  </Button>
-                  <Button
-                    type="submit"
-                    disabled={createMutation.isPending}
-                    className="flex-1"
-                  >
-                    {createMutation.isPending
-                      ? t("common:creating")
-                      : t("common:create")}
-                  </Button>
-                </div>
-              </form>
-            )}
-          </DialogContent>
-        </Dialog>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => setCreateDialogOpen(false)}
+                      className="flex-1"
+                    >
+                      {t("api-keys:cancel")}
+                    </Button>
+                    <Button
+                      type="submit"
+                      disabled={createMutation.isPending}
+                      className="flex-1"
+                    >
+                      {createMutation.isPending
+                        ? t("common:creating")
+                        : t("common:create")}
+                    </Button>
+                  </div>
+                </form>
+              )}
+            </DialogContent>
+          </Dialog>
+        )}
       </div>
 
       <Separator />

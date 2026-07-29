@@ -87,7 +87,7 @@
     "updateFailed": "更新失败",
     "updateFailedDescription": "更新端点失败",
     "requireScopedApiKeyLabel": "要求端点范围 API 密钥",
-    "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥"
+    "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥。仅适用于 API 密钥认证，不影响 OAuth 访问。"
   },
   "list": {
     "title": "端点",
@@ -111,6 +111,7 @@
     "editEndpoint": "编辑端点",
     "deleteConfirmTitle": "删除端点",
     "deleteConfirmDescription": "您确定要删除端点 \"{{name}}\" 吗？此操作无法撤消，将使端点无法访问。",
+    "deleteConfirmScopedKeyWarning": "限定到此端点的所有 API 密钥也将被永久删除。",
     "deleting": "删除中...",
     "deleteSuccess": "端点删除成功",
     "deleteError": "删除端点失败",
@@ -125,5 +126,5 @@
     "noResults": "无结果。"
   },
   "requireScopedApiKey": "要求端点范围 API 密钥",
-  "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥"
+  "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥。仅适用于 API 密钥认证，不影响 OAuth 访问。"
 }

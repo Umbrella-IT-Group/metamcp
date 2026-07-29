@@ -87,7 +87,7 @@
     "updateFailed": "업데이트 실패",
     "updateFailedDescription": "Endpoint 업데이트에 실패했습니다",
     "requireScopedApiKeyLabel": "엔드포인트 범위 API Key 필수",
-    "requireScopedApiKeyDescription": "이 엔드포인트로 범위가 지정된 API Key만 허용하고, 게이트웨이 전체(범위 없는) 키는 거부합니다"
+    "requireScopedApiKeyDescription": "이 엔드포인트로 범위가 지정된 API Key만 허용하고, 게이트웨이 전체(범위 없는) 키는 거부합니다. API Key 인증에만 적용되며 OAuth 접근에는 영향을 주지 않습니다."
   },
   "list": {
     "title": "Endpoints",
@@ -111,6 +111,7 @@
     "editEndpoint": "Endpoint 편집",
     "deleteConfirmTitle": "Endpoint 삭제",
     "deleteConfirmDescription": "\"{{name}}\" Endpoint를 삭제하시겠습니까? 이 작업은 취소할 수 없으며 Endpoint는 접근 불가해집니다.",
+    "deleteConfirmScopedKeyWarning": "이 Endpoint로 범위가 지정된 API Key도 영구적으로 삭제됩니다.",
     "deleting": "삭제 중...",
     "deleteSuccess": "Endpoint가 성공적으로 삭제되었습니다",
     "deleteError": "Endpoint 삭제 실패",
@@ -125,5 +126,5 @@
     "noResults": "결과 없음."
   },
   "requireScopedApiKey": "엔드포인트 범위 API Key 필수",
-  "requireScopedApiKeyDescription": "이 엔드포인트로 범위가 지정된 API Key만 허용하고, 게이트웨이 전체(범위 없는) 키는 거부합니다"
+  "requireScopedApiKeyDescription": "이 엔드포인트로 범위가 지정된 API Key만 허용하고, 게이트웨이 전체(범위 없는) 키는 거부합니다. API Key 인증에만 적용되며 OAuth 접근에는 영향을 주지 않습니다."
 }

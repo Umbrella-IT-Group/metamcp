@@ -3,6 +3,7 @@
   "description": "管理您的 API 密钥以进行程序化访问",
   "createApiKey": "创建 API 密钥",
   "createApiKeyDescription": "创建新的 API 密钥以编程方式访问 MetaMCP API",
+  "createAdminOnly": "只有管理员才能创建 API 密钥。",
   "name": "名称",
   "namePlaceholder": "例如，生产 API 密钥",
   "ownership": "所有权",

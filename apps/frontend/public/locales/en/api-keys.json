@@ -3,6 +3,7 @@
   "description": "Manage your API keys for programmatic access",
   "createApiKey": "Create API Key",
   "createApiKeyDescription": "Create a new API key to access the MetaMCP API programmatically",
+  "createAdminOnly": "Only administrators can create API keys.",
   "name": "Name",
   "namePlaceholder": "e.g., Production API Key",
   "ownership": "Ownership",
