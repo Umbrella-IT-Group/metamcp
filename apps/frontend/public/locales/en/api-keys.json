@@ -42,7 +42,7 @@
   "scopeDescription": "The key will only authenticate on the selected endpoint. \"All endpoints\" mints a gateway-wide key and is restricted to administrators.",
   "actsAsUser": "Acts as user (M365 identity)",
   "actsAsUserPlaceholder": "better-auth user id — leave empty for no identity",
-  "actsAsUserDescription": "Optional, administrators only. Requests authenticated by this key run delegated M365 calls as this user. Requires a specific endpoint scope; without a binding the key stays fail-closed (no delegated identity).",
+  "actsAsUserDescription": "Optional, administrators only. Requests authenticated by this key run delegated M365 calls as this user. Requires a specific endpoint scope, and the key must be owned by this same user — never available on public ('everyone') keys. Without a binding the key stays fail-closed (no delegated identity).",
   "actsAsBadge": "Acts as",
   "roleLoadError": "Couldn't determine your permissions.",
   "retryRoleLoad": "Retry"

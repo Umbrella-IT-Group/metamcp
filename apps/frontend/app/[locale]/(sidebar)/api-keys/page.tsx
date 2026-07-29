@@ -377,6 +377,16 @@ export default function ApiKeysPage() {
                           "user_id",
                           value === "public" ? null : undefined,
                         );
+                        if (value === "public") {
+                          // An identity binding requires the key to be OWNED
+                          // by the acted-as user — a public ('everyone') key
+                          // has no owner, so switching to it clears the
+                          // acts-as field (same pattern as the all-endpoints
+                          // switch in the scope select below) and the input
+                          // is disabled while 'everyone' is selected.
+                          form.setValue("acts_as_user_id", undefined);
+                          form.clearErrors("acts_as_user_id");
+                        }
                       }}
                     >
                       <SelectTrigger>
@@ -459,12 +469,19 @@ export default function ApiKeysPage() {
                   {/* Acts-as identity binding (migration 0024) — this whole
                       dialog is admin-only (see the create-button gate above),
                       and the backend re-enforces admin-only regardless. Free
-                      text for the better-auth user id: there is deliberately
-                      no list-users tRPC to feed a picker. Enabled ONLY when a
-                      specific endpoint is selected — an identity-bound key
-                      must be endpoint-scoped, so the field is inert (and
-                      cleared, see the scope onValueChange) under the
-                      all-endpoints escape hatch. */}
+                      text for the better-auth user id: the ownership select
+                      above carries no concrete user ids ('private' = the
+                      current admin implicitly, 'everyone' = null) and there
+                      is deliberately no list-users tRPC to feed a picker, so
+                      the id cannot be auto-filled/locked from an owner
+                      select. Enabled ONLY when a specific endpoint is
+                      selected AND ownership is a specific user — an
+                      identity-bound key must be endpoint-scoped and OWNED by
+                      the identity it exercises, so the field is inert (and
+                      cleared, see both onValueChange handlers) under the
+                      all-endpoints escape hatch or 'everyone' ownership. The
+                      backend rejects any owner ≠ acted-as divergence
+                      (FORBIDDEN + zod ownerMismatch) regardless of the UI. */}
                   <div>
                     <Label
                       htmlFor="acts-as-user"
@@ -483,7 +500,10 @@ export default function ApiKeysPage() {
                             : undefined,
                       })}
                       placeholder={t("api-keys:actsAsUserPlaceholder")}
-                      disabled={!form.watch("endpoint_uuid")}
+                      disabled={
+                        !form.watch("endpoint_uuid") ||
+                        form.watch("user_id") === null
+                      }
                     />
                     {form.formState.errors.acts_as_user_id && (
                       <p className="text-sm text-destructive mt-1">
