@@ -85,7 +85,9 @@
     "updateSuccess": "端点已更新",
     "updateSuccessDescription": "端点已成功更新",
     "updateFailed": "更新失败",
-    "updateFailedDescription": "更新端点失败"
+    "updateFailedDescription": "更新端点失败",
+    "requireScopedApiKeyLabel": "要求端点范围 API 密钥",
+    "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥"
   },
   "list": {
     "title": "端点",
@@ -121,5 +123,7 @@
     "openApiUrlWithApiKeyCopied": "带 API 密钥参数的 OpenAPI URL 已复制到剪贴板",
     "openApiSchemaUrlWithApiKeyCopied": "带 API 密钥参数的 OpenAPI 架构 URL 已复制到剪贴板",
     "noResults": "无结果。"
-  }
+  },
+  "requireScopedApiKey": "要求端点范围 API 密钥",
+  "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥"
 }

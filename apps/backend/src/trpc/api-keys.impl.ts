@@ -15,7 +15,7 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { ApiKeysRepository } from "../db/repositories";
+import { ApiKeysRepository, endpointsRepository } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
 
 const apiKeysRepository = new ApiKeysRepository();
@@ -45,6 +45,54 @@ export const apiKeysImplementations = {
           message: "You can only create API keys owned by yourself.",
         });
       }
+      // Scope selection is admin-only, same FORBIDDEN-before-write style: a
+      // member may neither bind a key to an endpoint nor mint a gateway-wide
+      // (all_endpoints) key. Combined with the explicit-scope requirement
+      // below, key minting is effectively an administrator operation.
+      if (
+        input.endpoint_uuid !== undefined ||
+        input.all_endpoints !== undefined
+      ) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "Only administrators can set an API key's endpoint scope (endpoint_uuid / all_endpoints).",
+        });
+      }
+    }
+
+    // Explicit-scope gate (mirrors the zod superRefine so the invariant holds
+    // even for callers that bypass the tRPC input schema): a new key must
+    // either name the ONE endpoint it may reach, or deliberately opt into
+    // gateway-wide reach with all_endpoints: true (stored as NULL scope).
+    // Silently defaulting to global is impossible.
+    if (input.endpoint_uuid && input.all_endpoints === true) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "Pass either endpoint_uuid or all_endpoints: true, not both — a key is scoped to one endpoint or explicitly global.",
+      });
+    }
+    if (!input.endpoint_uuid && input.all_endpoints !== true) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "An API key must be scoped to an endpoint (endpoint_uuid). To mint a gateway-wide key, pass all_endpoints: true explicitly.",
+      });
+    }
+
+    // The scope target must exist — reject before any write. (The FK would
+    // also catch this, but a clean NOT_FOUND beats a constraint error.)
+    if (input.endpoint_uuid) {
+      const endpoint = await endpointsRepository.findByUuid(
+        input.endpoint_uuid,
+      );
+      if (!endpoint) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "The endpoint to scope this API key to does not exist.",
+        });
+      }
     }
 
     try {
@@ -54,6 +102,9 @@ export const apiKeysImplementations = {
       const result = await apiKeysRepository.create({
         name: input.name,
         user_id: apiKeyUserId,
+        // all_endpoints: true is the explicit escape hatch — stores NULL
+        // (legacy gateway-wide scope). Otherwise the validated endpoint uuid.
+        endpoint_uuid: input.endpoint_uuid ?? null,
         is_active: true,
       });
 
@@ -175,6 +226,7 @@ export const apiKeysImplementations = {
         valid: result.valid,
         user_id: result.user_id ?? undefined,
         key_uuid: result.key_uuid,
+        endpoint_uuid: result.endpoint_uuid ?? null,
       };
     } catch (error) {
       logger.error("Error validating API key:", error);

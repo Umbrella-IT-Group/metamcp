@@ -89,6 +89,15 @@ export default function ApiKeysPage() {
   // firing the adminProcedure query (which would FORBIDDEN anyway).
   const { data: allApiKeys, refetch: refetchAll } =
     trpc.frontend.apiKeys.listAll.useQuery(undefined, { enabled: isAdmin });
+  // Endpoints, for the required scope picker in the create dialog and to
+  // render each key's scope by endpoint name in the lists.
+  const { data: endpointsResponse } = trpc.frontend.endpoints.list.useQuery();
+  const availableEndpoints = endpointsResponse?.success
+    ? endpointsResponse.data
+    : [];
+  const endpointNameByUuid = new Map(
+    availableEndpoints.map((endpoint) => [endpoint.uuid, endpoint.name]),
+  );
   const createMutation = trpc.frontend.apiKeys.create.useMutation({
     onSuccess: (data) => {
       setNewApiKey(data.key);
@@ -124,6 +133,11 @@ export default function ApiKeysPage() {
     defaultValues: {
       name: "",
       user_id: undefined, // Will be set based on ownership selection
+      // Scope is REQUIRED and has no default: the caller must pick the one
+      // endpoint the key works on, or (admin) the explicit all-endpoints
+      // escape hatch. The zod schema rejects an unset scope.
+      endpoint_uuid: undefined,
+      all_endpoints: undefined,
     },
   });
 
@@ -161,6 +175,23 @@ export default function ApiKeysPage() {
     setApiKeyToDelete(apiKey);
     setDeleteDialogOpen(true);
   };
+
+  // Scope cell: NULL endpoint_uuid = legacy/gateway-wide key ("All
+  // endpoints", visually marked as global); otherwise the bound endpoint's
+  // name (uuid prefix fallback if the endpoint isn't visible to the caller).
+  const renderScopeBadge = (endpointUuid: string | null) =>
+    endpointUuid === null ? (
+      <Badge
+        variant="outline"
+        className="bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
+      >
+        {t("api-keys:allEndpointsBadge")}
+      </Badge>
+    ) : (
+      <Badge variant="outline">
+        {endpointNameByUuid.get(endpointUuid) ?? endpointUuid.slice(0, 8)}
+      </Badge>
+    );
 
   const handleDeleteConfirm = () => {
     if (apiKeyToDelete) {
@@ -283,6 +314,55 @@ export default function ApiKeysPage() {
                     {t("api-keys:ownershipDescription")}
                   </p>
                 </div>
+                <div>
+                  <Label htmlFor="scope" className="text-sm font-medium">
+                    {t("api-keys:scope")}
+                  </Label>
+                  <Select
+                    value={
+                      form.watch("all_endpoints") === true
+                        ? "__all__"
+                        : (form.watch("endpoint_uuid") ?? "")
+                    }
+                    onValueChange={(value) => {
+                      if (value === "__all__") {
+                        form.setValue("all_endpoints", true);
+                        form.setValue("endpoint_uuid", undefined);
+                      } else {
+                        form.setValue("endpoint_uuid", value);
+                        form.setValue("all_endpoints", undefined);
+                      }
+                      form.clearErrors("endpoint_uuid");
+                    }}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder={t("api-keys:selectEndpoint")} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {availableEndpoints.map((endpoint) => (
+                        <SelectItem key={endpoint.uuid} value={endpoint.uuid}>
+                          {endpoint.name}
+                        </SelectItem>
+                      ))}
+                      {/* Gateway-wide keys are the explicit escape hatch and
+                          admin-only — the backend rejects the flag for
+                          members regardless, so the option is hidden. */}
+                      {isAdmin && (
+                        <SelectItem value="__all__">
+                          {t("api-keys:allEndpoints")}
+                        </SelectItem>
+                      )}
+                    </SelectContent>
+                  </Select>
+                  {form.formState.errors.endpoint_uuid && (
+                    <p className="text-sm text-destructive mt-1">
+                      {form.formState.errors.endpoint_uuid.message}
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {t("api-keys:scopeDescription")}
+                  </p>
+                </div>
                 <div className="flex gap-2">
                   <Button
                     type="button"
@@ -319,13 +399,14 @@ export default function ApiKeysPage() {
               <TableHead>{t("api-keys:created")}</TableHead>
               <TableHead>{t("common:status")}</TableHead>
               <TableHead>{t("api-keys:ownership")}</TableHead>
+              <TableHead>{t("api-keys:scope")}</TableHead>
               <TableHead className="w-[100px]">{t("common:actions")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {apiKeys?.apiKeys?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} className="text-center py-12">
+                <TableCell colSpan={7} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Key className="h-8 w-8 text-muted-foreground" />
                     <p className="text-muted-foreground">
@@ -406,6 +487,9 @@ export default function ApiKeysPage() {
                     </Badge>
                   </TableCell>
                   <TableCell>
+                    {renderScopeBadge(apiKey.endpoint_uuid)}
+                  </TableCell>
+                  <TableCell>
                     <Button
                       size="sm"
                       variant="ghost"
@@ -452,6 +536,7 @@ export default function ApiKeysPage() {
                   <TableHead>{t("common:name")}</TableHead>
                   <TableHead>Key</TableHead>
                   <TableHead>Owner</TableHead>
+                  <TableHead>{t("api-keys:scope")}</TableHead>
                   <TableHead>{t("api-keys:created")}</TableHead>
                   <TableHead>Last used</TableHead>
                   <TableHead>{t("common:status")}</TableHead>
@@ -463,7 +548,7 @@ export default function ApiKeysPage() {
               <TableBody>
                 {allApiKeys?.apiKeys?.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={7} className="text-center py-12">
+                    <TableCell colSpan={8} className="text-center py-12">
                       <p className="text-muted-foreground">
                         {t("api-keys:noApiKeys")}
                       </p>
@@ -489,6 +574,9 @@ export default function ApiKeysPage() {
                             {t("api-keys:public")}
                           </Badge>
                         )}
+                      </TableCell>
+                      <TableCell>
+                        {renderScopeBadge(apiKey.endpoint_uuid)}
                       </TableCell>
                       <TableCell>
                         {format(new Date(apiKey.created_at), "MMM d, yyyy")}

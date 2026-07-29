@@ -75,6 +75,7 @@ export const endpointsImplementations = {
         description: input.description,
         namespace_uuid: input.namespaceUuid,
         enable_api_key_auth: input.enableApiKeyAuth ?? true,
+        require_scoped_api_key: input.requireScopedApiKey ?? false,
         enable_max_rate: input.enableMaxRate ?? false,
         enable_client_max_rate: input.enableClientMaxRate ?? false,
         max_rate: input.maxRate,
@@ -107,10 +108,13 @@ export const endpointsImplementations = {
               if (activeApiKey) {
                 bearerToken = activeApiKey.key;
               } else {
-                // Create a new API key if none exists
+                // Create a new API key if none exists. Scoped to the endpoint
+                // it is being minted for — an internal convenience mint must
+                // not produce an unscoped (gateway-wide) key silently.
                 const newApiKey = await apiKeysRepository.create({
                   name: "Auto-generated for MCP Server",
                   user_id: userId,
+                  endpoint_uuid: result.uuid,
                   is_active: true,
                 });
                 bearerToken = newApiKey.key;
@@ -344,6 +348,7 @@ export const endpointsImplementations = {
         description: input.description,
         namespace_uuid: input.namespaceUuid,
         enable_api_key_auth: input.enableApiKeyAuth,
+        require_scoped_api_key: input.requireScopedApiKey,
         enable_max_rate: input.enableMaxRate ?? false,
         enable_client_max_rate: input.enableClientMaxRate ?? false,
         max_rate: input.maxRate,

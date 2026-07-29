@@ -33,5 +33,10 @@
   "ownershipDescription": "私有 API 密钥只对您可见。公开 API 密钥可供任何人使用。",
   "hideApiKey": "隐藏 API 密钥",
   "showApiKey": "显示 API 密钥",
-  "copyFullApiKey": "复制完整 API 密钥"
+  "copyFullApiKey": "复制完整 API 密钥",
+  "scope": "范围",
+  "selectEndpoint": "选择端点",
+  "allEndpoints": "所有端点（全局 — 管理员）",
+  "allEndpointsBadge": "所有端点",
+  "scopeDescription": "该密钥仅在所选端点上进行身份验证。\"所有端点\"会创建网关级全局密钥，仅限管理员使用。"
 }

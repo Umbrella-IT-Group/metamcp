@@ -85,7 +85,9 @@
     "updateSuccess": "Endpoint 업데이트됨",
     "updateSuccessDescription": "Endpoint가 성공적으로 업데이트되었습니다",
     "updateFailed": "업데이트 실패",
-    "updateFailedDescription": "Endpoint 업데이트에 실패했습니다"
+    "updateFailedDescription": "Endpoint 업데이트에 실패했습니다",
+    "requireScopedApiKeyLabel": "엔드포인트 범위 API Key 필수",
+    "requireScopedApiKeyDescription": "이 엔드포인트로 범위가 지정된 API Key만 허용하고, 게이트웨이 전체(범위 없는) 키는 거부합니다"
   },
   "list": {
     "title": "Endpoints",
@@ -121,5 +123,7 @@
     "openApiUrlWithApiKeyCopied": "API Key가 포함된 OpenAPI URL이 클립보드에 복사되었습니다",
     "openApiSchemaUrlWithApiKeyCopied": "API Key가 포함된 OpenAPI 스키마 URL이 클립보드에 복사되었습니다",
     "noResults": "결과 없음."
-  }
+  },
+  "requireScopedApiKey": "엔드포인트 범위 API Key 필수",
+  "requireScopedApiKeyDescription": "이 엔드포인트로 범위가 지정된 API Key만 허용하고, 게이트웨이 전체(범위 없는) 키는 거부합니다"
 }

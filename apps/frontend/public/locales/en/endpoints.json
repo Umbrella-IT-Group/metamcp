@@ -111,7 +111,9 @@
     "updateSuccess": "Endpoint Updated",
     "updateSuccessDescription": "Endpoint has been updated successfully",
     "updateFailed": "Update Failed",
-    "updateFailedDescription": "Failed to update endpoint"
+    "updateFailedDescription": "Failed to update endpoint",
+    "requireScopedApiKeyLabel": "Require Endpoint-Scoped API Keys",
+    "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys"
   },
   "list": {
     "title": "Endpoints",
@@ -147,5 +149,7 @@
     "openApiUrlWithApiKeyCopied": "OpenAPI URL with API key parameter copied to clipboard",
     "openApiSchemaUrlWithApiKeyCopied": "OpenAPI Schema URL with API key parameter copied to clipboard",
     "noResults": "No results."
-  }
+  },
+  "requireScopedApiKey": "Require Endpoint-Scoped API Keys",
+  "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys"
 }

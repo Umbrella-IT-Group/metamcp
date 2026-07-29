@@ -33,5 +33,10 @@
   "ownershipDescription": "비공개 API Key는 본인만 볼 수 있습니다. 공개 API Key는 누구나 사용할 수 있습니다.",
   "hideApiKey": "API Key 숨기기",
   "showApiKey": "API Key 표시",
-  "copyFullApiKey": "전체 API Key 복사"
+  "copyFullApiKey": "전체 API Key 복사",
+  "scope": "범위",
+  "selectEndpoint": "엔드포인트 선택",
+  "allEndpoints": "모든 엔드포인트 (전역 — 관리자)",
+  "allEndpointsBadge": "모든 엔드포인트",
+  "scopeDescription": "이 키는 선택한 엔드포인트에서만 인증됩니다. \"모든 엔드포인트\"는 게이트웨이 전체 키를 생성하며 관리자만 사용할 수 있습니다."
 }
