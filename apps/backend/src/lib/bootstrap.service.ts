@@ -744,11 +744,31 @@ async function maybeDeleteOtherUsers(
 }
 
 /**
+ * Identity of a key a deferred preserved-key restore will overwrite:
+ * restores upsert on the (user_id, name) unique pair, so that pair is the
+ * collision key. NUL separator — it cannot appear in either component.
+ */
+function pendingRestoreKeyId(userId: string, name: string): string {
+  return `${userId}\u0000${name}`;
+}
+
+/**
  * Bootstrap API keys from configuration array.
+ *
+ * `pendingRestoreKeyIds` names the (user_id, name) pairs that
+ * `restorePreservedApiKeys` will upsert LATER in the run (it runs after
+ * `bootstrapEndpoints`; this runs before). A config-declared key that
+ * collides with a pending restore is still minted — if the restore then
+ * fails, a working key beats none — but its log line must not present the
+ * fresh masked value as the live credential, because the restore's
+ * `onConflictDoUpdate` replaces it moments later. Without the amendment
+ * the log said "Created ... : <mask>" and the mask was never the value
+ * that survives startup.
  */
 async function bootstrapApiKeys(
   config: EnvConfig,
   userMap: Map<string, string>,
+  pendingRestoreKeyIds: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   if (!config.apiKeys || config.apiKeys.length === 0) {
     console.log(
@@ -811,9 +831,21 @@ async function bootstrapApiKeys(
         const ownerInfo = userId
           ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
           : "(public)";
-        console.log(
-          `✓ Created ${isPublic ? "public" : "private"} API key "${name}" ${ownerInfo}: ${maskKey(key)}`,
-        );
+        const restorePending =
+          userId !== null &&
+          pendingRestoreKeyIds.has(pendingRestoreKeyId(userId, name));
+        if (restorePending) {
+          // Log truth: the value minted here is NOT the one that survives
+          // startup — the deferred restore overwrites it. Never print this
+          // mask as if it were the live credential.
+          console.log(
+            `✓ Created ${isPublic ? "public" : "private"} API key "${name}" ${ownerInfo} (placeholder — a preserved-key restore for this name is pending and will overwrite it; the restored value is the live one)`,
+          );
+        } else {
+          console.log(
+            `✓ Created ${isPublic ? "public" : "private"} API key "${name}" ${ownerInfo}: ${maskKey(key)}`,
+          );
+        }
       } else {
         const ownerInfo = userId
           ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
@@ -1235,9 +1267,16 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
     console.warn("⚠️ User cleanup step failed:", err);
   }
 
-  // Bootstrap API keys
+  // Bootstrap API keys. The pending-restore pairs let the log stay truthful
+  // for a config-declared key the deferred restore will overwrite (see
+  // bootstrapApiKeys' doc comment).
   try {
-    await bootstrapApiKeys(config, userMap);
+    const pendingRestoreIds = new Set(
+      pendingApiKeyRestores.flatMap((pending) =>
+        pending.keys.map((k) => pendingRestoreKeyId(pending.userId, k.name)),
+      ),
+    );
+    await bootstrapApiKeys(config, userMap, pendingRestoreIds);
   } catch (err) {
     console.warn("⚠️ API keys bootstrap failed:", err);
   }

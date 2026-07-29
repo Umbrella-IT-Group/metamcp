@@ -263,3 +263,67 @@ describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residua
     ).toBe(true);
   });
 });
+
+describe("bootstrapApiKeys log truth — pending restore for the same (user_id, name)", () => {
+  it("amends the 'Created ... API key' line instead of presenting the doomed fresh value as live", async () => {
+    // The config declares a key with the SAME name as the preserved key
+    // ("tara-scoped", owned by the recreated user): bootstrapApiKeys mints
+    // it fresh, then the deferred restore's onConflictDoUpdate overwrites
+    // it. The minted value never survives startup, so the log must not
+    // present its mask as the live credential.
+    arrangeRecreateScenario({
+      apiKeysEnv: JSON.stringify([
+        { name: "tara-scoped", user_email: "admin@example.com" },
+      ]),
+    });
+    // bootstrapApiKeys' existence probe: the key is gone (the recreate
+    // deleted it), so the mint path runs.
+    readFixtures.apiKeysFindFirstQueue = [undefined];
+
+    await initializeEnvironmentConfiguration();
+
+    const logCalls = (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+    const createdLine = logCalls.find((line) =>
+      line.includes('Created private API key "tara-scoped"'),
+    );
+    expect(createdLine).toBeDefined();
+    // Amended: names the pending restore, and does NOT log a masked value
+    // (the mask format is `sk_mt_xxxx…xxxx`) as if it were the live key.
+    expect(createdLine).toContain("preserved-key restore");
+    expect(createdLine).not.toMatch(/: sk_mt_/);
+
+    // Both writes still happened: the config mint AND the restore upsert —
+    // net DB state is unchanged by the log fix.
+    const apiKeyInserts = statementLog.filter(
+      (s) => s.op === "insert" && s.table === apiKeysTable,
+    );
+    expect(apiKeyInserts).toHaveLength(2);
+    // Last write wins and it is the restore (the preserved value).
+    expect(apiKeyInserts[apiKeyInserts.length - 1].values).toMatchObject({
+      key: "sk_mt_preserved_secret",
+    });
+  });
+
+  it("a non-colliding config key keeps the normal masked-value log line", async () => {
+    arrangeRecreateScenario({
+      apiKeysEnv: JSON.stringify([
+        { name: "unrelated-key", user_email: "admin@example.com" },
+      ]),
+    });
+    readFixtures.apiKeysFindFirstQueue = [undefined];
+
+    await initializeEnvironmentConfiguration();
+
+    const logCalls = (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+    const createdLine = logCalls.find((line) =>
+      line.includes('Created private API key "unrelated-key"'),
+    );
+    expect(createdLine).toBeDefined();
+    expect(createdLine).toMatch(/: sk_mt_/);
+    expect(createdLine).not.toContain("preserved-key restore");
+  });
+});
