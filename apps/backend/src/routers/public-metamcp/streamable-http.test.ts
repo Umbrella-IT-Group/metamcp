@@ -80,6 +80,7 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
     getServer: vi.fn(),
     cleanupSession: vi.fn().mockResolvedValue(undefined),
     getMcpServerPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
+    getPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
   },
 }));
 
@@ -107,8 +108,10 @@ import {
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { hashAuthPrincipal } from "../../lib/metamcp/session-auth";
 import {
+  buildSessionsHealthPayload,
   cleanupSession,
   dispatchTracked,
+  getBoundSession,
   publicSessionSweeper,
   reapIdleSession,
   recoverPersistedSession,
@@ -332,5 +335,107 @@ describe("dispatchTracked — in-flight guard around a long-lived dispatch (item
     ).rejects.toThrow("boom");
 
     expect(publicSessionSweeper.getInFlight(sessionId)).toBe(0);
+  });
+});
+
+/**
+ * Seed a session into the module's real `sessionManager` (bound to
+ * ns/ep) by driving the recovery path — the same path production uses to
+ * repopulate the in-memory map. Returns the seeded sessionId.
+ */
+async function seedBoundSession(
+  sessionId: string,
+  namespaceUuid: string,
+  endpointName: string,
+): Promise<void> {
+  const rawToken = "bound-key-value";
+  (
+    mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+  ).mockResolvedValueOnce({
+    session_id: sessionId,
+    namespace_uuid: namespaceUuid,
+    endpoint_name: endpointName,
+    auth_principal: hashAuthPrincipal(rawToken, "api_key"),
+    auth_method: "api_key",
+    init_params: {},
+    created_at: new Date(),
+    last_seen_at: new Date(),
+    gateway_boot_id: GATEWAY_BOOT_ID,
+    capability_hash: GATEWAY_CAPABILITY_HASH,
+  });
+  (
+    metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+  ).mockResolvedValueOnce({
+    server: { connect: vi.fn().mockResolvedValue(undefined) },
+    cleanup: vi.fn().mockResolvedValue(undefined),
+    handlerContext: {} as Record<string, unknown>,
+  });
+  const result = await recoverPersistedSession(
+    sessionId,
+    fakeAuthReq({
+      namespaceUuid,
+      endpointName,
+      authMethod: "api_key",
+      headers: { "x-api-key": rawToken },
+    }),
+  );
+  expect(result.status).toBe("recovered");
+}
+
+describe("getBoundSession — endpoint-binding guard on the in-memory lookup (HIGH: cross-endpoint session replay)", () => {
+  it("returns the transport when the request targets the SAME endpoint the session is bound to", async () => {
+    const sessionId = "sess-bound-match";
+    await seedBoundSession(sessionId, "ns-A", "ep-A");
+
+    const transport = getBoundSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(transport).toBeDefined();
+  });
+
+  it("returns undefined when a key for a DIFFERENT endpoint presents this session id (the replay attempt)", async () => {
+    const sessionId = "sess-bound-mismatch";
+    await seedBoundSession(sessionId, "ns-A", "ep-A");
+
+    // Same live session id, but the caller is authenticated for endpoint B.
+    // The lookup must NOT hand them endpoint A's transport — it resolves to
+    // undefined so the route falls through to a 404, never signalling the id
+    // is live on ep-A.
+    const wrongEndpoint = getBoundSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+    );
+    expect(wrongEndpoint).toBeUndefined();
+
+    // A partial match (right namespace, wrong endpoint name) is still a miss.
+    const wrongName = getBoundSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-B" }),
+    );
+    expect(wrongName).toBeUndefined();
+  });
+
+  it("returns undefined for a session id that isn't resident in memory", () => {
+    const transport = getBoundSession(
+      "sess-never-seen",
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(transport).toBeUndefined();
+  });
+});
+
+describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/sessions id disclosure)", () => {
+  it("publishes aggregate counts + sweeper stats but never the session id list", () => {
+    const payload = buildSessionsHealthPayload();
+
+    // The old payload carried `streamableHttpSessions.sessionIds: [...]` —
+    // every live consumer's Mcp-Session-Id, unauthenticated. It must be gone.
+    expect(payload.streamableHttpSessions).toHaveProperty("count");
+    expect(payload.streamableHttpSessions).not.toHaveProperty("sessionIds");
+    expect(JSON.stringify(payload)).not.toContain("sessionIds");
+    // Monitoring still gets what it consumes.
+    expect(typeof payload.streamableHttpSessions.count).toBe("number");
+    expect(payload.publicSessionSweeper).toBeDefined();
   });
 });

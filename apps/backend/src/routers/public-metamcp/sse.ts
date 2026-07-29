@@ -11,7 +11,10 @@ import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
-import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
+import {
+  bindingMatches,
+  SessionLifetimeManagerImpl,
+} from "../../lib/session-lifetime-manager";
 
 const sseRouter = express.Router();
 
@@ -85,7 +88,12 @@ sseRouter.get(
         `Using MetaMCP server instance for public endpoint session ${sessionId}`,
       );
 
-      sessionManager.addSession(sessionId, webAppTransport);
+      // Bind the session to the endpoint it was opened on so the message leg
+      // below can reject a sessionId replayed against a different endpoint.
+      sessionManager.addSession(sessionId, webAppTransport, {
+        namespaceUuid,
+        endpointName,
+      });
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -109,19 +117,32 @@ sseRouter.post(
   authenticateApiKey,
   rateLimitMiddleware,
   async (req, res) => {
-    // const authReq = req as ApiKeyAuthenticatedRequest;
-    // const { namespaceUuid, endpointName } = authReq;
+    const authReq = req as ApiKeyAuthenticatedRequest;
+    const { namespaceUuid, endpointName } = authReq;
 
     try {
-      const sessionId = req.query.sessionId;
-      // logger.info(
-      //   `Received POST message for public endpoint ${endpointName} -> namespace ${namespaceUuid} sessionId ${sessionId}`,
-      // );
+      const sessionId = req.query.sessionId as string;
 
       const transport = sessionManager.getSession(
-        sessionId as string,
+        sessionId,
       ) as SSEServerTransport;
-      if (!transport) {
+      // Endpoint-binding guard: the message must target the SAME endpoint the
+      // SSE stream was opened on. Resolving by sessionId alone would let a
+      // caller authenticated for endpoint A post messages into endpoint B's
+      // transport. A missing session and a cross-endpoint session both return
+      // an identical 404 so the response never signals the id is live
+      // elsewhere.
+      const binding = sessionManager.getSessionBinding(sessionId);
+      if (
+        !transport ||
+        !bindingMatches(binding, { namespaceUuid, endpointName })
+      ) {
+        if (transport) {
+          logger.warn(
+            `SSE message for session ${sessionId} on endpoint ${endpointName} ` +
+              `rejected — session bound to a different endpoint.`,
+          );
+        }
         res.status(404).end("Session not found");
         return;
       }
