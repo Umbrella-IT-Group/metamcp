@@ -37,7 +37,8 @@
     "exclusive": "只能选择单个端点或所有端点，不能同时选择"
   },
   "apiKeyActsAs": {
-    "requiresEndpoint": "绑定身份的密钥必须限定到单个端点 — 请选择特定端点或移除身份用户"
+    "requiresEndpoint": "绑定身份的密钥必须限定到单个端点 — 请选择特定端点或移除身份用户",
+    "ownerMismatch": "绑定身份的密钥必须由其代表的用户拥有 — 公共密钥或他人拥有的密钥不能携带身份绑定"
   },
   "description": {
     "tooLong": "描述过长"

@@ -112,6 +112,28 @@ export const apiKeysImplementations = {
       });
     }
 
+    // Effective owner of the new key: input.user_id if provided (null =
+    // public/'everyone'), otherwise the caller (private). Resolved BEFORE the
+    // existence lookups below so the ownership invariant rejects without a
+    // single DB read.
+    const apiKeyUserId = input.user_id !== undefined ? input.user_id : userId;
+
+    // Ownership invariant (mirrored in both zod superRefines): an
+    // identity-bound key must be OWNED by the identity it exercises. This
+    // kills BOTH dangerous combinations: a public ('everyone') owner —
+    // `list` hands public keys' RAW values to every member, so a public
+    // identity-bound key would be a fleet-distributed delegated Graph
+    // credential — and a foreign owner, which hands one user's delegated
+    // identity to another user's key. The intended flow (a key owned by the
+    // user it acts as, e.g. admin-owned acting-as-self) still passes.
+    if (input.acts_as_user_id && apiKeyUserId !== input.acts_as_user_id) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message:
+          "An identity-bound API key must be owned by the user it acts as — a public ('everyone') or foreign-owned key cannot carry an acts-as identity.",
+      });
+    }
+
     // The scope target must exist — reject before any write. (The FK would
     // also catch this, but a clean NOT_FOUND beats a constraint error.)
     if (input.endpoint_uuid) {
@@ -139,9 +161,6 @@ export const apiKeysImplementations = {
     }
 
     try {
-      // Use input.user_id if provided, otherwise default to current user (private)
-      const apiKeyUserId = input.user_id !== undefined ? input.user_id : userId;
-
       const result = await apiKeysRepository.create({
         name: input.name,
         user_id: apiKeyUserId,

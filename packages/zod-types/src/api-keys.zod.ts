@@ -74,6 +74,24 @@ export const CreateApiKeyFormSchema = z
         message: "validation:apiKeyActsAs.requiresEndpoint",
       });
     }
+    // Ownership invariant: an identity-bound key must be OWNED by the
+    // identity it exercises. `user_id: null` is the public ('everyone')
+    // selection — public keys' raw values are listed to every member, so a
+    // public identity-bound key would be a fleet-distributed delegated
+    // credential; an explicit foreign owner is the same hazard one hop
+    // removed. `user_id: undefined` (default: the caller) can only be
+    // checked where the caller is known — the impl enforces that half.
+    if (
+      val.acts_as_user_id !== undefined &&
+      val.user_id !== undefined &&
+      val.user_id !== val.acts_as_user_id
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["acts_as_user_id"],
+        message: "validation:apiKeyActsAs.ownerMismatch",
+      });
+    }
   });
 
 export const CreateApiKeyRequestSchema = z
@@ -113,6 +131,22 @@ export const CreateApiKeyRequestSchema = z
         code: "custom",
         path: ["acts_as_user_id"],
         message: "validation:apiKeyActsAs.requiresEndpoint",
+      });
+    }
+    // Ownership invariant (mirrors the form schema above): an identity-bound
+    // key must be OWNED by the identity it exercises — public (`user_id:
+    // null`) and explicit-foreign-owner bindings are rejected here; the
+    // `user_id: undefined` (owner = caller) half is enforced in the impl,
+    // where the caller is known.
+    if (
+      val.acts_as_user_id !== undefined &&
+      val.user_id !== undefined &&
+      val.user_id !== val.acts_as_user_id
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["acts_as_user_id"],
+        message: "validation:apiKeyActsAs.ownerMismatch",
       });
     }
   });

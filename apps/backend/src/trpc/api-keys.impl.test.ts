@@ -307,10 +307,13 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
     endpointsRepoMock.findByUuid.mockResolvedValue({ uuid: EP, name: "m365" });
     usersRepoMock.findById.mockResolvedValue(undefined);
 
+    // Owner = acted-as user so the ownership invariant passes and the
+    // existence check is genuinely the gate under test.
     await expect(
       apiKeysImplementations.create(
         {
           name: "dangling-identity",
+          user_id: "no-such-user",
           endpoint_uuid: EP,
           acts_as_user_id: "no-such-user",
         },
@@ -322,7 +325,7 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
     expect(repoMock.create).not.toHaveBeenCalled();
   });
 
-  it("admin + endpoint scope + existing user: persists the binding", async () => {
+  it("admin + endpoint scope + existing user + owned-by-the-acted-as-user: persists the binding", async () => {
     endpointsRepoMock.findByUuid.mockResolvedValue({ uuid: EP, name: "m365" });
     usersRepoMock.findById.mockResolvedValue({
       id: "target-user",
@@ -333,25 +336,118 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
       uuid: "key-uuid",
       name: "sever-m365",
       key: "sk_mt_identityidentity",
-      user_id: "admin-1",
+      user_id: "target-user",
       endpoint_uuid: EP,
       acts_as_user_id: "target-user",
       created_at: new Date(),
     });
 
     await apiKeysImplementations.create(
-      { name: "sever-m365", endpoint_uuid: EP, acts_as_user_id: "target-user" },
+      {
+        name: "sever-m365",
+        user_id: "target-user",
+        endpoint_uuid: EP,
+        acts_as_user_id: "target-user",
+      },
       "admin-1",
       true,
     );
 
     expect(repoMock.create).toHaveBeenCalledWith({
       name: "sever-m365",
-      user_id: "admin-1",
+      user_id: "target-user",
       endpoint_uuid: EP,
       acts_as_user_id: "target-user",
       is_active: true,
     });
+  });
+
+  it("admin acting-as-self with implicit ownership (user_id omitted → owner = caller) passes", async () => {
+    endpointsRepoMock.findByUuid.mockResolvedValue({ uuid: EP, name: "m365" });
+    usersRepoMock.findById.mockResolvedValue({
+      id: "admin-1",
+      email: "admin@example.com",
+      name: "Admin",
+    });
+    repoMock.create.mockResolvedValue({
+      uuid: "key-uuid",
+      name: "self-bound",
+      key: "sk_mt_selfself",
+      user_id: "admin-1",
+      endpoint_uuid: EP,
+      acts_as_user_id: "admin-1",
+      created_at: new Date(),
+    });
+
+    await apiKeysImplementations.create(
+      { name: "self-bound", endpoint_uuid: EP, acts_as_user_id: "admin-1" },
+      "admin-1",
+      true,
+    );
+
+    expect(repoMock.create).toHaveBeenCalledWith({
+      name: "self-bound",
+      user_id: "admin-1",
+      endpoint_uuid: EP,
+      acts_as_user_id: "admin-1",
+      is_active: true,
+    });
+  });
+
+  // Ownership invariant (round-2 HIGH): an identity-bound key must be OWNED
+  // by the identity it exercises. Public keys' RAW values are listed to
+  // every member (see the `list` doc comment in the impl), so a public
+  // identity-bound key would be a fleet-distributed delegated Graph
+  // credential; a foreign owner is the same hazard one hop removed.
+  it("rejects a public ('everyone') identity-bound key with FORBIDDEN and no DB reads or writes", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        {
+          name: "public-identity",
+          user_id: null,
+          endpoint_uuid: EP,
+          acts_as_user_id: "target-user",
+        },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+    expect(usersRepoMock.findById).not.toHaveBeenCalled();
+    expect(endpointsRepoMock.findByUuid).not.toHaveBeenCalled();
+  });
+
+  it("rejects a foreign-owned identity-bound key (owner ≠ acted-as user) with FORBIDDEN and no write", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        {
+          name: "foreign-identity",
+          user_id: "some-other-user",
+          endpoint_uuid: EP,
+          acts_as_user_id: "target-user",
+        },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+    expect(usersRepoMock.findById).not.toHaveBeenCalled();
+  });
+
+  it("rejects an implicit-owner (caller) create acting as SOMEONE ELSE with FORBIDDEN", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        {
+          name: "admin-owned-acting-as-other",
+          endpoint_uuid: EP,
+          acts_as_user_id: "target-user",
+        },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+    expect(usersRepoMock.findById).not.toHaveBeenCalled();
   });
 
   it("a plain admin create (no acts_as) stores a NULL binding — fail-closed by default", async () => {
@@ -412,6 +508,39 @@ describe("CreateApiKeyRequestSchema — acts-as pairing rules", () => {
       acts_as_user_id: "target-user",
     });
     expect(parsed.success).toBe(false);
+  });
+
+  // Ownership invariant, schema half: public and explicit-foreign owners
+  // are rejected at parse time; owner = acted-as user passes; the implicit
+  // owner (user_id omitted → caller) is checked by the impl instead.
+  it("rejects acts_as_user_id on a public key (user_id: null)", () => {
+    const parsed = CreateApiKeyRequestSchema.safeParse({
+      name: "bound",
+      user_id: null,
+      endpoint_uuid: EP,
+      acts_as_user_id: "target-user",
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects acts_as_user_id when the explicit owner is a different user", () => {
+    const parsed = CreateApiKeyRequestSchema.safeParse({
+      name: "bound",
+      user_id: "someone-else",
+      endpoint_uuid: EP,
+      acts_as_user_id: "target-user",
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("accepts acts_as_user_id when the explicit owner IS the acted-as user", () => {
+    const parsed = CreateApiKeyRequestSchema.safeParse({
+      name: "bound",
+      user_id: "target-user",
+      endpoint_uuid: EP,
+      acts_as_user_id: "target-user",
+    });
+    expect(parsed.success).toBe(true);
   });
 });
 
