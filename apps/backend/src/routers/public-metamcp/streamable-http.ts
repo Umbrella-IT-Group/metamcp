@@ -989,8 +989,13 @@ streamableHttpRouter.delete(
           }
           if (
             !stored ||
-            stored.namespace_uuid !== namespaceUuid ||
-            stored.endpoint_name !== endpointName
+            !bindingMatches(
+              {
+                namespaceUuid: stored.namespace_uuid,
+                endpointName: stored.endpoint_name,
+              },
+              { namespaceUuid, endpointName },
+            )
           ) {
             res.status(404).json({
               error: "Session not found",
