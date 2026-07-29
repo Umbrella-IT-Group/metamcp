@@ -222,11 +222,16 @@ export const apiKeysImplementations = {
   ): Promise<z.infer<typeof ValidateApiKeyResponseSchema>> => {
     try {
       const result = await apiKeysRepository.validateApiKey(input.key);
+      // Deliberately does NOT echo the key's endpoint scope. `validate` is a
+      // protectedProcedure any member can call with an arbitrary key string;
+      // returning endpoint_uuid would widen the existing key oracle (a caller
+      // could probe not just validity but which endpoint a guessed key is
+      // bound to). Scope is enforced server-side in checkApiKeyAccess; it is
+      // never disclosed here.
       return {
         valid: result.valid,
         user_id: result.user_id ?? undefined,
         key_uuid: result.key_uuid,
-        endpoint_uuid: result.endpoint_uuid ?? null,
       };
     } catch (error) {
       logger.error("Error validating API key:", error);

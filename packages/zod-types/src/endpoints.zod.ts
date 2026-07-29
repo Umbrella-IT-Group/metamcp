@@ -62,6 +62,13 @@ export const CreateEndpointRequestSchema = z.object({
   description: z.string().optional(),
   namespaceUuid: z.string().uuid(),
   enableApiKeyAuth: z.boolean().default(true),
+  // API-KEY-ONLY gate. When true, checkApiKeyAccess refuses unscoped
+  // (grandfathered gateway-wide) API keys on this endpoint. It does NOT
+  // affect OAuth consumers — an authenticated OAuth user is gated by
+  // endpoint ownership, not by key scope, so there is no "unscoped OAuth
+  // token" for this flag to reject (see checkOAuthAccess). Pair it with
+  // scoping the consumer's key before flipping enable_api_key_auth on a
+  // sensitive endpoint.
   requireScopedApiKey: z.boolean().default(false),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),

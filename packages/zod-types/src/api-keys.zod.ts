@@ -159,11 +159,15 @@ export const ValidateApiKeyRequestSchema = z.object({
   key: z.string(),
 });
 
+// NOTE: intentionally does NOT expose the key's endpoint scope. `validate`
+// is callable by any member with an arbitrary key string; echoing
+// endpoint_uuid would widen the key oracle (probe which endpoint a guessed
+// key is bound to). Scope is enforced server-side in checkApiKeyAccess and
+// never disclosed through this response.
 export const ValidateApiKeyResponseSchema = z.object({
   valid: z.boolean(),
   user_id: z.string().optional(),
   key_uuid: z.string().uuid().optional(),
-  endpoint_uuid: z.string().uuid().nullable().optional(),
 });
 
 // Repository schemas

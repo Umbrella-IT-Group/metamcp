@@ -432,7 +432,19 @@ export function checkApiKeyAccess(
 }
 
 /**
- * Check if OAuth token user has access to the endpoint
+ * Check if OAuth token user has access to the endpoint.
+ *
+ * Scope note (migration 0023): `endpoint.require_scoped_api_key` is
+ * DELIBERATELY not consulted here. That toggle governs API KEYS only —
+ * it refuses grandfathered gateway-wide *keys* on a sensitive endpoint.
+ * OAuth consumers are authenticated humans identified by their better-auth
+ * user id, not bearer secrets that could be over-broadly scoped; access is
+ * already gated by endpoint ownership below (public endpoints: any
+ * authenticated user; private endpoints: the owner only), and delegated
+ * identity injection (m365) acts strictly as that user. There is no
+ * "unscoped OAuth token" to refuse, so applying the API-key-only flag to
+ * OAuth would be a category error. The flag's UI copy and the tRPC field
+ * comment state this API-key-only limit explicitly.
  */
 function checkOAuthAccess(
   oauthResult: { user_id?: string; scopes?: string[] },
