@@ -419,6 +419,25 @@ async function recordPasswordFingerprint(
 }
 
 /**
+ * Loud notice for the worst recreate outcome: the user's API keys were
+ * already DELETED (the recreate path removes them before sign-up) but the
+ * user never came back, so the deferred restore will never run for them —
+ * N credentials died behind an otherwise generic sign-up warning. Key
+ * NAMES only, never values: the values are secrets and are gone anyway.
+ */
+function warnPreservedKeysUnrestorable(
+  email: string,
+  preservedKeys: PreservedApiKey[] | undefined,
+): void {
+  if (!preservedKeys || preservedKeys.length === 0) return;
+  console.warn(
+    `⚠️ ${preservedKeys.length} preserved API key(s) for ${email} were deleted by the recreate but CANNOT be restored because the user was not recreated: ${preservedKeys
+      .map((k) => k.name)
+      .join(", ")}. Re-mint them once the user exists again.`,
+  );
+}
+
+/**
  * Ensure a single user exists.
  */
 async function ensureUser(
@@ -537,6 +556,8 @@ async function ensureUser(
           body ? `Response: ${body}` : ""
         }`,
       );
+      // The keys were deleted above; without a user there is no restore.
+      warnPreservedKeysUnrestorable(email, preservedUserApiKeys);
       return { email, recreated };
     }
   }
@@ -547,6 +568,8 @@ async function ensureUser(
 
   if (!user) {
     console.warn(`⚠️ User ${email} not found after signup; skipping.`);
+    // Same credential-loss case as the sign-up failure above.
+    warnPreservedKeysUnrestorable(email, preservedUserApiKeys);
     return { email, recreated };
   }
 

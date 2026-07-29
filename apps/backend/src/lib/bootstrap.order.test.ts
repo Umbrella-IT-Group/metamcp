@@ -327,3 +327,64 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
     expect(createdLine).not.toContain("preserved-key restore");
   });
 });
+
+describe("ensureUser early-return credential loss — preserved keys warned loudly", () => {
+  function warnLines(): string[] {
+    return (
+      console.warn as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.map((call) => String(call[0]));
+  }
+
+  it("warns with preserved-key count + names (never values) when Better Auth sign-up fails after the keys were deleted", async () => {
+    arrangeRecreateScenario();
+    authHandlerMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => "boom",
+    });
+
+    await initializeEnvironmentConfiguration();
+
+    const lossLine = warnLines().find((line) =>
+      line.includes("CANNOT be restored"),
+    );
+    expect(lossLine).toBeDefined();
+    expect(lossLine).toContain("1 preserved API key(s)");
+    expect(lossLine).toContain("admin@example.com");
+    expect(lossLine).toContain("tara-scoped"); // names…
+    expect(lossLine).not.toContain("sk_mt_preserved_secret"); // …never values
+
+    // And the restore really never ran — no api_keys insert at all.
+    expect(
+      statementLog.some((s) => s.op === "insert" && s.table === apiKeysTable),
+    ).toBe(false);
+  });
+
+  it("warns identically when the user is missing after an ok sign-up", async () => {
+    arrangeRecreateScenario();
+    // Sign-up "succeeds" but the post-sign-up re-read finds nothing.
+    readFixtures.usersFindFirstQueue = [
+      { id: "old-user-id", email: "admin@example.com" },
+      undefined,
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    const lossLine = warnLines().find((line) =>
+      line.includes("CANNOT be restored"),
+    );
+    expect(lossLine).toBeDefined();
+    expect(lossLine).toContain("tara-scoped");
+    expect(lossLine).not.toContain("sk_mt_preserved_secret");
+  });
+
+  it("stays silent on a healthy recreate (the restore handles the keys)", async () => {
+    arrangeRecreateScenario();
+
+    await initializeEnvironmentConfiguration();
+
+    expect(
+      warnLines().find((line) => line.includes("CANNOT be restored")),
+    ).toBeUndefined();
+  });
+});
