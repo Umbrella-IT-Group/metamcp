@@ -155,6 +155,9 @@ export default function ApiKeysPage() {
       // escape hatch. The zod schema rejects an unset scope.
       endpoint_uuid: undefined,
       all_endpoints: undefined,
+      // Acts-as identity (migration 0024) is OPTIONAL and defaults to none:
+      // an unbound key stays fail-closed for m365 delegated injection.
+      acts_as_user_id: undefined,
     },
   });
 
@@ -209,6 +212,27 @@ export default function ApiKeysPage() {
         {endpointNameByUuid.get(endpointUuid) ?? endpointUuid.slice(0, 8)}
       </Badge>
     );
+
+  // Identity badge (migration 0024): a key with an admin-bound acts-as
+  // identity exercises that user's delegated m365 identity on its endpoint.
+  // Surfaced next to the scope badge in every key list so an identity-bound
+  // key can never be mistaken for a plain (fail-closed) one. `label` is the
+  // acted-as user's email where available (admin list) or their id
+  // shortened (member list, via shortUserId); null renders nothing.
+  const renderIdentityBadge = (label: string | null) =>
+    label === null ? null : (
+      <Badge
+        variant="outline"
+        className="bg-purple-50 dark:bg-purple-950/20 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800"
+      >
+        {`${t("api-keys:actsAsBadge")} ${label}`}
+      </Badge>
+    );
+
+  // Better-auth ids are opaque ~32-char strings — shorten for badge display.
+  // Emails are shown in full (admin list only).
+  const shortUserId = (id: string | null) =>
+    id === null ? null : id.length > 8 ? `${id.slice(0, 8)}…` : id;
 
   const handleDeleteConfirm = () => {
     if (apiKeyToDelete) {
@@ -368,6 +392,11 @@ export default function ApiKeysPage() {
                         if (value === "__all__") {
                           form.setValue("all_endpoints", true);
                           form.setValue("endpoint_uuid", undefined);
+                          // An identity binding requires a single-endpoint
+                          // scope — switching to gateway-wide clears it so
+                          // the form can never submit the rejected pairing.
+                          form.setValue("acts_as_user_id", undefined);
+                          form.clearErrors("acts_as_user_id");
                         } else {
                           form.setValue("endpoint_uuid", value);
                           form.setValue("all_endpoints", undefined);
@@ -403,6 +432,44 @@ export default function ApiKeysPage() {
                     )}
                     <p className="text-xs text-muted-foreground mt-1">
                       {t("api-keys:scopeDescription")}
+                    </p>
+                  </div>
+                  {/* Acts-as identity binding (migration 0024) — this whole
+                      dialog is admin-only (see the create-button gate above),
+                      and the backend re-enforces admin-only regardless. Free
+                      text for the better-auth user id: there is deliberately
+                      no list-users tRPC to feed a picker. Enabled ONLY when a
+                      specific endpoint is selected — an identity-bound key
+                      must be endpoint-scoped, so the field is inert (and
+                      cleared, see the scope onValueChange) under the
+                      all-endpoints escape hatch. */}
+                  <div>
+                    <Label
+                      htmlFor="acts-as-user"
+                      className="text-sm font-medium"
+                    >
+                      {t("api-keys:actsAsUser")}
+                    </Label>
+                    <Input
+                      id="acts-as-user"
+                      {...form.register("acts_as_user_id", {
+                        // Empty / whitespace input means "no binding" — the
+                        // schema field is optional, never an empty string.
+                        setValueAs: (value: unknown) =>
+                          typeof value === "string" && value.trim() !== ""
+                            ? value.trim()
+                            : undefined,
+                      })}
+                      placeholder={t("api-keys:actsAsUserPlaceholder")}
+                      disabled={!form.watch("endpoint_uuid")}
+                    />
+                    {form.formState.errors.acts_as_user_id && (
+                      <p className="text-sm text-destructive mt-1">
+                        {form.formState.errors.acts_as_user_id.message}
+                      </p>
+                    )}
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t("api-keys:actsAsUserDescription")}
                     </p>
                   </div>
                   <div className="flex gap-2">
@@ -530,7 +597,10 @@ export default function ApiKeysPage() {
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    {renderScopeBadge(apiKey.endpoint_uuid)}
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {renderScopeBadge(apiKey.endpoint_uuid)}
+                      {renderIdentityBadge(shortUserId(apiKey.acts_as_user_id))}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <Button
@@ -619,7 +689,13 @@ export default function ApiKeysPage() {
                         )}
                       </TableCell>
                       <TableCell>
-                        {renderScopeBadge(apiKey.endpoint_uuid)}
+                        <div className="flex items-center gap-1 flex-wrap">
+                          {renderScopeBadge(apiKey.endpoint_uuid)}
+                          {renderIdentityBadge(
+                            apiKey.acts_as_email ??
+                              shortUserId(apiKey.acts_as_user_id),
+                          )}
+                        </div>
                       </TableCell>
                       <TableCell>
                         {format(new Date(apiKey.created_at), "MMM d, yyyy")}

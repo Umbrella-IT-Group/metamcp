@@ -210,14 +210,30 @@ export async function dispatchTracked(
 
 /**
  * Dispatch a transport request inside the M365 request-scoped user
- * context (AsyncLocalStorage). For OAuth-authenticated consumers the
- * context carries their better-auth user id down through the proxy and
- * pooled backend client into the M365 injected fetch, which mints and
- * stamps that user's Graph access token onto the backend request. For
- * API-key consumers (no per-user M365 identity) the dispatch runs with
- * NO context, so the injected fetch fail-closes (no Authorization
- * header) rather than ever acting as someone. No-op for servers without
- * delegated injection. See `lib/m365/request-context.ts`.
+ * context (AsyncLocalStorage). The context carries a better-auth user id
+ * down through the proxy and pooled backend client into the M365
+ * injected fetch, which mints and stamps that user's Graph access token
+ * onto the backend request. No-op for servers without delegated
+ * injection. See `lib/m365/request-context.ts`.
+ *
+ * Identity sources, in precedence order:
+ *  1. OAuth — the authenticated human's own id (unchanged behavior; a
+ *     token is user-bound, so the gateway knows exactly who is calling).
+ *  2. API key with an admin-bound acts-as identity
+ *     (`api_keys.acts_as_user_id`, migration 0024) — the request runs as
+ *     that user. This is an EXPLICIT, admin-set, creation-time binding,
+ *     and the create path enforces its pairing with PR #84's endpoint
+ *     scoping (an identity-bound key must be scoped to exactly one
+ *     endpoint), which is what contains the acted-as identity.
+ *  3. Anything else — including every API key WITHOUT a binding — runs
+ *     with NO context, so the injected fetch fail-closes (no
+ *     Authorization header) rather than ever acting as someone.
+ *
+ * DELIBERATE non-goal: this gate exists ONLY on the streamable-http
+ * transport. `sse.ts` and the OpenAPI bridge never populate an m365 user
+ * context — delegated identity over SSE/OpenAPI stays fail-closed BY
+ * DESIGN (pinned by test); do not add an acts-as branch there without a
+ * new security review.
  */
 function handleRequestWithUserContext(
   authReq: ApiKeyAuthenticatedRequest,
@@ -228,7 +244,9 @@ function handleRequestWithUserContext(
   const context =
     authReq.authMethod === "oauth" && authReq.oauthUserId
       ? { userId: authReq.oauthUserId }
-      : undefined;
+      : authReq.authMethod === "api_key" && authReq.apiKeyActsAsUserId
+        ? { userId: authReq.apiKeyActsAsUserId }
+        : undefined;
   return runWithM365UserContext(context, () =>
     transport.handleRequest(req, res),
   );

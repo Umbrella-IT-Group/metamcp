@@ -36,6 +36,9 @@
     "required": "请选择此 API 密钥限定的端点，或选择所有端点",
     "exclusive": "只能选择单个端点或所有端点，不能同时选择"
   },
+  "apiKeyActsAs": {
+    "requiresEndpoint": "绑定身份的密钥必须限定到单个端点 — 请选择特定端点或移除身份用户"
+  },
   "description": {
     "tooLong": "描述过长"
   },

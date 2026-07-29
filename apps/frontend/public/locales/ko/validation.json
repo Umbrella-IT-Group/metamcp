@@ -36,6 +36,9 @@
     "required": "이 API Key의 범위 엔드포인트를 선택하거나 모든 엔드포인트를 선택하세요",
     "exclusive": "단일 엔드포인트 또는 모든 엔드포인트 중 하나만 선택하세요"
   },
+  "apiKeyActsAs": {
+    "requiresEndpoint": "ID가 바인딩된 키는 단일 엔드포인트로 범위를 지정해야 합니다 — 특정 엔드포인트를 선택하거나 실행 사용자를 제거하세요"
+  },
   "description": {
     "tooLong": "설명이 너무 깁니다"
   },

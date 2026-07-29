@@ -15,7 +15,11 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { ApiKeysRepository, endpointsRepository } from "../db/repositories";
+import {
+  ApiKeysRepository,
+  endpointsRepository,
+  usersRepository,
+} from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
 
 const apiKeysRepository = new ApiKeysRepository();
@@ -59,6 +63,17 @@ export const apiKeysImplementations = {
             "Only administrators can set an API key's endpoint scope (endpoint_uuid / all_endpoints).",
         });
       }
+      // Acts-as identity binding (migration 0024) is admin-only, same
+      // FORBIDDEN-before-write style: a member must never mint a key that
+      // exercises anyone's delegated m365 identity — least of all another
+      // user's.
+      if (input.acts_as_user_id !== undefined) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "Only administrators can bind an API key to an acts-as identity (acts_as_user_id).",
+        });
+      }
     }
 
     // Explicit-scope gate (mirrors the zod superRefine so the invariant holds
@@ -81,6 +96,22 @@ export const apiKeysImplementations = {
       });
     }
 
+    // Identity-requires-scope invariant (mirrors the zod superRefine so it
+    // holds even for callers that bypass the tRPC input schema): an acts-as
+    // binding without a single-endpoint scope would let the key exercise the
+    // bound user's delegated m365 identity gateway-wide. Rejecting here
+    // covers both all_endpoints: true and a missing scope — endpoint_uuid is
+    // unset in either case. This pairing is the safety argument for the
+    // whole feature (PR #84's endpoint scoping is what contains the
+    // acted-as identity to ONE endpoint), so it must be impossible to skip.
+    if (input.acts_as_user_id && !input.endpoint_uuid) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "An identity-bound API key must be scoped to exactly one endpoint — acts_as_user_id requires endpoint_uuid (all_endpoints is not allowed).",
+      });
+    }
+
     // The scope target must exist — reject before any write. (The FK would
     // also catch this, but a clean NOT_FOUND beats a constraint error.)
     if (input.endpoint_uuid) {
@@ -95,6 +126,18 @@ export const apiKeysImplementations = {
       }
     }
 
+    // The acts-as target must exist — same friendly-NOT_FOUND-over-FK-error
+    // reasoning as the endpoint check above.
+    if (input.acts_as_user_id) {
+      const actsAsUser = await usersRepository.findById(input.acts_as_user_id);
+      if (!actsAsUser) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "The user this API key would act as does not exist.",
+        });
+      }
+    }
+
     try {
       // Use input.user_id if provided, otherwise default to current user (private)
       const apiKeyUserId = input.user_id !== undefined ? input.user_id : userId;
@@ -105,6 +148,9 @@ export const apiKeysImplementations = {
         // all_endpoints: true is the explicit escape hatch — stores NULL
         // (legacy gateway-wide scope). Otherwise the validated endpoint uuid.
         endpoint_uuid: input.endpoint_uuid ?? null,
+        // Validated acts-as identity (admin-only, requires the endpoint
+        // scope above). NULL = no identity, m365 injection fail-closes.
+        acts_as_user_id: input.acts_as_user_id ?? null,
         is_active: true,
       });
 

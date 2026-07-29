@@ -6,6 +6,7 @@ export * from "./tools.repo";
 export * from "./oauth-sessions.repo";
 export * from "./oauth.repo";
 export * from "./api-keys.repo";
+export * from "./users.repo";
 export * from "./m365-tokens.repo";
 export * from "./tool-call-audit.repo";
 export { configRepo } from "./config.repo";

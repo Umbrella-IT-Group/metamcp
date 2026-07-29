@@ -12,6 +12,17 @@ const scopeShape = {
   all_endpoints: z.boolean().optional(),
 };
 
+// Acts-as identity binding (migration 0024): the better-auth user id whose
+// delegated m365 identity requests authenticated by this key exercise.
+// Admin-only, creation-only, and REQUIRES a single-endpoint scope — an
+// identity-bound key must never be gateway-wide, so pairing it with
+// all_endpoints (or no scope at all) is rejected in the superRefines below
+// and re-checked in the impl for schema-bypassing callers. Plain string, not
+// uuid: better-auth ids are text.
+const actsAsShape = {
+  acts_as_user_id: z.string().min(1).optional(),
+};
+
 // Base API Key schemas
 export const ApiKeySchema = z.object({
   uuid: z.string().uuid(),
@@ -19,6 +30,7 @@ export const ApiKeySchema = z.object({
   key: z.string(),
   user_id: z.string().nullable(),
   endpoint_uuid: z.string().uuid().nullable(),
+  acts_as_user_id: z.string().nullable(),
   created_at: z.date(),
   is_active: z.boolean(),
 });
@@ -35,6 +47,7 @@ export const CreateApiKeyFormSchema = z
       ),
     user_id: z.string().nullable().optional(),
     ...scopeShape,
+    ...actsAsShape,
   })
   .superRefine((val, ctx) => {
     if (val.endpoint_uuid && val.all_endpoints === true) {
@@ -49,6 +62,16 @@ export const CreateApiKeyFormSchema = z
         code: "custom",
         path: ["endpoint_uuid"],
         message: "validation:apiKeyScope.required",
+      });
+    }
+    // Identity requires scope: an acts-as binding is only valid on a key
+    // scoped to exactly ONE endpoint. Covers both the all_endpoints escape
+    // hatch and a missing scope (endpoint_uuid unset in either case).
+    if (val.acts_as_user_id && !val.endpoint_uuid) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["acts_as_user_id"],
+        message: "validation:apiKeyActsAs.requiresEndpoint",
       });
     }
   });
@@ -65,6 +88,7 @@ export const CreateApiKeyRequestSchema = z
       ),
     user_id: z.string().nullable().optional(),
     ...scopeShape,
+    ...actsAsShape,
   })
   .superRefine((val, ctx) => {
     if (val.endpoint_uuid && val.all_endpoints === true) {
@@ -79,6 +103,16 @@ export const CreateApiKeyRequestSchema = z
         code: "custom",
         path: ["endpoint_uuid"],
         message: "validation:apiKeyScope.required",
+      });
+    }
+    // Identity requires scope: an acts-as binding is only valid on a key
+    // scoped to exactly ONE endpoint. Covers both the all_endpoints escape
+    // hatch and a missing scope (endpoint_uuid unset in either case).
+    if (val.acts_as_user_id && !val.endpoint_uuid) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["acts_as_user_id"],
+        message: "validation:apiKeyActsAs.requiresEndpoint",
       });
     }
   });
@@ -131,6 +165,7 @@ export const ListApiKeysResponseSchema = z.object({
       is_active: z.boolean(),
       user_id: z.string().nullable(),
       endpoint_uuid: z.string().uuid().nullable(),
+      acts_as_user_id: z.string().nullable(),
     }),
   ),
 });
@@ -146,6 +181,11 @@ export const AdminApiKeyItemSchema = z.object({
   user_id: z.string().nullable(),
   owner_email: z.string().nullable(),
   endpoint_uuid: z.string().uuid().nullable(),
+  // Acts-as identity binding (migration 0024): the bound better-auth user id
+  // plus their email (NULL when the key has no identity binding). Surfaced
+  // so the admin view labels identity-bound keys loudly.
+  acts_as_user_id: z.string().nullable(),
+  acts_as_email: z.string().nullable(),
   created_at: z.date(),
   last_used_at: z.date().nullable(),
   is_active: z.boolean(),
@@ -178,6 +218,10 @@ export const ApiKeyCreateInputSchema = z.object({
   // responsible for making NULL an explicit choice (all_endpoints: true);
   // at the repository layer the column is just nullable.
   endpoint_uuid: z.string().uuid().nullable().optional(),
+  // NULL/omitted = no acts-as identity (m365 injection fail-closes). The
+  // tRPC create path enforces admin-only + requires-endpoint-scope; at the
+  // repository layer the column is just nullable.
+  acts_as_user_id: z.string().nullable().optional(),
   is_active: z.boolean().optional().default(true),
 });
 

@@ -41,11 +41,18 @@ const deleteChain = {
   where: vi.fn().mockReturnThis(),
   returning: vi.fn(),
 };
+// Select chain for validateApiKey's flat key lookup (the projection tests
+// below): `.where()` resolves the row array directly, like drizzle does.
+const selectChain = {
+  from: vi.fn().mockReturnThis(),
+  where: vi.fn(),
+};
 
 vi.mock("../index", () => ({
   db: {
     update: vi.fn(() => updateChain),
     delete: vi.fn(() => deleteChain),
+    select: vi.fn(() => selectChain),
   },
 }));
 
@@ -55,6 +62,8 @@ vi.mock("../schema", () => ({
     name: { name: "name" },
     key: { name: "key" },
     user_id: { name: "user_id" },
+    endpoint_uuid: { name: "endpoint_uuid" },
+    acts_as_user_id: { name: "acts_as_user_id" },
     created_at: { name: "created_at" },
     is_active: { name: "is_active" },
     last_used_at: { name: "last_used_at" },
@@ -113,5 +122,82 @@ describe("ApiKeysRepository member-scoped update/delete — public key isolation
 
     expect(isNull).not.toHaveBeenCalled();
     expect(or).not.toHaveBeenCalled();
+  });
+});
+
+// validateApiKey is the SINGLE lookup every api-key-authenticated request
+// funnels through; checkApiKeyAccess (endpoint scope) and the streamable-http
+// m365 context gate (acts-as identity, migration 0024) can only enforce what
+// this projection actually returns. These tests pin that both columns are
+// selected and passed through — dropping either from the select would
+// silently disable its downstream gate.
+describe("ApiKeysRepository.validateApiKey — scope + acts-as projection", () => {
+  const repo = new ApiKeysRepository();
+
+  it("selects and returns endpoint_uuid + acts_as_user_id for a bound key", async () => {
+    selectChain.where.mockResolvedValueOnce([
+      {
+        uuid: "key-uuid-1",
+        user_id: "owner-1",
+        endpoint_uuid: "ep-uuid-1",
+        acts_as_user_id: "acted-as-user-1",
+        is_active: true,
+        // Fresh stamp so the fire-and-forget last-used touch stays inert.
+        last_used_at: new Date(),
+      },
+    ]);
+
+    const result = await repo.validateApiKey("sk_mt_bound");
+
+    expect(result).toEqual({
+      valid: true,
+      user_id: "owner-1",
+      key_uuid: "key-uuid-1",
+      endpoint_uuid: "ep-uuid-1",
+      acts_as_user_id: "acted-as-user-1",
+    });
+    // The projection itself names both columns — a dropped select can't
+    // masquerade as a NULL-bound key.
+    const dbModule = await import("../index");
+    const projection = (dbModule.db.select as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(projection).toHaveProperty("endpoint_uuid");
+    expect(projection).toHaveProperty("acts_as_user_id");
+  });
+
+  it("returns NULL acts_as_user_id for an unbound key (m365 injection fail-closes downstream)", async () => {
+    selectChain.where.mockResolvedValueOnce([
+      {
+        uuid: "key-uuid-2",
+        user_id: null,
+        endpoint_uuid: null,
+        acts_as_user_id: null,
+        is_active: true,
+        last_used_at: new Date(),
+      },
+    ]);
+
+    const result = await repo.validateApiKey("sk_mt_unbound");
+
+    expect(result.valid).toBe(true);
+    expect(result.acts_as_user_id).toBeNull();
+    expect(result.endpoint_uuid).toBeNull();
+  });
+
+  it("an inactive key stays invalid with no fields leaked", async () => {
+    selectChain.where.mockResolvedValueOnce([
+      {
+        uuid: "key-uuid-3",
+        user_id: "owner-1",
+        endpoint_uuid: "ep-uuid-1",
+        acts_as_user_id: "acted-as-user-1",
+        is_active: false,
+        last_used_at: new Date(),
+      },
+    ]);
+
+    const result = await repo.validateApiKey("sk_mt_inactive");
+
+    expect(result).toEqual({ valid: false });
   });
 });

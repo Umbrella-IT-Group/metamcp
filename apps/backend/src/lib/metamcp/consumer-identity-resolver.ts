@@ -39,10 +39,36 @@ export async function resolveClientIdentity(
     if (name === undefined) {
       try {
         const [row] = await db
-          .select({ name: apiKeysTable.name })
+          .select({
+            name: apiKeysTable.name,
+            acts_as_user_id: apiKeysTable.acts_as_user_id,
+          })
           .from(apiKeysTable)
           .where(eq(apiKeysTable.uuid, auth.apiKeyUuid));
         name = row?.name || `api-key ${short(auth.apiKeyUuid)}`;
+        // Acts-as binding (migration 0024): the audit trail must show BOTH
+        // the key and the identity its m365 calls run as — labeling by key
+        // name alone would hide that a delegated identity was exercised.
+        // Same string shape consumers already render (logs UI / tool_call
+        // audit read `.name` opaquely), just extended: `key (as email)`.
+        // Cacheable under the key uuid because the binding is creation-time
+        // immutable — a re-bind requires a new key, hence a new uuid.
+        if (row?.acts_as_user_id) {
+          let actsAsLabel = `user ${short(row.acts_as_user_id)}`;
+          try {
+            const [actsAsUser] = await db
+              .select({ email: usersTable.email })
+              .from(usersTable)
+              .where(eq(usersTable.id, row.acts_as_user_id));
+            if (actsAsUser?.email) {
+              actsAsLabel = actsAsUser.email;
+            }
+          } catch {
+            // Keep the short-id fallback — never fail identity resolution
+            // over a label lookup.
+          }
+          name = `${name} (as ${actsAsLabel})`;
+        }
         nameCache.set(cacheKey, name);
       } catch {
         name = `api-key ${short(auth.apiKeyUuid)}`;

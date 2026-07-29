@@ -39,5 +39,9 @@
   "selectEndpoint": "Select an endpoint",
   "allEndpoints": "All endpoints (Global — admin)",
   "allEndpointsBadge": "All endpoints",
-  "scopeDescription": "The key will only authenticate on the selected endpoint. \"All endpoints\" mints a gateway-wide key and is restricted to administrators."
+  "scopeDescription": "The key will only authenticate on the selected endpoint. \"All endpoints\" mints a gateway-wide key and is restricted to administrators.",
+  "actsAsUser": "Acts as user (M365 identity)",
+  "actsAsUserPlaceholder": "better-auth user id — leave empty for no identity",
+  "actsAsUserDescription": "Optional, administrators only. Requests authenticated by this key run delegated M365 calls as this user. Requires a specific endpoint scope; without a binding the key stays fail-closed (no delegated identity).",
+  "actsAsBadge": "Acts as"
 }
