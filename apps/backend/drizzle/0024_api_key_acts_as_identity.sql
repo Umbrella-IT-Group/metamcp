@@ -17,3 +17,26 @@
 -- max already applied — see UMBRELLA_FORK.md's migration-ordering note.
 ALTER TABLE "api_keys" ADD COLUMN IF NOT EXISTS "acts_as_user_id" text REFERENCES "users"("id") ON DELETE CASCADE;
 CREATE INDEX IF NOT EXISTS "api_keys_acts_as_user_id_idx" ON "api_keys" ("acts_as_user_id");
+
+-- Structural pairing invariant: an identity binding REQUIRES a single-
+-- endpoint scope (migration 0023's endpoint_uuid). The app layer already
+-- rejects the combination three times over (zod superRefines, the impl
+-- guard, and the middleware's runtime stamp gate), but none of those reach
+-- rows written OUTSIDE the app — psql / admin_cli is a routine ops path
+-- here. This CHECK makes an unscoped-but-bound row impossible to write at
+-- all, so the containment argument (identity is confined to exactly one
+-- endpoint) is structural, not policy. Mirrored in schema.ts via drizzle's
+-- check(). Guarded with a DO block for idempotency (postgres has no
+-- ADD CONSTRAINT IF NOT EXISTS), matching the file's IF-NOT-EXISTS
+-- convention in spirit.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'api_keys_acts_as_requires_scope'
+      AND conrelid = '"api_keys"'::regclass
+  ) THEN
+    ALTER TABLE "api_keys" ADD CONSTRAINT "api_keys_acts_as_requires_scope"
+      CHECK ("acts_as_user_id" IS NULL OR "endpoint_uuid" IS NOT NULL);
+  END IF;
+END $$;

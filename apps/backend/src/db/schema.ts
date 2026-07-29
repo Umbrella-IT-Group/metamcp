@@ -11,6 +11,7 @@ import {
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -434,6 +435,15 @@ export const apiKeysTable = pgTable(
     index("api_keys_endpoint_uuid_idx").on(table.endpoint_uuid),
     index("api_keys_acts_as_user_id_idx").on(table.acts_as_user_id),
     unique("api_keys_name_per_user_idx").on(table.user_id, table.name),
+    // Structural pairing invariant (migration 0024): an identity binding
+    // REQUIRES a single-endpoint scope. App-layer enforcement (zod + impl +
+    // the middleware's runtime stamp gate) cannot reach rows written outside
+    // the app, so the pairing is also a CHECK — an unscoped-but-bound row
+    // cannot exist.
+    check(
+      "api_keys_acts_as_requires_scope",
+      sql`${table.acts_as_user_id} IS NULL OR ${table.endpoint_uuid} IS NOT NULL`,
+    ),
   ],
 );
 
