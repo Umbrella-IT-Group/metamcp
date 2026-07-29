@@ -19,6 +19,47 @@ import {
  * Supports arrays of Users, API Keys, Namespaces, and Endpoints via JSON environment variables.
  */
 
+/**
+ * Columns preserved when `BOOTSTRAP_RECREATE_USER=true` +
+ * `preserveApiKeysOnRecreate` deletes and re-creates the bootstrap user.
+ * `endpoint_uuid` is load-bearing: without it a scoped key (migration 0023)
+ * silently comes back as a NULL / gateway-wide key on the next container
+ * recreate — a silent privilege escalation on a supported ops path. The
+ * projection below is typed to this shape, so dropping `endpoint_uuid` from
+ * the select is a compile error, not a silent regression.
+ */
+export interface PreservedApiKey {
+  name: string;
+  key: string;
+  is_active: boolean;
+  endpoint_uuid: string | null;
+}
+
+/**
+ * Build the `.values()` row that restores a preserved key onto the
+ * recreated user. Kept as a pure function so the endpoint-scope-survives-
+ * recreate invariant can be unit-tested without a live DB. Every field the
+ * key carried — crucially `endpoint_uuid` — is threaded through unchanged.
+ */
+export function buildPreservedApiKeyInsert(
+  key: PreservedApiKey,
+  userId: string,
+): {
+  name: string;
+  key: string;
+  user_id: string;
+  is_active: boolean;
+  endpoint_uuid: string | null;
+} {
+  return {
+    name: key.name,
+    key: key.key,
+    user_id: userId,
+    is_active: key.is_active,
+    endpoint_uuid: key.endpoint_uuid,
+  };
+}
+
 type UserConfig = {
   email: string;
   password: string;
@@ -349,9 +390,7 @@ async function ensureUser(
     config.recreateDefaultUser,
   );
 
-  let preservedUserApiKeys:
-    | { name: string; key: string; is_active: boolean }[]
-    | undefined;
+  let preservedUserApiKeys: PreservedApiKey[] | undefined;
 
   let recreated = false;
 
@@ -368,6 +407,9 @@ async function ensureUser(
             name: apiKeysTable.name,
             key: apiKeysTable.key,
             is_active: apiKeysTable.is_active,
+            // Load-bearing: carry the endpoint scope through the recreate so a
+            // scoped key is not silently promoted back to gateway-wide.
+            endpoint_uuid: apiKeysTable.endpoint_uuid,
           })
           .from(apiKeysTable)
           .where(eq(apiKeysTable.user_id, existing.id));
@@ -455,15 +497,16 @@ async function ensureUser(
       try {
         await db
           .insert(apiKeysTable)
-          .values({
-            name: k.name,
-            key: k.key,
-            user_id: user.id,
-            is_active: k.is_active,
-          })
+          .values(buildPreservedApiKeyInsert(k, user.id))
           .onConflictDoUpdate({
             target: [apiKeysTable.user_id, apiKeysTable.name],
-            set: { key: k.key, is_active: k.is_active },
+            set: {
+              key: k.key,
+              is_active: k.is_active,
+              // Restore the scope on conflict too, otherwise a pre-existing
+              // row could keep a stale (or NULL) scope.
+              endpoint_uuid: k.endpoint_uuid,
+            },
           });
       } catch (err) {
         console.warn(
