@@ -36,6 +36,10 @@
     "required": "Select the endpoint this API key is scoped to, or choose all endpoints",
     "exclusive": "Choose either a single endpoint or all endpoints, not both"
   },
+  "apiKeyActsAs": {
+    "requiresEndpoint": "An identity-bound key must be scoped to a single endpoint — pick a specific endpoint or remove the acts-as user",
+    "ownerMismatch": "An identity-bound key must be owned by the user it acts as — a public or foreign-owned key cannot carry an identity binding"
+  },
   "description": {
     "tooLong": "Description is too long"
   },

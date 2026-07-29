@@ -8,10 +8,11 @@ import {
   EyeOff,
   Key,
   Plus,
+  RefreshCw,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -79,15 +80,20 @@ export default function ApiKeysPage() {
   //
   // roleLoaded gates the create-button header: isAdmin starts false, so
   // without it every ADMIN saw a flash of the false "Only administrators
-  // can create API keys." claim while the session fetch was in flight —
-  // and a FAILED fetch pinned that false claim permanently (the promise
-  // had no .catch). Until the role genuinely resolves, the header renders
-  // a neutral disabled button that claims nothing about the viewer; on
-  // fetch failure it stays neutral rather than asserting a role we never
-  // learned. Fail-closed either way — the backend enforces the boundary.
+  // can create API keys." claim while the session fetch was in flight.
+  // Until the role genuinely resolves, the header renders a neutral
+  // disabled button that claims nothing about the viewer. A FAILED fetch
+  // no longer pins that state forever: roleError swaps the neutral
+  // spinner-button for an explicit error line + retry, so a transient
+  // auth-endpoint blip doesn't leave an admin staring at a permanently
+  // "loading" create button. Still fail-closed throughout — no admin
+  // surface renders until the role actually resolves, and the backend
+  // enforces the boundary regardless.
   const [isAdmin, setIsAdmin] = useState(false);
   const [roleLoaded, setRoleLoaded] = useState(false);
-  useEffect(() => {
+  const [roleError, setRoleError] = useState(false);
+  const loadRole = useCallback(() => {
+    setRoleError(false);
     authClient
       .getSession()
       .then((session) => {
@@ -97,9 +103,13 @@ export default function ApiKeysPage() {
         setRoleLoaded(true);
       })
       .catch(() => {
-        // Role unknown — keep the neutral loading state (see comment above).
+        // Role unknown — surface it and offer a retry (see comment above).
+        setRoleError(true);
       });
   }, []);
+  useEffect(() => {
+    loadRole();
+  }, [loadRole]);
 
   const { data: apiKeys, refetch } = trpc.frontend.apiKeys.list.useQuery();
   // Admin-only cross-user listing. `enabled: isAdmin` keeps members from ever
@@ -155,6 +165,9 @@ export default function ApiKeysPage() {
       // escape hatch. The zod schema rejects an unset scope.
       endpoint_uuid: undefined,
       all_endpoints: undefined,
+      // Acts-as identity (migration 0024) is OPTIONAL and defaults to none:
+      // an unbound key stays fail-closed for m365 delegated injection.
+      acts_as_user_id: undefined,
     },
   });
 
@@ -210,6 +223,27 @@ export default function ApiKeysPage() {
       </Badge>
     );
 
+  // Identity badge (migration 0024): a key with an admin-bound acts-as
+  // identity exercises that user's delegated m365 identity on its endpoint.
+  // Surfaced next to the scope badge in every key list so an identity-bound
+  // key can never be mistaken for a plain (fail-closed) one. `label` is the
+  // acted-as user's email where available (admin list) or their id
+  // shortened (member list, via shortUserId); null renders nothing.
+  const renderIdentityBadge = (label: string | null) =>
+    label === null ? null : (
+      <Badge
+        variant="outline"
+        className="bg-purple-50 dark:bg-purple-950/20 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800"
+      >
+        {`${t("api-keys:actsAsBadge")} ${label}`}
+      </Badge>
+    );
+
+  // Better-auth ids are opaque ~32-char strings — shorten for badge display.
+  // Emails are shown in full (admin list only).
+  const shortUserId = (id: string | null) =>
+    id === null ? null : id.length > 8 ? `${id.slice(0, 8)}…` : id;
+
   const handleDeleteConfirm = () => {
     if (apiKeyToDelete) {
       deleteMutation.mutate({ uuid: apiKeyToDelete.uuid });
@@ -241,10 +275,22 @@ export default function ApiKeysPage() {
             role is still resolving, the button is neutrally disabled with
             NO admin-only claim (see the roleLoaded comment above). */}
         {!roleLoaded ? (
-          <Button disabled aria-busy="true">
-            <Plus className="h-4 w-4 mr-2" />
-            {t("api-keys:createApiKey")}
-          </Button>
+          roleError ? (
+            <div className="flex flex-col items-end gap-1">
+              <Button variant="outline" onClick={loadRole}>
+                <RefreshCw className="h-4 w-4 mr-2" />
+                {t("api-keys:retryRoleLoad")}
+              </Button>
+              <p className="text-xs text-destructive">
+                {t("api-keys:roleLoadError")}
+              </p>
+            </div>
+          ) : (
+            <Button disabled aria-busy="true">
+              <Plus className="h-4 w-4 mr-2" />
+              {t("api-keys:createApiKey")}
+            </Button>
+          )
         ) : !isAdmin ? (
           <div className="flex flex-col items-end gap-1">
             <Button disabled title={t("api-keys:createAdminOnly")}>
@@ -331,6 +377,16 @@ export default function ApiKeysPage() {
                           "user_id",
                           value === "public" ? null : undefined,
                         );
+                        if (value === "public") {
+                          // An identity binding requires the key to be OWNED
+                          // by the acted-as user — a public ('everyone') key
+                          // has no owner, so switching to it clears the
+                          // acts-as field (same pattern as the all-endpoints
+                          // switch in the scope select below) and the input
+                          // is disabled while 'everyone' is selected.
+                          form.setValue("acts_as_user_id", undefined);
+                          form.clearErrors("acts_as_user_id");
+                        }
                       }}
                     >
                       <SelectTrigger>
@@ -368,6 +424,11 @@ export default function ApiKeysPage() {
                         if (value === "__all__") {
                           form.setValue("all_endpoints", true);
                           form.setValue("endpoint_uuid", undefined);
+                          // An identity binding requires a single-endpoint
+                          // scope — switching to gateway-wide clears it so
+                          // the form can never submit the rejected pairing.
+                          form.setValue("acts_as_user_id", undefined);
+                          form.clearErrors("acts_as_user_id");
                         } else {
                           form.setValue("endpoint_uuid", value);
                           form.setValue("all_endpoints", undefined);
@@ -403,6 +464,54 @@ export default function ApiKeysPage() {
                     )}
                     <p className="text-xs text-muted-foreground mt-1">
                       {t("api-keys:scopeDescription")}
+                    </p>
+                  </div>
+                  {/* Acts-as identity binding (migration 0024) — this whole
+                      dialog is admin-only (see the create-button gate above),
+                      and the backend re-enforces admin-only regardless. Free
+                      text for the better-auth user id: the ownership select
+                      above carries no concrete user ids ('private' = the
+                      current admin implicitly, 'everyone' = null) and there
+                      is deliberately no list-users tRPC to feed a picker, so
+                      the id cannot be auto-filled/locked from an owner
+                      select. Enabled ONLY when a specific endpoint is
+                      selected AND ownership is a specific user — an
+                      identity-bound key must be endpoint-scoped and OWNED by
+                      the identity it exercises, so the field is inert (and
+                      cleared, see both onValueChange handlers) under the
+                      all-endpoints escape hatch or 'everyone' ownership. The
+                      backend rejects any owner ≠ acted-as divergence
+                      (FORBIDDEN + zod ownerMismatch) regardless of the UI. */}
+                  <div>
+                    <Label
+                      htmlFor="acts-as-user"
+                      className="text-sm font-medium"
+                    >
+                      {t("api-keys:actsAsUser")}
+                    </Label>
+                    <Input
+                      id="acts-as-user"
+                      {...form.register("acts_as_user_id", {
+                        // Empty / whitespace input means "no binding" — the
+                        // schema field is optional, never an empty string.
+                        setValueAs: (value: unknown) =>
+                          typeof value === "string" && value.trim() !== ""
+                            ? value.trim()
+                            : undefined,
+                      })}
+                      placeholder={t("api-keys:actsAsUserPlaceholder")}
+                      disabled={
+                        !form.watch("endpoint_uuid") ||
+                        form.watch("user_id") === null
+                      }
+                    />
+                    {form.formState.errors.acts_as_user_id && (
+                      <p className="text-sm text-destructive mt-1">
+                        {form.formState.errors.acts_as_user_id.message}
+                      </p>
+                    )}
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t("api-keys:actsAsUserDescription")}
                     </p>
                   </div>
                   <div className="flex gap-2">
@@ -530,7 +639,10 @@ export default function ApiKeysPage() {
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    {renderScopeBadge(apiKey.endpoint_uuid)}
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {renderScopeBadge(apiKey.endpoint_uuid)}
+                      {renderIdentityBadge(shortUserId(apiKey.acts_as_user_id))}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <Button
@@ -619,7 +731,13 @@ export default function ApiKeysPage() {
                         )}
                       </TableCell>
                       <TableCell>
-                        {renderScopeBadge(apiKey.endpoint_uuid)}
+                        <div className="flex items-center gap-1 flex-wrap">
+                          {renderScopeBadge(apiKey.endpoint_uuid)}
+                          {renderIdentityBadge(
+                            apiKey.acts_as_email ??
+                              shortUserId(apiKey.acts_as_user_id),
+                          )}
+                        </div>
                       </TableCell>
                       <TableCell>
                         {format(new Date(apiKey.created_at), "MMM d, yyyy")}

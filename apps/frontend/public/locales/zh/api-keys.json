@@ -39,5 +39,11 @@
   "selectEndpoint": "选择端点",
   "allEndpoints": "所有端点（全局 — 管理员）",
   "allEndpointsBadge": "所有端点",
-  "scopeDescription": "该密钥仅在所选端点上进行身份验证。\"所有端点\"会创建网关级全局密钥，仅限管理员使用。"
+  "scopeDescription": "该密钥仅在所选端点上进行身份验证。\"所有端点\"会创建网关级全局密钥，仅限管理员使用。",
+  "actsAsUser": "以用户身份运行（M365 身份）",
+  "actsAsUserPlaceholder": "better-auth 用户 ID — 留空表示不绑定身份",
+  "actsAsUserDescription": "可选，仅限管理员。使用此密钥认证的请求将以该用户身份执行委托的 M365 调用。需要选择特定端点范围，且密钥必须由该用户拥有——公共（所有人）密钥不可绑定身份。未绑定时密钥保持安全关闭（无委托身份）。",
+  "actsAsBadge": "身份:",
+  "roleLoadError": "无法确定您的权限。",
+  "retryRoleLoad": "重试"
 }

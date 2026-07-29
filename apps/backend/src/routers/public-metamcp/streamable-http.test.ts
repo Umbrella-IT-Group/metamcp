@@ -29,6 +29,9 @@
  * `mcp-server-pool.test.ts` convention of mocking only the DB-touching
  * boundary, not the pure logic.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type express from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -101,6 +104,8 @@ vi.mock("../../lib/metamcp/transport-recovery-hydration", () => ({
 import { mcpSessionsRepository } from "@/db/repositories/mcp-sessions.repo";
 import type { ApiKeyAuthenticatedRequest } from "@/middleware/api-key-oauth.middleware";
 
+import type { M365UserContext } from "../../lib/m365/request-context";
+import { getM365UserContext } from "../../lib/m365/request-context";
 import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
@@ -557,5 +562,129 @@ describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/se
     // Monitoring still gets what it consumes.
     expect(typeof payload.streamableHttpSessions.count).toBe("number");
     expect(payload.publicSessionSweeper).toBeDefined();
+  });
+});
+
+/**
+ * The m365 delegated-identity context gate (PR: api-key-bound identity).
+ * `handleRequestWithUserContext` is module-private; `dispatchTracked` is its
+ * only production caller, so the gate is exercised through it with the REAL
+ * `m365/request-context` (unmocked — the fake transport reads the
+ * AsyncLocalStorage from inside the dispatch, exactly where the injected
+ * fetch would).
+ */
+describe("m365 identity gate (via dispatchTracked) — oauth + acts-as api keys inject, everything else fail-closes", () => {
+  /** Transport that captures the m365 context visible inside the dispatch. */
+  function contextCapturingTransport(captured: {
+    context: M365UserContext | undefined;
+  }): StreamableHTTPServerTransport {
+    return {
+      handleRequest: vi.fn().mockImplementation(async () => {
+        captured.context = getM365UserContext();
+      }),
+    } as unknown as StreamableHTTPServerTransport;
+  }
+
+  async function dispatchAndCaptureContext(
+    authReq: ApiKeyAuthenticatedRequest,
+    sessionId: string,
+  ): Promise<M365UserContext | undefined> {
+    publicSessionSweeper.beginTracking(sessionId);
+    const captured: { context: M365UserContext | undefined } = {
+      context: undefined,
+    };
+    await dispatchTracked(
+      authReq,
+      contextCapturingTransport(captured),
+      {} as express.Request,
+      {} as express.Response,
+      sessionId,
+    );
+    return captured.context;
+  }
+
+  it("OAuth consumer: injects the OAuth user's id (unchanged behavior)", async () => {
+    const context = await dispatchAndCaptureContext(
+      fakeAuthReq({ authMethod: "oauth", oauthUserId: "oauth-user-1" }),
+      "sess-gate-oauth",
+    );
+    expect(context).toEqual({ userId: "oauth-user-1" });
+  });
+
+  it("api-key consumer WITH an acts-as binding: injects the bound user's id", async () => {
+    const context = await dispatchAndCaptureContext(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUserId: "key-owner-1",
+        apiKeyActsAsUserId: "acted-as-user-1",
+      }),
+      "sess-gate-acts-as",
+    );
+    expect(context).toEqual({ userId: "acted-as-user-1" });
+  });
+
+  it("api-key consumer WITHOUT a binding: NO context — the injected fetch fail-closes", async () => {
+    const context = await dispatchAndCaptureContext(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUserId: "key-owner-1",
+        // apiKeyActsAsUserId deliberately absent (NULL binding).
+      }),
+      "sess-gate-unbound",
+    );
+    expect(context).toBeUndefined();
+    // Explicitly: the key owner's id is NEVER used as an identity — an
+    // api key acting as its creator is the exact hazard this gate refuses.
+    expect(context?.userId).not.toBe("key-owner-1");
+  });
+
+  it("OAuth branch takes precedence: with both oauthUserId and an acts-as id stamped, the OAuth id wins", async () => {
+    // Shouldn't be reachable (the middleware sets exactly one authMethod and
+    // its matching fields), but the precedence must hold even if a future
+    // middleware change stamps both.
+    const context = await dispatchAndCaptureContext(
+      fakeAuthReq({
+        authMethod: "oauth",
+        oauthUserId: "oauth-user-1",
+        apiKeyActsAsUserId: "acted-as-user-1",
+      }),
+      "sess-gate-precedence",
+    );
+    expect(context).toEqual({ userId: "oauth-user-1" });
+  });
+
+  it("an acts-as id never fires outside authMethod === 'api_key'", async () => {
+    const context = await dispatchAndCaptureContext(
+      fakeAuthReq({
+        // No authMethod at all (e.g. an unauthenticated endpoint) — a stray
+        // acts-as stamp must not inject.
+        apiKeyActsAsUserId: "acted-as-user-1",
+      }),
+      "sess-gate-no-method",
+    );
+    expect(context).toBeUndefined();
+  });
+
+  it("SSE and the OpenAPI bridge stay fail-closed BY DESIGN — no m365 context wiring exists there", () => {
+    // Source-level pin (there is no express harness in this repo's test
+    // setup): the identity gate must exist ONLY in streamable-http.ts.
+    // If this fails, someone wired delegated identity into another
+    // transport — that needs its own security review, not a silent pass.
+    const files = [
+      "sse.ts",
+      join("openapi", "routes.ts"),
+      join("openapi", "handlers.ts"),
+      join("openapi", "tool-execution.ts"),
+    ];
+    for (const file of files) {
+      const source = readFileSync(join(__dirname, file), "utf8");
+      expect(source).not.toContain("runWithM365UserContext");
+      expect(source).not.toContain("apiKeyActsAsUserId");
+    }
+    const streamableSource = readFileSync(
+      join(__dirname, "streamable-http.ts"),
+      "utf8",
+    );
+    expect(streamableSource).toContain("runWithM365UserContext");
   });
 });

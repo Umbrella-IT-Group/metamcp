@@ -33,7 +33,10 @@ vi.mock("../db/repositories/api-keys.repo", () => ({
   },
 }));
 
-import { checkApiKeyAccess } from "./api-key-oauth.middleware";
+import {
+  checkApiKeyAccess,
+  resolveActsAsUserId,
+} from "./api-key-oauth.middleware";
 
 const ENDPOINT_UUID = "11111111-1111-4111-8111-111111111111";
 const OTHER_ENDPOINT_UUID = "22222222-2222-4222-8222-222222222222";
@@ -168,5 +171,41 @@ describe("checkApiKeyAccess — pre-existing ownership checks unchanged", () => 
       makeEndpoint({ user_id: "owner-1" }),
     );
     expect(result.allowed).toBe(true);
+  });
+});
+
+// Runtime re-check of the identity-requires-scope pairing (round-2 MEDIUM):
+// mint-time is NOT the only writer of api_keys rows (psql / admin_cli are
+// routine ops paths), so both authenticateApiKey branches route the stamp
+// through resolveActsAsUserId — an unscoped-but-bound row must NEVER become
+// a gateway-wide identity key.
+describe("resolveActsAsUserId — acts-as honored only alongside an endpoint scope", () => {
+  const EP = "11111111-1111-4111-8111-111111111111";
+
+  it("an unscoped-but-bound row (direct DB write) does NOT stamp an identity", () => {
+    expect(
+      resolveActsAsUserId({ endpoint_uuid: null, acts_as_user_id: "alex-id" }),
+    ).toBeUndefined();
+    // undefined scope (row shape from a partial projection) is equally inert.
+    expect(resolveActsAsUserId({ acts_as_user_id: "alex-id" })).toBeUndefined();
+  });
+
+  it("a scoped+bound row stamps the bound identity", () => {
+    expect(
+      resolveActsAsUserId({ endpoint_uuid: EP, acts_as_user_id: "alex-id" }),
+    ).toBe("alex-id");
+  });
+
+  it("a scoped-but-unbound row stamps nothing (fail-closed default)", () => {
+    expect(
+      resolveActsAsUserId({ endpoint_uuid: EP, acts_as_user_id: null }),
+    ).toBeUndefined();
+    expect(resolveActsAsUserId({ endpoint_uuid: EP })).toBeUndefined();
+  });
+
+  it("an unscoped, unbound legacy row stamps nothing", () => {
+    expect(
+      resolveActsAsUserId({ endpoint_uuid: null, acts_as_user_id: null }),
+    ).toBeUndefined();
   });
 });

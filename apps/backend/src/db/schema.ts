@@ -11,6 +11,7 @@ import {
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -401,6 +402,20 @@ export const apiKeysTable = pgTable(
     endpoint_uuid: uuid("endpoint_uuid").references(() => endpointsTable.uuid, {
       onDelete: "cascade",
     }),
+    // Acts-as identity binding (migration 0024). Non-NULL names the ONE
+    // better-auth user whose delegated m365 identity requests authenticated
+    // by this key exercise (the streamable-http m365 context gate injects
+    // this id; see routers/public-metamcp/streamable-http.ts). NULL = no
+    // identity — the injected fetch fail-closes for this key exactly as it
+    // did before the migration. The binding is admin-set at CREATION only
+    // and immutable through the app (absent from every update schema/path),
+    // and the create path requires it to be paired with a non-null
+    // endpoint_uuid: an identity-bound key must be endpoint-scoped, never
+    // gateway-wide. ON DELETE CASCADE: a key bound to a deleted user dies
+    // with the identity it exercises.
+    acts_as_user_id: text("acts_as_user_id").references(() => usersTable.id, {
+      onDelete: "cascade",
+    }),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -418,7 +433,17 @@ export const apiKeysTable = pgTable(
     index("api_keys_key_idx").on(table.key),
     index("api_keys_is_active_idx").on(table.is_active),
     index("api_keys_endpoint_uuid_idx").on(table.endpoint_uuid),
+    index("api_keys_acts_as_user_id_idx").on(table.acts_as_user_id),
     unique("api_keys_name_per_user_idx").on(table.user_id, table.name),
+    // Structural pairing invariant (migration 0024): an identity binding
+    // REQUIRES a single-endpoint scope. App-layer enforcement (zod + impl +
+    // the middleware's runtime stamp gate) cannot reach rows written outside
+    // the app, so the pairing is also a CHECK — an unscoped-but-bound row
+    // cannot exist.
+    check(
+      "api_keys_acts_as_requires_scope",
+      sql`${table.acts_as_user_id} IS NULL OR ${table.endpoint_uuid} IS NOT NULL`,
+    ),
   ],
 );
 

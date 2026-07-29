@@ -16,6 +16,11 @@ export interface ApiKeyAuthenticatedRequest extends express.Request {
   endpoint: DatabaseEndpoint;
   apiKeyUserId?: string;
   apiKeyUuid?: string;
+  // Acts-as identity (api_keys.acts_as_user_id, migration 0024): the
+  // better-auth user whose delegated m365 identity this key's requests
+  // exercise. Undefined for unbound keys — the m365 injection then
+  // fail-closes. Consumed ONLY by the streamable-http m365 context gate.
+  apiKeyActsAsUserId?: string;
   oauthUserId?: string; // For OAuth-authenticated requests
   authMethod?: "api_key" | "oauth"; // Track which auth method was used
 }
@@ -197,6 +202,12 @@ export const authenticateApiKey = async (
         // API key valid - perform access control and pass
         authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
         authReq.apiKeyUuid = apiKeyResult.key_uuid;
+        // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
+        // api-key branches so the m365 context gate sees it regardless of
+        // whether the endpoint also has OAuth enabled. Runtime pairing
+        // re-check via resolveActsAsUserId: never stamped for an unscoped
+        // row.
+        authReq.apiKeyActsAsUserId = resolveActsAsUserId(apiKeyResult);
         authReq.authMethod = "api_key";
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
@@ -267,6 +278,12 @@ export const authenticateApiKey = async (
         // API key valid - perform access control and pass
         authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
         authReq.apiKeyUuid = apiKeyResult.key_uuid;
+        // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
+        // api-key branches so the m365 context gate sees it regardless of
+        // whether the endpoint also has OAuth enabled. Runtime pairing
+        // re-check via resolveActsAsUserId: never stamped for an unscoped
+        // row.
+        authReq.apiKeyActsAsUserId = resolveActsAsUserId(apiKeyResult);
         authReq.authMethod = "api_key";
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
@@ -365,6 +382,33 @@ export const authenticateApiKey = async (
     });
   }
 };
+
+/**
+ * Runtime re-check of the identity-requires-scope pairing (migration 0024):
+ * an acts-as identity is honored ONLY on a row that also carries a single-
+ * endpoint scope. Mint-time enforcement (zod + impl) cannot reach rows
+ * written outside the app — psql / admin_cli is a routine ops path here, and
+ * migration 0024's CHECK constraint could be dropped or predate a row — so
+ * without this gate an unscoped-but-bound row would become a GATEWAY-WIDE
+ * identity key honored by the streamable-http m365 context gate on every
+ * endpoint the key reaches. Fail-closed: no scope → no identity, the key
+ * still authenticates but injection stays inert.
+ *
+ * Exported for unit tests (api-key-access.test.ts); production callers are
+ * the two authenticateApiKey branches above.
+ */
+export function resolveActsAsUserId(validation: {
+  endpoint_uuid?: string | null;
+  acts_as_user_id?: string | null;
+}): string | undefined {
+  if (
+    validation.endpoint_uuid === null ||
+    validation.endpoint_uuid === undefined
+  ) {
+    return undefined;
+  }
+  return validation.acts_as_user_id || undefined;
+}
 
 /**
  * Check if API key has access to the endpoint.
