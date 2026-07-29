@@ -30,8 +30,110 @@ import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
 } from "../../lib/metamcp/transport-recovery-hydration";
-import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
+import {
+  bindingMatches,
+  SessionLifetimeManagerImpl,
+} from "../../lib/session-lifetime-manager";
 import { PublicSessionSweeper } from "./public-session-sweeper";
+
+/**
+ * Resolve a session's transport ONLY when the session belongs to the
+ * endpoint the request is targeting. The in-memory `sessionManager` is
+ * keyed by `Mcp-Session-Id` alone, so a bare `getSession(sessionId)` will
+ * happily hand endpoint A's transport to a caller authenticated for
+ * endpoint B — the caller then drives A's pooled namespace with a key that
+ * was never scoped to it. `/health/sessions` used to publish every live
+ * session id, making the id trivially guessable.
+ *
+ * This is the request-path twin of the cross-namespace replay defense in
+ * `recoverPersistedSession` (namespace_uuid + endpoint_name must both
+ * match). On a binding mismatch (or a session with no recorded binding) we
+ * return `undefined` so the caller falls through to the DB recovery path —
+ * which re-checks the SAME predicate against the persisted row and returns
+ * `not_found`, yielding a clean 404 that never signals the id is live on
+ * another endpoint.
+ */
+export function getBoundSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): StreamableHTTPServerTransport | undefined {
+  const transport = sessionManager.getSession(sessionId);
+  if (!transport) {
+    return undefined;
+  }
+  const binding = sessionManager.getSessionBinding(sessionId);
+  if (
+    !bindingMatches(binding, {
+      namespaceUuid: authReq.namespaceUuid,
+      endpointName: authReq.endpointName,
+    })
+  ) {
+    logger.warn(
+      `Session ${sessionId} presented on endpoint ${authReq.endpointName} ` +
+        `but is bound to a different endpoint — treating as not found.`,
+    );
+    return undefined;
+  }
+  return transport;
+}
+
+/**
+ * Endpoint-binding guard for the DELETE leg, extracted as a pure resolver
+ * (the teardown twin of `getBoundSession`): only the endpoint that OWNS a
+ * session may tear it down. Without it a key scoped to endpoint A could
+ * DELETE endpoint B's live session AND its persisted recovery row
+ * (`cleanupSession` deletes the row) — a cross-endpoint denial of service.
+ * Checks the in-memory binding first; if the session isn't resident,
+ * verifies the persisted row's binding (same `bindingMatches` predicate)
+ * before allowing the delete. A lookup failure is treated as absent —
+ * fail-closed, never delete on unknown state. Every non-deletable case
+ * collapses into the ONE `not_found` outcome, so the route's single 404
+ * response cannot reveal that the id is live on another endpoint.
+ */
+export async function resolveDeletableSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): Promise<{ outcome: "deletable" } | { outcome: "not_found" }> {
+  const target = {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+  };
+  const inMemoryTransport = sessionManager.getSession(sessionId);
+  if (inMemoryTransport) {
+    if (!bindingMatches(sessionManager.getSessionBinding(sessionId), target)) {
+      logger.warn(
+        `DELETE for session ${sessionId} on endpoint ${target.endpointName} ` +
+          `rejected — session bound to a different endpoint.`,
+      );
+      return { outcome: "not_found" };
+    }
+    return { outcome: "deletable" };
+  }
+
+  let stored;
+  try {
+    stored = await mcpSessionsRepository.findById(sessionId);
+  } catch (lookupError) {
+    logger.warn(
+      `mcp_sessions lookup failed during DELETE for session ${sessionId}; treating as not found.`,
+      lookupError,
+    );
+    stored = null;
+  }
+  if (
+    !stored ||
+    !bindingMatches(
+      {
+        namespaceUuid: stored.namespace_uuid,
+        endpointName: stored.endpoint_name,
+      },
+      target,
+    )
+  ) {
+    return { outcome: "not_found" };
+  }
+  return { outcome: "deletable" };
+}
 
 const streamableHttpRouter = express.Router();
 
@@ -338,7 +440,14 @@ export async function recoverPersistedSession(
       );
     return { status: "not_found" };
   }
-  sessionManager.addSession(sessionId, transport);
+  // Bind the recovered session to its endpoint. The row already passed the
+  // namespace_uuid + endpoint_name match above, so authReq's values are the
+  // session's true binding — record them so subsequent in-memory lookups go
+  // through the same endpoint check as the fresh-session path.
+  sessionManager.addSession(sessionId, transport, {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+  });
   // Resume idle-TTL tracking for the recovered session. Required whether
   // this recovery followed a sweep reap (the reap's forget() dropped
   // tracking; without this the recovered session would never be
@@ -555,21 +664,35 @@ export function stopMcpSessionPruner(): void {
 
 startMcpSessionPruner();
 
-// Health check endpoint to monitor sessions
-streamableHttpRouter.get("/health/sessions", (req, res) => {
-  const sessionIds = sessionManager.getSessionIds();
+// Health check endpoint to monitor sessions.
+//
+// This route is UNAUTHENTICATED. It deliberately publishes only aggregate
+// counts + sweeper stats — never the live session ids. An earlier version
+// returned `sessionIds: [...]`, i.e. every consumer's `Mcp-Session-Id`, to
+// any unauthenticated caller. Combined with the session-id-keyed transport
+// lookup on the MCP legs (now endpoint-bound — see `getBoundSession`), that
+// handed an attacker the exact ids needed to attempt a cross-endpoint
+// replay. Monitoring consumes `count` + the `publicSessionSweeper` block
+// (trackedSessions / reap counters); neither needs the ids. If per-session
+// detail is ever required, add a separately auth-gated admin view rather
+// than widening this public payload.
+export function buildSessionsHealthPayload() {
+  const sessionCount = sessionManager.getSessionCount();
   const poolStatus = metaMcpServerPool.getPoolStatus();
 
-  res.json({
+  return {
     timestamp: new Date().toISOString(),
     streamableHttpSessions: {
-      count: sessionIds.length,
-      sessionIds: sessionIds,
+      count: sessionCount,
     },
     metaMcpPoolStatus: poolStatus,
-    totalActiveSessions: sessionIds.length + poolStatus.active,
+    totalActiveSessions: sessionCount + poolStatus.active,
     publicSessionSweeper: publicSessionSweeper.getStats(),
-  });
+  };
+}
+
+streamableHttpRouter.get("/health/sessions", (req, res) => {
+  res.json(buildSessionsHealthPayload());
 });
 
 streamableHttpRouter.get(
@@ -590,10 +713,13 @@ streamableHttpRouter.get(
       logger.info(`Looking up existing session: ${sessionId}`);
 
       const authReq = req as ApiKeyAuthenticatedRequest;
-      let transport = sessionManager.getSession(sessionId);
+      // Endpoint-bound lookup: a session id presented on an endpoint other
+      // than the one it was created against resolves to `undefined` here and
+      // falls into recovery, which 404s on the same predicate.
+      let transport = getBoundSession(sessionId, authReq);
       if (!transport) {
         logger.info(
-          `Session ${sessionId} not found in session manager — attempting lazy recovery from mcp_sessions.`,
+          `Session ${sessionId} not found (or bound to another endpoint) in session manager — attempting lazy recovery from mcp_sessions.`,
         );
         const recovery = await recoverPersistedSession(sessionId, authReq);
         if (recovery.status === "recovered") {
@@ -710,8 +836,13 @@ streamableHttpRouter.post(
           `Session ${newSessionId} will be cleaned up when DELETE request is received`,
         );
 
-        // Store transport reference
-        sessionManager.addSession(newSessionId, transport);
+        // Store transport reference, bound to the endpoint it was created
+        // against so a later request carrying this id on a DIFFERENT endpoint
+        // is rejected (see getBoundSession).
+        sessionManager.addSession(newSessionId, transport, {
+          namespaceUuid,
+          endpointName,
+        });
         // Seed idle-TTL tracking for the new session (dispatchTracked's
         // markInFlight/touch calls are guarded to no-op on an untracked
         // session — see their doc comments — so this unconditional seed is
@@ -722,7 +853,9 @@ streamableHttpRouter.post(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,
         );
         logger.info(`Stored transport for sessionId: ${newSessionId}`);
-        logger.info(`Current stored sessions:`, sessionManager.getSessionIds());
+        // Deliberately count-only: dumping getSessionIds() here leaked every
+        // live Mcp-Session-Id into the logs on each new session (the exact
+        // class the round-1 commit stripped from the HTTP payloads).
         logger.info(
           `Total active sessions: ${sessionManager.getSessionCount()}`,
         );
@@ -780,16 +913,16 @@ streamableHttpRouter.post(
       // logger.info(
       //   `Received POST message for public endpoint ${endpointName} -> namespace ${namespaceUuid} sessionId ${sessionId}`,
       // );
-      logger.info(`Available session IDs:`, sessionManager.getSessionIds());
-      logger.info(`Looking for sessionId: ${sessionId}`);
+      // Count only — session-id lists never belong in request-path logs
+      // (see the round-1 payload/DELETE-log sweep this completes).
+      logger.debug(`Active sessions: ${sessionManager.getSessionCount()}`);
       try {
         logger.info(`Looking up existing session: ${sessionId}`);
-        logger.info(`Available sessions:`, sessionManager.getSessionIds());
 
-        let transport = sessionManager.getSession(sessionId);
+        let transport = getBoundSession(sessionId, authReq);
         if (!transport) {
           logger.info(
-            `Transport for sessionId ${sessionId} not in memory — attempting lazy recovery from mcp_sessions.`,
+            `Transport for sessionId ${sessionId} not in memory (or bound to another endpoint) — attempting lazy recovery from mcp_sessions.`,
           );
           const recovery = await recoverPersistedSession(sessionId, authReq);
           if (recovery.status === "recovered") {
@@ -880,26 +1013,33 @@ streamableHttpRouter.delete(
 
     if (sessionId) {
       try {
+        // Endpoint-binding guard — see resolveDeletableSession's doc
+        // comment. Single 404 site: absent, cross-endpoint, and
+        // lookup-failure all collapse into the same response shape.
+        const resolution = await resolveDeletableSession(sessionId, authReq);
+        if (resolution.outcome === "not_found") {
+          res.status(404).json({
+            error: "Session not found",
+            message: "Session expired or unknown.",
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
         logger.info(`Starting cleanup for session ${sessionId}`);
-        logger.info(
-          `Available sessions before cleanup:`,
-          sessionManager.getSessionIds(),
-        );
 
         await cleanupSession(sessionId);
 
         logger.info(
           `Public endpoint session ${sessionId} cleaned up successfully`,
         );
-        logger.info(
-          `Available sessions after cleanup:`,
-          sessionManager.getSessionIds(),
-        );
 
+        // Response deliberately omits the live session-id list the prior
+        // version returned (`remainingSessions`) — that leaked every other
+        // consumer's session id to any authenticated caller.
         res.status(200).json({
           message: "Session cleaned up successfully",
           sessionId: sessionId,
-          remainingSessions: sessionManager.getSessionIds(),
         });
       } catch (error) {
         logger.error("Error in public endpoint /mcp DELETE route:", error);

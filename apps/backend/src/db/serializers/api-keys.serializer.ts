@@ -23,6 +23,7 @@ export class ApiKeysSerializer {
       created_at: Date;
       is_active: boolean;
       user_id: string | null;
+      endpoint_uuid: string | null;
     }>,
   ) {
     return dbApiKeys.map((apiKey) => ({
@@ -32,6 +33,7 @@ export class ApiKeysSerializer {
       created_at: apiKey.created_at,
       is_active: apiKey.is_active,
       user_id: apiKey.user_id,
+      endpoint_uuid: apiKey.endpoint_uuid,
     }));
   }
 
@@ -62,6 +64,7 @@ export class ApiKeysSerializer {
       last_used_at: Date | null;
       is_active: boolean;
       user_id: string | null;
+      endpoint_uuid: string | null;
       owner_email: string | null;
     }>,
   ) {
@@ -71,6 +74,7 @@ export class ApiKeysSerializer {
       key_prefix: `${apiKey.key.slice(0, 10)}…`,
       user_id: apiKey.user_id,
       owner_email: apiKey.owner_email,
+      endpoint_uuid: apiKey.endpoint_uuid,
       created_at: apiKey.created_at,
       last_used_at: apiKey.last_used_at,
       is_active: apiKey.is_active,

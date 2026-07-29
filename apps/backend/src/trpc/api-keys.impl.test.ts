@@ -2,6 +2,12 @@
  * Unit tests for the api-keys tRPC implementation's RBAC + governance logic:
  *  - the mint gate (members may only create their own private keys; only
  *    admins may mint public/'everyone' keys or assign a key to another user),
+ *  - the endpoint-scope mint rules (migration 0023): every new key must
+ *    either name the ONE endpoint it may reach or pass the explicit
+ *    all_endpoints escape hatch; scope selection is admin-only; the scoped
+ *    endpoint must exist; all_endpoints stores NULL,
+ *  - scope immutability: the update schemas/paths do not carry endpoint_uuid
+ *    at all — a key's scope is fixed at mint time,
  *  - the admin cross-user listing (listAll) drops the full secret and carries
  *    owner email + last_used_at,
  *  - update/delete route to the owner-scoped repo methods for members and the
@@ -13,6 +19,10 @@
  * code review — there is no live-DB test harness in this fork.
  */
 
+import {
+  ApiKeyUpdateInputSchema,
+  UpdateApiKeyRequestSchema,
+} from "@repo/zod-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/logger", () => ({
@@ -25,8 +35,9 @@ vi.mock("@/utils/logger", () => ({
 }));
 
 // One shared mock instance returned by `new ApiKeysRepository()` — the impl
-// constructs it once at module load.
-const { repoMock } = vi.hoisted(() => ({
+// constructs it once at module load. endpointsRepoMock backs the exported
+// endpointsRepository singleton the impl uses to verify a scope target exists.
+const { repoMock, endpointsRepoMock } = vi.hoisted(() => ({
   repoMock: {
     create: vi.fn(),
     findAll: vi.fn(),
@@ -35,6 +46,9 @@ const { repoMock } = vi.hoisted(() => ({
     updateAsAdmin: vi.fn(),
     delete: vi.fn(),
     deleteAsAdmin: vi.fn(),
+  },
+  endpointsRepoMock: {
+    findByUuid: vi.fn(),
   },
 }));
 
@@ -50,6 +64,7 @@ vi.mock("../db/repositories", () => ({
     delete = repoMock.delete;
     deleteAsAdmin = repoMock.deleteAsAdmin;
   },
+  endpointsRepository: endpointsRepoMock,
 }));
 
 import { apiKeysImplementations } from "./api-keys.impl";
@@ -81,40 +96,56 @@ describe("api-keys create — mint RBAC gate", () => {
     expect(repoMock.create).not.toHaveBeenCalled();
   });
 
-  it("lets a member mint a private key owned by themselves", async () => {
-    repoMock.create.mockResolvedValue({
-      uuid: "key-uuid",
-      name: "mine",
-      key: "sk_mt_secretsecret",
-      user_id: "member-1",
-      created_at: new Date(),
-    });
-
-    const result = await apiKeysImplementations.create(
-      { name: "mine" },
-      "member-1",
-      false,
-    );
-
-    expect(repoMock.create).toHaveBeenCalledWith({
-      name: "mine",
-      user_id: "member-1",
-      is_active: true,
-    });
-    expect(result.key).toBe("sk_mt_secretsecret");
+  // Pre-0023 this was "lets a member mint a private key owned by themselves".
+  // Scope is now mandatory and scope selection is admin-only, so a member's
+  // create is rejected either way: no scope fields → BAD_REQUEST (explicit
+  // scope required), any scope field → FORBIDDEN (admin-only). Net effect:
+  // key minting is an administrator operation.
+  it("rejects a member minting even their own key when no scope is given (scope is mandatory)", async () => {
+    await expect(
+      apiKeysImplementations.create({ name: "mine" }, "member-1", false),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(repoMock.create).not.toHaveBeenCalled();
   });
 
-  it("lets an admin mint a public key", async () => {
+  it("rejects a member setting endpoint_uuid with FORBIDDEN and no write", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        {
+          name: "mine",
+          endpoint_uuid: "11111111-1111-4111-8111-111111111111",
+        },
+        "member-1",
+        false,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+    expect(endpointsRepoMock.findByUuid).not.toHaveBeenCalled();
+  });
+
+  it("rejects a member passing all_endpoints with FORBIDDEN and no write", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "mine", all_endpoints: true },
+        "member-1",
+        false,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("lets an admin mint a public gateway-wide key via the explicit all_endpoints escape hatch", async () => {
     repoMock.create.mockResolvedValue({
       uuid: "pub-uuid",
       name: "public",
       key: "sk_mt_publicpublic",
       user_id: null,
+      endpoint_uuid: null,
       created_at: new Date(),
     });
 
     await apiKeysImplementations.create(
-      { name: "public", user_id: null },
+      { name: "public", user_id: null, all_endpoints: true },
       "admin-1",
       true,
     );
@@ -122,8 +153,124 @@ describe("api-keys create — mint RBAC gate", () => {
     expect(repoMock.create).toHaveBeenCalledWith({
       name: "public",
       user_id: null,
+      endpoint_uuid: null,
       is_active: true,
     });
+  });
+});
+
+describe("api-keys create — explicit endpoint scope (migration 0023)", () => {
+  const EP = "11111111-1111-4111-8111-111111111111";
+
+  it("rejects an admin create with neither endpoint_uuid nor all_endpoints (silent-global impossible)", async () => {
+    await expect(
+      apiKeysImplementations.create({ name: "unscoped" }, "admin-1", true),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admin create passing BOTH endpoint_uuid and all_endpoints", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "both", endpoint_uuid: EP, all_endpoints: true },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("all_endpoints: true stores NULL scope (legacy gateway-wide key)", async () => {
+    repoMock.create.mockResolvedValue({
+      uuid: "key-uuid",
+      name: "global",
+      key: "sk_mt_globalglobal",
+      user_id: "admin-1",
+      endpoint_uuid: null,
+      created_at: new Date(),
+    });
+
+    await apiKeysImplementations.create(
+      { name: "global", all_endpoints: true },
+      "admin-1",
+      true,
+    );
+
+    expect(repoMock.create).toHaveBeenCalledWith({
+      name: "global",
+      user_id: "admin-1",
+      endpoint_uuid: null,
+      is_active: true,
+    });
+    // The escape hatch never triggers an endpoint lookup.
+    expect(endpointsRepoMock.findByUuid).not.toHaveBeenCalled();
+  });
+
+  it("admin create with endpoint_uuid validates the endpoint exists, then persists the scope", async () => {
+    endpointsRepoMock.findByUuid.mockResolvedValue({
+      uuid: EP,
+      name: "autotask",
+    });
+    repoMock.create.mockResolvedValue({
+      uuid: "key-uuid",
+      name: "scoped",
+      key: "sk_mt_scopedscoped",
+      user_id: "admin-1",
+      endpoint_uuid: EP,
+      created_at: new Date(),
+    });
+
+    const result = await apiKeysImplementations.create(
+      { name: "scoped", endpoint_uuid: EP },
+      "admin-1",
+      true,
+    );
+
+    expect(endpointsRepoMock.findByUuid).toHaveBeenCalledWith(EP);
+    expect(repoMock.create).toHaveBeenCalledWith({
+      name: "scoped",
+      user_id: "admin-1",
+      endpoint_uuid: EP,
+      is_active: true,
+    });
+    expect(result.key).toBe("sk_mt_scopedscoped");
+  });
+
+  it("rejects a scope pointing at a nonexistent endpoint with NOT_FOUND and no write", async () => {
+    endpointsRepoMock.findByUuid.mockResolvedValue(undefined);
+
+    await expect(
+      apiKeysImplementations.create(
+        { name: "dangling", endpoint_uuid: EP },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+});
+
+// A key's endpoint scope is immutable by omission: neither the update request
+// schema nor the repo update-input schema carries endpoint_uuid, so even an
+// admin cannot re-point an existing key at another endpoint through the app —
+// the only path is delete + re-mint. These tests pin that the field stays out
+// of the update surface (zod strips it as an unknown key).
+describe("api-keys update — endpoint scope is immutable by omission", () => {
+  it("UpdateApiKeyRequestSchema strips a smuggled endpoint_uuid", () => {
+    const parsed = UpdateApiKeyRequestSchema.parse({
+      uuid: "44444444-4444-4444-8444-444444444444",
+      name: "renamed",
+      endpoint_uuid: "11111111-1111-4111-8111-111111111111",
+    });
+    expect(parsed).not.toHaveProperty("endpoint_uuid");
+  });
+
+  it("ApiKeyUpdateInputSchema strips a smuggled endpoint_uuid", () => {
+    const parsed = ApiKeyUpdateInputSchema.parse({
+      name: "renamed",
+      endpoint_uuid: "11111111-1111-4111-8111-111111111111",
+    });
+    expect(parsed).not.toHaveProperty("endpoint_uuid");
   });
 });
 
@@ -138,6 +285,7 @@ describe("api-keys listAll — admin cross-user view", () => {
         last_used_at: null,
         is_active: true,
         user_id: "alice",
+        endpoint_uuid: "11111111-1111-4111-8111-111111111111",
         owner_email: "alice@example.com",
       },
       {
@@ -148,6 +296,7 @@ describe("api-keys listAll — admin cross-user view", () => {
         last_used_at: new Date("2026-07-10T00:00:00Z"),
         is_active: false,
         user_id: null,
+        endpoint_uuid: null,
         owner_email: null,
       },
     ]);
@@ -155,6 +304,12 @@ describe("api-keys listAll — admin cross-user view", () => {
     const result = await apiKeysImplementations.listAll();
 
     expect(result.apiKeys).toHaveLength(2);
+    // The endpoint scope survives serialization: scoped key carries its
+    // endpoint uuid, legacy key carries NULL (= all endpoints).
+    expect(result.apiKeys[0].endpoint_uuid).toBe(
+      "11111111-1111-4111-8111-111111111111",
+    );
+    expect(result.apiKeys[1].endpoint_uuid).toBeNull();
     // Cross-user: a key owned by "alice" is present even though listAll takes
     // no caller id — the ownership filter is gone.
     expect(result.apiKeys[0].owner_email).toBe("alice@example.com");

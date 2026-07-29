@@ -3,6 +3,7 @@
   "description": "Manage your API keys for programmatic access",
   "createApiKey": "Create API Key",
   "createApiKeyDescription": "Create a new API key to access the MetaMCP API programmatically",
+  "createAdminOnly": "Only administrators can create API keys.",
   "name": "Name",
   "namePlaceholder": "e.g., Production API Key",
   "ownership": "Ownership",
@@ -33,5 +34,10 @@
   "ownershipDescription": "Private API keys are only visible to you. Public API keys can be used by anyone.",
   "hideApiKey": "Hide API key",
   "showApiKey": "Show API key",
-  "copyFullApiKey": "Copy full API key"
+  "copyFullApiKey": "Copy full API key",
+  "scope": "Scope",
+  "selectEndpoint": "Select an endpoint",
+  "allEndpoints": "All endpoints (Global — admin)",
+  "allEndpointsBadge": "All endpoints",
+  "scopeDescription": "The key will only authenticate on the selected endpoint. \"All endpoints\" mints a gateway-wide key and is restricted to administrators."
 }

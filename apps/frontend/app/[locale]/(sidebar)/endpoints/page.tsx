@@ -71,6 +71,7 @@ export default function EndpointsPage() {
           description: "",
           namespaceUuid: "",
           enableApiKeyAuth: true,
+          requireScopedApiKey: false,
           enableMaxRate: false,
           enableClientMaxRate: false,
           maxRate: undefined,
@@ -124,6 +125,7 @@ export default function EndpointsPage() {
       clientMaxRateStrategy: "ip",
       clientMaxRateStrategyKey: "",
       enableApiKeyAuth: true,
+      requireScopedApiKey: false,
       enableOauth: true,
       useQueryParamAuth: false,
       createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
@@ -140,6 +142,7 @@ export default function EndpointsPage() {
         description: data.description,
         namespaceUuid: data.namespaceUuid,
         enableApiKeyAuth: data.enableApiKeyAuth,
+        requireScopedApiKey: data.requireScopedApiKey,
         enableMaxRate: data.enableMaxRate,
         enableClientMaxRate: data.enableClientMaxRate,
         maxRate: data.maxRate,
@@ -185,6 +188,7 @@ export default function EndpointsPage() {
       description: "",
       namespaceUuid: "",
       enableApiKeyAuth: true,
+      requireScopedApiKey: false,
       enableMaxRate: false,
       enableClientMaxRate: false,
       maxRate: undefined,
@@ -619,6 +623,28 @@ export default function EndpointsPage() {
                       disabled={isSubmitting}
                     />
                   </div>
+
+                  {/* Require endpoint-scoped keys (opt out of legacy
+                      gateway-wide keys on this endpoint) */}
+                  {form.watch("enableApiKeyAuth") && (
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5">
+                        <label className="text-sm font-medium">
+                          {t("endpoints:requireScopedApiKey")}
+                        </label>
+                        <p className="text-xs text-muted-foreground">
+                          {t("endpoints:requireScopedApiKeyDescription")}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={form.watch("requireScopedApiKey")}
+                        onCheckedChange={(checked) =>
+                          form.setValue("requireScopedApiKey", checked)
+                        }
+                        disabled={isSubmitting}
+                      />
+                    </div>
+                  )}
 
                   {/* Query Parameter Auth */}
                   {form.watch("enableApiKeyAuth") && (

@@ -37,10 +37,20 @@ export const createApiKeysRouter = (implementations: {
   ) => Promise<z.infer<typeof ValidateApiKeyResponseSchema>>;
 }) => {
   return router({
-    // Protected: create a key. The impl enforces RBAC on the ownership choice
-    // (only admins may mint public/'everyone' keys or assign a key to another
-    // user), so this stays protectedProcedure — members can still mint their
-    // own private keys. The admin flag is derived from the session role.
+    // Create a key. Minting is effectively ADMIN-ONLY since the migration
+    // 0023 scope rules landed: every new key must name the ONE endpoint it may
+    // reach or pass the explicit all_endpoints escape hatch, and BOTH of those
+    // scope selections are admin-gated in the impl (FORBIDDEN-before-write) —
+    // so a member has no valid scope to submit and every member create fails.
+    // Ownership is likewise admin-gated (only admins mint public/'everyone'
+    // keys or assign a key to another user).
+    //
+    // Why still protectedProcedure and not adminProcedure: the impl needs the
+    // session's user id to attribute a member's (rejected) attempt and to own
+    // an admin's private key, and it derives the admin flag from the session
+    // role to return precise FORBIDDEN/BAD_REQUEST messages. Swapping to
+    // adminProcedure would coarsen those into a generic gate; the RBAC lives
+    // in the impl, which this passes `ctx.user.role === "admin"` into.
     create: protectedProcedure
       .input(CreateApiKeyRequestSchema)
       .output(CreateApiKeyResponseSchema)

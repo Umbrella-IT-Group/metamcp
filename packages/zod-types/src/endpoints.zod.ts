@@ -11,6 +11,7 @@ export const createEndpointFormSchema = z.object({
   description: z.string().optional(),
   namespaceUuid: z.string().uuid("Please select a valid namespace"),
   enableApiKeyAuth: z.boolean(),
+  requireScopedApiKey: z.boolean(),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
@@ -36,6 +37,7 @@ export const editEndpointFormSchema = z.object({
   description: z.string().optional(),
   namespaceUuid: z.string().uuid("Please select a valid namespace"),
   enableApiKeyAuth: z.boolean().optional(),
+  requireScopedApiKey: z.boolean().optional(),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
@@ -60,6 +62,14 @@ export const CreateEndpointRequestSchema = z.object({
   description: z.string().optional(),
   namespaceUuid: z.string().uuid(),
   enableApiKeyAuth: z.boolean().default(true),
+  // API-KEY-ONLY gate. When true, checkApiKeyAccess refuses unscoped
+  // (grandfathered gateway-wide) API keys on this endpoint. It does NOT
+  // affect OAuth consumers — an authenticated OAuth user is gated by
+  // endpoint ownership, not by key scope, so there is no "unscoped OAuth
+  // token" for this flag to reject (see checkOAuthAccess). Pair it with
+  // scoping the consumer's key before flipping enable_api_key_auth on a
+  // sensitive endpoint.
+  requireScopedApiKey: z.boolean().default(false),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
@@ -83,6 +93,7 @@ export const EndpointSchema = z.object({
   description: z.string().nullable(),
   namespace_uuid: z.string(),
   enable_api_key_auth: z.boolean(),
+  require_scoped_api_key: z.boolean(),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
@@ -133,6 +144,7 @@ export const UpdateEndpointRequestSchema = z.object({
   description: z.string().optional(),
   namespaceUuid: z.string().uuid(),
   enableApiKeyAuth: z.boolean().optional(),
+  requireScopedApiKey: z.boolean().optional(),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
@@ -190,6 +202,7 @@ export const EndpointCreateInputSchema = z.object({
   description: z.string().nullable().optional(),
   namespace_uuid: z.string(),
   enable_api_key_auth: z.boolean().optional().default(true),
+  require_scoped_api_key: z.boolean().optional().default(false),
   enable_max_rate: z.boolean(),
   enable_client_max_rate: z.boolean(),
   max_rate_seconds: z.number().nullable().optional(),
@@ -209,6 +222,7 @@ export const EndpointUpdateInputSchema = z.object({
   description: z.string().nullable().optional(),
   namespace_uuid: z.string(),
   enable_api_key_auth: z.boolean().optional(),
+  require_scoped_api_key: z.boolean().optional(),
   enable_max_rate: z.boolean(),
   enable_client_max_rate: z.boolean(),
   max_rate_seconds: z.number().nullable().optional(),
@@ -232,6 +246,7 @@ export const DatabaseEndpointSchema = z.object({
   description: z.string().nullable(),
   namespace_uuid: z.string(),
   enable_api_key_auth: z.boolean(),
+  require_scoped_api_key: z.boolean(),
   enable_max_rate: z.boolean(),
   enable_client_max_rate: z.boolean(),
   max_rate_seconds: z.number().nullable().optional(),

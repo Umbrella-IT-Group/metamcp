@@ -21,6 +21,28 @@ import { EndpointsSerializer } from "../db/serializers";
 
 const apiKeysRepository = new ApiKeysRepository();
 
+/**
+ * Pick an existing active key that is safe to embed as the auto-generated
+ * MCP server's bearer token for `endpointUuid`. Since migration 0023 an
+ * endpoint-scoped key only authenticates on the endpoint it is bound to, so
+ * blindly reusing "any active key" (the pre-0023 behavior) can embed a key
+ * scoped to a DIFFERENT endpoint — it then 403s on the MCP server's first
+ * call. Reuse order:
+ *   1. an active key already scoped to THIS endpoint (ideal), then
+ *   2. an active unscoped (gateway-wide / NULL) key (works everywhere).
+ * A key scoped elsewhere is never reused; the caller mints a fresh scoped
+ * key instead.
+ */
+export function pickReusableApiKey<
+  T extends { key: string; is_active: boolean; endpoint_uuid: string | null },
+>(userApiKeys: T[], endpointUuid: string): T | undefined {
+  return (
+    userApiKeys.find(
+      (key) => key.is_active && key.endpoint_uuid === endpointUuid,
+    ) ?? userApiKeys.find((key) => key.is_active && key.endpoint_uuid === null)
+  );
+}
+
 export const endpointsImplementations = {
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
@@ -75,6 +97,7 @@ export const endpointsImplementations = {
         description: input.description,
         namespace_uuid: input.namespaceUuid,
         enable_api_key_auth: input.enableApiKeyAuth ?? true,
+        require_scoped_api_key: input.requireScopedApiKey ?? false,
         enable_max_rate: input.enableMaxRate ?? false,
         enable_client_max_rate: input.enableClientMaxRate ?? false,
         max_rate: input.maxRate,
@@ -102,15 +125,24 @@ export const endpointsImplementations = {
           if (input.enableApiKeyAuth) {
             try {
               const userApiKeys = await apiKeysRepository.findByUserId(userId);
-              const activeApiKey = userApiKeys.find((key) => key.is_active);
+              // Only reuse a key that will actually authenticate on THIS
+              // endpoint (scoped to it, or unscoped) — a key scoped elsewhere
+              // would 403 the auto-generated MCP server on first use.
+              const reusableApiKey = pickReusableApiKey(
+                userApiKeys,
+                result.uuid,
+              );
 
-              if (activeApiKey) {
-                bearerToken = activeApiKey.key;
+              if (reusableApiKey) {
+                bearerToken = reusableApiKey.key;
               } else {
-                // Create a new API key if none exists
+                // No reusable key: mint one SCOPED to the endpoint it is
+                // being created for — an internal convenience mint must not
+                // produce an unscoped (gateway-wide) key silently.
                 const newApiKey = await apiKeysRepository.create({
                   name: "Auto-generated for MCP Server",
                   user_id: userId,
+                  endpoint_uuid: result.uuid,
                   is_active: true,
                 });
                 bearerToken = newApiKey.key;
@@ -344,6 +376,7 @@ export const endpointsImplementations = {
         description: input.description,
         namespace_uuid: input.namespaceUuid,
         enable_api_key_auth: input.enableApiKeyAuth,
+        require_scoped_api_key: input.requireScopedApiKey,
         enable_max_rate: input.enableMaxRate ?? false,
         enable_client_max_rate: input.enableClientMaxRate ?? false,
         max_rate: input.maxRate,

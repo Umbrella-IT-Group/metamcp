@@ -162,6 +162,13 @@
       "when": 1784764800000,
       "tag": "0022_promote_ci_admin",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785196800000,
+      "tag": "0023_endpoint_scoped_api_keys",
+      "breakpoints": true
     }
   ]
 }

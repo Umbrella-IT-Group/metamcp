@@ -32,6 +32,10 @@
   "apiKeyName": {
     "required": "API key name is required"
   },
+  "apiKeyScope": {
+    "required": "Select the endpoint this API key is scoped to, or choose all endpoints",
+    "exclusive": "Choose either a single endpoint or all endpoints, not both"
+  },
   "description": {
     "tooLong": "Description is too long"
   },
@@ -45,7 +49,7 @@
     "tooShort": "Too short",
     "tooLong": "Too long"
   },
-  "maxRateSeconds":{
+  "maxRateSeconds": {
     "required": "Max rate seconds is required",
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"
@@ -55,7 +59,7 @@
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"
   },
-  "clientMaxRateSeconds":{
+  "clientMaxRateSeconds": {
     "required": "Max rate seconds is required",
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"

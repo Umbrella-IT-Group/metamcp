@@ -19,6 +19,104 @@ import {
  * Supports arrays of Users, API Keys, Namespaces, and Endpoints via JSON environment variables.
  */
 
+/**
+ * Columns preserved when `BOOTSTRAP_RECREATE_USER=true` +
+ * `preserveApiKeysOnRecreate` deletes and re-creates the bootstrap user.
+ * `endpoint_uuid` marks the key as scoped (migration 0023) — without it a
+ * scoped key silently comes back as a NULL / gateway-wide key on the next
+ * container recreate, a silent privilege escalation on a supported ops path.
+ * `endpoint_name` is equally load-bearing: deleting the user CASCADES away
+ * every USER-OWNED endpoint (`endpoints_user_id_users_id_fk` is
+ * `ON DELETE cascade`), and `bootstrapEndpoints` later recreates them with
+ * FRESH uuids — so the preserved uuid is stale by restore time and the
+ * NAME is the only stable handle to re-resolve the scope against. The
+ * preserve projection is typed to this shape, so dropping either field
+ * from the select is a compile error, not a silent regression.
+ */
+export interface PreservedApiKey {
+  name: string;
+  key: string;
+  is_active: boolean;
+  endpoint_uuid: string | null;
+  endpoint_name: string | null;
+}
+
+/** One key restore that could not be performed, with why — surfaced loudly. */
+export interface SkippedApiKeyRestore {
+  keyName: string;
+  endpointName: string | null;
+  endpointUuid: string | null;
+}
+
+/**
+ * Decide, for a batch of preserved keys, which can be restored onto the
+ * recreated user and which must be SKIPPED. Pure so the invariants can be
+ * unit-tested without a live DB (`bootstrap.preserve.test.ts`).
+ *
+ * Rules:
+ * - An unscoped key (`endpoint_uuid` NULL) restores as-is: NULL scope is
+ *   the deliberately-grandfathered gateway-wide class, not a promotion.
+ * - A scoped key restores ONLY by re-resolving its endpoint NAME to the
+ *   endpoint's CURRENT uuid (`endpointUuidByName` — the post-
+ *   `bootstrapEndpoints` state). The preserved uuid is never inserted:
+ *   for user-owned endpoints it dangles (FK violation) after the recreate
+ *   cascade.
+ * - A scoped key whose endpoint no longer exists (or whose name could not
+ *   be captured at preserve time) is SKIPPED — NEVER restored with a NULL
+ *   scope, which would silently widen it to gateway-wide.
+ */
+export function planPreservedApiKeyRestores(
+  keys: PreservedApiKey[],
+  userId: string,
+  endpointUuidByName: ReadonlyMap<string, string>,
+): {
+  restores: {
+    name: string;
+    key: string;
+    user_id: string;
+    is_active: boolean;
+    endpoint_uuid: string | null;
+  }[];
+  skipped: SkippedApiKeyRestore[];
+} {
+  const restores: {
+    name: string;
+    key: string;
+    user_id: string;
+    is_active: boolean;
+    endpoint_uuid: string | null;
+  }[] = [];
+  const skipped: SkippedApiKeyRestore[] = [];
+
+  for (const k of keys) {
+    let resolvedEndpointUuid: string | null = null;
+    if (k.endpoint_uuid !== null) {
+      const currentUuid =
+        k.endpoint_name !== null
+          ? endpointUuidByName.get(k.endpoint_name)
+          : undefined;
+      if (currentUuid === undefined) {
+        skipped.push({
+          keyName: k.name,
+          endpointName: k.endpoint_name,
+          endpointUuid: k.endpoint_uuid,
+        });
+        continue;
+      }
+      resolvedEndpointUuid = currentUuid;
+    }
+    restores.push({
+      name: k.name,
+      key: k.key,
+      user_id: userId,
+      is_active: k.is_active,
+      endpoint_uuid: resolvedEndpointUuid,
+    });
+  }
+
+  return { restores, skipped };
+}
+
 type UserConfig = {
   email: string;
   password: string;
@@ -330,6 +428,14 @@ async function ensureUser(
   userId?: string;
   email: string;
   recreated: boolean;
+  /**
+   * Keys captured before the recreate delete. Restoring them is DEFERRED to
+   * `restorePreservedApiKeys`, which the bootstrap entrypoint runs AFTER
+   * `bootstrapEndpoints`: the user delete cascades user-owned endpoints
+   * away and they come back with fresh uuids, so a scoped key can only be
+   * restored once the endpoints exist again (re-resolved by name).
+   */
+  preservedApiKeys?: PreservedApiKey[];
 }> {
   const email = userConfig.email;
   const password = userConfig.password;
@@ -349,9 +455,7 @@ async function ensureUser(
     config.recreateDefaultUser,
   );
 
-  let preservedUserApiKeys:
-    | { name: string; key: string; is_active: boolean }[]
-    | undefined;
+  let preservedUserApiKeys: PreservedApiKey[] | undefined;
 
   let recreated = false;
 
@@ -368,8 +472,19 @@ async function ensureUser(
             name: apiKeysTable.name,
             key: apiKeysTable.key,
             is_active: apiKeysTable.is_active,
+            // Load-bearing pair: `endpoint_uuid` marks the key as scoped and
+            // `endpoint_name` (left join — NULL for unscoped keys) is the
+            // stable handle the deferred restore re-resolves the scope
+            // against, because this uuid goes stale the moment the user
+            // delete below cascades user-owned endpoints away.
+            endpoint_uuid: apiKeysTable.endpoint_uuid,
+            endpoint_name: endpointsTable.name,
           })
           .from(apiKeysTable)
+          .leftJoin(
+            endpointsTable,
+            eq(apiKeysTable.endpoint_uuid, endpointsTable.uuid),
+          )
           .where(eq(apiKeysTable.user_id, existing.id));
       } catch (err) {
         console.warn(`⚠️ Failed to preserve API keys for ${email}:`, err);
@@ -449,32 +564,12 @@ async function ensureUser(
     console.warn(`⚠️ Failed to update user metadata for ${email}:`, err);
   }
 
-  // Restore preserved keys if recreated
-  if (recreated && config.preserveApiKeysOnRecreate && preservedUserApiKeys) {
-    for (const k of preservedUserApiKeys) {
-      try {
-        await db
-          .insert(apiKeysTable)
-          .values({
-            name: k.name,
-            key: k.key,
-            user_id: user.id,
-            is_active: k.is_active,
-          })
-          .onConflictDoUpdate({
-            target: [apiKeysTable.user_id, apiKeysTable.name],
-            set: { key: k.key, is_active: k.is_active },
-          });
-      } catch (err) {
-        console.warn(
-          `⚠️ Failed to restore preserved API key for ${email}:`,
-          err,
-        );
-      }
-    }
-
-    console.log(`✓ Restored preserved API keys for recreated user ${email}`);
-  }
+  // NOTE: preserved keys are deliberately NOT restored here. The restore
+  // must run AFTER `bootstrapEndpoints` (see `restorePreservedApiKeys`):
+  // inserting the preserved `endpoint_uuid` at this point violates the
+  // `api_keys.endpoint_uuid → endpoints.uuid` FK for any key scoped to a
+  // user-owned endpoint (cascaded away by the user delete above), which is
+  // exactly the silent-loss-reported-as-success bug this ordering fixes.
 
   // Record fingerprint when we actually create/recreate
   if (!existing || recreated) {
@@ -482,20 +577,39 @@ async function ensureUser(
   }
 
   console.log(`✓ User ready: ${email}`);
-  return { userId: user.id, email, recreated };
+  return {
+    userId: user.id,
+    email,
+    recreated,
+    preservedApiKeys:
+      recreated && config.preserveApiKeysOnRecreate
+        ? preservedUserApiKeys
+        : undefined,
+  };
 }
+
+/** Preserved keys awaiting the post-`bootstrapEndpoints` restore pass. */
+type PendingApiKeyRestore = {
+  userId: string;
+  email: string;
+  keys: PreservedApiKey[];
+};
 
 /**
  * Bootstrap all users from configuration.
  */
-async function bootstrapUsers(config: EnvConfig): Promise<Map<string, string>> {
+async function bootstrapUsers(config: EnvConfig): Promise<{
+  userMap: Map<string, string>;
+  pendingApiKeyRestores: PendingApiKeyRestore[];
+}> {
   const userMap = new Map<string, string>(); // email -> userId
+  const pendingApiKeyRestores: PendingApiKeyRestore[] = [];
 
   if (!config.users || config.users.length === 0) {
     console.warn(
       "⚠️ No users configured for bootstrap (BOOTSTRAP_USERS is empty and no single user config found)",
     );
-    return userMap;
+    return { userMap, pendingApiKeyRestores };
   }
 
   console.log(`👥 Bootstrapping ${config.users.length} user(s)...`);
@@ -510,13 +624,97 @@ async function bootstrapUsers(config: EnvConfig): Promise<Map<string, string>> {
       const result = await ensureUser(userConfig, config);
       if (result.userId) {
         userMap.set(result.email, result.userId);
+        if (result.preservedApiKeys && result.preservedApiKeys.length > 0) {
+          pendingApiKeyRestores.push({
+            userId: result.userId,
+            email: result.email,
+            keys: result.preservedApiKeys,
+          });
+        }
       }
     } catch (err) {
       console.warn(`⚠️ Failed to bootstrap user ${userConfig.email}:`, err);
     }
   }
 
-  return userMap;
+  return { userMap, pendingApiKeyRestores };
+}
+
+/**
+ * Restore the API keys preserved across a `BOOTSTRAP_RECREATE_USER` delete.
+ * MUST run after `bootstrapEndpoints`: the user delete cascades user-owned
+ * endpoints away and `bootstrapEndpoints` recreates them with FRESH uuids,
+ * so each scoped key's endpoint NAME is re-resolved against the CURRENT
+ * endpoint set here. A scoped key whose endpoint no longer exists is
+ * skipped LOUDLY — never restored gateway-wide, never reported as restored.
+ *
+ * Ordering note: `bootstrapApiKeys` (config-declared keys) has already run
+ * by now. On a name collision the preserved key wins via
+ * `onConflictDoUpdate` — the same net result as the pre-fix order, where
+ * the restore ran first and `bootstrapApiKeys` skipped the existing name.
+ */
+async function restorePreservedApiKeys(
+  pending: PendingApiKeyRestore[],
+): Promise<void> {
+  if (pending.length === 0) return;
+
+  let endpointUuidByName: Map<string, string>;
+  try {
+    const endpointRows = await db
+      .select({ uuid: endpointsTable.uuid, name: endpointsTable.name })
+      .from(endpointsTable);
+    endpointUuidByName = new Map(
+      endpointRows.map((row) => [row.name, row.uuid]),
+    );
+  } catch (err) {
+    const total = pending.reduce((sum, p) => sum + p.keys.length, 0);
+    console.warn(
+      `⚠️ Failed to load endpoints for API key restore — ${total} preserved key(s) NOT restored (restoring blind could widen a scoped key to gateway-wide):`,
+      err,
+    );
+    return;
+  }
+
+  for (const { userId, email, keys } of pending) {
+    const plan = planPreservedApiKeyRestores(keys, userId, endpointUuidByName);
+
+    let restored = 0;
+    let failed = 0;
+    for (const values of plan.restores) {
+      try {
+        await db
+          .insert(apiKeysTable)
+          .values(values)
+          .onConflictDoUpdate({
+            target: [apiKeysTable.user_id, apiKeysTable.name],
+            set: {
+              key: values.key,
+              is_active: values.is_active,
+              // Restore the scope on conflict too, otherwise a pre-existing
+              // row could keep a stale (or NULL) scope.
+              endpoint_uuid: values.endpoint_uuid,
+            },
+          });
+        restored++;
+      } catch (err) {
+        failed++;
+        console.warn(
+          `⚠️ Failed to restore preserved API key "${values.name}" for ${email}:`,
+          err,
+        );
+      }
+    }
+
+    for (const skip of plan.skipped) {
+      console.warn(
+        `⚠️ Preserved API key "${skip.keyName}" for ${email} was scoped to endpoint "${skip.endpointName ?? `uuid ${skip.endpointUuid}`}", which no longer exists after the recreate — key NOT restored (a NULL-scope restore would widen it to gateway-wide). Re-mint it against the intended endpoint.`,
+      );
+    }
+
+    console.log(
+      `✓ API key restore for recreated user ${email}: ${restored} restored, ${plan.skipped.length} skipped${failed > 0 ? `, ${failed} FAILED` : ""} (of ${keys.length} preserved)`,
+    );
+  }
 }
 
 async function maybeDeleteOtherUsers(
@@ -1020,11 +1218,13 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
 
   // Bootstrap all users
   let userMap: Map<string, string>;
+  let pendingApiKeyRestores: PendingApiKeyRestore[];
   try {
-    userMap = await bootstrapUsers(config);
+    ({ userMap, pendingApiKeyRestores } = await bootstrapUsers(config));
   } catch (err) {
     console.warn("⚠️ Users bootstrap failed:", err);
     userMap = new Map();
+    pendingApiKeyRestores = [];
   }
 
   // Delete other users after bootstrapping configured users
@@ -1056,6 +1256,16 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
     await bootstrapEndpoints(config, namespaceMap, userMap);
   } catch (err) {
     console.warn("⚠️ Endpoints bootstrap failed:", err);
+  }
+
+  // Restore API keys preserved across a user recreate — AFTER endpoints, so
+  // scoped keys re-resolve their endpoint name to the freshly-created uuid
+  // (see restorePreservedApiKeys' doc comment for why this ordering is
+  // load-bearing).
+  try {
+    await restorePreservedApiKeys(pendingApiKeyRestores);
+  } catch (err) {
+    console.warn("⚠️ Preserved API key restore failed:", err);
   }
 
   // Mark one-time bootstrap complete

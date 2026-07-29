@@ -590,6 +590,12 @@ export function EndpointsList({ onRefresh }: EndpointsListProps) {
                 name: endpointToDelete?.name || "",
               })}
             </DialogDescription>
+            {/* Endpoint-scoped API keys FK to this endpoint with ON DELETE
+                CASCADE (migration 0023) — deleting the endpoint also destroys
+                every key bound to it. Warn before the irreversible action. */}
+            <DialogDescription className="text-destructive">
+              {t("endpoints:list.deleteConfirmScopedKeyWarning")}
+            </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button

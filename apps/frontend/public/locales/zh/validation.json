@@ -32,6 +32,10 @@
   "apiKeyName": {
     "required": "API 密钥名称为必填项"
   },
+  "apiKeyScope": {
+    "required": "请选择此 API 密钥限定的端点，或选择所有端点",
+    "exclusive": "只能选择单个端点或所有端点，不能同时选择"
+  },
   "description": {
     "tooLong": "描述过长"
   },

@@ -115,6 +115,7 @@ export function EditEndpoint({
       description: "",
       namespaceUuid: "",
       enableApiKeyAuth: true,
+      requireScopedApiKey: false,
       enableMaxRate: false,
       enableClientMaxRate: false,
       maxRate: undefined,
@@ -136,6 +137,7 @@ export function EditEndpoint({
         description: endpoint.description || "",
         namespaceUuid: endpoint.namespace.uuid,
         enableApiKeyAuth: endpoint.enable_api_key_auth ?? true,
+        requireScopedApiKey: endpoint.require_scoped_api_key ?? false,
         enableMaxRate: endpoint.enableMaxRate,
         enableClientMaxRate: endpoint.enableClientMaxRate,
         maxRate: endpoint.maxRate,
@@ -176,6 +178,7 @@ export function EditEndpoint({
         description: data.description,
         namespaceUuid: data.namespaceUuid,
         enableApiKeyAuth: data.enableApiKeyAuth,
+        requireScopedApiKey: data.requireScopedApiKey,
         enableMaxRate: data.enableMaxRate,
         enableClientMaxRate: data.enableClientMaxRate,
         maxRate: data.maxRate,
@@ -206,6 +209,7 @@ export function EditEndpoint({
       description: "",
       namespaceUuid: "",
       enableApiKeyAuth: true,
+      requireScopedApiKey: false,
       enableOauth: true,
       useQueryParamAuth: false,
     });
@@ -572,6 +576,28 @@ export function EditEndpoint({
                   disabled={isUpdating}
                 />
               </div>
+
+              {/* Require endpoint-scoped keys (opt out of legacy
+                  gateway-wide keys on this endpoint) */}
+              {editForm.watch("enableApiKeyAuth") && (
+                <div className="flex items-center justify-between">
+                  <div className="space-y-0.5">
+                    <label className="text-sm font-medium">
+                      {t("endpoints:edit.requireScopedApiKeyLabel")}
+                    </label>
+                    <p className="text-xs text-muted-foreground">
+                      {t("endpoints:edit.requireScopedApiKeyDescription")}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editForm.watch("requireScopedApiKey")}
+                    onCheckedChange={(checked) =>
+                      editForm.setValue("requireScopedApiKey", checked)
+                    }
+                    disabled={isUpdating}
+                  />
+                </div>
+              )}
 
               {/* Query Parameter Auth */}
               {editForm.watch("enableApiKeyAuth") && (

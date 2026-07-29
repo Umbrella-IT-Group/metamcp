@@ -80,6 +80,7 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
     getServer: vi.fn(),
     cleanupSession: vi.fn().mockResolvedValue(undefined),
     getMcpServerPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
+    getPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
   },
 }));
 
@@ -107,11 +108,14 @@ import {
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { hashAuthPrincipal } from "../../lib/metamcp/session-auth";
 import {
+  buildSessionsHealthPayload,
   cleanupSession,
   dispatchTracked,
+  getBoundSession,
   publicSessionSweeper,
   reapIdleSession,
   recoverPersistedSession,
+  resolveDeletableSession,
 } from "./streamable-http";
 
 function fakeAuthReq(
@@ -332,5 +336,226 @@ describe("dispatchTracked — in-flight guard around a long-lived dispatch (item
     ).rejects.toThrow("boom");
 
     expect(publicSessionSweeper.getInFlight(sessionId)).toBe(0);
+  });
+});
+
+/**
+ * Seed a session into the module's real `sessionManager` (bound to
+ * ns/ep) by driving the recovery path — the same path production uses to
+ * repopulate the in-memory map. Returns the seeded sessionId.
+ */
+async function seedBoundSession(
+  sessionId: string,
+  namespaceUuid: string,
+  endpointName: string,
+): Promise<void> {
+  const rawToken = "bound-key-value";
+  (
+    mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+  ).mockResolvedValueOnce({
+    session_id: sessionId,
+    namespace_uuid: namespaceUuid,
+    endpoint_name: endpointName,
+    auth_principal: hashAuthPrincipal(rawToken, "api_key"),
+    auth_method: "api_key",
+    init_params: {},
+    created_at: new Date(),
+    last_seen_at: new Date(),
+    gateway_boot_id: GATEWAY_BOOT_ID,
+    capability_hash: GATEWAY_CAPABILITY_HASH,
+  });
+  (
+    metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+  ).mockResolvedValueOnce({
+    server: { connect: vi.fn().mockResolvedValue(undefined) },
+    cleanup: vi.fn().mockResolvedValue(undefined),
+    handlerContext: {} as Record<string, unknown>,
+  });
+  const result = await recoverPersistedSession(
+    sessionId,
+    fakeAuthReq({
+      namespaceUuid,
+      endpointName,
+      authMethod: "api_key",
+      headers: { "x-api-key": rawToken },
+    }),
+  );
+  expect(result.status).toBe("recovered");
+}
+
+describe("getBoundSession — endpoint-binding guard on the in-memory lookup (HIGH: cross-endpoint session replay)", () => {
+  it("returns the transport when the request targets the SAME endpoint the session is bound to", async () => {
+    const sessionId = "sess-bound-match";
+    await seedBoundSession(sessionId, "ns-A", "ep-A");
+
+    const transport = getBoundSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(transport).toBeDefined();
+  });
+
+  it("returns undefined when a key for a DIFFERENT endpoint presents this session id (the replay attempt)", async () => {
+    const sessionId = "sess-bound-mismatch";
+    await seedBoundSession(sessionId, "ns-A", "ep-A");
+
+    // Same live session id, but the caller is authenticated for endpoint B.
+    // The lookup must NOT hand them endpoint A's transport — it resolves to
+    // undefined so the route falls through to a 404, never signalling the id
+    // is live on ep-A.
+    const wrongEndpoint = getBoundSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+    );
+    expect(wrongEndpoint).toBeUndefined();
+
+    // A partial match (right namespace, wrong endpoint name) is still a miss.
+    const wrongName = getBoundSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-B" }),
+    );
+    expect(wrongName).toBeUndefined();
+  });
+
+  it("returns undefined for a session id that isn't resident in memory", () => {
+    const transport = getBoundSession(
+      "sess-never-seen",
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(transport).toBeUndefined();
+  });
+});
+
+describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (round 2: guard was untested)", () => {
+  /** A persisted mcp_sessions row shaped like findById returns it. */
+  function storedRow(namespaceUuid: string, endpointName: string) {
+    return {
+      session_id: "irrelevant",
+      namespace_uuid: namespaceUuid,
+      endpoint_name: endpointName,
+      auth_principal: "hash",
+      auth_method: "api_key",
+      init_params: {},
+      created_at: new Date(),
+      last_seen_at: new Date(),
+      gateway_boot_id: GATEWAY_BOOT_ID,
+      capability_hash: GATEWAY_CAPABILITY_HASH,
+    };
+  }
+
+  it("allows the delete when the IN-MEMORY session is bound to the requesting endpoint", async () => {
+    const sessionId = "sess-del-mem-match";
+    await seedBoundSession(sessionId, "ns-A", "ep-A");
+    // Seeding itself goes through recoverPersistedSession -> findById;
+    // reset call history so the assertion below sees ONLY the resolver.
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockClear();
+
+    const resolution = await resolveDeletableSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(resolution).toEqual({ outcome: "deletable" });
+    // The in-memory branch never needs the DB.
+    expect(mcpSessionsRepository.findById).not.toHaveBeenCalled();
+  });
+
+  it("refuses (not_found) when the in-memory session is bound to a DIFFERENT endpoint — cross-endpoint teardown DoS", async () => {
+    const sessionId = "sess-del-mem-cross";
+    await seedBoundSession(sessionId, "ns-A", "ep-A");
+
+    const resolution = await resolveDeletableSession(
+      sessionId,
+      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("allows the delete when the session is NOT resident but the persisted row matches the endpoint (findById branch)", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-row-match",
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(resolution).toEqual({ outcome: "deletable" });
+  });
+
+  it("refuses (not_found) when the persisted row belongs to another endpoint — recovery-row deletion stays owner-only", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-row-cross",
+      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("refuses (not_found) when no session exists anywhere", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(null);
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-absent",
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("treats a DB lookup FAILURE as absent (fail-closed: never delete on unknown state)", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockRejectedValueOnce(new Error("connection refused"));
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-db-error",
+      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("404-shaping: absent, cross-endpoint, and lookup-failure produce IDENTICAL resolutions — the response cannot distinguish them", async () => {
+    const target = fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" });
+
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(null);
+    const absent = await resolveDeletableSession("sess-shape-absent", target);
+
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+    const cross = await resolveDeletableSession("sess-shape-cross", target);
+
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockRejectedValueOnce(new Error("boom"));
+    const dbError = await resolveDeletableSession("sess-shape-db", target);
+
+    // One outcome, zero variants — the route's single 404 site sees the
+    // same object shape for all three, so the id being live elsewhere is
+    // unobservable from the response.
+    expect(absent).toEqual({ outcome: "not_found" });
+    expect(cross).toEqual(absent);
+    expect(dbError).toEqual(absent);
+  });
+});
+
+describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/sessions id disclosure)", () => {
+  it("publishes aggregate counts + sweeper stats but never the session id list", () => {
+    const payload = buildSessionsHealthPayload();
+
+    // The old payload carried `streamableHttpSessions.sessionIds: [...]` —
+    // every live consumer's Mcp-Session-Id, unauthenticated. It must be gone.
+    expect(payload.streamableHttpSessions).toHaveProperty("count");
+    expect(payload.streamableHttpSessions).not.toHaveProperty("sessionIds");
+    expect(JSON.stringify(payload)).not.toContain("sessionIds");
+    // Monitoring still gets what it consumes.
+    expect(typeof payload.streamableHttpSessions.count).toBe("number");
+    expect(payload.publicSessionSweeper).toBeDefined();
   });
 });

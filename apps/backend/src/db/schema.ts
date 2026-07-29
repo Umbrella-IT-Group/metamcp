@@ -277,6 +277,13 @@ export const endpointsTable = pgTable(
     use_query_param_auth: boolean("use_query_param_auth")
       .notNull()
       .default(false),
+    // When true, this endpoint rejects unscoped (endpoint_uuid IS NULL)
+    // API keys: only keys explicitly scoped to THIS endpoint authenticate.
+    // The opt-out from grandfathered gateway-wide keys for sensitive
+    // endpoints. Default false = legacy behavior for existing endpoints.
+    require_scoped_api_key: boolean("require_scoped_api_key")
+      .notNull()
+      .default(false),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -384,6 +391,16 @@ export const apiKeysTable = pgTable(
     user_id: text("user_id").references(() => usersTable.id, {
       onDelete: "cascade",
     }),
+    // Endpoint scope. Non-NULL binds this key to exactly ONE endpoint —
+    // checkApiKeyAccess denies it everywhere else. NULL = legacy/unscoped
+    // (grandfathered): reaches every enable_api_key_auth endpoint, as all
+    // keys did before migration 0023. New keys must name an endpoint or pass
+    // the explicit all_endpoints escape hatch (enforced in the tRPC create
+    // path); NULL can no longer be reached silently through the app. ON
+    // DELETE CASCADE: a key bound to a deleted endpoint is revoked with it.
+    endpoint_uuid: uuid("endpoint_uuid").references(() => endpointsTable.uuid, {
+      onDelete: "cascade",
+    }),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -400,6 +417,7 @@ export const apiKeysTable = pgTable(
     index("api_keys_user_id_idx").on(table.user_id),
     index("api_keys_key_idx").on(table.key),
     index("api_keys_is_active_idx").on(table.is_active),
+    index("api_keys_endpoint_uuid_idx").on(table.endpoint_uuid),
     unique("api_keys_name_per_user_idx").on(table.user_id, table.name),
   ],
 );

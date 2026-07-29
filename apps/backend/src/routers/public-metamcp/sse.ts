@@ -11,7 +11,43 @@ import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
-import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
+import {
+  bindingMatches,
+  SessionBinding,
+  SessionLifetimeManager,
+  SessionLifetimeManagerImpl,
+} from "../../lib/session-lifetime-manager";
+
+/**
+ * Pure resolver for the `/message` leg's endpoint-binding guard — the SSE
+ * twin of streamable-http's `getBoundSession`. The message must target the
+ * SAME endpoint the SSE stream was opened on: resolving by sessionId alone
+ * would let a caller authenticated for endpoint A post messages into
+ * endpoint B's transport. A missing session and a cross-endpoint session
+ * both resolve to `not_found` so the route's 404 never signals the id is
+ * live elsewhere; `crossEndpoint` exists ONLY to drive the server-side
+ * warn log, never the response shape. Takes the manager as a parameter so
+ * the guard is unit-testable against a seeded manager (`sse.test.ts`).
+ */
+export function resolveSseMessageSession(
+  manager: Pick<
+    SessionLifetimeManager<Transport>,
+    "getSession" | "getSessionBinding"
+  >,
+  sessionId: string,
+  target: SessionBinding,
+):
+  | { outcome: "ok"; transport: Transport }
+  | { outcome: "not_found"; crossEndpoint: boolean } {
+  const transport = manager.getSession(sessionId);
+  if (
+    !transport ||
+    !bindingMatches(manager.getSessionBinding(sessionId), target)
+  ) {
+    return { outcome: "not_found", crossEndpoint: transport !== undefined };
+  }
+  return { outcome: "ok", transport };
+}
 
 const sseRouter = express.Router();
 
@@ -85,7 +121,12 @@ sseRouter.get(
         `Using MetaMCP server instance for public endpoint session ${sessionId}`,
       );
 
-      sessionManager.addSession(sessionId, webAppTransport);
+      // Bind the session to the endpoint it was opened on so the message leg
+      // below can reject a sessionId replayed against a different endpoint.
+      sessionManager.addSession(sessionId, webAppTransport, {
+        namespaceUuid,
+        endpointName,
+      });
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -109,23 +150,31 @@ sseRouter.post(
   authenticateApiKey,
   rateLimitMiddleware,
   async (req, res) => {
-    // const authReq = req as ApiKeyAuthenticatedRequest;
-    // const { namespaceUuid, endpointName } = authReq;
+    const authReq = req as ApiKeyAuthenticatedRequest;
+    const { namespaceUuid, endpointName } = authReq;
 
     try {
-      const sessionId = req.query.sessionId;
-      // logger.info(
-      //   `Received POST message for public endpoint ${endpointName} -> namespace ${namespaceUuid} sessionId ${sessionId}`,
-      // );
+      const sessionId = req.query.sessionId as string;
 
-      const transport = sessionManager.getSession(
-        sessionId as string,
-      ) as SSEServerTransport;
-      if (!transport) {
+      // Endpoint-binding guard — see resolveSseMessageSession's doc comment.
+      const resolution = resolveSseMessageSession(sessionManager, sessionId, {
+        namespaceUuid,
+        endpointName,
+      });
+      if (resolution.outcome === "not_found") {
+        if (resolution.crossEndpoint) {
+          logger.warn(
+            `SSE message for session ${sessionId} on endpoint ${endpointName} ` +
+              `rejected — session bound to a different endpoint.`,
+          );
+        }
         res.status(404).end("Session not found");
         return;
       }
-      await transport.handlePostMessage(req, res);
+      await (resolution.transport as SSEServerTransport).handlePostMessage(
+        req,
+        res,
+      );
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);
       res.status(500).json(error);

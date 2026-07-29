@@ -367,12 +367,45 @@ export const authenticateApiKey = async (
 };
 
 /**
- * Check if API key has access to the endpoint
+ * Check if API key has access to the endpoint.
+ *
+ * Scope semantics (migration 0023):
+ * - validation.endpoint_uuid non-NULL — the key is scoped to exactly ONE
+ *   endpoint and is denied everywhere else.
+ * - validation.endpoint_uuid NULL/undefined — legacy/unscoped (grandfathered):
+ *   reaches every enable_api_key_auth endpoint as before, UNLESS the endpoint
+ *   sets require_scoped_api_key, which opts it out of gateway-wide keys.
+ *
+ * Exported for unit tests (api-key-access.test.ts); production callers are the
+ * two authenticateApiKey branches above.
  */
-function checkApiKeyAccess(
-  validation: { user_id?: string | null },
+export function checkApiKeyAccess(
+  validation: { user_id?: string | null; endpoint_uuid?: string | null },
   endpoint: DatabaseEndpoint,
 ): { allowed: boolean; message?: string } {
+  const isScopedKey =
+    validation.endpoint_uuid !== null && validation.endpoint_uuid !== undefined;
+
+  // A scoped key is valid ONLY on the endpoint it is bound to.
+  if (isScopedKey && validation.endpoint_uuid !== endpoint.uuid) {
+    return {
+      allowed: false,
+      message:
+        "This API key is scoped to a different endpoint. Use a key scoped to this endpoint, or an unscoped (gateway-wide) key.",
+    };
+  }
+
+  // An endpoint may opt out of legacy gateway-wide keys entirely: when
+  // require_scoped_api_key is set, only keys explicitly scoped to THIS
+  // endpoint authenticate — unscoped (grandfathered) keys are refused.
+  if (!isScopedKey && endpoint.require_scoped_api_key) {
+    return {
+      allowed: false,
+      message:
+        "This endpoint requires an endpoint-scoped API key. Unscoped (gateway-wide) API keys are not accepted here — mint a key scoped to this endpoint.",
+    };
+  }
+
   const isPublicApiKey = validation.user_id === null;
   const isPrivateEndpoint = endpoint.user_id !== null;
 
@@ -399,7 +432,19 @@ function checkApiKeyAccess(
 }
 
 /**
- * Check if OAuth token user has access to the endpoint
+ * Check if OAuth token user has access to the endpoint.
+ *
+ * Scope note (migration 0023): `endpoint.require_scoped_api_key` is
+ * DELIBERATELY not consulted here. That toggle governs API KEYS only —
+ * it refuses grandfathered gateway-wide *keys* on a sensitive endpoint.
+ * OAuth consumers are authenticated humans identified by their better-auth
+ * user id, not bearer secrets that could be over-broadly scoped; access is
+ * already gated by endpoint ownership below (public endpoints: any
+ * authenticated user; private endpoints: the owner only), and delegated
+ * identity injection (m365) acts strictly as that user. There is no
+ * "unscoped OAuth token" to refuse, so applying the API-key-only flag to
+ * OAuth would be a category error. The flag's UI copy and the tRPC field
+ * comment state this API-key-only limit explicitly.
  */
 function checkOAuthAccess(
   oauthResult: { user_id?: string; scopes?: string[] },
