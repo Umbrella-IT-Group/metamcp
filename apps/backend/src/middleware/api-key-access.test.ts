@@ -187,9 +187,7 @@ describe("resolveActsAsUserId — acts-as honored only alongside an endpoint sco
       resolveActsAsUserId({ endpoint_uuid: null, acts_as_user_id: "alex-id" }),
     ).toBeUndefined();
     // undefined scope (row shape from a partial projection) is equally inert.
-    expect(
-      resolveActsAsUserId({ acts_as_user_id: "alex-id" }),
-    ).toBeUndefined();
+    expect(resolveActsAsUserId({ acts_as_user_id: "alex-id" })).toBeUndefined();
   });
 
   it("a scoped+bound row stamps the bound identity", () => {

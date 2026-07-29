@@ -84,9 +84,7 @@ afterEach(() => {
 describe("resolveClientIdentity — acts-as label composition", () => {
   it("labels a bound key `name (as email)`", async () => {
     const resolve = await freshResolver();
-    fixtures.apiKeysRows = [
-      { name: "sever-m365", acts_as_user_id: "alex-id" },
-    ];
+    fixtures.apiKeysRows = [{ name: "sever-m365", acts_as_user_id: "alex-id" }];
     fixtures.userRows = [{ email: "alex@example.com" }];
 
     const identity = await resolve({
@@ -132,9 +130,7 @@ describe("resolveClientIdentity — DB-error path is honest and uncached", () =>
     await resolve({ authMethod: "api_key", apiKeyUuid: KEY_UUID });
 
     fixtures.apiKeysError = false;
-    fixtures.apiKeysRows = [
-      { name: "sever-m365", acts_as_user_id: "alex-id" },
-    ];
+    fixtures.apiKeysRows = [{ name: "sever-m365", acts_as_user_id: "alex-id" }];
     fixtures.userRows = [{ email: "alex@example.com" }];
 
     const identity = await resolve({
@@ -151,9 +147,7 @@ describe("resolveClientIdentity — DB-error path is honest and uncached", () =>
 describe("resolveClientIdentity — binding cached forever, email TTL-fresh", () => {
   it("re-resolves a changed email after the TTL while never re-reading the immutable binding", async () => {
     const resolve = await freshResolver();
-    fixtures.apiKeysRows = [
-      { name: "sever-m365", acts_as_user_id: "alex-id" },
-    ];
+    fixtures.apiKeysRows = [{ name: "sever-m365", acts_as_user_id: "alex-id" }];
     fixtures.userRows = [{ email: "alex@example.com" }];
 
     const first = await resolve({
@@ -180,9 +174,7 @@ describe("resolveClientIdentity — binding cached forever, email TTL-fresh", ()
 
   it("within the TTL, repeated calls pay no extra users lookup", async () => {
     const resolve = await freshResolver();
-    fixtures.apiKeysRows = [
-      { name: "sever-m365", acts_as_user_id: "alex-id" },
-    ];
+    fixtures.apiKeysRows = [{ name: "sever-m365", acts_as_user_id: "alex-id" }];
     fixtures.userRows = [{ email: "alex@example.com" }];
 
     await resolve({ authMethod: "api_key", apiKeyUuid: KEY_UUID });

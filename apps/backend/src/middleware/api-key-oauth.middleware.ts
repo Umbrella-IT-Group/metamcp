@@ -401,7 +401,10 @@ export function resolveActsAsUserId(validation: {
   endpoint_uuid?: string | null;
   acts_as_user_id?: string | null;
 }): string | undefined {
-  if (validation.endpoint_uuid === null || validation.endpoint_uuid === undefined) {
+  if (
+    validation.endpoint_uuid === null ||
+    validation.endpoint_uuid === undefined
+  ) {
     return undefined;
   }
   return validation.acts_as_user_id || undefined;
