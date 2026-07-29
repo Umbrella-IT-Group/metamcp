@@ -41,10 +41,12 @@ type LoggedStatement = {
 const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
   const statementLog: LoggedStatement[] = [];
   const readFixtures = {
-    /** rows returned by select().from(apiKeysTable).leftJoin().where() — the preserve capture */
+    /** rows returned by select().from(apiKeysTable).leftJoin()….where() — the preserve capture */
     preservedKeyRows: [] as Record<string, unknown>[],
     /** rows returned by select().from(endpointsTable) — the restore's re-resolution load */
     endpointRows: [] as Record<string, unknown>[],
+    /** rows returned by select().from(usersTable) — the restore's acts-as email → id load */
+    userRows: [] as Record<string, unknown>[],
     /** FIFO responses for db.query.usersTable.findFirst */
     usersFindFirstQueue: [] as (Record<string, unknown> | undefined)[],
     /** FIFO responses for db.query.apiKeysTable.findFirst */
@@ -90,8 +92,17 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
       from: (table: unknown) => {
         const bareRows = tableIs(table, "endpoints")
           ? readFixtures.endpointRows
-          : [];
-        const joined = {
+          : tableIs(table, "users")
+            ? readFixtures.userRows
+            : [];
+        // Self-referencing so a query may chain any number of leftJoins
+        // (the preserve capture now joins endpoints AND the aliased
+        // acts-as users) before its terminal where().
+        const joined: {
+          leftJoin: () => unknown;
+          where: () => Promise<unknown[]>;
+        } = {
+          leftJoin: () => joined,
           where: () =>
             Promise.resolve(
               tableIs(table, "api_keys") ? readFixtures.preservedKeyRows : [],
@@ -154,6 +165,7 @@ beforeEach(() => {
   statementLog.length = 0;
   readFixtures.preservedKeyRows = [];
   readFixtures.endpointRows = [];
+  readFixtures.userRows = [];
   readFixtures.usersFindFirstQueue = [];
   readFixtures.apiKeysFindFirstQueue = [];
   for (const key of BOOTSTRAP_ENV_KEYS) {
@@ -194,20 +206,28 @@ function arrangeRecreateScenario(options?: { apiKeysEnv?: string }) {
     { id: "old-user-id", email: "admin@example.com" },
     { id: "new-user-id", email: "admin@example.com" },
   ];
-  // The preserve capture: one key scoped (by name) to the endpoint that the
-  // recreate cascade will destroy and bootstrapEndpoints will recreate.
+  // The preserve capture: one key OWNED by the doomed user, scoped (by
+  // name) to the endpoint that the recreate cascade will destroy and
+  // bootstrapEndpoints will recreate. Unbound (acts_as NULL) by default —
+  // the identity-binding scenarios override this fixture.
   readFixtures.preservedKeyRows = [
     {
       name: "tara-scoped",
       key: "sk_mt_preserved_secret",
       is_active: true,
+      user_id: "old-user-id",
       endpoint_uuid: "stale-ep-uuid",
       endpoint_name: "ep-a",
+      acts_as_user_id: null,
+      acts_as_email: null,
     },
   ];
   // The restore pass's endpoint load — post-bootstrapEndpoints state with a
   // FRESH uuid for the recreated endpoint.
   readFixtures.endpointRows = [{ uuid: "fresh-ep-uuid", name: "ep-a" }];
+  // The restore pass's users load (only issued when a preserved key carries
+  // an identity binding) — post-recreate state with the FRESH user id.
+  readFixtures.userRows = [{ id: "new-user-id", email: "admin@example.com" }];
 
   authHandlerMock.mockResolvedValue({ ok: true, text: async () => "" });
 }
@@ -381,5 +401,128 @@ describe("ensureUser early-return credential loss — preserved keys warned loud
     expect(
       warnLines().find((line) => line.includes("CANNOT be restored")),
     ).toBeUndefined();
+  });
+});
+
+describe("bootstrap wiring — acts-as identity binding across the recreate (PR #85 round 2)", () => {
+  function warnLines(): string[] {
+    return (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+  }
+
+  it("restores an identity-bound key RE-BOUND by email to the fresh user id (never the stale id, never unbound)", async () => {
+    arrangeRecreateScenario();
+    // Self-bound key (owner = acted-as user, the only mintable shape after
+    // the round-2 ownership invariant): both ids are the PRE-recreate ones.
+    readFixtures.preservedKeyRows = [
+      {
+        name: "alex-m365",
+        key: "sk_mt_bound_secret",
+        is_active: true,
+        user_id: "old-user-id",
+        endpoint_uuid: "stale-ep-uuid",
+        endpoint_name: "ep-a",
+        acts_as_user_id: "old-user-id",
+        acts_as_email: "admin@example.com",
+      },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    const apiKeyInserts = statementLog.filter(
+      (s) => s.op === "insert" && s.table === apiKeysTable,
+    );
+    expect(apiKeyInserts).toHaveLength(1);
+    // Both stale handles were re-resolved: endpoint by NAME, identity by
+    // EMAIL — each to its post-recreate value.
+    expect(apiKeyInserts[0].values).toMatchObject({
+      name: "alex-m365",
+      key: "sk_mt_bound_secret",
+      user_id: "new-user-id",
+      endpoint_uuid: "fresh-ep-uuid",
+      acts_as_user_id: "new-user-id",
+    });
+  });
+
+  it("SKIPS loudly (no unbound restore) when the acted-as email resolves to no current user", async () => {
+    arrangeRecreateScenario();
+    readFixtures.preservedKeyRows = [
+      {
+        name: "bound-to-departed",
+        key: "sk_mt_departed_secret",
+        is_active: true,
+        user_id: "old-user-id",
+        endpoint_uuid: "stale-ep-uuid",
+        endpoint_name: "ep-a",
+        acts_as_user_id: "departed-user-id",
+        acts_as_email: "departed@example.com",
+      },
+    ];
+    // Post-recreate users: the acted-as account is gone.
+    readFixtures.userRows = [{ id: "new-user-id", email: "admin@example.com" }];
+
+    await initializeEnvironmentConfiguration();
+
+    // NOT restored at all — restoring unbound would silently degrade the
+    // key (it authenticates, m365 injection fail-closes, log says restored).
+    expect(
+      statementLog.some((s) => s.op === "insert" && s.table === apiKeysTable),
+    ).toBe(false);
+    const skipLine = warnLines().find((line) =>
+      line.includes('"bound-to-departed"'),
+    );
+    expect(skipLine).toBeDefined();
+    expect(skipLine).toContain("departed@example.com");
+    expect(skipLine).toContain("NOT restored");
+    expect(skipLine).not.toContain("sk_mt_departed_secret"); // names, never values
+  });
+
+  it("counts a foreign-owned identity-bound key in the loud warn and never restores it", async () => {
+    arrangeRecreateScenario();
+    // Captured only via the acts_as edge: owned by ANOTHER user but bound
+    // to the recreated user's identity (a pre-invariant legacy row). The
+    // user delete CASCADES it away; it must be warned about, not silently
+    // destroyed — and never restored (it violates the ownership invariant).
+    readFixtures.preservedKeyRows = [
+      {
+        name: "tara-scoped",
+        key: "sk_mt_preserved_secret",
+        is_active: true,
+        user_id: "old-user-id",
+        endpoint_uuid: "stale-ep-uuid",
+        endpoint_name: "ep-a",
+        acts_as_user_id: null,
+        acts_as_email: null,
+      },
+      {
+        name: "foreign-bound-key",
+        key: "sk_mt_foreign_secret",
+        is_active: true,
+        user_id: "some-other-user",
+        endpoint_uuid: "stale-ep-uuid",
+        endpoint_name: "ep-a",
+        acts_as_user_id: "old-user-id",
+        acts_as_email: "admin@example.com",
+      },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    const foreignLine = warnLines().find((line) =>
+      line.includes("foreign-bound-key"),
+    );
+    expect(foreignLine).toBeDefined();
+    expect(foreignLine).toContain("1 API key(s)");
+    expect(foreignLine).toContain("NOT owned");
+    expect(foreignLine).toContain("CANNOT be restored");
+    expect(foreignLine).not.toContain("sk_mt_foreign_secret"); // names, never values
+
+    // Only the owned key is restored; the foreign-bound one never is.
+    const apiKeyInserts = statementLog.filter(
+      (s) => s.op === "insert" && s.table === apiKeysTable,
+    );
+    expect(apiKeyInserts).toHaveLength(1);
+    expect(apiKeyInserts[0].values).toMatchObject({ name: "tara-scoped" });
   });
 });

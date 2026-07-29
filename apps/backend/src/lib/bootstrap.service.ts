@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
 
 import { ConfigKeyEnum } from "@repo/zod-types";
-import { and, eq, isNull, notInArray } from "drizzle-orm";
+import { and, eq, isNull, notInArray, or } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 
 import { auth } from "../auth";
 import { db } from "../db";
@@ -32,6 +33,16 @@ import {
  * NAME is the only stable handle to re-resolve the scope against. The
  * preserve projection is typed to this shape, so dropping either field
  * from the select is a compile error, not a silent regression.
+ *
+ * `acts_as_user_id` + `acts_as_email` (migration 0024) are the identity
+ * binding's pair of handles, with EXACTLY the endpoint pair's split of
+ * roles: the recreate deletes the user row and better-auth sign-up mints a
+ * brand-new id, so the preserved user id is stale by restore time and the
+ * EMAIL is the only stable handle to re-resolve the binding against.
+ * Restoring a bound key WITHOUT its binding would be silent degradation
+ * (the key authenticates, m365 injection fail-closes, the log says
+ * restored) — a bound key whose identity cannot be re-resolved is SKIPPED
+ * loudly instead.
  */
 export interface PreservedApiKey {
   name: string;
@@ -39,13 +50,17 @@ export interface PreservedApiKey {
   is_active: boolean;
   endpoint_uuid: string | null;
   endpoint_name: string | null;
+  acts_as_user_id: string | null;
+  acts_as_email: string | null;
 }
 
 /** One key restore that could not be performed, with why — surfaced loudly. */
 export interface SkippedApiKeyRestore {
   keyName: string;
+  reason: "endpoint_missing" | "acts_as_unresolvable";
   endpointName: string | null;
   endpointUuid: string | null;
+  actsAsEmail: string | null;
 }
 
 /**
@@ -64,11 +79,19 @@ export interface SkippedApiKeyRestore {
  * - A scoped key whose endpoint no longer exists (or whose name could not
  *   be captured at preserve time) is SKIPPED — NEVER restored with a NULL
  *   scope, which would silently widen it to gateway-wide.
+ * - An identity-bound key (`acts_as_user_id` non-NULL, migration 0024)
+ *   restores ONLY by re-resolving its acted-as EMAIL to the user's CURRENT
+ *   id (`userIdByEmail` — the post-`bootstrapUsers` state; the recreate
+ *   mints a fresh user id, so the preserved id is stale). If the email is
+ *   missing or resolves to no current user, the key is SKIPPED — NEVER
+ *   restored unbound (silent degradation: the key would authenticate while
+ *   m365 injection fail-closes) and never bound to a guessed identity.
  */
 export function planPreservedApiKeyRestores(
   keys: PreservedApiKey[],
   userId: string,
   endpointUuidByName: ReadonlyMap<string, string>,
+  userIdByEmail: ReadonlyMap<string, string>,
 ): {
   restores: {
     name: string;
@@ -76,6 +99,7 @@ export function planPreservedApiKeyRestores(
     user_id: string;
     is_active: boolean;
     endpoint_uuid: string | null;
+    acts_as_user_id: string | null;
   }[];
   skipped: SkippedApiKeyRestore[];
 } {
@@ -85,6 +109,7 @@ export function planPreservedApiKeyRestores(
     user_id: string;
     is_active: boolean;
     endpoint_uuid: string | null;
+    acts_as_user_id: string | null;
   }[] = [];
   const skipped: SkippedApiKeyRestore[] = [];
 
@@ -98,19 +123,42 @@ export function planPreservedApiKeyRestores(
       if (currentUuid === undefined) {
         skipped.push({
           keyName: k.name,
+          reason: "endpoint_missing",
           endpointName: k.endpoint_name,
           endpointUuid: k.endpoint_uuid,
+          actsAsEmail: k.acts_as_email,
         });
         continue;
       }
       resolvedEndpointUuid = currentUuid;
     }
+
+    let resolvedActsAsUserId: string | null = null;
+    if (k.acts_as_user_id !== null) {
+      const currentId =
+        k.acts_as_email !== null
+          ? userIdByEmail.get(k.acts_as_email)
+          : undefined;
+      if (currentId === undefined) {
+        skipped.push({
+          keyName: k.name,
+          reason: "acts_as_unresolvable",
+          endpointName: k.endpoint_name,
+          endpointUuid: k.endpoint_uuid,
+          actsAsEmail: k.acts_as_email,
+        });
+        continue;
+      }
+      resolvedActsAsUserId = currentId;
+    }
+
     restores.push({
       name: k.name,
       key: k.key,
       user_id: userId,
       is_active: k.is_active,
       endpoint_uuid: resolvedEndpointUuid,
+      acts_as_user_id: resolvedActsAsUserId,
     });
   }
 
@@ -486,11 +534,25 @@ async function ensureUser(
 
     if (config.preserveApiKeysOnRecreate) {
       try {
-        preservedUserApiKeys = await db
+        // Second users join, aliased: acts_as_user_id → the acted-as user's
+        // CURRENT email — the stable handle the deferred restore re-resolves
+        // the binding against (the user id minted by the recreate's sign-up
+        // is different, so the preserved id is stale by restore time).
+        const actsAsUsers = alias(usersTable, "acts_as_users");
+        // The capture must cover BOTH edges into the doomed user row:
+        // keys the user OWNS (user_id) — the restorable set — and keys that
+        // merely ACT AS them (acts_as_user_id, migration 0024) while being
+        // owned elsewhere (public or another user). The latter die via the
+        // acts_as FK's ON DELETE CASCADE when the user row is deleted below;
+        // they cannot be restored (an identity-bound key must be owned by
+        // the identity it exercises — post-round-2 rule; such rows predate
+        // it), but their destruction must be LOUD, never silent.
+        const capturedRows = await db
           .select({
             name: apiKeysTable.name,
             key: apiKeysTable.key,
             is_active: apiKeysTable.is_active,
+            user_id: apiKeysTable.user_id,
             // Load-bearing pair: `endpoint_uuid` marks the key as scoped and
             // `endpoint_name` (left join — NULL for unscoped keys) is the
             // stable handle the deferred restore re-resolves the scope
@@ -498,13 +560,51 @@ async function ensureUser(
             // delete below cascades user-owned endpoints away.
             endpoint_uuid: apiKeysTable.endpoint_uuid,
             endpoint_name: endpointsTable.name,
+            // Same split of roles for the identity binding (see the
+            // PreservedApiKey doc comment).
+            acts_as_user_id: apiKeysTable.acts_as_user_id,
+            acts_as_email: actsAsUsers.email,
           })
           .from(apiKeysTable)
           .leftJoin(
             endpointsTable,
             eq(apiKeysTable.endpoint_uuid, endpointsTable.uuid),
           )
-          .where(eq(apiKeysTable.user_id, existing.id));
+          .leftJoin(
+            actsAsUsers,
+            eq(apiKeysTable.acts_as_user_id, actsAsUsers.id),
+          )
+          .where(
+            or(
+              eq(apiKeysTable.user_id, existing.id),
+              eq(apiKeysTable.acts_as_user_id, existing.id),
+            ),
+          );
+
+        const ownedKeys: PreservedApiKey[] = [];
+        const foreignBoundKeyNames: string[] = [];
+        for (const row of capturedRows) {
+          if (row.user_id === existing.id) {
+            ownedKeys.push({
+              name: row.name,
+              key: row.key,
+              is_active: row.is_active,
+              endpoint_uuid: row.endpoint_uuid ?? null,
+              endpoint_name: row.endpoint_name ?? null,
+              acts_as_user_id: row.acts_as_user_id ?? null,
+              acts_as_email: row.acts_as_email ?? null,
+            });
+          } else {
+            foreignBoundKeyNames.push(row.name);
+          }
+        }
+        preservedUserApiKeys = ownedKeys;
+
+        if (foreignBoundKeyNames.length > 0) {
+          console.warn(
+            `⚠️ ${foreignBoundKeyNames.length} API key(s) bound to ${email}'s identity but NOT owned by them (public or another user's) will be DELETED by the recreate cascade and CANNOT be restored — an identity-bound key must be owned by the identity it exercises: ${foreignBoundKeyNames.join(", ")}. Re-mint compliant keys if still needed.`,
+          );
+        }
       } catch (err) {
         console.warn(`⚠️ Failed to preserve API keys for ${email}:`, err);
       }
@@ -698,8 +798,39 @@ async function restorePreservedApiKeys(
     return;
   }
 
+  // The acted-as email → CURRENT user id map, for re-binding identity-bound
+  // keys (migration 0024). Loaded only when some preserved key actually
+  // carries a binding — and, symmetrically with the endpoints load above,
+  // a failed load aborts the restore LOUDLY rather than restoring blind
+  // (an unbound restore of a bound key is silent degradation; a guessed
+  // binding is worse).
+  let userIdByEmail: Map<string, string> = new Map();
+  const anyBound = pending.some((p) =>
+    p.keys.some((k) => k.acts_as_user_id !== null),
+  );
+  if (anyBound) {
+    try {
+      const userRows = await db
+        .select({ id: usersTable.id, email: usersTable.email })
+        .from(usersTable);
+      userIdByEmail = new Map(userRows.map((row) => [row.email, row.id]));
+    } catch (err) {
+      const total = pending.reduce((sum, p) => sum + p.keys.length, 0);
+      console.warn(
+        `⚠️ Failed to load users for API key restore — ${total} preserved key(s) NOT restored (identity-bound keys cannot be re-bound without the email → user map):`,
+        err,
+      );
+      return;
+    }
+  }
+
   for (const { userId, email, keys } of pending) {
-    const plan = planPreservedApiKeyRestores(keys, userId, endpointUuidByName);
+    const plan = planPreservedApiKeyRestores(
+      keys,
+      userId,
+      endpointUuidByName,
+      userIdByEmail,
+    );
 
     let restored = 0;
     let failed = 0;
@@ -716,6 +847,9 @@ async function restorePreservedApiKeys(
               // Restore the scope on conflict too, otherwise a pre-existing
               // row could keep a stale (or NULL) scope.
               endpoint_uuid: values.endpoint_uuid,
+              // Same for the identity binding — a conflicting row must not
+              // keep a stale (or NULL) acts-as identity.
+              acts_as_user_id: values.acts_as_user_id,
             },
           });
         restored++;
@@ -729,9 +863,15 @@ async function restorePreservedApiKeys(
     }
 
     for (const skip of plan.skipped) {
-      console.warn(
-        `⚠️ Preserved API key "${skip.keyName}" for ${email} was scoped to endpoint "${skip.endpointName ?? `uuid ${skip.endpointUuid}`}", which no longer exists after the recreate — key NOT restored (a NULL-scope restore would widen it to gateway-wide). Re-mint it against the intended endpoint.`,
-      );
+      if (skip.reason === "acts_as_unresolvable") {
+        console.warn(
+          `⚠️ Preserved API key "${skip.keyName}" for ${email} was bound to acts-as identity "${skip.actsAsEmail ?? "unknown (email not captured)"}", which cannot be resolved to a current user after the recreate — key NOT restored (restoring it unbound would silently degrade an identity key; restoring with a guessed identity is worse). Re-mint it against the intended user.`,
+        );
+      } else {
+        console.warn(
+          `⚠️ Preserved API key "${skip.keyName}" for ${email} was scoped to endpoint "${skip.endpointName ?? `uuid ${skip.endpointUuid}`}", which no longer exists after the recreate — key NOT restored (a NULL-scope restore would widen it to gateway-wide). Re-mint it against the intended endpoint.`,
+        );
+      }
     }
 
     console.log(
