@@ -45,8 +45,10 @@ run_migrations() {
 # here. Doing it in the entrypoint (rather than in docker-compose.yml) means it
 # works for `docker run -e`, Kubernetes, and compose alike, and it happens
 # before either server process starts — so the server render and the client
-# hydration can never resolve different brands. An explicitly-set
-# NEXT_PUBLIC_ value always wins; unset aliases are a no-op.
+# hydration can never resolve different brands. Any NON-EMPTY NEXT_PUBLIC_
+# value wins; an explicitly-empty one is treated as unset and the alias still
+# promotes, matching resolveBrandText's empty-means-unset rule. Unset aliases
+# are a no-op.
 for _brand_key in PRODUCT_NAME ORG_NAME LOGO_PATH DESCRIPTION; do
     _public_var="NEXT_PUBLIC_BRANDING_${_brand_key}"
     _alias_var="BRANDING_${_brand_key}"

@@ -80,9 +80,10 @@ describe("resolveLogoPath", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  // next/image throws on a src whose host is not in images.remotePatterns, and
-  // this renders in the layout wrapping every authenticated page — so a bad
-  // value must degrade to the default LOUDLY rather than 500 the whole UI.
+  // A host next/image doesn't accept crashes the dev UI (the check is
+  // dev-only) and, in production, yields a silently broken logo behind an
+  // opaque optimizer 400 — so a bad value must degrade to the bundled default
+  // LOUDLY. See resolveLogoPath's docstring for the full rationale.
   it.each([
     ["https://cdn.example.com/logo.png", "absolute URL"],
     ["//cdn.example.com/logo.png", "protocol-relative URL"],

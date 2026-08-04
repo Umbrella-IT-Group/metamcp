@@ -59,14 +59,30 @@ export function resolveBrandText(
 }
 
 /**
- * The logo is rendered with `next/image`, which THROWS on a src whose host is
- * not declared in `next.config.js` `images.remotePatterns`. That component
- * sits in the sidebar layout wrapping every authenticated page, so a typo'd
- * env var pointing at an external URL would take the entire UI down. A
- * cosmetic setting must not be able to do that, so the accepted contract is
- * narrow: an app-served absolute path only (leading "/", and not the
- * protocol-relative "//host/..." form). Anything else falls back to the
- * bundled default and says so on stderr rather than degrading silently.
+ * The accepted contract is narrow: an app-served absolute path only (leading
+ * "/", and not the protocol-relative "//host/..." form). Anything else falls
+ * back to the bundled default and says so on stderr rather than degrading
+ * silently.
+ *
+ * Why reject a remote URL rather than pass it through: `next/image` only
+ * accepts a host declared in `next.config.js` `images.remotePatterns`, and its
+ * two failure modes are both bad. In `next dev` it THROWS (the check in
+ * `next/dist/shared/lib/image-loader.js` is wrapped in
+ * `NODE_ENV !== 'production'` — Next's own comment there reads "this should
+ * only error in development") and this component sits in the layout wrapping
+ * every authenticated page, so a typo'd env var crashes the dev UI outright.
+ * In production that check is compiled out, so instead the optimizer answers
+ * `400 "url" parameter is not allowed` and the operator gets a silently broken
+ * logo behind an opaque status code. A working default plus a loud warning
+ * beats both. (Declaring a remote host would also mean editing
+ * `next.config.js` — i.e. an image rebuild, which is exactly what this feature
+ * exists to avoid.)
+ *
+ * This validates the SHAPE, it does not sanitize: `/a/../b` and backslash
+ * forms pass. That is fine — the value is operator-supplied container config,
+ * and any `/`-leading url is served internally by the image optimizer (no
+ * outbound fetch, no filesystem escape), so a malformed one yields an internal
+ * 400/404 rather than reaching anything.
  *
  * Serving a custom image: mount it into the container under
  * `apps/frontend/public/` (a subdirectory such as `/branding` keeps the
