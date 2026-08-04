@@ -12,6 +12,7 @@ import { logsImplementations } from "../trpc/logs.impl";
 import { mcpServersImplementations } from "../trpc/mcp-servers.impl";
 import { namespacesImplementations } from "../trpc/namespaces.impl";
 import { oauthImplementations } from "../trpc/oauth.impl";
+import { oauthClientsImplementations } from "../trpc/oauth-clients.impl";
 import { toolsImplementations } from "../trpc/tools.impl";
 
 // Create the app router with implementations
@@ -21,6 +22,7 @@ const appRouter = createAppRouter({
     namespaces: namespacesImplementations,
     endpoints: endpointsImplementations,
     oauth: oauthImplementations,
+    oauthClients: oauthClientsImplementations,
     tools: toolsImplementations,
     apiKeys: apiKeysImplementations,
     config: configImplementations,

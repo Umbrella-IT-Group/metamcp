@@ -6,7 +6,7 @@ import {
   OAuthClient,
   OAuthClientCreateInput,
 } from "@repo/zod-types";
-import { eq, lt, and, isNull } from "drizzle-orm";
+import { eq, lt, and, isNull, desc } from "drizzle-orm";
 
 import { db } from "../index";
 import {
@@ -38,6 +38,35 @@ export class OAuthRepository {
           updated_at: new Date(),
         },
       });
+  }
+
+  // Admin listing for the OAuth Clients management UI. Newest first, matching
+  // how every other admin list in the app is ordered. Returns whole rows: the
+  // caller (the tRPC impl) is responsible for dropping `client_secret` before
+  // it leaves the server — see OAuthClientsSerializer.
+  async listClients(): Promise<OAuthClient[]> {
+    return db
+      .select()
+      .from(oauthClientsTable)
+      .orderBy(desc(oauthClientsTable.created_at));
+  }
+
+  // Hard delete — there is no is_active/soft-delete column on oauth_clients,
+  // same as api_keys. Both child tables (oauth_authorization_codes,
+  // oauth_access_tokens) declare `onDelete: "cascade"` against client_id, so
+  // removing the client also revokes every code and token already issued to
+  // it. That cascade is the point: deleting a client the operator no longer
+  // trusts must not leave live tokens behind.
+  //
+  // Returns false when no row matched, so the caller can answer "not found"
+  // instead of reporting a successful delete that deleted nothing.
+  async deleteClient(clientId: string): Promise<boolean> {
+    const deleted = await db
+      .delete(oauthClientsTable)
+      .where(eq(oauthClientsTable.client_id, clientId))
+      .returning({ client_id: oauthClientsTable.client_id });
+
+    return deleted.length > 0;
   }
 
   // ===== Authorization Codes =====
