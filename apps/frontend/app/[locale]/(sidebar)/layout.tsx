@@ -36,6 +36,7 @@ import {
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
+import { getBranding } from "@/lib/branding";
 import { getLocalizedPath, SupportedLocale } from "@/lib/i18n";
 
 // Menu items function - now takes locale parameter
@@ -154,6 +155,7 @@ export default function SidebarLayout({
 }) {
   const { t, locale } = useTranslations();
   const items = getMenuItems(t, locale);
+  const { orgName, logoPath } = getBranding();
 
   return (
     <SidebarProvider>
@@ -162,20 +164,25 @@ export default function SidebarLayout({
             uses the square color "Umbrella Bug" brandmark + the
             "Umbrella IT" text. Square asset renders crisply in the
             sidebar at any size; the previous wordmark-only attempt
-            relied on a 3:1 aspect ratio that didn't fit. */}
+            relied on a 3:1 aspect ratio that didn't fit.
+
+            Both the mark and the text are deployment-configurable (see
+            lib/branding.ts); the defaults are those same Umbrella assets.
+            Width is `w-auto` rather than a fixed `w-10` so a non-square
+            replacement logo scales on its own aspect ratio instead of being
+            squashed into a square box — for the square default the rendered
+            box is 40x40 either way. */}
         <SidebarHeader className="flex flex-col justify-center items-center px-2 py-4">
           <div className="flex items-center justify-center w-full mb-2 gap-3">
             <Image
-              src="/umbrella-bug.png"
-              alt="Umbrella IT Group"
+              src={logoPath}
+              alt={orgName}
               width={256}
               height={256}
               priority
-              className="h-10 w-10"
+              className="h-10 w-auto"
             />
-            <h2 className="text-xl font-semibold leading-tight">
-              Umbrella IT
-            </h2>
+            <h2 className="text-xl font-semibold leading-tight">{orgName}</h2>
           </div>
         </SidebarHeader>
 

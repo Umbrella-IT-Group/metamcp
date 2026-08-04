@@ -7,6 +7,14 @@
     "DATABASE_URL",
     "BETTER_AUTH_SECRET",
     "NEXT_PUBLIC_APP_URL",
+    "NEXT_PUBLIC_BRANDING_PRODUCT_NAME",
+    "NEXT_PUBLIC_BRANDING_ORG_NAME",
+    "NEXT_PUBLIC_BRANDING_LOGO_PATH",
+    "NEXT_PUBLIC_BRANDING_DESCRIPTION",
+    "BRANDING_PRODUCT_NAME",
+    "BRANDING_ORG_NAME",
+    "BRANDING_LOGO_PATH",
+    "BRANDING_DESCRIPTION",
     "OIDC_CLIENT_ID",
     "OIDC_CLIENT_SECRET",
     "OIDC_DISCOVERY_URL",
@@ -73,6 +81,9 @@
     },
     "check-types": {
       "dependsOn": ["^check-types"]
+    },
+    "test": {
+      "dependsOn": ["^test"]
     },
     "dev": {
       "cache": false,

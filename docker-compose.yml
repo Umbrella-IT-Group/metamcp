@@ -34,7 +34,34 @@ services:
       
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
-      
+
+      # ========================================================================
+      # White-label branding (optional)
+      # ========================================================================
+      # Unset = the Umbrella branding this image has always shipped. Setting
+      # any of these rebrands that surface without an image rebuild — the
+      # frontend resolves them per request, so `docker compose up -d` (or any
+      # container restart) is enough.
+      #
+      # No `environment:` entry is needed for these: `env_file: .env` above
+      # already passes them into the container, and docker-entrypoint.sh
+      # promotes the short names to the NEXT_PUBLIC_-prefixed ones the
+      # frontend reads. Just put them in .env:
+      #
+      #   BRANDING_PRODUCT_NAME="Personal MCP Gateway"   # browser-tab title
+      #   BRANDING_ORG_NAME="Ivantsov"                   # name beside the logo
+      #   BRANDING_LOGO_PATH="/branding/logo.png"        # see volume below
+      #   BRANDING_DESCRIPTION="..."                     # <meta description>
+      #
+      # A custom logo is a mounted file, not a rebuild — add to `volumes:`:
+      #
+      #   - ./branding/logo.png:/app/apps/frontend/public/branding/logo.png:ro
+      #
+      # Mount a file (or a subdirectory such as .../public/branding), never
+      # .../public itself — that would shadow the bundled assets. Next
+      # enumerates public/ once at server start, so the file has to exist
+      # before the container starts; swapping it later needs a restart.
+
       # ========================================================================
       # Bootstrap Configuration Examples
       # ========================================================================

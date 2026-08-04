@@ -36,6 +36,31 @@ run_migrations() {
     cd /app
 }
 
+# Umbrella fork: white-label branding aliases.
+#
+# The frontend reads branding through next-runtime-env, which only republishes
+# NEXT_PUBLIC_-prefixed vars to the browser — and the sidebar brand is a client
+# component, so the canonical names must carry that prefix. Operators should
+# not have to care, so accept the short BRANDING_* names too and promote them
+# here. Doing it in the entrypoint (rather than in docker-compose.yml) means it
+# works for `docker run -e`, Kubernetes, and compose alike, and it happens
+# before either server process starts — so the server render and the client
+# hydration can never resolve different brands. Any NON-EMPTY NEXT_PUBLIC_
+# value wins; an explicitly-empty one is treated as unset and the alias still
+# promotes, matching resolveBrandText's empty-means-unset rule. Unset aliases
+# are a no-op.
+for _brand_key in PRODUCT_NAME ORG_NAME LOGO_PATH DESCRIPTION; do
+    _public_var="NEXT_PUBLIC_BRANDING_${_brand_key}"
+    _alias_var="BRANDING_${_brand_key}"
+    _public_val=$(eval "printf '%s' \"\${${_public_var}:-}\"")
+    _alias_val=$(eval "printf '%s' \"\${${_alias_var}:-}\"")
+    if [ -z "$_public_val" ] && [ -n "$_alias_val" ]; then
+        export "$_public_var=$_alias_val"
+        echo "Branding: promoted ${_alias_var} -> ${_public_var}"
+    fi
+done
+unset _brand_key _public_var _alias_var _public_val _alias_val
+
 # Set default values for postgres connection if not provided
 POSTGRES_HOST=${POSTGRES_HOST:-postgres}
 POSTGRES_PORT=${POSTGRES_PORT:-5432}
