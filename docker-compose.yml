@@ -1,7 +1,14 @@
 services:
   app:
     container_name: metamcp
-    image: ghcr.io/metatool-ai/metamcp:latest
+    # THE FORK IMAGE, not upstream's. This compose is what the README quick
+    # start tells you to run, so pointing it back at upstream's GHCR namespace
+    # silently deploys upstream MetaMCP from a clone of this fork — you get
+    # none of the fork's fixes (OAuth refresh-token grant, configurable TTLs,
+    # session recovery, RBAC, pool-cap env wiring) and nothing errors to tell
+    # you. Built from `umbrella` on every push by
+    # .github/workflows/umbrella-build.yml.
+    image: ghcr.io/umbrella-it-group/metamcp:latest
     pull_policy: always
     env_file:
       - .env
