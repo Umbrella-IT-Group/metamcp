@@ -202,3 +202,122 @@ export type OAuthAccessToken = z.infer<typeof OAuthAccessTokenSchema>;
 export type OAuthAccessTokenCreateInput = z.infer<
   typeof OAuthAccessTokenCreateInputSchema
 >;
+
+// ===== Registered-client administration (admin UI) =====
+
+// The value sets RFC 7591 registration accepts. Declared in the shared
+// contract package — not inline in the express DCR handler where they used to
+// live — because there are now TWO ways to mint a client (the public DCR
+// endpoint and the admin UI) and a second copy of these lists would let the
+// UI offer an option the server rejects. The backend registration core and
+// the tRPC contract both validate against these.
+export const OAuthGrantTypeEnum = z.enum([
+  "authorization_code",
+  "refresh_token",
+  "client_credentials",
+]);
+export const OAuthResponseTypeEnum = z.enum(["code"]);
+export const OAuthTokenEndpointAuthMethodEnum = z.enum([
+  "none",
+  "client_secret_post",
+  "client_secret_basic",
+]);
+
+// Defaults mirror the OAuth 2.1 posture the DCR handler already applied:
+// PKCE-only public client ("none" — no secret is minted at all), the single
+// authorization_code grant, and the `code` response type.
+export const CreateOAuthClientRequestSchema = z.object({
+  client_name: z.string().min(1, "Name is required").max(255),
+  redirect_uris: z
+    .array(z.string().min(1))
+    .min(1, "At least one redirect URI is required"),
+  token_endpoint_auth_method: OAuthTokenEndpointAuthMethodEnum.default("none"),
+  grant_types: z
+    .array(OAuthGrantTypeEnum)
+    .min(1)
+    .default(["authorization_code"]),
+  response_types: z.array(OAuthResponseTypeEnum).min(1).default(["code"]),
+  scope: z.string().min(1).default("admin"),
+});
+
+// The ONE response that ever carries `client_secret`. It is returned straight
+// from the mint and never read back out of the database by any other route —
+// the list schema below deliberately has no field for it — so the UI's
+// "you will not see this secret again" promise is enforced by the contract,
+// not just by the dialog. `client_secret` is null for a PKCE public client
+// ("none"), where no secret is generated in the first place.
+export const CreateOAuthClientResponseSchema = z.object({
+  client_id: z.string(),
+  client_secret: z.string().nullable(),
+  client_name: z.string(),
+  redirect_uris: z.array(z.string()),
+  grant_types: z.array(z.string()),
+  response_types: z.array(z.string()),
+  token_endpoint_auth_method: z.string(),
+  scope: z.string().nullable(),
+  created_at: z.date(),
+});
+
+// Admin listing. Mirrors the api-key admin view's rule (AdminApiKeyItemSchema)
+// — the stored secret is NEVER echoed back, only whether one exists, so the
+// list route cannot become a credential-exfiltration surface.
+export const OAuthClientListItemSchema = z.object({
+  client_id: z.string(),
+  client_name: z.string(),
+  redirect_uris: z.array(z.string()),
+  grant_types: z.array(z.string()),
+  response_types: z.array(z.string()),
+  token_endpoint_auth_method: z.string(),
+  scope: z.string().nullable(),
+  has_client_secret: z.boolean(),
+  created_at: z.date(),
+  updated_at: z.date().nullable(),
+});
+
+export const ListOAuthClientsResponseSchema = z.object({
+  clients: z.array(OAuthClientListItemSchema),
+});
+
+export const DeleteOAuthClientRequestSchema = z.object({
+  client_id: z.string().min(1),
+});
+
+export const DeleteOAuthClientResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string(),
+});
+
+// Form-side schema for the create dialog. redirect_uris is a newline-separated
+// STRING here, not an array: the frontend has no useFieldArray anywhere and
+// renders every multi-value input as a Textarea split at submit time (the same
+// convention mcp-servers uses for `env`). The page parses this into the
+// string[] CreateOAuthClientRequestSchema expects.
+export const CreateOAuthClientFormSchema = z.object({
+  client_name: z.string().min(1, "Name is required").max(255),
+  redirect_uris: z.string().min(1, "At least one redirect URI is required"),
+  token_endpoint_auth_method: OAuthTokenEndpointAuthMethodEnum,
+  scope: z.string().min(1, "Scope is required"),
+});
+
+export type OAuthGrantType = z.infer<typeof OAuthGrantTypeEnum>;
+export type OAuthResponseType = z.infer<typeof OAuthResponseTypeEnum>;
+export type OAuthTokenEndpointAuthMethod = z.infer<
+  typeof OAuthTokenEndpointAuthMethodEnum
+>;
+export type CreateOAuthClientRequest = z.infer<
+  typeof CreateOAuthClientRequestSchema
+>;
+export type CreateOAuthClientResponse = z.infer<
+  typeof CreateOAuthClientResponseSchema
+>;
+export type CreateOAuthClientForm = z.infer<typeof CreateOAuthClientFormSchema>;
+export type OAuthClientListItem = z.infer<typeof OAuthClientListItemSchema>;
+export type ListOAuthClientsResponse = z.infer<
+  typeof ListOAuthClientsResponseSchema
+>;
+export type DeleteOAuthClientRequest = z.infer<
+  typeof DeleteOAuthClientRequestSchema
+>;
+export type DeleteOAuthClientResponse = z.infer<
+  typeof DeleteOAuthClientResponseSchema
+>;

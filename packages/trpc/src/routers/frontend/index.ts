@@ -5,12 +5,14 @@ import { createLogsRouter } from "./logs";
 import { createMcpServersRouter } from "./mcp-servers";
 import { createNamespacesRouter } from "./namespaces";
 import { createOAuthRouter } from "./oauth";
+import { createOAuthClientsRouter } from "./oauth-clients";
 import { createToolsRouter } from "./tools";
 
 export { createMcpServersRouter };
 export { createNamespacesRouter };
 export { createEndpointsRouter };
 export { createOAuthRouter };
+export { createOAuthClientsRouter };
 export { createToolsRouter };
 export { createApiKeysRouter };
 export { createConfigRouter };
@@ -21,6 +23,7 @@ export const createFrontendRouter = (implementations: {
   namespaces: Parameters<typeof createNamespacesRouter>[0];
   endpoints: Parameters<typeof createEndpointsRouter>[0];
   oauth: Parameters<typeof createOAuthRouter>[0];
+  oauthClients: Parameters<typeof createOAuthClientsRouter>[0];
   tools: Parameters<typeof createToolsRouter>[0];
   apiKeys: Parameters<typeof createApiKeysRouter>[0];
   config: Parameters<typeof createConfigRouter>[0];
@@ -31,6 +34,7 @@ export const createFrontendRouter = (implementations: {
     namespaces: createNamespacesRouter(implementations.namespaces),
     endpoints: createEndpointsRouter(implementations.endpoints),
     oauth: createOAuthRouter(implementations.oauth),
+    oauthClients: createOAuthClientsRouter(implementations.oauthClients),
     tools: createToolsRouter(implementations.tools),
     apiKeys: createApiKeysRouter(implementations.apiKeys),
     config: createConfigRouter(implementations.config),

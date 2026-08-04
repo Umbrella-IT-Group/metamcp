@@ -23,6 +23,7 @@ export {
   createToolsRouter,
   createLogsRouter,
   createOAuthRouter,
+  createOAuthClientsRouter,
 } from "./routers/frontend";
 
 // Export all zod types for convenience

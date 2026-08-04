@@ -12,6 +12,7 @@ export const createAppRouter = (implementations: {
       namespaces: frontendRouters.namespaces,
       endpoints: frontendRouters.endpoints,
       oauth: frontendRouters.oauth,
+      oauthClients: frontendRouters.oauthClients,
       tools: frontendRouters.tools,
       apiKeys: frontendRouters.apiKeys,
       config: frontendRouters.config,

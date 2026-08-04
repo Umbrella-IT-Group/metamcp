@@ -3,6 +3,7 @@
 import {
   FileTerminal,
   Key,
+  KeyRound,
   Link as LinkIcon,
   Package,
   Search,
@@ -69,6 +70,11 @@ const getMenuItems = (t: (key: string) => string, locale: SupportedLocale) => [
     title: t("navigation:apiKeys"),
     url: getLocalizedPath("/api-keys", locale),
     icon: Key,
+  },
+  {
+    title: t("navigation:oauthClients"),
+    url: getLocalizedPath("/oauth-clients", locale),
+    icon: KeyRound,
   },
   {
     title: t("navigation:settings"),
