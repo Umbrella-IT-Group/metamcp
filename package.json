@@ -9,6 +9,7 @@
     "dev:docker:clean": "docker compose -f docker-compose.dev.yml down -v --remove-orphans",
     "lint": "turbo run lint",
     "lint:fix": "turbo run lint:fix",
+    "test": "turbo run test",
     "format": "prettier --write \"**/*.{ts,tsx,md}\"",
     "check-types": "turbo run check-types"
   },
