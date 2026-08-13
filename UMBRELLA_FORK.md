@@ -190,6 +190,38 @@ When we write a patch that's not Umbrella-specific (env-var fallbacks, bug fixes
 
 The cherry-pick log doubles as our own upstream-PR backlog — anything in "Our own patches" is a candidate.
 
+## Deferred / future work
+
+### MCP spec 2026-07-28 catch-up (the "sessionless rewrite"), parked 2026-08-13
+
+Source: a 2026-08-13 research session (~500K tokens) that read the MCP spec revision dated 2026-07-28 end to end against this fork and the wider Umbrella MCP platform. Operator ruling that night, verbatim: park Phase 2-3 with the ideas in the repo, revisit at a later date (probably next year), after double-checking our systems will support it. Two phases, filed as the paired counterpart to `Umbrella-MCP-Server` `docs/TASKLIST.md`, "MetaMCP fork backlog" section (`MCP-SPEC-2026-07-28-PHASE2` / `MCP-SPEC-2026-07-28-PHASE3`), where the full writeup lives. This is the pointer, not a duplicate; read that entry before starting anything below.
+
+**Phase 2, gated on three named triggers (verify each, then re-verify the operator's own systems-support gate before starting):**
+
+1. TypeScript `@modelcontextprotocol/sdk` v2 goes STABLE. Currently 2.0.0 beta, itself a package split (core/client/server/...) rather than a drop-in bump. This fork pins v1 today: `apps/backend/package.json` and `apps/frontend/package.json` both carry `1.29.0` (fork PR #64's zod v4 migration).
+2. `fastmcp` 4.0 goes STABLE. Currently 4.0.0b2. The 4.x line serves sessionless alongside the handshake era (dual support), which is the property every backend MCP depends on existing before this bump touches anything.
+3. claude.ai connectors actually negotiate protocol version 2026-07-28. Per Anthropic's docs fetched 2026-08-13, connector support today goes only through 2025-11-25.
+
+Key facts a 2027 resumer needs on this fork specifically:
+
+- The gateway must stay dual-era (serving both the pre-rewrite handshake protocol and the new sessionless one) for as long as any Claude surface we serve, meaning every claude.ai connector today, still speaks handshake-era. No flag day exists in the spec that forces a cutover.
+- This fork carries zero hardcoded `protocolVersion` anywhere; the SDK negotiates it. That removes one migration step but not the one below.
+- `apps/backend/src/lib/metamcp/transport-recovery-hydration.ts` is the number one migration risk. It reaches into SDK-private internals to hydrate lazily-recovered StreamableHTTP transports (the fix that made PRs #15/#22/#23/#24 actually work). Any SDK major bump needs this file re-verified line by line against the new internals before merge; do not assume compatibility.
+- Backends across the platform are pure tools-over-POST (205 tools fleet-wide, no sampling, no elicitation, no resources), so the migration's real risk concentrates in this gateway's session/transport plumbing, not in the per-vendor MCP servers it fronts.
+- No deprecation clock forces this migration. Legacy servers keep serving dual-era clients indefinitely under the spec. The 12-month deprecation runway announced 2026-07-28 covers only HTTP+SSE transport, the Roots / Sampling / Logging capabilities, and RFC 7591 Dynamic Client Registration (see Phase 3 below), none of which is `protocolVersion` itself.
+
+**Canary path, not a fresh design question.** Per the operator's standing 2026-08-04 ruling (`Exploitacious/Personal-MCP-Server` `README.md:185-188`), the personal MCP instance is the designated fork canary for this exact upgrade: prove it there first, single-operator, low blast radius, before this fork or any Umbrella production backend touches it.
+
+**Phase 3, opportunistic, no date, pick up individually:**
+
+- **Tasks extension (`io.modelcontextprotocol/tasks`).** Rolling out across Claude products. Watch for it reaching a stable client surface before scoping gateway support.
+- **Elicitation.** Client-gated, asymmetrically, today: Claude Code supports form and URL modes; claude.ai connectors do not. Revisit when claude.ai adds support, not before.
+- **MCP Apps.** No current consumer need identified. Track only.
+- **CIMD migration off deprecated RFC 7591 DCR.** claude.ai still uses DCR today; keep both until Anthropic actually moves claude.ai off it. This is the one item on an actual clock: a 12-month deprecation runway was announced 2026-07-28.
+- **Enterprise Managed Auth extension.** No current consumer need identified. Track only.
+
+Discovery evidence and the full research trail live in the operator's 2026-08-13 COWORK session memory, not copied into either repo. Pull that before re-deriving any of the above from scratch.
+
 ## Disclaimer
 
 The `LICENSE` file is unchanged from upstream (MIT). Upstream copyright notice is preserved. Our fork-specific changes are clearly marked in commit messages and in this file's logs.
