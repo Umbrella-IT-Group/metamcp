@@ -69,7 +69,10 @@ export const mcpServersImplementations = {
 
       return {
         success: true as const,
-        data: McpServersSerializer.serializeMcpServer(createdServer),
+        // create is adminProcedure, so echoing the full config back is safe.
+        data: McpServersSerializer.serializeMcpServer(createdServer, {
+          includeSecrets: true,
+        }),
         message: "MCP server created successfully",
       };
     } catch (error) {
@@ -82,8 +85,11 @@ export const mcpServersImplementations = {
     }
   },
 
+  // `includeSecrets` is decided by the router from the session role, never by
+  // this layer — see packages/trpc/src/routers/frontend/mcp-servers.ts.
   list: async (
     userId: string,
+    includeSecrets: boolean,
   ): Promise<z.infer<typeof ListMcpServersResponseSchema>> => {
     try {
       // Find servers accessible to user (public + user's own)
@@ -92,7 +98,9 @@ export const mcpServersImplementations = {
 
       return {
         success: true as const,
-        data: McpServersSerializer.serializeMcpServerList(servers),
+        data: McpServersSerializer.serializeMcpServerList(servers, {
+          includeSecrets,
+        }),
         message: "MCP servers retrieved successfully",
       };
     } catch (error) {
@@ -201,11 +209,13 @@ export const mcpServersImplementations = {
     }
   },
 
+  // `includeSecrets`: see the note on `list` above.
   get: async (
     input: {
       uuid: string;
     },
     userId: string,
+    includeSecrets: boolean,
   ): Promise<z.infer<typeof GetMcpServerResponseSchema>> => {
     try {
       const server = await mcpServersRepository.findByUuid(input.uuid);
@@ -228,7 +238,9 @@ export const mcpServersImplementations = {
 
       return {
         success: true as const,
-        data: McpServersSerializer.serializeMcpServer(server),
+        data: McpServersSerializer.serializeMcpServer(server, {
+          includeSecrets,
+        }),
         message: "MCP server retrieved successfully",
       };
     } catch (error) {
@@ -456,7 +468,10 @@ export const mcpServersImplementations = {
 
       return {
         success: true as const,
-        data: McpServersSerializer.serializeMcpServer(updatedServer),
+        // update is adminProcedure, so echoing the full config back is safe.
+        data: McpServersSerializer.serializeMcpServer(updatedServer, {
+          includeSecrets: true,
+        }),
         message: "MCP server updated successfully",
       };
     } catch (error) {

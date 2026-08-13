@@ -35,6 +35,33 @@ const setStoredAutoRefreshState = (enabled: boolean): void => {
   localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, JSON.stringify(enabled));
 };
 
+// Errors that will not resolve by polling again. UNAUTHORIZED is the
+// logged-out case; FORBIDDEN is the steady state for a member now that
+// logs.get is adminProcedure. This store starts polling on import — not on
+// visiting /live-logs — so without a stop condition a member's browser would
+// re-issue a guaranteed-failing request every 2s from every page, for the
+// whole session. The tRPC error code is read from the structured payload
+// first, with a message match as fallback for transport-level shapes that
+// carry no `data`.
+const isTerminalAuthError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") return false;
+
+  const code = (error as { data?: { code?: string } }).data?.code;
+  if (code === "UNAUTHORIZED" || code === "FORBIDDEN") return true;
+
+  if ("message" in error) {
+    const message = String((error as { message?: unknown }).message);
+    return (
+      message.includes("UNAUTHORIZED") ||
+      message.includes("FORBIDDEN") ||
+      message.includes("You must be logged in") ||
+      message.includes("administrator role")
+    );
+  }
+
+  return false;
+};
+
 export const useLogsStore = create<LogsState>()(
   subscribeWithSelector((set, get) => ({
     logs: [],
@@ -67,19 +94,14 @@ export const useLogsStore = create<LogsState>()(
         console.error("Failed to fetch logs:", error);
         set({ isLoading: false });
 
-        // Check if it's an authentication error
-        if (error && typeof error === "object" && "message" in error) {
-          const errorMessage = String(error.message);
-          if (
-            errorMessage.includes("UNAUTHORIZED") ||
-            errorMessage.includes("You must be logged in")
-          ) {
-            // Stop auto-refresh if user is not authenticated
-            const currentState = get();
-            if (currentState.isAutoRefreshing) {
-              currentState.stopAutoRefresh();
-              console.log("Auto-refresh stopped due to authentication error");
-            }
+        // Stop auto-refresh if the user is not authenticated, or not allowed
+        if (isTerminalAuthError(error)) {
+          const currentState = get();
+          if (currentState.isAutoRefreshing) {
+            currentState.stopAutoRefresh();
+            console.log(
+              "Auto-refresh stopped due to authentication/authorization error",
+            );
           }
         }
       }

@@ -19,7 +19,12 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  isAdminUser,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the namespaces router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -38,6 +43,7 @@ export const createNamespacesRouter = (
         uuid: string;
       },
       userId: string,
+      includeSecrets: boolean,
     ) => Promise<z.infer<typeof GetNamespaceResponseSchema>>;
     getTools: (
       input: z.infer<typeof GetNamespaceToolsRequestSchema>,
@@ -79,12 +85,19 @@ export const createNamespacesRouter = (
         return await implementations.list(ctx.user.id);
       }),
 
-    // Protected: Get single namespace by UUID
+    // Protected: Get single namespace by UUID. The payload embeds every member
+    // server's row, so it carries the same upstream credential columns as
+    // mcpServers.get and gets the same role-driven redaction — see the note on
+    // mcpServers.list.
     get: protectedProcedure
       .input(z.object({ uuid: z.string() }))
       .output(GetNamespaceResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.get(input, ctx.user.id);
+        return await implementations.get(
+          input,
+          ctx.user.id,
+          isAdminUser(ctx.user),
+        );
       }),
 
     // Protected: Get tools for namespace from mapping table

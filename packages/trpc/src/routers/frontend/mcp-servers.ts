@@ -13,7 +13,12 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  isAdminUser,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the MCP servers router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -26,6 +31,7 @@ export const createMcpServersRouter = (
     ) => Promise<z.infer<typeof CreateMcpServerResponseSchema>>;
     list: (
       userId: string,
+      includeSecrets: boolean,
     ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
     bulkImport: (
       input: z.infer<typeof BulkImportMcpServersRequestSchema>,
@@ -36,6 +42,7 @@ export const createMcpServersRouter = (
         uuid: string;
       },
       userId: string,
+      includeSecrets: boolean,
     ) => Promise<z.infer<typeof GetMcpServerResponseSchema>>;
     delete: (
       input: {
@@ -54,19 +61,29 @@ export const createMcpServersRouter = (
   },
 ) => {
   return router({
-    // Protected: List all MCP servers
+    // Protected: List all MCP servers. Stays member-readable — the sidebar,
+    // the namespace editor and the inspector all need the server catalogue —
+    // but `includeSecrets` is false for anyone who is not an admin, so the
+    // upstream credential columns (env / bearerToken / headers) never reach a
+    // member. The role check lives here, in the RBAC layer, rather than in the
+    // implementation: the impl takes a decided boolean and cannot get the
+    // policy wrong.
     list: protectedProcedure
       .output(ListMcpServersResponseSchema)
       .query(async ({ ctx }) => {
-        return await implementations.list(ctx.user.id);
+        return await implementations.list(ctx.user.id, isAdminUser(ctx.user));
       }),
 
-    // Protected: Get single MCP server by UUID
+    // Protected: Get single MCP server by UUID. Same redaction as `list`.
     get: protectedProcedure
       .input(z.object({ uuid: z.string() }))
       .output(GetMcpServerResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.get(input, ctx.user.id);
+        return await implementations.get(
+          input,
+          ctx.user.id,
+          isAdminUser(ctx.user),
+        );
       }),
 
     // Admin only: Create MCP server

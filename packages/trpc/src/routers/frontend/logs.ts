@@ -5,7 +5,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import { adminProcedure, router } from "../../trpc";
 
 // Define the logs router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -19,8 +19,12 @@ export const createLogsRouter = (
   },
 ) =>
   router({
-    // Protected: Get logs with optional limit
-    get: protectedProcedure
+    // Admin only: Get logs. The buffer is gateway-wide, not per-user, and each
+    // entry carries `clientName` — the API-key name or the OAuth user's email
+    // — alongside the tool-call traffic that key produced. That is operational
+    // intel about every other tenant of this gateway, so a member reading it
+    // is a disclosure, not a self-service view.
+    get: adminProcedure
       .input(GetLogsRequestSchema)
       .output(GetLogsResponseSchema)
       .query(async ({ input }) => {

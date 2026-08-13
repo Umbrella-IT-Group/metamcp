@@ -7,6 +7,8 @@ import {
   NamespaceWithServers,
 } from "@repo/zod-types";
 
+import { McpServerSerializeOptions } from "./mcp-servers.serializer";
+
 export class NamespacesSerializer {
   static serializeNamespace(dbNamespace: DatabaseNamespace): Namespace {
     return {
@@ -25,8 +27,14 @@ export class NamespacesSerializer {
     return dbNamespaces.map(this.serializeNamespace);
   }
 
+  // Same upstream-credential redaction as McpServersSerializer, for the same
+  // reason: this joins `mcp_servers` and so carries `env` / `bearerToken` /
+  // `headers` for every server in the namespace, and namespaces.get is a
+  // member-reachable protectedProcedure. See mcp-servers.serializer.ts for why
+  // the fields are blanked rather than omitted.
   static serializeNamespaceWithServers(
     dbNamespace: DatabaseNamespaceWithServers,
+    options: McpServerSerializeOptions,
   ): NamespaceWithServers {
     return {
       uuid: dbNamespace.uuid,
@@ -43,9 +51,9 @@ export class NamespacesSerializer {
         command: server.command,
         args: server.args || [],
         url: server.url,
-        env: server.env || {},
-        bearerToken: server.bearerToken,
-        headers: server.headers || {},
+        env: options.includeSecrets ? server.env || {} : {},
+        bearerToken: options.includeSecrets ? server.bearerToken : null,
+        headers: options.includeSecrets ? server.headers || {} : {},
         error_status: server.error_status,
         created_at: server.created_at.toISOString(),
         user_id: server.user_id,

@@ -151,6 +151,9 @@ export const namespacesImplementations = {
       uuid: string;
     },
     userId: string,
+    // Decided by the router from the session role, never by this layer — see
+    // packages/trpc/src/routers/frontend/namespaces.ts.
+    includeSecrets: boolean,
   ): Promise<z.infer<typeof GetNamespaceResponseSchema>> => {
     try {
       const namespaceWithServers =
@@ -179,6 +182,7 @@ export const namespacesImplementations = {
         success: true as const,
         data: NamespacesSerializer.serializeNamespaceWithServers(
           namespaceWithServers,
+          { includeSecrets },
         ),
         message: "Namespace retrieved successfully",
       };
