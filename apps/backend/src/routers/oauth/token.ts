@@ -40,6 +40,64 @@ logger.info(
   `[oauth] token TTLs: access=${ACCESS_TOKEN_EXPIRY}s refresh=${REFRESH_TOKEN_EXPIRY}s`,
 );
 
+// Umbrella fork: success-path grant observability. Until now the token endpoint
+// logged only FAILURES, so nothing in `app.log` distinguished "the connector
+// refreshed on schedule" from "the connector never refreshed and silently died
+// when its access token expired" — the open question behind the 2026-08
+// Claude.ai disconnect investigation. One grep-friendly line per issued token
+// answers it from the log file alone: `grep '\[oauth\] token issued'`.
+//
+// SECRETS DISCIPLINE: the access token's LAST FOUR CHARACTERS only, and nothing
+// else credential-shaped. Four characters are enough to tie an issued token to a
+// later introspect/revoke line while being useless to an attacker who reads the
+// log. Full access tokens, refresh tokens, authorization codes, and client
+// secrets are never logged at any level.
+function lastFour(secret: string): string {
+  // Guard instead of trusting the caller: `slice(-4)` on a string shorter than
+  // four characters returns the WHOLE string, which for a credential is a leak.
+  // Generated tokens are always long, so this only fires on a caller bug.
+  return secret.length >= 4 ? secret.slice(-4) : "????";
+}
+
+/**
+ * Emit one line per successfully issued access token.
+ *
+ * `clientName` is passed only on the authorization_code path, where the client
+ * row is already loaded for auth-method validation. The refresh path never
+ * fetches it: a name lookup there would add a DB round-trip to a hot path purely
+ * for logging, and it is not needed — every refresh chain begins with an
+ * authorization_code grant, so the id-to-name mapping is already in the same log
+ * file.
+ */
+function logTokenIssued(fields: {
+  grantType: "authorization_code" | "refresh_token";
+  clientId: string;
+  clientName?: string | null;
+  userId: string;
+  accessToken: string;
+  // Set only on the refresh path, where redemption always mints a replacement
+  // refresh token (see handleRefreshTokenGrant). Omitted on the initial grant
+  // because there was no prior refresh token to rotate, and `rotated=false`
+  // there would read as "rotation is off".
+  rotatedRefreshToken?: true;
+}) {
+  const parts = [
+    "[oauth] token issued",
+    `grant=${fields.grantType}`,
+    `client=${fields.clientId}`,
+  ];
+  if (fields.clientName) {
+    parts.push(`client_name="${fields.clientName}"`);
+  }
+  parts.push(`user=${fields.userId}`);
+  parts.push(`token=...${lastFour(fields.accessToken)}`);
+  if (fields.rotatedRefreshToken) {
+    parts.push("rotated=true");
+  }
+
+  logger.info(parts.join(" "));
+}
+
 /**
  * Issue a new access token + refresh token pair and store them.
  */
@@ -254,6 +312,14 @@ async function handleAuthorizationCodeGrant(
     codeData.scope,
   );
 
+  logTokenIssued({
+    grantType: "authorization_code",
+    clientId: codeData.client_id,
+    clientName: clientData.client_name,
+    userId: codeData.user_id,
+    accessToken,
+  });
+
   res.json({
     access_token: accessToken,
     token_type: "Bearer",
@@ -318,6 +384,18 @@ async function handleRefreshTokenGrant(
     tokenData.user_id,
     tokenData.scope,
   );
+
+  // `rotated=true` is unconditional here because this handler always mints a
+  // replacement refresh token and deletes the redeemed one above. It is logged
+  // anyway so the 48h traffic read can tell a rotating client from a client that
+  // is somehow reusing a refresh token, without re-reading this file.
+  logTokenIssued({
+    grantType: "refresh_token",
+    clientId: tokenData.client_id,
+    userId: tokenData.user_id,
+    accessToken,
+    rotatedRefreshToken: true,
+  });
 
   res.json({
     access_token: accessToken,
