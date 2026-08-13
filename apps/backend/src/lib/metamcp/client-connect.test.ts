@@ -14,6 +14,8 @@ import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { ServerParameters } from "@repo/zod-types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import logger from "@/utils/logger";
+
 vi.mock("../../db/repositories/index", () => ({
   mcpServersRepository: {},
 }));
@@ -32,6 +34,7 @@ import {
   runWithM365UserContext,
   takeConnectBrokerFailure,
 } from "../m365/request-context";
+import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { metamcpLogStore } from "./log-store";
 
@@ -327,5 +330,205 @@ describe("connectMetaMcpClient — closing guard on established connections", ()
     expect(messages.some((m) => m.includes("backend drop"))).toBe(true);
     expect(messages.some((m) => m.includes("established"))).toBe(true);
     expect(onTransportDrop).toHaveBeenCalledWith("error", expect.any(Error));
+  });
+});
+
+// -------------------------------------------------------------------
+// Spec session termination on teardown
+//
+// `Protocol.close()` only closes the local transport; without an
+// explicit `terminateSession()` the backend never sees the spec DELETE
+// and keeps the session object forever (prod 2026-08-13: 1027 sessions
+// created / 0 terminated against one backend). These pin the three
+// properties of the fix in `client.ts`'s `cleanup()` choke point:
+// DELETE-then-close ordering, fail-open on a broken/hung backend, and
+// a clean skip for transports that carry no HTTP session.
+// -------------------------------------------------------------------
+
+/**
+ * A real `StreamableHTTPClientTransport` — so `terminateBackendSession`'s
+ * `instanceof` gate sees the production type — with `terminateSession`
+ * and `close` stubbed to record ordering and do no network I/O.
+ * `terminateImpl` lets a test decide whether the DELETE resolves,
+ * rejects, or never settles.
+ */
+function makeTerminableHttpTransport(
+  terminateImpl: () => Promise<void> = async () => {},
+) {
+  const calls: string[] = [];
+  const t = new StreamableHTTPClientTransport(
+    new URL("http://backend:3000/mcp"),
+  );
+  const terminateSession = vi.fn(async () => {
+    calls.push("terminate");
+    await terminateImpl();
+  });
+  const close = vi.fn(async () => {
+    calls.push("close");
+    t.onclose?.();
+  });
+  t.terminateSession = terminateSession as unknown as typeof t.terminateSession;
+  t.close = close as unknown as typeof t.close;
+  return {
+    transport: t as unknown as Transport,
+    calls,
+    terminateSession,
+    close,
+  };
+}
+
+/**
+ * A real (never-started, so no child process is spawned) STDIO transport.
+ * Constructing one is side-effect free; `start()` is what spawns.
+ */
+function makeStdioTransport() {
+  const t = new ProcessManagedStdioTransport({
+    command: "true",
+    stderr: "pipe",
+  });
+  const close = vi.fn(async () => {
+    t.onclose?.();
+  });
+  t.close = close as unknown as typeof t.close;
+  return { transport: t as unknown as Transport, close };
+}
+
+async function connectForTeardown(transport: Transport, client: Client) {
+  const createClient = vi.fn(() => ({ client, transport }));
+  const result = (await connectMetaMcpClient(params, undefined, undefined, {
+    createClient,
+  })) as ConnectedClient;
+  expect(result).toBeDefined();
+  return result;
+}
+
+describe("ConnectedClient.cleanup — spec session termination", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.spyOn(metamcpLogStore, "record").mockImplementation(() => {});
+    warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("sends the session DELETE before closing a streamable-HTTP transport", async () => {
+    const client = makeFakeClient(async () => {});
+    const { transport, calls, terminateSession } =
+      makeTerminableHttpTransport();
+
+    const result = await connectForTeardown(transport, client);
+    await result.cleanup();
+
+    // Ordering is load-bearing: `close()` aborts the transport's abort
+    // controller, so a DELETE issued after it could never reach the wire.
+    expect(calls).toEqual(["terminate", "close"]);
+    expect(terminateSession).toHaveBeenCalledTimes(1);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("closes anyway and warns once when the DELETE rejects", async () => {
+    const client = makeFakeClient(async () => {});
+    const { transport, calls, close } = makeTerminableHttpTransport(
+      async () => {
+        throw new Error("connect ECONNREFUSED 172.18.0.13:3000");
+      },
+    );
+
+    const result = await connectForTeardown(transport, client);
+    // Must NOT reject — a dead backend cannot be allowed to abort the
+    // pool's eviction path.
+    await expect(result.cleanup()).resolves.toBeUndefined();
+
+    expect(calls).toEqual(["terminate", "close"]);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const [message, error] = warnSpy.mock.calls[0] as [string, Error];
+    expect(message).toContain("Failed to terminate backend session");
+    expect(message).toContain("m365");
+    expect(message).toContain("srv-m365");
+    expect(error.message).toContain("ECONNREFUSED");
+  });
+
+  it("closes anyway and warns once when the DELETE hangs past the timeout", async () => {
+    const client = makeFakeClient(async () => {});
+    // Never settles — the hung-backend case the 2s bound exists for.
+    const { transport, calls, close } = makeTerminableHttpTransport(
+      () => new Promise<void>(() => {}),
+    );
+
+    const result = await connectForTeardown(transport, client);
+
+    vi.useFakeTimers();
+    const pending = result.cleanup();
+    // SESSION_TERMINATE_TIMEOUT_MS in client.ts.
+    await vi.advanceTimersByTimeAsync(2000);
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(calls).toEqual(["terminate", "close"]);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const [message, error] = warnSpy.mock.calls[0] as [string, Error];
+    expect(message).toContain("Failed to terminate backend session");
+    expect(error.message).toContain("exceeded 2000ms");
+  });
+
+  it("skips termination for a STDIO transport and closes without warning", async () => {
+    const client = makeFakeClient(async () => {});
+    const { transport, close } = makeStdioTransport();
+
+    // The skip is not cosmetic: STDIO carries no HTTP session and the
+    // SDK class has no such method, so calling it would TypeError.
+    expect(
+      (transport as unknown as Record<string, unknown>).terminateSession,
+    ).toBeUndefined();
+
+    const result = await connectForTeardown(transport, client);
+    await expect(result.cleanup()).resolves.toBeUndefined();
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("sends one DELETE, not two, when cleanup runs twice", async () => {
+    // The invalidation cascade can reach the same ConnectedClient as both
+    // an idle and an active slot. The SDK clears its session id after a
+    // successful DELETE and `terminateSession()` no-ops without one, so
+    // the second teardown must not re-issue it. Modelled here with the
+    // SDK's own guard shape.
+    const client = makeFakeClient(async () => {});
+    const calls: string[] = [];
+    const t = new StreamableHTTPClientTransport(
+      new URL("http://backend:3000/mcp"),
+    );
+    const internals = t as unknown as { _sessionId?: string };
+    internals._sessionId = "session-abc";
+    const terminateSession = vi.fn(async () => {
+      if (!internals._sessionId) return; // mirrors the SDK's early return
+      calls.push("terminate");
+      internals._sessionId = undefined;
+    });
+    t.terminateSession =
+      terminateSession as unknown as typeof t.terminateSession;
+    t.close = vi.fn(async () => {
+      calls.push("close");
+      t.onclose?.();
+    }) as unknown as typeof t.close;
+
+    const result = await connectForTeardown(t as unknown as Transport, client);
+    await result.cleanup();
+    await result.cleanup();
+
+    expect(terminateSession).toHaveBeenCalledTimes(2);
+    // Only the first call reached the wire.
+    expect(calls).toEqual(["terminate", "close", "close"]);
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 });
