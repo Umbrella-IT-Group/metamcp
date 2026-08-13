@@ -95,6 +95,91 @@ export const computeReconnectBackoffMs = (attempt: number): number => {
 };
 
 /**
+ * Upper bound on how long teardown waits for the spec session-termination
+ * DELETE before it gives up and closes the transport anyway.
+ *
+ * Teardown runs on latency-sensitive paths (idle sweep, pool-cap
+ * eviction, the `invalidateServerConnection` cascade), so an unbounded
+ * DELETE against a backend that is hung, mid-restart or gone would stall
+ * pool eviction behind one dead server — the exact failure this fix must
+ * not introduce. 2s is generous for the container-to-container round trip
+ * every one of our backends actually makes, and short enough that a dead
+ * backend costs one blink instead of a wedged pool.
+ */
+const SESSION_TERMINATE_TIMEOUT_MS = 2000;
+
+/**
+ * Send the MCP spec's session-termination `DELETE` (with `Mcp-Session-Id`)
+ * to a Streamable-HTTP backend, then let the caller close the transport.
+ *
+ * WHY THIS EXISTS: the SDK's `Protocol.close()` only closes the LOCAL
+ * transport — it never emits the spec DELETE, so every pool teardown left
+ * the backend holding a live session object forever. Measured on prod
+ * 2026-08-13: 1027 sessions created / 0 terminated against a single
+ * backend, ~1.17MB retained each, one backend OOM-cycling every ~4 days.
+ * The SDK ships `terminateSession()` for exactly this, but its only call
+ * site was the admin-only Inspector DELETE route — never the production
+ * pool.
+ *
+ * FAIL-OPEN BY DESIGN: a backend that is unreachable, hung, or answers
+ * the DELETE with an error must never block or abort pool eviction, so
+ * the call is bounded by `SESSION_TERMINATE_TIMEOUT_MS` and every failure
+ * becomes exactly one WARN naming the server — surfaced, never swallowed
+ * silently, never rethrown into the teardown path.
+ *
+ * SAFE TO CALL TWICE: STDIO and SSE transports carry no HTTP session and
+ * no `terminateSession` method, so they short-circuit on the type check;
+ * and the SDK clears its `_sessionId` after a successful DELETE while
+ * `terminateSession()` returns immediately when there is no session id.
+ * A double teardown (the same `ConnectedClient` reachable as both an idle
+ * and an active slot during an invalidation cascade) therefore sends one
+ * DELETE, not two. A FAILED DELETE deliberately leaves the session id in
+ * place, so a later teardown retries it rather than orphaning the session.
+ */
+const terminateBackendSession = async (
+  transport: Transport,
+  serverParams: ServerParameters,
+): Promise<void> => {
+  if (!(transport instanceof StreamableHTTPClientTransport)) {
+    return;
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const termination = transport.terminateSession();
+    // Attach a sink handler so a rejection arriving AFTER the timeout has
+    // already won the race can't surface as an unhandled rejection and
+    // take the process down. The race below still observes the original
+    // rejection through `termination` itself.
+    termination.catch(() => {});
+
+    await Promise.race([
+      termination,
+      new Promise<never>((_resolve, reject) => {
+        timeoutHandle = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `Session termination exceeded ${SESSION_TERMINATE_TIMEOUT_MS}ms`,
+              ),
+            ),
+          SESSION_TERMINATE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } catch (error) {
+    logger.warn(
+      `Failed to terminate backend session for server ${serverParams.name} (${serverParams.uuid}); closing transport anyway:`,
+      error,
+    );
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+};
+
+/**
  * A subscriber invoked when the backend MCP server emits
  * `notifications/tools/list_changed`. The proxy layer (and the pool
  * invalidation path) attach subscribers here to fan that signal out to
@@ -545,6 +630,15 @@ export const connectMetaMcpClient = async (
           // during transport teardown can't trigger fan-out against a
           // half-closed proxy server.
           listChangedSubscribers.clear();
+          // Spec session termination MUST precede `close()`: the DELETE
+          // needs the still-live transport (its abort signal and headers),
+          // and `close()` aborts that controller. Every pool teardown site
+          // funnels through this one `cleanup()`, which is why the fix
+          // lives here rather than at the 14 `client.cleanup()` callers in
+          // `mcp-server-pool.ts`.
+          // `closing` is already set above, so the WARN this may emit can
+          // never be mistaken for a backend drop by the transport handlers.
+          await terminateBackendSession(capturedTransport, serverParams);
           await capturedTransport.close();
           await capturedClient.close();
         },
