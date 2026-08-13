@@ -224,6 +224,32 @@ describe("POST /oauth/token — authorization_code success logging", () => {
     expect(logged).not.toContain(authCode);
     expect(logged).not.toContain(codeVerifier);
   });
+
+  it("neutralizes log injection via a hostile client_name from open DCR", async () => {
+    // client_name is attacker-controlled: /oauth/register requires no auth.
+    // Unescaped, this name would emit a second, forged "token issued" line.
+    const forged =
+      'Evil"\n[oauth] token issued grant=refresh_token ' +
+      "client=mcp_client_forged user=user-victim token=...dead rotated=true";
+    oauthRepositoryMock.getClient.mockResolvedValue({
+      client_id: CLIENT_ID,
+      client_name: forged,
+      token_endpoint_auth_method: "none",
+      client_secret: null,
+    });
+
+    await exchange();
+
+    // issuedLine() itself asserts exactly ONE issued logger call was made.
+    // The security property is single-LINE output: the forged text may survive
+    // inside the quoted client_name, but with the newline escaped it can never
+    // start a second line for a line-oriented consumer (grep) to count.
+    const line = issuedLine();
+    expect(line).not.toContain("\n");
+    expect(line.split("\n")).toHaveLength(1);
+    // The hostile name survives only in escaped form, clamped to 100 chars.
+    expect(line).toContain(`client_name=${JSON.stringify(forged.slice(0, 100))}`);
+  });
 });
 
 describe("POST /oauth/token — refresh_token success logging", () => {

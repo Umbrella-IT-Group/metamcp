@@ -87,7 +87,13 @@ function logTokenIssued(fields: {
     `client=${fields.clientId}`,
   ];
   if (fields.clientName) {
-    parts.push(`client_name="${fields.clientName}"`);
+    // JSON.stringify, not naive quoting: client_name arrives verbatim from the
+    // UNAUTHENTICATED /oauth/register DCR endpoint, so an embedded newline or
+    // quote would otherwise forge whole "[oauth] token issued" lines in this
+    // log. stringify escapes both and supplies the surrounding quotes, keeping
+    // benign output byte-identical. Length-clamped so a hostile registration
+    // cannot bloat the log line.
+    parts.push(`client_name=${JSON.stringify(fields.clientName.slice(0, 100))}`);
   }
   parts.push(`user=${fields.userId}`);
   parts.push(`token=...${lastFour(fields.accessToken)}`);
