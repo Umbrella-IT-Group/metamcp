@@ -22,7 +22,6 @@ import { transformDockerUrl } from "../../lib/metamcp/client";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
-import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
 
 const SSE_HEADERS_PASSTHROUGH = ["authorization"];
 const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
@@ -189,8 +188,11 @@ const getHttpHeaders = (
 
 const serverRouter = express.Router();
 
-// Apply better auth middleware to all MCP proxy routes
-serverRouter.use(betterAuthMcpMiddleware);
+// Auth (session) and authorization (admin-only) are applied once by the
+// parent router in `routers/mcp-proxy.ts`, so every route below is already
+// admin-gated by the time it runs. Do NOT mount this router anywhere else:
+// /stdio, /sse and POST /mcp all reach `createTransport`, which spawns a
+// query-string-supplied command with the backend's environment.
 
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by web app sessionId
 const serverTransports: Map<string, Transport> = new Map<string, Transport>(); // Server Transports by web app sessionId
