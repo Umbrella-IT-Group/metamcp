@@ -9,12 +9,15 @@ import logger from "@/utils/logger";
 
 import { createServer } from "../../lib/metamcp/index";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
-import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
 
 const metamcpRouter = express.Router();
 
-// Apply better auth middleware to all metamcp routes
-metamcpRouter.use(betterAuthMcpMiddleware);
+// Auth (session) and authorization (admin-only) are applied once by the
+// parent router in `routers/mcp-proxy.ts`, so every route below is already
+// admin-gated by the time it runs. This is the Inspector's namespace-testing
+// surface, NOT the production endpoint path — API-key/OAuth clients reach
+// namespaces through `routers/public-metamcp` mounted at /metamcp, which is
+// untouched by that gate.
 
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by sessionId
 const metamcpServers: Map<

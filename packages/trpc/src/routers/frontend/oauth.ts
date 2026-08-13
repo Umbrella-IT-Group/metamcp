@@ -6,7 +6,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import { adminProcedure, router } from "../../trpc";
 
 // Define the OAuth router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -22,8 +22,16 @@ export const createOAuthRouter = (
   },
 ) => {
   return router({
-    // Protected: Get OAuth session by MCP server UUID
-    get: protectedProcedure
+    // Admin only: Get OAuth session by MCP server UUID. The response is the
+    // raw upstream credential set for that MCP server — `tokens`
+    // (access_token + refresh_token), `client_information` (client_id +
+    // client_secret) and `code_verifier`, all unredacted (see
+    // `apps/backend/src/db/serializers/oauth-sessions.serializer.ts`). It is
+    // server config, not per-user data: there is no per-caller row here, so
+    // `protectedProcedure` handed every member the gateway's credentials for
+    // every upstream MCP server. Gated to match its sibling `upsert`, which
+    // writes the same records.
+    get: adminProcedure
       .input(GetOAuthSessionRequestSchema)
       .output(GetOAuthSessionResponseSchema)
       .query(async ({ input }) => {
