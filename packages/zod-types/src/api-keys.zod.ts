@@ -76,7 +76,7 @@ export const CreateApiKeyFormSchema = z
     }
     // Ownership invariant: an identity-bound key must be OWNED by the
     // identity it exercises. `user_id: null` is the public ('everyone')
-    // selection — public keys' raw values are listed to every member, so a
+    // selection — a public key exists to be handed to every consumer, so a
     // public identity-bound key would be a fleet-distributed delegated
     // credential; an explicit foreign owner is the same hazard one hop
     // removed. `user_id: undefined` (default: the caller) can only be
@@ -133,11 +133,11 @@ export const CreateApiKeyRequestSchema = z
         message: "validation:apiKeyActsAs.requiresEndpoint",
       });
     }
-    // Ownership invariant (mirrors the form schema above): an identity-bound
-    // key must be OWNED by the identity it exercises — public (`user_id:
-    // null`) and explicit-foreign-owner bindings are rejected here; the
-    // `user_id: undefined` (owner = caller) half is enforced in the impl,
-    // where the caller is known.
+    // Ownership invariant (mirrors the form schema above, same reasoning): an
+    // identity-bound key must be OWNED by the identity it exercises — public
+    // (`user_id: null`) and explicit-foreign-owner bindings are rejected
+    // here; the `user_id: undefined` (owner = caller) half is enforced in the
+    // impl, where the caller is known.
     if (
       val.acts_as_user_id !== undefined &&
       val.user_id !== undefined &&
@@ -189,12 +189,23 @@ export const DeleteApiKeyResponseSchema = z.object({
   message: z.string(),
 });
 
+// Member-facing key list: the caller's own keys plus every public
+// ('everyone') key. Deliberately omits the full `key` secret and carries only
+// a non-reversible prefix, exactly like the admin view below.
+//
+// Pentest finding 2026-08-13: this schema used to type `key` as the full
+// string and the serializer returned it raw, so any self-registered member
+// could read every public key — gateway-wide production credentials — in
+// plaintext. Because this is the tRPC `.output()` schema, keeping key out of
+// it is also the second half of the defense: even a serializer that
+// regressed and re-added `key` would have it stripped here before the
+// response leaves the server.
 export const ListApiKeysResponseSchema = z.object({
   apiKeys: z.array(
     z.object({
       uuid: z.string().uuid(),
       name: z.string(),
-      key: z.string(),
+      key_prefix: z.string(),
       created_at: z.date(),
       is_active: z.boolean(),
       user_id: z.string().nullable(),

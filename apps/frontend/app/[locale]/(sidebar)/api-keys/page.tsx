@@ -2,16 +2,7 @@
 
 import { CreateApiKeyFormSchema } from "@repo/zod-types";
 import { format } from "date-fns";
-import {
-  Copy,
-  Eye,
-  EyeOff,
-  Key,
-  Plus,
-  RefreshCw,
-  ShieldCheck,
-  Trash2,
-} from "lucide-react";
+import { Copy, Key, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
@@ -64,8 +55,10 @@ type CreateApiKeyFormData = z.infer<typeof CreateApiKeyFormSchema>;
 
 export default function ApiKeysPage() {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
+  // The mint-time one-time reveal. This is the ONLY place a full key value
+  // is ever rendered — `list` returns prefixes only (see the key column
+  // below), so a key not copied here is gone and must be re-minted.
   const [newApiKey, setNewApiKey] = useState<string | null>(null);
-  const [visibleKeys, setVisibleKeys] = useState<Set<string>>(new Set());
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [apiKeyToDelete, setApiKeyToDelete] = useState<{
     uuid: string;
@@ -183,22 +176,6 @@ export default function ApiKeysPage() {
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
     toast.success(t("api-keys:copyToClipboard"));
-  };
-
-  const toggleKeyVisibility = (uuid: string) => {
-    setVisibleKeys((prev) => {
-      const newSet = new Set(prev);
-      if (newSet.has(uuid)) {
-        newSet.delete(uuid);
-      } else {
-        newSet.add(uuid);
-      }
-      return newSet;
-    });
-  };
-
-  const maskKey = (key: string) => {
-    return "•".repeat(key.length);
   };
 
   const handleDeleteClick = (apiKey: { uuid: string; name: string }) => {
@@ -542,6 +519,16 @@ export default function ApiKeysPage() {
 
       <Separator />
 
+      {/* Fork-added: says out loud why the key column stopped being
+          copyable, so the removal reads as a deliberate control rather
+          than a broken table, and points at the supported replacement. */}
+      <p className="text-sm text-muted-foreground">
+        Key values are shown as a prefix only. A key&apos;s full value is
+        displayed once, when it is created, and is never retrievable afterwards.
+        If you need gateway access, ask an administrator to mint a key scoped to
+        the endpoint you need rather than reusing a shared one.
+      </p>
+
       <div className="rounded-md border">
         <Table>
           <TableHeader>
@@ -574,38 +561,17 @@ export default function ApiKeysPage() {
               apiKeys?.apiKeys?.map((apiKey) => (
                 <TableRow key={apiKey.uuid}>
                   <TableCell className="font-medium">{apiKey.name}</TableCell>
+                  {/* Prefix only — the server no longer sends a usable
+                      secret here (see serializeApiKeyList). The reveal and
+                      copy-full controls that used to live in this cell are
+                      gone with it: there is nothing left to reveal, and a
+                      button that copies a truncated key would only produce
+                      401s. Full values exist exactly once, in the mint
+                      dialog above. */}
                   <TableCell>
-                    <div className="flex items-center gap-2">
-                      <code className="text-sm font-mono break-all">
-                        {visibleKeys.has(apiKey.uuid)
-                          ? apiKey.key
-                          : maskKey(apiKey.key)}
-                      </code>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => toggleKeyVisibility(apiKey.uuid)}
-                        title={
-                          visibleKeys.has(apiKey.uuid)
-                            ? t("api-keys:hideApiKey")
-                            : t("api-keys:showApiKey")
-                        }
-                      >
-                        {visibleKeys.has(apiKey.uuid) ? (
-                          <EyeOff className="h-4 w-4" />
-                        ) : (
-                          <Eye className="h-4 w-4" />
-                        )}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => copyToClipboard(apiKey.key)}
-                        title={t("api-keys:copyFullApiKey")}
-                      >
-                        <Copy className="h-4 w-4" />
-                      </Button>
-                    </div>
+                    <code className="text-sm font-mono break-all">
+                      {apiKey.key_prefix}
+                    </code>
                   </TableCell>
                   <TableCell>
                     {format(new Date(apiKey.created_at), "MMM d, yyyy")}

@@ -8,6 +8,8 @@
  *    endpoint must exist; all_endpoints stores NULL,
  *  - scope immutability: the update schemas/paths do not carry endpoint_uuid
  *    at all — a key's scope is fixed at mint time,
+ *  - the member-facing listing (list) drops the full secret for EVERY key,
+ *    public keys included (pentest fix 2026-08-13),
  *  - the admin cross-user listing (listAll) drops the full secret and carries
  *    owner email + last_used_at,
  *  - update/delete route to the owner-scoped repo methods for members and the
@@ -22,6 +24,7 @@
 import {
   ApiKeyUpdateInputSchema,
   CreateApiKeyRequestSchema,
+  ListApiKeysResponseSchema,
   UpdateApiKeyRequestSchema,
 } from "@repo/zod-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -395,10 +398,10 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
   });
 
   // Ownership invariant (round-2 HIGH): an identity-bound key must be OWNED
-  // by the identity it exercises. Public keys' RAW values are listed to
-  // every member (see the `list` doc comment in the impl), so a public
-  // identity-bound key would be a fleet-distributed delegated Graph
-  // credential; a foreign owner is the same hazard one hop removed.
+  // by the identity it exercises. A public key exists to be handed to every
+  // consumer, so a public identity-bound key would be a fleet-distributed
+  // delegated Graph credential; a foreign owner is the same hazard one hop
+  // removed.
   it("rejects a public ('everyone') identity-bound key with FORBIDDEN and no DB reads or writes", async () => {
     await expect(
       apiKeysImplementations.create(
@@ -587,6 +590,133 @@ describe("api-keys update — acts-as identity is immutable by omission", () => 
       acts_as_user_id: "victim-user",
     });
     expect(parsed).not.toHaveProperty("acts_as_user_id");
+  });
+});
+
+// Pentest fix 2026-08-13 (CRITICAL). `list` is a plain protectedProcedure and
+// findAccessibleToUser deliberately returns the caller's own keys PLUS every
+// public ('everyone') key — so when the serializer emitted `key` raw, any
+// self-registered member could read the gateway-wide production keys in
+// plaintext. Three live keys were recovered that way. These tests pin the
+// masking at BOTH layers that stand between the DB row and the wire: the
+// serializer, and the tRPC `.output()` schema.
+describe("api-keys list — member view never returns a usable secret", () => {
+  // Realistic shapes: sk_mt_ + 64 hex, the bootstrap generator's format.
+  const PUBLIC_KEY = `sk_mt_${"a".repeat(64)}`;
+  const PRIVATE_KEY = `sk_mt_${"b".repeat(64)}`;
+  const EP = "11111111-1111-4111-8111-111111111111";
+
+  const accessibleRows = [
+    {
+      uuid: "pub-1",
+      name: "gateway-wide shared",
+      key: PUBLIC_KEY,
+      created_at: new Date("2026-07-01T00:00:00Z"),
+      is_active: true,
+      user_id: null, // public / 'everyone' — the leaked class
+      endpoint_uuid: null,
+      acts_as_user_id: null,
+    },
+    {
+      uuid: "priv-1",
+      name: "my own key",
+      key: PRIVATE_KEY,
+      created_at: new Date("2026-07-02T00:00:00Z"),
+      is_active: true,
+      user_id: "member-1",
+      endpoint_uuid: EP,
+      acts_as_user_id: "member-1",
+    },
+  ];
+
+  it("returns a prefix instead of the raw value for public AND private keys", async () => {
+    repoMock.findAccessibleToUser.mockResolvedValue(accessibleRows);
+
+    const result = await apiKeysImplementations.list("member-1");
+
+    expect(result.apiKeys).toHaveLength(2);
+    for (const row of result.apiKeys) {
+      // The old field is gone entirely, not merely overwritten.
+      expect((row as Record<string, unknown>).key).toBeUndefined();
+      // 10 characters of key, then the elision marker — nothing more.
+      expect(row.key_prefix).toMatch(/^sk_mt_[a-z0-9]{4}…$/);
+    }
+  });
+
+  it("carries NO full-length sk_mt_ token anywhere in the response payload", async () => {
+    repoMock.findAccessibleToUser.mockResolvedValue(accessibleRows);
+
+    const result = await apiKeysImplementations.list("member-1");
+
+    // Serialize the whole response and hunt for a usable key in ANY field —
+    // this is the assertion that stays true no matter which field a future
+    // regression smuggles the secret through. `sk_mt_` + 16 chars is far
+    // longer than the 4 characters a prefix exposes and far shorter than a
+    // real key, so it fires on a leak and never on a legitimate prefix.
+    const payload = JSON.stringify(result);
+    expect(payload).not.toMatch(/sk_mt_[A-Za-z0-9_-]{16,}/);
+    expect(payload).not.toContain(PUBLIC_KEY);
+    expect(payload).not.toContain(PRIVATE_KEY);
+  });
+
+  it("exposes only a strict, non-reversible prefix of each key", async () => {
+    repoMock.findAccessibleToUser.mockResolvedValue(accessibleRows);
+
+    const result = await apiKeysImplementations.list("member-1");
+
+    expect(result.apiKeys[0].key_prefix).toBe("sk_mt_aaaa…");
+    expect(result.apiKeys[1].key_prefix).toBe("sk_mt_bbbb…");
+    // A prefix must be a genuine truncation of the original, not a rename.
+    expect(
+      PUBLIC_KEY.startsWith(result.apiKeys[0].key_prefix.slice(0, -1)),
+    ).toBe(true);
+    expect(result.apiKeys[0].key_prefix.length).toBeLessThan(PUBLIC_KEY.length);
+  });
+
+  it("still returns the non-secret fields the key list is for", async () => {
+    repoMock.findAccessibleToUser.mockResolvedValue(accessibleRows);
+
+    const result = await apiKeysImplementations.list("member-1");
+
+    expect(result.apiKeys[0]).toMatchObject({
+      uuid: "pub-1",
+      name: "gateway-wide shared",
+      is_active: true,
+      user_id: null,
+      endpoint_uuid: null,
+      acts_as_user_id: null,
+    });
+    expect(result.apiKeys[1]).toMatchObject({
+      uuid: "priv-1",
+      user_id: "member-1",
+      endpoint_uuid: EP,
+      acts_as_user_id: "member-1",
+    });
+    expect(repoMock.findAccessibleToUser).toHaveBeenCalledWith("member-1");
+  });
+
+  // Second layer: the tRPC router declares this schema as `.output()`, so a
+  // serializer that regressed and re-added `key` would still have it stripped
+  // before the response leaves the server. Zod objects strip unknown keys.
+  it("ListApiKeysResponseSchema strips a smuggled full key value", () => {
+    const parsed = ListApiKeysResponseSchema.parse({
+      apiKeys: [
+        {
+          uuid: "44444444-4444-4444-8444-444444444444",
+          name: "regressed",
+          key: PUBLIC_KEY,
+          key_prefix: "sk_mt_aaaa…",
+          created_at: new Date(),
+          is_active: true,
+          user_id: null,
+          endpoint_uuid: null,
+          acts_as_user_id: null,
+        },
+      ],
+    });
+
+    expect(parsed.apiKeys[0]).not.toHaveProperty("key");
+    expect(JSON.stringify(parsed)).not.toContain(PUBLIC_KEY);
   });
 });
 

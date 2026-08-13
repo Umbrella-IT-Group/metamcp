@@ -120,8 +120,8 @@ export const apiKeysImplementations = {
 
     // Ownership invariant (mirrored in both zod superRefines): an
     // identity-bound key must be OWNED by the identity it exercises. This
-    // kills BOTH dangerous combinations: a public ('everyone') owner —
-    // `list` hands public keys' RAW values to every member, so a public
+    // kills BOTH dangerous combinations: a public ('everyone') owner — a
+    // public key exists to be handed to every consumer, so a public
     // identity-bound key would be a fleet-distributed delegated Graph
     // credential — and a foreign owner, which hands one user's delegated
     // identity to another user's key. The intended flow (a key owned by the
@@ -187,15 +187,19 @@ export const apiKeysImplementations = {
     }
   },
 
-  // Deliberate: this member-facing list returns the FULL key value for
-  // public ('everyone') keys, not just a prefix. That is the intended
-  // "copy the shared key to configure your client" feature — a public key
-  // exists to be handed to every consumer (Tara/n8n/Claude) in the first
-  // place, so masking it here would only make the UI less useful without
-  // reducing exposure (the secret is already distributed). This does NOT
-  // apply to the admin cross-user view (listAll, below) — that one stays
-  // prefix-masked because it also surfaces every user's PRIVATE keys, which
-  // must never be reconstructable from an admin listing.
+  // Member-facing list: the caller's own keys plus every public
+  // ('everyone') key. Returns key_prefix only — never a usable secret — for
+  // ALL of them (see serializeApiKeyList).
+  //
+  // This previously returned public keys' FULL value, justified as the
+  // "copy the shared key to configure your client" convenience. That
+  // reasoning was wrong: a public key being distributed to its intended
+  // consumers out-of-band is not the same as every self-registered member
+  // being able to read it on demand, and `list` is reachable by any member.
+  // A pentest recovered three live gateway-wide production keys through
+  // exactly this call (2026-08-13). The convenience is gone deliberately;
+  // an operator who needs gateway access gets an endpoint-scoped key minted
+  // for them instead (create is admin-only and scope is mandatory).
   list: async (
     userId: string,
   ): Promise<z.infer<typeof ListApiKeysResponseSchema>> => {
