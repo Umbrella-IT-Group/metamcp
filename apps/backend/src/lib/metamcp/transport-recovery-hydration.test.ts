@@ -1,7 +1,7 @@
 /**
  * Tests for the lazy-recovery transport hydration shim.
  *
- * These exercise the REAL `@modelcontextprotocol/sdk` 1.29.0
+ * These exercise the REAL `@modelcontextprotocol/sdk` 1.30.0
  * `StreamableHTTPServerTransport` — NO mock — because the whole point of
  * the shim is to satisfy the SDK's internal `validateSession` gate that
  * a mocked transport would paper over. The original wedge
