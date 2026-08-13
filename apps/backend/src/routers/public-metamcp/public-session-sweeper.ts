@@ -41,14 +41,19 @@ import logger from "@/utils/logger";
  * re-entrancy guard, cleanup on dispose, and WARN/INFO discipline (one
  * INFO line only when a sweep actually reaps something, debug otherwise).
  *
- * Known blind spot (accepted, not fixed here): a half-open TCP connection
- * — client process died or a network path silently dropped packets
- * without FIN/RST — keeps an open standalone GET stream's `dispatchTracked`
- * call pending indefinitely from Node's perspective, so the in-flight
- * guard below never releases and the session is never reaped even though
- * no real client is listening. See the comment on `dispatchTracked` in
- * `streamable-http.ts` for the full writeup and the named follow-up
- * (SO_KEEPALIVE / an app-level SSE heartbeat).
+ * Known blind spot (NARROWED by the SDK 1.30.0 bump, not proven closed): a
+ * half-open TCP connection — client process died or a network path
+ * silently dropped packets without FIN/RST — keeps an open standalone GET
+ * stream's `dispatchTracked` call pending indefinitely from Node's
+ * perspective, so the in-flight guard below never releases and the session
+ * is never reaped even though no real client is listening. SDK 1.30.0's
+ * default 15s SSE keep-alive frames now push bytes at that dead peer, so
+ * the kernel's retransmit timeout eventually errors the socket and settles
+ * the dispatch — on the kernel's clock, not ours, and inferred from the
+ * SDK source rather than runtime-verified. See the comment on
+ * `dispatchTracked` in `streamable-http.ts` for the full writeup and the
+ * residual follow-up (SO_KEEPALIVE / a fork-side missed-heartbeat
+ * threshold).
  */
 
 // 24h default. Long-idle-but-real consumers (e.g. Hermes/Tara connecting a

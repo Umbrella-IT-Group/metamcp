@@ -175,23 +175,38 @@ export const publicSessionSweeper = PublicSessionSweeper.fromEnv(
  * markSettled also stamp last-activity at request arrival + completion,
  * which is how "any request updates the stamp" is satisfied.
  *
- * Known blind spot (accepted, not fixed here): the GET handler below uses
- * this same wrapper to serve a standalone SSE stream (a client opens a
- * long-lived GET with no body to receive server-initiated notifications
- * per the MCP Streamable HTTP spec). `handleRequestWithUserContext`'s
- * promise doesn't resolve until that stream closes, so `markInFlight` is
- * called once at stream-open and `markSettled` only fires when the stream
- * ends — for as long as the promise is pending, the sweeper's in-flight
- * guard correctly treats the session as live. But if the CLIENT dies
- * without a clean TCP close (process killed, network path silently drops
- * packets — no FIN/RST reaches this process), Node has no way to know the
- * peer is gone without OS-level keepalive probing or an app-level
- * heartbeat, neither of which this transport does today. The request
- * handler stays pending indefinitely, in-flight never clears, and the
- * abandoned session is never reaped — a false negative in the exact
- * scenario this sweeper exists to catch. Follow-up (not this PR):
- * `SO_KEEPALIVE` on the underlying socket, or an app-level SSE heartbeat
- * that lets a missed-heartbeat threshold force-settle the dispatch.
+ * Known blind spot (NARROWED by the SDK 1.30.0 bump, not proven closed):
+ * the GET handler below uses this same wrapper to serve a standalone SSE
+ * stream (a client opens a long-lived GET with no body to receive
+ * server-initiated notifications per the MCP Streamable HTTP spec).
+ * `handleRequestWithUserContext`'s promise doesn't resolve until that
+ * stream closes, so `markInFlight` is called once at stream-open and
+ * `markSettled` only fires when the stream ends — for as long as the
+ * promise is pending, the sweeper's in-flight guard correctly treats the
+ * session as live. If the CLIENT dies without a clean TCP close (process
+ * killed, network path silently drops packets — no FIN/RST reaches this
+ * process), Node cannot know the peer is gone without OS-level keepalive
+ * probing or an app-level heartbeat.
+ *
+ * SDK 1.30.0 ships the app-level half: `WebStandardStreamableHTTPServerTransport`
+ * arms an unref'd interval per SSE stream that writes a `: keepalive`
+ * comment frame every `keepAliveMs` (public transport option, DEFAULT
+ * 15000; values < 1 disable it). We inherit that default at every
+ * construction site — see `sdk-sse-keepalive.test.ts` for the tripwire
+ * that fails if a later SDK bump changes or drops it. Because those writes
+ * push bytes at a peer that is gone, the kernel's retransmit timer
+ * eventually errors the socket, which cancels the stream, settles the
+ * pending dispatch, and lets the sweeper reap.
+ *
+ * Why "narrowed" and not "fixed": that chain is inferred from the SDK
+ * source, NOT runtime-verified against a real half-open connection, and it
+ * only fires on the kernel retransmit timescale (`tcp_retries2`, order of
+ * 15 minutes) rather than on a heartbeat-miss threshold. A write that
+ * merely buffers in the stream's internal queue without reaching the
+ * socket would still surface nothing. Residual follow-up (not this PR):
+ * `SO_KEEPALIVE` on the underlying socket, or a fork-side missed-heartbeat
+ * threshold that force-settles the dispatch on our own clock instead of
+ * the kernel's.
  */
 export async function dispatchTracked(
   authReq: ApiKeyAuthenticatedRequest,
