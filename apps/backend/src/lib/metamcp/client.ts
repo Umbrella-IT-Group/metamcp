@@ -634,7 +634,8 @@ export const connectMetaMcpClient = async (
           // needs the still-live transport (its abort signal and headers),
           // and `close()` aborts that controller. Every pool teardown site
           // funnels through this one `cleanup()`, which is why the fix
-          // lives here rather than at the ~13 `client.cleanup()` callers.
+          // lives here rather than at the 14 `client.cleanup()` callers in
+          // `mcp-server-pool.ts`.
           // `closing` is already set above, so the WARN this may emit can
           // never be mistaken for a backend drop by the transport handlers.
           await terminateBackendSession(capturedTransport, serverParams);
