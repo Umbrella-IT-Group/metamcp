@@ -101,9 +101,14 @@ async function validateOAuthToken(
         return {
           valid: true,
           user_id: introspectData.sub,
-          scopes: introspectData.scope
-            ? introspectData.scope.split(" ")
-            : ["admin"],
+          // A token that carries no scope reports NO scopes, not ["admin"].
+          // `scopes` is inert today — checkOAuthAccess authorizes on
+          // `user_id` + endpoint ownership and never reads this field — so the
+          // change grants and revokes nothing now. It matters for whoever
+          // wires a scope check onto it later: the empty list fails such a
+          // check closed, where the old fallback would have handed every
+          // scopeless token full admin.
+          scopes: introspectData.scope ? introspectData.scope.split(" ") : [],
         };
       } catch (error) {
         logger.error("Error introspecting MCP token:", error);

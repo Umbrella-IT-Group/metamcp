@@ -39,7 +39,15 @@ export const oauthClientsImplementations = {
     // redirect-URI safety (scheme, and the production localhost/private-IP
     // ban) — rules the schema cannot express and which must not be skipped
     // just because the caller is an authenticated admin.
-    const registration = buildClientRegistration(input);
+    //
+    // `allowElevatedScope` is the one entitlement this path claims that the
+    // public DCR endpoint does not. Every procedure on this router is
+    // `adminProcedure`, so an elevated scope here is a deliberate choice by an
+    // operator who already holds the role; on `/oauth/register` the same
+    // request comes from an anonymous self-registrant and is refused.
+    const registration = buildClientRegistration(input, {
+      allowElevatedScope: true,
+    });
 
     if (!registration.ok) {
       // A rejected registration is caller error, not a server fault: surface

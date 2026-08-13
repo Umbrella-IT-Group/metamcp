@@ -480,6 +480,16 @@ export const oauthClientsTable = pgTable("oauth_clients", {
   token_endpoint_auth_method: text("token_endpoint_auth_method")
     .notNull()
     .default("none"),
+  // The column default is a LEGACY artifact and is unreachable from app code:
+  // `oauthRepository.upsertClient` inserts the whole row object, so `scope` is
+  // always supplied explicitly — NULL for a self-registered client, since
+  // `routers/oauth/client-registration.ts` stopped defaulting anonymous
+  // registrations to "admin". Postgres only applies a DEFAULT to an OMITTED
+  // column, and no insert omits this one. It is left in place because dropping
+  // it costs a production DDL migration for zero behavioural change; anyone
+  // adding a new insert path here must pass `scope` explicitly rather than let
+  // this default decide, and must not read the stored value as a grant (real
+  // RBAC is the better-auth session role).
   scope: text("scope").default("admin"),
   client_uri: text("client_uri"),
   logo_uri: text("logo_uri"),
@@ -505,6 +515,10 @@ export const oauthAuthorizationCodesTable = pgTable(
       .notNull()
       .references(() => oauthClientsTable.client_id, { onDelete: "cascade" }),
     redirect_uri: text("redirect_uri").notNull(),
+    // Legacy default, unreachable: `setAuthCode` always passes `scope`, which
+    // `routers/oauth/authorization.ts` resolves from the request or the
+    // registered client (empty string when neither names one). Same rule as
+    // oauth_clients.scope above — never let this default decide a scope.
     scope: text("scope").notNull().default("admin"),
     user_id: text("user_id")
       .notNull()
@@ -534,6 +548,9 @@ export const oauthAccessTokensTable = pgTable(
     user_id: text("user_id")
       .notNull()
       .references(() => usersTable.id, { onDelete: "cascade" }),
+    // Legacy default, unreachable: `setAccessToken` always passes `scope`,
+    // copied from the authorization code being redeemed. Same rule as
+    // oauth_clients.scope above.
     scope: text("scope").notNull().default("admin"),
     expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
     refresh_token: text("refresh_token"),

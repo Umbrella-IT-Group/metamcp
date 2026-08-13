@@ -14,6 +14,33 @@ export interface OAuthParams {
 }
 
 /**
+ * Decide the scope an authorization request is granted.
+ *
+ * RFC 6749 §3.3: a request that omits `scope` is processed using "the scope
+ * registered for the client" (or a documented server default). `/oauth/authorize`
+ * used to substitute the literal "admin" instead, so a request naming no scope
+ * was recorded as an admin grant — and since a self-registered client now
+ * registers with no scope at all (see ./client-registration.ts), that fallback
+ * would have handed anonymous registrants the very scope registration refuses
+ * them.
+ *
+ * Returns "" when neither side names a scope: the auth-code and access-token
+ * columns are NOT NULL, and an empty scope is the truthful record of a grant
+ * that conveyed nothing. Extracted from the handler purely so this rule is
+ * unit-testable without an express app, a database, or a better-auth session —
+ * the same reason `buildClientRegistration` lives outside its handler.
+ */
+export function resolveGrantedScope(
+  requestedScope: unknown,
+  registeredScope: string | null | undefined,
+): string {
+  if (typeof requestedScope === "string" && requestedScope.trim()) {
+    return requestedScope;
+  }
+  return registeredScope ?? "";
+}
+
+/**
  * Generate cryptographically secure authorization code
  * Follows OAuth 2.1 security requirements
  */

@@ -9,6 +9,7 @@ import {
   getBaseUrl,
   type OAuthParams,
   rateLimitAuth,
+  resolveGrantedScope,
   validateRedirectUri,
 } from "./utils";
 
@@ -110,7 +111,10 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     const oauthParams: OAuthParams = {
       client_id: finalClientId,
       redirect_uri: redirect_uri as string,
-      scope: scope ? (scope as string) : "admin",
+      // Requested scope, else the scope registered for this client, else none
+      // — never the hardcoded "admin" this used to substitute. See
+      // resolveGrantedScope in ./utils for the rule and why it changed.
+      scope: resolveGrantedScope(scope, clientData.scope),
       state: state ? (state as string) : undefined,
       code_challenge: code_challenge ? (code_challenge as string) : undefined,
       code_challenge_method: code_challenge_method
@@ -152,7 +156,11 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
             await oauthRepository.setAuthCode(code, {
               client_id: oauthParams.client_id,
               redirect_uri: oauthParams.redirect_uri,
-              scope: oauthParams.scope || "admin",
+              // Already resolved above (requested scope, else the client's
+              // registered scope). The `?? ""` only satisfies the NOT NULL
+              // column for the empty case — it must never reintroduce a scope
+              // the request did not carry.
+              scope: oauthParams.scope ?? "",
               user_id: sessionData.user.id,
               code_challenge: oauthParams.code_challenge || null,
               code_challenge_method: oauthParams.code_challenge_method || null,
@@ -332,7 +340,10 @@ Content-Type: application/json
     await oauthRepository.setAuthCode(code, {
       client_id,
       redirect_uri,
-      scope: oauthParams.scope || "admin",
+      // Carried through from /oauth/authorize, which already resolved it
+      // against the registered client. Same rule as that callsite: `?? ""`
+      // fills a NOT NULL column, it does not grant a scope.
+      scope: oauthParams.scope ?? "",
       user_id: sessionData.user.id,
       code_challenge: oauthParams.code_challenge || null,
       code_challenge_method: oauthParams.code_challenge_method || null,

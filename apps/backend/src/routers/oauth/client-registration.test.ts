@@ -87,7 +87,6 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
     expect(result.client.client_secret).toBeNull();
     expect(result.client.grant_types).toEqual(["authorization_code"]);
     expect(result.client.response_types).toEqual(["code"]);
-    expect(result.client.scope).toBe("admin");
     expect(result.client.client_name).toBe("Unnamed MCP Client");
   });
 
@@ -137,7 +136,7 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
     const result = buildClientRegistration({
       redirect_uris: ["https://app.example.com/cb"],
       client_name: "My App",
-      scope: "admin",
+      scope: "mcp:read",
       grant_types: ["authorization_code", "refresh_token"],
       client_uri: "https://app.example.com",
       contacts: ["ops@example.com"],
@@ -147,12 +146,133 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
     if (!result.ok) return;
 
     expect(result.client.client_name).toBe("My App");
+    expect(result.client.scope).toBe("mcp:read");
     expect(result.client.grant_types).toEqual([
       "authorization_code",
       "refresh_token",
     ]);
     expect(result.client.client_uri).toBe("https://app.example.com");
     expect(result.client.contacts).toEqual(["ops@example.com"]);
+  });
+});
+
+// The registration core used to write `scope: scope || "admin"`, so a client
+// that POSTed to the UNAUTHENTICATED /oauth/register endpoint and named no
+// scope was stored as fully privileged, and one that asked for "admin" was
+// handed it verbatim. Nothing reads oauth_clients.scope for authorization
+// today, so neither granted access — but the stored row is what a future
+// scope-based check would read, and it would inherit "anyone who can reach
+// /oauth/register is an admin". These cases pin the default at "no scope" and
+// the elevated request at "refused", for the self-registration path only.
+describe("buildClientRegistration — scope is not granted by default", () => {
+  it("records NO scope for a self-registered client that asks for none", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      client_name: "Claude",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.client.scope).toBeNull();
+    expect(result.client.scope).not.toBe("admin");
+  });
+
+  it("refuses a self-registered client that asks for the admin scope", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      scope: "admin",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+
+    expect(result.error).toBe("invalid_client_metadata");
+    expect(result.error_description).toContain("admin");
+  });
+
+  it("refuses an elevated scope hidden among ordinary ones", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      scope: "mcp:read admin mcp:write",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("invalid_client_metadata");
+  });
+
+  it("does NOT refuse an ordinary scope that merely contains 'admin'", () => {
+    // Space-delimited tokens per RFC 6749 §3.3 — a substring match here would
+    // reject legitimate scopes and turn a hygiene fix into an outage.
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      scope: "read:administration",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.client.scope).toBe("read:administration");
+  });
+
+  it("treats a blank scope as absent rather than storing whitespace", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      scope: "   ",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.client.scope).toBeNull();
+  });
+
+  it("ignores a non-string scope instead of coercing it", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      scope: { admin: true },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.client.scope).toBeNull();
+  });
+
+  it("allows the admin scope for an entitled caller (the admin UI path)", () => {
+    // The tRPC create is adminProcedure-gated, so an elevated scope there is a
+    // deliberate act by someone who already holds the role.
+    const result = buildClientRegistration(
+      { redirect_uris: CLAUDE_CALLBACKS, scope: "admin" },
+      { allowElevatedScope: true },
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.client.scope).toBe("admin");
+  });
+
+  it("still registers a Claude connector end to end", () => {
+    // The connector pairing path must keep working: the DCR body Claude sends
+    // carries no scope, and the whole registration has to succeed unchanged
+    // apart from the scope column.
+    const result = buildClientRegistration({
+      client_name: "Claude",
+      redirect_uris: CLAUDE_CALLBACKS,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.client.client_id).toMatch(/^mcp_client_/);
+    expect(result.client.client_secret).toBeNull();
+    expect(result.client.redirect_uris).toEqual(CLAUDE_CALLBACKS);
+    expect(result.client.grant_types).toEqual([
+      "authorization_code",
+      "refresh_token",
+    ]);
+    expect(result.client.scope).toBeNull();
   });
 });
 

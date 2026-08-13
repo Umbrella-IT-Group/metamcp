@@ -100,6 +100,19 @@ describe("oauthClientsImplementations.create", () => {
     );
   });
 
+  it("keeps the admin scope available to this admin-gated path", async () => {
+    // The public DCR endpoint refuses a self-registrant that asks for "admin"
+    // (see routers/oauth/client-registration.test.ts). This path is
+    // adminProcedure-only, so it opts into the elevated scope explicitly and
+    // must keep persisting exactly what the operator chose in the dialog.
+    const result = await oauthClientsImplementations.create(baseCreateInput);
+
+    expect(result.scope).toBe("admin");
+    expect(oauthRepoMock.upsertClient).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: "admin" }),
+    );
+  });
+
   it("rejects an invalid redirect URI WITHOUT writing anything", async () => {
     await expect(
       oauthClientsImplementations.create({

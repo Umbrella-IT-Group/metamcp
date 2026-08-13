@@ -52,6 +52,17 @@ export interface ClientRegistrationInput {
   software_version?: unknown;
 }
 
+/** Caller-supplied entitlements. See `allowElevatedScope`. */
+export interface ClientRegistrationOptions {
+  /**
+   * Whether the CALLER is entitled to hand the new client an elevated scope
+   * (see `ELEVATED_SCOPES`). Defaults to false, because the caller that must
+   * be safe without opting in is the anonymous one: `POST /oauth/register` is
+   * unauthenticated. The admin-gated tRPC create passes true explicitly.
+   */
+  allowElevatedScope?: boolean;
+}
+
 export type ClientRegistrationResult =
   | { ok: true; client: OAuthClientCreateInput }
   | { ok: false; error: string; error_description: string };
@@ -62,17 +73,28 @@ const VALID_AUTH_METHODS: readonly string[] =
   OAuthTokenEndpointAuthMethodEnum.options;
 
 /**
+ * Scope tokens a self-registered client may never hold. `admin` is the only
+ * scope this server names anywhere (`routers/oauth/metadata.ts` advertises it
+ * as the whole `scopes_supported` vocabulary) and the only one whose name
+ * asserts full access, so today it is the entire elevated set.
+ */
+const ELEVATED_SCOPES: readonly string[] = ["admin"];
+
+/**
  * Validate a registration request and mint the client row for it.
  *
  * Validation order matches the original handler exactly (redirect URIs, then
  * grant types, response types, auth method) so error responses are unchanged
- * for existing DCR callers.
+ * for existing DCR callers. The scope check is appended AFTER those four for
+ * the same reason: it is the only new rejection, so no request that used to be
+ * refused with one error code is now refused with another.
  *
  * Not pure — it generates the client id and, where the auth method calls for
  * one, the client secret. It performs no I/O, so tests drive it directly.
  */
 export function buildClientRegistration(
   input: ClientRegistrationInput,
+  options: ClientRegistrationOptions = {},
 ): ClientRegistrationResult {
   const {
     redirect_uris,
@@ -155,6 +177,39 @@ export function buildClientRegistration(
     };
   }
 
+  // Scope is validated like the value sets above instead of being stored
+  // verbatim, and there is NO "admin" fallback any more. This core's busiest
+  // caller is the UNAUTHENTICATED `POST /oauth/register`, so the old
+  // `scope || "admin"` recorded every anonymous self-registrant as fully
+  // privileged. Nothing reads `oauth_clients.scope` for authorization today —
+  // real RBAC is the better-auth session role — so that default granted no
+  // access; the row is the hazard. It is exactly what a future scope-based
+  // check would consult, and such a check would silently inherit "anyone who
+  // can reach /oauth/register is an admin". A client that asks for nothing now
+  // gets NULL, the honest record of what it was granted.
+  const requestedScope = typeof scope === "string" ? scope.trim() : "";
+
+  if (requestedScope && !options.allowElevatedScope) {
+    // Token-wise, not substring: "read:administration" is an ordinary scope
+    // and must not be refused because "admin" appears inside it. RFC 6749 §3.3
+    // defines a scope as space-delimited tokens, so that is how it is split.
+    const elevated = requestedScope
+      .split(/\s+/)
+      .filter((token) => ELEVATED_SCOPES.includes(token));
+
+    if (elevated.length > 0) {
+      return {
+        ok: false,
+        // RFC 7591 §3.2.2's code for a metadata VALUE the server refuses —
+        // the value-set failures above predate this file and keep their
+        // historical `invalid_request`, but a brand-new rejection has no
+        // back-compat debt, so it uses the code the RFC actually specifies.
+        error: "invalid_client_metadata",
+        error_description: `Scope not available to self-registered clients: ${elevated.join(" ")}`,
+      };
+    }
+  }
+
   const clientId = generateSecureClientId();
 
   // OAuth 2.1 Security: Generate client secret only if auth method requires it
@@ -174,7 +229,7 @@ export function buildClientRegistration(
       grant_types: clientGrantTypes as string[],
       response_types: clientResponseTypes as string[],
       token_endpoint_auth_method: clientTokenEndpointAuthMethod,
-      scope: (scope as string) || "admin",
+      scope: requestedScope || null,
       client_uri: (client_uri as string) || null,
       logo_uri: (logo_uri as string) || null,
       contacts: contacts && Array.isArray(contacts) ? contacts : null,

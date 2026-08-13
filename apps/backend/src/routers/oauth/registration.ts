@@ -51,7 +51,6 @@ registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
       grant_types: clientRegistration.grant_types,
       response_types: clientRegistration.response_types,
       token_endpoint_auth_method: clientRegistration.token_endpoint_auth_method,
-      scope: clientRegistration.scope,
 
       // OAuth 2.1 Security Information
       oauth_compliance: "OAuth 2.1",
@@ -75,7 +74,13 @@ registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
         "This client uses PKCE for security. Ensure code_challenge and code_challenge_method are included in authorization requests.";
     }
 
-    // Include optional metadata if provided
+    // Include optional metadata if provided. `scope` sits in this block rather
+    // than in the fixed body above because a self-registered client is now
+    // normally granted none — echoing `scope: null` on every registration
+    // would read as "the server lost your scope", whereas RFC 7591 §3.2.1
+    // treats an absent field as "not registered". A client that asked for a
+    // (non-elevated) scope still sees exactly what was recorded for it.
+    if (clientRegistration.scope) response.scope = clientRegistration.scope;
     if (clientRegistration.client_uri)
       response.client_uri = clientRegistration.client_uri;
     if (clientRegistration.logo_uri)
@@ -125,7 +130,8 @@ registrationRouter.get("/oauth/register", async (req, res) => {
         response_types: "OAuth response types (default: ['code'])",
         token_endpoint_auth_method:
           "Client authentication method (default: 'none' for PKCE)",
-        scope: "Requested scope (default: 'admin')",
+        scope:
+          "Requested scope. Optional, and no scope is recorded when it is omitted. Self-registered clients cannot request the privileged 'admin' scope; such a request is rejected with invalid_client_metadata.",
         client_uri: "Homepage URL for your application",
         logo_uri: "Logo URL for your application",
         contacts: "Array of contact email addresses",
@@ -153,7 +159,6 @@ registrationRouter.get("/oauth/register", async (req, res) => {
           grant_types: ["authorization_code"],
           response_types: ["code"],
           token_endpoint_auth_method: "none",
-          scope: "admin",
         },
       },
 
