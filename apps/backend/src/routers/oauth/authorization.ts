@@ -98,13 +98,17 @@ function consentCookieOptions(req: express.Request) {
   };
 }
 
-/** The cookie name this request's scheme allows — see consentCsrfCookieName. */
-function consentCookieName(req: express.Request): string {
-  return consentCsrfCookieName(getBaseUrl(req).startsWith("https://"));
+/** The cookie name for one consent request — see consentCsrfCookieName. */
+function consentCookieName(req: express.Request, cid: string): string {
+  return consentCsrfCookieName(getBaseUrl(req).startsWith("https://"), cid);
 }
 
-function clearConsentCookie(req: express.Request, res: express.Response) {
-  res.clearCookie(consentCookieName(req), consentCookieOptions(req));
+function clearConsentCookie(
+  req: express.Request,
+  res: express.Response,
+  cid: string,
+) {
+  res.clearCookie(consentCookieName(req, cid), consentCookieOptions(req));
 }
 
 /**
@@ -247,6 +251,10 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     // user with a fresh CSRF nonce, and handed to a page a human has to act
     // on; POST /oauth/authorize/decision is the only place a code appears.
     const csrf = randomBytes(32).toString("base64url");
+    // Names this request's cookie. Not a secret — it only has to be unique
+    // enough that two authorizations from the same browser never share a
+    // cookie name. The secret is `csrf`, which lives in the cookie's value.
+    const cid = randomBytes(9).toString("base64url");
     const areq = signConsentRequest({
       client_id: oauthParams.client_id,
       redirect_uri: oauthParams.redirect_uri,
@@ -255,11 +263,16 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
       code_challenge: oauthParams.code_challenge,
       code_challenge_method: oauthParams.code_challenge_method,
       user_id: userId,
+      cid,
       csrf,
       exp: Date.now() + CONSENT_REQUEST_TTL_MS,
     });
 
-    res.cookie(consentCookieName(req), csrf, {
+    // Per-cid name: a second authorize from the same browser adds a cookie
+    // rather than replacing this one, so whichever consent page the user
+    // actually approves still finds its own nonce. Abandoned flows leave a
+    // ~90-byte cookie behind until the TTL expires them.
+    res.cookie(consentCookieName(req, cid), csrf, {
       ...consentCookieOptions(req),
       maxAge: CONSENT_REQUEST_TTL_MS,
     });
@@ -420,9 +433,11 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     // Nothing is cleared on this branch on purpose: clearing the cookie for
     // a request that failed verification would let anyone cancel a victim's
     // pending consent by replaying a bad decision.
+    // The name comes from the VERIFIED token, so the browser's other pending
+    // consent cookies are simply different names and cannot interfere.
     const presentedCsrf = readCookieValues(
       req.headers.cookie,
-      consentCookieName(req),
+      consentCookieName(req, consentRequest.cid),
     );
 
     if (!presentedCsrf.some((v) => safeEquals(v, consentRequest.csrf))) {
@@ -444,14 +459,14 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
       !clientData ||
       !clientData.redirect_uris.includes(consentRequest.redirect_uri)
     ) {
-      clearConsentCookie(req, res);
+      clearConsentCookie(req, res, consentRequest.cid);
       return res.status(400).json({
         error: "invalid_request",
         error_description: "redirect_uri is not registered for this client",
       });
     }
 
-    clearConsentCookie(req, res);
+    clearConsentCookie(req, res, consentRequest.cid);
 
     const redirectUrl = new URL(consentRequest.redirect_uri);
     if (consentRequest.state) {

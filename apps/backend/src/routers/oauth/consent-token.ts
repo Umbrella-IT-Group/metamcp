@@ -30,7 +30,18 @@ export interface ConsentRequestPayload {
   code_challenge_method?: string;
   /** The signed-in user the consent request belongs to. */
   user_id: string;
-  /** Double-submit nonce; must equal the oauth_consent_csrf cookie. */
+  /**
+   * Consent-request id. NOT a secret and never compared for authorization —
+   * it exists only to give this request its own cookie NAME. A real OAuth
+   * client hits /oauth/authorize more than once (prefetch, retry, parallel
+   * tabs); with one shared cookie name the second Set-Cookie overwrote the
+   * first, so approving the page bound to the first request compared against
+   * the second request's nonce and failed. Observed against a live Claude.ai
+   * connect: two `consent requested` lines in the same second, then
+   * `consent rejected reason=csrf` on Approve.
+   */
+  cid: string;
+  /** Double-submit nonce; must equal the per-cid csrf cookie's value. */
   csrf: string;
   /** Absolute expiry, epoch milliseconds. */
   exp: number;
@@ -45,7 +56,7 @@ export interface ConsentRequestPayload {
  */
 const SIGNING_CONTEXT = "metamcp.oauth.consent.v1";
 
-/** Name of the double-submit cookie on a plain-http (local) deployment. */
+/** Base name of the double-submit cookie on a plain-http (local) deployment. */
 export const CONSENT_CSRF_COOKIE = "oauth_consent_csrf";
 
 /**
@@ -62,9 +73,19 @@ export const CONSENT_CSRF_COOKIE = "oauth_consent_csrf";
  */
 export const CONSENT_CSRF_COOKIE_HOST_PREFIXED = "__Host-oauth_consent_csrf";
 
-/** The cookie name this deployment issues and reads. */
-export function consentCsrfCookieName(secure: boolean): string {
-  return secure ? CONSENT_CSRF_COOKIE_HOST_PREFIXED : CONSENT_CSRF_COOKIE;
+/**
+ * The cookie name for ONE consent request.
+ *
+ * Suffixed with the request's `cid` so concurrent authorizations get separate
+ * cookies instead of overwriting each other — see ConsentRequestPayload.cid
+ * for the live failure that forced this. The `__Host-` prefix is unaffected by
+ * a suffix: it constrains the cookie's attributes (Secure, Path=/, no Domain),
+ * not the rest of its name. `cid` is base64url, whose alphabet is all valid
+ * cookie-name characters.
+ */
+export function consentCsrfCookieName(secure: boolean, cid: string): string {
+  const base = secure ? CONSENT_CSRF_COOKIE_HOST_PREFIXED : CONSENT_CSRF_COOKIE;
+  return `${base}_${cid}`;
 }
 
 /**
@@ -150,6 +171,11 @@ export function verifyConsentRequest(
     typeof candidate.redirect_uri !== "string" ||
     typeof candidate.scope !== "string" ||
     typeof candidate.user_id !== "string" ||
+    // Required, so a token predating the per-cid cookie split cannot resolve
+    // to a cookie name of "undefined". Any such token still in flight during a
+    // rollout is refused and the client re-authorizes cleanly.
+    typeof candidate.cid !== "string" ||
+    candidate.cid.length === 0 ||
     typeof candidate.csrf !== "string" ||
     typeof candidate.exp !== "number"
   ) {

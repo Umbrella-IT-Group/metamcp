@@ -73,8 +73,11 @@ const {
 const { resetConsentDecisionRateLimitForTests } = await import("./utils");
 
 // APP_URL is https here, as on the real deployment, so the cookie this server
-// issues and reads carries the __Host- prefix.
-const CSRF_COOKIE = CONSENT_CSRF_COOKIE_HOST_PREFIXED;
+// issues and reads carries the __Host- prefix. The name is per consent request:
+// see ConsentRequestPayload.cid.
+function csrfCookieName(cid: string): string {
+  return `${CONSENT_CSRF_COOKIE_HOST_PREFIXED}_${cid}`;
+}
 
 const APP_URL = "https://mcp.example.test";
 const CLIENT_ID = "mcp_client_test";
@@ -256,11 +259,15 @@ function authorize(cookie?: string) {
 }
 
 /** A consent request as /oauth/authorize would have issued it. */
+let cidCounter = 0;
 function makeAreq(overrides: Partial<ConsentRequestPayload> = {}): {
   areq: string;
   csrf: string;
+  cid: string;
 } {
   const csrf = overrides.csrf ?? "csrf-nonce-for-this-browser";
+  cidCounter += 1;
+  const cid = overrides.cid ?? `cid${cidCounter}`;
   const areq = signConsentRequest({
     client_id: CLIENT_ID,
     redirect_uri: REDIRECT_URI,
@@ -269,11 +276,40 @@ function makeAreq(overrides: Partial<ConsentRequestPayload> = {}): {
     code_challenge: CODE_CHALLENGE,
     code_challenge_method: "S256",
     user_id: USER_ID,
+    cid,
     csrf,
     exp: Date.now() + 10 * 60 * 1000,
     ...overrides,
   });
-  return { areq, csrf };
+  return { areq, csrf, cid };
+}
+
+/** The raw signed token a consent redirect carries. */
+function areqFrom(res: FakeRes): string {
+  const areq = redirectUrl(res).searchParams.get("areq");
+  if (!areq) throw new Error("consent redirect carried no areq");
+  return areq;
+}
+
+/**
+ * The `Cookie` header a real browser would send after these responses.
+ *
+ * Modelled as a jar keyed by NAME, last write winning — which is the whole
+ * point. A browser does not accumulate two cookies with the same name, path
+ * and domain: the second Set-Cookie REPLACES the first. That replacement is
+ * what broke the live connect, so a test that simply concatenated both
+ * Set-Cookie values would quietly pass even against the broken server.
+ */
+function browserCookieHeader(...responses: FakeRes[]): string {
+  const jar = new Map<string, string>([
+    ["better-auth.session_token", "session-value"],
+  ]);
+  for (const res of responses) {
+    for (const cookie of res.cookies) {
+      jar.set(cookie.name, cookie.value);
+    }
+  }
+  return [...jar].map(([name, value]) => `${name}=${value}`).join("; ");
 }
 
 /** Split an areq into its encoded payload and its hex MAC. */
@@ -301,12 +337,16 @@ function decide(init: {
   /** Extra values sent under the SAME cookie name, ahead of the real one. */
   plantedCsrfCookies?: string[];
 }) {
+  // The browser sends the cookie whose NAME belongs to this request. For an
+  // unverifiable token the name is irrelevant — it is refused before the
+  // cookie is ever read.
+  const cid = verifyConsentRequest(init.areq)?.cid ?? "unverifiable";
   const cookies = [SESSION_COOKIE];
   for (const planted of init.plantedCsrfCookies ?? []) {
-    cookies.push(`${CSRF_COOKIE}=${planted}`);
+    cookies.push(`${csrfCookieName(cid)}=${planted}`);
   }
   if (init.csrfCookie !== null && init.csrfCookie !== undefined) {
-    cookies.push(`${CSRF_COOKIE}=${init.csrfCookie}`);
+    cookies.push(`${csrfCookieName(cid)}=${init.csrfCookie}`);
   }
 
   return dispatch({
@@ -322,7 +362,9 @@ function decide(init: {
 
 /** The cookie the authorize endpoint wrote, asserted present. */
 function issuedCsrfCookie(res: FakeRes): CookieWrite {
-  const written = res.cookies.filter((c) => c.name === CSRF_COOKIE);
+  const written = res.cookies.filter((c) =>
+    c.name.startsWith(CONSENT_CSRF_COOKIE_HOST_PREFIXED),
+  );
   expect(written).toHaveLength(1);
   const cookie = written[0];
   if (!cookie) throw new Error("no consent csrf cookie was written");
@@ -420,7 +462,7 @@ describe("GET /oauth/authorize — being signed in is not consent", () => {
     // __Host- is only honoured with Secure, Path=/ and no Domain — the three
     // attributes asserted above. It is what stops a sibling subdomain from
     // planting a same-named cookie at all.
-    expect(cookie.name).toBe("__Host-oauth_consent_csrf");
+    expect(cookie.name).toMatch(/^__Host-oauth_consent_csrf_.+/);
     expect(cookie.options).not.toHaveProperty("domain");
 
     // The cookie carries exactly the nonce inside the signed token — that
@@ -492,11 +534,97 @@ describe("POST /oauth/authorize/decision — approval mints", () => {
   });
 
   it("clears the csrf cookie once the request has been completed", async () => {
-    const { areq, csrf } = makeAreq();
+    const { areq, csrf, cid } = makeAreq();
 
     const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
 
-    expect(res.clearedCookies.map((c) => c.name)).toEqual([CSRF_COOKIE]);
+    expect(res.clearedCookies).toHaveLength(1);
+    expect(res.clearedCookies[0]?.name).toBe(csrfCookieName(cid));
+  });
+});
+
+describe("POST /oauth/authorize/decision — concurrent authorize flows", () => {
+  it("completes the flow the user approved after the client hit /oauth/authorize twice", async () => {
+    // Alex's live Claude.ai connect, exactly. The connector requested
+    // /oauth/authorize twice in the same second (two `consent requested`
+    // lines); with one shared cookie name the second Set-Cookie replaced the
+    // first, so approving the page bound to request A compared A's signed
+    // nonce against B's cookie and logged `consent rejected reason=csrf`.
+    // Both cookies are in the header here because a browser sends every
+    // unexpired cookie it holds for the origin.
+    const flowA = await authorize(SESSION_COOKIE);
+    const flowB = await authorize(SESSION_COOKIE);
+
+    const res = await dispatch({
+      method: "POST",
+      path: "/oauth/authorize/decision",
+      body: { areq: areqFrom(flowA), decision: "approve" },
+      cookie: browserCookieHeader(flowA, flowB),
+    });
+
+    // The symptom Alex saw, asserted first: a 403 with no code minted.
+    expect(res.statusCode).not.toBe(403);
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+    expect(redirectUrl(res).searchParams.get("code")).toMatch(/^mcp_code_/);
+
+    // And the mechanism behind it: two authorizations, two cookie names, so
+    // the second Set-Cookie never displaced the first.
+    const cookieA = issuedCsrfCookie(flowA);
+    const cookieB = issuedCsrfCookie(flowB);
+    expect(cookieA.name).not.toBe(cookieB.name);
+    expect(cookieA.value).not.toBe(cookieB.value);
+  });
+
+  it("completes the SECOND flow just as well, with both cookies present", async () => {
+    const flowA = await authorize(SESSION_COOKIE);
+    const flowB = await authorize(SESSION_COOKIE);
+
+    const res = await dispatch({
+      method: "POST",
+      path: "/oauth/authorize/decision",
+      body: { areq: areqFrom(flowB), decision: "approve" },
+      cookie: browserCookieHeader(flowA, flowB),
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+    expect(redirectUrl(res).searchParams.get("code")).toMatch(/^mcp_code_/);
+  });
+
+  it("still refuses flow A when only the OTHER flow's cookie is held", async () => {
+    // The per-cid name must not become a way in: B's cookie is a different
+    // name AND a different value, so it can never satisfy A.
+    const flowA = await authorize(SESSION_COOKIE);
+    const flowB = await authorize(SESSION_COOKIE);
+
+    const res = await dispatch({
+      method: "POST",
+      path: "/oauth/authorize/decision",
+      body: { areq: areqFrom(flowA), decision: "approve" },
+      cookie: browserCookieHeader(flowB),
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses a cookie holding the right nonce under another flow's name", async () => {
+    // Belt and braces: the value alone must not be enough if it arrives under
+    // a name that does not belong to the request being approved.
+    const flowA = await authorize(SESSION_COOKIE);
+    const flowB = await authorize(SESSION_COOKIE);
+
+    const cookieA = issuedCsrfCookie(flowA);
+    const cookieB = issuedCsrfCookie(flowB);
+
+    const res = await dispatch({
+      method: "POST",
+      path: "/oauth/authorize/decision",
+      body: { areq: areqFrom(flowA), decision: "approve" },
+      cookie: [SESSION_COOKIE, `${cookieB.name}=${cookieA.value}`].join("; "),
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
   });
 });
 
