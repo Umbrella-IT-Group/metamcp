@@ -178,10 +178,10 @@
       "breakpoints": true
     },
     {
-      "idx": 25,
+      "idx": 26,
       "version": "7",
       "when": 1786665600000,
-      "tag": "0025_oauth_scope_default_mcp",
+      "tag": "0026_oauth_scope_default_mcp",
       "breakpoints": true
     }
   ]
