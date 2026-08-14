@@ -366,6 +366,31 @@ export class EndpointsRepository {
     return endpoint;
   }
 
+  /**
+   * Does this deployment have ANY OAuth-enabled endpoint?
+   *
+   * Backs the unscoped `/.well-known/oauth-*` discovery documents (upstream
+   * issue #277): those carry no endpoint in their path, so the only honest
+   * question they can answer is whether this gateway runs an OAuth
+   * authorization server at all. A deployment where every endpoint is
+   * API-key-only must not advertise one — Claude Code ≥ v2.1.85 does RFC 9728
+   * discovery before connecting and abandons its configured bearer token the
+   * moment it finds OAuth metadata.
+   *
+   * `limit(1)` and a single projected column because this runs on an
+   * unauthenticated public route; `findAll()` would drag every row and every
+   * column back for a boolean.
+   */
+  async hasOAuthEnabledEndpoint(): Promise<boolean> {
+    const [row] = await db
+      .select({ uuid: endpointsTable.uuid })
+      .from(endpointsTable)
+      .where(eq(endpointsTable.enable_oauth, true))
+      .limit(1);
+
+    return Boolean(row);
+  }
+
   // Find endpoint by name within user scope (for uniqueness checks)
   async findByNameAndUserId(
     name: string,

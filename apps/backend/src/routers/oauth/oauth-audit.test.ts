@@ -294,7 +294,11 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
       path: "/oauth/register",
       body: {
         client_name: "Definitely Claude",
-        redirect_uris: ["https://attacker.example.invalid/callback"],
+        // Loopback, because since FIND-023 that is the only shape an
+        // anonymous caller can still register besides the Anthropic hosts —
+        // and it makes the point better: the NAME is the lie the consent
+        // screen shows, and no host allowlist constrains it.
+        redirect_uris: ["http://localhost:8765/callback"],
       },
     });
     await flush();
@@ -316,7 +320,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
     });
     expect(rows[0].detail).toMatchObject({
       client_name: "Definitely Claude",
-      redirect_uris: ["https://attacker.example.invalid/callback"],
+      redirect_uris: ["http://localhost:8765/callback"],
     });
   });
 
@@ -345,14 +349,20 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
   it("CLAMPS the caller-supplied arrays — this endpoint takes no credential", async () => {
     // Without a clamp this emit is a write-amplification primitive: the JSON
     // body limit is 50mb, `buildClientRegistration` validates each URI's
-    // scheme but bounds neither the array nor its elements, and
+    // scheme and host but bounds neither the array nor its elements, and
     // `rateLimitToken` keys on `req.ip` — the same loopback address for every
     // caller behind the in-container rewrite, i.e. one global bucket. The
     // target is a jsonb column in a table with DELETE/TRUNCATE triggers and
     // no prune path, so every byte written is permanent.
+    //
+    // One allowlisted host with 40 distinct long PATHS, because FIND-023's
+    // host allowlist refuses 40 distinct hosts — and the clamp this test
+    // exists for bounds length, which the path carries just as well. The
+    // amplification is real either way: the allowlist caps the host set, not
+    // the number or size of URIs.
     const manyUris = Array.from(
       { length: 40 },
-      (_, i) => `https://c${i}.example.invalid/${"p".repeat(2000)}`,
+      (_, i) => `https://claude.ai/${i}/${"p".repeat(2000)}`,
     );
 
     const res = await dispatch(registrationRouter, {

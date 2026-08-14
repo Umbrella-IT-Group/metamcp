@@ -61,6 +61,15 @@ export function generateSecureClientSecret(): string {
 /**
  * Validate redirect URI according to OAuth 2.1 security requirements
  * Prevents open redirect vulnerabilities
+ *
+ * SUPERSEDED AT REGISTRATION by `isAllowedRedirectUri` below, which is the
+ * only checker `buildClientRegistration` calls. This one is deliberately left
+ * in place for `/oauth/authorize`: the stricter rules would also apply to the
+ * redirect_uris of clients that are ALREADY stored, and re-validating those
+ * rows mid-incident is a separate, evidence-gated decision (see the
+ * "belt-and-suspenders" note on `isAllowedRedirectUri`). Registration-time
+ * enforcement plus removal of the red-team test clients is what closes
+ * FIND-023; adopting the strict checker here too is the planned follow-up.
  */
 export function validateRedirectUri(
   uri: string,
@@ -106,6 +115,190 @@ export function validateRedirectUri(
   } catch {
     return false;
   }
+}
+
+/**
+ * The port `apps/backend/src/index.ts` calls `app.listen()` on.
+ *
+ * Needed here because it is the one loopback port a redirect_uri must NOT use:
+ * every request reaches this router through the Next.js rewrite, so
+ * `localhost:12009` is the gateway talking to itself. No external OAuth client
+ * has a callback listener there, which makes `http://localhost:12009/...` a
+ * pure attack shape — the red-team run registered exactly that. Kept in step
+ * with index.ts by `redirect-uri-allowlist.test.ts`, which reads the literal
+ * back out of that file; a bare duplicated number would drift silently.
+ */
+export const GATEWAY_INTERNAL_PORT = 12009;
+
+/**
+ * Hostnames a NON-loopback redirect_uri may use at registration time.
+ *
+ * Locked to the Anthropic connector hosts because that is what the live data
+ * says is real: of the 65 clients registered against this gateway before
+ * 2026-08-14, every legitimate redirect_uri was loopback or one of these, and
+ * every other host (evil.com, `mcp.umbrellaitgroup.com.evil.com`,
+ * `…@evil.com`) was a red-team probe. An allowlist is therefore the cheapest
+ * complete fix for FIND-023: DCR is anonymous, so anything short of "the
+ * server decides which hosts are acceptable" leaves an attacker free to
+ * register a client whose consent screen shows a plausible name and whose code
+ * lands on their own host.
+ *
+ * `anthropic.com` is included as headroom for a first-party callback move; it
+ * is not currently used by any registered client.
+ */
+export const DEFAULT_DCR_REDIRECT_URI_ALLOWED_HOSTS: readonly string[] = [
+  "claude.ai",
+  "claude.com",
+  "anthropic.com",
+];
+
+/**
+ * Env override for the allowlist above: comma-separated hostnames.
+ *
+ * Setting it REPLACES the default rather than extending it, so an operator can
+ * both add a host and remove one of ours without editing code. Setting it to
+ * an empty value is meaningful, not a mistake — it means "loopback only".
+ */
+export const DCR_REDIRECT_URI_ALLOWED_HOSTS_ENV =
+  "DCR_REDIRECT_URI_ALLOWED_HOSTS";
+
+/**
+ * Exactly the hostnames that count as loopback. Membership is EXACT, never a
+ * suffix test: `localhost.evil.com` and `127.0.0.1.evil.com` both end in a
+ * loopback label and both resolve to an attacker's server.
+ *
+ * `::1` is stored unbracketed because the WHATWG parser reports IPv6 hosts
+ * bracketed (`new URL("http://[::1]/").hostname === "[::1]"`), and the check
+ * strips the brackets before comparing.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set([
+  "localhost",
+  "127.0.0.1",
+  "::1",
+]);
+
+/** Why a redirect_uri was refused. Machine-readable so tests can pin the rule. */
+export type RedirectUriRejectionReason =
+  | "not_a_string"
+  | "unparseable"
+  | "unsupported_scheme"
+  | "insecure_scheme_non_loopback"
+  | "userinfo_present"
+  | "fragment_present"
+  | "gateway_internal_port"
+  | "host_not_allowed";
+
+export type RedirectUriCheck =
+  | { ok: true }
+  | { ok: false; reason: RedirectUriRejectionReason };
+
+/**
+ * Resolve the effective non-loopback host allowlist.
+ *
+ * Read per call, not at module load, because the env is process configuration
+ * an operator may set at deploy time and because a module-load snapshot cannot
+ * be exercised by more than one test in a file.
+ */
+export function resolveDcrAllowedHosts(): string[] {
+  const raw = process.env[DCR_REDIRECT_URI_ALLOWED_HOSTS_ENV];
+
+  // `undefined` means "not configured" → default. An empty or whitespace-only
+  // string is a configured value meaning "no non-loopback host is allowed".
+  if (raw === undefined) {
+    return [...DEFAULT_DCR_REDIRECT_URI_ALLOWED_HOSTS];
+  }
+
+  return raw
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter((host) => host.length > 0);
+}
+
+/**
+ * The registration-time redirect_uri gate — FIND-023 (HIGH, incident 65394).
+ *
+ * `POST /oauth/register` takes no credential, so whatever passes this function
+ * is a host a signed-in human can later be asked to approve on the consent
+ * screen. Before it existed the endpoint 201-accepted `https://evil.com`, the
+ * lookalike `https://mcp.umbrellaitgroup.com.evil.com`, and the userinfo trick
+ * `https://mcp.umbrellaitgroup.com@evil.com` (whose real host is evil.com but
+ * which reads as ours to a human skimming the URL). Only `javascript:`/`data:`
+ * were refused.
+ *
+ * Pure and I/O-free: the only ambient input is the env allowlist, which
+ * `options.allowedHosts` overrides for tests and for callers that have already
+ * resolved it.
+ *
+ * Rules, all of which must pass:
+ *  1. Parses under the WHATWG URL parser.
+ *  2. `https` for non-loopback; `http` only for loopback. Every other scheme
+ *     is refused, which generalises the old `javascript:`/`data:` special case.
+ *  3. No userinfo — `username` and `password` must both be empty.
+ *  4. No fragment (RFC 6749 §3.1.2 forbids one on a redirection endpoint).
+ *  5. Loopback is an EXACT hostname match, any port except the gateway's own
+ *     internal listener.
+ *  6. Non-loopback hosts must match the allowlist exactly. Exact, not suffix:
+ *     a suffix rule is what makes `mcp.umbrellaitgroup.com.evil.com` look
+ *     legitimate, and it would also hand every `*.claude.ai` subdomain — user
+ *     content included — a valid callback.
+ */
+export function isAllowedRedirectUri(
+  uri: unknown,
+  options?: { allowedHosts?: readonly string[] },
+): RedirectUriCheck {
+  if (typeof uri !== "string") {
+    return { ok: false, reason: "not_a_string" };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return { ok: false, reason: "unparseable" };
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return { ok: false, reason: "unsupported_scheme" };
+  }
+
+  // Checked before the host rules on purpose. `https://good.example@evil.com`
+  // has host evil.com, so the allowlist would refuse it anyway — but a URI
+  // whose authority a human and a parser read differently is not something to
+  // accept even when the host happens to be allowed
+  // (`https://evil.com@claude.ai` is the mirror image).
+  if (parsed.username !== "" || parsed.password !== "") {
+    return { ok: false, reason: "userinfo_present" };
+  }
+
+  if (parsed.hash !== "") {
+    return { ok: false, reason: "fragment_present" };
+  }
+
+  // Bracket-stripped so the IPv6 literal `[::1]` compares against `::1`.
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+
+  if (LOOPBACK_HOSTNAMES.has(hostname)) {
+    // Any port a local client happens to bind is fine — an installed client
+    // picks an ephemeral one — except the gateway's own.
+    if (parsed.port === String(GATEWAY_INTERNAL_PORT)) {
+      return { ok: false, reason: "gateway_internal_port" };
+    }
+    return { ok: true };
+  }
+
+  if (parsed.protocol !== "https:") {
+    return { ok: false, reason: "insecure_scheme_non_loopback" };
+  }
+
+  const allowedHosts = (options?.allowedHosts ?? resolveDcrAllowedHosts()).map(
+    (host) => host.trim().toLowerCase(),
+  );
+
+  if (!allowedHosts.includes(hostname)) {
+    return { ok: false, reason: "host_not_allowed" };
+  }
+
+  return { ok: true };
 }
 
 /**

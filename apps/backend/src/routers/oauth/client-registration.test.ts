@@ -19,8 +19,9 @@ import { GRANTED_OAUTH_SCOPE } from "./utils";
 
 // The two canonical Anthropic connector callbacks the create dialog's Claude
 // preset fills in. Pinned here so a change to the preset has to be deliberate.
+const CLAUDE_AI_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
 const CLAUDE_CALLBACKS = [
-  "https://claude.ai/api/mcp/auth_callback",
+  CLAUDE_AI_CALLBACK,
   "https://claude.com/api/mcp/auth_callback",
 ];
 
@@ -54,8 +55,11 @@ describe("buildClientRegistration — redirect URIs", () => {
   });
 
   it("rejects when ANY uri in the list is invalid, not just the first", () => {
+    // First entry deliberately VALID (it is an allowlisted Claude callback),
+    // so the failure can only come from the second — the whole point of the
+    // assertion.
     const result = buildClientRegistration({
-      redirect_uris: ["https://good.example/cb", "not a url"],
+      redirect_uris: [CLAUDE_AI_CALLBACK, "not a url"],
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error_description).toContain("not a url");
@@ -136,7 +140,10 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
 
   it("passes explicit values through", () => {
     const result = buildClientRegistration({
-      redirect_uris: ["https://app.example.com/cb"],
+      // An allowlisted host: this test is about metadata pass-through, and
+      // since FIND-023 an arbitrary vendor host would fail before any of the
+      // fields below were reached.
+      redirect_uris: [CLAUDE_AI_CALLBACK],
       client_name: "My App",
       // NOTE: `scope` is deliberately absent here — it is not a
       // passed-through field. See the scope-substitution block below.
