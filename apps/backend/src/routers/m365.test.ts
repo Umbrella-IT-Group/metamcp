@@ -36,9 +36,13 @@ vi.mock("@/db/repositories/m365-tokens.repo", () => ({
     deleteByUserId: vi.fn(async () => true),
   },
 }));
+vi.mock("@/db/repositories/users.repo", () => ({
+  usersRepository: { isDisabled: vi.fn(async () => false) },
+}));
 
 import { auth } from "@/auth";
 import { m365TokensRepository } from "@/db/repositories/m365-tokens.repo";
+import { usersRepository } from "@/db/repositories/users.repo";
 
 import { decryptRefreshToken } from "../lib/m365/crypto";
 import m365Router, { escapeHtml } from "./m365";
@@ -54,6 +58,9 @@ const repoMock = m365TokensRepository as unknown as {
   upsertEnrollment: ReturnType<typeof vi.fn>;
   deleteByUserId: ReturnType<typeof vi.fn>;
 };
+const isDisabledMock = usersRepository.isDisabled as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 let server: Server;
 let baseUrl: string;
@@ -99,6 +106,10 @@ beforeEach(() => {
   vi.stubEnv("M365_TOKEN_KEK", KEK_B64);
   vi.stubEnv("APP_URL", "https://mcp.example.com");
   getSessionMock.mockReset();
+  // Default: the signed-in account is live. Tests that care set their own
+  // answer, so a disabled-enforcement test that forgot to arm the mock fails
+  // OPEN and its own assertion catches it.
+  isDisabledMock.mockReset().mockResolvedValue(false);
   repoMock.findByUserId.mockReset().mockResolvedValue(undefined);
   repoMock.upsertEnrollment.mockReset().mockResolvedValue({});
   repoMock.deleteByUserId.mockReset().mockResolvedValue(true);
@@ -352,5 +363,92 @@ describe("status + disconnect", () => {
     const body = (await response.json()) as { disconnected?: boolean };
     expect(body.disconnected).toBe(true);
     expect(repoMock.deleteByUserId).toHaveBeenCalledWith("user-1");
+  });
+});
+
+/**
+ * `users.disabled` enforcement on the M365 broker (migration 0027).
+ *
+ * These routes resolve the better-auth session directly, so neither the
+ * sign-in hook nor the tRPC context guard is on the path: a locked-out account
+ * holding a live 30-day session cookie could otherwise still re-enroll a fresh
+ * delegated Microsoft grant or read the connection state of the identity an
+ * admin just took away.
+ *
+ * The gate lives in getSessionUser, so this asserts it holds on ALL FOUR
+ * routes — a per-route check is the version that a fifth route added later
+ * silently escapes.
+ */
+describe("users.disabled — the whole broker closes for a locked-out account", () => {
+  beforeEach(() => {
+    signInAs("user-1");
+    isDisabledMock.mockResolvedValue(true);
+  });
+
+  it("/status answers 401, exactly as if there were no session", async () => {
+    const response = await realFetch(`${baseUrl}/m365/status`);
+    expect(response.status).toBe(401);
+    expect(isDisabledMock).toHaveBeenCalledWith("user-1");
+    // No enrollment state is disclosed to a locked-out caller.
+    expect(repoMock.findByUserId).not.toHaveBeenCalled();
+  });
+
+  it("/disconnect answers 401 and touches no grant", async () => {
+    const response = await realFetch(`${baseUrl}/m365/disconnect`, {
+      method: "POST",
+    });
+    expect(response.status).toBe(401);
+    expect(repoMock.deleteByUserId).not.toHaveBeenCalled();
+  });
+
+  it("/enroll redirects to login instead of starting an Entra round-trip", async () => {
+    const response = await realFetch(`${baseUrl}/m365/enroll`, {
+      redirect: "manual",
+    });
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe(
+      "/login?callbackUrl=%2Fm365%2Fenroll",
+    );
+    expect(response.headers.get("location")).not.toContain(
+      "login.microsoftonline.com",
+    );
+  });
+
+  it("/callback cannot complete an enrollment started before the lock", async () => {
+    // The realistic race: the flow began while the account was live, the admin
+    // pressed disable mid-round-trip, and Entra redirects back with a valid
+    // code and a valid single-use state. Nothing may be persisted.
+    isDisabledMock.mockResolvedValue(false);
+    const state = await startEnrollment();
+    isDisabledMock.mockResolvedValue(true);
+
+    entraExchange.mockResolvedValue(
+      new Response(JSON.stringify(goodExchangeBody()), { status: 200 }),
+    );
+    const response = await realFetch(
+      `${baseUrl}/m365/callback?code=c&state=${encodeURIComponent(state)}`,
+    );
+
+    expect(response.status).toBe(403);
+    expect(repoMock.upsertEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("serves all four routes normally when the account is ENABLED", async () => {
+    // Regression guard: a gate that refused everyone would pass every test
+    // above it.
+    isDisabledMock.mockResolvedValue(false);
+
+    expect((await realFetch(`${baseUrl}/m365/status`)).status).toBe(200);
+    expect(
+      (await realFetch(`${baseUrl}/m365/disconnect`, { method: "POST" }))
+        .status,
+    ).toBe(200);
+    const enroll = await realFetch(`${baseUrl}/m365/enroll`, {
+      redirect: "manual",
+    });
+    expect(enroll.status).toBe(302);
+    expect(enroll.headers.get("location")).toContain(
+      "login.microsoftonline.com",
+    );
   });
 });

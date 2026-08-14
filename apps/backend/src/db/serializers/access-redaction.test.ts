@@ -182,6 +182,38 @@ describe("UsersSerializer.serializeUserList", () => {
       expect(() => UserListItemSchema.parse(serialized)).not.toThrow();
     }
   });
+
+  it("badges a lost `disabled` value as DISABLED, matching enforcement", () => {
+    // The serializer and usersRepository.isDisabled must agree about what an
+    // absent value means, and the two answers are not equally safe. The
+    // enforcement path reads `?? true`; a `=== true` read here would badge the
+    // account ENABLED, so the dashboard would tell an admin that the attacker
+    // they just locked out is still active — while the middleware was in fact
+    // refusing them. That disagreement is the one lie this screen exists to
+    // prevent, so the badge fails in the same direction the gate does.
+    for (const missing of [null, undefined]) {
+      const lost = {
+        ...dbUser,
+        disabled: missing,
+      } as unknown as Parameters<
+        typeof UsersSerializer.serializeUserList
+      >[0][number];
+
+      for (const serialized of UsersSerializer.serializeUserList([lost])) {
+        expect(serialized.disabled).toBe(true);
+        expect(() => UserListItemSchema.parse(serialized)).not.toThrow();
+      }
+    }
+  });
+
+  it("still reports a real `false` as enabled (regression guard)", () => {
+    // Fail-closed must not become "always closed": the ordinary case is an
+    // enabled account, and badging every account disabled would be its own
+    // incident.
+    for (const serialized of UsersSerializer.serializeUserList([dbUser])) {
+      expect(serialized.disabled).toBe(false);
+    }
+  });
 });
 
 describe("OAuthTokensSerializer.serializeActiveTokenList", () => {

@@ -36,6 +36,7 @@ import express from "express";
 
 import { auth } from "@/auth";
 import { m365TokensRepository } from "@/db/repositories/m365-tokens.repo";
+import { usersRepository } from "@/db/repositories/users.repo";
 import logger from "@/utils/logger";
 
 import {
@@ -97,6 +98,29 @@ async function getSessionUser(
       headers: webHeadersFromExpress(req),
     });
     if (session?.user?.id) {
+      // `users.disabled` enforcement (migration 0027). Sessions in this fork
+      // live 30 days and this router resolves them directly through
+      // better-auth, so neither the sign-in hook nor the tRPC context guard is
+      // on this path: without this check a locked-out account keeps a working
+      // Microsoft enrollment surface — it could re-enroll a fresh delegated
+      // grant, or read the connection status of the identity an admin just
+      // took away.
+      //
+      // Answered as "no session" rather than with an error of its own, which
+      // is what puts the check HERE instead of in each route: all four routes
+      // (/enroll, /callback, /status, /disconnect) already branch on the
+      // undefined return, so one gate closes the whole router and no route
+      // added later can forget it. /enroll and /callback land on the login
+      // page, where auth.ts refuses the sign-in and says why; /status and
+      // /disconnect answer 401. Sitting inside the existing try also makes a
+      // database failure here fail CLOSED — the catch below returns undefined,
+      // i.e. locked out, not let through.
+      if (await usersRepository.isDisabled(session.user.id)) {
+        logger.warn(
+          `M365 broker: request rejected reason=disabled user=${session.user.id}`,
+        );
+        return undefined;
+      }
       return { id: session.user.id, email: session.user.email };
     }
   } catch (error) {

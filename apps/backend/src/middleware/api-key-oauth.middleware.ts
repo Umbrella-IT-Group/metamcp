@@ -4,6 +4,7 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { ApiKeysRepository } from "../db/repositories/api-keys.repo";
+import { usersRepository } from "../db/repositories/users.repo";
 import {
   authRateLimiter,
   getAuthRateLimitIdentifier,
@@ -125,6 +126,45 @@ async function validateOAuthToken(
 }
 
 /**
+ * `users.disabled` enforcement for the DATA plane (migration 0027).
+ *
+ * The login hook, the tRPC context and the OAuth authorize handler all refuse
+ * a disabled account, but every one of them sits on the HUMAN plane. This
+ * middleware is the machine plane — bearer tokens and API keys — and it is the
+ * plane the 2026-08-13 attacker actually used. Without this gate "disabled"
+ * meant "cannot obtain NEW credentials", which is worth very little against
+ * someone already holding one: OAuth access tokens live 24h, refresh tokens
+ * 365d, and API keys never expire.
+ *
+ * Checked against the EFFECTIVE identity, which for an API key can be two
+ * accounts: the key's owner and — for an admin key carrying an acts-as
+ * binding — the user it impersonates. Either being disabled refuses the
+ * request. A disabled owner must not keep acting through anyone, and an
+ * enabled admin must not keep acting AS someone who was just locked out.
+ *
+ * Returns the first disabled account id so the caller can name it in the log.
+ */
+async function findDisabledIdentity(
+  candidateUserIds: Array<string | null | undefined>,
+): Promise<string | undefined> {
+  for (const userId of candidateUserIds) {
+    // Public API keys carry no owner (`user_id` is NULL by design — see
+    // checkApiKeyAccess) and unscoped keys carry no acts-as target. There is
+    // no account behind those, so there is nothing to lock out and skipping is
+    // not a fail-open hole. Calling isDisabled(undefined) instead would match
+    // no row, fail CLOSED to `true`, and take every public API key on the
+    // gateway offline the moment this shipped.
+    if (!userId) continue;
+    // Sequential on purpose: at most two ids, and the common answer is "not
+    // disabled" for the first one, so this is one indexed primary-key select
+    // on a path that has already spent a DB round-trip validating the
+    // credential itself.
+    if (await usersRepository.isDisabled(userId)) return userId;
+  }
+  return undefined;
+}
+
+/**
  * Extract authentication token from request headers and query parameters
  */
 function extractAuthToken(
@@ -204,15 +244,39 @@ export const authenticateApiKey = async (
       const apiKeyResult = await apiKeysRepository.validateApiKey(token);
 
       if (apiKeyResult?.valid) {
-        // API key valid - perform access control and pass
-        authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
-        authReq.apiKeyUuid = apiKeyResult.key_uuid;
         // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
         // api-key branches so the m365 context gate sees it regardless of
         // whether the endpoint also has OAuth enabled. Runtime pairing
         // re-check via resolveActsAsUserId: never stamped for an unscoped
         // row.
-        authReq.apiKeyActsAsUserId = resolveActsAsUserId(apiKeyResult);
+        const actsAsUserId = resolveActsAsUserId(apiKeyResult);
+
+        // `users.disabled` gate (migration 0027) — see findDisabledIdentity.
+        // Runs BEFORE the endpoint access check so a locked-out account gets
+        // one uniform refusal everywhere instead of scope-specific messages
+        // that map out which endpoints its key could otherwise reach. Nothing
+        // is stamped on the request and next() is never reached, so the
+        // downstream m365 identity injection never sees this caller.
+        const disabledUserId = await findDisabledIdentity([
+          apiKeyResult.user_id,
+          actsAsUserId,
+        ]);
+        if (disabledUserId) {
+          logger.warn(
+            `[auth] api key rejected reason=disabled endpoint=${endpoint.uuid} key=${apiKeyResult.key_uuid} user=${disabledUserId}`,
+          );
+          return res.status(403).json({
+            error: "Access denied",
+            message:
+              "This credential is not currently permitted to access this gateway.",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        // API key valid - perform access control and pass
+        authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
+        authReq.apiKeyUuid = apiKeyResult.key_uuid;
+        authReq.apiKeyActsAsUserId = actsAsUserId;
         authReq.authMethod = "api_key";
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
@@ -259,6 +323,25 @@ export const authenticateApiKey = async (
         const oauthResult = await validateOAuthToken(token, req);
 
         if (oauthResult.valid) {
+          // `users.disabled` gate (migration 0027) — see findDisabledIdentity.
+          // Introspection deliberately stays a pure token-row lookup, so the
+          // account check has to happen here, at the call site that turns a
+          // token into a caller.
+          const disabledUserId = await findDisabledIdentity([
+            oauthResult.user_id,
+          ]);
+          if (disabledUserId) {
+            logger.warn(
+              `[auth] oauth token rejected reason=disabled endpoint=${endpoint.uuid} user=${disabledUserId}`,
+            );
+            return res.status(403).json({
+              error: "access_denied",
+              error_description:
+                "This credential is not currently permitted to access this gateway.",
+              timestamp: new Date().toISOString(),
+            });
+          }
+
           // OAuth token valid - perform access control and pass
           authReq.oauthUserId = oauthResult.user_id;
           authReq.authMethod = "oauth";
@@ -280,15 +363,39 @@ export const authenticateApiKey = async (
       const apiKeyResult = await apiKeysRepository.validateApiKey(token);
 
       if (apiKeyResult?.valid) {
-        // API key valid - perform access control and pass
-        authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
-        authReq.apiKeyUuid = apiKeyResult.key_uuid;
         // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
         // api-key branches so the m365 context gate sees it regardless of
         // whether the endpoint also has OAuth enabled. Runtime pairing
         // re-check via resolveActsAsUserId: never stamped for an unscoped
         // row.
-        authReq.apiKeyActsAsUserId = resolveActsAsUserId(apiKeyResult);
+        const actsAsUserId = resolveActsAsUserId(apiKeyResult);
+
+        // `users.disabled` gate (migration 0027) — see findDisabledIdentity.
+        // Runs BEFORE the endpoint access check so a locked-out account gets
+        // one uniform refusal everywhere instead of scope-specific messages
+        // that map out which endpoints its key could otherwise reach. Nothing
+        // is stamped on the request and next() is never reached, so the
+        // downstream m365 identity injection never sees this caller.
+        const disabledUserId = await findDisabledIdentity([
+          apiKeyResult.user_id,
+          actsAsUserId,
+        ]);
+        if (disabledUserId) {
+          logger.warn(
+            `[auth] api key rejected reason=disabled endpoint=${endpoint.uuid} key=${apiKeyResult.key_uuid} user=${disabledUserId}`,
+          );
+          return res.status(403).json({
+            error: "Access denied",
+            message:
+              "This credential is not currently permitted to access this gateway.",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        // API key valid - perform access control and pass
+        authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
+        authReq.apiKeyUuid = apiKeyResult.key_uuid;
+        authReq.apiKeyActsAsUserId = actsAsUserId;
         authReq.authMethod = "api_key";
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
@@ -335,6 +442,24 @@ export const authenticateApiKey = async (
       const oauthResult = await validateOAuthToken(token, req);
 
       if (oauthResult.valid) {
+        // `users.disabled` gate (migration 0027) — see findDisabledIdentity.
+        // Same check as the OAuth branch of CONDITION 3; both call sites carry
+        // it because either one alone leaves the other endpoint shape open.
+        const disabledUserId = await findDisabledIdentity([
+          oauthResult.user_id,
+        ]);
+        if (disabledUserId) {
+          logger.warn(
+            `[auth] oauth token rejected reason=disabled endpoint=${endpoint.uuid} user=${disabledUserId}`,
+          );
+          return res.status(403).json({
+            error: "access_denied",
+            error_description:
+              "This credential is not currently permitted to access this gateway.",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
         // OAuth token valid - perform access control and pass
         authReq.oauthUserId = oauthResult.user_id;
         authReq.authMethod = "oauth";

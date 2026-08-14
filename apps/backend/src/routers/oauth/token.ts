@@ -2,7 +2,7 @@ import express from "express";
 
 import logger from "@/utils/logger";
 
-import { oauthRepository } from "../../db/repositories";
+import { oauthRepository, usersRepository } from "../../db/repositories";
 import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
@@ -308,6 +308,26 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
+  // `users.disabled` enforcement (migration 0027). The authorize handler
+  // already refuses to MINT a code for a disabled account, but a code minted
+  // in the seconds before the admin pressed disable stays redeemable for its
+  // full 10-minute TTL — and one redemption here buys a 24h access token plus
+  // a 365d refresh token. Guarding only the mint would leave that ten-minute
+  // window open on the exact credential chain the incident turned on.
+  //
+  // Placed before the single-use delete below for the same reason as the
+  // refresh path: a refused grant leaves no wreckage, so re-enabling the
+  // account inside the TTL restores a working flow instead of a burnt code.
+  if (await usersRepository.isDisabled(codeData.user_id)) {
+    logger.warn(
+      `[oauth] token rejected reason=disabled grant=authorization_code client=${codeData.client_id} user=${codeData.user_id}`,
+    );
+    return res.status(400).json({
+      error: "invalid_grant",
+      error_description: "Invalid or expired authorization code",
+    });
+  }
+
   // Code is valid, delete it (authorization codes are single-use)
   await oauthRepository.deleteAuthCode(code);
 
@@ -378,6 +398,34 @@ async function handleRefreshTokenGrant(
     return res.status(400).json({
       error: "invalid_client",
       error_description: "Client ID does not match",
+    });
+  }
+
+  // `users.disabled` enforcement (migration 0027) — the plane the 2026-08-13
+  // attacker actually held. Refresh tokens live 365 days in this fork and the
+  // authorize handler is nowhere on this path, so without this check a
+  // disabled account keeps minting fresh 24h access tokens for a year from a
+  // credential it already has. Disable has to mean the NEXT request fails, and
+  // this is the request it makes.
+  //
+  // Deliberately placed BEFORE the rotation delete below: disable is a
+  // reversible lockout, not a revocation. Rejecting after the delete would
+  // destroy the token row and permanently break the connector even after an
+  // admin presses Enable, quietly turning Disable into Revoke. Leaving the row
+  // intact costs nothing — this check re-runs and refuses on every retry for
+  // as long as the account stays disabled.
+  //
+  // The response is byte-identical to the unknown-refresh-token branch above.
+  // A holder of a stolen refresh token learns only "this no longer works", not
+  // that they tripped an admin lock — the `reason=disabled` distinction lives
+  // in the server log, where the operator reads it and the attacker does not.
+  if (await usersRepository.isDisabled(tokenData.user_id)) {
+    logger.warn(
+      `[oauth] token rejected reason=disabled grant=refresh_token client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
+    return res.status(400).json({
+      error: "invalid_grant",
+      error_description: "Invalid refresh token",
     });
   }
 

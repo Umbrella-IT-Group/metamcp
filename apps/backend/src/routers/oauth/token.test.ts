@@ -42,8 +42,13 @@ const oauthRepositoryMock = {
   getAccessToken: vi.fn(),
 };
 
+const usersRepositoryMock = {
+  isDisabled: vi.fn(),
+};
+
 vi.mock("../../db/repositories", () => ({
   oauthRepository: oauthRepositoryMock,
+  usersRepository: usersRepositoryMock,
 }));
 
 const { default: tokenRouter } = await import("./token");
@@ -160,6 +165,10 @@ beforeEach(() => {
   oauthRepositoryMock.setAccessToken.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAccessToken.mockResolvedValue(undefined);
+  // Default: the account is live. Tests that care set their own answer, so a
+  // disabled-enforcement test that forgot to arm the mock fails OPEN and its
+  // own assertion catches it.
+  usersRepositoryMock.isDisabled.mockResolvedValue(false);
 });
 
 describe("POST /oauth/token — authorization_code success logging", () => {
@@ -294,6 +303,157 @@ describe("POST /oauth/token — refresh_token success logging", () => {
     expect(logged).not.toContain(body.access_token);
     expect(logged).not.toContain(body.refresh_token);
     expect(logged).not.toContain("mcp_token_previouslyissued0000");
+  });
+});
+
+/**
+ * `users.disabled` enforcement at the token endpoint (migration 0027).
+ *
+ * Wave 2 first shipped disable at the login and OAuth-authorize planes. This
+ * endpoint sits behind BOTH of them and is reached by neither: a refresh token
+ * minted before the lock is good for 365 days here, and an authorization code
+ * minted in the seconds before the lock stays redeemable for its full 10-minute
+ * TTL. Either one hands a locked-out account a fresh 24h access token, which is
+ * exactly the credential chain the 2026-08-13 incident turned on.
+ *
+ * Each test asserts three things together, because any one alone can pass while
+ * the guard is useless: the grant is REFUSED, no token was minted
+ * (`setAccessToken` never called), and — the reversibility property — the
+ * existing credential was NOT destroyed on the way out. Disable is a lockout;
+ * Revoke is the thing that deletes.
+ */
+describe("POST /oauth/token — disabled account is refused on both grants", () => {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  const authCode = "mcp_code_disabledaccount0000";
+  const refreshToken = "mcp_refresh_disabledaccount0";
+  const priorAccessToken = "mcp_token_previouslyissued0000";
+
+  beforeEach(() => {
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: authCode,
+      client_id: CLIENT_ID,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      scope: SCOPE,
+      user_id: USER_ID,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+    });
+    oauthRepositoryMock.getClient.mockResolvedValue({
+      client_id: CLIENT_ID,
+      client_name: "Claude",
+      token_endpoint_auth_method: "none",
+      client_secret: null,
+    });
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue({
+      access_token: priorAccessToken,
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 60 * 1000),
+      refresh_token_expires_at: new Date(Date.now() + 365 * 24 * 3600 * 1000),
+    });
+  });
+
+  const exchange = () =>
+    post({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      client_id: CLIENT_ID,
+      code_verifier: codeVerifier,
+    });
+
+  const refresh = () =>
+    post({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+    });
+
+  it("refuses a disabled account's refresh token with invalid_grant", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await refresh();
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_grant");
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+    expect(allLoggedText()).not.toContain("[oauth] token issued");
+  });
+
+  it("does not destroy the refused refresh token — disable is reversible", async () => {
+    // The guard sits BEFORE the rotation delete on purpose. Rejecting after it
+    // would consume the token row and leave the connector permanently broken
+    // even after an admin presses Enable, which quietly turns Disable into
+    // Revoke.
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    await refresh();
+
+    expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("still answers a disabled account exactly like an unknown refresh token", async () => {
+    // No oracle: a holder of a stolen refresh token must not be able to tell
+    // "this account was locked" from "this token is not one of ours".
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+    const disabledRes = await refresh();
+
+    vi.clearAllMocks();
+    usersRepositoryMock.isDisabled.mockResolvedValue(false);
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
+    const unknownRes = await refresh();
+
+    expect(disabledRes.statusCode).toBe(unknownRes.statusCode);
+    expect(disabledRes.body).toEqual(unknownRes.body);
+  });
+
+  it("refuses a disabled account's authorization code inside its 10-minute TTL", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await exchange();
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_grant");
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+    expect(allLoggedText()).not.toContain("[oauth] token issued");
+  });
+
+  it("does not burn the refused authorization code", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    await exchange();
+
+    expect(oauthRepositoryMock.deleteAuthCode).not.toHaveBeenCalled();
+  });
+
+  it("logs reason=disabled naming the grant and user, and no credential", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    await refresh();
+
+    const logged = allLoggedText();
+    expect(logged).toContain("reason=disabled");
+    expect(logged).toContain("grant=refresh_token");
+    expect(logged).toContain(`user=${USER_ID}`);
+    expect(logged).not.toContain(refreshToken);
+    expect(logged).not.toContain(priorAccessToken);
+  });
+
+  it("still issues both grants for an ENABLED account (regression guard)", async () => {
+    // The guard must refuse the disabled account and nobody else — a check
+    // that rejected everyone would pass every test above.
+    usersRepositoryMock.isDisabled.mockResolvedValue(false);
+
+    expect(grantBody(await refresh()).access_token).toMatch(/^mcp_token_/);
+    expect(grantBody(await exchange()).access_token).toMatch(/^mcp_token_/);
   });
 });
 

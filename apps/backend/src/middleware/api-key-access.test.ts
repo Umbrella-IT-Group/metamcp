@@ -33,6 +33,14 @@ vi.mock("../db/repositories/api-keys.repo", () => ({
   },
 }));
 
+// Same reason as api-keys.repo above: the middleware imports users.repo at
+// module load for the `users.disabled` data-plane gate (migration 0027), and
+// that import chain reaches db/index too. The pure functions under test here
+// never call it — the gate is exercised in api-key-disabled-account.test.ts.
+vi.mock("../db/repositories/users.repo", () => ({
+  usersRepository: { isDisabled: vi.fn() },
+}));
+
 import {
   checkApiKeyAccess,
   resolveActsAsUserId,

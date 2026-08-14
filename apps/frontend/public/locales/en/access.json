@@ -46,7 +46,7 @@
   "disableUser": "Disable account",
   "enableUser": "Enable account",
   "disableConfirmTitle": "Disable {{email}}?",
-  "disableConfirmDescription": "Locks the account out. It cannot sign in, its existing sessions stop working on their next request, and it cannot complete an OAuth authorization. Everything else is preserved exactly as it is — the account, its history and its owned resources remain for the incident record. Reversible at any time with Enable.",
+  "disableConfirmDescription": "Blocks every way in, starting with the next request: sign-in, OAuth authorization, existing sessions, existing OAuth and bearer tokens, and API keys — including admin keys acting as this account. Nothing is deleted — the account, its history, its owned resources and its credentials are preserved for the incident record — and Enable restores access at any time. Use Revoke instead to invalidate the sessions, tokens and keys permanently.",
   "disableConfirmAction": "Disable account",
   "disabling": "Disabling...",
   "enableConfirmTitle": "Enable {{email}}?",

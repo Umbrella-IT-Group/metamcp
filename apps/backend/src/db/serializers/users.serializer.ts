@@ -48,7 +48,11 @@ export class UsersSerializer {
       name: string;
       role: string;
       emailVerified: boolean;
-      disabled: boolean;
+      // Widened past the column's NOT NULL because the point of the `?? true`
+      // below is to survive a driver/query regression that stops producing a
+      // real boolean here — a type that forbids the bad value would optimise
+      // the defence away.
+      disabled: boolean | null | undefined;
       disabled_at: Date | string | null;
       disabled_by: string | null;
       created_at: Date | string;
@@ -65,7 +69,15 @@ export class UsersSerializer {
       name: user.name,
       role: user.role,
       emailVerified: user.emailVerified === true,
-      disabled: user.disabled === true,
+      // Fail CLOSED, matching usersRepository.isDisabled's `?? true`. The
+      // enforcement path and the badge that reports it must agree about what
+      // an absent value means, and the two answers are not equally safe: a
+      // `=== true` read of a lost value badges the account ENABLED, so the
+      // dashboard would tell an admin that the attacker they just locked out
+      // is still active — the one lie this screen exists to prevent. Reading
+      // it as disabled is the harmless direction: the admin sees a lock that
+      // enforcement is also applying.
+      disabled: user.disabled ?? true,
       disabled_at: toDateOrNull(user.disabled_at),
       disabled_by: user.disabled_by,
       // Coerced for the same reason as last_session_refresh_at below — these
