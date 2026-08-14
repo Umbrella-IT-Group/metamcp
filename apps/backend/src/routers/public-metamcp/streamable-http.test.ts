@@ -563,6 +563,42 @@ describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/se
     expect(typeof payload.streamableHttpSessions.count).toBe("number");
     expect(payload.publicSessionSweeper).toBeDefined();
   });
+
+  it("projects metaMcpPoolStatus to counts, dropping the pool's id lists", () => {
+    // The removal above took `sessionIds` off the TOP level, but
+    // `metaMcpPoolStatus` spread `getPoolStatus()` whole — and that returns
+    // `activeSessionIds` (the same replay material, one level down) plus
+    // `idleNamespaceUuids`. The default mock returns only counts, so the
+    // leak was invisible until the real shape is returned here.
+    vi.mocked(metaMcpServerPool.getPoolStatus).mockReturnValueOnce({
+      idle: 2,
+      active: 3,
+      activeSessionIds: ["sess-live-1", "sess-live-2", "sess-live-3"],
+      idleNamespaceUuids: ["ns-uuid-A", "ns-uuid-B"],
+    });
+
+    const payload = buildSessionsHealthPayload();
+
+    expect(Object.keys(payload.metaMcpPoolStatus).sort()).toEqual([
+      "active",
+      "idle",
+    ]);
+    const serialised = JSON.stringify(payload);
+    for (const secret of [
+      "activeSessionIds",
+      "idleNamespaceUuids",
+      "sess-live-1",
+      "ns-uuid-A",
+    ]) {
+      expect(serialised).not.toContain(secret);
+    }
+    // The counts a monitor alarms on survive, including the rollup that
+    // reads `active` off the same status object.
+    expect(payload.metaMcpPoolStatus).toEqual({ idle: 2, active: 3 });
+    expect(payload.totalActiveSessions).toBe(
+      payload.streamableHttpSessions.count + 3,
+    );
+  });
 });
 
 /**

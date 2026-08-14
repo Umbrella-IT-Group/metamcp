@@ -69,6 +69,27 @@ export function buildUpstreamHealthBody(
 }
 
 /**
+ * Body for the 500 branch of the same endpoint.
+ *
+ * Constant by construction. The branch previously serialised
+ * `error.message`, which on the failure this catch actually sees — a pg or
+ * driver error — carries internal hostnames, ports and SQL fragments, and
+ * served them to the same unauthenticated caller the success path was just
+ * hardened against. The real error is logged at the call site instead, so
+ * nothing is swallowed; only the wire form is constant.
+ *
+ * A fresh object per call rather than a shared frozen one: express serialises
+ * it immediately, and a shared instance is an invitation for a later caller
+ * to mutate the response of every other.
+ */
+export function buildUpstreamHealthErrorBody(): Record<string, unknown> {
+  return {
+    status: "error",
+    healthy: false,
+  };
+}
+
+/**
  * Resolve the caller's better-auth session and report whether they hold the
  * admin role.
  *

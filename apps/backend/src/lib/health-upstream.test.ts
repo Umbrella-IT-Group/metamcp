@@ -29,9 +29,11 @@ vi.mock("../utils/logger", () => ({
   default: { error: vi.fn(), info: vi.fn(), warn: vi.fn() },
 }));
 
-const { buildUpstreamHealthBody, isAdminHealthRequest } = await import(
-  "./health-upstream"
-);
+const {
+  buildUpstreamHealthBody,
+  buildUpstreamHealthErrorBody,
+  isAdminHealthRequest,
+} = await import("./health-upstream");
 
 const LIVENESS = {
   healthy: false,
@@ -95,6 +97,31 @@ describe("buildUpstreamHealthBody — what an admin sees", () => {
     expect(body.servers).toEqual(DETAIL.servers);
     expect(body.pool).toEqual(DETAIL.pool);
     expect(body.total_servers).toBe(9);
+  });
+});
+
+describe("buildUpstreamHealthErrorBody — the 500 branch", () => {
+  it("is a constant: two fields, no echo of whatever threw", () => {
+    // The branch used to serialise `error.message`. The errors it actually
+    // catches come from pg, so that message reads like
+    // `connect ECONNREFUSED postgres-internal:5432` — internal host, port,
+    // sometimes SQL — handed to an unauthenticated caller on the endpoint
+    // the success path was just gated for. The body takes no error at all
+    // now, so there is nothing to forget to redact.
+    const body = buildUpstreamHealthErrorBody();
+
+    expect(body).toEqual({ status: "error", healthy: false });
+    // Named as well as key-set-matched, per this file's convention.
+    expect(body).not.toHaveProperty("error");
+    expect(body).not.toHaveProperty("message");
+  });
+
+  it("hands back a fresh object each call", () => {
+    // Express serialises the returned object directly; sharing one instance
+    // across responses would let a later mutation rewrite an earlier reply.
+    expect(buildUpstreamHealthErrorBody()).not.toBe(
+      buildUpstreamHealthErrorBody(),
+    );
   });
 });
 

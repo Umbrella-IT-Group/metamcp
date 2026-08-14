@@ -3,6 +3,7 @@ import express from "express";
 import { auth } from "./auth";
 import {
   buildUpstreamHealthBody,
+  buildUpstreamHealthErrorBody,
   isAdminHealthRequest,
 } from "./lib/health-upstream";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
@@ -302,10 +303,10 @@ app.get("/health/upstream", async (req, res) => {
       ),
     );
   } catch (error) {
-    res.status(500).json({
-      status: "error",
-      healthy: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    // Logged here, never serialised: the body is the constant from
+    // ./lib/health-upstream, because this endpoint answers unauthenticated
+    // callers and a driver error's message names internal hosts and SQL.
+    logger.error("/health/upstream failed:", error);
+    res.status(500).json(buildUpstreamHealthErrorBody());
   }
 });
