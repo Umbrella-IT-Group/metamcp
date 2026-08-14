@@ -6,13 +6,14 @@ import {
   OAuthClient,
   OAuthClientCreateInput,
 } from "@repo/zod-types";
-import { eq, lt, and, isNull, desc } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, lt, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import {
   oauthAccessTokensTable,
   oauthAuthorizationCodesTable,
   oauthClientsTable,
+  usersTable,
 } from "../schema";
 
 export class OAuthRepository {
@@ -137,6 +138,50 @@ export class OAuthRepository {
     await db
       .delete(oauthAccessTokensTable)
       .where(eq(oauthAccessTokensTable.access_token, token));
+  }
+
+  // Admin listing of LIVE access tokens — "who is connected over OAuth right
+  // now", which before the Access dashboard had no answer outside psql.
+  //
+  // Filtered to non-expired rows only: `cleanupExpired` is opportunistic, so
+  // the table accumulates dead rows and an unfiltered listing would bury the
+  // handful of tokens that still authenticate. Expiry is evaluated against a
+  // single caller-supplied `now` so every row in one response is judged
+  // against the same instant.
+  //
+  // LEFT JOINs (not inner) on users and clients: a token whose user or client
+  // row is gone is precisely the anomaly an administrator must be able to
+  // see, and an inner join would silently hide it.
+  //
+  // Selects METADATA ONLY. `access_token` and `refresh_token` are not in the
+  // projection at all — a bearer credential for the whole gateway must not be
+  // pulled out of the database just to be dropped later. `refresh_token` is
+  // reduced to a boolean in SQL so the value never enters the process.
+  async listActiveAccessTokens(now: Date = new Date()) {
+    return await db
+      .select({
+        user_id: oauthAccessTokensTable.user_id,
+        user_email: usersTable.email,
+        client_id: oauthAccessTokensTable.client_id,
+        client_name: oauthClientsTable.client_name,
+        scope: oauthAccessTokensTable.scope,
+        created_at: oauthAccessTokensTable.created_at,
+        expires_at: oauthAccessTokensTable.expires_at,
+        has_refresh_token:
+          sql<boolean>`${oauthAccessTokensTable.refresh_token} IS NOT NULL`.as(
+            "has_refresh_token",
+          ),
+        refresh_token_expires_at:
+          oauthAccessTokensTable.refresh_token_expires_at,
+      })
+      .from(oauthAccessTokensTable)
+      .leftJoin(usersTable, eq(oauthAccessTokensTable.user_id, usersTable.id))
+      .leftJoin(
+        oauthClientsTable,
+        eq(oauthAccessTokensTable.client_id, oauthClientsTable.client_id),
+      )
+      .where(gt(oauthAccessTokensTable.expires_at, now))
+      .orderBy(desc(oauthAccessTokensTable.created_at));
   }
 
   // ===== Refresh Tokens =====

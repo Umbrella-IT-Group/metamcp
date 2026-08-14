@@ -1,0 +1,40 @@
+export class OAuthTokensSerializer {
+  // Admin listing of live OAuth access tokens for the Access dashboard.
+  //
+  // There is no `access_token` / `refresh_token` field to drop here, and that
+  // is deliberate: the repository query never selects either column, so the
+  // secret does not exist in this process to be leaked by a careless spread.
+  // This serializer is the SECOND layer — it re-states the exact wire shape
+  // as an allow-list, mirroring OAuthClientsSerializer's rule that a
+  // management listing must never become an exfiltration surface. Refresh
+  // tokens are reported as presence only, computed in SQL.
+  //
+  // Never replace this with a spread of the row. The whole point of naming
+  // every field is that adding a column to `oauth_access_tokens` cannot
+  // silently widen the response.
+  static serializeActiveTokenList(
+    dbTokens: Array<{
+      user_id: string;
+      user_email: string | null;
+      client_id: string;
+      client_name: string | null;
+      scope: string;
+      created_at: Date;
+      expires_at: Date;
+      has_refresh_token: boolean;
+      refresh_token_expires_at: Date | null;
+    }>,
+  ) {
+    return dbTokens.map((token) => ({
+      user_id: token.user_id,
+      user_email: token.user_email,
+      client_id: token.client_id,
+      client_name: token.client_name,
+      scope: token.scope,
+      created_at: token.created_at,
+      expires_at: token.expires_at,
+      has_refresh_token: Boolean(token.has_refresh_token),
+      refresh_token_expires_at: token.refresh_token_expires_at,
+    }));
+  }
+}

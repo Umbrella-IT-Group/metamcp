@@ -10,6 +10,7 @@ import {
   SearchCode,
   Server,
   Settings,
+  ShieldCheck,
 } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -83,6 +84,52 @@ const getMenuItems = (t: (key: string) => string, locale: SupportedLocale) => [
     icon: Settings,
   },
 ];
+
+/**
+ * The Access dashboard link, rendered only for administrators.
+ *
+ * Every other item in this sidebar is ungated because every page behind them
+ * has a member-usable view. Access does not: all four of its queries are
+ * adminProcedure, so a member who followed the link would get an empty page
+ * and an "administrators only" notice.
+ *
+ * This is presentation, NOT the security boundary — the backend gate is. A
+ * member who types the URL still reaches the route and still sees nothing,
+ * because the page itself fails closed on the same session role. Hiding the
+ * link only keeps the nav honest about what the member can do.
+ */
+function AccessMenuItem() {
+  const { t, locale } = useTranslations();
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    // Fail closed: isAdmin starts false and a failed session lookup leaves it
+    // false, so an error hides the link rather than showing a dead one.
+    authClient
+      .getSession()
+      .then((session) => {
+        const role = (session?.data?.user as { role?: string } | undefined)
+          ?.role;
+        setIsAdmin(role === "admin");
+      })
+      .catch(() => {
+        setIsAdmin(false);
+      });
+  }, []);
+
+  if (!isAdmin) return null;
+
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton asChild>
+        <Link href={getLocalizedPath("/access", locale)}>
+          <ShieldCheck />
+          <span>{t("navigation:access")}</span>
+        </Link>
+      </SidebarMenuButton>
+    </SidebarMenuItem>
+  );
+}
 
 function LiveLogsMenuItem() {
   const { t, locale } = useTranslations();
@@ -207,6 +254,7 @@ export default function SidebarLayout({
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 ))}
+                <AccessMenuItem />
                 <LiveLogsMenuItem />
               </SidebarMenu>
             </SidebarGroupContent>
