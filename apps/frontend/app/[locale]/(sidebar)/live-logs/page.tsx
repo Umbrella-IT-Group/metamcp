@@ -1,20 +1,12 @@
 "use client";
 
-import { FileTerminal, RefreshCw, Trash2 } from "lucide-react";
+import { FileTerminal, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { useTranslations } from "@/hooks/useTranslations";
 import { useLogsStore } from "@/lib/stores/logs-store";
 
@@ -75,9 +67,13 @@ const messageColor = (level: string) =>
       ? "text-amber-300"
       : "text-gray-300";
 
+// Read-only view. The "Clear logs" button and its confirm dialog were removed
+// with migration 0028's audit_log: they were the one admin gesture that
+// erased the live security view mid-incident. See
+// packages/trpc/src/routers/frontend/logs.ts — the procedure behind them no
+// longer exists.
 export default function LiveLogsPage() {
   const { t } = useTranslations();
-  const [showClearDialog, setShowClearDialog] = useState(false);
   const {
     logs,
     isLoading,
@@ -85,19 +81,8 @@ export default function LiveLogsPage() {
     totalCount,
     lastFetch,
     fetchLogs,
-    clearLogs,
     setAutoRefresh,
   } = useLogsStore();
-
-  const handleClearLogs = async () => {
-    try {
-      await clearLogs();
-      toast.success(t("logs:logsClearSuccess"));
-      setShowClearDialog(false);
-    } catch (_error) {
-      toast.error(t("logs:logsClearError"));
-    }
-  };
 
   const handleRefresh = async () => {
     try {
@@ -188,15 +173,6 @@ export default function LiveLogsPage() {
               className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`}
             />
             {t("logs:refresh")}
-          </Button>
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={() => setShowClearDialog(true)}
-            disabled={isLoading || logs.length === 0}
-          >
-            <Trash2 className="h-4 w-4" />
-            {t("logs:clearLogs")}
           </Button>
         </div>
       </div>
@@ -301,28 +277,6 @@ export default function LiveLogsPage() {
           })}
         </div>
       )}
-
-      <Dialog open={showClearDialog} onOpenChange={setShowClearDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t("logs:clearAllLogs")}</DialogTitle>
-            <DialogDescription>{t("logs:clearLogsConfirm")}</DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowClearDialog(false)}>
-              {t("common:cancel")}
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleClearLogs}
-              disabled={isLoading}
-            >
-              <Trash2 className="h-4 w-4 mr-2" />
-              {t("logs:clearLogs")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

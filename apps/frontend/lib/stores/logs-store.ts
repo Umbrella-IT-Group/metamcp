@@ -11,9 +11,10 @@ interface LogsState {
   totalCount: number;
   lastFetch: Date | null;
 
-  // Actions
+  // Actions. Read-only: `clearLogs` was removed with migration 0028's
+  // audit_log — the backend procedure it called no longer exists. See
+  // packages/trpc/src/routers/frontend/logs.ts.
   fetchLogs: () => Promise<void>;
-  clearLogs: () => Promise<void>;
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
   setAutoRefresh: (enabled: boolean) => void;
@@ -86,33 +87,6 @@ export const useLogsStore = create<LogsState>()(
               currentState.stopAutoRefresh();
               console.log(
                 "Auto-refresh stopped due to authentication/authorization error",
-              );
-            }
-          }
-        }
-      }
-    },
-
-    clearLogs: async () => {
-      try {
-        await vanillaTrpcClient.frontend.logs.clear.mutate();
-        set({ logs: [], totalCount: 0 });
-      } catch (error) {
-        console.error("Failed to clear logs:", error);
-
-        // Check if it's an authentication error
-        if (error && typeof error === "object" && "message" in error) {
-          const errorMessage = String(error.message);
-          if (
-            errorMessage.includes("UNAUTHORIZED") ||
-            errorMessage.includes("You must be logged in")
-          ) {
-            // Stop auto-refresh if user is not authenticated
-            const currentState = get();
-            if (currentState.isAutoRefreshing) {
-              currentState.stopAutoRefresh();
-              console.log(
-                "Auto-refresh stopped due to authentication error in clearLogs",
               );
             }
           }

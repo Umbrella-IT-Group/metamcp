@@ -4,6 +4,8 @@
  * namespaces.updateToolStatus — writes to the shared tools catalog),
  * logs.clear (destructive, gateway-wide), and oauth.upsert (writes upstream
  * MCP-server OAuth credentials, a server-config surface) to adminProcedure.
+ * `logs.clear` has since been REMOVED outright — see its describe block
+ * below, which now asserts absence.
  *
  * Pre-condition verified by code inspection: `namespaces.refreshTools`
  * (member-accessible, kept as-is — see namespaces-curation-admin.test.ts)
@@ -67,24 +69,45 @@ describe("tools.create / tools.sync — admin gate", () => {
   });
 });
 
-describe("logs.clear — admin gate", () => {
+/**
+ * `logs.clear` used to be gated here. It is now GONE, and this suite asserts
+ * absence rather than a gate.
+ *
+ * The gate was never the problem: the procedure only emptied the in-memory
+ * ring buffer, but it was the one admin gesture that erased the live security
+ * view mid-incident, and it is the exact affordance the post-2026-08-13
+ * requirement forbids — no application or admin path that clears the record.
+ * An admin-gated wipe is still a wipe.
+ *
+ * Asserted against the router's procedure map rather than by calling
+ * `caller.clear()`, because a caller for a missing procedure fails as a plain
+ * TypeError, which is also what a typo in the test would produce.
+ */
+describe("logs.clear — removed, not gated", () => {
+  // Shaped to satisfy GetLogsResponseSchema: `get` declares `.output()`, so a
+  // loose stub fails output validation rather than the gate under test.
   const buildRouter = () =>
     createLogsRouter({
-      getLogs: vi.fn().mockResolvedValue({ logs: [] }),
-      clearLogs: vi
+      getLogs: vi
         .fn()
-        .mockResolvedValue({ success: true, message: "cleared" }),
+        .mockResolvedValue({ success: true, data: [], totalCount: 0 }),
     });
 
-  it("admin allowed, member FORBIDDEN", async () => {
+  it("the procedure does not exist on the router", () => {
+    const procedures = buildRouter()._def.procedures;
+
+    expect(Object.keys(procedures)).toEqual(["get"]);
+    expect("clear" in procedures).toBe(false);
+  });
+
+  it("logs.get survives and is still admin-gated", async () => {
     const router = buildRouter();
 
-    await expect(router.createCaller(adminCtx).clear()).resolves.toEqual({
+    await expect(router.createCaller(adminCtx).get({})).resolves.toMatchObject({
       success: true,
-      message: "cleared",
     });
 
-    await expect(router.createCaller(memberCtx).clear()).rejects.toMatchObject({
+    await expect(router.createCaller(memberCtx).get({})).rejects.toMatchObject({
       code: "FORBIDDEN",
     });
   });

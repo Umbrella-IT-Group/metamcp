@@ -7,8 +7,14 @@ export {
   router,
   baseProcedure,
   createTRPCRouter,
+  setTrpcAuditSink,
 } from "./trpc";
-export type { BaseContext } from "./trpc";
+export type {
+  AuditRequestContext,
+  BaseContext,
+  TrpcAuditSink,
+  TrpcDenialEvent,
+} from "./trpc";
 
 // Export router creators
 export { createAppRouter, createFrontendRouter } from "./router";
