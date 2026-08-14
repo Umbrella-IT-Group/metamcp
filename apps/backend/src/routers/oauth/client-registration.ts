@@ -9,7 +9,7 @@ import {
   generateSecureClientId,
   generateSecureClientSecret,
   GRANTED_OAUTH_SCOPE,
-  validateRedirectUri,
+  isAllowedRedirectUri,
 } from "./utils";
 
 /**
@@ -19,9 +19,15 @@ import {
  * admin UI gained a "create OAuth client" flow, so both mint paths run ONE
  * set of rules. Two entry points each carrying their own copy would drift,
  * and the drift would be silent in the dangerous direction: a UI-minted
- * client that skipped `validateRedirectUri` is an open redirect, and one that
+ * client that skipped `isAllowedRedirectUri` is an open redirect, and one that
  * skipped the auth-method check could be stored with a method the token
  * endpoint refuses to honour.
+ *
+ * That sharing also means the FIND-023 host allowlist covers the admin UI's
+ * create-client dialog, not just anonymous DCR. Deliberate: an admin who needs
+ * a callback host outside `DCR_REDIRECT_URI_ALLOWED_HOSTS` changes that env
+ * var, which leaves a deployment-visible record of the decision, rather than
+ * quietly minting through the UI a client the anonymous path would refuse.
  *
  * Deliberately free of express and of the database — it takes an untrusted
  * object and returns either a row ready to persist or an RFC 7591 error pair.
@@ -103,13 +109,25 @@ export function buildClientRegistration(
     };
   }
 
-  // OAuth 2.1 Security: Validate redirect URIs
+  // OAuth 2.1 Security: Validate redirect URIs.
+  //
+  // `isAllowedRedirectUri` — scheme, userinfo, fragment, exact-match loopback,
+  // and the non-loopback host allowlist. See its doc comment for why each rule
+  // exists; FIND-023 is the reason it replaced the old scheme-only check.
+  //
+  // The 400 pair below is unchanged apart from a trailing parenthesised reason:
+  // the allowlist is default-on, so a registration that used to succeed can now
+  // fail, and an operator staring at "Must use secure scheme and valid format"
+  // for `https://partner.example/cb` has no way to tell that the HOST is what
+  // was refused. `error` and the leading sentence are byte-identical, so
+  // anything matching on the RFC 7591 contract is unaffected.
   for (const uri of redirect_uris) {
-    if (typeof uri !== "string" || !validateRedirectUri(uri)) {
+    const check = isAllowedRedirectUri(uri);
+    if (!check.ok) {
       return {
         ok: false,
         error: "invalid_redirect_uri",
-        error_description: `Invalid redirect URI: ${uri}. Must use secure scheme and valid format.`,
+        error_description: `Invalid redirect URI: ${uri}. Must use secure scheme and valid format. (${check.reason})`,
       };
     }
   }
