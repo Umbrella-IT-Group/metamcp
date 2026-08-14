@@ -5,7 +5,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import { adminProcedure, router } from "../../trpc";
 
 // Define the logs router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -19,8 +19,13 @@ export const createLogsRouter = (
   },
 ) =>
   router({
-    // Protected: Get logs with optional limit
-    get: protectedProcedure
+    // Admin only: read the gateway log buffer. These are process-wide
+    // operational logs, not per-user records — they carry upstream MCP
+    // connection errors, request paths and internal hostnames for the whole
+    // estate, so a member reading them learns about servers and endpoints
+    // they have no other visibility into. `clear` was already admin-gated;
+    // leaving the read open made that gate cosmetic.
+    get: adminProcedure
       .input(GetLogsRequestSchema)
       .output(GetLogsResponseSchema)
       .query(async ({ input }) => {

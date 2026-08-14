@@ -7,6 +7,7 @@ import { oauthRepository } from "../../db/repositories";
 import {
   generateSecureAuthCode,
   getBaseUrl,
+  GRANTED_OAUTH_SCOPE,
   type OAuthParams,
   rateLimitAuth,
   validateRedirectUri,
@@ -110,7 +111,10 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     const oauthParams: OAuthParams = {
       client_id: finalClientId,
       redirect_uri: redirect_uri as string,
-      scope: scope ? (scope as string) : "admin",
+      // Granted scope is server-decided, never taken from req.query — the
+      // requested `scope` above is logged for diagnostics only. See
+      // GRANTED_OAUTH_SCOPE in ./utils.
+      scope: GRANTED_OAUTH_SCOPE,
       state: state ? (state as string) : undefined,
       code_challenge: code_challenge ? (code_challenge as string) : undefined,
       code_challenge_method: code_challenge_method
@@ -152,7 +156,7 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
             await oauthRepository.setAuthCode(code, {
               client_id: oauthParams.client_id,
               redirect_uri: oauthParams.redirect_uri,
-              scope: oauthParams.scope || "admin",
+              scope: GRANTED_OAUTH_SCOPE,
               user_id: sessionData.user.id,
               code_challenge: oauthParams.code_challenge || null,
               code_challenge_method: oauthParams.code_challenge_method || null,
@@ -329,10 +333,13 @@ Content-Type: application/json
     const code = generateSecureAuthCode();
 
     // Store authorization code with associated data
+    // Server-decided scope. This path matters most: `oauthParams` here can be
+    // decoded from the `params` query blob, which round-trips through the
+    // client unsigned, so any scope it carries is caller-controlled input.
     await oauthRepository.setAuthCode(code, {
       client_id,
       redirect_uri,
-      scope: oauthParams.scope || "admin",
+      scope: GRANTED_OAUTH_SCOPE,
       user_id: sessionData.user.id,
       code_challenge: oauthParams.code_challenge || null,
       code_challenge_method: oauthParams.code_challenge_method || null,

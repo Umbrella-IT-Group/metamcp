@@ -151,6 +151,7 @@ export const namespacesImplementations = {
       uuid: string;
     },
     userId: string,
+    isAdmin: boolean,
   ): Promise<z.infer<typeof GetNamespaceResponseSchema>> => {
     try {
       const namespaceWithServers =
@@ -177,8 +178,12 @@ export const namespacesImplementations = {
 
       return {
         success: true as const,
+        // protectedProcedure: the embedded server objects carry the same
+        // credential + internal-URL fields the mcpServers router redacts,
+        // so they follow the same rule here.
         data: NamespacesSerializer.serializeNamespaceWithServers(
           namespaceWithServers,
+          isAdmin,
         ),
         message: "Namespace retrieved successfully",
       };

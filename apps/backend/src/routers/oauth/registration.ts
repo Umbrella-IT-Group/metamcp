@@ -4,7 +4,7 @@ import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
 import { buildClientRegistration } from "./client-registration";
-import { rateLimitToken } from "./utils";
+import { getBaseUrl, GRANTED_OAUTH_SCOPE, rateLimitToken } from "./utils";
 
 const registrationRouter = express.Router();
 
@@ -42,8 +42,14 @@ registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
     // Store the client registration
     await oauthRepository.upsertClient(clientRegistration);
 
-    // Prepare response according to RFC 7591 with OAuth 2.1 guidance
-    const baseUrl = req.protocol + "://" + req.get("host");
+    // Prepare response according to RFC 7591 with OAuth 2.1 guidance.
+    // getBaseUrl, not `req.get("host")`: every request reaches this router
+    // through the Next.js proxy, so the Host header is the container-internal
+    // `localhost:12009`. Building the advertised endpoints from it both leaked
+    // the internal listener to an anonymous caller and handed registering
+    // clients token/authorize URLs they cannot reach. getBaseUrl prefers
+    // APP_URL, then X-Forwarded-Host.
+    const baseUrl = getBaseUrl(req);
     const response: any = {
       client_id: clientRegistration.client_id,
       client_name: clientRegistration.client_name,
@@ -107,7 +113,8 @@ registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
  */
 registrationRouter.get("/oauth/register", async (req, res) => {
   try {
-    const baseUrl = req.protocol + "://" + req.get("host");
+    // Same proxy caveat as the POST handler above — see the comment there.
+    const baseUrl = getBaseUrl(req);
 
     res.json({
       registration_endpoint: `${baseUrl}/oauth/register`,
@@ -125,7 +132,10 @@ registrationRouter.get("/oauth/register", async (req, res) => {
         response_types: "OAuth response types (default: ['code'])",
         token_endpoint_auth_method:
           "Client authentication method (default: 'none' for PKCE)",
-        scope: "Requested scope (default: 'admin')",
+        // Kept listed because RFC 7591 allows clients to send it, but say
+        // plainly that it is ignored — this doc previously told callers to
+        // ask for 'admin', which the server now never grants.
+        scope: `Ignored. This server always grants '${GRANTED_OAUTH_SCOPE}'.`,
         client_uri: "Homepage URL for your application",
         logo_uri: "Logo URL for your application",
         contacts: "Array of contact email addresses",
@@ -153,7 +163,6 @@ registrationRouter.get("/oauth/register", async (req, res) => {
           grant_types: ["authorization_code"],
           response_types: ["code"],
           token_endpoint_auth_method: "none",
-          scope: "admin",
         },
       },
 

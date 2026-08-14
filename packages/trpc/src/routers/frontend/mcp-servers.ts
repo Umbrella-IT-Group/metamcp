@@ -24,8 +24,14 @@ export const createMcpServersRouter = (
       input: z.infer<typeof CreateMcpServerRequestSchema>,
       userId: string,
     ) => Promise<z.infer<typeof CreateMcpServerResponseSchema>>;
+    // `isAdmin` decides whether the serialized servers keep their connection
+    // URL and credential fields (env / bearerToken / headers / command /
+    // args) or come back redacted. It is threaded from `ctx.user.role` at
+    // the call site below rather than re-derived in the impl, so the RBAC
+    // source of truth stays the session role that `adminProcedure` uses.
     list: (
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
     bulkImport: (
       input: z.infer<typeof BulkImportMcpServersRequestSchema>,
@@ -36,6 +42,7 @@ export const createMcpServersRouter = (
         uuid: string;
       },
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof GetMcpServerResponseSchema>>;
     delete: (
       input: {
@@ -54,19 +61,29 @@ export const createMcpServersRouter = (
   },
 ) => {
   return router({
-    // Protected: List all MCP servers
+    // Protected (deliberate): members legitimately see the server inventory
+    // in their dashboard, so this stays protectedProcedure. The disclosure
+    // fix is redaction inside the serializer, driven by the flag below —
+    // admin-gating the whole list would blank the member UI instead.
     list: protectedProcedure
       .output(ListMcpServersResponseSchema)
       .query(async ({ ctx }) => {
-        return await implementations.list(ctx.user.id);
+        return await implementations.list(
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
 
-    // Protected: Get single MCP server by UUID
+    // Protected: Get single MCP server by UUID — same contract as `list`.
     get: protectedProcedure
       .input(z.object({ uuid: z.string() }))
       .output(GetMcpServerResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.get(input, ctx.user.id);
+        return await implementations.get(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
 
     // Admin only: Create MCP server
