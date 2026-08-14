@@ -4,7 +4,7 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
-import { oauthRepository } from "../../db/repositories";
+import { oauthRepository, usersRepository } from "../../db/repositories";
 import {
   CONSENT_REQUEST_TTL_MS,
   consentCsrfCookieName,
@@ -238,6 +238,27 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
       return res.redirect(loginUrl.toString());
     }
 
+    // `users.disabled` enforcement (migration 0027). This handler resolves the
+    // session itself through auth.handler, so neither the tRPC context guard
+    // nor the auth.ts sign-in hook is on this path: without this check a
+    // locked-out account still gets a signed areq and a consent screen, one
+    // click away from an authorization code and the 30-day access token behind
+    // it. Being disabled has to close the OAuth door too, or it only closes the
+    // one nobody was using.
+    //
+    // Answered exactly like "not signed in" above — same /login redirect, no
+    // areq signed, no CSRF cookie set — rather than with an error of its own.
+    // The account learns nothing here about why, and the login it lands on is
+    // where the auth.ts hook refuses it.
+    if (await usersRepository.isDisabled(userId)) {
+      logger.warn(
+        `[oauth] authorize rejected reason=disabled client=${oauthParams.client_id} user=${userId}`,
+      );
+      const loginUrl = new URL("/login", baseUrl);
+      loginUrl.searchParams.set("callbackUrl", req.originalUrl);
+      return res.redirect(loginUrl.toString());
+    }
+
     // Signed in — and this is the fix. Being signed in is NOT consent.
     //
     // Previously this branch minted an authorization code on the spot for any
@@ -463,6 +484,29 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
       return res.status(400).json({
         error: "invalid_request",
         error_description: "redirect_uri is not registered for this client",
+      });
+    }
+
+    // `users.disabled` enforcement (migration 0027), and the one that actually
+    // has to hold: this is the only place a code is minted. The four checks
+    // above all pass for someone disabled after the consent screen was issued —
+    // the session, the areq and the nonce stay valid for the full ten-minute
+    // TTL — so guarding only the authorize GET would leave a ten-minute window
+    // in which an already-revoked account can still complete a grant. Whoever
+    // pressed disable expects the door shut then, not when the areq expires.
+    //
+    // Same 403 access_denied shape as the checks above, and like every other
+    // failed check here the consent cookie is deliberately left alone: clearing
+    // it for a request that did not pass would hand anyone a way to cancel a
+    // victim's pending consent.
+    if (await usersRepository.isDisabled(userId)) {
+      logger.warn(
+        `[oauth] consent rejected reason=disabled client=${consentRequest.client_id} user=${userId}`,
+      );
+      return res.status(403).json({
+        error: "access_denied",
+        error_description:
+          "Consent could not be verified. Please start the connection again from your application.",
       });
     }
 

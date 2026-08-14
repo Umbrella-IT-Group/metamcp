@@ -47,8 +47,18 @@ const oauthRepositoryMock = {
   deleteAuthCode: vi.fn(),
 };
 
+// The `users.disabled` gate (migration 0027). Left deliberately un-defaulted
+// here and set per-run in beforeEach: a bare `vi.fn()` resolves undefined,
+// which is falsy, so a mock that silently lost its setup would read as
+// "enabled" — the failing direction that mints. beforeEach makes the value
+// explicit on every test.
+const usersRepositoryMock = {
+  isDisabled: vi.fn(),
+};
+
 vi.mock("../../db/repositories", () => ({
   oauthRepository: oauthRepositoryMock,
+  usersRepository: usersRepositoryMock,
 }));
 
 // auth.handler is the session oracle for every endpoint under test, so mocking
@@ -413,6 +423,7 @@ beforeEach(() => {
   oauthRepositoryMock.getClient.mockResolvedValue(registeredClient());
   oauthRepositoryMock.setAuthCode.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
+  usersRepositoryMock.isDisabled.mockResolvedValue(false);
   sessionFor(USER_ID);
 });
 
@@ -1069,5 +1080,111 @@ describe("GET /oauth/consent/info", () => {
     });
 
     expect((jsonBody(res).client_name as string).length).toBe(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. A disabled account cannot reach either code-minting path
+// ---------------------------------------------------------------------------
+
+/**
+ * `users.disabled` (migration 0027) re-homed onto the consent flow.
+ *
+ * The guards these tests pin used to sit on two different handlers — the old
+ * authorize fast path and the old /oauth/callback mint — and the consent fix
+ * deleted both. Re-homing them is not a refactor: an account disabled during
+ * an incident that could still complete an authorization would walk away with
+ * a fresh 30-day MCP access token, which is precisely the credential the
+ * disable was pressed to take away.
+ *
+ * Both sites are covered because they fail differently. The GET is the door a
+ * disabled account walks up to; the POST is the door someone disabled DURING
+ * the ten-minute consent TTL is already standing inside, holding a valid
+ * session, a valid areq and the matching nonce.
+ */
+describe("users.disabled closes both code-minting paths", () => {
+  it("sends a disabled account to log in instead of issuing a consent request", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await authorize(SESSION_COOKIE);
+
+    // Answered as "not signed in" — the same redirect the unauthenticated
+    // branch produces, so nothing about the account's state leaks here.
+    const redirect = redirectUrl(res);
+    expect(redirect.pathname).toBe("/login");
+    expect(redirect.searchParams.get("callbackUrl") ?? "").toContain(
+      "/oauth/authorize?",
+    );
+
+    // No areq was signed, so there is nothing to carry to /consent and
+    // nothing to POST back to the decision endpoint later.
+    expect(res.redirectedTo).not.toContain("areq=");
+    expect(redirect.pathname).not.toBe("/consent");
+
+    // ...and no CSRF cookie, which is the other half of a usable areq.
+    expect(
+      res.cookies.filter((c) =>
+        c.name.startsWith(CONSENT_CSRF_COOKIE_HOST_PREFIXED),
+      ),
+    ).toHaveLength(0);
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    // The check ran against the SESSION user, not against anything the caller
+    // supplied in the query string.
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("refuses to mint when the account is disabled after the consent screen was issued", async () => {
+    // Everything the four existing guards check is valid here: a signed,
+    // unexpired areq, a session that is the same user, the matching nonce, and
+    // a client still registered for the redirect_uri. Only the account changed.
+    const { areq, csrf } = makeAreq();
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    // The assertion that matters: no code exists.
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.redirectedTo).toBeUndefined();
+
+    // The endpoint's own denial shape, not a new one.
+    expect(res.statusCode).toBe(403);
+    expect(res.body?.error).toBe("access_denied");
+
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("does not clear the pending consent cookie on the disabled deny", async () => {
+    // Same rule the CSRF and session-mismatch branches follow: clearing a
+    // cookie for a request that did not pass would let a replayed bad decision
+    // cancel a consent the real user is still holding.
+    const { areq, csrf } = makeAreq();
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(res.clearedCookies).toHaveLength(0);
+  });
+
+  it("still lets an enabled account through both doors to a minted code", async () => {
+    // The regression guard. A check that refuses everyone would satisfy every
+    // assertion above and break the product.
+    const authorizeRes = await authorize(SESSION_COOKIE);
+
+    expect(redirectUrl(authorizeRes).pathname).toBe("/consent");
+    const cookie = issuedCsrfCookie(authorizeRes);
+
+    const res = await dispatch({
+      method: "POST",
+      path: "/oauth/authorize/decision",
+      body: { areq: areqFrom(authorizeRes), decision: "approve" },
+      cookie: browserCookieHeader(authorizeRes),
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+    expect(redirectUrl(res).searchParams.get("code")).toMatch(/^mcp_code_/);
+    // Both sites consulted the flag rather than one of them being dead code.
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledTimes(2);
+    expect(cookie.name).toMatch(/^__Host-oauth_consent_csrf_.+/);
   });
 });

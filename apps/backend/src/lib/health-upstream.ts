@@ -132,7 +132,26 @@ export async function isAdminHealthRequest(
     const userId = sessionData?.user?.id;
     if (!userId) return false;
 
-    return (await usersRepository.findRoleById(userId)) === "admin";
+    if ((await usersRepository.findRoleById(userId)) !== "admin") return false;
+
+    // `users.disabled` enforcement (migration 0027). What an admin answer
+    // buys here is reconnaissance: the detail half of `/health/upstream` is
+    // the estate map (every backend MCP by UUID and name, plus live pool
+    // counts and caps), and `/health/sessions` and the endpoint/namespace
+    // directory on `GET /` gate on this same function. A disabled admin
+    // holding a live session cookie would otherwise keep reading all three —
+    // precisely the survey an attacker runs first, and precisely what the
+    // lockout exists to stop.
+    //
+    // Ordered after the role check so only an actual admin pays a second
+    // query; the answer is identical either way. Disabled takes the SAME
+    // closed path the rest of this function takes — return false, i.e.
+    // liveness-only — rather than throwing, because the contract above is
+    // that this never turns a monitor's 200 into a 401 or a 500.
+    // `isDisabled` fails closed on its own (an id with no row reads as
+    // disabled), and if the query itself throws, the catch below answers
+    // non-admin.
+    return !(await usersRepository.isDisabled(userId));
   } catch (error) {
     // Logged, not silently discarded: a session check that starts failing
     // would otherwise surface only as admins mysteriously losing the detail

@@ -10,6 +10,7 @@ import {
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
   boolean,
   check,
   index,
@@ -162,6 +163,32 @@ export const usersTable = pgTable("users", {
   // in auth.ts with `input: false`, so a user cannot self-escalate by
   // sending a role on sign-up / update.
   role: text("role").notNull().default("member"),
+  // Account lock (migration 0027). TRUE means this account may not hold a
+  // session: `session.create.before` in auth.ts refuses to mint a new one,
+  // and the tRPC context treats any session it already holds as
+  // unauthenticated rather than waiting out the 30-day expiry. Both halves
+  // are required — either alone leaves a real path in.
+  //
+  // The incident-response middle tier: revoking access lets the account sign
+  // straight back in, and deleting it destroys the evidence AND cascades into
+  // other users' endpoints and API keys. Disabling locks the account while
+  // preserving it whole.
+  //
+  // Deliberately absent from better-auth `additionalFields`: unlike `role`
+  // (which is surfaced read-only for the session), nothing a client sends may
+  // reach this column, and the enforcement paths re-read it from the database
+  // per request rather than trusting a serialized session.
+  disabled: boolean("disabled").notNull().default(false),
+  disabled_at: timestamp("disabled_at", { withTimezone: true }),
+  // Who locked the account. ON DELETE SET NULL, not CASCADE: deleting the
+  // administrator who disabled an account must never quietly re-enable it or
+  // erase the record of the action.
+  disabled_by: text("disabled_by").references(
+    (): AnyPgColumn => usersTable.id,
+    {
+      onDelete: "set null",
+    },
+  ),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -488,7 +515,10 @@ export const oauthClientsTable = pgTable("oauth_clients", {
   // ownership and never reads it), so this is honest labelling rather than an
   // access change — but handleRefreshTokenGrant copies the stored scope
   // forward on every refresh, so a wrong default persists indefinitely.
-  // Migration 0025 flips the column default and rewrites the legacy rows.
+  // Migration 0026 flips the column default and rewrites the legacy rows.
+  // (Numbered 0026, not 0025: an earlier renumber left 0025 unused — the
+  // journal jumps idx 24 -> 26 — and this comment named the pre-renumber
+  // file until 2026-08-14.)
   scope: text("scope").default("mcp"),
   client_uri: text("client_uri"),
   logo_uri: text("logo_uri"),

@@ -1,8 +1,13 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { APIError } from "better-auth/api";
 import { genericOAuth, GenericOAuthConfig } from "better-auth/plugins";
 
 import { db } from "./db/index";
+// Imported from the module directly, not the repositories barrel: the barrel
+// pulls in every repository (and their transitive imports) into the auth
+// module graph, which is loaded before almost everything else.
+import { usersRepository } from "./db/repositories/users.repo";
 import * as schema from "./db/schema";
 import { configService } from "./lib/config.service";
 import logger from "./utils/logger";
@@ -117,16 +122,12 @@ export const auth = betterAuth({
     expiresIn: (() => {
       const raw = process.env.BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS;
       const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-      return Number.isFinite(parsed) && parsed > 0
-        ? parsed
-        : 60 * 60 * 24 * 30; // 30 days
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 60 * 60 * 24 * 30; // 30 days
     })(),
     updateAge: (() => {
       const raw = process.env.BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS;
       const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-      return Number.isFinite(parsed) && parsed > 0
-        ? parsed
-        : 60 * 60 * 24 * 7; // 7 days (sliding refresh)
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 60 * 60 * 24 * 7; // 7 days (sliding refresh)
     })(),
   },
   user: {
@@ -187,6 +188,46 @@ export const auth = betterAuth({
           }
 
           return { data: user };
+        },
+      },
+    },
+    session: {
+      create: {
+        // HALF ONE of two-part enforcement for `users.disabled` (migration
+        // 0027): refuse to mint a session for a locked account. This is the
+        // hook every sign-in path funnels through — email/password, OIDC
+        // callback, account linking — so one guard here covers all of them
+        // without having to enumerate endpoints.
+        //
+        // HALF TWO lives in `createContext` (src/trpc.ts) and the OAuth
+        // authorize handler, and it is not optional: sessions in this fork
+        // live 30 days, so blocking new logins alone would leave a disabled
+        // attacker working from the session they already hold for a month.
+        // Together the two halves mean "disabled" takes effect on the very
+        // next request, which is the only definition of disabled worth
+        // shipping during an incident.
+        //
+        // Throwing (rather than returning `false`) is deliberate: better-auth
+        // treats a `false` return as "abort and return null", which surfaces
+        // to the user as an opaque broken sign-in. An APIError produces an
+        // honest 403 with a message the login page can show.
+        before: async (session) => {
+          const userId = (session as { userId?: string }).userId;
+          if (!userId) return { data: session };
+
+          // Read straight from the database rather than from anything on the
+          // session being built — the flag must be current as of THIS login,
+          // not as of whenever some cached value was populated.
+          if (await usersRepository.isDisabled(userId)) {
+            logger.warn(
+              `Blocked session creation for disabled account ${userId}`,
+            );
+            throw new APIError("FORBIDDEN", {
+              message: "This account has been disabled.",
+            });
+          }
+
+          return { data: session };
         },
       },
     },

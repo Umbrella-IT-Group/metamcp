@@ -1,5 +1,6 @@
 /**
- * Integration tests for the /mcp-proxy admin gate — the member-role RCE.
+ * Integration tests for the two gates on /mcp-proxy — the member-role RCE and
+ * the disabled-account lockout.
  *
  * GET /mcp-proxy/server/stdio takes `command`, `args` and `env` off the
  * QUERY STRING and spawns them with the backend's full environment
@@ -8,19 +9,28 @@
  * `betterAuthMcpMiddleware`, a session check with no role check, so any
  * member-role account could execute commands on the gateway host.
  *
+ * The second gate answers the other half of the same question. Being an admin
+ * is not the same as being an ALLOWED admin: `users.disabled` (migration
+ * 0027) locks an account out, nothing on this router re-read it, and sessions
+ * live 30 days here — so a disabled admin kept the spawn route above for the
+ * remaining life of a cookie they already held.
+ *
  * These drive the REAL `mcpProxyRouter` composition (parent router, mount
  * order, both sub-router mounts) over a real socket, mirroring
- * `routers/m365.test.ts`. Two seams are mocked:
+ * `routers/m365.test.ts`. Three seams are mocked:
  *  - `better-auth-mcp.middleware`, so a session can be simulated without a
  *    database, leaving `req.user` exactly as better-auth does,
+ *  - `users.repo`, so the disabled lookup answers on command — and so
+ *    `db/index.ts`, which throws without DATABASE_URL, stays out of the
+ *    import graph,
  *  - the two sub-routers, replaced by stubs that record invocation and
  *    mirror the real route tables. Recording invocation is the point: for a
  *    member the spawn-capable handler must never run at all, and asserting
  *    the stub stayed untouched proves the gate short-circuits before
  *    delegation rather than merely rewriting the response.
  *
- * `requireAdminMcpMiddleware` itself is NOT mocked; it is the code under
- * test.
+ * `requireAdminMcpMiddleware` and `requireEnabledMcpMiddleware` are NOT
+ * mocked; they are the code under test.
  */
 import type { Server } from "node:http";
 
@@ -98,8 +108,18 @@ const h = vi.hoisted(() => {
     return stub;
   };
 
-  return { state, SERVER_ROUTES, METAMCP_ROUTES, buildStubRouter };
+  return {
+    state,
+    isDisabled: vi.fn(),
+    SERVER_ROUTES,
+    METAMCP_ROUTES,
+    buildStubRouter,
+  };
 });
+
+vi.mock("../db/repositories/users.repo", () => ({
+  usersRepository: { isDisabled: h.isDisabled },
+}));
 
 vi.mock("../middleware/better-auth-mcp.middleware", () => ({
   betterAuthMcpMiddleware: (
@@ -152,6 +172,9 @@ afterAll(async () => {
 beforeEach(() => {
   h.state.sessionUser = null;
   h.state.handlerCalls.length = 0;
+  // Default: the account is live. Each disabled test arms its own answer, so
+  // one that forgot to would fail OPEN and be caught by its own assertion.
+  h.isDisabled.mockReset().mockResolvedValue(false);
 });
 
 const signInAs = (role: string | undefined, id = "user-1") => {
@@ -204,26 +227,28 @@ describe("/mcp-proxy — member-role RCE gate", () => {
   });
 });
 
-describe("/mcp-proxy — whole-surface coverage", () => {
-  // Both sub-routers, every method, so a route added later cannot quietly
-  // land outside the gate.
-  const surface: [string, string][] = [
-    ["GET", "/mcp-proxy/server/stdio"],
-    ["GET", "/mcp-proxy/server/sse"],
-    ["GET", "/mcp-proxy/server/mcp"],
-    ["POST", "/mcp-proxy/server/mcp"],
-    ["DELETE", "/mcp-proxy/server/mcp"],
-    ["POST", "/mcp-proxy/server/message"],
-    ["GET", "/mcp-proxy/server/health"],
-    ["GET", "/mcp-proxy/metamcp/ns-1/mcp"],
-    ["POST", "/mcp-proxy/metamcp/ns-1/mcp"],
-    ["DELETE", "/mcp-proxy/metamcp/ns-1/mcp"],
-    ["GET", "/mcp-proxy/metamcp/ns-1/sse"],
-    ["POST", "/mcp-proxy/metamcp/ns-1/message"],
-    ["GET", "/mcp-proxy/metamcp/health"],
-    ["GET", "/mcp-proxy/metamcp/info"],
-  ];
+// Both sub-routers, every method, so a route added later cannot quietly land
+// outside the gates. Shared by the role suite and the disabled suite below —
+// one list means a new route cannot be added to one gate's coverage and
+// forgotten by the other's.
+const surface: [string, string][] = [
+  ["GET", "/mcp-proxy/server/stdio"],
+  ["GET", "/mcp-proxy/server/sse"],
+  ["GET", "/mcp-proxy/server/mcp"],
+  ["POST", "/mcp-proxy/server/mcp"],
+  ["DELETE", "/mcp-proxy/server/mcp"],
+  ["POST", "/mcp-proxy/server/message"],
+  ["GET", "/mcp-proxy/server/health"],
+  ["GET", "/mcp-proxy/metamcp/ns-1/mcp"],
+  ["POST", "/mcp-proxy/metamcp/ns-1/mcp"],
+  ["DELETE", "/mcp-proxy/metamcp/ns-1/mcp"],
+  ["GET", "/mcp-proxy/metamcp/ns-1/sse"],
+  ["POST", "/mcp-proxy/metamcp/ns-1/message"],
+  ["GET", "/mcp-proxy/metamcp/health"],
+  ["GET", "/mcp-proxy/metamcp/info"],
+];
 
+describe("/mcp-proxy — whole-surface coverage", () => {
   it.each(surface)("member gets 403 on %s %s", async (method, path) => {
     signInAs("member");
 
@@ -278,5 +303,109 @@ describe("/mcp-proxy — the gate is fail-closed", () => {
 
     expect(response.status).toBe(401);
     expect(h.state.handlerCalls).toEqual([]);
+  });
+});
+
+describe("/mcp-proxy — the disabled-account gate", () => {
+  it("refuses a DISABLED ADMIN on the STDIO spawn route", async () => {
+    // The whole point of the gate: role alone said yes. Disable is the
+    // incident-response button, and until this check it did not reach the one
+    // route on this gateway that runs commands.
+    signInAs("admin");
+    h.isDisabled.mockResolvedValue(true);
+
+    const response = await fetch(`${baseUrl}${RCE_PATH}`);
+
+    expect(response.status).toBe(403);
+    expect(h.isDisabled).toHaveBeenCalledWith("user-1");
+    expect(h.state.handlerCalls).toEqual([]);
+  });
+
+  it.each(surface)("disabled admin gets 403 on %s %s", async (method, path) => {
+    signInAs("admin");
+    h.isDisabled.mockResolvedValue(true);
+
+    const response = await fetch(`${baseUrl}${path}`, { method });
+
+    expect(response.status).toBe(403);
+    expect(h.state.handlerCalls).toEqual([]);
+  });
+
+  it.each(surface)(
+    "enabled admin is still served %s %s",
+    async (method, path) => {
+      // The gate has to be additive: closing the lockout must not close the
+      // proxy for the operators who use it.
+      signInAs("admin");
+
+      const response = await fetch(`${baseUrl}${path}`, { method });
+
+      expect(response.status).toBe(200);
+      expect(h.state.handlerCalls).toHaveLength(1);
+    },
+  );
+
+  it("refuses the disabled account with the ROLE gate's exact body", async () => {
+    // Indistinguishable on the wire from "you are not an admin": a caller
+    // must not be able to use this endpoint to learn that an account exists
+    // and has been locked out. The reason goes to the log instead.
+    signInAs("member");
+    const roleDenial = await fetch(`${baseUrl}${RCE_PATH}`);
+    const roleBody = await roleDenial.text();
+
+    signInAs("admin");
+    h.isDisabled.mockResolvedValue(true);
+    const disabledDenial = await fetch(`${baseUrl}${RCE_PATH}`);
+
+    expect(disabledDenial.status).toBe(roleDenial.status);
+    expect(await disabledDenial.text()).toBe(roleBody);
+  });
+
+  it("runs BEFORE the role gate, so the lockout does not depend on it", async () => {
+    // Ordering pin, not an accident of implementation: if /mcp-proxy is ever
+    // opened to another role, the disabled check must already be in front of
+    // that decision rather than behind it. A member reaching the disabled
+    // lookup at all is what proves the order.
+    signInAs("member");
+
+    const response = await fetch(`${baseUrl}${RCE_PATH}`);
+
+    expect(response.status).toBe(403);
+    expect(h.isDisabled).toHaveBeenCalledWith("user-1");
+    expect(h.state.handlerCalls).toEqual([]);
+  });
+
+  it("denies when the disabled lookup throws, without hanging the request", async () => {
+    // An async express middleware that rejects hands nothing to next(err), so
+    // a propagated database failure would leave a spawn-capable route waiting
+    // rather than refused. It is caught at the gate and answered 403.
+    signInAs("admin");
+    h.isDisabled.mockRejectedValue(new Error("connection terminated"));
+
+    const response = await fetch(`${baseUrl}${RCE_PATH}`);
+
+    expect(response.status).toBe(403);
+    expect(h.state.handlerCalls).toEqual([]);
+  });
+
+  it("denies a session that carries no user id, without querying", async () => {
+    // isDisabled(undefined) would match no row and fail closed anyway, but
+    // the id is what the gate is about — deny before the query, not after.
+    h.state.sessionUser = { role: "admin" };
+
+    const response = await fetch(`${baseUrl}${RCE_PATH}`);
+
+    expect(response.status).toBe(403);
+    expect(h.isDisabled).not.toHaveBeenCalled();
+    expect(h.state.handlerCalls).toEqual([]);
+  });
+
+  it("still answers 401 when there is no session at all", async () => {
+    // The disabled gate must not turn an anonymous caller's 401 into a 403:
+    // authentication still runs first.
+    const response = await fetch(`${baseUrl}${RCE_PATH}`);
+
+    expect(response.status).toBe(401);
+    expect(h.isDisabled).not.toHaveBeenCalled();
   });
 });

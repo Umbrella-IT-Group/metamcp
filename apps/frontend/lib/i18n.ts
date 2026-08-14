@@ -18,6 +18,7 @@ export type Translations = {
   endpoints: Record<string, any>;
   "api-keys": Record<string, any>;
   "oauth-clients": Record<string, any>;
+  access: Record<string, any>;
   settings: Record<string, any>;
   search: Record<string, any>;
   inspector: Record<string, any>;
@@ -68,6 +69,7 @@ export async function loadTranslations(
       "api-keys": (await import("../public/locales/en/api-keys.json")).default,
       "oauth-clients": (await import("../public/locales/en/oauth-clients.json"))
         .default,
+      access: (await import("../public/locales/en/access.json")).default,
       settings: (await import("../public/locales/en/settings.json")).default,
       search: (await import("../public/locales/en/search.json")).default,
       inspector: (await import("../public/locales/en/inspector.json")).default,
@@ -86,6 +88,7 @@ export async function loadTranslations(
       endpointsZh,
       apiKeysZh,
       oauthClientsZh,
+      accessZh,
       settingsZh,
       searchZh,
       inspectorZh,
@@ -110,6 +113,16 @@ export async function loadTranslations(
         default: {},
       })),
       import("../public/locales/zh/oauth-clients.json").catch(() => ({
+        default: {},
+      })),
+      // The zh access.json is an intentionally EMPTY object, not a missing
+      // file: these imports are resolved statically at build time, so a file
+      // that does not exist fails the build rather than falling into the
+      // .catch(). Empty means the English strings below win the merge — an
+      // honest untranslated fallback instead of a machine-translated one on a
+      // security surface. Filling the file in translates the page with no
+      // further wiring.
+      import("../public/locales/zh/access.json").catch(() => ({
         default: {},
       })),
       import("../public/locales/zh/settings.json").catch(() => ({
@@ -140,6 +153,7 @@ export async function loadTranslations(
         ...englishDict["oauth-clients"],
         ...oauthClientsZh.default,
       },
+      access: { ...englishDict.access, ...accessZh.default },
       settings: { ...englishDict.settings, ...settingsZh.default },
       search: { ...englishDict.search, ...searchZh.default },
       inspector: { ...englishDict.inspector, ...inspectorZh.default },
@@ -157,6 +171,7 @@ export async function loadTranslations(
       endpointsKo,
       apiKeysKo,
       oauthClientsKo,
+      accessKo,
       settingsKo,
       searchKo,
       inspectorKo,
@@ -181,6 +196,16 @@ export async function loadTranslations(
         default: {},
       })),
       import("../public/locales/ko/oauth-clients.json").catch(() => ({
+        default: {},
+      })),
+      // The ko access.json is an intentionally EMPTY object, not a missing
+      // file: these imports are resolved statically at build time, so a file
+      // that does not exist fails the build rather than falling into the
+      // .catch(). Empty means the English strings below win the merge — an
+      // honest untranslated fallback instead of a machine-translated one on a
+      // security surface. Filling the file in translates the page with no
+      // further wiring.
+      import("../public/locales/ko/access.json").catch(() => ({
         default: {},
       })),
       import("../public/locales/ko/settings.json").catch(() => ({
@@ -211,6 +236,7 @@ export async function loadTranslations(
         ...englishDict["oauth-clients"],
         ...oauthClientsKo.default,
       },
+      access: { ...englishDict.access, ...accessKo.default },
       settings: { ...englishDict.settings, ...settingsKo.default },
       search: { ...englishDict.search, ...searchKo.default },
       inspector: { ...englishDict.inspector, ...inspectorKo.default },

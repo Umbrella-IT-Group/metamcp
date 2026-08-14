@@ -83,7 +83,8 @@
       "dependsOn": ["^check-types"]
     },
     "test": {
-      "dependsOn": ["^test"]
+      "dependsOn": ["^test"],
+      "env": ["TEST_DATABASE_URL"]
     },
     "dev": {
       "cache": false,

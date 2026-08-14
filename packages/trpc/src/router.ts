@@ -13,6 +13,11 @@ export const createAppRouter = (implementations: {
       endpoints: frontendRouters.endpoints,
       oauth: frontendRouters.oauth,
       oauthClients: frontendRouters.oauthClients,
+      // Access dashboard (incident 2026-08-13). Sub-routers are enumerated
+      // explicitly here, so a router that is not listed is unreachable no
+      // matter how it is wired elsewhere.
+      oauthTokens: frontendRouters.oauthTokens,
+      users: frontendRouters.users,
       tools: frontendRouters.tools,
       apiKeys: frontendRouters.apiKeys,
       config: frontendRouters.config,
