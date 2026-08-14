@@ -321,3 +321,38 @@ export type DeleteOAuthClientRequest = z.infer<
 export type DeleteOAuthClientResponse = z.infer<
   typeof DeleteOAuthClientResponseSchema
 >;
+
+// ===== Active access-token administration (Access dashboard) =====
+//
+// "Who is connected via OAuth right now" had no answer in the GUI: tokens
+// were only visible in psql. This is the metadata view of
+// `oauth_access_tokens`, joined to the owning user and the registered client.
+//
+// The token value itself (and the refresh token) is STRUCTURALLY absent from
+// this schema, not masked — `access_token` is the table's primary key and a
+// bearer credential for the whole gateway. Same rule as
+// OAuthClientListItemSchema and AdminApiKeyItemSchema: presence only, via
+// `has_refresh_token`.
+export const ActiveOAuthTokenItemSchema = z.object({
+  user_id: z.string(),
+  // LEFT JOINed: nullable so a token whose user row vanished mid-cascade
+  // still appears in the listing instead of dropping out of it. An orphaned
+  // live token is exactly the thing an administrator must be able to see.
+  user_email: z.string().nullable(),
+  client_id: z.string(),
+  client_name: z.string().nullable(),
+  scope: z.string(),
+  created_at: z.date(),
+  expires_at: z.date(),
+  has_refresh_token: z.boolean(),
+  refresh_token_expires_at: z.date().nullable(),
+});
+
+export const ListActiveOAuthTokensResponseSchema = z.object({
+  tokens: z.array(ActiveOAuthTokenItemSchema),
+});
+
+export type ActiveOAuthTokenItem = z.infer<typeof ActiveOAuthTokenItemSchema>;
+export type ListActiveOAuthTokensResponse = z.infer<
+  typeof ListActiveOAuthTokensResponseSchema
+>;

@@ -3,5 +3,7 @@ export * from "./mcp-servers.serializer";
 export * from "./namespaces.serializer";
 export * from "./oauth-clients.serializer";
 export * from "./oauth-sessions.serializer";
+export * from "./oauth-tokens.serializer";
+export * from "./users.serializer";
 export * from "./tools.serializer";
 export * from "./api-keys.serializer";

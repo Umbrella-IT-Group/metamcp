@@ -6,14 +6,18 @@ import { createMcpServersRouter } from "./mcp-servers";
 import { createNamespacesRouter } from "./namespaces";
 import { createOAuthRouter } from "./oauth";
 import { createOAuthClientsRouter } from "./oauth-clients";
+import { createOAuthTokensRouter } from "./oauth-tokens";
 import { createToolsRouter } from "./tools";
+import { createUsersRouter } from "./users";
 
 export { createMcpServersRouter };
 export { createNamespacesRouter };
 export { createEndpointsRouter };
 export { createOAuthRouter };
 export { createOAuthClientsRouter };
+export { createOAuthTokensRouter };
 export { createToolsRouter };
+export { createUsersRouter };
 export { createApiKeysRouter };
 export { createConfigRouter };
 export { createLogsRouter };
@@ -24,6 +28,8 @@ export const createFrontendRouter = (implementations: {
   endpoints: Parameters<typeof createEndpointsRouter>[0];
   oauth: Parameters<typeof createOAuthRouter>[0];
   oauthClients: Parameters<typeof createOAuthClientsRouter>[0];
+  oauthTokens: Parameters<typeof createOAuthTokensRouter>[0];
+  users: Parameters<typeof createUsersRouter>[0];
   tools: Parameters<typeof createToolsRouter>[0];
   apiKeys: Parameters<typeof createApiKeysRouter>[0];
   config: Parameters<typeof createConfigRouter>[0];
@@ -35,6 +41,8 @@ export const createFrontendRouter = (implementations: {
     endpoints: createEndpointsRouter(implementations.endpoints),
     oauth: createOAuthRouter(implementations.oauth),
     oauthClients: createOAuthClientsRouter(implementations.oauthClients),
+    oauthTokens: createOAuthTokensRouter(implementations.oauthTokens),
+    users: createUsersRouter(implementations.users),
     tools: createToolsRouter(implementations.tools),
     apiKeys: createApiKeysRouter(implementations.apiKeys),
     config: createConfigRouter(implementations.config),

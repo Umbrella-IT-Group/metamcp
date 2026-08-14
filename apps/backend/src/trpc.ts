@@ -5,6 +5,25 @@ import type { Request, Response } from "express";
 import { auth, type Session, type User } from "./auth";
 import logger from "./utils/logger";
 
+/**
+ * The disabled-account check, reached through a LAZY import.
+ *
+ * `users.repo` pulls in `db/index`, which throws at module load without
+ * DATABASE_URL and constructs a pg Pool. Importing it at the top of this file
+ * would make the tRPC instance itself undloadable without a database — and
+ * error-formatter.test.ts deliberately imports this module with `../auth`
+ * mocked precisely because the instance under test is independent of all
+ * that. Deferring the import keeps that true: the database is touched when a
+ * REQUEST arrives, not when the router is defined.
+ *
+ * ESM caches the module after the first await, so this costs one resolution
+ * on the first authenticated request and nothing thereafter.
+ */
+async function isSessionUserDisabled(userId: string): Promise<boolean> {
+  const { usersRepository } = await import("./db/repositories/users.repo");
+  return usersRepository.isDisabled(userId);
+}
+
 // Extend the base context with Express request/response and auth data
 export interface Context extends BaseContext {
   req: Request;
@@ -50,8 +69,32 @@ export const createContext = async ({
         };
 
         if (sessionData?.user && sessionData?.session) {
-          user = sessionData.user;
-          session = sessionData.session;
+          // HALF TWO of `users.disabled` enforcement (migration 0027). The
+          // sign-in hook in auth.ts stops a locked account getting a NEW
+          // session; this stops the sessions it ALREADY holds.
+          //
+          // Both halves are required. Sessions in this fork live 30 days
+          // (BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS), so an attacker who is
+          // disabled while signed in would otherwise keep full access for a
+          // month — the disable button would look like it worked and would
+          // not have. Re-reading the column per request is what makes the
+          // lock take effect on the very next call.
+          //
+          // Dropping the user/session (rather than throwing) makes the
+          // request look UNAUTHENTICATED, so protectedProcedure returns its
+          // normal UNAUTHORIZED and the frontend's existing sign-in redirect
+          // handles it. Fail-closed: if the lookup itself throws, the outer
+          // catch leaves user/session undefined, which is also unauthenticated.
+          const disabled = await isSessionUserDisabled(sessionData.user.id);
+
+          if (disabled) {
+            logger.warn(
+              `Rejected request from disabled account ${sessionData.user.id}`,
+            );
+          } else {
+            user = sessionData.user;
+            session = sessionData.session;
+          }
         }
       }
     }
