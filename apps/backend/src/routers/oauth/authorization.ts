@@ -344,6 +344,36 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
       });
     }
 
+    // `users.disabled` enforcement (migration 0027), completing the set on this
+    // flow. Adversarial audit 2026-08-14 (caveat 1): the two guards that shipped
+    // with Disable sit on the code-minting paths — the authorize GET and the
+    // decision POST — and this endpoint had neither, so it kept describing a
+    // pending authorization to an account that had just been locked out.
+    //
+    // The exposure is small and bounded, which is why it is a caveat and not a
+    // finding: nothing is minted here, and a disabled account cannot obtain a
+    // fresh areq (the authorize GET refuses it), so the only reachable window is
+    // the ≤10-minute TTL tail of an areq signed before the lock. What it served
+    // in that window was still real — the client_id, the display name and the
+    // FULL redirect_uri of a pending grant. Closed anyway, because "disabled"
+    // has to mean the same thing at every door on this flow rather than at the
+    // ones someone remembered.
+    //
+    // Deliberately the byte-identical body of the session-mismatch branch above,
+    // not a denial of its own: a distinguishable response would turn this
+    // endpoint into an oracle that confirms an account is disabled to anyone
+    // holding its session, and the account learns why at the login it is sent to.
+    if (await usersRepository.isDisabled(userId)) {
+      logger.warn(
+        `[oauth] consent info withheld reason=disabled client=${consentRequest.client_id} user=${userId}`,
+      );
+      return res.status(403).json({
+        error: "access_denied",
+        error_description:
+          "This authorization request belongs to a different session",
+      });
+    }
+
     const clientData = await oauthRepository.getClient(
       consentRequest.client_id,
     );

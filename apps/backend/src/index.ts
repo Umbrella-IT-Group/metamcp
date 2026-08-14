@@ -8,6 +8,7 @@ import {
 } from "./lib/health-upstream";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
+import { errorHandler } from "./middleware/error-handler.middleware";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -310,3 +311,15 @@ app.get("/health/upstream", async (req, res) => {
     res.status(500).json(buildUpstreamHealthErrorBody());
   }
 });
+
+// LAST registration in this file, and it has to stay last. Express dispatches
+// error middleware in registration order, so one mounted above a router never
+// sees that router's errors — and `app.listen()` runs inside `start()` after
+// an `await`, so every `app.use`/`app.get` at module scope (including this
+// one) is registered before the first request can arrive.
+//
+// Until this existed, a malformed JSON body was answered by Express's built-in
+// final handler with a full stack trace: `/app/...` paths, the pnpm store
+// layout with dependency names and versions, node internals — to an
+// unauthenticated caller. See ./middleware/error-handler.middleware.
+app.use(errorHandler);

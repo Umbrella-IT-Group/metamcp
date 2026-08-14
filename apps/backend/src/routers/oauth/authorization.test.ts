@@ -1063,6 +1063,74 @@ describe("GET /oauth/consent/info", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it("withholds the pending grant from a disabled account", async () => {
+    // The window this closes: an areq signed while the account was still
+    // enabled stays valid for its full ten-minute TTL, and the session with
+    // it, so a lock pressed in between left this endpoint still describing
+    // the pending grant. Nothing is minted here — but the client_id, the
+    // display name and the full redirect_uri are real, and "disabled" has to
+    // mean the same thing at every door on this flow.
+    const { areq } = makeAreq();
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body?.error).toBe("access_denied");
+    // Not one display field escaped.
+    expect(JSON.stringify(res.body)).not.toContain(CLIENT_NAME);
+    expect(JSON.stringify(res.body)).not.toContain(REDIRECT_URI);
+    // The check ran against the SESSION user, not anything the caller supplied.
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("refuses BEFORE the client is looked up", async () => {
+    // Fail-closed ordering: a locked account must not be able to drive a
+    // database read off a token it still holds.
+    const { areq } = makeAreq();
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(oauthRepositoryMock.getClient).not.toHaveBeenCalled();
+  });
+
+  it("answers a disabled account exactly as it answers the wrong session", async () => {
+    // No oracle: whoever holds the session must not be able to tell "this
+    // areq is not yours" from "your account has been locked".
+    const { areq: mismatchAreq } = makeAreq();
+    sessionFor(OTHER_USER_ID);
+    const mismatch = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq: mismatchAreq },
+      cookie: SESSION_COOKIE,
+    });
+
+    sessionFor(USER_ID);
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+    const { areq: disabledAreq } = makeAreq();
+    const disabled = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq: disabledAreq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(disabled.statusCode).toBe(mismatch.statusCode);
+    expect(disabled.body).toEqual(mismatch.body);
+  });
+
   it("clamps a hostile client_name from anonymous registration", async () => {
     // /oauth/register requires no authentication, so client_name is
     // attacker-controlled text rendered on a page the victim is asked to trust.
