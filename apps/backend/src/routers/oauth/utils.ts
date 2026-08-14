@@ -136,6 +136,27 @@ export function verifyClientSecret(
 }
 
 /**
+ * The single scope this authorization server ever grants.
+ *
+ * RFC 7591 §3.2.1 and RFC 6749 §3.3 both put the scope decision on the
+ * authorization server, not the caller: the AS "MAY fully or partially ignore
+ * the scope requested by the client" and the response states what was actually
+ * granted. The previous code echoed the caller's `scope` back and fell back to
+ * the literal "admin", so an anonymous dynamic-registration request could ask
+ * for — and be told it had been granted — an administrative scope.
+ *
+ * Substituting one non-administrative constant is a documentation fix, not an
+ * access change: nothing in this codebase reads the OAuth scope string for an
+ * authorization decision. `api-key-oauth.middleware` authenticates a bearer
+ * token by resolving it to a user id and never inspects the scope, and the
+ * real privilege gate is the better-auth session role (`requireAdmin` in
+ * @repo/trpc, which reads `user.role` from the database). Existing tokens keep
+ * working unchanged; what stops is this server advertising and recording
+ * "admin" for callers who were never administrators.
+ */
+export const GRANTED_OAUTH_SCOPE = "mcp";
+
+/**
  * Helper function to get the correct base URL from request
  * Prioritizes APP_URL environment variable, then checks proxy headers
  */

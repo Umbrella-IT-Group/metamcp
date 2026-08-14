@@ -8,6 +8,7 @@ import {
   authRateLimiter,
   getAuthRateLimitIdentifier,
 } from "../lib/auth-rate-limiter";
+import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
 
 // Extend Express Request interface for our custom properties
 export interface ApiKeyAuthenticatedRequest extends express.Request {
@@ -101,9 +102,13 @@ async function validateOAuthToken(
         return {
           valid: true,
           user_id: introspectData.sub,
+          // Fall back to the scope this server grants, not "admin". Nothing
+          // reads `scopes` for an authorization decision today (the gate is
+          // the better-auth session role), but a write-only field that says
+          // "admin" is the exact string a future reader would trust.
           scopes: introspectData.scope
             ? introspectData.scope.split(" ")
-            : ["admin"],
+            : [GRANTED_OAUTH_SCOPE],
         };
       } catch (error) {
         logger.error("Error introspecting MCP token:", error);
@@ -551,7 +556,10 @@ function sendOAuthChallengeResponse(
   // Set WWW-Authenticate header for OAuth flow
   const bearerChallenge = [
     `Bearer realm="MetaMCP"`,
-    `scope="admin"`,
+    // Advertise the scope this server actually grants, not "admin" — the
+    // challenge is what an unauthenticated client copies into its next
+    // authorization request. See GRANTED_OAUTH_SCOPE.
+    `scope="${GRANTED_OAUTH_SCOPE}"`,
     `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
   ].join(", ");
 

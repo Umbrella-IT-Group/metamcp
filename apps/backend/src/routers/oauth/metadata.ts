@@ -2,7 +2,7 @@ import express from "express";
 
 import logger from "@/utils/logger";
 
-import { getBaseUrl } from "./utils";
+import { getBaseUrl, GRANTED_OAUTH_SCOPE } from "./utils";
 
 const metadataRouter = express.Router();
 
@@ -37,10 +37,15 @@ metadataRouter.get(
         // Supported bearer token methods (required by RFC 9728)
         bearer_methods_supported: ["header"],
 
-        // OAuth scopes supported by this protected resource
-        // MCP requires admin scope for full access
+        // OAuth scopes supported by this protected resource. One scope, and
+        // it is not an administrative one: this document is served
+        // unauthenticated to anyone doing RFC 9728 discovery, so advertising
+        // "admin" both overstated what a token here carries and told a
+        // stranger which string to ask for. Actual privilege comes from the
+        // better-auth session role, not from this value — see
+        // GRANTED_OAUTH_SCOPE.
         scopes_supported: [
-          "admin", // Administrative access to all MCP resources
+          GRANTED_OAUTH_SCOPE, // Access to MCP resources this user already owns
         ],
 
         // Resource name for display purposes

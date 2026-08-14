@@ -8,8 +8,41 @@ export interface BaseContext {
   session?: any;
 }
 
-// Initialize tRPC with base context
-const t = initTRPC.context<BaseContext>().create();
+// Initialize tRPC with base context.
+//
+// errorFormatter strips `stack` from every error payload. @trpc/server only
+// attaches the stack when its `isDev` flag is on, and `isDev` defaults to
+// `process.env.NODE_ENV !== "production"` — which is always true in the
+// deployed gateway, because nothing in the container image or compose files
+// ever sets NODE_ENV. Every 4xx/5xx from a procedure built by this factory
+// therefore shipped an internal stack trace (absolute `/app/...` paths,
+// bundled dependency names and versions) to the caller.
+//
+// This mirrors the same formatter on the backend's own `initTRPC` instance
+// (apps/backend/src/trpc.ts). BOTH are needed: routers in this package are
+// built from `t` here, while the backend builds others from its own
+// instance, and an errorFormatter only covers the instance it is passed to.
+const t = initTRPC.context<BaseContext>().create({
+  errorFormatter({ shape }) {
+    const { stack: _stack, ...data } = shape.data as typeof shape.data & {
+      stack?: string;
+    };
+    // Mask the message for unexpected server errors too. @trpc/server sets
+    // shape.message = error.message unconditionally, and getTRPCErrorFromUnknown
+    // preserves cause.message when wrapping an unexpected throw as
+    // INTERNAL_SERVER_ERROR — so a raw driver/DB message (internal hostnames,
+    // SQL, table names) can reach an unauthenticated caller through any
+    // publicProcedure that lacks its own try/catch (e.g. the config router).
+    // Safe: every deliberate INTERNAL_SERVER_ERROR in this tree already throws a
+    // fixed string, and all user-facing messages are FORBIDDEN/NOT_FOUND/
+    // UNAUTHORIZED, so no UI copy degrades. `code`/`httpStatus`/`path` stay.
+    const message =
+      data.code === "INTERNAL_SERVER_ERROR"
+        ? "Internal server error"
+        : shape.message;
+    return { ...shape, message, data };
+  },
+});
 
 // Export router and procedure helpers
 export const router = t.router;

@@ -28,6 +28,29 @@ export class UsersRepository {
 
     return user;
   }
+
+  /**
+   * Read a user's RBAC role straight from the database.
+   *
+   * Exists for authorization checks that run OUTSIDE tRPC, where there is no
+   * `ctx.user` to read `role` from — currently the express `/health/upstream`
+   * handler, which decides whether to attach server topology to its response.
+   * Those paths only have a session user id, and re-reading the role here
+   * keeps the decision independent of how better-auth happens to serialise
+   * the session (`additionalFields` in auth.ts), which is a presentation
+   * detail rather than the record of record.
+   *
+   * Returns undefined for an unknown id, so callers can fail closed on a
+   * strict `=== "admin"` test rather than on the absence of a truthy value.
+   */
+  async findRoleById(id: string): Promise<string | undefined> {
+    const [user] = await db
+      .select({ role: usersTable.role })
+      .from(usersTable)
+      .where(eq(usersTable.id, id));
+
+    return user?.role;
+  }
 }
 
 // Export the repository instance

@@ -480,7 +480,16 @@ export const oauthClientsTable = pgTable("oauth_clients", {
   token_endpoint_auth_method: text("token_endpoint_auth_method")
     .notNull()
     .default("none"),
-  scope: text("scope").default("admin"),
+  // Matches GRANTED_OAUTH_SCOPE ("mcp"), the one scope this server ever
+  // issues. The default used to be "admin", so a row written without an
+  // explicit scope — and every legacy row — recorded an administrative-
+  // sounding grant for a caller who was never an administrator. Scope carries
+  // no privilege here (checkOAuthAccess authorizes on user id + endpoint
+  // ownership and never reads it), so this is honest labelling rather than an
+  // access change — but handleRefreshTokenGrant copies the stored scope
+  // forward on every refresh, so a wrong default persists indefinitely.
+  // Migration 0025 flips the column default and rewrites the legacy rows.
+  scope: text("scope").default("mcp"),
   client_uri: text("client_uri"),
   logo_uri: text("logo_uri"),
   contacts: text("contacts").array(),
@@ -505,7 +514,8 @@ export const oauthAuthorizationCodesTable = pgTable(
       .notNull()
       .references(() => oauthClientsTable.client_id, { onDelete: "cascade" }),
     redirect_uri: text("redirect_uri").notNull(),
-    scope: text("scope").notNull().default("admin"),
+    // "mcp", not "admin" — see oauthClientsTable.scope above.
+    scope: text("scope").notNull().default("mcp"),
     user_id: text("user_id")
       .notNull()
       .references(() => usersTable.id, { onDelete: "cascade" }),
@@ -534,7 +544,8 @@ export const oauthAccessTokensTable = pgTable(
     user_id: text("user_id")
       .notNull()
       .references(() => usersTable.id, { onDelete: "cascade" }),
-    scope: text("scope").notNull().default("admin"),
+    // "mcp", not "admin" — see oauthClientsTable.scope above.
+    scope: text("scope").notNull().default("mcp"),
     expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
     refresh_token: text("refresh_token"),
     refresh_token_expires_at: timestamp("refresh_token_expires_at", {

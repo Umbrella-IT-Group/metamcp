@@ -1,6 +1,11 @@
 import express from "express";
 
 import { auth } from "./auth";
+import {
+  buildUpstreamHealthBody,
+  buildUpstreamHealthErrorBody,
+  isAdminHealthRequest,
+} from "./lib/health-upstream";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import m365Router from "./routers/m365";
@@ -202,6 +207,11 @@ app.get("/health", (req, res) => {
 // whether to alarm; the per-server detail tells the operator where to
 // look when it flips. Status returns 200 not 503 because liveness is
 // distinct from rollup health — Kubernetes-style probes can map both.
+//
+// The response is split by role — see ./lib/health-upstream, which owns
+// that decision (and is tested). The liveness rollup stays unauthenticated
+// because that is what external probes consume and gating it would break
+// them; `servers` and `pool` are admin-only.
 app.get("/health/upstream", async (req, res) => {
   try {
     const { mcpServersRepository } = await import("./db/repositories");
@@ -255,37 +265,48 @@ app.get("/health/upstream", async (req, res) => {
     const unreachable = details.filter((d) => !d.reachable).length;
     const healthy = unreachable === 0;
 
-    res.json({
-      status: "ok",
-      healthy,
-      total_servers: totalServers,
-      errored_servers: errored,
-      unreachable_servers: unreachable,
-      pool: {
-        idle: pool.idle,
-        active: pool.active,
-        pending: pool.pending ?? 0,
-        // pending-inclusive so `total` matches what canCreateConnection's
-        // MAX_TOTAL_CONNECTIONS check actually compares against
-        // (getTotalConnectionCount = idle+active+pending) — a total that
-        // silently dropped in-flight idle creations would read below the
-        // cap while the pool itself refuses new connections at it
-        // (2026-07-14 audit finding).
-        total: pool.idle + pool.active + (pool.pending ?? 0),
-        // Effective caps the pool actually enforces (from getPoolConfig, the
-        // single source of truth), NOT a re-parse of env with local defaults.
-        // The prior payload reported only the per-server cap and never the
-        // global cap, so an operator debugging saturation could not see it.
-        max_connections_per_server: poolConfig.maxConnectionsPerServer,
-        max_total_connections: poolConfig.maxTotalConnections,
-      },
-      servers: details,
-    });
+    const isAdmin = await isAdminHealthRequest(req);
+
+    res.json(
+      buildUpstreamHealthBody(
+        {
+          healthy,
+          total_servers: totalServers,
+          errored_servers: errored,
+          unreachable_servers: unreachable,
+        },
+        isAdmin
+          ? {
+              pool: {
+                idle: pool.idle,
+                active: pool.active,
+                pending: pool.pending ?? 0,
+                // pending-inclusive so `total` matches what
+                // canCreateConnection's MAX_TOTAL_CONNECTIONS check actually
+                // compares against (getTotalConnectionCount =
+                // idle+active+pending) — a total that silently dropped
+                // in-flight idle creations would read below the cap while the
+                // pool itself refuses new connections at it (2026-07-14 audit
+                // finding).
+                total: pool.idle + pool.active + (pool.pending ?? 0),
+                // Effective caps the pool actually enforces (from
+                // getPoolConfig, the single source of truth), NOT a re-parse
+                // of env with local defaults. The prior payload reported only
+                // the per-server cap and never the global cap, so an operator
+                // debugging saturation could not see it.
+                max_connections_per_server: poolConfig.maxConnectionsPerServer,
+                max_total_connections: poolConfig.maxTotalConnections,
+              },
+              servers: details,
+            }
+          : null,
+      ),
+    );
   } catch (error) {
-    res.status(500).json({
-      status: "error",
-      healthy: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    // Logged here, never serialised: the body is the constant from
+    // ./lib/health-upstream, because this endpoint answers unauthenticated
+    // callers and a driver error's message names internal hosts and SQL.
+    logger.error("/health/upstream failed:", error);
+    res.status(500).json(buildUpstreamHealthErrorBody());
   }
 });

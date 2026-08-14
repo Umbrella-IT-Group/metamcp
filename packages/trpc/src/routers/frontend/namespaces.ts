@@ -33,11 +33,15 @@ export const createNamespacesRouter = (
     list: (
       userId: string,
     ) => Promise<z.infer<typeof ListNamespacesResponseSchema>>;
+    // `isAdmin`: the namespace response embeds full server objects, so it
+    // carries the same connection-URL / credential redaction contract as the
+    // mcpServers router. Threaded from `ctx.user.role` at the call site.
     get: (
       input: {
         uuid: string;
       },
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof GetNamespaceResponseSchema>>;
     getTools: (
       input: z.infer<typeof GetNamespaceToolsRequestSchema>,
@@ -84,7 +88,11 @@ export const createNamespacesRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(GetNamespaceResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.get(input, ctx.user.id);
+        return await implementations.get(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
 
     // Protected: Get tools for namespace from mapping table

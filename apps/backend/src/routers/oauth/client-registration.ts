@@ -8,6 +8,7 @@ import {
 import {
   generateSecureClientId,
   generateSecureClientSecret,
+  GRANTED_OAUTH_SCOPE,
   validateRedirectUri,
 } from "./utils";
 
@@ -81,7 +82,6 @@ export function buildClientRegistration(
     client_name,
     client_uri,
     logo_uri,
-    scope,
     contacts,
     tos_uri,
     policy_uri,
@@ -174,7 +174,12 @@ export function buildClientRegistration(
       grant_types: clientGrantTypes as string[],
       response_types: clientResponseTypes as string[],
       token_endpoint_auth_method: clientTokenEndpointAuthMethod,
-      scope: (scope as string) || "admin",
+      // The caller's requested `scope` is deliberately NOT honoured — the
+      // authorization server decides what it grants (RFC 7591 §3.2.1). See
+      // GRANTED_OAUTH_SCOPE. `POST /oauth/register` is anonymous, so echoing
+      // an attacker-chosen string here let a self-registered client be
+      // recorded with, and told it held, "admin".
+      scope: GRANTED_OAUTH_SCOPE,
       client_uri: (client_uri as string) || null,
       logo_uri: (logo_uri as string) || null,
       contacts: contacts && Array.isArray(contacts) ? contacts : null,

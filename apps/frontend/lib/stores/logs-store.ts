@@ -67,18 +67,26 @@ export const useLogsStore = create<LogsState>()(
         console.error("Failed to fetch logs:", error);
         set({ isLoading: false });
 
-        // Check if it's an authentication error
+        // Check if it's an auth error the user can't recover from by staying on
+        // the page. UNAUTHORIZED = not logged in. FORBIDDEN = logged in but not
+        // an admin: logs.get is adminProcedure, and this store's fetch fires on
+        // every page for every user (see the module init below), so without the
+        // FORBIDDEN case a member browser would run a permanent 2s 403 poll loop.
         if (error && typeof error === "object" && "message" in error) {
           const errorMessage = String(error.message);
           if (
             errorMessage.includes("UNAUTHORIZED") ||
-            errorMessage.includes("You must be logged in")
+            errorMessage.includes("You must be logged in") ||
+            errorMessage.includes("FORBIDDEN") ||
+            errorMessage.includes("administrator role")
           ) {
-            // Stop auto-refresh if user is not authenticated
+            // Stop auto-refresh — retrying won't fix a missing session or role.
             const currentState = get();
             if (currentState.isAutoRefreshing) {
               currentState.stopAutoRefresh();
-              console.log("Auto-refresh stopped due to authentication error");
+              console.log(
+                "Auto-refresh stopped due to authentication/authorization error",
+              );
             }
           }
         }

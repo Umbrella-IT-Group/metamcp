@@ -15,6 +15,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildClientRegistration } from "./client-registration";
+import { GRANTED_OAUTH_SCOPE } from "./utils";
 
 // The two canonical Anthropic connector callbacks the create dialog's Claude
 // preset fills in. Pinned here so a change to the preset has to be deliberate.
@@ -87,7 +88,7 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
     expect(result.client.client_secret).toBeNull();
     expect(result.client.grant_types).toEqual(["authorization_code"]);
     expect(result.client.response_types).toEqual(["code"]);
-    expect(result.client.scope).toBe("admin");
+    expect(result.client.scope).toBe(GRANTED_OAUTH_SCOPE);
     expect(result.client.client_name).toBe("Unnamed MCP Client");
   });
 
@@ -137,7 +138,8 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
     const result = buildClientRegistration({
       redirect_uris: ["https://app.example.com/cb"],
       client_name: "My App",
-      scope: "admin",
+      // NOTE: `scope` is deliberately absent here — it is not a
+      // passed-through field. See the scope-substitution block below.
       grant_types: ["authorization_code", "refresh_token"],
       client_uri: "https://app.example.com",
       contacts: ["ops@example.com"],
@@ -153,6 +155,56 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
     ]);
     expect(result.client.client_uri).toBe("https://app.example.com");
     expect(result.client.contacts).toEqual(["ops@example.com"]);
+  });
+});
+
+describe("buildClientRegistration — granted scope is server-decided", () => {
+  // `POST /oauth/register` is anonymous and rate-limited only. Before this
+  // was pinned, the caller's `scope` was echoed straight into the stored
+  // client row and into the 201 response, defaulting to the literal "admin"
+  // when absent — so a stranger could self-register a client recorded as
+  // administrative. RFC 7591 §3.2.1 puts that decision on the server.
+
+  it("grants the fixed non-administrative scope by default", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.client.scope).toBe(GRANTED_OAUTH_SCOPE);
+  });
+
+  it("does not honour a caller-supplied scope, including 'admin'", () => {
+    for (const scope of ["admin", "admin openid", "", "  "]) {
+      const result = buildClientRegistration({
+        redirect_uris: CLAUDE_CALLBACKS,
+        scope,
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) continue;
+      expect(result.client.scope).toBe(GRANTED_OAUTH_SCOPE);
+    }
+  });
+
+  it("never grants an administrative scope, whatever the input shape", () => {
+    // Non-string inputs went through the same `(scope as string) || "admin"`
+    // cast, so an object or array could not be relied on to be rejected.
+    for (const scope of [undefined, null, 0, ["admin"], { scope: "admin" }]) {
+      const result = buildClientRegistration({
+        redirect_uris: CLAUDE_CALLBACKS,
+        scope,
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) continue;
+      expect(result.client.scope).toBe(GRANTED_OAUTH_SCOPE);
+      expect(result.client.scope).not.toBe("admin");
+    }
+  });
+
+  it("pins the granted scope constant itself to a non-admin value", () => {
+    // The assertions above would all still pass if the constant were changed
+    // to "admin". This is the one that would not.
+    expect(GRANTED_OAUTH_SCOPE).toBe("mcp");
   });
 });
 

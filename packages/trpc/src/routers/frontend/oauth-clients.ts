@@ -21,9 +21,9 @@ export const createOAuthClientsRouter = (implementations: {
   return router({
     // Every procedure here is adminProcedure — unlike api-keys, which is
     // protectedProcedure because members legitimately own their own keys.
-    // A registered OAuth client is gateway-level configuration: it is minted
-    // with `scope: "admin"` by default, any user can then complete an
-    // authorization flow through it, and deleting one revokes live tokens
+    // A registered OAuth client is gateway-level configuration: any user can
+    // complete an authorization flow through it, and deleting one revokes
+    // live tokens
     // fleet-wide. There is no per-user ownership to scope by, so there is no
     // reason to let a member reach any of these — matching how the sibling
     // `oauth.upsert` (upstream server credentials) is already gated.

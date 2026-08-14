@@ -721,6 +721,14 @@ startMcpSessionPruner();
 // (trackedSessions / reap counters); neither needs the ids. If per-session
 // detail is ever required, add a separately auth-gated admin view rather
 // than widening this public payload.
+//
+// The same rule binds `metaMcpPoolStatus`: `getPoolStatus()` returns
+// `activeSessionIds` + `idleNamespaceUuids` alongside the counts, and
+// spreading it whole re-published the very ids the `sessionIds` removal took
+// away, one level down. The counts are projected out field by field here so
+// a field added to MetaMcpServerPoolStatus later cannot land in this payload
+// by default. Admins still get the detail half via `/health/upstream`, which
+// is role-gated; `getPoolStatus` itself is deliberately left intact.
 export function buildSessionsHealthPayload() {
   const sessionCount = sessionManager.getSessionCount();
   const poolStatus = metaMcpServerPool.getPoolStatus();
@@ -730,7 +738,10 @@ export function buildSessionsHealthPayload() {
     streamableHttpSessions: {
       count: sessionCount,
     },
-    metaMcpPoolStatus: poolStatus,
+    metaMcpPoolStatus: {
+      idle: poolStatus.idle,
+      active: poolStatus.active,
+    },
     totalActiveSessions: sessionCount + poolStatus.active,
     publicSessionSweeper: publicSessionSweeper.getStats(),
   };

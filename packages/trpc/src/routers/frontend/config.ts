@@ -73,6 +73,13 @@ export const createConfigRouter = (implementations: {
         return await implementations.setSsoSignupDisabled(input);
       }),
 
+    // Deliberately public: the login page reads this BEFORE any session
+    // exists, to decide whether to render the email/password form at all
+    // (apps/frontend/app/[locale]/login/page.tsx). Gating it would leave
+    // users on a login screen that cannot tell them basic auth is off. The
+    // value is a single boolean about the gateway's own auth posture and
+    // discloses nothing about users, servers or endpoints. The paired
+    // WRITE (setBasicAuthDisabled, below) is admin-only.
     getBasicAuthDisabled: publicProcedure.query(async () => {
       return await implementations.getBasicAuthDisabled();
     }),
