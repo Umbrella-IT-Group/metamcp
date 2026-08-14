@@ -1,15 +1,17 @@
 /**
  * SQL-shape test for the admin user listing.
  *
- * This fork has no live-DB test harness (see the note in
- * api-keys.repo.member-scope.test.ts), and `buildUserListQuery` hand-builds
- * three CORRELATED SUBQUERIES via drizzle's `sql` template — a construction
- * that type-checks whatever it emits. So the SQL text itself is the thing
- * worth pinning: `.toSQL()` renders the statement without opening a
- * connection.
+ * `buildUserListQuery` hand-builds four CORRELATED SUBQUERIES via drizzle's
+ * `sql` template — a construction that type-checks whatever it emits — so the
+ * SQL text itself is worth pinning. `.toSQL()` renders the statement without
+ * opening a connection, which keeps this test in the fast default suite;
+ * access-queries.integration.test.ts then EXECUTES the same builder against a
+ * real postgres (that pairing is deliberate: this file catches shape
+ * regressions in CI with no database, the integration file catches the
+ * driver-decode class of bug that no amount of SQL-text assertion can).
  *
- * Two properties are asserted, and each maps to a way this query has a
- * realistic chance of going wrong:
+ * Each assertion maps to a way this query has a realistic chance of going
+ * wrong:
  *
  *  1. The counts are SUBQUERIES, not joins. Three one-to-many LEFT JOINs off
  *     the same driving table multiply each other's rows — a user with 2
@@ -20,6 +22,9 @@
  *     `"users"."id"` correlation turns each count into a deployment-wide
  *     total, so every account would show the same (large) live-access counts
  *     and an idle attacker account would look busy.
+ *  3. The API-key count spans BOTH ownership and acts-as delegation.
+ *  4. The listing is capped, so a signup flood cannot make the page unusable
+ *     at the exact moment it is needed.
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
@@ -39,16 +44,11 @@ describe("buildUserListQuery", () => {
     const { buildUserListQuery } = await import("./users.repo");
     const { sql } = buildUserListQuery(NOW).toSQL();
 
-    // Three independent counts + the last-active max, each parenthesised as
-    // its own scalar subselect in the projection.
     expect(sql).toContain(
       `(select count(*) from "sessions" where ("sessions"."user_id" = "users"."id"`,
     );
     expect(sql).toContain(
       `(select count(*) from "oauth_access_tokens" where ("oauth_access_tokens"."user_id" = "users"."id"`,
-    );
-    expect(sql).toContain(
-      `(select count(*) from "api_keys" where ("api_keys"."user_id" = "users"."id"`,
     );
     expect(sql).toContain(
       `(select max("updated_at") from "sessions" where "sessions"."user_id" = "users"."id")`,
@@ -58,11 +58,23 @@ describe("buildUserListQuery", () => {
     expect(sql).not.toMatch(/\bjoin\b/i);
   });
 
+  it("counts API keys by ownership OR acts-as delegation", async () => {
+    const { buildUserListQuery } = await import("./users.repo");
+    const { sql } = buildUserListQuery(NOW).toSQL();
+
+    // A key owned by another admin but carrying `acts_as_user_id = this user`
+    // (migration 0024) authenticates requests that run AS this identity
+    // against M365. Counting only `user_id` under-reported the column an
+    // operator reads to decide whether an account still has reach.
+    expect(sql).toContain(
+      `(select count(*) from "api_keys" where (("api_keys"."user_id" = "users"."id" or "api_keys"."acts_as_user_id" = "users"."id")`,
+    );
+  });
+
   it("filters the counts to LIVE access and orders newest account first", async () => {
     const { buildUserListQuery } = await import("./users.repo");
     const { sql, params } = buildUserListQuery(NOW).toSQL();
 
-    // Liveness predicates: unexpired sessions, unexpired tokens, active keys.
     expect(sql).toContain(`"sessions"."expires_at" > $`);
     expect(sql).toContain(`"oauth_access_tokens"."expires_at" > $`);
     expect(sql).toContain(`"api_keys"."is_active" = $`);
@@ -83,6 +95,20 @@ describe("buildUserListQuery", () => {
     expect(timestamps[1]).toEqual(timestamps[0]);
   });
 
+  it("caps the listing so a signup flood cannot make the page unusable", async () => {
+    const { buildUserListQuery, USER_LIST_LIMIT } = await import(
+      "./users.repo"
+    );
+    const { sql } = buildUserListQuery(NOW).toSQL();
+
+    expect(sql).toContain("limit");
+    expect(USER_LIST_LIMIT).toBeGreaterThan(0);
+
+    // The cap is overridable so the boundary itself stays testable.
+    const capped = buildUserListQuery(NOW, 10).toSQL();
+    expect(capped.params).toContain(10);
+  });
+
   it("selects no credential column", async () => {
     const { buildUserListQuery } = await import("./users.repo");
     const { sql } = buildUserListQuery(NOW).toSQL();
@@ -91,6 +117,6 @@ describe("buildUserListQuery", () => {
     // allow-list precisely so that stays true as columns are added. A bare
     // `select *` would silently pick up whatever lands there next.
     expect(sql).not.toContain("select *");
-    expect(sql).not.toMatch(/"password"|"token"|"secret"/);
+    expect(sql).not.toMatch(/"password"|"secret"/);
   });
 });

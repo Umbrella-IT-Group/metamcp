@@ -167,10 +167,20 @@ export class OAuthRepository {
         scope: oauthAccessTokensTable.scope,
         created_at: oauthAccessTokensTable.created_at,
         expires_at: oauthAccessTokensTable.expires_at,
+        // `.mapWith(Boolean)` for the same reason the user listing's counts
+        // carry `.mapWith(Number)`: a raw `sql` fragment has NO driver
+        // decoder, so whatever node-postgres puts on the wire is what the
+        // caller gets. A postgres `boolean` happens to decode to a JS boolean
+        // natively, so this is currently a no-op — but the guard is explicit
+        // because the trap is invisible until it bites: change this
+        // expression to anything bigint-shaped (`count(...) > 0` rewritten as
+        // a count, say) and it silently starts returning a STRING that the
+        // router's `.output()` schema rejects at runtime. Verified against a
+        // real postgres in access-queries.integration.test.ts.
         has_refresh_token:
-          sql<boolean>`${oauthAccessTokensTable.refresh_token} IS NOT NULL`.as(
-            "has_refresh_token",
-          ),
+          sql<boolean>`${oauthAccessTokensTable.refresh_token} IS NOT NULL`
+            .mapWith(Boolean)
+            .as("has_refresh_token"),
         refresh_token_expires_at:
           oauthAccessTokensTable.refresh_token_expires_at,
       })

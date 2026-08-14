@@ -5,9 +5,10 @@
  * invisible because no surface listed users. The fix adds one — and a user
  * listing is itself a disclosure (every account's email, role and live
  * session count in one response), while `delete` removes an identity and
- * everything it owns. So every procedure on both routers is `adminProcedure`,
- * and this test pins that: an anonymous caller gets UNAUTHORIZED, an
- * authenticated member gets FORBIDDEN, an admin succeeds.
+ * everything it owns and `setDisabled` locks somebody out of the product. So
+ * every procedure on both routers is `adminProcedure`, and this test pins
+ * that: an anonymous caller gets UNAUTHORIZED, an authenticated member gets
+ * FORBIDDEN, an admin succeeds.
  *
  * Exercised through the real `createUsersRouter` / `createOAuthTokensRouter`
  * wiring via a real tRPC caller — the same approach as
@@ -18,7 +19,27 @@
 import { createOAuthTokensRouter, createUsersRouter } from "@repo/trpc";
 import { describe, expect, it, vi } from "vitest";
 
-const listResult = { users: [] };
+const listResult = { users: [], total: 0 };
+const previewResult = {
+  found: true,
+  email: "target@example.invalid",
+  impact: {
+    own_namespaces: 1,
+    own_endpoints: 2,
+    own_mcp_servers: 0,
+    own_api_keys: 1,
+    other_users_endpoints: 3,
+    other_users_api_keys: 4,
+    sessions: 1,
+    oauth_tokens: 2,
+    m365_tokens: 1,
+  },
+};
+const disabledResult = {
+  success: true,
+  message: "Account disabled",
+  disabled: true,
+};
 const revokeResult = {
   success: true,
   message: "Access revoked",
@@ -26,14 +47,20 @@ const revokeResult = {
   oauth_tokens_deleted: 0,
   authorization_codes_deleted: 0,
   api_keys_deactivated: 0,
+  m365_tokens_revoked: 0,
 };
 const deleteResult = { success: true, message: "User deleted successfully" };
 
-const buildUsersRouter = () =>
+const buildUsersRouter = (
+  overrides: Partial<Parameters<typeof createUsersRouter>[0]> = {},
+) =>
   createUsersRouter({
     list: vi.fn().mockResolvedValue(listResult),
+    previewDelete: vi.fn().mockResolvedValue(previewResult),
+    setDisabled: vi.fn().mockResolvedValue(disabledResult),
     revokeAccess: vi.fn().mockResolvedValue(revokeResult),
     delete: vi.fn().mockResolvedValue(deleteResult),
+    ...overrides,
   });
 
 const buildTokensRouter = () =>
@@ -50,7 +77,8 @@ const memberCtx = {
   session: { id: "s-member" },
 };
 // No user and no session at all — the shape createContext produces for a
-// request that carried no valid cookie.
+// request that carried no valid cookie, and also for a request from a
+// DISABLED account (createContext drops both rather than throwing).
 const anonCtx = {};
 
 describe("frontend.users — admin gate", () => {
@@ -60,14 +88,44 @@ describe("frontend.users — admin gate", () => {
     await expect(router.createCaller(adminCtx).list()).resolves.toEqual(
       listResult,
     );
-
     await expect(router.createCaller(memberCtx).list()).rejects.toMatchObject({
       code: "FORBIDDEN",
     });
-
     await expect(router.createCaller(anonCtx).list()).rejects.toMatchObject({
       code: "UNAUTHORIZED",
     });
+  });
+
+  it("previewDelete: admin allowed, member FORBIDDEN, anonymous UNAUTHORIZED", async () => {
+    const router = buildUsersRouter();
+    const input = { user_id: "target-1" };
+
+    await expect(
+      router.createCaller(adminCtx).previewDelete(input),
+    ).resolves.toEqual(previewResult);
+    await expect(
+      router.createCaller(memberCtx).previewDelete(input),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      router.createCaller(anonCtx).previewDelete(input),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+  });
+
+  it("setDisabled: admin allowed, member FORBIDDEN, anonymous UNAUTHORIZED", async () => {
+    const router = buildUsersRouter();
+    const input = { user_id: "target-1", disabled: true };
+
+    await expect(
+      router.createCaller(adminCtx).setDisabled(input),
+    ).resolves.toEqual(disabledResult);
+    // A member being able to lock accounts would be a privilege escalation
+    // into a denial-of-service against every other user.
+    await expect(
+      router.createCaller(memberCtx).setDisabled(input),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      router.createCaller(anonCtx).setDisabled(input),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 
   it("revokeAccess: admin allowed, member FORBIDDEN, anonymous UNAUTHORIZED", async () => {
@@ -77,11 +135,9 @@ describe("frontend.users — admin gate", () => {
     await expect(
       router.createCaller(adminCtx).revokeAccess(input),
     ).resolves.toEqual(revokeResult);
-
     await expect(
       router.createCaller(memberCtx).revokeAccess(input),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
-
     await expect(
       router.createCaller(anonCtx).revokeAccess(input),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
@@ -94,34 +150,37 @@ describe("frontend.users — admin gate", () => {
     await expect(router.createCaller(adminCtx).delete(input)).resolves.toEqual(
       deleteResult,
     );
-
     await expect(
       router.createCaller(memberCtx).delete(input),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
-
     await expect(
       router.createCaller(anonCtx).delete(input),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 
-  it("passes the CALLER's id to the mutations so the impl can refuse self-action", async () => {
-    // The self-revoke / self-delete refusals live in the impl, and they can
-    // only work if the router actually forwards ctx.user.id. A refactor that
-    // dropped the second argument would silently re-enable an administrator
-    // deleting their own account (and cascading their own namespaces).
+  it("passes the CALLER's id to every mutation so the impl can refuse self-action", async () => {
+    // The self-revoke / self-disable / self-delete refusals live in the impl,
+    // and they can only work if the router actually forwards ctx.user.id. A
+    // refactor that dropped the second argument would silently re-enable an
+    // administrator deleting their own account (cascading their own
+    // namespaces) or locking themselves out of the console.
     const revokeAccess = vi.fn().mockResolvedValue(revokeResult);
+    const setDisabled = vi.fn().mockResolvedValue(disabledResult);
     const del = vi.fn().mockResolvedValue(deleteResult);
-    const router = createUsersRouter({
-      list: vi.fn().mockResolvedValue(listResult),
-      revokeAccess,
-      delete: del,
-    });
+    const router = buildUsersRouter({ revokeAccess, setDisabled, delete: del });
 
     await router.createCaller(adminCtx).revokeAccess({ user_id: "target-1" });
+    await router
+      .createCaller(adminCtx)
+      .setDisabled({ user_id: "target-1", disabled: true });
     await router.createCaller(adminCtx).delete({ user_id: "target-1" });
 
     expect(revokeAccess).toHaveBeenCalledWith(
       { user_id: "target-1" },
+      "admin-1",
+    );
+    expect(setDisabled).toHaveBeenCalledWith(
+      { user_id: "target-1", disabled: true },
       "admin-1",
     );
     expect(del).toHaveBeenCalledWith({ user_id: "target-1" }, "admin-1");
@@ -135,8 +194,9 @@ describe("Access routers — .output() is a second redaction layer", () => {
   // impls do — the router's `.output()` schema strips anything the contract
   // does not name, so a secret cannot ride out on an unlisted key.
   it("users.list strips fields the contract does not name", async () => {
-    const router = createUsersRouter({
+    const router = buildUsersRouter({
       list: vi.fn().mockResolvedValue({
+        total: 1,
         users: [
           {
             id: "user-1",
@@ -144,9 +204,12 @@ describe("Access routers — .output() is a second redaction layer", () => {
             name: "Self Registered",
             role: "member",
             emailVerified: false,
+            disabled: false,
+            disabled_at: null,
+            disabled_by: null,
             created_at: new Date("2026-08-13T12:00:00.000Z"),
             updated_at: new Date("2026-08-13T12:00:00.000Z"),
-            last_active_at: null,
+            last_session_refresh_at: null,
             active_session_count: 0,
             active_oauth_token_count: 0,
             active_api_key_count: 0,
@@ -155,8 +218,6 @@ describe("Access routers — .output() is a second redaction layer", () => {
           },
         ],
       }),
-      revokeAccess: vi.fn().mockResolvedValue(revokeResult),
-      delete: vi.fn().mockResolvedValue(deleteResult),
     });
 
     const result = await router.createCaller(adminCtx).list();
@@ -202,11 +263,9 @@ describe("frontend.oauthTokens — admin gate", () => {
     await expect(router.createCaller(adminCtx).list()).resolves.toEqual({
       tokens: [],
     });
-
     await expect(router.createCaller(memberCtx).list()).rejects.toMatchObject({
       code: "FORBIDDEN",
     });
-
     await expect(router.createCaller(anonCtx).list()).rejects.toMatchObject({
       code: "UNAUTHORIZED",
     });

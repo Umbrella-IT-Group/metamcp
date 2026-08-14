@@ -1,3 +1,31 @@
+/**
+ * Coerce a value the driver may have handed back as a wire string into the
+ * `Date` the wire contract demands.
+ *
+ * This exists because of a real production-shaped failure: `users.list`
+ * returned `last_session_refresh_at` from a raw `sql` fragment, raw fragments
+ * carry no driver decoder, and node-postgres therefore returned the
+ * timestamptz as the string `'2026-08-14 13:07:51.558+00'`. The router's
+ * `.output()` schema rejected it — `invalid_type: expected date, received
+ * string` — so the entire listing failed for any account that had ever held a
+ * session. The type system was no help: the query's TS type already claimed
+ * `Date`.
+ *
+ * The repository now attaches `.mapWith(sessionsTable.updatedAt)`, which is
+ * the real fix. This is the second layer: a serializer that cannot be broken
+ * by a future query rewrite that forgets the decoder again. Cheap, and the
+ * failure it prevents is total.
+ *
+ * An unparseable value becomes null rather than an Invalid Date — a null
+ * renders as "Never" in the UI, whereas an Invalid Date would sail through
+ * `z.date()` (it IS a Date) and surface as "Invalid Date" in the table.
+ */
+function toDateOrNull(value: Date | string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export class UsersSerializer {
   // Admin listing for the Access dashboard's Users section.
   //
@@ -20,9 +48,12 @@ export class UsersSerializer {
       name: string;
       role: string;
       emailVerified: boolean;
-      created_at: Date;
-      updated_at: Date;
-      last_active_at: Date | null;
+      disabled: boolean;
+      disabled_at: Date | string | null;
+      disabled_by: string | null;
+      created_at: Date | string;
+      updated_at: Date | string;
+      last_session_refresh_at: Date | string | null;
       active_session_count: number;
       active_oauth_token_count: number;
       active_api_key_count: number;
@@ -33,10 +64,18 @@ export class UsersSerializer {
       email: user.email,
       name: user.name,
       role: user.role,
-      emailVerified: user.emailVerified,
-      created_at: user.created_at,
-      updated_at: user.updated_at,
-      last_active_at: user.last_active_at,
+      emailVerified: user.emailVerified === true,
+      disabled: user.disabled === true,
+      disabled_at: toDateOrNull(user.disabled_at),
+      disabled_by: user.disabled_by,
+      // Coerced for the same reason as last_session_refresh_at below — these
+      // are ordinary typed columns today and need no help, but the cost of
+      // being wrong here is the whole listing, so every date on this response
+      // goes through one path.
+      created_at: toDateOrNull(user.created_at) ?? new Date(0),
+      updated_at: toDateOrNull(user.updated_at) ?? new Date(0),
+      // The field that actually broke. See toDateOrNull above.
+      last_session_refresh_at: toDateOrNull(user.last_session_refresh_at),
       // Number() is a belt-and-braces coercion on top of the repository's
       // `.mapWith(Number)`: postgres count(*) is bigint and node-postgres
       // hands bigint back as a string, which would fail the `.output()`

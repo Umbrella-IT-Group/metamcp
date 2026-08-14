@@ -1,22 +1,23 @@
 /**
- * Behaviour of the two account kill switches.
+ * Statement-shape behaviour of the account kill switches.
  *
  * The DB layer is mocked with chain stubs — same pattern as
- * api-keys.repo.member-scope.test.ts and mcp-sessions.repo.test.ts; this fork
- * has no live-DB test harness. What is asserted is therefore the SHAPE of the
- * statements issued, which is where the security property actually lives:
+ * api-keys.repo.member-scope.test.ts and mcp-sessions.repo.test.ts. The
+ * queries themselves run against a real postgres in
+ * access-queries.integration.test.ts; what THIS file pins is the structure
+ * that no amount of seeding would prove, because it is about what the code
+ * refuses to do:
  *
  *  - `deleteById` issues exactly ONE delete, against `users`, and does not
  *    hand-roll dependent cleanup. Every FK into `users` is ON DELETE CASCADE,
  *    so a second copy of that graph in application code could only drift out
  *    of sync with the schema.
- *  - `revokeAccess` severs ALL FOUR access paths — sessions, OAuth access
- *    tokens, pending authorization codes, API keys — and severs them for the
- *    named user only. Missing one leaves an attacker connected through it.
+ *  - `revokeAccess` runs inside a TRANSACTION. Under the previous
+ *    `Promise.all` a mid-flight failure could leave sessions deleted but keys
+ *    still live while the caller was told the revoke failed — the reported
+ *    state was a lie in both directions.
  *  - `revokeAccess` DEACTIVATES keys rather than deleting them, and leaves
- *    the `users` row alone: the account record is the incident evidence
- *    (deleting the sessions is already lossy enough; deleting the identity
- *    too destroys the authoritative record of who the account was).
+ *    the `users` row alone: the account record is the incident evidence.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,12 +31,10 @@ vi.mock("@/utils/logger", () => ({
   },
 }));
 
-// One chain object per statement kind, recording which table it was pointed
-// at. drizzle's builders are thenable, so `.returning()` resolving to an
-// array is enough for the repository's `await`.
 const deleteCalls: unknown[] = [];
 const updateCalls: unknown[] = [];
 const setCalls: unknown[] = [];
+let transactionCount = 0;
 
 const deleteChain = {
   where: vi.fn().mockReturnThis(),
@@ -50,6 +49,20 @@ const updateChain = {
   returning: vi.fn(),
 };
 
+// The transaction handle exposes the same delete/update surface, so the
+// repository code under test is identical whether it runs on `db` or `tx` —
+// and the counter proves it actually opened one.
+const tx = {
+  delete: vi.fn((table: unknown) => {
+    deleteCalls.push(table);
+    return deleteChain;
+  }),
+  update: vi.fn((table: unknown) => {
+    updateCalls.push(table);
+    return updateChain;
+  }),
+};
+
 vi.mock("../index", () => ({
   db: {
     delete: vi.fn((table: unknown) => {
@@ -61,11 +74,16 @@ vi.mock("../index", () => ({
       return updateChain;
     }),
     select: vi.fn(),
+    transaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => {
+      transactionCount += 1;
+      return fn(tx);
+    }),
   },
 }));
 
 import {
   apiKeysTable,
+  m365UserTokensTable,
   oauthAccessTokensTable,
   oauthAuthorizationCodesTable,
   sessionsTable,
@@ -78,6 +96,7 @@ beforeEach(() => {
   deleteCalls.length = 0;
   updateCalls.length = 0;
   setCalls.length = 0;
+  transactionCount = 0;
   deleteChain.returning.mockResolvedValue([]);
   updateChain.returning.mockResolvedValue([]);
 });
@@ -105,16 +124,25 @@ describe("UsersRepository.deleteById", () => {
 });
 
 describe("UsersRepository.revokeAccess", () => {
-  it("severs all four access paths and leaves the account row intact", async () => {
+  it("runs every statement inside ONE transaction", async () => {
+    await usersRepository.revokeAccess("user-1");
+
+    // All-or-nothing is the whole point: a partial revoke reported as a
+    // failure leaves the operator believing access is intact when it is
+    // half-cut.
+    expect(transactionCount).toBe(1);
+    expect(tx.delete).toHaveBeenCalled();
+    expect(tx.update).toHaveBeenCalled();
+  });
+
+  it("severs all five access paths and leaves the account row intact", async () => {
     deleteChain.returning
       .mockResolvedValueOnce([{ id: "s1" }, { id: "s2" }]) // sessions
       .mockResolvedValueOnce([{ token: "t1" }]) // oauth access tokens
       .mockResolvedValueOnce([{ code: "c1" }, { code: "c2" }]); // auth codes
-    updateChain.returning.mockResolvedValue([
-      { uuid: "k1" },
-      { uuid: "k2" },
-      { uuid: "k3" },
-    ]);
+    updateChain.returning
+      .mockResolvedValueOnce([{ uuid: "k1" }, { uuid: "k2" }, { uuid: "k3" }]) // api keys
+      .mockResolvedValueOnce([{ uuid: "m1" }]); // m365 delegation
 
     const result = await usersRepository.revokeAccess("user-1");
 
@@ -128,14 +156,21 @@ describe("UsersRepository.revokeAccess", () => {
 
     // API keys are DEACTIVATED, not deleted: `is_active` is the revocation
     // flag the key-auth path already checks, and the row stays auditable.
-    expect(updateCalls).toEqual([apiKeysTable]);
-    expect(setCalls).toEqual([{ is_active: false }]);
+    // The M365 delegation is pushed to `reauth_required`, which the mint path
+    // already treats as missing — without it a revoked identity could still
+    // be exercised against Microsoft 365.
+    expect(updateCalls).toEqual([apiKeysTable, m365UserTokensTable]);
+    expect(setCalls).toEqual([
+      { is_active: false },
+      { status: "reauth_required" },
+    ]);
 
     expect(result).toEqual({
       sessions_deleted: 2,
       oauth_tokens_deleted: 1,
       authorization_codes_deleted: 2,
       api_keys_deactivated: 3,
+      m365_tokens_revoked: 1,
     });
   });
 
@@ -149,6 +184,64 @@ describe("UsersRepository.revokeAccess", () => {
       oauth_tokens_deleted: 0,
       authorization_codes_deleted: 0,
       api_keys_deactivated: 0,
+      m365_tokens_revoked: 0,
     });
+  });
+
+  it("propagates a failure instead of returning partial counts", async () => {
+    deleteChain.returning.mockRejectedValueOnce(new Error("deadlock detected"));
+
+    // The transaction rolls back, so the honest answer is a throw. Returning
+    // partial counts here would tell the operator that some paths were cut
+    // when in fact none were.
+    await expect(usersRepository.revokeAccess("user-1")).rejects.toThrow(
+      "deadlock detected",
+    );
+  });
+});
+
+describe("UsersRepository.setDisabled", () => {
+  it("stamps who locked the account and when", async () => {
+    updateChain.returning.mockResolvedValue([{ id: "user-1", disabled: true }]);
+
+    const result = await usersRepository.setDisabled("user-1", true, "admin-1");
+
+    expect(updateCalls).toEqual([usersTable]);
+    const [values] = setCalls as Array<{
+      disabled: boolean;
+      disabled_at: Date | null;
+      disabled_by: string | null;
+    }>;
+    expect(values?.disabled).toBe(true);
+    expect(values?.disabled_at).toBeInstanceOf(Date);
+    expect(values?.disabled_by).toBe("admin-1");
+    expect(result).toEqual({ id: "user-1", disabled: true });
+  });
+
+  it("clears the audit stamp on enable so the columns describe the CURRENT lock", async () => {
+    updateChain.returning.mockResolvedValue([
+      { id: "user-1", disabled: false },
+    ]);
+
+    await usersRepository.setDisabled("user-1", false, "admin-1");
+
+    const [values] = setCalls as Array<{
+      disabled: boolean;
+      disabled_at: Date | null;
+      disabled_by: string | null;
+    }>;
+    expect(values?.disabled).toBe(false);
+    // Leaving a stale who/when behind on an ENABLED account would read as
+    // "this account is locked" to the next person looking at the row.
+    expect(values?.disabled_at).toBeNull();
+    expect(values?.disabled_by).toBeNull();
+  });
+
+  it("returns undefined when no row matched", async () => {
+    updateChain.returning.mockResolvedValue([]);
+
+    await expect(
+      usersRepository.setDisabled("ghost", true, "admin-1"),
+    ).resolves.toBeUndefined();
   });
 });

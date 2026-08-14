@@ -3,7 +3,7 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
-import { oauthRepository } from "../../db/repositories";
+import { oauthRepository, usersRepository } from "../../db/repositories";
 import {
   generateSecureAuthCode,
   getBaseUrl,
@@ -148,7 +148,17 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
             user?: { id: string };
           };
 
-          if (sessionData?.user?.id) {
+          if (
+            sessionData?.user?.id &&
+            // `users.disabled` enforcement (migration 0027), third site. The
+            // tRPC context guards the admin UI and the auth.ts hook guards
+            // new sign-ins, but this handler resolves the session itself via
+            // auth.handler and would otherwise happily mint an authorization
+            // code — and thus a fresh 30-day MCP access token — for an
+            // account that was locked out minutes ago. Disabling has to close
+            // the OAuth door too, or it only closes the one nobody was using.
+            !(await usersRepository.isDisabled(sessionData.user.id))
+          ) {
             // User is already authenticated, generate authorization code directly
             const code = generateSecureAuthCode();
 
@@ -323,6 +333,22 @@ Content-Type: application/json
 
     if (!sessionData?.user?.id) {
       // Redirect back to login if no user
+      const baseUrl = getBaseUrl(req);
+      const loginUrl = new URL("/login", baseUrl);
+      loginUrl.searchParams.set("callbackUrl", req.originalUrl);
+      return res.redirect(loginUrl.toString());
+    }
+
+    // `users.disabled` enforcement (migration 0027), fourth site — the
+    // consent/approval POST is a SECOND code-minting path through this file,
+    // and guarding only the GET above would leave it wide open. Treated as
+    // "not signed in" rather than as an error, so the disabled account lands
+    // on the login page (where the auth.ts hook then refuses it) instead of
+    // receiving a code.
+    if (await usersRepository.isDisabled(sessionData.user.id)) {
+      logger.warn(
+        `Blocked OAuth authorization for disabled account ${sessionData.user.id}`,
+      );
       const baseUrl = getBaseUrl(req);
       const loginUrl = new URL("/login", baseUrl);
       loginUrl.searchParams.set("callbackUrl", req.originalUrl);

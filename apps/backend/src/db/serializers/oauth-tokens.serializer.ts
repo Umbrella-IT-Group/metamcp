@@ -33,7 +33,13 @@ export class OAuthTokensSerializer {
       scope: token.scope,
       created_at: token.created_at,
       expires_at: token.expires_at,
-      has_refresh_token: Boolean(token.has_refresh_token),
+      // `=== true`, NOT `Boolean(...)`. Boolean() is truthy-coercion: the
+      // string "false" — exactly what a driver hands back for a boolean it
+      // did not decode — coerces to TRUE, so a decode regression would flip
+      // this badge to "has a refresh token" for every row rather than failing
+      // loudly. A strict comparison degrades to `false` instead, which is the
+      // safe direction for a security display.
+      has_refresh_token: token.has_refresh_token === true,
       refresh_token_expires_at: token.refresh_token_expires_at,
     }));
   }

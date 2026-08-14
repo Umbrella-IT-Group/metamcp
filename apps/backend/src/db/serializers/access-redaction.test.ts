@@ -1,26 +1,32 @@
 /**
- * No-secret-leak contract for the two Access-dashboard listings.
+ * No-secret-leak AND driver-decode contract for the two Access-dashboard
+ * listings.
  *
- * The 2026-08-13 pentest recovered three live gateway API keys from a list
- * route that returned `key` raw (see api-keys.serializer.ts). These two
- * listings are new surfaces of the same shape — one enumerates accounts, the
- * other enumerates live OAuth grants — so they get the same treatment before
- * they ship, not after somebody finds them.
+ * Redaction half: the 2026-08-13 pentest recovered three live gateway API
+ * keys from a list route that returned `key` raw (see api-keys.serializer.ts).
+ * These two listings are new surfaces of the same shape — one enumerates
+ * accounts, the other enumerates live OAuth grants — so they get the same
+ * treatment before they ship, not after somebody finds them. The rows fed in
+ * are deliberately POLLUTED with credential-looking fields that a careless
+ * `...row` spread would carry through.
  *
- * The rows fed in are deliberately POLLUTED with credential-looking fields
- * that a careless `...row` spread would carry through: a password hash on the
- * user row, and access/refresh token values on the token row. Neither may
- * appear anywhere in the serialized output.
- *
- * Both halves are asserted: the serializer's own field list, AND a
- * whole-response regex sweep for the secret VALUES, so a leak under some
- * other key name is caught too.
+ * Decode half: `frontend.users.list` failed 100% of the time in its first cut
+ * because a raw `sql` fragment returned `timestamptz` as the STRING
+ * '2026-08-14 13:07:51.558+00', and the router's `.output()` schema demands a
+ * Date. The serializer is the second line of defence against that class of
+ * bug, so the fixtures below feed it exactly what an undecoded driver hands
+ * back — strings for dates, strings for bigint counts — and the assertions
+ * pin that the output still parses under the real contract.
  *
  * Rows are iterated rather than indexed throughout — `noUncheckedIndexedAccess`
  * makes `list[0]` possibly-undefined, and the sibling redaction.test.ts uses
  * the same loop instead of a non-null assertion.
  */
 
+import {
+  ActiveOAuthTokenItemSchema,
+  UserListItemSchema,
+} from "@repo/zod-types";
 import { describe, expect, it } from "vitest";
 
 import { OAuthTokensSerializer } from "./oauth-tokens.serializer";
@@ -42,9 +48,12 @@ const dbUser = {
   name: "Self Registered",
   role: "member",
   emailVerified: false,
+  disabled: false,
+  disabled_at: null,
+  disabled_by: null,
   created_at: CREATED_AT,
   updated_at: CREATED_AT,
-  last_active_at: CREATED_AT,
+  last_session_refresh_at: CREATED_AT,
   // count(*) is bigint, and node-postgres hands bigint back as a STRING.
   // Fed in as strings on purpose: the serializer must coerce, or the router's
   // `.output()` schema rejects the response at runtime.
@@ -89,10 +98,13 @@ describe("UsersSerializer.serializeUserList", () => {
           "active_oauth_token_count",
           "active_session_count",
           "created_at",
+          "disabled",
+          "disabled_at",
+          "disabled_by",
           "email",
           "emailVerified",
           "id",
-          "last_active_at",
+          "last_session_refresh_at",
           "name",
           "role",
           "updated_at",
@@ -126,6 +138,50 @@ describe("UsersSerializer.serializeUserList", () => {
       expect(serialized.active_api_key_count).toBe(3);
     }
   });
+
+  it("parses under the real contract when EVERY date arrives as a driver string", () => {
+    // The exact production failure, reproduced without a database: a raw
+    // `sql` fragment carries no decoder, so node-postgres returns
+    // timestamptz in this wire format. `.output()` then threw
+    // "invalid_type: expected date, received string" and the whole listing
+    // died for any account that had ever held a session.
+    const undecoded = {
+      ...dbUser,
+      created_at: "2026-08-13 12:00:00+00",
+      updated_at: "2026-08-13 12:00:00+00",
+      last_session_refresh_at: "2026-08-14 13:07:51.558+00",
+      disabled_at: "2026-08-14 09:00:00+00",
+      disabled: true,
+    } as unknown as Parameters<
+      typeof UsersSerializer.serializeUserList
+    >[0][number];
+
+    for (const serialized of UsersSerializer.serializeUserList([undecoded])) {
+      expect(serialized.last_session_refresh_at).toBeInstanceOf(Date);
+      expect(serialized.created_at).toBeInstanceOf(Date);
+      expect(serialized.disabled_at).toBeInstanceOf(Date);
+      // The contract itself is the assertion that matters — this is what
+      // tRPC runs on every response.
+      expect(() => UserListItemSchema.parse(serialized)).not.toThrow();
+    }
+  });
+
+  it("degrades an unparseable date to null rather than an Invalid Date", () => {
+    // An Invalid Date IS a Date, so it sails through z.date() and surfaces in
+    // the table as the literal text "Invalid Date". Null renders as "Never",
+    // which is at least honest.
+    const garbage = {
+      ...dbUser,
+      last_session_refresh_at: "not-a-timestamp",
+    } as unknown as Parameters<
+      typeof UsersSerializer.serializeUserList
+    >[0][number];
+
+    for (const serialized of UsersSerializer.serializeUserList([garbage])) {
+      expect(serialized.last_session_refresh_at).toBeNull();
+      expect(() => UserListItemSchema.parse(serialized)).not.toThrow();
+    }
+  });
 });
 
 describe("OAuthTokensSerializer.serializeActiveTokenList", () => {
@@ -152,6 +208,7 @@ describe("OAuthTokensSerializer.serializeActiveTokenList", () => {
 
       expect(serialized).not.toHaveProperty("access_token");
       expect(serialized).not.toHaveProperty("refresh_token");
+      expect(() => ActiveOAuthTokenItemSchema.parse(serialized)).not.toThrow();
     }
   });
 
@@ -175,5 +232,24 @@ describe("OAuthTokensSerializer.serializeActiveTokenList", () => {
       true,
       false,
     ]);
+  });
+
+  it("does not treat an undecoded 'false' string as a present refresh token", () => {
+    // `Boolean("false")` is TRUE. If a decode regression ever hands this
+    // serializer the string form, a truthy coercion would label every row as
+    // holding a long-lived refresh credential — failing in the unsafe
+    // direction on a security display. `=== true` degrades to false instead.
+    const undecoded = {
+      ...dbToken,
+      has_refresh_token: "false",
+    } as unknown as Parameters<
+      typeof OAuthTokensSerializer.serializeActiveTokenList
+    >[0][number];
+
+    for (const serialized of OAuthTokensSerializer.serializeActiveTokenList([
+      undecoded,
+    ])) {
+      expect(serialized.has_refresh_token).toBe(false);
+    }
   });
 });
