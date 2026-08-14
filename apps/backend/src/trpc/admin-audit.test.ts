@@ -537,6 +537,240 @@ describe("user.disabled.set / user.enabled.set", () => {
   });
 });
 
+describe("user.access.revoked / user.delete — the incident-response actions", () => {
+  // These are the two operations an administrator performs WHILE containing an
+  // incident: severing an attacker's live access, and destroying the account.
+  // They tear their targets down with raw drizzle, so no better-auth hook sees
+  // them — without an emitter here the table would record deleting one API key
+  // but not wiping an entire identity.
+  //
+  // The values they touch ARE the credential set: session rows, OAuth access
+  // and refresh tokens, authorization codes, API keys, M365 delegations. None
+  // of it may reach `audit_log`, which is append-only with no prune path — a
+  // token copied in here would outlive the revocation meant to kill it. So the
+  // detail is counts plus one clamped email, and these tests assert that by
+  // searching the whole serialized row for every secret the fixtures carry.
+  const TARGET_ID = "44444444-4444-4444-8444-444444444444";
+  const TARGET_EMAIL = "attacker@example.invalid";
+  const LEAKED_SESSION_TOKEN = "session-token-must-not-be-logged";
+  const LEAKED_OAUTH_TOKEN = "oauth-access-token-must-not-be-logged";
+  const LEAKED_API_KEY = "sk_mt_revoked_key_must_not_be_logged";
+
+  const REVOKED = {
+    sessions_deleted: 3,
+    oauth_tokens_deleted: 2,
+    authorization_codes_deleted: 1,
+    api_keys_deactivated: 4,
+    m365_tokens_revoked: 1,
+  };
+
+  const IMPACT = {
+    own_namespaces: 2,
+    own_endpoints: 3,
+    own_mcp_servers: 1,
+    own_api_keys: 4,
+    other_users_endpoints: 5,
+    other_users_api_keys: 6,
+    sessions: 3,
+    oauth_tokens: 2,
+    m365_tokens: 1,
+  };
+
+  const assertNoCredential = () => {
+    for (const secret of [
+      LEAKED_SESSION_TOKEN,
+      LEAKED_OAUTH_TOKEN,
+      LEAKED_API_KEY,
+    ]) {
+      expect(serialized()).not.toContain(secret);
+    }
+  };
+
+  beforeEach(() => {
+    usersRepositoryMock.findById.mockResolvedValue({
+      id: TARGET_ID,
+      email: TARGET_EMAIL,
+      // Deliberately present on the row the impls read, so a future refactor
+      // that spreads the whole record into `detail` fails these tests rather
+      // than shipping.
+      session_token: LEAKED_SESSION_TOKEN,
+      oauth_token: LEAKED_OAUTH_TOKEN,
+      api_key: LEAKED_API_KEY,
+    });
+  });
+
+  it("revokeAccess records counts of what was cut, never the credentials", async () => {
+    usersRepositoryMock.revokeAccess.mockResolvedValue(REVOKED);
+
+    await expect(
+      usersRouter().createCaller(adminCtx).revokeAccess({
+        user_id: TARGET_ID,
+      }),
+    ).resolves.toMatchObject({ success: true });
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user.access.revoked",
+      outcome: "success",
+      actor_type: "user",
+      actor_id: "admin-1",
+      actor_label: "admin@example.invalid",
+      actor_ip: "203.0.113.7",
+      request_id: "req-under-test",
+      target_type: "user",
+      target_id: TARGET_ID,
+    });
+    expect(rows[0].detail).toEqual({
+      target_email: TARGET_EMAIL,
+      sessions_revoked: 3,
+      oauth_tokens_revoked: 2,
+      auth_codes_revoked: 1,
+      api_keys_revoked: 4,
+      m365_tokens_revoked: 1,
+    });
+    assertNoCredential();
+  });
+
+  it("revokeAccess writes NOTHING when the target does not exist", async () => {
+    usersRepositoryMock.findById.mockResolvedValue(undefined);
+
+    await expect(
+      usersRouter().createCaller(adminCtx).revokeAccess({ user_id: "ghost" }),
+    ).resolves.toMatchObject({ success: false, message: "User not found" });
+    await flush();
+
+    expect(usersRepositoryMock.revokeAccess).not.toHaveBeenCalled();
+    expect(rows).toEqual([]);
+  });
+
+  it("revokeAccess emits AFTER the teardown — a failed transaction leaves no row", async () => {
+    // The repository runs its statements in ONE transaction, so a throw means
+    // nothing was cut. A row claiming an attacker was severed when they were
+    // not is the worst thing this table could say.
+    usersRepositoryMock.revokeAccess.mockRejectedValue(
+      new Error("transaction rolled back"),
+    );
+
+    await expect(
+      usersRouter().createCaller(adminCtx).revokeAccess({
+        user_id: TARGET_ID,
+      }),
+    ).rejects.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
+    await flush();
+
+    expect(rows).toEqual([]);
+  });
+
+  it("delete records the cascade counts and the only surviving email", async () => {
+    usersRepositoryMock.previewDeleteImpact.mockResolvedValue(IMPACT);
+    usersRepositoryMock.deleteById.mockResolvedValue(true);
+
+    await expect(
+      usersRouter().createCaller(adminCtx).delete({ user_id: TARGET_ID }),
+    ).resolves.toMatchObject({ success: true });
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user.delete",
+      outcome: "success",
+      actor_id: "admin-1",
+      target_type: "user",
+      target_id: TARGET_ID,
+    });
+    expect(rows[0].detail).toEqual({
+      // Every FK into `users` is ON DELETE CASCADE, so this row is the only
+      // place the id is still tied to a human after the statement runs.
+      target_email: TARGET_EMAIL,
+      own_namespaces: 2,
+      own_endpoints: 3,
+      own_mcp_servers: 1,
+      own_api_keys: 4,
+      // The cross-user reach is what an incident review asks about first.
+      other_users_endpoints: 5,
+      other_users_api_keys: 6,
+      sessions: 3,
+      oauth_tokens: 2,
+      m365_tokens: 1,
+    });
+    assertNoCredential();
+  });
+
+  it("delete writes NOTHING when the row was already gone", async () => {
+    usersRepositoryMock.previewDeleteImpact.mockResolvedValue(IMPACT);
+    usersRepositoryMock.deleteById.mockResolvedValue(false);
+
+    await expect(
+      usersRouter().createCaller(adminCtx).delete({ user_id: TARGET_ID }),
+    ).resolves.toMatchObject({ success: false, message: "User not found" });
+    await flush();
+
+    expect(rows).toEqual([]);
+  });
+
+  it("clamps an over-long target email on both actions", async () => {
+    const monstrous = `${"a".repeat(100_000)}@example.invalid`;
+    usersRepositoryMock.findById.mockResolvedValue({
+      id: TARGET_ID,
+      email: monstrous,
+    });
+    usersRepositoryMock.revokeAccess.mockResolvedValue(REVOKED);
+    usersRepositoryMock.previewDeleteImpact.mockResolvedValue(IMPACT);
+    usersRepositoryMock.deleteById.mockResolvedValue(true);
+
+    await usersRouter().createCaller(adminCtx).revokeAccess({
+      user_id: TARGET_ID,
+    });
+    await usersRouter().createCaller(adminCtx).delete({ user_id: TARGET_ID });
+    await flush();
+
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      // RFC 5321's maximum address length — the row COUNT is bounded by the
+      // admin gate, the row SIZE has to be bounded here.
+      expect(
+        (row.detail as { target_email: string }).target_email,
+      ).toHaveLength(320);
+    }
+  });
+
+  it("a THROWING sink still lets a revoke and a delete succeed", async () => {
+    setAuditSinkForTesting(() => {
+      throw new Error("audit table is on fire");
+    });
+    usersRepositoryMock.revokeAccess.mockResolvedValue(REVOKED);
+    usersRepositoryMock.previewDeleteImpact.mockResolvedValue(IMPACT);
+    usersRepositoryMock.deleteById.mockResolvedValue(true);
+
+    await expect(
+      usersRouter().createCaller(adminCtx).revokeAccess({
+        user_id: TARGET_ID,
+      }),
+    ).resolves.toMatchObject({ success: true });
+    await expect(
+      usersRouter().createCaller(adminCtx).delete({ user_id: TARGET_ID }),
+    ).resolves.toMatchObject({ success: true });
+    expect(usersRepositoryMock.revokeAccess).toHaveBeenCalledTimes(1);
+    expect(usersRepositoryMock.deleteById).toHaveBeenCalledTimes(1);
+  });
+
+  it("a REJECTING sink still lets a delete succeed", async () => {
+    // An unhandled rejection is process death under node's default
+    // --unhandled-rejections=throw: the whole gateway, not one request.
+    setAuditSinkForTesting(async () => {
+      throw new Error("connection pool exhausted");
+    });
+    usersRepositoryMock.previewDeleteImpact.mockResolvedValue(IMPACT);
+    usersRepositoryMock.deleteById.mockResolvedValue(true);
+
+    await expect(
+      usersRouter().createCaller(adminCtx).delete({ user_id: TARGET_ID }),
+    ).resolves.toMatchObject({ success: true });
+    await flush();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // mcp-servers — the rows that sit closest to real vendor credentials
 // ---------------------------------------------------------------------------

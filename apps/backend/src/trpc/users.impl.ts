@@ -18,6 +18,17 @@ import logger from "@/utils/logger";
 import { usersRepository } from "../db/repositories";
 import { UsersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { clampAuditText } from "../lib/audit/audit-emitter";
+
+/**
+ * RFC 5321 §4.5.3.1.3: the longest legal email address.
+ *
+ * Emails are the only free-text values these audit rows carry, and
+ * `audit_log` has no prune path — so they are clamped at the same bound the
+ * failed-login row uses, rather than trusted to be sane because they came out
+ * of the database.
+ */
+const MAX_EMAIL_LENGTH = 320;
 
 // Every zero, for the responses that must report a shape even when nothing
 // happened. Declared once so a new counter cannot be added to the contract
@@ -61,6 +72,20 @@ const NO_IMPACT = {
  * Every procedure in the matching router is `adminProcedure` — there is no
  * per-user ownership to scope an account listing by, and enumerating every
  * account in the deployment is exactly the disclosure a member must not have.
+ *
+ * ALL THREE TIERS EMIT (`user.disabled.set` / `user.enabled.set`,
+ * `user.access.revoked`, `user.delete`), and that is not symmetry for its own
+ * sake: these are the operations an administrator performs WHILE containing
+ * an incident, so they are the ones an after-action review reads first. They
+ * also tear their targets down with raw drizzle rather than through
+ * better-auth, so no `databaseHooks` sink sees them — an emitter here is the
+ * only way they are recorded at all.
+ *
+ * SECRETS. Between them these procedures delete sessions, OAuth access and
+ * refresh tokens, authorization codes and API keys, and reset M365
+ * delegations. `detail` therefore carries COUNTS and one clamped email,
+ * never a credential value: `audit_log` is append-only with no prune path,
+ * so a token copied into it would outlive the revocation meant to kill it.
  */
 export const usersImplementations = {
   list: async (): Promise<z.infer<typeof ListUsersResponseSchema>> => {
@@ -170,6 +195,7 @@ export const usersImplementations = {
   revokeAccess: async (
     input: z.infer<typeof RevokeUserAccessRequestSchema>,
     actorUserId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof RevokeUserAccessResponseSchema>> => {
     // Self-revocation is refused rather than allowed-with-a-warning: it would
     // delete the caller's own session mid-request, signing the administrator
@@ -203,6 +229,34 @@ export const usersImplementations = {
           `${revoked.m365_tokens_revoked} M365 delegations reset`,
       );
 
+      // Emitted AFTER the repository's single transaction committed — a throw
+      // above means nothing was cut, and a row claiming an attacker was
+      // severed when they were not is the worst thing this table could say.
+      //
+      // COUNTS ONLY. What this operation touches IS the credential set: it
+      // deletes session rows, OAuth access and refresh tokens and
+      // authorization codes, and resets M365 delegated tokens. None of those
+      // values may be recorded — `audit_log` is append-only with no prune
+      // path, so a token copied in here outlives the revocation that was
+      // supposed to kill it. The counts answer "how much access was cut",
+      // which is the question an incident review actually asks; the email is
+      // clamped because it is the only free-text field in the row.
+      emitAdminEvent(actor, {
+        action: "user.access.revoked",
+        target_type: "user",
+        target_id: input.user_id,
+        detail: {
+          target_email: clampAuditText(target.email, MAX_EMAIL_LENGTH),
+          sessions_revoked: revoked.sessions_deleted,
+          oauth_tokens_revoked: revoked.oauth_tokens_deleted,
+          auth_codes_revoked: revoked.authorization_codes_deleted,
+          api_keys_revoked: revoked.api_keys_deactivated,
+          // Part of the same teardown and a real credential plane of its own
+          // — omitting it would under-report what was cut.
+          m365_tokens_revoked: revoked.m365_tokens_revoked,
+        },
+      });
+
       return {
         success: true,
         message: "Access revoked",
@@ -224,6 +278,7 @@ export const usersImplementations = {
   delete: async (
     input: z.infer<typeof DeleteUserRequestSchema>,
     actorUserId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteUserResponseSchema>> => {
     // An administrator deleting their own account cascades away their own
     // sessions, keys and owned namespaces/endpoints in one irreversible
@@ -263,6 +318,37 @@ export const usersImplementations = {
           `${impact.m365_tokens} M365 tokens — AND ${impact.other_users_endpoints} ` +
           `endpoints + ${impact.other_users_api_keys} API keys belonging to OTHER users`,
       );
+
+      // Emitted AFTER the delete committed, and below the `!deleted` guard, so
+      // no row can claim an account was destroyed that still exists.
+      //
+      // This is the only row that will ever mention this account: every FK
+      // into `users` is ON DELETE CASCADE, so by this line the user, its
+      // sessions, its keys and its owned resources are gone from every other
+      // table in the database. `target_email` is the sole remaining link
+      // between the id in `target_id` and a human — captured before the
+      // delete, clamped like every other free-text field here. The counts
+      // come from the impact preview taken above for the same reason: after
+      // the cascade there is nothing left to count, and the CROSS-USER reach
+      // (other people's endpoints and production keys) is exactly what an
+      // incident review asks about. Counts and one email, never a key value.
+      emitAdminEvent(actor, {
+        action: "user.delete",
+        target_type: "user",
+        target_id: input.user_id,
+        detail: {
+          target_email: clampAuditText(target.email, MAX_EMAIL_LENGTH),
+          own_namespaces: impact.own_namespaces,
+          own_endpoints: impact.own_endpoints,
+          own_mcp_servers: impact.own_mcp_servers,
+          own_api_keys: impact.own_api_keys,
+          other_users_endpoints: impact.other_users_endpoints,
+          other_users_api_keys: impact.other_users_api_keys,
+          sessions: impact.sessions,
+          oauth_tokens: impact.oauth_tokens,
+          m365_tokens: impact.m365_tokens,
+        },
+      });
 
       return { success: true, message: "User deleted successfully" };
     } catch (error) {

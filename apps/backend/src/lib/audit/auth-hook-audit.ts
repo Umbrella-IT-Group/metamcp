@@ -143,11 +143,13 @@ export function emitSessionCreated(session: unknown, context: unknown): void {
 /**
  * A session row was deleted — sign-out, expiry cleanup, or a bulk revoke.
  *
- * COVERAGE, stated because it is a real gap rather than a claim of
- * completeness: this only sees deletions that go THROUGH better-auth. The
- * admin `users.revokeAccess` and `users.delete` paths tear down session rows
- * with drizzle directly, never reach this hook, and are NOT recorded by
- * Phase 1B — they need their own emitters in `users.impl.ts`.
+ * COVERAGE: this only sees deletions that go THROUGH better-auth. The admin
+ * `users.revokeAccess` and `users.delete` paths tear down session rows with
+ * drizzle directly and never reach this hook — they emit their own
+ * `user.access.revoked` / `user.delete` rows from `users.impl.ts` instead, so
+ * an administrator severing or destroying an account is recorded there rather
+ * than here. A future teardown path that bypasses BOTH would be silent, which
+ * is the thing to check when one is added.
  */
 export function emitSessionRevoked(session: unknown, context: unknown): void {
   emitHookEvent(context, {

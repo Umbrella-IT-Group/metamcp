@@ -277,13 +277,13 @@ export const auth = betterAuth({
         // `deleteWithHooks` / `deleteManyWithHooks`, which loop the `after`
         // hook over every entity they removed.
         //
-        // NOTE ON COVERAGE, because it is a real gap and not a claim of
-        // completeness: this covers session deletions that go THROUGH
+        // NOTE ON COVERAGE: this covers session deletions that go THROUGH
         // better-auth. The admin `users.revokeAccess` and `users.delete`
-        // paths tear down session rows with drizzle directly, so they never
-        // reach this hook and are NOT recorded by Phase 1B — those two need
-        // their own emitters in the impl, which is a deliberate follow-on
-        // rather than something this hook silently covers.
+        // paths tear down session rows with drizzle directly and never reach
+        // this hook; they emit `user.access.revoked` / `user.delete` from
+        // `users.impl.ts` instead. Between the two, every path that destroys
+        // a session today is recorded somewhere — a new teardown that uses
+        // neither would be silent.
         after: async (session, context) => {
           emitSessionRevoked(session, context);
         },
