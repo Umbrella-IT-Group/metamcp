@@ -4,6 +4,7 @@ import helmet from "helmet";
 
 import { betterAuthMcpMiddleware } from "../middleware/better-auth-mcp.middleware";
 import { requireAdminMcpMiddleware } from "../middleware/require-admin-mcp.middleware";
+import { requireEnabledMcpMiddleware } from "../middleware/require-enabled-mcp.middleware";
 import metamcpRoutes from "./mcp-proxy/metamcp";
 import serverRoutes from "./mcp-proxy/server";
 
@@ -35,18 +36,26 @@ mcpProxyRouter.use((req, res, next) => {
   next();
 });
 
-// Authentication then authorization for the WHOLE proxy surface. Both live
-// here at the parent router rather than inside each sub-router so no route
-// file can ever be mounted under /mcp-proxy without them — the sub-routers
-// used to apply the session check themselves, which left the gate one
-// forgotten `use()` away from a hole. Order is load-bearing:
-// betterAuthMcpMiddleware populates `req.user` from the session cookie, and
-// requireAdminMcpMiddleware then reads `req.user.role`. The admin
+// Authentication, then account validity, then authorization for the WHOLE
+// proxy surface. All three live here at the parent router rather than inside
+// each sub-router so no route file can ever be mounted under /mcp-proxy
+// without them — the sub-routers used to apply the session check themselves,
+// which left the gate one forgotten `use()` away from a hole. Order is
+// load-bearing: betterAuthMcpMiddleware populates `req.user` from the session
+// cookie, requireEnabledMcpMiddleware then re-reads `users.disabled` for that
+// id, and requireAdminMcpMiddleware reads `req.user.role`. The admin
 // restriction is not incidental hardening — the STDIO branch of
 // /server/{stdio,sse,mcp} spawns a query-string-supplied command with the
 // backend's environment, so session-only access was remote code execution
 // for any member. See middleware/require-admin-mcp.middleware.ts.
+//
+// The disabled gate sits between the two because a valid cookie is not a
+// valid ACCOUNT: nothing else on this router re-reads `users.disabled`, so
+// without it an admin who was locked out mid-session kept that same spawn
+// route for the 30-day life of the cookie they already held. See
+// middleware/require-enabled-mcp.middleware.ts.
 mcpProxyRouter.use(betterAuthMcpMiddleware);
+mcpProxyRouter.use(requireEnabledMcpMiddleware);
 mcpProxyRouter.use(requireAdminMcpMiddleware);
 
 // Mount MCP server proxy routes under /server

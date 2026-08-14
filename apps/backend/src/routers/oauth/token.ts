@@ -500,6 +500,38 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
       });
     }
 
+    // `users.disabled` enforcement (migration 0027). Introspection is the
+    // authoritative "is this credential live?" answer a resource server asks
+    // for, and the token row knows nothing about the account behind it — so
+    // without this check a locked-out account's still-unexpired token reports
+    // `active: true` along with its scope, client_id and `sub`. That both
+    // tells a relying party to honour a credential every other plane now
+    // refuses, and confirms to whoever holds the token that the account is
+    // still there.
+    //
+    // `{ active: false }` alone is the correct wire answer rather than an
+    // error: RFC 7662 §2.2 defines `active` as covering a token that has been
+    // revoked or otherwise invalidated by the resource owner, and requires
+    // that no other member be returned for an inactive token.
+    //
+    // The row is deliberately NOT deleted here (contrast the expiry branch
+    // above): disable is a reversible lockout, and deleting would turn it
+    // into a revocation that outlives Enable.
+    //
+    // The check lives in this handler rather than in the introspection helper
+    // `middleware/api-key-oauth.middleware.ts` calls, which stays a pure
+    // token-row lookup — the data plane it feeds does its own isDisabled
+    // check on the resolved identity, and one plane's account policy has no
+    // business hiding inside the other's lookup.
+    if (await usersRepository.isDisabled(tokenData.user_id)) {
+      logger.warn(
+        `[oauth] introspect reported inactive reason=disabled client=${tokenData.client_id} user=${tokenData.user_id}`,
+      );
+      return res.json({
+        active: false,
+      });
+    }
+
     // Token is active, return introspection details
     res.json({
       active: true,

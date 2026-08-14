@@ -70,12 +70,15 @@ interface FakeRes {
 // per minute, shared process-wide because it lives at module scope in utils.ts)
 // can never make one test's traffic fail another's.
 let ipCounter = 0;
-function makeReq(body: Record<string, unknown>): express.Request {
+function makeReq(
+  body: Record<string, unknown>,
+  path = "/oauth/token",
+): express.Request {
   ipCounter += 1;
   return {
     method: "POST",
-    url: "/oauth/token",
-    originalUrl: "/oauth/token",
+    url: path,
+    originalUrl: path,
     baseUrl: "",
     body,
     headers: {},
@@ -112,8 +115,11 @@ function makeRes(): FakeRes {
   return res;
 }
 
-async function post(body: Record<string, unknown>): Promise<FakeRes> {
-  const req = makeReq(body);
+async function post(
+  body: Record<string, unknown>,
+  path?: string,
+): Promise<FakeRes> {
+  const req = makeReq(body, path);
   const res = makeRes();
 
   await new Promise<void>((resolve, reject) => {
@@ -454,6 +460,70 @@ describe("POST /oauth/token — disabled account is refused on both grants", () 
 
     expect(grantBody(await refresh()).access_token).toMatch(/^mcp_token_/);
     expect(grantBody(await exchange()).access_token).toMatch(/^mcp_token_/);
+  });
+});
+
+describe("POST /oauth/introspect — a disabled account's token is not active", () => {
+  const accessToken = "mcp_token_introspectme";
+
+  const introspect = () => post({ token: accessToken }, "/oauth/introspect");
+
+  beforeEach(() => {
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: accessToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 60 * 60 * 1000),
+      created_at: new Date(Date.now() - 60 * 1000),
+    });
+  });
+
+  it("answers active:false and nothing else once the account is disabled", async () => {
+    // RFC 7662 §2.2: an inactive token gets `active` and no other member. The
+    // members withheld here are the ones that matter — `sub` confirms the
+    // account exists, `client_id` and `scope` describe the grant.
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await introspect();
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ active: false });
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("leaves the token row in place — disable is reversible, revoke is not", async () => {
+    // The expiry branch deletes; this one must not. Deleting here would turn
+    // Disable into a revocation that outlives Enable.
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    await introspect();
+
+    expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("logs reason=disabled without echoing the token", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    await introspect();
+
+    const logged = allLoggedText();
+    expect(logged).toContain("reason=disabled");
+    expect(logged).toContain(`user=${USER_ID}`);
+    expect(logged).not.toContain(accessToken);
+  });
+
+  it("still reports an ENABLED account's token as active (regression guard)", async () => {
+    usersRepositoryMock.isDisabled.mockResolvedValue(false);
+
+    const res = await introspect();
+
+    expect(res.body).toMatchObject({
+      active: true,
+      sub: USER_ID,
+      scope: SCOPE,
+      client_id: CLIENT_ID,
+    });
   });
 });
 

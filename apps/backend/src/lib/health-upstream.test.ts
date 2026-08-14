@@ -6,9 +6,13 @@
  * the Cloudflare healthcheck consume the liveness rollup, so the fix is a
  * split response rather than a 401.
  *
- * Two properties are worth pinning:
+ * Three properties are worth pinning:
  *  - a non-admin (including an anonymous prober) gets the liveness fields
- *    and NOTHING else, and
+ *    and NOTHING else,
+ *  - a DISABLED admin counts as a non-admin — the detail half is the estate
+ *    map, and `/health/sessions` and the endpoint directory on `GET /metamcp`
+ *    gate on this same function, so a locked-out account holding a live
+ *    session cookie would otherwise keep the whole recon surface, and
  *  - the admin check fails closed on every error path, without throwing —
  *    a health endpoint that 500s because a session lookup hiccuped would
  *    page the on-call for nothing.
@@ -19,9 +23,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const handler = vi.fn();
 const findRoleById = vi.fn();
+const isDisabled = vi.fn();
 
 vi.mock("../auth", () => ({ auth: { handler } }));
-vi.mock("../db/repositories", () => ({ usersRepository: { findRoleById } }));
+vi.mock("../db/repositories", () => ({
+  usersRepository: { findRoleById, isDisabled },
+}));
 vi.mock("../routers/oauth/utils", () => ({
   getBaseUrl: () => "https://gateway.example",
 }));
@@ -128,6 +135,9 @@ describe("buildUpstreamHealthErrorBody — the 500 branch", () => {
 describe("isAdminHealthRequest", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: the account is live. Disabled cases arm their own answer, so
+    // one that forgot to would fail OPEN and its assertion would catch it.
+    isDisabled.mockResolvedValue(false);
   });
 
   it("is false with no cookie, without touching auth or the database", async () => {
@@ -205,5 +215,59 @@ describe("isAdminHealthRequest", () => {
     await expect(isAdminHealthRequest(reqWith("session=x"))).resolves.toBe(
       false,
     );
+  });
+
+  it("is false for a DISABLED admin", async () => {
+    // `users.disabled` (migration 0027). The role still says admin; the
+    // account is locked out, and what the admin answer buys on this endpoint
+    // is the estate map.
+    handler.mockResolvedValue(sessionOk({ user: { id: "u-admin" } }));
+    findRoleById.mockResolvedValue("admin");
+    isDisabled.mockResolvedValue(true);
+
+    await expect(isAdminHealthRequest(reqWith("session=x"))).resolves.toBe(
+      false,
+    );
+    expect(isDisabled).toHaveBeenCalledWith("u-admin");
+  });
+
+  it("takes the liveness-only path for a disabled admin rather than throwing", async () => {
+    // The closed path is a `false` RETURN, not an error: the endpoints that
+    // call this are unauthenticated liveness routes that must keep their 200.
+    handler.mockResolvedValue(sessionOk({ user: { id: "u-admin" } }));
+    findRoleById.mockResolvedValue("admin");
+    isDisabled.mockResolvedValue(true);
+
+    const isAdmin = await isAdminHealthRequest(reqWith("session=x"));
+
+    expect(buildUpstreamHealthBody(LIVENESS, isAdmin ? DETAIL : null)).toEqual({
+      status: "ok",
+      healthy: false,
+      total_servers: 9,
+      errored_servers: 1,
+      unreachable_servers: 2,
+    });
+  });
+
+  it("resolves false rather than throwing when the disabled lookup blows up", async () => {
+    handler.mockResolvedValue(sessionOk({ user: { id: "u-admin" } }));
+    findRoleById.mockResolvedValue("admin");
+    isDisabled.mockRejectedValue(new Error("connection terminated"));
+
+    await expect(isAdminHealthRequest(reqWith("session=x"))).resolves.toBe(
+      false,
+    );
+  });
+
+  it("does not query the disabled column for a non-admin", async () => {
+    // Ordered after the role check on purpose: only an actual admin pays the
+    // second query, and the answer is the same either way.
+    handler.mockResolvedValue(sessionOk({ user: { id: "u-member" } }));
+    findRoleById.mockResolvedValue("member");
+
+    await expect(isAdminHealthRequest(reqWith("session=x"))).resolves.toBe(
+      false,
+    );
+    expect(isDisabled).not.toHaveBeenCalled();
   });
 });

@@ -51,13 +51,34 @@ export const requireAdminMcpMiddleware = (
       `MCP proxy admin gate denied ${req.method} ${req.path} for user ` +
         `${user?.id ?? "unknown"} (role: ${user?.role ?? "unknown"})`,
     );
-    return res.status(403).json({
-      error: "Forbidden",
-      message:
-        "The MCP Inspector proxy is restricted to administrators. " +
-        "Ask a gateway administrator if you need access.",
-    });
+    return res.status(403).json(buildMcpProxyForbiddenBody());
   }
 
   return next();
 };
+
+/**
+ * The one denial body for the whole `/mcp-proxy` surface.
+ *
+ * Exported because the disabled-account gate
+ * (`require-enabled-mcp.middleware.ts`) answers with it too: both refusals
+ * are 403 with this exact body, so a caller cannot tell "not an admin" from
+ * "an admin who has been locked out". The distinguishing detail is logged at
+ * each gate, where the operator reads it and the caller does not — the same
+ * rule the OAuth token planes follow. Sharing one builder rather than
+ * copying the literal is what keeps the two indistinguishable through later
+ * edits.
+ *
+ * A function rather than a shared constant, for the reason
+ * `lib/health-upstream.ts` `buildUpstreamHealthErrorBody` gives: express
+ * serialises the returned object directly, and a single shared instance is
+ * an invitation for a later mutation to rewrite an earlier response.
+ */
+export function buildMcpProxyForbiddenBody(): Record<string, string> {
+  return {
+    error: "Forbidden",
+    message:
+      "The MCP Inspector proxy is restricted to administrators. " +
+      "Ask a gateway administrator if you need access.",
+  };
+}
