@@ -6,9 +6,9 @@ import logger from "@/utils/logger";
 import { auth } from "../../auth";
 import { oauthRepository } from "../../db/repositories";
 import {
-  CONSENT_CSRF_COOKIE,
   CONSENT_REQUEST_TTL_MS,
-  readCookie,
+  consentCsrfCookieName,
+  readCookieValues,
   safeEquals,
   signConsentRequest,
   verifyConsentRequest,
@@ -17,6 +17,7 @@ import {
   generateSecureAuthCode,
   getBaseUrl,
   GRANTED_OAUTH_SCOPE,
+  isConsentDecisionRateLimited,
   type OAuthParams,
   rateLimitAuth,
   validateRedirectUri,
@@ -92,12 +93,18 @@ function consentCookieOptions(req: express.Request) {
     httpOnly: true,
     sameSite: "lax" as const,
     secure: getBaseUrl(req).startsWith("https://"),
+    // `__Host-` requires exactly this path and no Domain attribute.
     path: "/",
   };
 }
 
+/** The cookie name this request's scheme allows — see consentCsrfCookieName. */
+function consentCookieName(req: express.Request): string {
+  return consentCsrfCookieName(getBaseUrl(req).startsWith("https://"));
+}
+
 function clearConsentCookie(req: express.Request, res: express.Response) {
-  res.clearCookie(CONSENT_CSRF_COOKIE, consentCookieOptions(req));
+  res.clearCookie(consentCookieName(req), consentCookieOptions(req));
 }
 
 /**
@@ -252,7 +259,7 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
       exp: Date.now() + CONSENT_REQUEST_TTL_MS,
     });
 
-    res.cookie(CONSENT_CSRF_COOKIE, csrf, {
+    res.cookie(consentCookieName(req), csrf, {
       ...consentCookieOptions(req),
       maxAge: CONSENT_REQUEST_TTL_MS,
     });
@@ -314,15 +321,27 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
       });
     }
 
+    // Re-checked here as well as at decision time so the page can never show a
+    // destination the client is no longer registered for.
+    if (!clientData.redirect_uris.includes(consentRequest.redirect_uri)) {
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description: "redirect_uri is not registered for this client",
+      });
+    }
+
     res.json({
       client_id: consentRequest.client_id,
       client_name: (clientData.client_name || consentRequest.client_id).slice(
         0,
         MAX_DISPLAYED_CLIENT_NAME,
       ),
-      // Host only: it is the part of the redirect target a human can actually
-      // judge, and the part that decides where the code ends up.
-      redirect_uri_host: new URL(consentRequest.redirect_uri).host,
+      // The FULL redirect target, not just its host. client_name is whatever
+      // an anonymous registration asked to be called, so a "Claude" claiming
+      // host "claude-ai.example.com" is trivial to arrange; the destination is
+      // the field that actually decides where the code goes, and a human can
+      // only judge it if they see all of it.
+      redirect_uri: consentRequest.redirect_uri,
       scope: consentRequest.scope,
     });
   } catch (error) {
@@ -350,113 +369,133 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
  *   4. the redirect_uri is still registered for the client — the client
  *      record may have changed since the token was signed.
  */
-authorizationRouter.post(
-  "/oauth/authorize/decision",
-  rateLimitAuth,
-  async (req, res) => {
-    try {
-      const body = (req.body ?? {}) as Record<string, unknown>;
-      const consentRequest = verifyConsentRequest(body.areq);
+authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const consentRequest = verifyConsentRequest(body.areq);
 
-      if (!consentRequest) {
-        return res.status(400).json({
-          error: "invalid_request",
-          error_description:
-            "Authorization request is missing, invalid, or expired. Please start the connection again from your application.",
-        });
-      }
-
-      const userId = await resolveSessionUserId(req);
-
-      if (!userId || !safeEquals(userId, consentRequest.user_id)) {
-        return res.status(403).json({
-          error: "access_denied",
-          error_description:
-            "This authorization request belongs to a different session",
-        });
-      }
-
-      // Double submit. The cookie is httpOnly and SameSite=Lax, so a
-      // cross-site page can neither read the nonce nor get the browser to
-      // attach the cookie to its own POST.
-      //
-      // Nothing is cleared on this branch on purpose: clearing the cookie for
-      // a request that failed verification would let anyone cancel a victim's
-      // pending consent by replaying a bad decision.
-      const cookieCsrf = readCookie(req.headers.cookie, CONSENT_CSRF_COOKIE);
-
-      if (!safeEquals(cookieCsrf, consentRequest.csrf)) {
-        logger.warn(
-          `[oauth] consent rejected reason=csrf client=${consentRequest.client_id} user=${userId}`,
-        );
-        return res.status(403).json({
-          error: "access_denied",
-          error_description:
-            "Consent could not be verified. Please start the connection again from your application.",
-        });
-      }
-
-      const clientData = await oauthRepository.getClient(
-        consentRequest.client_id,
-      );
-
-      if (
-        !clientData ||
-        !clientData.redirect_uris.includes(consentRequest.redirect_uri)
-      ) {
-        clearConsentCookie(req, res);
-        return res.status(400).json({
-          error: "invalid_request",
-          error_description: "redirect_uri is not registered for this client",
-        });
-      }
-
-      clearConsentCookie(req, res);
-
-      const redirectUrl = new URL(consentRequest.redirect_uri);
-      if (consentRequest.state) {
-        redirectUrl.searchParams.set("state", consentRequest.state);
-      }
-
-      // Default deny: only the exact string "approve" grants. Anything else —
-      // a missing field, a truncated body, a decision this server does not
-      // recognise — is refused.
-      if (body.decision !== "approve") {
-        redirectUrl.searchParams.set("error", "access_denied");
-        logger.info(
-          `[oauth] consent denied client=${consentRequest.client_id} user=${userId}`,
-        );
-        return res.redirect(redirectUrl.toString());
-      }
-
-      const code = generateSecureAuthCode();
-
-      await oauthRepository.setAuthCode(code, {
-        client_id: consentRequest.client_id,
-        redirect_uri: consentRequest.redirect_uri,
-        scope: GRANTED_OAUTH_SCOPE,
-        user_id: userId,
-        code_challenge: consentRequest.code_challenge || null,
-        code_challenge_method: consentRequest.code_challenge_method || null,
-        expires_at: Date.now() + AUTH_CODE_TTL_MS,
-      });
-
-      redirectUrl.searchParams.set("code", code);
-
-      logger.info(
-        `[oauth] consent granted client=${consentRequest.client_id} user=${userId}`,
-      );
-
-      res.redirect(redirectUrl.toString());
-    } catch (error) {
-      logger.error("Error in OAuth consent decision endpoint:", error);
-      res.status(500).json({
-        error: "server_error",
-        error_description: "Internal server error",
+    if (!consentRequest) {
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description:
+          "Authorization request is missing, invalid, or expired. Please start the connection again from your application.",
       });
     }
-  },
-);
+
+    // Keyed on the user inside the verified token rather than req.ip — see
+    // isConsentDecisionRateLimited. Checked after verification because that
+    // is the first point a trustworthy user id exists; an unsigned body
+    // costs one HMAC and never reaches the database.
+    if (isConsentDecisionRateLimited(consentRequest.user_id)) {
+      logger.info(
+        `[RATE LIMIT] Consent decision rate limited for user: ${consentRequest.user_id}`,
+      );
+      return res.status(429).json({
+        error: "too_many_requests",
+        error_description:
+          "Too many consent decisions. Please try again shortly.",
+      });
+    }
+
+    const userId = await resolveSessionUserId(req);
+
+    if (!userId || !safeEquals(userId, consentRequest.user_id)) {
+      return res.status(403).json({
+        error: "access_denied",
+        error_description:
+          "This authorization request belongs to a different session",
+      });
+    }
+
+    // Double submit. The cookie is httpOnly and SameSite=Lax, so a
+    // cross-site page can neither read the nonce nor get the browser to
+    // attach the cookie to its own POST.
+    //
+    // Every value sent under the name is considered, not just the first: a
+    // browser will send a more specific cookie ahead of ours, so taking one
+    // value would let a planted duplicate deny consent to the real user
+    // forever. Accepting a match on any is not weaker — the nonce still has
+    // to be produced — and `__Host-` blocks the planting route outright.
+    //
+    // Nothing is cleared on this branch on purpose: clearing the cookie for
+    // a request that failed verification would let anyone cancel a victim's
+    // pending consent by replaying a bad decision.
+    const presentedCsrf = readCookieValues(
+      req.headers.cookie,
+      consentCookieName(req),
+    );
+
+    if (!presentedCsrf.some((v) => safeEquals(v, consentRequest.csrf))) {
+      logger.warn(
+        `[oauth] consent rejected reason=csrf client=${consentRequest.client_id} user=${userId}`,
+      );
+      return res.status(403).json({
+        error: "access_denied",
+        error_description:
+          "Consent could not be verified. Please start the connection again from your application.",
+      });
+    }
+
+    const clientData = await oauthRepository.getClient(
+      consentRequest.client_id,
+    );
+
+    if (
+      !clientData ||
+      !clientData.redirect_uris.includes(consentRequest.redirect_uri)
+    ) {
+      clearConsentCookie(req, res);
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description: "redirect_uri is not registered for this client",
+      });
+    }
+
+    clearConsentCookie(req, res);
+
+    const redirectUrl = new URL(consentRequest.redirect_uri);
+    if (consentRequest.state) {
+      redirectUrl.searchParams.set("state", consentRequest.state);
+    }
+
+    // Default deny: only the exact string "approve" grants. Anything else —
+    // a missing field, a truncated body, a decision this server does not
+    // recognise — is refused.
+    if (body.decision !== "approve") {
+      redirectUrl.searchParams.set("error", "access_denied");
+      logger.info(
+        `[oauth] consent denied client=${consentRequest.client_id} user=${userId}`,
+      );
+      return res.redirect(redirectUrl.toString());
+    }
+
+    const code = generateSecureAuthCode();
+
+    await oauthRepository.setAuthCode(code, {
+      client_id: consentRequest.client_id,
+      redirect_uri: consentRequest.redirect_uri,
+      scope: GRANTED_OAUTH_SCOPE,
+      user_id: userId,
+      code_challenge: consentRequest.code_challenge || null,
+      code_challenge_method: consentRequest.code_challenge_method || null,
+      expires_at: Date.now() + AUTH_CODE_TTL_MS,
+    });
+
+    redirectUrl.searchParams.set("code", code);
+
+    logger.info(
+      `[oauth] consent granted client=${consentRequest.client_id} user=${userId}`,
+    );
+
+    res.redirect(redirectUrl.toString());
+  } catch (error) {
+    logger.error("Error in OAuth consent decision endpoint:", error);
+    res.status(500).json({
+      error: "server_error",
+      error_description: "Internal server error",
+    });
+  }
+});
 
 /**
  * OAuth 2.0 Callback Handler
@@ -498,40 +537,31 @@ authorizationRouter.get("/oauth/callback", async (req, res) => {
         return res.status(400).send("Authorization code has expired");
       }
 
-      // Check if the redirect_uri points back to our own callback endpoint
-      // This would create an infinite loop, so we need to handle it differently
-      const baseUrl = getBaseUrl(req);
-      const ourCallbackUrl = `${baseUrl}/oauth/callback`;
+      // A client that registered THIS server's callback as its own
+      // redirect_uri would be redirected to itself forever, so that case still
+      // has to terminate here — but it no longer renders anything.
+      //
+      // What used to be here was a development convenience page that
+      // interpolated `code`, `state` and `codeData.redirect_uri` into HTML
+      // unescaped. `state` made it reflected; `redirect_uri` made it stored,
+      // since that value arrives verbatim from anonymous dynamic client
+      // registration. The CSP on these routes blocks script execution today,
+      // but it sets no form-action, so an injected full-page overlay could
+      // still post to an attacker's host from this origin — and a CSP
+      // regression would turn the sink into a way around the consent screen
+      // this endpoint now depends on. A JSON error breaks the loop and leaves
+      // no HTML sink at all.
+      const ourCallbackUrl = `${getBaseUrl(req)}/oauth/callback`;
 
       if (
         codeData.redirect_uri === ourCallbackUrl ||
         codeData.redirect_uri.includes("/oauth/callback")
       ) {
-        // This is likely a development/testing scenario where the client redirect_uri
-        // points back to our callback. Instead of redirecting, show a success page.
-
-        return res.send(`
-            <html>
-              <head><title>OAuth Authorization Successful</title></head>
-              <body>
-                <h1>Authorization Successful</h1>
-                <p>Authorization code: <code>${code}</code></p>
-                <p>State: <code>${state || "none"}</code></p>
-                <p>You can now exchange this code for an access token using the token endpoint.</p>
-                <pre>
-POST ${baseUrl}/oauth/token
-Content-Type: application/json
-
-{
-  "grant_type": "authorization_code",
-  "code": "${code}",
-  "client_id": "${codeData.client_id}",
-  "redirect_uri": "${codeData.redirect_uri}"
-}
-                </pre>
-              </body>
-            </html>
-        `);
+        return res.status(400).json({
+          error: "invalid_request",
+          error_description:
+            "This client's redirect_uri points back at the authorization server. Register a redirect_uri that belongs to the client.",
+        });
       }
 
       // Code exists and is valid, redirect back to the original redirect_uri

@@ -39,6 +39,28 @@ function getLocale(request: NextRequest): string {
   return defaultLocale;
 }
 
+/**
+ * Where to send an unauthenticated request, preserving the QUERY STRING.
+ *
+ * The query is not decoration on every route: the OAuth consent screen carries
+ * its whole authorization request in `?areq=`, so dropping the search string
+ * here meant a session that lapsed mid-consent sent the user back to a bare
+ * /consent with nothing to approve, and the connection had to be restarted
+ * from the client.
+ */
+function loginRedirect(
+  request: NextRequest,
+  locale: string,
+  pathnameWithoutLocale: string,
+): URL {
+  const loginUrl = new URL(`/${locale}/login`, request.url);
+  loginUrl.searchParams.set(
+    "callbackUrl",
+    `${pathnameWithoutLocale}${request.nextUrl.search}`,
+  );
+  return loginUrl;
+}
+
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
@@ -115,18 +137,18 @@ export async function middleware(request: NextRequest) {
 
     if (!session) {
       // Redirect to login if not authenticated (with locale)
-      const loginUrl = new URL(`/${locale}/login`, request.url);
-      loginUrl.searchParams.set("callbackUrl", pathnameWithoutLocale);
-      return NextResponse.redirect(loginUrl);
+      return NextResponse.redirect(
+        loginRedirect(request, locale, pathnameWithoutLocale),
+      );
     }
 
     return NextResponse.next();
   } catch (error) {
     console.error("Auth middleware error:", error);
     // On error, redirect to login (with locale)
-    const loginUrl = new URL(`/${locale}/login`, request.url);
-    loginUrl.searchParams.set("callbackUrl", pathnameWithoutLocale);
-    return NextResponse.redirect(loginUrl);
+    return NextResponse.redirect(
+      loginRedirect(request, locale, pathnameWithoutLocale),
+    );
   }
 }
 

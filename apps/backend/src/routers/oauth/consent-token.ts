@@ -45,8 +45,27 @@ export interface ConsentRequestPayload {
  */
 const SIGNING_CONTEXT = "metamcp.oauth.consent.v1";
 
-/** Name of the double-submit cookie written alongside every areq token. */
+/** Name of the double-submit cookie on a plain-http (local) deployment. */
 export const CONSENT_CSRF_COOKIE = "oauth_consent_csrf";
+
+/**
+ * Name of the same cookie wherever the deployment is https.
+ *
+ * The `__Host-` prefix is a browser-enforced contract: the cookie is accepted
+ * only with Secure and Path=/ and NO Domain attribute, which locks it to this
+ * exact host. That matters because a sibling subdomain — anything else under
+ * umbrellaitgroup.com — can otherwise set a cookie that is sent to this host
+ * too. It could not forge a valid nonce, but it could plant a same-named one
+ * and jam consent for every user indefinitely. A `__Host-` cookie cannot be
+ * planted by a sibling at all. The prefix requires Secure, so plain-http local
+ * stacks keep the unprefixed name.
+ */
+export const CONSENT_CSRF_COOKIE_HOST_PREFIXED = "__Host-oauth_consent_csrf";
+
+/** The cookie name this deployment issues and reads. */
+export function consentCsrfCookieName(secure: boolean): string {
+  return secure ? CONSENT_CSRF_COOKIE_HOST_PREFIXED : CONSENT_CSRF_COOKIE;
+}
 
 /**
  * How long a pending consent request stays valid. Matches the authorization
@@ -152,18 +171,28 @@ export function safeEquals(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Read one cookie out of a raw `Cookie` header.
+ * Read EVERY value a raw `Cookie` header carries under one name.
+ *
+ * Returning only the first match would make availability an attacker's to
+ * decide: a `Cookie` header can legally repeat a name — a cookie with a more
+ * specific Path, or one set by a sibling subdomain, is sent ahead of ours —
+ * and a single planted value would then permanently fail the comparison for
+ * that user. Collecting all of them and accepting a match on any turns that
+ * into a no-op. It costs nothing in strength: the attacker still has to
+ * produce the real nonce to be accepted, and `__Host-` (above) stops the
+ * sibling-planting case at the browser.
  *
  * This codebase has no `cookie-parser` middleware, so `req.cookies` does not
- * exist; adding the dependency for a single read is not worth it. Setting and
- * clearing still go through `res.cookie` / `res.clearCookie`, which are express
- * core.
+ * exist; adding the dependency for one read is not worth it. Setting and
+ * clearing still go through `res.cookie` / `res.clearCookie`, express core.
  */
-export function readCookie(
+export function readCookieValues(
   header: string | undefined,
   name: string,
-): string | undefined {
-  if (!header) return undefined;
+): string[] {
+  if (!header) return [];
+
+  const values: string[] = [];
 
   for (const part of header.split(";")) {
     const separator = part.indexOf("=");
@@ -172,14 +201,14 @@ export function readCookie(
 
     const raw = part.slice(separator + 1).trim();
     try {
-      return decodeURIComponent(raw);
+      values.push(decodeURIComponent(raw));
     } catch {
       // A value that is not valid percent-encoding still has to compare
-      // exactly against what we issued, so return it unchanged rather than
+      // exactly against what we issued, so keep it unchanged rather than
       // throwing out of a request handler.
-      return raw;
+      values.push(raw);
     }
   }
 
-  return undefined;
+  return values;
 }

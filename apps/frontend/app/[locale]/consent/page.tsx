@@ -27,7 +27,7 @@ import { useTranslations } from "@/hooks/useTranslations";
 interface ConsentInfo {
   client_id: string;
   client_name: string;
-  redirect_uri_host: string;
+  redirect_uri: string;
   scope: string;
 }
 
@@ -112,12 +112,25 @@ function ConsentPrompt() {
       </div>
 
       <div className="space-y-3 rounded-md border p-4 text-sm">
-        <p className="text-base font-medium break-words">{info.client_name}</p>
-        <div className="flex justify-between gap-4">
+        <div className="space-y-1">
+          <p className="text-base font-medium break-words">
+            {info.client_name}
+          </p>
+          {/*
+            client_name is whatever the application asked to be called during
+            anonymous registration — nothing verifies it. Saying so, and
+            showing the full destination below rather than a bare host, is what
+            lets someone notice a "Claude" that sends codes somewhere else.
+          */}
+          <p className="text-xs text-muted-foreground">
+            {t("auth:consentClientNameNote")}
+          </p>
+        </div>
+        <div className="space-y-1">
           <span className="text-muted-foreground">
             {t("auth:consentRedirectLabel")}
           </span>
-          <span className="font-mono break-all">{info.redirect_uri_host}</span>
+          <p className="font-mono text-xs break-all">{info.redirect_uri}</p>
         </div>
         <div className="flex justify-between gap-4">
           <span className="text-muted-foreground">

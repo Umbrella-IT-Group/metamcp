@@ -64,8 +64,17 @@ process.env.APP_URL = "https://mcp.example.test";
 process.env.BETTER_AUTH_SECRET = "test-secret-for-consent-request-signing";
 
 const { default: authorizationRouter } = await import("./authorization");
-const { CONSENT_CSRF_COOKIE, signConsentRequest, verifyConsentRequest } =
-  await import("./consent-token");
+const {
+  CONSENT_CSRF_COOKIE_HOST_PREFIXED,
+  signConsentRequest,
+  verifyConsentRequest,
+} = await import("./consent-token");
+
+const { resetConsentDecisionRateLimitForTests } = await import("./utils");
+
+// APP_URL is https here, as on the real deployment, so the cookie this server
+// issues and reads carries the __Host- prefix.
+const CSRF_COOKIE = CONSENT_CSRF_COOKIE_HOST_PREFIXED;
 
 const APP_URL = "https://mcp.example.test";
 const CLIENT_ID = "mcp_client_test";
@@ -205,12 +214,17 @@ async function dispatch(init: Parameters<typeof makeReq>[0]): Promise<FakeRes> {
 // Session + request fixtures
 // ---------------------------------------------------------------------------
 
+// A Response body can only be read once, so a single shared instance would
+// make the SECOND session lookup in a request see an empty body — failing in
+// the safe-looking direction (no user => refuse) and hiding a real regression.
+// A fresh Response per call keeps that trap out of future tests.
 function sessionFor(userId: string | null) {
-  authMock.handler.mockResolvedValue(
-    new Response(JSON.stringify(userId ? { user: { id: userId } } : null), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
+  authMock.handler.mockImplementation(
+    async () =>
+      new Response(JSON.stringify(userId ? { user: { id: userId } } : null), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
   );
 }
 
@@ -284,10 +298,15 @@ function decide(init: {
   areq: string;
   decision?: string;
   csrfCookie?: string | null;
+  /** Extra values sent under the SAME cookie name, ahead of the real one. */
+  plantedCsrfCookies?: string[];
 }) {
   const cookies = [SESSION_COOKIE];
+  for (const planted of init.plantedCsrfCookies ?? []) {
+    cookies.push(`${CSRF_COOKIE}=${planted}`);
+  }
   if (init.csrfCookie !== null && init.csrfCookie !== undefined) {
-    cookies.push(`${CONSENT_CSRF_COOKIE}=${init.csrfCookie}`);
+    cookies.push(`${CSRF_COOKIE}=${init.csrfCookie}`);
   }
 
   return dispatch({
@@ -303,7 +322,7 @@ function decide(init: {
 
 /** The cookie the authorize endpoint wrote, asserted present. */
 function issuedCsrfCookie(res: FakeRes): CookieWrite {
-  const written = res.cookies.filter((c) => c.name === CONSENT_CSRF_COOKIE);
+  const written = res.cookies.filter((c) => c.name === CSRF_COOKIE);
   expect(written).toHaveLength(1);
   const cookie = written[0];
   if (!cookie) throw new Error("no consent csrf cookie was written");
@@ -345,6 +364,10 @@ function mintedAuthCode(): { code: string; stored: Record<string, unknown> } {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The consent limiter is keyed per user and lives at module scope, so
+  // without this the file's own decisions would eventually exhaust one
+  // budget and later tests would 429 — which reads like a passing refusal.
+  resetConsentDecisionRateLimitForTests();
   oauthRepositoryMock.getClient.mockResolvedValue(registeredClient());
   oauthRepositoryMock.setAuthCode.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
@@ -394,6 +417,11 @@ describe("GET /oauth/authorize — being signed in is not consent", () => {
     // APP_URL is https here, as it is on the real deployment.
     expect(cookie.options.secure).toBe(true);
     expect(cookie.options.path).toBe("/");
+    // __Host- is only honoured with Secure, Path=/ and no Domain — the three
+    // attributes asserted above. It is what stops a sibling subdomain from
+    // planting a same-named cookie at all.
+    expect(cookie.name).toBe("__Host-oauth_consent_csrf");
+    expect(cookie.options).not.toHaveProperty("domain");
 
     // The cookie carries exactly the nonce inside the signed token — that
     // pairing is what the decision endpoint checks.
@@ -468,9 +496,7 @@ describe("POST /oauth/authorize/decision — approval mints", () => {
 
     const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
 
-    expect(res.clearedCookies.map((c) => c.name)).toEqual([
-      CONSENT_CSRF_COOKIE,
-    ]);
+    expect(res.clearedCookies.map((c) => c.name)).toEqual([CSRF_COOKIE]);
   });
 });
 
@@ -493,6 +519,37 @@ describe("POST /oauth/authorize/decision — CSRF double submit", () => {
       areq,
       decision: "approve",
       csrfCookie: "csrf-nonce-for-other-browser",
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("accepts the real nonce even when a duplicate cookie is sent ahead of it", async () => {
+    // A `Cookie` header may repeat a name — a more specific Path, or a
+    // sibling subdomain's cookie, is sent first. Reading only the first value
+    // would let anyone who can plant one deny consent to a user permanently.
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({
+      areq,
+      decision: "approve",
+      csrfCookie: csrf,
+      plantedCsrfCookies: ["planted-by-a-sibling-host", "another-planted-one"],
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+    expect(redirectUrl(res).searchParams.get("code")).toMatch(/^mcp_code_/);
+  });
+
+  it("still refuses when only planted values are present", async () => {
+    const { areq } = makeAreq();
+
+    const res = await decide({
+      areq,
+      decision: "approve",
+      csrfCookie: null,
+      plantedCsrfCookies: ["planted-by-a-sibling-host"],
     });
 
     expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
@@ -637,6 +694,45 @@ describe("POST /oauth/authorize/decision — denial and default deny", () => {
   });
 });
 
+describe("POST /oauth/authorize/decision — rate limiting is per user", () => {
+  it("limits one user without spending another user's budget", async () => {
+    // Keyed on req.ip this would be one bucket for the whole organisation:
+    // `trust proxy` is not set and the backend is reached through the
+    // frontend's in-container rewrite, so every human shares an address. A
+    // 429 here is also uniquely bad — it strands someone who already clicked
+    // Approve. Note each request below comes from a DIFFERENT fake IP, so an
+    // IP-keyed limiter would never trip at all.
+    const heavyUser = "user-rate-limit-subject";
+    const bystander = "user-rate-limit-bystander";
+
+    sessionFor(heavyUser);
+    let limited: FakeRes | undefined;
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const { areq, csrf } = makeAreq({
+        user_id: heavyUser,
+        csrf: `nonce-${attempt}`,
+      });
+      const res = await decide({ areq, decision: "deny", csrfCookie: csrf });
+      if (res.statusCode === 429) {
+        limited = res;
+        break;
+      }
+    }
+
+    expect(limited).toBeDefined();
+    expect(limited?.body?.error).toBe("too_many_requests");
+
+    // A different user is untouched and can still complete a consent.
+    sessionFor(bystander);
+    const { areq, csrf } = makeAreq({ user_id: bystander });
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(res.statusCode).not.toBe(429);
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("POST /oauth/authorize/decision — redirect_uri re-validation", () => {
   it("refuses to mint when the redirect_uri is no longer registered", async () => {
     // The client record can change between issuing the request and approving
@@ -693,6 +789,63 @@ describe("GET /oauth/callback — the params blob no longer mints", () => {
     expect(res.redirectedTo).toBeUndefined();
   });
 
+  it("emits no HTML for a client that registered our own callback", async () => {
+    // This case used to render a debug page that interpolated `code`, `state`
+    // and the client's registered redirect_uri straight into HTML. `state` is
+    // request input and redirect_uri is anonymous-registration input, so the
+    // sink was both reflected and stored. The CSP blocks script today, but it
+    // sets no form-action — an injected overlay could still post to an
+    // attacker's host from this origin, and a CSP regression would turn it
+    // into a way around the consent screen entirely.
+    const payload = '"><img src=x onerror=alert(document.domain)>';
+    const existingCode = "mcp_code_selfreferential";
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: existingCode,
+      client_id: CLIENT_ID,
+      redirect_uri: `${APP_URL}/oauth/callback`,
+      scope: "mcp",
+      user_id: USER_ID,
+      expires_at: new Date(Date.now() + 5 * 60 * 1000),
+    });
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/callback",
+      query: { code: existingCode, state: payload },
+    });
+
+    // Nothing was rendered at all: no res.send body, JSON only.
+    expect(res.sentBody).toBeUndefined();
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_request");
+
+    // And the payload appears nowhere in what was returned.
+    expect(JSON.stringify(res.body)).not.toContain("<img");
+    expect(JSON.stringify(res.body)).not.toContain(payload);
+  });
+
+  it("emits no HTML when a hostile redirect_uri was stored at registration", async () => {
+    // The stored half: redirect_uri arrives verbatim from anonymous DCR.
+    const hostile = `${APP_URL}/oauth/callback#"><script>alert(1)</script>`;
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: "mcp_code_hostileuri",
+      client_id: CLIENT_ID,
+      redirect_uri: hostile,
+      scope: "mcp",
+      user_id: USER_ID,
+      expires_at: new Date(Date.now() + 5 * 60 * 1000),
+    });
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/callback",
+      query: { code: "mcp_code_hostileuri" },
+    });
+
+    expect(res.sentBody).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain("<script");
+  });
+
   it("still forwards a code that already exists (the lookup path is unchanged)", async () => {
     const existingCode = "mcp_code_alreadyissued";
     oauthRepositoryMock.getAuthCode.mockResolvedValue({
@@ -737,7 +890,7 @@ describe("GET /oauth/consent/info", () => {
     expect(res.body).toEqual({
       client_id: CLIENT_ID,
       client_name: CLIENT_NAME,
-      redirect_uri_host: "claude.ai",
+      redirect_uri: REDIRECT_URI,
       scope: "mcp",
     });
   });

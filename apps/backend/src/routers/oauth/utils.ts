@@ -263,6 +263,10 @@ class RateLimiter {
     this.attempts.delete(identifier);
   }
 
+  clear(): void {
+    this.attempts.clear();
+  }
+
   // Clean up old entries periodically
   cleanup(): void {
     const now = Date.now();
@@ -277,15 +281,45 @@ class RateLimiter {
 // Create rate limiter instances
 const authEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
 const tokenEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 10 attempts per 1 minute
+const consentDecisionLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 decisions per user per 1 minute
 
 // Clean up rate limiter entries every 10 minutes
 setInterval(
   () => {
     authEndpointLimiter.cleanup();
     tokenEndpointLimiter.cleanup();
+    consentDecisionLimiter.cleanup();
   },
   10 * 60 * 1000,
 );
+
+/**
+ * Rate limit the OAuth consent decision by USER, not by IP.
+ *
+ * The other two limiters key on `req.ip`, which works only as well as the
+ * deployment lets it: express has no `trust proxy` set here and the backend is
+ * reached through the frontend's rewrite inside the same container, so `req.ip`
+ * is the same container-local address for every human. An IP key on this
+ * endpoint would therefore be one bucket shared by the whole organisation —
+ * and unlike the others, a 429 here strands a user who has ALREADY clicked
+ * Approve, with no way forward but to restart the whole flow.
+ *
+ * The user id comes from the verified areq token, so it is this server's own
+ * signed value, not anything the caller asserted.
+ */
+export function isConsentDecisionRateLimited(userId: string): boolean {
+  return consentDecisionLimiter.isRateLimited(`user:${userId}`);
+}
+
+/**
+ * Test-only. The limiter lives at module scope, so without this every consent
+ * test in a file shares one 20-per-minute budget and the suite starts failing
+ * once it grows — as a 429, which looks like a passing negative assertion.
+ * Production never calls this.
+ */
+export function resetConsentDecisionRateLimitForTests(): void {
+  consentDecisionLimiter.clear();
+}
 
 /**
  * Rate limiting middleware for OAuth authorization endpoint
