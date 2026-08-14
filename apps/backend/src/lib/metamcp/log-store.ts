@@ -123,9 +123,11 @@ class MetaMcpLogStore {
     return [...logsToReturn].reverse(); // Return newest first
   }
 
-  clearLogs(): void {
-    this.logs = [];
-  }
+  // There is deliberately no clearLogs(). Its only caller was the `logs.clear`
+  // tRPC mutation, removed with migration 0028's audit_log: the one admin
+  // gesture that erased the live security view mid-incident. Leaving an unused
+  // wipe method behind is how it comes back. The buffer still rolls at
+  // maxLogs — bounded, but never emptied on command.
 
   addListener(listener: (log: MetaMcpLogEntry) => void): () => void {
     this.listeners.add(listener);

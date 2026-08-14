@@ -148,11 +148,13 @@ describe("namespaces.get — isAdmin reaches the implementation", () => {
   });
 });
 
+// `logs.get` is the router's ONLY procedure now — `logs.clear` was removed
+// with migration 0028's audit_log (admin-gate-sweep.test.ts asserts its
+// absence), so there is no second implementation to stub here.
 describe("logs.get — admin only", () => {
   const buildRouter = () =>
     createLogsRouter({
       getLogs: okImpl({ success: true, data: [], totalCount: 0 } as never),
-      clearLogs: okImpl({ success: true } as never),
     });
 
   it("admin allowed", async () => {

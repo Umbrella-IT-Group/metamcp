@@ -3,6 +3,7 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import type { Request, Response } from "express";
 
 import { auth, type Session, type User } from "./auth";
+import { auditRequestContext } from "./lib/audit/audit-emitter";
 import logger from "./utils/logger";
 
 /**
@@ -108,6 +109,12 @@ export const createContext = async ({
     res,
     user,
     session,
+    // Flattened request attribution for the RBAC/authn denial emitters in
+    // @repo/trpc. That package holds the choke points but cannot type or
+    // import the express `req` on this context, so the three fields it needs
+    // are threaded explicitly. Built from the fields
+    // `middleware/audit-context.middleware` stamped on the request.
+    audit: auditRequestContext(req),
   };
 };
 

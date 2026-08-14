@@ -8,6 +8,7 @@ import {
 } from "./lib/health-upstream";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
+import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { errorHandler } from "./middleware/error-handler.middleware";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
@@ -17,6 +18,17 @@ import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
 
 const app = express();
+
+// FIRST registration in this file, and it has to stay first — the mirror of
+// the errorHandler's "has to stay last" at the bottom. Every audit row's
+// `request_id` and `actor_ip` come from here, so any route mounted above it
+// would emit rows with neither. It sits ahead of the body parser too, so the
+// raw-stream `/mcp-proxy` and `/metamcp` legs (which deliberately skip JSON
+// parsing) are covered as well: those are the MCP data plane, i.e. exactly
+// the paths the 2026-08-13 attacker's stolen credential would have been used
+// on. See ./middleware/audit-context.middleware for the CF-Connecting-IP
+// trust assumption and for why `trust proxy` is deliberately NOT set with it.
+app.use(auditContextMiddleware);
 
 // Global JSON middleware for non-proxy routes
 app.use((req, res, next) => {

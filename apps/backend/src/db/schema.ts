@@ -722,3 +722,58 @@ export const toolCallAuditTable = pgTable(
     index("tool_call_audit_client_name_idx").on(table.client_name),
   ],
 );
+
+// Control-plane security audit log (migration 0028). Companion to
+// `tool_call_audit` above, deliberately a SECOND table rather than more
+// columns on that one: different write rate, different query shape, and
+// `tool_call_audit` already has consumers whose indexes should not churn.
+//
+// The two differ in one more way that matters: `tool_call_audit` is pruned
+// (`pruneOlderThan`, hard DELETE, 90d). This table has NO prune, NO update
+// and NO delete anywhere in the application — the repository exposes
+// `record()` and nothing else, and migration 0028 adds BEFORE
+// UPDATE/DELETE/TRUNCATE triggers that RAISE. That asymmetry is the point:
+// an audit archive an admin can empty is not an audit archive.
+//
+// Raw secrets are NEVER written. `detail` carries a sha256 + last-4
+// fingerprint of a presented credential, never the credential.
+export const auditLogTable = pgTable(
+  "audit_log",
+  {
+    uuid: uuid("uuid")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    occurred_at: timestamp("occurred_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    // user | api_key | oauth_client | anonymous | system. Kept as text
+    // rather than a pgEnum: a new actor class must never be able to make an
+    // audit INSERT fail, and a failed audit INSERT is a silently missing
+    // security record.
+    actor_type: text("actor_type").notNull(),
+    actor_id: text("actor_id"),
+    actor_label: text("actor_label"),
+    // Resolved from CF-Connecting-IP by the audit-context middleware, not
+    // from req.ip (which is container-local for every caller — see
+    // middleware/audit-context.middleware.ts).
+    actor_ip: text("actor_ip"),
+    actor_user_agent: text("actor_user_agent"),
+    action: text("action").notNull(),
+    target_type: text("target_type"),
+    target_id: text("target_id"),
+    // success | failure | denied — same reasoning as actor_type for staying
+    // text.
+    outcome: text("outcome").notNull(),
+    request_id: text("request_id"),
+    http_status: integer("http_status"),
+    detail: jsonb("detail")
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+  },
+  (table) => [
+    index("audit_log_occurred_at_idx").on(table.occurred_at),
+    index("audit_log_action_idx").on(table.action),
+    index("audit_log_actor_id_idx").on(table.actor_id),
+    index("audit_log_outcome_idx").on(table.outcome),
+  ],
+);

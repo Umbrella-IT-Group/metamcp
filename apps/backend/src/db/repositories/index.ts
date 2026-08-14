@@ -9,4 +9,5 @@ export * from "./api-keys.repo";
 export * from "./users.repo";
 export * from "./m365-tokens.repo";
 export * from "./tool-call-audit.repo";
+export * from "./audit-log.repo";
 export { configRepo } from "./config.repo";

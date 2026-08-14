@@ -6,6 +6,12 @@ import logger from "@/utils/logger";
 import { ApiKeysRepository } from "../db/repositories/api-keys.repo";
 import { usersRepository } from "../db/repositories/users.repo";
 import {
+  type AuditActorType,
+  auditRequestContext,
+  credentialFingerprint,
+  emit,
+} from "../lib/audit/audit-emitter";
+import {
   authRateLimiter,
   getAuthRateLimitIdentifier,
 } from "../lib/auth-rate-limiter";
@@ -213,6 +219,79 @@ function extractAuthToken(
 }
 
 /**
+ * Record a refused MCP bearer attempt to the durable audit log.
+ *
+ * THIS IS THE STOLEN-KEY DETECTOR, and its absence is the single largest
+ * forensic gap the 2026-08-13 incident exposed. This middleware is the layer
+ * every machine-plane caller passes through — API keys and OAuth bearer
+ * tokens, i.e. the credential class the attacker actually held — and until
+ * now it wrote NOTHING on refusal. Not a log line, not a counter. A stolen
+ * key being tried against endpoint after endpoint was indistinguishable from
+ * silence.
+ *
+ * WHAT IS AND IS NOT STORED: the presented credential is fingerprinted
+ * (sha256 + last 4), never written. That is deliberately enough to answer
+ * "is this the same credential that was refused 400 times last night, and is
+ * it one of ours?" — and useless to anyone who later reads the audit table.
+ * `key_uuid` / `user_id` are recorded when the credential resolved to a row;
+ * on an invalid credential there is nothing to resolve and the actor is
+ * honestly `anonymous`.
+ *
+ * NOISE, stated because it is a deliberate trade: the no-credential 401s are
+ * emitted too, even though every well-behaved MCP client produces one on its
+ * first request (that 401 IS the OAuth discovery handshake). They carry
+ * `reason: "no_credential"` so a query can exclude them in one predicate.
+ * Dropping them at the source instead would also drop unauthenticated
+ * endpoint scanning, which is exactly the recon phase this incident began
+ * with. Volume management belongs in Phase 2 retention, not in deciding not
+ * to see it.
+ *
+ * Fire-and-forget: `emit` never throws and is never awaited, and this
+ * wrapper adds its own guard so that even a future change to the envelope
+ * construction cannot turn a logging bug into a failed auth response.
+ */
+function emitMcpAuthDenial(
+  req: express.Request,
+  endpoint: DatabaseEndpoint | undefined,
+  denial: {
+    httpStatus: number;
+    /** Machine-readable denial cause, queried far more often than the status. */
+    reason: string;
+    presentedToken?: string;
+    authMethod?: "api_key" | "oauth";
+    actorType?: AuditActorType;
+    actorId?: string | null;
+  },
+): void {
+  try {
+    const requestContext = auditRequestContext(req);
+    emit({
+      actor_type: denial.actorType ?? "anonymous",
+      actor_id: denial.actorId ?? null,
+      actor_label: null,
+      actor_ip: requestContext.actor_ip,
+      actor_user_agent: requestContext.actor_user_agent,
+      action:
+        denial.httpStatus === 429 ? "mcp.auth.ratelimited" : "mcp.auth.denied",
+      target_type: "endpoint",
+      target_id: endpoint?.uuid ?? null,
+      outcome: "denied",
+      request_id: requestContext.request_id,
+      http_status: denial.httpStatus,
+      detail: {
+        reason: denial.reason,
+        auth_method: denial.authMethod ?? null,
+        endpoint_name: endpoint?.name ?? null,
+        credential: credentialFingerprint(denial.presentedToken),
+      },
+    });
+  } catch {
+    // An audit failure must never change what this middleware answers. See
+    // lib/audit/audit-emitter for the full contract.
+  }
+}
+
+/**
  * Enhanced authentication middleware organized by 4 clear conditions
  * to prevent infinite retry issues with MCP inspector
  */
@@ -237,6 +316,10 @@ export const authenticateApiKey = async (
     if (endpoint.enable_api_key_auth && !endpoint.enable_oauth) {
       if (!token) {
         // No token provided - request API key
+        emitMcpAuthDenial(req, endpoint, {
+          httpStatus: 401,
+          reason: "no_credential",
+        });
         return sendApiKeyRequiredResponse(res);
       }
 
@@ -265,6 +348,14 @@ export const authenticateApiKey = async (
           logger.warn(
             `[auth] api key rejected reason=disabled endpoint=${endpoint.uuid} key=${apiKeyResult.key_uuid} user=${disabledUserId}`,
           );
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "account_disabled",
+            presentedToken: token,
+            authMethod: "api_key",
+            actorType: "api_key",
+            actorId: apiKeyResult.key_uuid,
+          });
           return res.status(403).json({
             error: "Access denied",
             message:
@@ -281,6 +372,14 @@ export const authenticateApiKey = async (
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
         if (!accessCheckResult.allowed) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "endpoint_access_denied",
+            presentedToken: token,
+            authMethod: "api_key",
+            actorType: "api_key",
+            actorId: apiKeyResult.key_uuid,
+          });
           return res.status(403).json({
             error: "Access denied",
             message: accessCheckResult.message,
@@ -295,6 +394,12 @@ export const authenticateApiKey = async (
         authRateLimiter.recordFailedAttempt(rateLimitId);
 
         if (authRateLimiter.isRateLimited(rateLimitId)) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 429,
+            reason: "too_many_failed_attempts",
+            presentedToken: token,
+            authMethod: "api_key",
+          });
           return res.status(429).json({
             error: "too_many_requests",
             error_description:
@@ -303,6 +408,12 @@ export const authenticateApiKey = async (
           });
         }
 
+        emitMcpAuthDenial(req, endpoint, {
+          httpStatus: 401,
+          reason: "invalid_api_key",
+          presentedToken: token,
+          authMethod: "api_key",
+        });
         return res.status(401).json({
           error: "invalid_api_key",
           error_description: "The provided API key is invalid or expired",
@@ -315,6 +426,10 @@ export const authenticateApiKey = async (
     if (endpoint.enable_api_key_auth && endpoint.enable_oauth) {
       if (!token) {
         // No token provided - allow OAuth flow
+        emitMcpAuthDenial(req, endpoint, {
+          httpStatus: 401,
+          reason: "no_credential",
+        });
         return sendOAuthChallengeResponse(req, res, endpoint);
       }
 
@@ -334,6 +449,14 @@ export const authenticateApiKey = async (
             logger.warn(
               `[auth] oauth token rejected reason=disabled endpoint=${endpoint.uuid} user=${disabledUserId}`,
             );
+            emitMcpAuthDenial(req, endpoint, {
+              httpStatus: 403,
+              reason: "account_disabled",
+              presentedToken: token,
+              authMethod: "oauth",
+              actorType: "user",
+              actorId: oauthResult.user_id ?? null,
+            });
             return res.status(403).json({
               error: "access_denied",
               error_description:
@@ -348,6 +471,14 @@ export const authenticateApiKey = async (
 
           const accessCheckResult = checkOAuthAccess(oauthResult, endpoint);
           if (!accessCheckResult.allowed) {
+            emitMcpAuthDenial(req, endpoint, {
+              httpStatus: 403,
+              reason: "endpoint_access_denied",
+              presentedToken: token,
+              authMethod: "oauth",
+              actorType: "user",
+              actorId: oauthResult.user_id ?? null,
+            });
             return res.status(403).json({
               error: "access_denied",
               error_description: accessCheckResult.message,
@@ -384,6 +515,14 @@ export const authenticateApiKey = async (
           logger.warn(
             `[auth] api key rejected reason=disabled endpoint=${endpoint.uuid} key=${apiKeyResult.key_uuid} user=${disabledUserId}`,
           );
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "account_disabled",
+            presentedToken: token,
+            authMethod: "api_key",
+            actorType: "api_key",
+            actorId: apiKeyResult.key_uuid,
+          });
           return res.status(403).json({
             error: "Access denied",
             message:
@@ -400,6 +539,14 @@ export const authenticateApiKey = async (
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
         if (!accessCheckResult.allowed) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "endpoint_access_denied",
+            presentedToken: token,
+            authMethod: "api_key",
+            actorType: "api_key",
+            actorId: apiKeyResult.key_uuid,
+          });
           return res.status(403).json({
             error: "Access denied",
             message: accessCheckResult.message,
@@ -414,6 +561,11 @@ export const authenticateApiKey = async (
         authRateLimiter.recordFailedAttempt(rateLimitId);
 
         if (authRateLimiter.isRateLimited(rateLimitId)) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 429,
+            reason: "too_many_failed_attempts",
+            presentedToken: token,
+          });
           return res.status(429).json({
             error: "too_many_requests",
             error_description:
@@ -422,6 +574,11 @@ export const authenticateApiKey = async (
           });
         }
 
+        emitMcpAuthDenial(req, endpoint, {
+          httpStatus: 401,
+          reason: "invalid_credentials",
+          presentedToken: token,
+        });
         return res.status(401).json({
           error: "invalid_credentials",
           error_description:
@@ -435,6 +592,10 @@ export const authenticateApiKey = async (
     if (!endpoint.enable_api_key_auth && endpoint.enable_oauth) {
       if (!token) {
         // No token provided - allow OAuth flow
+        emitMcpAuthDenial(req, endpoint, {
+          httpStatus: 401,
+          reason: "no_credential",
+        });
         return sendOAuthChallengeResponse(req, res, endpoint);
       }
 
@@ -452,6 +613,14 @@ export const authenticateApiKey = async (
           logger.warn(
             `[auth] oauth token rejected reason=disabled endpoint=${endpoint.uuid} user=${disabledUserId}`,
           );
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "account_disabled",
+            presentedToken: token,
+            authMethod: "oauth",
+            actorType: "user",
+            actorId: oauthResult.user_id ?? null,
+          });
           return res.status(403).json({
             error: "access_denied",
             error_description:
@@ -466,6 +635,14 @@ export const authenticateApiKey = async (
 
         const accessCheckResult = checkOAuthAccess(oauthResult, endpoint);
         if (!accessCheckResult.allowed) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "endpoint_access_denied",
+            presentedToken: token,
+            authMethod: "oauth",
+            actorType: "user",
+            actorId: oauthResult.user_id ?? null,
+          });
           return res.status(403).json({
             error: "access_denied",
             error_description: accessCheckResult.message,
@@ -480,6 +657,12 @@ export const authenticateApiKey = async (
         authRateLimiter.recordFailedAttempt(rateLimitId);
 
         if (authRateLimiter.isRateLimited(rateLimitId)) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 429,
+            reason: "too_many_failed_attempts",
+            presentedToken: token,
+            authMethod: "oauth",
+          });
           return res.status(429).json({
             error: "too_many_requests",
             error_description:
@@ -488,6 +671,12 @@ export const authenticateApiKey = async (
           });
         }
 
+        emitMcpAuthDenial(req, endpoint, {
+          httpStatus: 401,
+          reason: "invalid_token",
+          presentedToken: token,
+          authMethod: "oauth",
+        });
         return res.status(401).json({
           error: "invalid_token",
           error_description:

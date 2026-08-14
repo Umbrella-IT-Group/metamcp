@@ -32,13 +32,13 @@ export const GetLogsResponseSchema = z.object({
   totalCount: z.number(),
 });
 
-export const ClearLogsResponseSchema = z.object({
-  success: z.literal(true),
-  message: z.string(),
-});
+// There is deliberately no ClearLogsResponseSchema. The `logs.clear`
+// procedure was removed with the audit_log work (migration 0028): a gateway
+// whose promise is an immutable security record must not ship a
+// "clear all logs" contract for anyone to re-wire a button to. Read-only is
+// the whole surface.
 
 export type MetaMcpLogCategory = z.infer<typeof MetaMcpLogCategorySchema>;
 export type MetaMcpLogEntry = z.infer<typeof MetaMcpLogEntrySchema>;
 export type GetLogsRequest = z.infer<typeof GetLogsRequestSchema>;
 export type GetLogsResponse = z.infer<typeof GetLogsResponseSchema>;
-export type ClearLogsResponse = z.infer<typeof ClearLogsResponseSchema>;
