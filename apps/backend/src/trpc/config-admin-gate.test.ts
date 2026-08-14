@@ -46,6 +46,8 @@ const memberCtx = {
   user: { id: "member-1", role: "member" },
   session: { id: "s-member" },
 };
+/** No user, no session — what `createContext` leaves for an anonymous /trpc call. */
+const anonCtx = {};
 
 describe("config write surface — admin gate", () => {
   it("setSignupDisabled: admin allowed, member FORBIDDEN", async () => {
@@ -83,4 +85,69 @@ describe("config write surface — admin gate", () => {
       router.createCaller(memberCtx).getSignupDisabled(),
     ).resolves.toBe(false);
   });
+});
+
+/**
+ * The config READ surface, split by who may read it (redteam re-verification
+ * 2026-08-14).
+ *
+ * The write surface was admin-gated in 2026-07-14 (above); the reads were all
+ * left public, so an anonymous caller could pull the gateway's MCP
+ * retry/timeout budget and session lifetime straight off `/trpc`. The five
+ * operational getters are now `protectedProcedure`; the four auth-posture
+ * getters stay public because the sign-in pages read them before a session
+ * exists, and gating one of those would leave a login screen that cannot
+ * render itself.
+ *
+ * Both halves are pinned. A test that only proved the gates would be
+ * satisfied by gating everything — which breaks login — and a test that only
+ * proved the public reads would be satisfied by gating nothing.
+ */
+describe("config read surface — anonymous access", () => {
+  const GATED = [
+    "getSessionLifetime",
+    "getMcpTimeout",
+    "getMcpMaxTotalTimeout",
+    "getMcpMaxAttempts",
+    "getMcpResetTimeoutOnProgress",
+  ] as const;
+
+  const KEPT_PUBLIC = [
+    "getSignupDisabled",
+    "getSsoSignupDisabled",
+    "getBasicAuthDisabled",
+    "getAuthProviders",
+  ] as const;
+
+  it.each(GATED)("%s: UNAUTHORIZED to an anonymous caller", async (getter) => {
+    const router = buildRouter();
+
+    await expect(router.createCaller(anonCtx)[getter]()).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it.each(GATED)(
+    "%s: still served to an authenticated caller",
+    async (getter) => {
+      // The regression guard for the settings page and the MCP inspector, whose
+      // useConnection hook reads three of these on every connect.
+      const router = buildRouter();
+
+      await expect(
+        router.createCaller(memberCtx)[getter](),
+      ).resolves.not.toBeUndefined();
+    },
+  );
+
+  it.each(KEPT_PUBLIC)(
+    "%s: still readable pre-auth (the login page depends on it)",
+    async (getter) => {
+      const router = buildRouter();
+
+      await expect(
+        router.createCaller(anonCtx)[getter](),
+      ).resolves.not.toBeUndefined();
+    },
+  );
 });

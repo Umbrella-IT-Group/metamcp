@@ -48,6 +48,27 @@ export const createConfigRouter = (implementations: {
   >;
 }) =>
   router({
+    // Deliberately public, and the only reads in this router that stay so.
+    //
+    // Redteam re-verification 2026-08-14 flagged the whole `publicProcedure`
+    // read cluster here: an anonymous caller could enumerate the gateway's
+    // operational configuration from `/trpc`. The MCP timeout/attempt/session
+    // getters had no reason to be reachable that way and are now
+    // `protectedProcedure` (see the block above `getMcpResetTimeoutOnProgress`).
+    // These four stay public because the SIGN-IN PAGES read them before a
+    // session can exist, so gating them would leave a login screen that cannot
+    // render itself:
+    //   getSignupDisabled     — login/page.tsx:37, register/page.tsx:46,99,121
+    //   getBasicAuthDisabled  — login/page.tsx:52
+    //   getAuthProviders      — login/page.tsx:67
+    //   getSsoSignupDisabled  — no pre-auth reader today (settings only), kept
+    //                           with its siblings: it is the same single
+    //                           boolean about the gateway's own auth posture,
+    //                           and the register page is the natural next
+    //                           caller for it.
+    // None of the four describes a user, a server, an endpoint or a timing
+    // window; each is one boolean or the enabled-provider list the login form
+    // has to draw buttons for. Every paired WRITE is `adminProcedure`.
     getSignupDisabled: publicProcedure.query(async () => {
       return await implementations.getSignupDisabled();
     }),
@@ -90,7 +111,35 @@ export const createConfigRouter = (implementations: {
         return await implementations.setBasicAuthDisabled(input);
       }),
 
-    getMcpResetTimeoutOnProgress: publicProcedure.query(async () => {
+    // Authenticated read (redteam re-verification 2026-08-14). This and the
+    // four getters below were `publicProcedure`, so an anonymous caller could
+    // read the gateway's MCP retry/timeout budget and session lifetime from
+    // `/trpc` with no credentials. Individually each is a number; together
+    // they are the timing model of the service — how long a stalled upstream
+    // is held, how many reconnects are attempted before the breaker trips,
+    // and how long a stolen session cookie stays good — which is exactly the
+    // information that tunes a resource-exhaustion attempt against the
+    // backend pool (the failure mode of the 2026-07-14 METAMCP-POOL-1
+    // incident) rather than merely attempting one.
+    //
+    // Safe to gate because nothing pre-auth reads them. Every frontend call
+    // site is inside the authenticated app shell, which `middleware.ts`
+    // admits only with a session (its `publicRoutes` are /login, /register,
+    // /cors-error and /, and / is a client-side redirect to /mcp-servers):
+    //   getMcpResetTimeoutOnProgress — settings/page.tsx:74, useConnection.ts:113
+    //   getMcpTimeout                — settings/page.tsx:80, useConnection.ts:104
+    //   getMcpMaxTotalTimeout        — settings/page.tsx:86, useConnection.ts:109
+    //   getMcpMaxAttempts            — settings/page.tsx:92
+    //   getSessionLifetime           — settings/page.tsx:98
+    // `useConnection` is imported only by mcp-inspector, mcp-servers/[uuid]
+    // and namespaces/[uuid], all under the same gate, and reads each value
+    // through a `?? default` fallback.
+    //
+    // The MCP RUNTIME is unaffected: the backend never goes through tRPC for
+    // these. `metamcp-proxy.ts`, `mcp-server-pool.ts`, `metamcp-server-pool.ts`,
+    // `server-error-tracker.ts`, `session-lifetime-manager.ts` and the OpenAPI
+    // handlers all call `configService.*` directly.
+    getMcpResetTimeoutOnProgress: protectedProcedure.query(async () => {
       return await implementations.getMcpResetTimeoutOnProgress();
     }),
 
@@ -100,7 +149,8 @@ export const createConfigRouter = (implementations: {
         return await implementations.setMcpResetTimeoutOnProgress(input);
       }),
 
-    getMcpTimeout: publicProcedure.query(async () => {
+    // Authenticated read — see the block above getMcpResetTimeoutOnProgress.
+    getMcpTimeout: protectedProcedure.query(async () => {
       return await implementations.getMcpTimeout();
     }),
 
@@ -110,7 +160,8 @@ export const createConfigRouter = (implementations: {
         return await implementations.setMcpTimeout(input);
       }),
 
-    getMcpMaxTotalTimeout: publicProcedure.query(async () => {
+    // Authenticated read — see the block above getMcpResetTimeoutOnProgress.
+    getMcpMaxTotalTimeout: protectedProcedure.query(async () => {
       return await implementations.getMcpMaxTotalTimeout();
     }),
 
@@ -120,7 +171,8 @@ export const createConfigRouter = (implementations: {
         return await implementations.setMcpMaxTotalTimeout(input);
       }),
 
-    getMcpMaxAttempts: publicProcedure.query(async () => {
+    // Authenticated read — see the block above getMcpResetTimeoutOnProgress.
+    getMcpMaxAttempts: protectedProcedure.query(async () => {
       return await implementations.getMcpMaxAttempts();
     }),
 
@@ -130,7 +182,10 @@ export const createConfigRouter = (implementations: {
         return await implementations.setMcpMaxAttempts(input);
       }),
 
-    getSessionLifetime: publicProcedure.query(async () => {
+    // Authenticated read — see the block above getMcpResetTimeoutOnProgress.
+    // The most sensitive of the five: it is how long a stolen session cookie
+    // remains valid, and this fork runs 30-day sessions.
+    getSessionLifetime: protectedProcedure.query(async () => {
       return await implementations.getSessionLifetime();
     }),
 
