@@ -27,7 +27,20 @@ const t = initTRPC.context<BaseContext>().create({
     const { stack: _stack, ...data } = shape.data as typeof shape.data & {
       stack?: string;
     };
-    return { ...shape, data };
+    // Mask the message for unexpected server errors too. @trpc/server sets
+    // shape.message = error.message unconditionally, and getTRPCErrorFromUnknown
+    // preserves cause.message when wrapping an unexpected throw as
+    // INTERNAL_SERVER_ERROR — so a raw driver/DB message (internal hostnames,
+    // SQL, table names) can reach an unauthenticated caller through any
+    // publicProcedure that lacks its own try/catch (e.g. the config router).
+    // Safe: every deliberate INTERNAL_SERVER_ERROR in this tree already throws a
+    // fixed string, and all user-facing messages are FORBIDDEN/NOT_FOUND/
+    // UNAUTHORIZED, so no UI copy degrades. `code`/`httpStatus`/`path` stay.
+    const message =
+      data.code === "INTERNAL_SERVER_ERROR"
+        ? "Internal server error"
+        : shape.message;
+    return { ...shape, message, data };
   },
 });
 

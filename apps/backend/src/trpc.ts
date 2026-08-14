@@ -89,7 +89,19 @@ const t = initTRPC.context<Context>().create({
     const { stack: _stack, ...data } = shape.data as typeof shape.data & {
       stack?: string;
     };
-    return { ...shape, data };
+    // Mask the message for unexpected server errors too — @trpc/server sets
+    // shape.message = error.message unconditionally, and an unexpected throw
+    // wrapped as INTERNAL_SERVER_ERROR keeps cause.message, which can carry a
+    // raw driver/DB message (internal hostnames, SQL) to an unauthenticated
+    // caller through any publicProcedure lacking its own try/catch. Deliberate
+    // INTERNAL_SERVER_ERROR throws in this tree already use fixed strings and
+    // every user-facing message is FORBIDDEN/NOT_FOUND/UNAUTHORIZED, so no UI
+    // copy degrades. Mirrors the same mask in packages/trpc/src/trpc.ts.
+    const message =
+      data.code === "INTERNAL_SERVER_ERROR"
+        ? "Internal server error"
+        : shape.message;
+    return { ...shape, message, data };
   },
 });
 

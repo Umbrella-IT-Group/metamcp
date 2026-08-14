@@ -117,19 +117,35 @@ describe("@repo/trpc instance — the one every production router is built from"
   it("leaks no absolute source path anywhere in the serialised body", async () => {
     // Broader than the property check above: catches a stack re-appearing
     // under a different key, or being folded into another field.
-    //
-    // Scope note: this asserts on FILE PATHS, not on the error message.
-    // @trpc/server passes an unexpected error's `message` straight through
-    // for INTERNAL_SERVER_ERROR regardless of NODE_ENV, so the text of a
-    // thrown internal error still reaches the caller. That is upstream
-    // behaviour independent of FIND-007's stack leak, and redacting it would
-    // also blank the TRPCError messages the frontend surfaces to users
-    // ("Access denied: You can only view servers you own", etc.). Left as a
-    // separate decision rather than silently changed here.
     const { body } = await callOverHttp(appRouter, "explode");
 
     expect(JSON.stringify(body)).not.toMatch(/\bat .*[/\\].*:\d+:\d+/);
     expect(JSON.stringify(body)).not.toContain(".ts:");
+  });
+
+  it("masks the MESSAGE of an unexpected internal error", async () => {
+    // @trpc/server sets shape.message = error.message unconditionally, and an
+    // unexpected throw wrapped as INTERNAL_SERVER_ERROR keeps cause.message —
+    // so a raw driver/DB message would reach the caller (config-router
+    // publicProcedures have no try/catch, i.e. this is reachable unauth).
+    const { status, body } = await callOverHttp(appRouter, "explode");
+
+    expect(status).toBe(500);
+    expect(body.error?.message).toBe("Internal server error");
+    // The originally thrown internal detail must not survive anywhere.
+    expect(JSON.stringify(body)).not.toContain(
+      "internal detail that must not reach the client",
+    );
+  });
+
+  it("PRESERVES the message of a client-facing TRPCError (no over-redaction)", async () => {
+    // The mask keys on data.code === INTERNAL_SERVER_ERROR only, so the
+    // deliberate messages the frontend surfaces to users (FORBIDDEN /
+    // NOT_FOUND / UNAUTHORIZED) pass through untouched.
+    const { status, body } = await callOverHttp(appRouter, "unauthorized");
+
+    expect(status).toBe(401);
+    expect(body.error?.message).toBe("nope");
   });
 });
 
