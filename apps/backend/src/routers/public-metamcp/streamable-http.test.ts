@@ -30,11 +30,36 @@
  * boundary, not the pure logic.
  */
 import { readFileSync } from "node:fs";
+import type { Server } from "node:http";
 import { join } from "node:path";
 
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type express from "express";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Value import, not `import type`: the /health/sessions gate tests below mount
+// the REAL router on a real socket, which needs express itself. The default
+// import still carries the `express.Request` / `express.Response` types the
+// dispatch tests cast to.
+import express from "express";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+
+const h = vi.hoisted(() => ({
+  isAdminHealthRequest: vi.fn<() => Promise<boolean>>(),
+}));
+
+// The gate's own fail-closed behavior (no cookie, bad session, unknown user,
+// db error — all resolve false, never throw) is exhaustively tested in
+// `lib/health-upstream.test.ts`. What is under test here is that
+// /health/sessions CONSULTS it and withholds when it says no.
+vi.mock("../../lib/health-upstream", () => ({
+  isAdminHealthRequest: h.isAdminHealthRequest,
+}));
 
 vi.mock("@/utils/logger", () => ({
   default: {
@@ -112,7 +137,7 @@ import {
 } from "../../lib/metamcp/gateway-boot-id";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { hashAuthPrincipal } from "../../lib/metamcp/session-auth";
-import {
+import streamableHttpRouter, {
   buildSessionsHealthPayload,
   cleanupSession,
   dispatchTracked,
@@ -552,15 +577,16 @@ describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (
 
 describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/sessions id disclosure)", () => {
   it("publishes aggregate counts + sweeper stats but never the session id list", () => {
-    const payload = buildSessionsHealthPayload();
+    const payload = buildSessionsHealthPayload(true);
+    const sessions = payload.streamableHttpSessions as Record<string, unknown>;
 
     // The old payload carried `streamableHttpSessions.sessionIds: [...]` —
     // every live consumer's Mcp-Session-Id, unauthenticated. It must be gone.
-    expect(payload.streamableHttpSessions).toHaveProperty("count");
-    expect(payload.streamableHttpSessions).not.toHaveProperty("sessionIds");
+    expect(sessions).toHaveProperty("count");
+    expect(sessions).not.toHaveProperty("sessionIds");
     expect(JSON.stringify(payload)).not.toContain("sessionIds");
     // Monitoring still gets what it consumes.
-    expect(typeof payload.streamableHttpSessions.count).toBe("number");
+    expect(typeof sessions.count).toBe("number");
     expect(payload.publicSessionSweeper).toBeDefined();
   });
 
@@ -577,12 +603,12 @@ describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/se
       idleNamespaceUuids: ["ns-uuid-A", "ns-uuid-B"],
     });
 
-    const payload = buildSessionsHealthPayload();
+    const payload = buildSessionsHealthPayload(true);
+    const sessions = payload.streamableHttpSessions as { count: number };
 
-    expect(Object.keys(payload.metaMcpPoolStatus).sort()).toEqual([
-      "active",
-      "idle",
-    ]);
+    expect(
+      Object.keys(payload.metaMcpPoolStatus as Record<string, unknown>).sort(),
+    ).toEqual(["active", "idle"]);
     const serialised = JSON.stringify(payload);
     for (const secret of [
       "activeSessionIds",
@@ -595,9 +621,193 @@ describe("buildSessionsHealthPayload — no session ids leaked (HIGH: /health/se
     // The counts a monitor alarms on survive, including the rollup that
     // reads `active` off the same status object.
     expect(payload.metaMcpPoolStatus).toEqual({ idle: 2, active: 3 });
-    expect(payload.totalActiveSessions).toBe(
-      payload.streamableHttpSessions.count + 3,
-    );
+    expect(payload.totalActiveSessions).toBe(sessions.count + 3);
+  });
+});
+
+/**
+ * The /health/sessions admin gate.
+ *
+ * The counts above are not secrets about a consumer — they are live intel
+ * about the GATEWAY: its current scale and load, plus the sweeper's TTL,
+ * sweep interval and reap counters, i.e. how long an abandoned session
+ * survives and how many are in flight. That is enough to size a
+ * resource-exhaustion attempt against the backend pool cap and time it
+ * between sweeps, and it was served to anyone who could reach the host. Same
+ * shape of fix as `/health/upstream` (`servers[]` + `pool`) and `GET
+ * /metamcp/` (the estate listing): withhold the detail, keep the 200.
+ */
+describe("buildSessionsHealthPayload — detail is admin-only", () => {
+  it("gives a non-admin caller status only — no counts, no pool, no sweeper", () => {
+    expect(buildSessionsHealthPayload(false)).toEqual({ status: "ok" });
+  });
+
+  it("does not even read the session manager, pool or sweeper for a non-admin", () => {
+    // Additive by construction: the detail is never BUILT, not built-then-
+    // redacted, so a field added to it later cannot leak by someone
+    // forgetting a delete-list. Mirrors the estate gate's "does not even
+    // query the database for an anonymous caller".
+    const getStats = vi.spyOn(publicSessionSweeper, "getStats");
+
+    buildSessionsHealthPayload(false);
+
+    expect(metaMcpServerPool.getPoolStatus).not.toHaveBeenCalled();
+    expect(getStats).not.toHaveBeenCalled();
+    getStats.mockRestore();
+  });
+
+  it("keeps the admin body on the same status base, detail on top", () => {
+    const payload = buildSessionsHealthPayload(true);
+
+    expect(payload.status).toBe("ok");
+    expect(Object.keys(payload).sort()).toEqual([
+      "metaMcpPoolStatus",
+      "publicSessionSweeper",
+      "status",
+      "streamableHttpSessions",
+      "timestamp",
+      "totalActiveSessions",
+    ]);
+  });
+});
+
+/**
+ * Route-level proof over a REAL socket, mirroring
+ * `public-metamcp.estate-gate.test.ts`. The unit tests above pin the builder;
+ * these pin the WIRING — that the handler consults the gate at all and passes
+ * its answer through. Reverting the handler to call the builder with a
+ * hard-coded `true` leaves every unit test above green and only these red.
+ */
+describe("GET /health/sessions — route consults the admin gate", () => {
+  /** `Response.json()` is typed `unknown`; every body here is an object. */
+  const readJson = async (
+    response: Response,
+  ): Promise<Record<string, unknown>> =>
+    (await response.json()) as Record<string, unknown>;
+
+  let server: Server;
+  let baseUrl = "";
+
+  beforeAll(async () => {
+    const app = express();
+    app.use("/metamcp", streamableHttpRouter);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (typeof address === "object" && address) {
+      baseUrl = `http://127.0.0.1:${address.port}`;
+    }
+  });
+
+  afterAll(async () => {
+    // Restore the file-wide default: `clearAllMocks` does not reset
+    // implementations, so the stub below would otherwise follow this block
+    // into any describe added after it.
+    vi.mocked(metaMcpServerPool.getPoolStatus).mockReturnValue({
+      idle: 0,
+      active: 0,
+      activeSessionIds: [],
+      idleNamespaceUuids: [],
+    });
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  beforeEach(() => {
+    // Runs after the file-level beforeEach's clearAllMocks.
+    h.isAdminHealthRequest.mockResolvedValue(false);
+    // Full pool shape, ids included: the anonymous body must contain neither
+    // the counts nor the ids, and the ADMIN body must carry the counts while
+    // still projecting the ids out.
+    vi.mocked(metaMcpServerPool.getPoolStatus).mockReturnValue({
+      idle: 7,
+      active: 11,
+      activeSessionIds: ["sess-route-live-1"],
+      idleNamespaceUuids: ["ns-uuid-route-A"],
+    });
+  });
+
+  it("gives an anonymous caller a bare 200 liveness body and nothing else", async () => {
+    const response = await fetch(`${baseUrl}/metamcp/health/sessions`);
+    const body = await readJson(response);
+
+    // 200, not 401: an external monitor on this path must keep working.
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ status: "ok" });
+    for (const withheld of [
+      "streamableHttpSessions",
+      "metaMcpPoolStatus",
+      "totalActiveSessions",
+      "publicSessionSweeper",
+      "timestamp",
+    ]) {
+      expect(body).not.toHaveProperty(withheld);
+    }
+  });
+
+  it("leaks no count, TTL or sweep interval to an anonymous caller", async () => {
+    const response = await fetch(`${baseUrl}/metamcp/health/sessions`);
+    const serialised = JSON.stringify(await readJson(response));
+
+    // The pool numbers stubbed above, and the sweeper's own knobs — the
+    // material that sizes and times a pool-exhaustion attempt — plus the
+    // session ids a prior fix took off this endpoint.
+    for (const secret of [
+      "11",
+      "ttlSeconds",
+      "intervalSeconds",
+      "inFlightSessions",
+      "trackedSessions",
+      "totalSweeps",
+      "sess-route-live-1",
+      "ns-uuid-route-A",
+    ]) {
+      expect(serialised).not.toContain(secret);
+    }
+  });
+
+  it("consults the gate on every request", async () => {
+    await fetch(`${baseUrl}/metamcp/health/sessions`);
+
+    expect(h.isAdminHealthRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives an admin the full operational detail", async () => {
+    h.isAdminHealthRequest.mockResolvedValue(true);
+
+    const response = await fetch(`${baseUrl}/metamcp/health/sessions`);
+    const body = await readJson(response);
+
+    const sessions = body.streamableHttpSessions as { count: number };
+
+    expect(response.status).toBe(200);
+    expect(body.status).toBe("ok");
+    expect(body.metaMcpPoolStatus).toEqual({ idle: 7, active: 11 });
+    // Count comes from the REAL session manager, which earlier describes in
+    // this file seed — assert the rollup relation, not a fixed number.
+    expect(typeof sessions.count).toBe("number");
+    expect(body.totalActiveSessions).toBe(sessions.count + 11);
+    expect(body.publicSessionSweeper).toHaveProperty("ttlSeconds");
+    expect(typeof body.timestamp).toBe("string");
+    // Admin-only is not a licence to re-publish the session ids the prior
+    // fix removed — they stay projected out of the detail half too.
+    const serialised = JSON.stringify(body);
+    for (const secret of ["sess-route-live-1", "ns-uuid-route-A"]) {
+      expect(serialised).not.toContain(secret);
+    }
+  });
+
+  it("still answers 200 with the withheld body if the gate itself throws", async () => {
+    // `isAdminHealthRequest` is contractually non-throwing, but express 4 does
+    // not catch an async handler's rejection — a regression there would hang
+    // the request and take the liveness probe down. Fail closed, keep the 200.
+    h.isAdminHealthRequest.mockRejectedValue(new Error("auth backend down"));
+
+    const response = await fetch(`${baseUrl}/metamcp/health/sessions`);
+    const body = await readJson(response);
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ status: "ok" });
   });
 });
 

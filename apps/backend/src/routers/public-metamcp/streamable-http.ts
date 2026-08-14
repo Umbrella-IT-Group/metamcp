@@ -12,6 +12,7 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
+import { isAdminHealthRequest } from "../../lib/health-upstream";
 import { runWithM365UserContext } from "../../lib/m365/request-context";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
@@ -709,46 +710,88 @@ export function stopMcpSessionPruner(): void {
 
 startMcpSessionPruner();
 
-// Health check endpoint to monitor sessions.
-//
-// This route is UNAUTHENTICATED. It deliberately publishes only aggregate
-// counts + sweeper stats — never the live session ids. An earlier version
-// returned `sessionIds: [...]`, i.e. every consumer's `Mcp-Session-Id`, to
-// any unauthenticated caller. Combined with the session-id-keyed transport
-// lookup on the MCP legs (now endpoint-bound — see `getBoundSession`), that
-// handed an attacker the exact ids needed to attempt a cross-endpoint
-// replay. Monitoring consumes `count` + the `publicSessionSweeper` block
-// (trackedSessions / reap counters); neither needs the ids. If per-session
-// detail is ever required, add a separately auth-gated admin view rather
-// than widening this public payload.
-//
-// The same rule binds `metaMcpPoolStatus`: `getPoolStatus()` returns
-// `activeSessionIds` + `idleNamespaceUuids` alongside the counts, and
-// spreading it whole re-published the very ids the `sessionIds` removal took
-// away, one level down. The counts are projected out field by field here so
-// a field added to MetaMcpServerPoolStatus later cannot land in this payload
-// by default. Admins still get the detail half via `/health/upstream`, which
-// is role-gated; `getPoolStatus` itself is deliberately left intact.
-export function buildSessionsHealthPayload() {
+/**
+ * Assemble the `GET /health/sessions` body. Pass `false` for `isAdmin` to
+ * withhold the operational half.
+ *
+ * The route stays UNAUTHENTICATED and must — external monitors probe it and a
+ * 401 would break them — so what it PUBLISHES is split by role instead. Every
+ * caller gets `status: "ok"`, which is all a liveness probe consumes; the
+ * detail is admin-only.
+ *
+ * That detail is live operational intel about this gateway. The session count
+ * and the pool's idle/active split are its current scale and load; the
+ * `publicSessionSweeper` block publishes the reap TTL, the sweep interval and
+ * the running reap counters — i.e. precisely how long an abandoned session
+ * survives, how often the gateway looks, and how many it is carrying right
+ * now. Together those size a resource-exhaustion attempt against the backend
+ * pool cap (the failure mode of the 2026-07-14 METAMCP-POOL-1 incident) and
+ * time it to land between sweeps. Served to anyone who could reach the host,
+ * it was reconnaissance.
+ *
+ * Built additively rather than by deleting keys from a full body, matching
+ * `buildUpstreamHealthBody` in ../../lib/health-upstream: a field added to
+ * the block below cannot leak by someone forgetting to add it to a redaction
+ * list. The early return also means an anonymous request never reads the
+ * session manager, the pool or the sweeper at all.
+ *
+ * The admin half still never carries live session ids. An earlier version
+ * returned `sessionIds: [...]` — every consumer's `Mcp-Session-Id` — and,
+ * after that removal, re-published the same ids one level down by spreading
+ * `getPoolStatus()` whole (it returns `activeSessionIds` +
+ * `idleNamespaceUuids` alongside the counts). Both are projected out field by
+ * field here so a field added to MetaMcpServerPoolStatus later cannot land in
+ * this payload by default; `getPoolStatus` itself is deliberately left
+ * intact.
+ */
+export function buildSessionsHealthPayload(
+  isAdmin: boolean,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    status: "ok",
+  };
+
+  if (!isAdmin) {
+    return body;
+  }
+
   const sessionCount = sessionManager.getSessionCount();
   const poolStatus = metaMcpServerPool.getPoolStatus();
 
-  return {
-    timestamp: new Date().toISOString(),
-    streamableHttpSessions: {
-      count: sessionCount,
-    },
-    metaMcpPoolStatus: {
-      idle: poolStatus.idle,
-      active: poolStatus.active,
-    },
-    totalActiveSessions: sessionCount + poolStatus.active,
-    publicSessionSweeper: publicSessionSweeper.getStats(),
+  body.timestamp = new Date().toISOString();
+  body.streamableHttpSessions = {
+    count: sessionCount,
   };
+  body.metaMcpPoolStatus = {
+    idle: poolStatus.idle,
+    active: poolStatus.active,
+  };
+  body.totalActiveSessions = sessionCount + poolStatus.active;
+  body.publicSessionSweeper = publicSessionSweeper.getStats();
+
+  return body;
 }
 
-streamableHttpRouter.get("/health/sessions", (req, res) => {
-  res.json(buildSessionsHealthPayload());
+streamableHttpRouter.get("/health/sessions", async (req, res) => {
+  // Gated with the same soft admin check as /health/upstream and GET
+  // /metamcp/: it resolves the better-auth session and fails to "not an
+  // admin" on every error path, so it can never 401 or throw on this
+  // unauthenticated route.
+  //
+  // The catch enforces that same invariant one level out. `isAdminHealthRequest`
+  // is contractually non-throwing, but express 4 does not catch an async
+  // handler's rejection — if the gate ever regressed to throwing, the request
+  // would hang with no response at all and take every liveness probe down
+  // with it. Falling back to `false` keeps the 200 and keeps the failure
+  // direction safe: a broken auth check withholds detail, it never exposes it.
+  let isAdmin = false;
+  try {
+    isAdmin = await isAdminHealthRequest(req);
+  } catch (error) {
+    logger.error("Admin check failed for /health/sessions:", error);
+  }
+
+  res.json(buildSessionsHealthPayload(isAdmin));
 });
 
 streamableHttpRouter.get(
