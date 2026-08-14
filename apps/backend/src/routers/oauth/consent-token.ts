@@ -1,0 +1,185 @@
+import crypto from "crypto";
+
+/**
+ * Signed authorization-request ("areq") tokens for the OAuth consent screen.
+ *
+ * The consent screen splits what used to be one request into three: the browser
+ * asks `/oauth/authorize` for authorization, a human approves on a page, and
+ * `/oauth/authorize/decision` mints the code. The authorization parameters have
+ * to survive that round trip through the user's browser, and the previous
+ * version of this flow carried them as a plain base64 blob — which meant a
+ * caller could edit client_id, redirect_uri or the PKCE challenge in flight and
+ * hand the edited blob back. Everything the decision endpoint trusts therefore
+ * travels HMAC-signed and short-lived, and is re-validated against the client
+ * record on the way out anyway.
+ *
+ * The `csrf` nonce in the payload is the server's half of a double-submit pair:
+ * the same value is written to an httpOnly cookie when the token is issued, so
+ * approving requires possession of BOTH the token (in the URL of a page only
+ * the signed-in user was redirected to) and the cookie (which SameSite=Lax
+ * keeps off cross-site POSTs, and which httpOnly keeps out of reach of script).
+ */
+
+export interface ConsentRequestPayload {
+  client_id: string;
+  redirect_uri: string;
+  /** Server-decided grant, carried for display only — see GRANTED_OAUTH_SCOPE. */
+  scope: string;
+  state?: string;
+  code_challenge?: string;
+  code_challenge_method?: string;
+  /** The signed-in user the consent request belongs to. */
+  user_id: string;
+  /** Double-submit nonce; must equal the oauth_consent_csrf cookie. */
+  csrf: string;
+  /** Absolute expiry, epoch milliseconds. */
+  exp: number;
+}
+
+/**
+ * Domain separation. BETTER_AUTH_SECRET also keys better-auth's own signatures,
+ * so the signed material is prefixed with a constant no other consumer uses:
+ * an areq token can never be presented as some other artifact derived from the
+ * same key, nor the reverse. Bump the suffix if the payload shape ever changes
+ * in a way older tokens must not satisfy.
+ */
+const SIGNING_CONTEXT = "metamcp.oauth.consent.v1";
+
+/** Name of the double-submit cookie written alongside every areq token. */
+export const CONSENT_CSRF_COOKIE = "oauth_consent_csrf";
+
+/**
+ * How long a pending consent request stays valid. Matches the authorization
+ * code lifetime used elsewhere in this router — long enough for a human to
+ * read the page, short enough that an abandoned tab stops being usable.
+ */
+export const CONSENT_REQUEST_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Read at call time rather than module load so a process that somehow starts
+ * without the secret fails on the request instead of importing a module that
+ * silently signs with `undefined`. `auth.ts` already hard-fails at boot without
+ * it, so in a running server this never throws.
+ */
+function signingKey(): string {
+  const secret = process.env.BETTER_AUTH_SECRET;
+  if (!secret) {
+    throw new Error(
+      "BETTER_AUTH_SECRET environment variable is required to sign OAuth consent requests",
+    );
+  }
+  return secret;
+}
+
+function computeMac(encodedPayload: string): string {
+  return crypto
+    .createHmac("sha256", signingKey())
+    .update(`${SIGNING_CONTEXT}.${encodedPayload}`)
+    .digest("hex");
+}
+
+/** `base64url(payload) + "." + hex(HMAC-SHA256(payload))`. */
+export function signConsentRequest(payload: ConsentRequestPayload): string {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `${encoded}.${computeMac(encoded)}`;
+}
+
+/**
+ * Returns the payload only for a token this server signed that has not expired.
+ * Every other input — wrong signature, truncated, re-encoded, malformed JSON,
+ * missing a required field, past its exp — returns null, so callers can treat
+ * null as "no authorization request" without classifying the failure.
+ */
+export function verifyConsentRequest(
+  token: unknown,
+  now: number = Date.now(),
+): ConsentRequestPayload | null {
+  if (typeof token !== "string") return null;
+
+  const separator = token.indexOf(".");
+  if (separator <= 0) return null;
+
+  const encoded = token.slice(0, separator);
+  const provided = token.slice(separator + 1);
+
+  let expected: string;
+  try {
+    expected = computeMac(encoded);
+  } catch {
+    return null;
+  }
+
+  // timingSafeEqual throws on a length mismatch, so length is compared first.
+  // The length of a hex SHA-256 is a public constant; nothing leaks here.
+  if (provided.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
+    return null;
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, "base64url").toString());
+  } catch {
+    return null;
+  }
+
+  if (!payload || typeof payload !== "object") return null;
+  const candidate = payload as Partial<ConsentRequestPayload>;
+
+  if (
+    typeof candidate.client_id !== "string" ||
+    typeof candidate.redirect_uri !== "string" ||
+    typeof candidate.scope !== "string" ||
+    typeof candidate.user_id !== "string" ||
+    typeof candidate.csrf !== "string" ||
+    typeof candidate.exp !== "number"
+  ) {
+    return null;
+  }
+
+  if (now >= candidate.exp) return null;
+
+  return candidate as ConsentRequestPayload;
+}
+
+/** Constant-time string comparison that tolerates undefined/mismatched input. */
+export function safeEquals(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Read one cookie out of a raw `Cookie` header.
+ *
+ * This codebase has no `cookie-parser` middleware, so `req.cookies` does not
+ * exist; adding the dependency for a single read is not worth it. Setting and
+ * clearing still go through `res.cookie` / `res.clearCookie`, which are express
+ * core.
+ */
+export function readCookie(
+  header: string | undefined,
+  name: string,
+): string | undefined {
+  if (!header) return undefined;
+
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+
+    const raw = part.slice(separator + 1).trim();
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      // A value that is not valid percent-encoding still has to compare
+      // exactly against what we issued, so return it unchanged rather than
+      // throwing out of a request handler.
+      return raw;
+    }
+  }
+
+  return undefined;
+}

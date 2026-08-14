@@ -1,9 +1,18 @@
+import { randomBytes } from "crypto";
 import express from "express";
 
 import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
 import { oauthRepository } from "../../db/repositories";
+import {
+  CONSENT_CSRF_COOKIE,
+  CONSENT_REQUEST_TTL_MS,
+  readCookie,
+  safeEquals,
+  signConsentRequest,
+  verifyConsentRequest,
+} from "./consent-token";
 import {
   generateSecureAuthCode,
   getBaseUrl,
@@ -14,6 +23,82 @@ import {
 } from "./utils";
 
 const authorizationRouter = express.Router();
+
+/**
+ * Frontend path of the consent screen.
+ *
+ * Deliberately NOT `/oauth/consent`: `apps/frontend/next.config.js` rewrites
+ * `/oauth/:path*` to this backend, so any frontend page under `/oauth/` is
+ * shadowed by the proxy and never renders. The frontend middleware likewise
+ * skips i18n and its auth gate for anything starting with `/oauth`. A path
+ * outside that prefix gets the normal locale redirect and session check.
+ */
+const CONSENT_PAGE_PATH = "/consent";
+
+/** Authorization codes live 10 minutes, matching the consent request TTL. */
+const AUTH_CODE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Longest client_name echoed to the consent screen. `client_name` is
+ * attacker-controlled — `/oauth/register` is anonymous dynamic registration —
+ * so it is clamped for the same reason token.ts clamps it in log lines: a
+ * caller does not get to decide how much of someone else's screen it occupies.
+ */
+const MAX_DISPLAYED_CLIENT_NAME = 100;
+
+/**
+ * Resolve the better-auth session user for a request, or null.
+ *
+ * Every consent-flow endpoint re-resolves the session itself rather than
+ * trusting anything carried in the request: the whole point of the fix is that
+ * a code is bound to the human who is signed in at the moment of approval.
+ */
+async function resolveSessionUserId(
+  req: express.Request,
+): Promise<string | null> {
+  if (!req.headers.cookie) return null;
+
+  try {
+    const sessionUrl = new URL("/api/auth/get-session", getBaseUrl(req));
+    const headers = new Headers();
+    headers.set("cookie", req.headers.cookie);
+
+    const sessionResponse = await auth.handler(
+      new Request(sessionUrl.toString(), { method: "GET", headers }),
+    );
+
+    if (!sessionResponse.ok) return null;
+
+    const sessionData = (await sessionResponse.json()) as {
+      user?: { id: string };
+    };
+
+    return sessionData?.user?.id ?? null;
+  } catch (error) {
+    logger.info("OAuth session verification failed:", error);
+    return null;
+  }
+}
+
+/**
+ * `Secure` is derived from the resolved base URL rather than hardcoded: APP_URL
+ * is mandatory (auth.ts hard-fails without it) and server-controlled, so this
+ * is `true` on the real deployment and `false` only for a plain-http local
+ * stack — where a hardcoded `Secure` would make the browser drop the cookie and
+ * every consent silently fail the CSRF check.
+ */
+function consentCookieOptions(req: express.Request) {
+  return {
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: getBaseUrl(req).startsWith("https://"),
+    path: "/",
+  };
+}
+
+function clearConsentCookie(req: express.Request, res: express.Response) {
+  res.clearCookie(CONSENT_CSRF_COOKIE, consentCookieOptions(req));
+}
 
 /**
  * OAuth 2.0 Authorization Endpoint
@@ -127,70 +212,58 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     );
 
     const baseUrl = getBaseUrl(req);
+    const userId = await resolveSessionUserId(req);
 
-    // Check if user is already authenticated by verifying better-auth session
-    if (req.headers.cookie) {
-      try {
-        // Verify the session using better-auth
-        const sessionUrl = new URL("/api/auth/get-session", baseUrl);
-        const headers = new Headers();
-        headers.set("cookie", req.headers.cookie);
-
-        const sessionRequest = new Request(sessionUrl.toString(), {
-          method: "GET",
-          headers,
-        });
-
-        const sessionResponse = await auth.handler(sessionRequest);
-
-        if (sessionResponse.ok) {
-          const sessionData = (await sessionResponse.json()) as {
-            user?: { id: string };
-          };
-
-          if (sessionData?.user?.id) {
-            // User is already authenticated, generate authorization code directly
-            const code = generateSecureAuthCode();
-
-            // Store authorization code with associated data
-            await oauthRepository.setAuthCode(code, {
-              client_id: oauthParams.client_id,
-              redirect_uri: oauthParams.redirect_uri,
-              scope: GRANTED_OAUTH_SCOPE,
-              user_id: sessionData.user.id,
-              code_challenge: oauthParams.code_challenge || null,
-              code_challenge_method: oauthParams.code_challenge_method || null,
-              expires_at: Date.now() + 10 * 60 * 1000, // 10 minutes
-            });
-
-            // Redirect back to the MCP client with authorization code
-            const redirectUrl = new URL(oauthParams.redirect_uri);
-            redirectUrl.searchParams.set("code", code);
-            if (oauthParams.state) {
-              redirectUrl.searchParams.set("state", oauthParams.state);
-            }
-
-            return res.redirect(redirectUrl.toString());
-          }
-        }
-      } catch (error) {
-        logger.info("Session verification failed, proceeding to login:", error);
-        // Continue to login flow if session verification fails
-      }
+    if (!userId) {
+      // Not signed in: log in, then RE-ENTER this same authorize request.
+      //
+      // This used to hand the browser a base64 blob of the OAuth parameters
+      // and send it to /oauth/callback, which minted a code from that blob —
+      // unsigned data that had round-tripped through the client. Returning to
+      // /oauth/authorize keeps every parameter under the validation above and
+      // leaves exactly one place in this server that mints codes.
+      const loginUrl = new URL("/login", baseUrl);
+      loginUrl.searchParams.set("callbackUrl", req.originalUrl);
+      return res.redirect(loginUrl.toString());
     }
 
-    // User is not authenticated, redirect to login page
-    const authUrl = new URL("/login", baseUrl);
-    const encodedParams = Buffer.from(JSON.stringify(oauthParams)).toString(
-      "base64url",
-    );
-    authUrl.searchParams.set(
-      "callbackUrl",
-      `/oauth/callback?params=${encodedParams}`,
+    // Signed in — and this is the fix. Being signed in is NOT consent.
+    //
+    // Previously this branch minted an authorization code on the spot for any
+    // registered client. Registration is anonymous, so one top-level
+    // navigation to a crafted /oauth/authorize URL was enough to mint a code
+    // bound to whoever happened to be signed in, delivered straight to the
+    // attacker's redirect_uri. The session cookie is SameSite=Lax, so the
+    // browser sends it on exactly that navigation.
+    //
+    // No code is minted here any more. The request is signed, tied to this
+    // user with a fresh CSRF nonce, and handed to a page a human has to act
+    // on; POST /oauth/authorize/decision is the only place a code appears.
+    const csrf = randomBytes(32).toString("base64url");
+    const areq = signConsentRequest({
+      client_id: oauthParams.client_id,
+      redirect_uri: oauthParams.redirect_uri,
+      scope: GRANTED_OAUTH_SCOPE,
+      state: oauthParams.state,
+      code_challenge: oauthParams.code_challenge,
+      code_challenge_method: oauthParams.code_challenge_method,
+      user_id: userId,
+      csrf,
+      exp: Date.now() + CONSENT_REQUEST_TTL_MS,
+    });
+
+    res.cookie(CONSENT_CSRF_COOKIE, csrf, {
+      ...consentCookieOptions(req),
+      maxAge: CONSENT_REQUEST_TTL_MS,
+    });
+
+    logger.info(
+      `[oauth] consent requested client=${oauthParams.client_id} user=${userId}`,
     );
 
-    // Redirect to frontend login page
-    res.redirect(authUrl.toString());
+    const consentUrl = new URL(CONSENT_PAGE_PATH, baseUrl);
+    consentUrl.searchParams.set("areq", areq);
+    res.redirect(consentUrl.toString());
   } catch (error) {
     logger.error("Error in OAuth authorize endpoint:", error);
     res.status(500).json({
@@ -201,53 +274,243 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
 });
 
 /**
+ * Consent screen data source.
+ *
+ * Returns the few fields the consent page shows, and only to the signed-in user
+ * the request belongs to. It deliberately does NOT echo the token's internals —
+ * above all the csrf nonce, whose whole value is that nothing readable by
+ * script ever carries it.
+ */
+authorizationRouter.get("/oauth/consent/info", async (req, res) => {
+  try {
+    const consentRequest = verifyConsentRequest(req.query.areq);
+
+    if (!consentRequest) {
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description:
+          "Authorization request is missing, invalid, or expired",
+      });
+    }
+
+    const userId = await resolveSessionUserId(req);
+
+    if (!userId || !safeEquals(userId, consentRequest.user_id)) {
+      return res.status(403).json({
+        error: "access_denied",
+        error_description:
+          "This authorization request belongs to a different session",
+      });
+    }
+
+    const clientData = await oauthRepository.getClient(
+      consentRequest.client_id,
+    );
+
+    if (!clientData) {
+      return res.status(400).json({
+        error: "invalid_client",
+        error_description: "Client is no longer registered",
+      });
+    }
+
+    res.json({
+      client_id: consentRequest.client_id,
+      client_name: (clientData.client_name || consentRequest.client_id).slice(
+        0,
+        MAX_DISPLAYED_CLIENT_NAME,
+      ),
+      // Host only: it is the part of the redirect target a human can actually
+      // judge, and the part that decides where the code ends up.
+      redirect_uri_host: new URL(consentRequest.redirect_uri).host,
+      scope: consentRequest.scope,
+    });
+  } catch (error) {
+    logger.error("Error in OAuth consent info endpoint:", error);
+    res.status(500).json({
+      error: "server_error",
+      error_description: "Internal server error",
+    });
+  }
+});
+
+/**
+ * OAuth 2.0 Consent Decision Endpoint — the ONLY place this server mints an
+ * authorization code.
+ *
+ * Four things must all hold before a code exists, and each closes a distinct
+ * door:
+ *   1. the areq token verifies and has not expired — the parameters are the
+ *      ones /oauth/authorize validated, not ones edited in flight;
+ *   2. the current session is the same user the token was issued to — one
+ *      user cannot finish another's authorization;
+ *   3. the oauth_consent_csrf cookie equals the nonce inside the token — the
+ *      approval came from the browser this request was issued to, on a
+ *      same-site POST, which is what a cross-site attacker cannot produce;
+ *   4. the redirect_uri is still registered for the client — the client
+ *      record may have changed since the token was signed.
+ */
+authorizationRouter.post(
+  "/oauth/authorize/decision",
+  rateLimitAuth,
+  async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const consentRequest = verifyConsentRequest(body.areq);
+
+      if (!consentRequest) {
+        return res.status(400).json({
+          error: "invalid_request",
+          error_description:
+            "Authorization request is missing, invalid, or expired. Please start the connection again from your application.",
+        });
+      }
+
+      const userId = await resolveSessionUserId(req);
+
+      if (!userId || !safeEquals(userId, consentRequest.user_id)) {
+        return res.status(403).json({
+          error: "access_denied",
+          error_description:
+            "This authorization request belongs to a different session",
+        });
+      }
+
+      // Double submit. The cookie is httpOnly and SameSite=Lax, so a
+      // cross-site page can neither read the nonce nor get the browser to
+      // attach the cookie to its own POST.
+      //
+      // Nothing is cleared on this branch on purpose: clearing the cookie for
+      // a request that failed verification would let anyone cancel a victim's
+      // pending consent by replaying a bad decision.
+      const cookieCsrf = readCookie(req.headers.cookie, CONSENT_CSRF_COOKIE);
+
+      if (!safeEquals(cookieCsrf, consentRequest.csrf)) {
+        logger.warn(
+          `[oauth] consent rejected reason=csrf client=${consentRequest.client_id} user=${userId}`,
+        );
+        return res.status(403).json({
+          error: "access_denied",
+          error_description:
+            "Consent could not be verified. Please start the connection again from your application.",
+        });
+      }
+
+      const clientData = await oauthRepository.getClient(
+        consentRequest.client_id,
+      );
+
+      if (
+        !clientData ||
+        !clientData.redirect_uris.includes(consentRequest.redirect_uri)
+      ) {
+        clearConsentCookie(req, res);
+        return res.status(400).json({
+          error: "invalid_request",
+          error_description: "redirect_uri is not registered for this client",
+        });
+      }
+
+      clearConsentCookie(req, res);
+
+      const redirectUrl = new URL(consentRequest.redirect_uri);
+      if (consentRequest.state) {
+        redirectUrl.searchParams.set("state", consentRequest.state);
+      }
+
+      // Default deny: only the exact string "approve" grants. Anything else —
+      // a missing field, a truncated body, a decision this server does not
+      // recognise — is refused.
+      if (body.decision !== "approve") {
+        redirectUrl.searchParams.set("error", "access_denied");
+        logger.info(
+          `[oauth] consent denied client=${consentRequest.client_id} user=${userId}`,
+        );
+        return res.redirect(redirectUrl.toString());
+      }
+
+      const code = generateSecureAuthCode();
+
+      await oauthRepository.setAuthCode(code, {
+        client_id: consentRequest.client_id,
+        redirect_uri: consentRequest.redirect_uri,
+        scope: GRANTED_OAUTH_SCOPE,
+        user_id: userId,
+        code_challenge: consentRequest.code_challenge || null,
+        code_challenge_method: consentRequest.code_challenge_method || null,
+        expires_at: Date.now() + AUTH_CODE_TTL_MS,
+      });
+
+      redirectUrl.searchParams.set("code", code);
+
+      logger.info(
+        `[oauth] consent granted client=${consentRequest.client_id} user=${userId}`,
+      );
+
+      res.redirect(redirectUrl.toString());
+    } catch (error) {
+      logger.error("Error in OAuth consent decision endpoint:", error);
+      res.status(500).json({
+        error: "server_error",
+        error_description: "Internal server error",
+      });
+    }
+  },
+);
+
+/**
  * OAuth 2.0 Callback Handler
- * Handles the callback from frontend login and redirects back to the OAuth client
- * Verifies user authentication before issuing authorization code
+ *
+ * Looks up an authorization code that already exists and forwards it. It does
+ * NOT mint. The branch that used to live here decoded an unsigned base64
+ * `params` blob — which had round-tripped through the client's browser — and
+ * minted a code from whatever it contained; that was the second way to get a
+ * code without consent. Minting now happens only in
+ * POST /oauth/authorize/decision, and the post-login return path goes back to
+ * /oauth/authorize instead of here.
  */
 authorizationRouter.get("/oauth/callback", async (req, res) => {
   try {
-    let oauthParams: OAuthParams;
+    if (req.query.params) {
+      // A client still holding a pre-consent-screen URL. Retrying from the
+      // client re-enters /oauth/authorize and completes normally.
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description:
+          "This authorization flow is no longer supported. Please start the connection again from your application.",
+      });
+    }
 
-    // Check if we have encoded params (from our internal redirect flow)
-    const { params } = req.query;
+    // Handle direct callback with individual query parameters
+    // This is likely from an external OAuth flow or direct URL access
+    const { code, state } = req.query;
 
-    if (params) {
-      // Decode OAuth parameters from our internal flow
-      oauthParams = JSON.parse(
-        Buffer.from(params as string, "base64url").toString(),
-      );
-    } else {
-      // Handle direct callback with individual query parameters
-      // This is likely from an external OAuth flow or direct URL access
-      const { code, state } = req.query;
+    if (!code) {
+      return res.status(400).send("Missing authorization code");
+    }
 
-      if (!code) {
-        return res.status(400).send("Missing authorization code");
+    // If we receive a code directly, look up the code data to get the original parameters
+    const codeData = await oauthRepository.getAuthCode(code as string);
+    if (codeData) {
+      // Check if code has expired
+      if (Date.now() > codeData.expires_at.getTime()) {
+        await oauthRepository.deleteAuthCode(code as string);
+        return res.status(400).send("Authorization code has expired");
       }
 
-      // If we receive a code directly, look up the code data to get the original parameters
-      const codeData = await oauthRepository.getAuthCode(code as string);
-      if (codeData) {
-        // Check if code has expired
-        if (Date.now() > codeData.expires_at.getTime()) {
-          await oauthRepository.deleteAuthCode(code as string);
-          return res.status(400).send("Authorization code has expired");
-        }
+      // Check if the redirect_uri points back to our own callback endpoint
+      // This would create an infinite loop, so we need to handle it differently
+      const baseUrl = getBaseUrl(req);
+      const ourCallbackUrl = `${baseUrl}/oauth/callback`;
 
-        // Check if the redirect_uri points back to our own callback endpoint
-        // This would create an infinite loop, so we need to handle it differently
-        const baseUrl = getBaseUrl(req);
-        const ourCallbackUrl = `${baseUrl}/oauth/callback`;
+      if (
+        codeData.redirect_uri === ourCallbackUrl ||
+        codeData.redirect_uri.includes("/oauth/callback")
+      ) {
+        // This is likely a development/testing scenario where the client redirect_uri
+        // points back to our callback. Instead of redirecting, show a success page.
 
-        if (
-          codeData.redirect_uri === ourCallbackUrl ||
-          codeData.redirect_uri.includes("/oauth/callback")
-        ) {
-          // This is likely a development/testing scenario where the client redirect_uri
-          // points back to our callback. Instead of redirecting, show a success page.
-
-          return res.send(`
+        return res.send(`
             <html>
               <head><title>OAuth Authorization Successful</title></head>
               <body>
@@ -268,92 +531,22 @@ Content-Type: application/json
                 </pre>
               </body>
             </html>
-          `);
-        }
-
-        // Code exists and is valid, redirect back to the original redirect_uri
-        const redirectUrl = new URL(codeData.redirect_uri);
-        redirectUrl.searchParams.set("code", code as string);
-        if (state) {
-          redirectUrl.searchParams.set("state", state as string);
-        }
-        return res.redirect(redirectUrl.toString());
-      } else {
-        return res.status(400).json({
-          error: "invalid_request",
-          error_description: "Invalid authorization parameters",
-        });
+        `);
       }
+
+      // Code exists and is valid, redirect back to the original redirect_uri
+      const redirectUrl = new URL(codeData.redirect_uri);
+      redirectUrl.searchParams.set("code", code as string);
+      if (state) {
+        redirectUrl.searchParams.set("state", state as string);
+      }
+      return res.redirect(redirectUrl.toString());
+    } else {
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description: "Invalid authorization parameters",
+      });
     }
-
-    const { client_id, redirect_uri, state } = oauthParams;
-
-    // Verify user authentication by checking session cookies
-    if (!req.headers.cookie) {
-      // Redirect back to login if no authentication
-      const baseUrl = getBaseUrl(req);
-      const loginUrl = new URL("/login", baseUrl);
-      loginUrl.searchParams.set("callbackUrl", req.originalUrl);
-      return res.redirect(loginUrl.toString());
-    }
-
-    // Verify the session using better-auth
-    const sessionUrl = new URL("/api/auth/get-session", getBaseUrl(req));
-    const headers = new Headers();
-    headers.set("cookie", req.headers.cookie);
-
-    const sessionRequest = new Request(sessionUrl.toString(), {
-      method: "GET",
-      headers,
-    });
-
-    const sessionResponse = await auth.handler(sessionRequest);
-
-    if (!sessionResponse.ok) {
-      // Redirect back to login if session invalid
-      const baseUrl = getBaseUrl(req);
-      const loginUrl = new URL("/login", baseUrl);
-      loginUrl.searchParams.set("callbackUrl", req.originalUrl);
-      return res.redirect(loginUrl.toString());
-    }
-
-    const sessionData = (await sessionResponse.json()) as {
-      user?: { id: string };
-    };
-
-    if (!sessionData?.user?.id) {
-      // Redirect back to login if no user
-      const baseUrl = getBaseUrl(req);
-      const loginUrl = new URL("/login", baseUrl);
-      loginUrl.searchParams.set("callbackUrl", req.originalUrl);
-      return res.redirect(loginUrl.toString());
-    }
-
-    // User is authenticated, generate authorization code
-    const code = generateSecureAuthCode();
-
-    // Store authorization code with associated data
-    // Server-decided scope. This path matters most: `oauthParams` here can be
-    // decoded from the `params` query blob, which round-trips through the
-    // client unsigned, so any scope it carries is caller-controlled input.
-    await oauthRepository.setAuthCode(code, {
-      client_id,
-      redirect_uri,
-      scope: GRANTED_OAUTH_SCOPE,
-      user_id: sessionData.user.id,
-      code_challenge: oauthParams.code_challenge || null,
-      code_challenge_method: oauthParams.code_challenge_method || null,
-      expires_at: Date.now() + 10 * 60 * 1000, // 10 minutes
-    });
-
-    // Redirect back to the MCP client with authorization code
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set("code", code);
-    if (state) {
-      redirectUrl.searchParams.set("state", state);
-    }
-
-    res.redirect(redirectUrl.toString());
   } catch (error) {
     logger.error("Error in OAuth callback:", error);
     res.status(500).send("OAuth callback error");

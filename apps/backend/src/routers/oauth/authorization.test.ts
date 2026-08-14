@@ -1,0 +1,792 @@
+/**
+ * Tests for the OAuth consent screen.
+ *
+ * What is being pinned is a negative: this authorization server must not mint
+ * an authorization code because someone is merely signed in. It used to. Client
+ * registration is anonymous, so an attacker could register a client pointing at
+ * their own redirect_uri and phish a signed-in administrator into one top-level
+ * navigation to /oauth/authorize; the session cookie is SameSite=Lax, so the
+ * browser attached it, and a code bound to that administrator was handed to the
+ * attacker's URL. /oauth/callback offered the same thing a second way, minting
+ * from an unsigned base64 `params` blob that had round-tripped through the
+ * client.
+ *
+ * So the assertions that matter most are the ones that check setAuthCode was
+ * NOT called. Every guard on the decision endpoint gets one: a wrong or absent
+ * CSRF cookie, a session belonging to someone else, an expired token, a forged
+ * signature, a payload edited in flight, a redirect_uri that has since been
+ * deregistered, and a decision that is not an explicit approval.
+ *
+ * The handlers are module-private, so the router is driven directly as express
+ * middleware against fake req/res objects — no supertest dependency, and no DB
+ * or auth stack: `../../db/repositories` and `../../auth` are both mocked,
+ * which also keeps `db/index.ts` and better-auth's pg pool (each of which
+ * throws without its environment) out of the import graph entirely.
+ */
+
+import express from "express";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// Type-only, so it is erased at compile time and does not pull the module in
+// before the environment below is set.
+import type { ConsentRequestPayload } from "./consent-token";
+
+const loggerMock = {
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+};
+
+vi.mock("@/utils/logger", () => ({ default: loggerMock }));
+
+const oauthRepositoryMock = {
+  getClient: vi.fn(),
+  setAuthCode: vi.fn(),
+  getAuthCode: vi.fn(),
+  deleteAuthCode: vi.fn(),
+};
+
+vi.mock("../../db/repositories", () => ({
+  oauthRepository: oauthRepositoryMock,
+}));
+
+// auth.handler is the session oracle for every endpoint under test, so mocking
+// it is both what keeps better-auth out of the import graph and the lever that
+// simulates a valid / absent / different-user session.
+const authMock = { handler: vi.fn() };
+
+vi.mock("../../auth", () => ({ auth: authMock }));
+
+// Set before the router is imported: getBaseUrl prefers APP_URL, and the areq
+// signer needs a key. Both are mandatory in a real process.
+process.env.APP_URL = "https://mcp.example.test";
+process.env.BETTER_AUTH_SECRET = "test-secret-for-consent-request-signing";
+
+const { default: authorizationRouter } = await import("./authorization");
+const { CONSENT_CSRF_COOKIE, signConsentRequest, verifyConsentRequest } =
+  await import("./consent-token");
+
+const APP_URL = "https://mcp.example.test";
+const CLIENT_ID = "mcp_client_test";
+const CLIENT_NAME = "Claude";
+const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
+const USER_ID = "user-abc123";
+const OTHER_USER_ID = "user-attacker999";
+const STATE = "opaque-client-state";
+const CODE_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+const SESSION_COOKIE = "better-auth.session_token=session-value";
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+interface CookieWrite {
+  name: string;
+  value: string;
+  options: Record<string, unknown>;
+}
+
+interface FakeRes {
+  statusCode: number;
+  body: Record<string, unknown> | undefined;
+  redirectedTo: string | undefined;
+  sentBody: string | undefined;
+  cookies: CookieWrite[];
+  clearedCookies: CookieWrite[];
+  settled: Promise<void>;
+  status(code: number): FakeRes;
+  json(payload: Record<string, unknown>): FakeRes;
+  send(payload?: string): FakeRes;
+  redirect(url: string): FakeRes;
+  cookie(
+    name: string,
+    value: string,
+    options: Record<string, unknown>,
+  ): FakeRes;
+  clearCookie(name: string, options: Record<string, unknown>): FakeRes;
+}
+
+// Unique per request so the authorization endpoint's in-memory rate limiter
+// (20 per IP per minute, shared process-wide because it lives at module scope
+// in utils.ts) can never make one test's traffic fail another's.
+let ipCounter = 0;
+
+function makeReq(init: {
+  method: string;
+  path: string;
+  query?: Record<string, string>;
+  body?: Record<string, unknown>;
+  cookie?: string;
+}): express.Request {
+  ipCounter += 1;
+  const search = new URLSearchParams(init.query ?? {}).toString();
+  const url = search ? `${init.path}?${search}` : init.path;
+
+  return {
+    method: init.method,
+    url,
+    originalUrl: url,
+    baseUrl: "",
+    path: init.path,
+    // Express populates req.query from the app, not the router, so the router
+    // under test is handed the parsed object directly.
+    query: init.query ?? {},
+    body: init.body,
+    headers: init.cookie ? { cookie: init.cookie } : {},
+    ip: `10.1.0.${ipCounter}`,
+    socket: { remoteAddress: `10.1.0.${ipCounter}` },
+  } as unknown as express.Request;
+}
+
+function makeRes(): FakeRes {
+  let settle: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+
+  const res: FakeRes = {
+    statusCode: 200,
+    body: undefined,
+    redirectedTo: undefined,
+    sentBody: undefined,
+    cookies: [],
+    clearedCookies: [],
+    settled,
+    status(code) {
+      res.statusCode = code;
+      return res;
+    },
+    json(payload) {
+      res.body = payload;
+      settle();
+      return res;
+    },
+    send(payload) {
+      res.sentBody = payload;
+      settle();
+      return res;
+    },
+    redirect(url) {
+      res.redirectedTo = url;
+      settle();
+      return res;
+    },
+    cookie(name, value, options) {
+      res.cookies.push({ name, value, options });
+      return res;
+    },
+    clearCookie(name, options) {
+      res.clearedCookies.push({ name, value: "", options });
+      return res;
+    },
+  };
+
+  return res;
+}
+
+async function dispatch(init: Parameters<typeof makeReq>[0]): Promise<FakeRes> {
+  const req = makeReq(init);
+  const res = makeRes();
+
+  await new Promise<void>((resolve, reject) => {
+    (authorizationRouter as unknown as express.RequestHandler)(
+      req,
+      res as unknown as express.Response,
+      (err?: unknown) => (err ? reject(err) : resolve()),
+    );
+    res.settled.then(resolve);
+  });
+
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Session + request fixtures
+// ---------------------------------------------------------------------------
+
+function sessionFor(userId: string | null) {
+  authMock.handler.mockResolvedValue(
+    new Response(JSON.stringify(userId ? { user: { id: userId } } : null), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  );
+}
+
+function registeredClient(redirectUris: string[] = [REDIRECT_URI]) {
+  return {
+    client_id: CLIENT_ID,
+    client_name: CLIENT_NAME,
+    redirect_uris: redirectUris,
+  };
+}
+
+const AUTHORIZE_QUERY = {
+  response_type: "code",
+  client_id: CLIENT_ID,
+  redirect_uri: REDIRECT_URI,
+  scope: "admin",
+  state: STATE,
+  code_challenge: CODE_CHALLENGE,
+  code_challenge_method: "S256",
+};
+
+function authorize(cookie?: string) {
+  return dispatch({
+    method: "GET",
+    path: "/oauth/authorize",
+    query: AUTHORIZE_QUERY,
+    cookie,
+  });
+}
+
+/** A consent request as /oauth/authorize would have issued it. */
+function makeAreq(overrides: Partial<ConsentRequestPayload> = {}): {
+  areq: string;
+  csrf: string;
+} {
+  const csrf = overrides.csrf ?? "csrf-nonce-for-this-browser";
+  const areq = signConsentRequest({
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    scope: "mcp",
+    state: STATE,
+    code_challenge: CODE_CHALLENGE,
+    code_challenge_method: "S256",
+    user_id: USER_ID,
+    csrf,
+    exp: Date.now() + 10 * 60 * 1000,
+    ...overrides,
+  });
+  return { areq, csrf };
+}
+
+/** Split an areq into its encoded payload and its hex MAC. */
+function splitAreq(areq: string): { payload: string; mac: string } {
+  const separator = areq.indexOf(".");
+  if (separator <= 0) throw new Error("areq is not a signed token");
+  return { payload: areq.slice(0, separator), mac: areq.slice(separator + 1) };
+}
+
+/** Re-encode an areq payload under its ORIGINAL signature, as an attacker would. */
+function tamperPayload(
+  areq: string,
+  edit: (payload: Record<string, unknown>) => void,
+): string {
+  const { payload, mac } = splitAreq(areq);
+  const decoded = JSON.parse(Buffer.from(payload, "base64url").toString());
+  edit(decoded);
+  return `${Buffer.from(JSON.stringify(decoded)).toString("base64url")}.${mac}`;
+}
+
+function decide(init: {
+  areq: string;
+  decision?: string;
+  csrfCookie?: string | null;
+}) {
+  const cookies = [SESSION_COOKIE];
+  if (init.csrfCookie !== null && init.csrfCookie !== undefined) {
+    cookies.push(`${CONSENT_CSRF_COOKIE}=${init.csrfCookie}`);
+  }
+
+  return dispatch({
+    method: "POST",
+    path: "/oauth/authorize/decision",
+    body:
+      init.decision === undefined
+        ? { areq: init.areq }
+        : { areq: init.areq, decision: init.decision },
+    cookie: cookies.join("; "),
+  });
+}
+
+/** The cookie the authorize endpoint wrote, asserted present. */
+function issuedCsrfCookie(res: FakeRes): CookieWrite {
+  const written = res.cookies.filter((c) => c.name === CONSENT_CSRF_COOKIE);
+  expect(written).toHaveLength(1);
+  const cookie = written[0];
+  if (!cookie) throw new Error("no consent csrf cookie was written");
+  return cookie;
+}
+
+/** The URL the handler redirected to, asserted present. */
+function redirectUrl(res: FakeRes): URL {
+  if (!res.redirectedTo) throw new Error("handler settled without a redirect");
+  return new URL(res.redirectedTo);
+}
+
+/** The verified consent request carried by a redirect to the consent page. */
+function consentPayloadFrom(res: FakeRes): ConsentRequestPayload {
+  const payload = verifyConsentRequest(
+    redirectUrl(res).searchParams.get("areq"),
+  );
+  if (!payload) throw new Error("consent redirect carried no valid areq");
+  return payload;
+}
+
+/** The JSON body a handler returned, asserted present. */
+function jsonBody(res: FakeRes): Record<string, unknown> {
+  if (!res.body) throw new Error("handler settled without a JSON body");
+  return res.body;
+}
+
+/** The single (code, data) pair handed to setAuthCode, asserted unique. */
+function mintedAuthCode(): { code: string; stored: Record<string, unknown> } {
+  const calls = oauthRepositoryMock.setAuthCode.mock.calls;
+  expect(calls).toHaveLength(1);
+  const call = calls[0];
+  if (!call) throw new Error("setAuthCode was never called");
+  return {
+    code: call[0] as string,
+    stored: call[1] as Record<string, unknown>,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  oauthRepositoryMock.getClient.mockResolvedValue(registeredClient());
+  oauthRepositoryMock.setAuthCode.mockResolvedValue(undefined);
+  oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
+  sessionFor(USER_ID);
+});
+
+// ---------------------------------------------------------------------------
+// 1. The authorize fast path no longer mints
+// ---------------------------------------------------------------------------
+
+describe("GET /oauth/authorize — being signed in is not consent", () => {
+  it("does NOT mint an authorization code for a signed-in user", async () => {
+    const res = await authorize(SESSION_COOKIE);
+
+    // The whole fix in one assertion.
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+
+    // ...and nothing resembling a code reached the client's redirect_uri.
+    expect(res.redirectedTo).toBeDefined();
+    expect(res.redirectedTo).not.toContain(REDIRECT_URI);
+    expect(res.redirectedTo).not.toContain("code=");
+  });
+
+  it("redirects to the consent page with a signed request bound to the session user", async () => {
+    const res = await authorize(SESSION_COOKIE);
+
+    const redirect = redirectUrl(res);
+    expect(redirect.origin).toBe(APP_URL);
+    expect(redirect.pathname).toBe("/consent");
+
+    const payload = consentPayloadFrom(res);
+    expect(payload.user_id).toBe(USER_ID);
+    expect(payload.client_id).toBe(CLIENT_ID);
+    expect(payload.redirect_uri).toBe(REDIRECT_URI);
+    expect(payload.state).toBe(STATE);
+    expect(payload.code_challenge).toBe(CODE_CHALLENGE);
+    // Scope is server-decided, never the "admin" the caller asked for.
+    expect(payload.scope).toBe("mcp");
+  });
+
+  it("sets the double-submit csrf cookie httpOnly, SameSite=Lax and Secure", async () => {
+    const res = await authorize(SESSION_COOKIE);
+
+    const cookie = issuedCsrfCookie(res);
+    expect(cookie.options.httpOnly).toBe(true);
+    expect(cookie.options.sameSite).toBe("lax");
+    // APP_URL is https here, as it is on the real deployment.
+    expect(cookie.options.secure).toBe(true);
+    expect(cookie.options.path).toBe("/");
+
+    // The cookie carries exactly the nonce inside the signed token — that
+    // pairing is what the decision endpoint checks.
+    expect(cookie.value).toBe(consentPayloadFrom(res).csrf);
+    // A nonce an attacker could guess would defeat the whole control.
+    expect(cookie.value.length).toBeGreaterThanOrEqual(32);
+  });
+
+  it("sends an unauthenticated user to log in and back to /oauth/authorize, with no params blob", async () => {
+    sessionFor(null);
+
+    const res = await authorize(SESSION_COOKIE);
+
+    const redirect = redirectUrl(res);
+    expect(redirect.pathname).toBe("/login");
+
+    const callbackUrl = redirect.searchParams.get("callbackUrl") ?? "";
+    expect(callbackUrl.startsWith("/oauth/authorize?")).toBe(true);
+    // The old flow returned to /oauth/callback carrying the parameters as an
+    // unsigned base64 blob, which that endpoint then minted from.
+    expect(callbackUrl).not.toContain("/oauth/callback");
+    expect(callbackUrl).not.toContain("params=");
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a redirect_uri that is not registered for the client", async () => {
+    oauthRepositoryMock.getClient.mockResolvedValue(
+      registeredClient(["https://legit.example/cb"]),
+    );
+
+    const res = await authorize(SESSION_COOKIE);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_request");
+    expect(res.cookies).toHaveLength(0);
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. The decision endpoint is the only mint site
+// ---------------------------------------------------------------------------
+
+describe("POST /oauth/authorize/decision — approval mints", () => {
+  it("mints and redirects with the code when session, csrf and client all check out", async () => {
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+
+    const { code, stored } = mintedAuthCode();
+    expect(code).toMatch(/^mcp_code_/);
+    expect(stored).toMatchObject({
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      scope: "mcp",
+      user_id: USER_ID,
+      code_challenge: CODE_CHALLENGE,
+      code_challenge_method: "S256",
+    });
+
+    const redirect = redirectUrl(res);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(REDIRECT_URI);
+    expect(redirect.searchParams.get("code")).toBe(code);
+    expect(redirect.searchParams.get("state")).toBe(STATE);
+    expect(redirect.searchParams.get("error")).toBeNull();
+  });
+
+  it("clears the csrf cookie once the request has been completed", async () => {
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(res.clearedCookies.map((c) => c.name)).toEqual([
+      CONSENT_CSRF_COOKIE,
+    ]);
+  });
+});
+
+describe("POST /oauth/authorize/decision — CSRF double submit", () => {
+  it("refuses to mint when the csrf cookie is absent", async () => {
+    const { areq } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: null });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+    expect(res.body?.error).toBe("access_denied");
+    expect(res.redirectedTo).toBeUndefined();
+  });
+
+  it("refuses to mint when the csrf cookie does not match the signed nonce", async () => {
+    const { areq } = makeAreq();
+
+    const res = await decide({
+      areq,
+      decision: "approve",
+      csrfCookie: "csrf-nonce-for-other-browser",
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("does not clear a pending consent cookie on a failed verification", async () => {
+    // Otherwise anyone able to replay a bad decision could cancel a victim's
+    // pending authorization at will.
+    const { areq } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: null });
+
+    expect(res.clearedCookies).toHaveLength(0);
+  });
+});
+
+describe("POST /oauth/authorize/decision — session binding", () => {
+  it("refuses to mint when the session belongs to a different user", async () => {
+    const { areq, csrf } = makeAreq();
+    sessionFor(OTHER_USER_ID);
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+    expect(res.body?.error).toBe("access_denied");
+  });
+
+  it("refuses to mint when there is no session at all", async () => {
+    const { areq, csrf } = makeAreq();
+    sessionFor(null);
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+describe("POST /oauth/authorize/decision — token integrity", () => {
+  it("refuses to mint on an expired authorization request", async () => {
+    const { areq, csrf } = makeAreq({ exp: Date.now() - 1000 });
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_request");
+  });
+
+  it("refuses to mint on a forged signature", async () => {
+    const { areq, csrf } = makeAreq();
+    const { payload, mac } = splitAreq(areq);
+    const forged = `${payload}.${mac.replace(/^./, (c) => (c === "a" ? "b" : "a"))}`;
+
+    const res = await decide({
+      areq: forged,
+      decision: "approve",
+      csrfCookie: csrf,
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("refuses to mint when the redirect_uri was edited and re-encoded in flight", async () => {
+    // Keep the victim's user_id and csrf, swap the destination the code is
+    // delivered to. Two independent guards refuse this one — the signature and
+    // the redirect_uri re-check against the client record — which is the point
+    // of re-validating rather than trusting the token alone.
+    const { areq, csrf } = makeAreq();
+    const tampered = tamperPayload(areq, (payload) => {
+      payload.redirect_uri = "https://attacker.example/steal";
+    });
+
+    const res = await decide({
+      areq: tampered,
+      decision: "approve",
+      csrfCookie: csrf,
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("refuses to mint when the PKCE challenge was edited and re-encoded in flight", async () => {
+    // Only the signature stops this one. Nothing downstream re-derives the
+    // code_challenge, so a caller who could swap it for one whose verifier they
+    // hold would turn PKCE — the control that stops a stolen code from being
+    // redeemed by anyone else — into decoration.
+    const { areq, csrf } = makeAreq();
+    const tampered = tamperPayload(areq, (payload) => {
+      payload.code_challenge = "attacker-chosen-challenge-value-000000000000";
+    });
+
+    const res = await decide({
+      areq: tampered,
+      decision: "approve",
+      csrfCookie: csrf,
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("refuses to mint on a missing areq", async () => {
+    const res = await dispatch({
+      method: "POST",
+      path: "/oauth/authorize/decision",
+      body: { decision: "approve" },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("POST /oauth/authorize/decision — denial and default deny", () => {
+  it("redirects with error=access_denied and mints nothing on deny", async () => {
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "deny", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+
+    const redirect = redirectUrl(res);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(REDIRECT_URI);
+    expect(redirect.searchParams.get("error")).toBe("access_denied");
+    expect(redirect.searchParams.get("state")).toBe(STATE);
+    expect(redirect.searchParams.get("code")).toBeNull();
+  });
+
+  it("treats an absent decision as a denial rather than an approval", async () => {
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(redirectUrl(res).searchParams.get("error")).toBe("access_denied");
+  });
+});
+
+describe("POST /oauth/authorize/decision — redirect_uri re-validation", () => {
+  it("refuses to mint when the redirect_uri is no longer registered", async () => {
+    // The client record can change between issuing the request and approving
+    // it; the signature alone would not catch a deregistered URI.
+    const { areq, csrf } = makeAreq();
+    oauthRepositoryMock.getClient.mockResolvedValue(
+      registeredClient(["https://claude.ai/some/other/callback"]),
+    );
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error_description).toContain("not registered");
+    expect(res.redirectedTo).toBeUndefined();
+  });
+
+  it("refuses to mint when the client has been deleted", async () => {
+    const { areq, csrf } = makeAreq();
+    oauthRepositoryMock.getClient.mockResolvedValue(null);
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. The second door: /oauth/callback no longer mints
+// ---------------------------------------------------------------------------
+
+describe("GET /oauth/callback — the params blob no longer mints", () => {
+  it("rejects an unsigned params blob instead of issuing a code from it", async () => {
+    const params = Buffer.from(
+      JSON.stringify({
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        scope: "admin",
+        state: STATE,
+      }),
+    ).toString("base64url");
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/callback",
+      query: { params },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_request");
+    expect(res.redirectedTo).toBeUndefined();
+  });
+
+  it("still forwards a code that already exists (the lookup path is unchanged)", async () => {
+    const existingCode = "mcp_code_alreadyissued";
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: existingCode,
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      scope: "mcp",
+      user_id: USER_ID,
+      expires_at: new Date(Date.now() + 5 * 60 * 1000),
+    });
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/callback",
+      query: { code: existingCode, state: STATE },
+    });
+
+    // Forwarding an existing code is a lookup, not a mint.
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+
+    const redirect = redirectUrl(res);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(REDIRECT_URI);
+    expect(redirect.searchParams.get("code")).toBe(existingCode);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Consent screen data source
+// ---------------------------------------------------------------------------
+
+describe("GET /oauth/consent/info", () => {
+  it("returns display fields to the user the request belongs to", async () => {
+    const { areq } = makeAreq();
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(res.body).toEqual({
+      client_id: CLIENT_ID,
+      client_name: CLIENT_NAME,
+      redirect_uri_host: "claude.ai",
+      scope: "mcp",
+    });
+  });
+
+  it("never echoes the csrf nonce back to the page", async () => {
+    // The nonce lives in an httpOnly cookie precisely so nothing script can
+    // read ever carries it; returning it here would undo that.
+    const { areq, csrf } = makeAreq();
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(JSON.stringify(res.body)).not.toContain(csrf);
+  });
+
+  it("refuses to describe a request belonging to another session", async () => {
+    const { areq } = makeAreq();
+    sessionFor(OTHER_USER_ID);
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("clamps a hostile client_name from anonymous registration", async () => {
+    // /oauth/register requires no authentication, so client_name is
+    // attacker-controlled text rendered on a page the victim is asked to trust.
+    const { areq } = makeAreq();
+    oauthRepositoryMock.getClient.mockResolvedValue({
+      ...registeredClient(),
+      client_name: "A".repeat(500),
+    });
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/consent/info",
+      query: { areq },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect((jsonBody(res).client_name as string).length).toBe(100);
+  });
+});
