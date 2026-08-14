@@ -179,9 +179,14 @@ describe("frontend.users — admin gate", () => {
       { user_id: "target-1" },
       "admin-1",
     );
+    // `setDisabled` also takes the audit actor bundle (Phase 1B) so the
+    // `user.disabled.set` row it emits can name who pressed the button.
+    // Asserted here rather than loosened away, because the caller id it
+    // carries is the same one the self-lockout refusal depends on.
     expect(setDisabled).toHaveBeenCalledWith(
       { user_id: "target-1", disabled: true },
       "admin-1",
+      expect.objectContaining({ actor_id: "admin-1" }),
     );
     expect(del).toHaveBeenCalledWith({ user_id: "target-1" }, "admin-1");
   });

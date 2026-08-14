@@ -7,15 +7,22 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  router,
+} from "../../trpc";
 
 export const createOAuthClientsRouter = (implementations: {
   create: (
     input: z.infer<typeof CreateOAuthClientRequestSchema>,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof CreateOAuthClientResponseSchema>>;
   list: () => Promise<z.infer<typeof ListOAuthClientsResponseSchema>>;
   delete: (
     input: z.infer<typeof DeleteOAuthClientRequestSchema>,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof DeleteOAuthClientResponseSchema>>;
 }) => {
   return router({
@@ -35,8 +42,8 @@ export const createOAuthClientsRouter = (implementations: {
     create: adminProcedure
       .input(CreateOAuthClientRequestSchema)
       .output(CreateOAuthClientResponseSchema)
-      .mutation(async ({ input }) => {
-        return implementations.create(input);
+      .mutation(async ({ input, ctx }) => {
+        return implementations.create(input, auditActor(ctx));
       }),
 
     // Admin only: list registered clients. The response carries no secrets,
@@ -51,8 +58,8 @@ export const createOAuthClientsRouter = (implementations: {
     delete: adminProcedure
       .input(DeleteOAuthClientRequestSchema)
       .output(DeleteOAuthClientResponseSchema)
-      .mutation(async ({ input }) => {
-        return implementations.delete(input);
+      .mutation(async ({ input, ctx }) => {
+        return implementations.delete(input, auditActor(ctx));
       }),
   });
 };

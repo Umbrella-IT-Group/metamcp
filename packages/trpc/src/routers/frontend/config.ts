@@ -3,6 +3,8 @@ import { z } from "zod";
 
 import {
   adminProcedure,
+  type AuditActor,
+  auditActor,
   protectedProcedure,
   publicProcedure,
   router,
@@ -10,17 +12,26 @@ import {
 
 export const createConfigRouter = (implementations: {
   getSignupDisabled: () => Promise<boolean>;
-  setSignupDisabled: (input: {
-    disabled: boolean;
-  }) => Promise<{ success: boolean }>;
+  setSignupDisabled: (
+    input: {
+      disabled: boolean;
+    },
+    actor: AuditActor,
+  ) => Promise<{ success: boolean }>;
   getSsoSignupDisabled: () => Promise<boolean>;
-  setSsoSignupDisabled: (input: {
-    disabled: boolean;
-  }) => Promise<{ success: boolean }>;
+  setSsoSignupDisabled: (
+    input: {
+      disabled: boolean;
+    },
+    actor: AuditActor,
+  ) => Promise<{ success: boolean }>;
   getBasicAuthDisabled: () => Promise<boolean>;
-  setBasicAuthDisabled: (input: {
-    disabled: boolean;
-  }) => Promise<{ success: boolean }>;
+  setBasicAuthDisabled: (
+    input: {
+      disabled: boolean;
+    },
+    actor: AuditActor,
+  ) => Promise<{ success: boolean }>;
   getMcpResetTimeoutOnProgress: () => Promise<boolean>;
   setMcpResetTimeoutOnProgress: (input: {
     enabled: boolean;
@@ -36,13 +47,19 @@ export const createConfigRouter = (implementations: {
     maxAttempts: number;
   }) => Promise<{ success: boolean }>;
   getSessionLifetime: () => Promise<number | null>;
-  setSessionLifetime: (input: {
-    lifetime?: number | null;
-  }) => Promise<{ success: boolean }>;
+  setSessionLifetime: (
+    input: {
+      lifetime?: number | null;
+    },
+    actor: AuditActor,
+  ) => Promise<{ success: boolean }>;
   getAllConfigs: () => Promise<
     Array<{ id: string; value: string; description?: string | null }>
   >;
-  setConfig: (input: SetConfigRequest) => Promise<{ success: boolean }>;
+  setConfig: (
+    input: SetConfigRequest,
+    actor: AuditActor,
+  ) => Promise<{ success: boolean }>;
   getAuthProviders: () => Promise<
     Array<{ id: string; name: string; enabled: boolean }>
   >;
@@ -82,8 +99,8 @@ export const createConfigRouter = (implementations: {
     // access level.
     setSignupDisabled: adminProcedure
       .input(z.object({ disabled: z.boolean() }))
-      .mutation(async ({ input }) => {
-        return await implementations.setSignupDisabled(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.setSignupDisabled(input, auditActor(ctx));
       }),
 
     // Authenticated read. Grouped with the pre-auth cluster above until
@@ -103,8 +120,11 @@ export const createConfigRouter = (implementations: {
 
     setSsoSignupDisabled: adminProcedure
       .input(z.object({ disabled: z.boolean() }))
-      .mutation(async ({ input }) => {
-        return await implementations.setSsoSignupDisabled(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.setSsoSignupDisabled(
+          input,
+          auditActor(ctx),
+        );
       }),
 
     // Deliberately public: the login page reads this BEFORE any session
@@ -120,8 +140,11 @@ export const createConfigRouter = (implementations: {
 
     setBasicAuthDisabled: adminProcedure
       .input(z.object({ disabled: z.boolean() }))
-      .mutation(async ({ input }) => {
-        return await implementations.setBasicAuthDisabled(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.setBasicAuthDisabled(
+          input,
+          auditActor(ctx),
+        );
       }),
 
     // Authenticated read (redteam re-verification 2026-08-14). This and the
@@ -208,8 +231,8 @@ export const createConfigRouter = (implementations: {
           lifetime: z.number().min(300000).max(86400000).nullable().optional(),
         }),
       )
-      .mutation(async ({ input }) => {
-        return await implementations.setSessionLifetime(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.setSessionLifetime(input, auditActor(ctx));
       }),
 
     getAllConfigs: protectedProcedure.query(async () => {
@@ -218,8 +241,8 @@ export const createConfigRouter = (implementations: {
 
     setConfig: adminProcedure
       .input(SetConfigRequestSchema)
-      .mutation(async ({ input }) => {
-        return await implementations.setConfig(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.setConfig(input, auditActor(ctx));
       }),
 
     getAuthProviders: publicProcedure.query(async () => {

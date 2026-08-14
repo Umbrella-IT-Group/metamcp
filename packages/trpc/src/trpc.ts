@@ -124,6 +124,58 @@ function actorFields(user: unknown): {
   };
 }
 
+/**
+ * The five envelope fields an audit row needs to say WHO did something and
+ * from WHERE, flattened out of the tRPC context.
+ *
+ * Exists because the SUCCESS-path emitters live in the backend's `*.impl.ts`
+ * files, which are handed `input` (and sometimes `ctx.user.id`) and nothing
+ * else — the routers in this package are the only layer that holds both the
+ * session user and the request attribution Express stamped on. Threading one
+ * flat object is the same idiom the routers already use for `ctx.user.id`,
+ * and it keeps `audit_log`'s actor columns identical whether the row came
+ * from a denial hook here or from a mutation over there.
+ */
+export interface AuditActor {
+  actor_id: string | null;
+  actor_label: string | null;
+  actor_ip: string | null;
+  actor_user_agent: string | null;
+  request_id: string | null;
+}
+
+/**
+ * Build the actor bundle a mutation's audit row will carry.
+ *
+ * NEVER THROWS, and that is the entire reason it is a function rather than an
+ * object literal at each call site. It is evaluated as an ARGUMENT to the
+ * implementation call, i.e. strictly before the mutation runs, so a throwing
+ * property read on `ctx.user` (typed `any`, reached from JSON) would abort the
+ * write itself — the audit path deciding whether an admin's toggle takes
+ * effect. Degrading to an all-null actor loses attribution on one row; the
+ * alternative loses the operation.
+ */
+export function auditActor(ctx: BaseContext): AuditActor {
+  try {
+    const actor = actorFields(ctx?.user);
+    return {
+      actor_id: actor.id,
+      actor_label: actor.label,
+      actor_ip: ctx?.audit?.actor_ip ?? null,
+      actor_user_agent: ctx?.audit?.actor_user_agent ?? null,
+      request_id: ctx?.audit?.request_id ?? null,
+    };
+  } catch {
+    return {
+      actor_id: null,
+      actor_label: null,
+      actor_ip: null,
+      actor_user_agent: null,
+      request_id: null,
+    };
+  }
+}
+
 // Initialize tRPC with base context.
 //
 // errorFormatter strips `stack` from every error payload. @trpc/server only

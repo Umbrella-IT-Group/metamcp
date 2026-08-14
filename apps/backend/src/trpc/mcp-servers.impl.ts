@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   BulkImportMcpServersRequestSchema,
   BulkImportMcpServersResponseSchema,
@@ -21,6 +22,8 @@ import {
   namespaceMappingsRepository,
 } from "../db/repositories";
 import { McpServersSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
+import { clampAuditTextList } from "../lib/audit/audit-emitter";
 import { mcpServerPool } from "../lib/metamcp/mcp-server-pool";
 import { clearOverrideCache } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
@@ -31,6 +34,7 @@ export const mcpServersImplementations = {
   create: async (
     input: z.infer<typeof CreateMcpServerRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateMcpServerResponseSchema>> => {
     try {
       // Determine user ownership based on input.user_id or default to current user
@@ -66,6 +70,23 @@ export const mcpServersImplementations = {
             );
           });
       }
+
+      // SECRETS. An MCP server row carries the VENDOR credentials this
+      // gateway uses to reach a third party — `bearerToken`, `env`, and
+      // `headers` (which is where an API key lives for an HTTP backend). None
+      // of the three appears here, and none may be added: `audit_log` is
+      // append-only and un-clearable by design, so a credential written into
+      // it cannot be taken back out. Identity and transport only.
+      emitAdminEvent(actor, {
+        action: "mcpserver.create",
+        target_type: "mcp_server",
+        target_id: createdServer.uuid,
+        detail: {
+          name: createdServer.name,
+          type: createdServer.type,
+          owner_user_id: effectiveUserId,
+        },
+      });
 
       return {
         success: true as const,
@@ -114,6 +135,7 @@ export const mcpServersImplementations = {
   bulkImport: async (
     input: z.infer<typeof BulkImportMcpServersRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof BulkImportMcpServersResponseSchema>> => {
     try {
       const serversToInsert = [];
@@ -188,6 +210,32 @@ export const mcpServersImplementations = {
         }
       }
 
+      // Guarded on a write having happened, like every other emit in this
+      // change: if every entry fails the server-name check, `serversToInsert`
+      // is empty, `bulkCreate` is never called, and a row here would claim an
+      // import that did not occur.
+      //
+      // Server NAMES only, never the configs — a bulk import body is a JSON
+      // blob of `env` and `headers`, i.e. the densest concentration of vendor
+      // credentials this API accepts. Names answer "what appeared" without
+      // copying any of it into an un-deletable table, and are clamped because
+      // they are caller-supplied object keys with no length bound.
+      if (imported > 0) {
+        emitAdminEvent(actor, {
+          action: "mcpserver.bulk_import",
+          target_type: "mcp_server",
+          detail: {
+            imported,
+            server_names: clampAuditTextList(
+              serversToInsert.map((server) => server.name),
+              50,
+              128,
+            ),
+            error_count: errors.length,
+          },
+        });
+      }
+
       return {
         success: true as const,
         imported,
@@ -253,6 +301,7 @@ export const mcpServersImplementations = {
       uuid: string;
     },
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteMcpServerResponseSchema>> => {
     try {
       // Check if server exists and user has permission to delete it
@@ -331,6 +380,13 @@ export const mcpServersImplementations = {
         );
       }
 
+      emitAdminEvent(actor, {
+        action: "mcpserver.delete",
+        target_type: "mcp_server",
+        target_id: deletedServer.uuid,
+        detail: { name: deletedServer.name },
+      });
+
       return {
         success: true as const,
         message: "MCP server deleted successfully",
@@ -348,6 +404,7 @@ export const mcpServersImplementations = {
   update: async (
     input: z.infer<typeof UpdateMcpServerRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateMcpServerResponseSchema>> => {
     try {
       // Check if server exists and user has permission to update it
@@ -461,6 +518,16 @@ export const mcpServersImplementations = {
           `Cleared tool overrides cache for ${affectedNamespaceUuids.length} namespaces after updating server: ${updatedServer.name} (${updatedServer.uuid})`,
         );
       }
+
+      // Same credential ban as `create` above — an update is the call that
+      // ROTATES a vendor token, so it is the likeliest place for one to leak
+      // into a log.
+      emitAdminEvent(actor, {
+        action: "mcpserver.update",
+        target_type: "mcp_server",
+        target_id: updatedServer.uuid,
+        detail: { name: updatedServer.name, type: updatedServer.type },
+      });
 
       return {
         success: true as const,

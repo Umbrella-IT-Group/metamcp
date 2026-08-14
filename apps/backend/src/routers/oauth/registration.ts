@@ -1,5 +1,11 @@
 import express from "express";
 
+import {
+  auditRequestContext,
+  clampAuditText,
+  clampAuditTextList,
+  emit,
+} from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
@@ -41,6 +47,65 @@ registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
 
     // Store the client registration
     await oauthRepository.upsertClient(clientRegistration);
+
+    // The highest-signal anonymous write this gateway accepts, and until now
+    // it was invisible. RFC 7591 dynamic registration needs no credential, so
+    // anyone who can reach /oauth/register can add a client that a signed-in
+    // human may then be asked to approve — and `client_name` is whatever that
+    // caller typed, which is how a consent screen ends up saying "Claude".
+    // Emitted AFTER upsertClient, so a row here means a client that exists.
+    //
+    // actor_type is `anonymous`, honestly: there is no session, no key and no
+    // prior client identity on this request. The IP is the only attribution
+    // available, which is precisely why the CF-Connecting-IP middleware had
+    // to land before this lane. `client_secret` is never recorded — it is
+    // returned to the caller once, in the response below, and nowhere else.
+    const audit = auditRequestContext(req);
+    emit({
+      actor_type: "anonymous",
+      actor_id: null,
+      actor_label: null,
+      actor_ip: audit.actor_ip,
+      actor_user_agent: audit.actor_user_agent,
+      action: "oauth.dcr.register",
+      target_type: "oauth_client",
+      target_id: clientRegistration.client_id,
+      outcome: "success",
+      request_id: audit.request_id,
+      http_status: 201,
+      // EVERY caller-supplied field here is clamped, and on this endpoint
+      // that is a hard requirement rather than tidiness. `/oauth/register`
+      // takes no credential and the JSON body limit is 50mb, while
+      // `buildClientRegistration` validates each redirect URI's SCHEME but
+      // caps neither the array length nor the element length. Copying those
+      // arrays verbatim would hand an anonymous caller a multi-megabyte
+      // write per request into a jsonb column with DELETE/TRUNCATE triggers
+      // and no prune path — turning the table that exists to survive an
+      // incident into a disk-exhaustion vector. `rateLimitToken` does not
+      // save it: it keys on `req.ip`, which is the same loopback address for
+      // every caller behind the in-container rewrite, so it is one global
+      // bucket. `redirect_uri_count` preserves the fact that truncation
+      // happened.
+      detail: {
+        client_name: clientRegistration.client_name
+          ? clampAuditText(clientRegistration.client_name, 100)
+          : null,
+        redirect_uris: clampAuditTextList(
+          clientRegistration.redirect_uris,
+          10,
+          512,
+        ),
+        redirect_uri_count: Array.isArray(clientRegistration.redirect_uris)
+          ? clientRegistration.redirect_uris.length
+          : 0,
+        grant_types: clampAuditTextList(clientRegistration.grant_types, 10, 64),
+        token_endpoint_auth_method: clampAuditText(
+          clientRegistration.token_endpoint_auth_method,
+          64,
+        ),
+        has_client_secret: Boolean(clientSecret),
+      },
+    });
 
     // Prepare response according to RFC 7591 with OAuth 2.1 guidance.
     // getBaseUrl, not `req.get("host")`: every request reaches this router

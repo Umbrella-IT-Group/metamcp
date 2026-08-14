@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateNamespaceRequestSchema,
   CreateNamespaceResponseSchema,
@@ -28,6 +29,7 @@ import {
   toolsRepository,
 } from "../db/repositories";
 import { NamespacesSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 import {
   clearOverrideCache,
   mapOverrideNameToOriginal,
@@ -38,6 +40,7 @@ export const namespacesImplementations = {
   create: async (
     input: z.infer<typeof CreateNamespaceRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateNamespaceResponseSchema>> => {
     try {
       // Determine user ownership based on input.user_id or default to current user
@@ -107,6 +110,17 @@ export const namespacesImplementations = {
           );
           // Don't fail the entire create operation if idle server creation fails
         });
+
+      emitAdminEvent(actor, {
+        action: "namespace.create",
+        target_type: "namespace",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          owner_user_id: effectiveUserId,
+          mcp_server_count: input.mcpServerUuids?.length ?? 0,
+        },
+      });
 
       return {
         success: true as const,
@@ -248,6 +262,7 @@ export const namespacesImplementations = {
       uuid: string;
     },
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteNamespaceResponseSchema>> => {
     try {
       // First, check if the namespace exists and user has permission to delete it
@@ -301,6 +316,13 @@ export const namespacesImplementations = {
         `Cleared tool overrides cache for deleted namespace ${input.uuid}`,
       );
 
+      emitAdminEvent(actor, {
+        action: "namespace.delete",
+        target_type: "namespace",
+        target_id: input.uuid,
+        detail: { name: existingNamespace.name },
+      });
+
       return {
         success: true as const,
         message: "Namespace deleted successfully",
@@ -318,6 +340,7 @@ export const namespacesImplementations = {
   update: async (
     input: z.infer<typeof UpdateNamespaceRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceResponseSchema>> => {
     try {
       // First, check if the namespace exists and user has permission to update it
@@ -431,6 +454,16 @@ export const namespacesImplementations = {
         `Cleared tool overrides cache for updated namespace ${input.uuid}`,
       );
 
+      emitAdminEvent(actor, {
+        action: "namespace.update",
+        target_type: "namespace",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          mcp_server_count: input.mcpServerUuids?.length ?? 0,
+        },
+      });
+
       return {
         success: true as const,
         data: NamespacesSerializer.serializeNamespace(result),
@@ -449,6 +482,7 @@ export const namespacesImplementations = {
   updateServerStatus: async (
     input: z.infer<typeof UpdateNamespaceServerStatusRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceServerStatusResponseSchema>> => {
     try {
       // First, check if user has permission to update this namespace
@@ -519,6 +553,16 @@ export const namespacesImplementations = {
           // Don't fail the entire operation if OpenAPI session invalidation fails
         });
 
+      // ACTIVE/INACTIVE decides whether a backend MCP server is reachable
+      // through this namespace at all, so it is an availability change to the
+      // data plane, not a cosmetic one.
+      emitAdminEvent(actor, {
+        action: "namespace.server_status",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: { server_uuid: input.serverUuid, status: input.status },
+      });
+
       return {
         success: true as const,
         message: "Server status updated successfully",
@@ -536,6 +580,7 @@ export const namespacesImplementations = {
   updateToolStatus: async (
     input: z.infer<typeof UpdateNamespaceToolStatusRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceToolStatusResponseSchema>> => {
     try {
       // First, check if user has permission to update this namespace
@@ -575,6 +620,17 @@ export const namespacesImplementations = {
         };
       }
 
+      emitAdminEvent(actor, {
+        action: "namespace.tool_status",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: {
+          tool_uuid: input.toolUuid,
+          server_uuid: input.serverUuid,
+          status: input.status,
+        },
+      });
+
       return {
         success: true as const,
         message: "Tool status updated successfully",
@@ -592,6 +648,7 @@ export const namespacesImplementations = {
   updateToolOverrides: async (
     input: z.infer<typeof UpdateNamespaceToolOverridesRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateNamespaceToolOverridesResponseSchema>> => {
     try {
       // First, check if user has permission to update this namespace
@@ -638,6 +695,20 @@ export const namespacesImplementations = {
       logger.info(
         `Cleared tool overrides cache for namespace ${input.namespaceUuid} after updating tool overrides`,
       );
+
+      // An override RENAMES a tool as the client sees it, so it can make one
+      // tool answer to another one's name. The overridden name is recorded;
+      // the description/annotation bodies are not, to keep the row small.
+      emitAdminEvent(actor, {
+        action: "namespace.tool_overrides",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: {
+          tool_uuid: input.toolUuid,
+          server_uuid: input.serverUuid,
+          override_name: input.overrideName ?? null,
+        },
+      });
 
       return {
         success: true as const,

@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   DeleteUserRequestSchema,
   DeleteUserResponseSchema,
@@ -16,6 +17,7 @@ import logger from "@/utils/logger";
 
 import { usersRepository } from "../db/repositories";
 import { UsersSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 
 // Every zero, for the responses that must report a shape even when nothing
 // happened. Declared once so a new counter cannot be added to the contract
@@ -102,6 +104,7 @@ export const usersImplementations = {
   setDisabled: async (
     input: z.infer<typeof SetUserDisabledRequestSchema>,
     actorUserId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof SetUserDisabledResponseSchema>> => {
     // Self-lockout is refused. Disabling yourself takes effect on your very
     // next request, so the administrator who does it loses the console they
@@ -136,6 +139,19 @@ export const usersImplementations = {
         `${input.disabled ? "Disabled" : "Enabled"} user ${input.user_id} ` +
           `via admin UI (actor ${actorUserId})`,
       );
+
+      // Emitted here rather than above the `if (!updated)` return, so a
+      // no-op against a user id that does not exist leaves no row claiming an
+      // account was locked. Two distinct actions rather than one with a
+      // boolean in `detail`: enabling an account someone else disabled is the
+      // reversal of a containment decision, and it has to be greppable on its
+      // own rather than hiding inside the same verb as the lock.
+      emitAdminEvent(actor, {
+        action: input.disabled ? "user.disabled.set" : "user.enabled.set",
+        target_type: "user",
+        target_id: input.user_id,
+        detail: { disabled: updated.disabled },
+      });
 
       return {
         success: true,

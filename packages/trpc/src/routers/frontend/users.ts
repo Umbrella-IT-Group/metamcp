@@ -11,7 +11,12 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  router,
+} from "../../trpc";
 
 export const createUsersRouter = (implementations: {
   list: () => Promise<z.infer<typeof ListUsersResponseSchema>>;
@@ -21,6 +26,7 @@ export const createUsersRouter = (implementations: {
   setDisabled: (
     input: z.infer<typeof SetUserDisabledRequestSchema>,
     actorUserId: string,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof SetUserDisabledResponseSchema>>;
   revokeAccess: (
     input: z.infer<typeof RevokeUserAccessRequestSchema>,
@@ -76,7 +82,7 @@ export const createUsersRouter = (implementations: {
       .input(SetUserDisabledRequestSchema)
       .output(SetUserDisabledResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return implementations.setDisabled(input, ctx.user.id);
+        return implementations.setDisabled(input, ctx.user.id, auditActor(ctx));
       }),
 
     // Admin only: sever an account's live access (sessions, OAuth tokens and

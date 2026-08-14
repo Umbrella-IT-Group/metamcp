@@ -9,7 +9,13 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the endpoints router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -19,6 +25,7 @@ export const createEndpointsRouter = (
     create: (
       input: z.infer<typeof CreateEndpointRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof CreateEndpointResponseSchema>>;
     list: (
       userId: string,
@@ -34,10 +41,12 @@ export const createEndpointsRouter = (
         uuid: string;
       },
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof DeleteEndpointResponseSchema>>;
     update: (
       input: z.infer<typeof UpdateEndpointRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateEndpointResponseSchema>>;
   },
 ) => {
@@ -62,7 +71,11 @@ export const createEndpointsRouter = (
       .input(CreateEndpointRequestSchema)
       .output(CreateEndpointResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.create(input, ctx.user.id);
+        return await implementations.create(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Delete endpoint
@@ -70,7 +83,11 @@ export const createEndpointsRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(DeleteEndpointResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.delete(input, ctx.user.id);
+        return await implementations.delete(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update endpoint
@@ -78,7 +95,11 @@ export const createEndpointsRouter = (
       .input(UpdateEndpointRequestSchema)
       .output(UpdateEndpointResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.update(input, ctx.user.id);
+        return await implementations.update(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
   });
 };

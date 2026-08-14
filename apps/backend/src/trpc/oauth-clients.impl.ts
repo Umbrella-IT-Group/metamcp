@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateOAuthClientRequestSchema,
   CreateOAuthClientResponseSchema,
@@ -12,6 +13,8 @@ import logger from "@/utils/logger";
 
 import { oauthRepository } from "../db/repositories";
 import { OAuthClientsSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
+import { clampAuditText, clampAuditTextList } from "../lib/audit/audit-emitter";
 import { buildClientRegistration } from "../routers/oauth/client-registration";
 
 /**
@@ -33,6 +36,7 @@ import { buildClientRegistration } from "../routers/oauth/client-registration";
 export const oauthClientsImplementations = {
   create: async (
     input: z.infer<typeof CreateOAuthClientRequestSchema>,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateOAuthClientResponseSchema>> => {
     // The zod contract has already constrained the enums and required a
     // non-empty redirect_uris, but the core is still the authority on
@@ -67,6 +71,35 @@ export const oauthClientsImplementations = {
       `Created OAuth client ${client.client_id} (${client.client_name}) via admin UI`,
     );
 
+    // A registered client is a standing permission to complete an
+    // authorization flow against this gateway, so its birth is a security
+    // event whichever door it came through — this is the attributed twin of
+    // the anonymous `oauth.dcr.register` row that POST /oauth/register emits.
+    // `client.client_secret` is deliberately absent from `detail`: it crosses
+    // the wire once, in the response below, and nowhere else ever.
+    emitAdminEvent(actor, {
+      action: "oauthclient.create",
+      target_type: "oauth_client",
+      target_id: client.client_id,
+      // Clamped for the same reason the DCR endpoint clamps: the zod contract
+      // is `z.array(z.string().min(1))` with no `.max()` on either the array
+      // or its elements, so an admin session can put an unbounded value into
+      // a table that has no delete path. Lower stakes than the anonymous
+      // endpoint, identical failure mode.
+      detail: {
+        client_name: clampAuditText(client.client_name, 100),
+        redirect_uris: clampAuditTextList(client.redirect_uris, 10, 512),
+        redirect_uri_count: Array.isArray(client.redirect_uris)
+          ? client.redirect_uris.length
+          : 0,
+        token_endpoint_auth_method: clampAuditText(
+          client.token_endpoint_auth_method,
+          64,
+        ),
+        has_client_secret: Boolean(client.client_secret),
+      },
+    });
+
     // The one and only time client_secret crosses the wire. It is returned
     // from the freshly-minted object rather than re-read from the database,
     // and no other route exposes it — see OAuthClientsSerializer.
@@ -100,6 +133,7 @@ export const oauthClientsImplementations = {
 
   delete: async (
     input: z.infer<typeof DeleteOAuthClientRequestSchema>,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteOAuthClientResponseSchema>> => {
     try {
       const deleted = await oauthRepository.deleteClient(input.client_id);
@@ -115,6 +149,14 @@ export const oauthClientsImplementations = {
       }
 
       logger.info(`Deleted OAuth client ${input.client_id} via admin UI`);
+
+      // Emitted below the `!deleted` early return, so a delete that matched
+      // nothing leaves no row claiming a client was revoked.
+      emitAdminEvent(actor, {
+        action: "oauthclient.delete",
+        target_type: "oauth_client",
+        target_id: input.client_id,
+      });
 
       return {
         success: true,

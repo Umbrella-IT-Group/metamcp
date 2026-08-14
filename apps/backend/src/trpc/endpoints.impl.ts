@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateEndpointRequestSchema,
   CreateEndpointResponseSchema,
@@ -18,6 +19,7 @@ import {
   namespacesRepository,
 } from "../db/repositories";
 import { EndpointsSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -47,6 +49,7 @@ export const endpointsImplementations = {
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateEndpointResponseSchema>> => {
     try {
       // Check if endpoint name already exists (must be globally unique)
@@ -174,6 +177,25 @@ export const endpointsImplementations = {
         }
       }
 
+      // An endpoint is a publicly reachable MCP surface, so its creation and
+      // its auth posture (API-key gate, scoped-key requirement, OAuth) are
+      // the breadcrumbs that answer "when did this URL start existing, and
+      // did it ever require a credential". Never the bearer token the block
+      // above may have embedded in the companion MCP server.
+      emitAdminEvent(actor, {
+        action: "endpoint.create",
+        target_type: "endpoint",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          namespace_uuid: input.namespaceUuid,
+          owner_user_id: effectiveUserId,
+          enable_api_key_auth: input.enableApiKeyAuth,
+          require_scoped_api_key: input.requireScopedApiKey,
+          enable_oauth: input.enableOauth,
+        },
+      });
+
       return {
         success: true as const,
         data: EndpointsSerializer.serializeEndpoint(result),
@@ -258,6 +280,7 @@ export const endpointsImplementations = {
       uuid: string;
     },
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteEndpointResponseSchema>> => {
     try {
       // First, check if the endpoint exists and user has permission to delete it
@@ -290,6 +313,13 @@ export const endpointsImplementations = {
         };
       }
 
+      emitAdminEvent(actor, {
+        action: "endpoint.delete",
+        target_type: "endpoint",
+        target_id: input.uuid,
+        detail: { name: deletedEndpoint.name },
+      });
+
       return {
         success: true as const,
         message: "Endpoint deleted successfully",
@@ -307,6 +337,7 @@ export const endpointsImplementations = {
   update: async (
     input: z.infer<typeof UpdateEndpointRequestSchema>,
     userId: string,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateEndpointResponseSchema>> => {
     try {
       // First, check if the endpoint exists and user has permission to update it
@@ -387,6 +418,22 @@ export const endpointsImplementations = {
         client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
         enable_oauth: input.enableOauth,
         use_query_param_auth: input.useQueryParamAuth,
+      });
+
+      // The auth-posture fields are carried for the same reason as on create:
+      // turning `enable_api_key_auth` off on a live endpoint opens it to the
+      // internet, and that has to be attributable to a person and a moment.
+      emitAdminEvent(actor, {
+        action: "endpoint.update",
+        target_type: "endpoint",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          namespace_uuid: input.namespaceUuid,
+          enable_api_key_auth: input.enableApiKeyAuth,
+          require_scoped_api_key: input.requireScopedApiKey,
+          enable_oauth: input.enableOauth,
+        },
       });
 
       return {

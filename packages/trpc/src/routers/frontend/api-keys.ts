@@ -12,13 +12,20 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 export const createApiKeysRouter = (implementations: {
   create: (
     input: z.infer<typeof CreateApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof CreateApiKeyResponseSchema>>;
   list: (userId: string) => Promise<z.infer<typeof ListApiKeysResponseSchema>>;
   listAll: () => Promise<z.infer<typeof ListAllApiKeysResponseSchema>>;
@@ -26,11 +33,13 @@ export const createApiKeysRouter = (implementations: {
     input: z.infer<typeof UpdateApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof UpdateApiKeyResponseSchema>>;
   delete: (
     input: z.infer<typeof DeleteApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof DeleteApiKeyResponseSchema>>;
   validate: (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
@@ -59,6 +68,7 @@ export const createApiKeysRouter = (implementations: {
           input,
           ctx.user.id,
           ctx.user.role === "admin",
+          auditActor(ctx),
         );
       }),
 
@@ -86,6 +96,7 @@ export const createApiKeysRouter = (implementations: {
           input,
           ctx.user.id,
           ctx.user.role === "admin",
+          auditActor(ctx),
         );
       }),
 
@@ -99,6 +110,7 @@ export const createApiKeysRouter = (implementations: {
           input,
           ctx.user.id,
           ctx.user.role === "admin",
+          auditActor(ctx),
         );
       }),
 

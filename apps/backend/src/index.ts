@@ -2,6 +2,11 @@ import express from "express";
 
 import { auth } from "./auth";
 import {
+  auditRequestContext,
+  stampAuditHeaders,
+} from "./lib/audit/audit-emitter";
+import { emitAuthRelayEvent } from "./lib/audit/auth-relay-audit";
+import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
   isAdminHealthRequest,
@@ -58,6 +63,17 @@ app.use(async (req, res, next) => {
         }
       });
 
+      // Hand the Express request's audit attribution across the relay seam.
+      // better-auth's `databaseHooks` (auth.ts) see only this Request, so
+      // without these two the signup and session rows they emit would carry a
+      // null request_id and could not be joined to the auth.login.* row from
+      // the same HTTP call. Must run AFTER the copy loop above, which brings
+      // the CALLER's headers in verbatim — including any it invented under
+      // these names. See lib/audit/audit-emitter for why the absent case
+      // deletes rather than skips.
+      const auditContext = auditRequestContext(req);
+      stampAuditHeaders(headers, auditContext);
+
       // Create Request object
       const request = new Request(url.toString(), {
         method: req.method,
@@ -81,6 +97,20 @@ app.use(async (req, res, next) => {
 
       // Send body
       const body = await response.text();
+
+      // Record the outcome AFTER better-auth has answered and BEFORE the
+      // response goes out, so the row describes a verdict that has actually
+      // been reached. Fire-and-forget and never throws — see
+      // lib/audit/auth-relay-audit; a logging failure here must not turn a
+      // successful sign-in into a 500 (the catch below would answer one).
+      emitAuthRelayEvent({
+        path: req.path,
+        status: response.status,
+        requestBody: req.body,
+        responseBody: body,
+        audit: auditContext,
+      });
+
       res.send(body);
     } catch (error) {
       logger.error("Auth route error:", error);
