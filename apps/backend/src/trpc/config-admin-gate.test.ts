@@ -93,11 +93,16 @@ describe("config write surface — admin gate", () => {
  *
  * The write surface was admin-gated in 2026-07-14 (above); the reads were all
  * left public, so an anonymous caller could pull the gateway's MCP
- * retry/timeout budget and session lifetime straight off `/trpc`. The five
- * operational getters are now `protectedProcedure`; the four auth-posture
- * getters stay public because the sign-in pages read them before a session
- * exists, and gating one of those would leave a login screen that cannot
- * render itself.
+ * retry/timeout budget and session lifetime straight off `/trpc`. Six getters
+ * are now `protectedProcedure`; three stay public because the sign-in pages
+ * read them before a session exists, and gating one of those would leave a
+ * login screen that cannot render itself.
+ *
+ * `getSsoSignupDisabled` is in the GATED list, not the public one, and the
+ * reason is worth keeping: it is an auth-posture boolean sitting next to two
+ * genuinely pre-auth siblings, which is why it was public — but the call-site
+ * sweep found its only reader is the settings page. Public by association is
+ * how a read surface grows without anyone deciding to grow it.
  *
  * Both halves are pinned. A test that only proved the gates would be
  * satisfied by gating everything — which breaks login — and a test that only
@@ -110,11 +115,11 @@ describe("config read surface — anonymous access", () => {
     "getMcpMaxTotalTimeout",
     "getMcpMaxAttempts",
     "getMcpResetTimeoutOnProgress",
+    "getSsoSignupDisabled",
   ] as const;
 
   const KEPT_PUBLIC = [
     "getSignupDisabled",
-    "getSsoSignupDisabled",
     "getBasicAuthDisabled",
     "getAuthProviders",
   ] as const;

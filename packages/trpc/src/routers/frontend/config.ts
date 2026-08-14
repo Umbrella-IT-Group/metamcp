@@ -55,18 +55,20 @@ export const createConfigRouter = (implementations: {
     // operational configuration from `/trpc`. The MCP timeout/attempt/session
     // getters had no reason to be reachable that way and are now
     // `protectedProcedure` (see the block above `getMcpResetTimeoutOnProgress`).
-    // These four stay public because the SIGN-IN PAGES read them before a
+    // These THREE stay public because the SIGN-IN PAGES read them before a
     // session can exist, so gating them would leave a login screen that cannot
     // render itself:
     //   getSignupDisabled     — login/page.tsx:37, register/page.tsx:46,99,121
     //   getBasicAuthDisabled  — login/page.tsx:52
     //   getAuthProviders      — login/page.tsx:67
-    //   getSsoSignupDisabled  — no pre-auth reader today (settings only), kept
-    //                           with its siblings: it is the same single
-    //                           boolean about the gateway's own auth posture,
-    //                           and the register page is the natural next
-    //                           caller for it.
-    // None of the four describes a user, a server, an endpoint or a timing
+    // Membership here is decided by an actual pre-auth CALL SITE, not by
+    // topic: `getSsoSignupDisabled` reads like a fourth sibling — same auth
+    // posture, adjacent toggle in the same settings card — and was public for
+    // exactly that reason, but no sign-in page has ever called it. It is now
+    // `protectedProcedure` too. Adding a getter to this cluster means finding
+    // it in a page that renders without a session, not that it sounds like it
+    // belongs.
+    // None of the three describes a user, a server, an endpoint or a timing
     // window; each is one boolean or the enabled-provider list the login form
     // has to draw buttons for. Every paired WRITE is `adminProcedure`.
     getSignupDisabled: publicProcedure.query(async () => {
@@ -84,7 +86,18 @@ export const createConfigRouter = (implementations: {
         return await implementations.setSignupDisabled(input);
       }),
 
-    getSsoSignupDisabled: publicProcedure.query(async () => {
+    // Authenticated read. Grouped with the pre-auth cluster above until
+    // 2026-08-14, when a call-site sweep of `apps/frontend` found its only
+    // reader is the settings page (`settings/page.tsx:62`), inside the app
+    // shell `middleware.ts` admits only with a session — the sign-in pages
+    // read `getSignupDisabled` and never this. Public by association is not
+    // a reason, so it moved to `protectedProcedure` with the operational
+    // getters below. The paired WRITE stays `adminProcedure`.
+    //
+    // If a future register page needs to hide the SSO button pre-session,
+    // this is the getter to move back — deliberately, with that call site as
+    // the evidence.
+    getSsoSignupDisabled: protectedProcedure.query(async () => {
       return await implementations.getSsoSignupDisabled();
     }),
 
