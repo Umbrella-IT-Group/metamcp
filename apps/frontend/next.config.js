@@ -4,6 +4,25 @@ const nextConfig = {
   experimental: {
     proxyTimeout: 1000 * 120,
   },
+  async headers() {
+    return [
+      {
+        // The OAuth consent screen is the trust anchor of the authorization
+        // flow: it is where a human decides whether a client gets access to
+        // their account. Framing it would allow a clickjacked Approve, and a
+        // referrer leak would hand the signed `areq` token in the query string
+        // to whatever the page links or fetches. The backend's own /oauth/*
+        // routes get these from securityHeaders in the express router; this
+        // page is served by Next.js and had none.
+        source: "/:locale/consent",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Content-Security-Policy", value: "frame-ancestors 'none'" },
+          { key: "Referrer-Policy", value: "no-referrer" },
+        ],
+      },
+    ];
+  },
   async rewrites() {
     // Use localhost for rewrites since frontend and backend run in the same container
     const backendUrl = "http://localhost:12009";
