@@ -7,9 +7,11 @@ export {
   router,
   baseProcedure,
   createTRPCRouter,
+  auditActor,
   setTrpcAuditSink,
 } from "./trpc";
 export type {
+  AuditActor,
   AuditRequestContext,
   BaseContext,
   TrpcAuditSink,
@@ -24,6 +26,7 @@ export { createMcpServersRouter } from "./routers/frontend";
 // same pattern the pre-existing createMcpServersRouter export enables,
 // rather than re-deriving each gate against a synthetic router.
 export {
+  createApiKeysRouter,
   createNamespacesRouter,
   createConfigRouter,
   createToolsRouter,

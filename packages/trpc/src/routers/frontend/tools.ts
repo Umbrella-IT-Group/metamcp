@@ -3,13 +3,19 @@ import {
   GetToolsByMcpServerUuidRequestSchema,
 } from "@repo/zod-types";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 export const createToolsRouter = <
   TImplementations extends {
     getByMcpServerUuid: (input: any) => Promise<any>;
-    create: (input: any) => Promise<any>;
-    sync: (input: any) => Promise<any>;
+    create: (input: any, actor: AuditActor) => Promise<any>;
+    sync: (input: any, actor: AuditActor) => Promise<any>;
   },
 >(
   implementations: TImplementations,
@@ -30,16 +36,16 @@ export const createToolsRouter = <
     // tRPC entirely, so this gate has no effect on that member-facing path.
     create: adminProcedure
       .input(CreateToolRequestSchema)
-      .mutation(async ({ input }) => {
-        return implementations.create(input);
+      .mutation(async ({ input, ctx }) => {
+        return implementations.create(input, auditActor(ctx));
       }),
 
     // Admin only: Sync tools with cleanup (removes obsolete tools). Same
     // rationale and refreshTools independence as create() above.
     sync: adminProcedure
       .input(CreateToolRequestSchema)
-      .mutation(async ({ input }) => {
-        return implementations.sync(input);
+      .mutation(async ({ input, ctx }) => {
+        return implementations.sync(input, auditActor(ctx));
       }),
   });
 };

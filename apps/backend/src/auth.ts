@@ -9,6 +9,12 @@ import { db } from "./db/index";
 // module graph, which is loaded before almost everything else.
 import { usersRepository } from "./db/repositories/users.repo";
 import * as schema from "./db/schema";
+import {
+  emitSessionCreated,
+  emitSessionRevoked,
+  emitSignupCreated,
+  emitSignupDenied,
+} from "./lib/audit/auth-hook-audit";
 import { configService } from "./lib/config.service";
 import logger from "./utils/logger";
 
@@ -177,17 +183,36 @@ export const auth = betterAuth({
 
           if (isSsoRegistration) {
             if (isSsoSignupDisabled) {
+              // The incident's front door, from the inside. When
+              // self-registration was open on 2026-08-13 the accounts that
+              // walked through it left no trace beyond the `users` rows
+              // themselves; when it is CLOSED, the attempts that bounce off
+              // it leave nothing at all — and a burst of them is the clearest
+              // possible signal that someone is still trying. Emitted before
+              // the throw, by a helper that cannot throw, so the caller's
+              // rejection is unchanged.
+              emitSignupDenied(user, context, "sso");
               throw new Error(
                 "New user registration via SSO/OAuth is currently disabled.",
               );
             }
           } else {
             if (isSignupDisabled) {
+              emitSignupDenied(user, context, "basic");
               throw new Error("New user registration is currently disabled.");
             }
           }
 
           return { data: user };
+        },
+
+        // Only reachable on success — `before` above is what refuses a
+        // registration, so anything arriving here is an account that now
+        // exists. This is the row that answers "when did this account appear
+        // and from where", which the 2026-08-13 review had to reconstruct
+        // from `users.created_at` and inference.
+        after: async (user, context) => {
+          emitSignupCreated(user, context);
         },
       },
     },
@@ -228,6 +253,39 @@ export const auth = betterAuth({
           }
 
           return { data: session };
+        },
+
+        // The universal record of "a credential that grants access to this
+        // gateway came into existence". Every sign-in path funnels through
+        // it — email/password, the OIDC callback, account linking — which is
+        // why it is wired IN ADDITION to the `/api/auth` relay wrap in
+        // index.ts: that wrap can only read a status code, and a 200 from
+        // `sign-in/social` means "here is a redirect URL", not "someone
+        // authenticated". SSO logins are recorded here or nowhere.
+        //
+        // This is also the direct replacement for the forensic record lost at
+        // containment on 2026-08-13, when the attacker's sessions were
+        // DELETEd and took their `ip_address` and `user_agent` with them.
+        after: async (session, context) => {
+          emitSessionCreated(session, context);
+        },
+      },
+
+      delete: {
+        // Fires once per deleted row for single deletes (sign-out) and for
+        // bulk deletes alike — verified against better-auth 1.6.23's
+        // `deleteWithHooks` / `deleteManyWithHooks`, which loop the `after`
+        // hook over every entity they removed.
+        //
+        // NOTE ON COVERAGE: this covers session deletions that go THROUGH
+        // better-auth. The admin `users.revokeAccess` and `users.delete`
+        // paths tear down session rows with drizzle directly and never reach
+        // this hook; they emit `user.access.revoked` / `user.delete` from
+        // `users.impl.ts` instead. Between the two, every path that destroys
+        // a session today is recorded somewhere — a new teardown that uses
+        // neither would be silent.
+        after: async (session, context) => {
+          emitSessionRevoked(session, context);
         },
       },
     },

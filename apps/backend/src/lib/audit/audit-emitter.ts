@@ -164,6 +164,154 @@ export function auditRequestContext(
   };
 }
 
+/**
+ * Header names the `/api/auth` relay in `index.ts` writes onto the internal
+ * `Request` it hands to `auth.handler()`, purely so better-auth's
+ * `databaseHooks` can see the same attribution as the Express layer.
+ *
+ * WHY A HEADER AND NOT A PARAMETER. The signup / session-lifecycle events are
+ * emitted from `databaseHooks` in `auth.ts`, which better-auth calls with a
+ * `GenericEndpointContext` — the web `Request` it was given, and nothing from
+ * Express. Without this, every hook-emitted row would carry a null
+ * `request_id` and a null `actor_ip`, and could not be joined to the
+ * `auth.login.*` row the same HTTP request produced. The relay is the one
+ * place that holds both objects.
+ *
+ * NOT CLIENT-CONTROLLED. The relay copies the caller's headers into that
+ * Request first, so a caller CAN put its own value under these names — which
+ * is why the relay then unconditionally `set`s them when it has a value and
+ * `delete`s them when it does not. Overwriting alone would not be enough: the
+ * case with no `CF-Connecting-IP` is exactly the case where a forged
+ * `x-audit-client-ip` would otherwise survive. These names are internal to
+ * that one hop and are never emitted on any outbound request.
+ */
+export const AUDIT_REQUEST_ID_HEADER = "x-audit-request-id";
+export const AUDIT_CLIENT_IP_HEADER = "x-audit-client-ip";
+
+/**
+ * Write this request's attribution onto the internal `Request` the `/api/auth`
+ * relay hands to better-auth, replacing anything the caller sent under the
+ * same names.
+ *
+ * EVERY branch writes, and the `delete` half is the security part rather than
+ * tidiness: the relay copies the caller's headers into that bag first, so a
+ * client that sends `x-audit-client-ip` has already put its own value there.
+ * Setting only when we have a value would leave the forged one standing in
+ * exactly the case that matters — a request with no `CF-Connecting-IP`, i.e.
+ * one that did not come through the Cloudflare tunnel and whose IP claims are
+ * therefore worthless. Deleting on absence makes "unknown" mean unknown.
+ *
+ * Lives here rather than inline in `index.ts` so the property is testable:
+ * importing `index.ts` boots the entire server.
+ */
+export function stampAuditHeaders(
+  headers: Headers,
+  context: AuditRequestContext,
+): void {
+  if (context.request_id) {
+    headers.set(AUDIT_REQUEST_ID_HEADER, context.request_id);
+  } else {
+    headers.delete(AUDIT_REQUEST_ID_HEADER);
+  }
+  if (context.actor_ip) {
+    headers.set(AUDIT_CLIENT_IP_HEADER, context.actor_ip);
+  } else {
+    headers.delete(AUDIT_CLIENT_IP_HEADER);
+  }
+}
+
+/** Anything header-shaped enough to read a value out of. */
+interface HeaderReader {
+  get(name: string): string | null;
+}
+
+/**
+ * Read one header from the first of several candidate bags that can answer.
+ *
+ * Plural because better-auth types the hook context's `headers` as the loose
+ * `HeadersInit`, which is satisfied by a plain object or an array of pairs as
+ * well as by a real `Headers`. Reading only `context.headers` and giving up
+ * when it has no `.get` would silently produce an unattributed row even
+ * though `context.request.headers` — a genuine `Headers` — was sitting right
+ * there. Falling through per lookup rather than picking one bag up front is
+ * what makes that impossible.
+ */
+function readHeader(sources: unknown[], name: string): string | null {
+  for (const source of sources) {
+    const candidate = source as HeaderReader | null | undefined;
+    if (typeof candidate?.get !== "function") continue;
+    const value = candidate.get(name);
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return null;
+}
+
+/**
+ * Rebuild the request half of the envelope inside a better-auth database
+ * hook, from the two relay headers above plus the caller's User-Agent.
+ *
+ * Takes `unknown` deliberately: better-auth types the hook's context as
+ * `GenericEndpointContext | null`, whose `headers` is the loose `HeadersInit`
+ * and whose `request` may be absent, and this runs on the sign-up and
+ * sign-in paths where a type assumption that turns out wrong at runtime would
+ * throw inside an awaited hook — i.e. break authentication to record it.
+ * Every read is guarded and every miss degrades to null.
+ */
+export function auditContextFromHook(context: unknown): AuditRequestContext {
+  try {
+    const candidate = context as
+      | { headers?: unknown; request?: { headers?: unknown } }
+      | null
+      | undefined;
+    const bags = [candidate?.headers, candidate?.request?.headers];
+    return {
+      actor_ip: readHeader(bags, AUDIT_CLIENT_IP_HEADER),
+      actor_user_agent: readHeader(bags, "user-agent"),
+      request_id: readHeader(bags, AUDIT_REQUEST_ID_HEADER),
+    };
+  } catch {
+    return { actor_ip: null, actor_user_agent: null, request_id: null };
+  }
+}
+
+/**
+ * Bound a caller-supplied string before it goes into `detail`.
+ *
+ * `audit_log` has UPDATE/DELETE/TRUNCATE triggers and deliberately no prune
+ * path, so a row's SIZE is as permanent as its contents. Anything that
+ * reaches an emitter from a request body is therefore a write-amplification
+ * primitive unless it is clamped at the emitter: the JSON body limit is 50mb
+ * and `/oauth/register` is unauthenticated, so one anonymous request could
+ * otherwise push megabytes into a jsonb column nobody can delete from. The
+ * point of the table is to survive an incident, not to be the vector for the
+ * next one.
+ *
+ * Clamping is lossy on purpose. A redirect URI truncated at 512 characters
+ * still identifies where a grant was aimed; the untruncated value is not
+ * worth an unbounded column.
+ */
+export function clampAuditText(value: unknown, maxLength: number): string {
+  return String(value ?? "").slice(0, maxLength);
+}
+
+/**
+ * Bound a caller-supplied ARRAY of strings the same way — both how many
+ * entries are kept and how long each one may be.
+ *
+ * Array length matters as much as element length: `redirect_uris` arrives
+ * verbatim from anonymous dynamic client registration, and nothing upstream
+ * of the emitter caps how many entries a caller may send. Callers that keep
+ * a count alongside the clamped list can still see when truncation happened.
+ */
+export function clampAuditTextList(
+  values: unknown,
+  maxItems: number,
+  maxLength: number,
+): string[] {
+  if (!Array.isArray(values)) return [];
+  return values.slice(0, maxItems).map((v) => clampAuditText(v, maxLength));
+}
+
 export interface CredentialFingerprint {
   /** sha256 of the presented credential — correlates reuse without storing it. */
   sha256: string | null;

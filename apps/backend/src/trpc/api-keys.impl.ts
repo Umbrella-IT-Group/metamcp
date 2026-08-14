@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
@@ -21,6 +22,7 @@ import {
   usersRepository,
 } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -29,6 +31,7 @@ export const apiKeysImplementations = {
     input: z.infer<typeof CreateApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> => {
     // RBAC on the mint path. `input.user_id === null` is the public
     // ('everyone') selection; `undefined` means "private to me". A member may
@@ -173,6 +176,24 @@ export const apiKeysImplementations = {
         is_active: true,
       });
 
+      // The row exists — emit before serialising, since the serialiser is the
+      // only thing between here and a response body carrying the FULL key.
+      // `detail` gets the uuid, the name and the scope that decides how far
+      // the key reaches; it must never get `result.key`, which is the
+      // credential itself and is returned to the caller exactly once.
+      emitAdminEvent(actor, {
+        action: "apikey.create",
+        target_type: "api_key",
+        target_id: result.uuid,
+        detail: {
+          name: result.name,
+          owner_user_id: apiKeyUserId,
+          endpoint_uuid: input.endpoint_uuid ?? null,
+          all_endpoints: input.all_endpoints === true,
+          acts_as_user_id: input.acts_as_user_id ?? null,
+        },
+      });
+
       return ApiKeysSerializer.serializeCreateApiKeyResponse(result);
     } catch (error) {
       // Preserve an intentional authorization error's code; only wrap the
@@ -235,6 +256,7 @@ export const apiKeysImplementations = {
     input: z.infer<typeof UpdateApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateApiKeyResponseSchema>> => {
     try {
       // Admins bypass the ownership WHERE (may edit / revoke any key); members
@@ -249,6 +271,17 @@ export const apiKeysImplementations = {
             is_active: input.is_active,
           });
 
+      // Deactivating a key is a REVOCATION and gets its own verb — during an
+      // incident "which credentials were killed, by whom, when" is a question
+      // asked directly of the action column, and burying it inside a generic
+      // `apikey.update` alongside renames would make it un-greppable.
+      emitAdminEvent(actor, {
+        action: input.is_active === false ? "apikey.revoke" : "apikey.update",
+        target_type: "api_key",
+        target_id: input.uuid,
+        detail: { name: result.name, is_active: result.is_active },
+      });
+
       return ApiKeysSerializer.serializeApiKey(result);
     } catch (error) {
       logger.error("Error updating API key:", error);
@@ -262,6 +295,7 @@ export const apiKeysImplementations = {
     input: z.infer<typeof DeleteApiKeyRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteApiKeyResponseSchema>> => {
     try {
       // Admins bypass the ownership WHERE (may delete / revoke any key);
@@ -271,6 +305,13 @@ export const apiKeysImplementations = {
       } else {
         await apiKeysRepository.delete(input.uuid, userId);
       }
+
+      emitAdminEvent(actor, {
+        action: "apikey.delete",
+        target_type: "api_key",
+        target_id: input.uuid,
+        detail: { as_admin: isAdmin },
+      });
 
       return {
         success: true,

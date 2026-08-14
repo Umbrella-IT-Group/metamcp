@@ -1,3 +1,4 @@
+import type { AuditActor } from "@repo/trpc";
 import {
   CreateToolRequestSchema,
   CreateToolResponseSchema,
@@ -10,7 +11,18 @@ import logger from "@/utils/logger";
 
 import { toolsRepository } from "../db/repositories";
 import { ToolsSerializer } from "../db/serializers";
+import { emitAdminEvent } from "../lib/audit/admin-event";
 import { toolsSyncCache } from "../lib/metamcp/tools-sync-cache";
+
+/**
+ * AUDITING NOTE for this file. Both writes below emit only when the database
+ * was actually touched — `create` skips the empty-input branch and `sync`
+ * skips the "tools unchanged" branch. These two procedures are called by the
+ * inspector and the server detail pages on every refresh, so emitting on the
+ * no-op branches would put an admin-triggered, unbounded stream of rows that
+ * record nothing into the same table an incident is read from. A row here
+ * means the shared tools catalog for an MCP server changed.
+ */
 
 export const toolsImplementations = {
   getByMcpServerUuid: async (
@@ -38,6 +50,7 @@ export const toolsImplementations = {
 
   create: async (
     input: z.infer<typeof CreateToolRequestSchema>,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateToolResponseSchema>> => {
     try {
       if (!input.tools || input.tools.length === 0) {
@@ -51,6 +64,13 @@ export const toolsImplementations = {
       const results = await toolsRepository.bulkUpsert({
         tools: input.tools,
         mcpServerUuid: input.mcpServerUuid,
+      });
+
+      emitAdminEvent(actor, {
+        action: "tools.create",
+        target_type: "mcp_server",
+        target_id: input.mcpServerUuid,
+        detail: { upserted: results.length },
       });
 
       return {
@@ -74,6 +94,7 @@ export const toolsImplementations = {
    */
   sync: async (
     input: z.infer<typeof CreateToolRequestSchema>,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof CreateToolResponseSchema>> => {
     try {
       if (!input.tools || input.tools.length === 0) {
@@ -106,6 +127,13 @@ export const toolsImplementations = {
           deleted.length > 0
             ? `Successfully synced ${upserted.length} tools (removed ${deleted.length} obsolete)`
             : `Successfully synced ${upserted.length} tools`;
+
+        emitAdminEvent(actor, {
+          action: "tools.sync",
+          target_type: "mcp_server",
+          target_id: input.mcpServerUuid,
+          detail: { upserted: upserted.length, deleted: deleted.length },
+        });
 
         return {
           success: true as const,

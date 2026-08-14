@@ -1,5 +1,10 @@
 import express from "express";
 
+import {
+  auditRequestContext,
+  credentialFingerprint,
+  emit,
+} from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
@@ -102,6 +107,55 @@ function logTokenIssued(fields: {
   }
 
   logger.info(parts.join(" "));
+}
+
+/**
+ * Record an issued or refreshed access token in `audit_log`.
+ *
+ * The durable twin of `logTokenIssued` above: that writes a grep-friendly
+ * line to a ring buffer that dies on restart, this writes a queryable row
+ * that cannot be cleared. The 2026-08-13 credential chain ran through here
+ * and left nothing durable behind it.
+ *
+ * The token appears ONLY as a `credentialFingerprint` — sha256 plus last-4,
+ * the same shape the MCP bearer detector records on refused requests, which
+ * is deliberate: it means a token minted here and later refused there can be
+ * matched across the two by hash, without either row holding anything usable.
+ */
+function emitTokenIssued(
+  req: express.Request,
+  fields: {
+    action: "oauth.token.issue" | "oauth.token.refresh";
+    grantType: string;
+    clientId: string;
+    clientName?: string | null;
+    userId: string;
+    accessToken: string;
+  },
+): void {
+  const audit = auditRequestContext(req);
+  const fingerprint = credentialFingerprint(fields.accessToken);
+  emit({
+    actor_type: "user",
+    actor_id: fields.userId,
+    actor_label: null,
+    actor_ip: audit.actor_ip,
+    actor_user_agent: audit.actor_user_agent,
+    action: fields.action,
+    target_type: "oauth_client",
+    target_id: fields.clientId,
+    outcome: "success",
+    request_id: audit.request_id,
+    http_status: 200,
+    detail: {
+      grant_type: fields.grantType,
+      // Clamped for the same reason logTokenIssued clamps it: client_name
+      // arrives verbatim from the UNAUTHENTICATED /oauth/register endpoint.
+      client_name: fields.clientName ? fields.clientName.slice(0, 100) : null,
+      access_token_sha256: fingerprint.sha256,
+      access_token_last4: fingerprint.last4,
+    },
+  });
 }
 
 /**
@@ -346,6 +400,17 @@ async function handleAuthorizationCodeGrant(
     accessToken,
   });
 
+  // After issueTokenPair, i.e. after setAccessToken committed the row — a
+  // token that failed to persist must not leave a row saying it was issued.
+  emitTokenIssued(req, {
+    action: "oauth.token.issue",
+    grantType: "authorization_code",
+    clientId: codeData.client_id,
+    clientName: clientData.client_name,
+    userId: codeData.user_id,
+    accessToken,
+  });
+
   res.json({
     access_token: accessToken,
     token_type: "Bearer",
@@ -451,12 +516,84 @@ async function handleRefreshTokenGrant(
     rotatedRefreshToken: true,
   });
 
+  emitTokenIssued(req, {
+    action: "oauth.token.refresh",
+    grantType: "refresh_token",
+    clientId: tokenData.client_id,
+    userId: tokenData.user_id,
+    accessToken,
+  });
+
   res.json({
     access_token: accessToken,
     token_type: "Bearer",
     expires_in: ACCESS_TOKEN_EXPIRY,
     refresh_token: refreshToken,
     scope: tokenData.scope,
+  });
+}
+
+/**
+ * Record an introspection or revocation of a token that ACTUALLY EXISTS.
+ *
+ * WHAT IS AND IS NOT EMITTED HERE, because both endpoints are unauthenticated
+ * and neither carries a rate limiter (unlike /oauth/token and /oauth/register,
+ * which have `rateLimitToken`), and `audit_log` has no prune path:
+ *
+ *  - UNKNOWN token, either endpoint: NOTHING. One anonymous request would
+ *    equal one permanent INSERT recording a string the caller invented, and
+ *    RFC 7009 requires /oauth/revoke to answer 200 to garbage, so the flood is
+ *    not even distinguishable at the wire.
+ *  - REVOKE of a real token: emitted. It is self-limiting — revocation
+ *    DELETES the row, so a replay of the same token finds nothing and writes
+ *    nothing. One row per credential killed, which is the forensic record.
+ *  - INTROSPECT reporting ACTIVE: deliberately NOT emitted. Introspection does
+ *    not consume the token, so unlike revoke it is unbounded: whoever holds
+ *    one stolen credential — the 2026-08-13 scenario exactly — can replay it
+ *    forever, each replay a permanent row. And the event has little to add:
+ *    `oauth.token.issue` already recorded that this credential exists, under
+ *    the same fingerprint. Bounding it properly means mounting a rate limiter
+ *    on a public endpoint, which is a behaviour change for existing resource
+ *    servers and belongs to whoever can verify it against live traffic.
+ *  - INTROSPECT reporting INACTIVE because the ACCOUNT IS DISABLED: emitted.
+ *    That one is bounded by the same argument in reverse — it requires a real
+ *    token belonging to a locked-out account, i.e. a credential an
+ *    administrator has already acted against, and a relying party still asking
+ *    about it is exactly what an incident responder wants to see.
+ *
+ * The token is recorded as a fingerprint only, matching `emitTokenIssued`, so
+ * an operator can follow one credential from mint to revocation by hash.
+ */
+function emitTokenLifecycle(
+  req: express.Request,
+  fields: {
+    action: "oauth.token.introspect" | "oauth.token.revoke";
+    clientId: string;
+    userId: string;
+    token: string;
+    outcome: "success" | "failure";
+    detail?: Record<string, unknown>;
+  },
+): void {
+  const audit = auditRequestContext(req);
+  const fingerprint = credentialFingerprint(fields.token);
+  emit({
+    actor_type: "user",
+    actor_id: fields.userId,
+    actor_label: null,
+    actor_ip: audit.actor_ip,
+    actor_user_agent: audit.actor_user_agent,
+    action: fields.action,
+    target_type: "oauth_client",
+    target_id: fields.clientId,
+    outcome: fields.outcome,
+    request_id: audit.request_id,
+    http_status: 200,
+    detail: {
+      token_sha256: fingerprint.sha256,
+      token_last4: fingerprint.last4,
+      ...(fields.detail ?? {}),
+    },
   });
 }
 
@@ -527,10 +664,22 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
       logger.warn(
         `[oauth] introspect reported inactive reason=disabled client=${tokenData.client_id} user=${tokenData.user_id}`,
       );
+      emitTokenLifecycle(req, {
+        action: "oauth.token.introspect",
+        clientId: tokenData.client_id,
+        userId: tokenData.user_id,
+        token,
+        outcome: "failure",
+        detail: { active: false, reason: "disabled" },
+      });
       return res.json({
         active: false,
       });
     }
+
+    // No audit row on this branch — see emitTokenLifecycle's header. An
+    // active introspection does not consume the token, so it is the one
+    // outcome in this file an attacker can replay without limit.
 
     // Token is active, return introspection details
     res.json({
@@ -575,13 +724,30 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
     }
 
     // Try revoking as access token
-    if (await oauthRepository.getAccessToken(token)) {
+    const accessTokenData = await oauthRepository.getAccessToken(token);
+    if (accessTokenData) {
       await oauthRepository.deleteAccessToken(token);
+      emitTokenLifecycle(req, {
+        action: "oauth.token.revoke",
+        clientId: accessTokenData.client_id,
+        userId: accessTokenData.user_id,
+        token,
+        outcome: "success",
+        detail: { token_type: "access_token" },
+      });
     } else {
       // Try revoking as refresh token
       const tokenData = await oauthRepository.getByRefreshToken(token);
       if (tokenData) {
         await oauthRepository.deleteAccessToken(tokenData.access_token);
+        emitTokenLifecycle(req, {
+          action: "oauth.token.revoke",
+          clientId: tokenData.client_id,
+          userId: tokenData.user_id,
+          token,
+          outcome: "success",
+          detail: { token_type: "refresh_token" },
+        });
       }
       // RFC 7009: return success even if token doesn't exist
     }

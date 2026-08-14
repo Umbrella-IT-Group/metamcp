@@ -1,6 +1,7 @@
 import { randomBytes } from "crypto";
 import express from "express";
 
+import { auditRequestContext, emit } from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
@@ -109,6 +110,56 @@ function clearConsentCookie(
   cid: string,
 ) {
   res.clearCookie(consentCookieName(req, cid), consentCookieOptions(req));
+}
+
+/**
+ * Record a consent decision.
+ *
+ * POST /oauth/authorize/decision is the ONLY place this server mints an
+ * authorization code, so it is the only place a human grants a client access
+ * to their account here — which makes it the single highest-value row in the
+ * OAuth half of the taxonomy. The 2026-08-13 incident turned on exactly this
+ * chain (code -> 24h access token -> 365d refresh token) at a time when there
+ * was no consent screen at all and nothing anywhere recorded that a grant had
+ * happened.
+ *
+ * Fire-and-forget through `emit`; never awaited, never able to fail the
+ * redirect it describes.
+ */
+function emitConsentDecision(
+  req: express.Request,
+  params: {
+    granted: boolean;
+    userId: string | null;
+    clientId: string;
+    redirectUri: string;
+    httpStatus: number;
+    /** Which branch refused, for the denied rows. Omitted on a grant. */
+    reason?: string;
+  },
+): void {
+  const audit = auditRequestContext(req);
+  emit({
+    actor_type: "user",
+    actor_id: params.userId,
+    actor_label: null,
+    actor_ip: audit.actor_ip,
+    actor_user_agent: audit.actor_user_agent,
+    action: params.granted ? "oauth.authorize.grant" : "oauth.authorize.denied",
+    target_type: "oauth_client",
+    target_id: params.clientId,
+    outcome: params.granted ? "success" : "denied",
+    request_id: audit.request_id,
+    http_status: params.httpStatus,
+    // The redirect_uri is WHERE the code was sent, which is the field that
+    // separates a legitimate grant from one aimed at an attacker's host, and
+    // it is registration metadata rather than a secret. The authorization
+    // code itself is never recorded.
+    detail: {
+      redirect_uri: params.redirectUri,
+      ...(params.reason ? { reason: params.reason } : {}),
+    },
+  });
 }
 
 /**
@@ -495,6 +546,14 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
       logger.warn(
         `[oauth] consent rejected reason=csrf client=${consentRequest.client_id} user=${userId}`,
       );
+      emitConsentDecision(req, {
+        granted: false,
+        userId,
+        clientId: consentRequest.client_id,
+        redirectUri: consentRequest.redirect_uri,
+        httpStatus: 403,
+        reason: "csrf",
+      });
       return res.status(403).json({
         error: "access_denied",
         error_description:
@@ -533,6 +592,14 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
       logger.warn(
         `[oauth] consent rejected reason=disabled client=${consentRequest.client_id} user=${userId}`,
       );
+      emitConsentDecision(req, {
+        granted: false,
+        userId,
+        clientId: consentRequest.client_id,
+        redirectUri: consentRequest.redirect_uri,
+        httpStatus: 403,
+        reason: "disabled",
+      });
       return res.status(403).json({
         error: "access_denied",
         error_description:
@@ -555,6 +622,14 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
       logger.info(
         `[oauth] consent denied client=${consentRequest.client_id} user=${userId}`,
       );
+      emitConsentDecision(req, {
+        granted: false,
+        userId,
+        clientId: consentRequest.client_id,
+        redirectUri: consentRequest.redirect_uri,
+        httpStatus: 302,
+        reason: "user_denied",
+      });
       return res.redirect(redirectUrl.toString());
     }
 
@@ -575,6 +650,16 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     logger.info(
       `[oauth] consent granted client=${consentRequest.client_id} user=${userId}`,
     );
+
+    // AFTER setAuthCode: the code exists in the database by this line, so the
+    // row cannot claim a grant that then failed to persist.
+    emitConsentDecision(req, {
+      granted: true,
+      userId,
+      clientId: consentRequest.client_id,
+      redirectUri: consentRequest.redirect_uri,
+      httpStatus: 302,
+    });
 
     res.redirect(redirectUrl.toString());
   } catch (error) {

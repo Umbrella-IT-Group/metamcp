@@ -13,7 +13,13 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the MCP servers router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -23,6 +29,7 @@ export const createMcpServersRouter = (
     create: (
       input: z.infer<typeof CreateMcpServerRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof CreateMcpServerResponseSchema>>;
     // `isAdmin` decides whether the serialized servers keep their connection
     // URL and credential fields (env / bearerToken / headers / command /
@@ -36,6 +43,7 @@ export const createMcpServersRouter = (
     bulkImport: (
       input: z.infer<typeof BulkImportMcpServersRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof BulkImportMcpServersResponseSchema>>;
     get: (
       input: {
@@ -49,10 +57,12 @@ export const createMcpServersRouter = (
         uuid: string;
       },
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof DeleteMcpServerResponseSchema>>;
     update: (
       input: z.infer<typeof UpdateMcpServerRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateMcpServerResponseSchema>>;
     reconnect: (
       input: z.infer<typeof ReconnectMcpServerRequestSchema>,
@@ -91,7 +101,11 @@ export const createMcpServersRouter = (
       .input(CreateMcpServerRequestSchema)
       .output(CreateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.create(input, ctx.user.id);
+        return await implementations.create(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Bulk import MCP servers. Gated even though the brief names
@@ -102,7 +116,11 @@ export const createMcpServersRouter = (
       .input(BulkImportMcpServersRequestSchema)
       .output(BulkImportMcpServersResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.bulkImport(input, ctx.user.id);
+        return await implementations.bulkImport(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Delete MCP server
@@ -110,7 +128,11 @@ export const createMcpServersRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(DeleteMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.delete(input, ctx.user.id);
+        return await implementations.delete(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update MCP server
@@ -118,7 +140,11 @@ export const createMcpServersRouter = (
       .input(UpdateMcpServerRequestSchema)
       .output(UpdateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.update(input, ctx.user.id);
+        return await implementations.update(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Protected (deliberate): Reconnect MCP server (drop pooled upstream

@@ -19,7 +19,13 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the namespaces router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -29,6 +35,7 @@ export const createNamespacesRouter = (
     create: (
       input: z.infer<typeof CreateNamespaceRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof CreateNamespaceResponseSchema>>;
     list: (
       userId: string,
@@ -52,22 +59,27 @@ export const createNamespacesRouter = (
         uuid: string;
       },
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof DeleteNamespaceResponseSchema>>;
     update: (
       input: z.infer<typeof UpdateNamespaceRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceResponseSchema>>;
     updateServerStatus: (
       input: z.infer<typeof UpdateNamespaceServerStatusRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceServerStatusResponseSchema>>;
     updateToolStatus: (
       input: z.infer<typeof UpdateNamespaceToolStatusRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceToolStatusResponseSchema>>;
     updateToolOverrides: (
       input: z.infer<typeof UpdateNamespaceToolOverridesRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceToolOverridesResponseSchema>>;
     refreshTools: (
       input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
@@ -108,7 +120,11 @@ export const createNamespacesRouter = (
       .input(CreateNamespaceRequestSchema)
       .output(CreateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.create(input, ctx.user.id);
+        return await implementations.create(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Delete namespace
@@ -116,7 +132,11 @@ export const createNamespacesRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(DeleteNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.delete(input, ctx.user.id);
+        return await implementations.delete(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update namespace
@@ -124,7 +144,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceRequestSchema)
       .output(UpdateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.update(input, ctx.user.id);
+        return await implementations.update(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update server status within namespace. This is namespace
@@ -135,7 +159,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceServerStatusRequestSchema)
       .output(UpdateNamespaceServerStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.updateServerStatus(input, ctx.user.id);
+        return await implementations.updateServerStatus(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update tool status within namespace. Curation, same
@@ -144,7 +172,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceToolStatusRequestSchema)
       .output(UpdateNamespaceToolStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.updateToolStatus(input, ctx.user.id);
+        return await implementations.updateToolStatus(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update tool overrides within namespace. Curation, same
@@ -153,7 +185,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceToolOverridesRequestSchema)
       .output(UpdateNamespaceToolOverridesResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.updateToolOverrides(input, ctx.user.id);
+        return await implementations.updateToolOverrides(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Protected (deliberate): re-lists tools over the existing pooled

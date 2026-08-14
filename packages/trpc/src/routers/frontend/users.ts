@@ -11,7 +11,12 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  router,
+} from "../../trpc";
 
 export const createUsersRouter = (implementations: {
   list: () => Promise<z.infer<typeof ListUsersResponseSchema>>;
@@ -21,14 +26,17 @@ export const createUsersRouter = (implementations: {
   setDisabled: (
     input: z.infer<typeof SetUserDisabledRequestSchema>,
     actorUserId: string,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof SetUserDisabledResponseSchema>>;
   revokeAccess: (
     input: z.infer<typeof RevokeUserAccessRequestSchema>,
     actorUserId: string,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof RevokeUserAccessResponseSchema>>;
   delete: (
     input: z.infer<typeof DeleteUserRequestSchema>,
     actorUserId: string,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof DeleteUserResponseSchema>>;
 }) => {
   return router({
@@ -76,7 +84,7 @@ export const createUsersRouter = (implementations: {
       .input(SetUserDisabledRequestSchema)
       .output(SetUserDisabledResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return implementations.setDisabled(input, ctx.user.id);
+        return implementations.setDisabled(input, ctx.user.id, auditActor(ctx));
       }),
 
     // Admin only: sever an account's live access (sessions, OAuth tokens and
@@ -88,7 +96,11 @@ export const createUsersRouter = (implementations: {
       .input(RevokeUserAccessRequestSchema)
       .output(RevokeUserAccessResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return implementations.revokeAccess(input, ctx.user.id);
+        return implementations.revokeAccess(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: delete the account. Every FK into `users` is ON DELETE
@@ -102,7 +114,7 @@ export const createUsersRouter = (implementations: {
       .input(DeleteUserRequestSchema)
       .output(DeleteUserResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return implementations.delete(input, ctx.user.id);
+        return implementations.delete(input, ctx.user.id, auditActor(ctx));
       }),
   });
 };
