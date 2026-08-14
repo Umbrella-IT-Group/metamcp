@@ -221,6 +221,82 @@ describe("THE SAFETY PROPERTY — the gate outranks the logging", () => {
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
+  it("a registered sink that REJECTS does not reach the caller OR the process", async () => {
+    // The landmine this guards: `TrpcAuditSink` permits `Promise<void>`, and
+    // even a `=> void` signature could not have excluded an async function
+    // (TypeScript assigns `() => Promise<void>` to `() => void`). An
+    // unhandled rejection is not a lost log line under Node's default
+    // `--unhandled-rejections=throw` — it is the gateway process exiting.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    setTrpcAuditSink(() => Promise.reject(new Error("async sink exploded")));
+
+    try {
+      await expect(
+        buildRouter().createCaller(memberCtx).get({}),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+      await expect(
+        buildRouter().createCaller(anonymousCtx).get({}),
+      ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+
+      // Two full macrotask turns: an unhandled rejection is only reported
+      // after the microtask queue drains, so asserting sooner would pass even
+      // with the guard removed.
+      await flush();
+      await flush();
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("an ASYNC sink that rejects does not break the SUCCESS path", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    setTrpcAuditSink(async () => {
+      throw new Error("async sink exploded");
+    });
+
+    try {
+      await expect(
+        buildRouter().createCaller(adminCtx).get({}),
+      ).resolves.toMatchObject({ success: true });
+      await flush();
+      await flush();
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("a hostile ctx.user cannot turn the FORBIDDEN into a 500", async () => {
+    // The event is built from `ctx.user`, which is typed `any`. Building it
+    // outside the guard would let a throwing property read replace the
+    // security answer with an INTERNAL_SERVER_ERROR — the audit path silently
+    // changing what the gate decided.
+    const hostileCtx = {
+      user: {
+        role: "member",
+        get id(): string {
+          throw new Error("hostile getter");
+        },
+      },
+      session: { id: "s-hostile" },
+      audit: AUDIT,
+    };
+
+    await expect(
+      buildRouter().createCaller(hostileCtx).get({}),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
   it("a throwing sink does not break the SUCCESS path either", async () => {
     setTrpcAuditSink(() => {
       throw new Error("registered sink exploded");

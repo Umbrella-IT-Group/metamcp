@@ -146,10 +146,15 @@ describeIfDb("audit_log against a REAL postgres", () => {
 
   afterAll(async () => {
     if (!TEST_DATABASE_URL || !db) return;
-    // Deliberately no cleanup: every removal verb is blocked, which is the
+    // Deliberately no row cleanup: every removal verb is blocked, which is the
     // whole point. Use a disposable database.
+    //
+    // TWO pools to close. The repository writes through its own bounded pool
+    // (see ../audit-db) so an audit flood cannot starve the auth path; leaving
+    // it open here hangs the vitest worker.
     const { pool } = await import("../index");
-    await pool.end();
+    const { auditPool } = await import("../audit-db");
+    await Promise.all([pool.end(), auditPool.end()]);
   });
 
   it("accepts the INSERT the repository makes", async () => {

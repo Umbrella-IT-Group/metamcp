@@ -45,7 +45,18 @@ export interface TrpcDenialEvent {
   audit?: AuditRequestContext;
 }
 
-export type TrpcAuditSink = (event: TrpcDenialEvent) => void;
+/**
+ * `void | Promise<void>` is deliberate, not permissive.
+ *
+ * A plain `=> void` return type would NOT keep an async sink out — TypeScript
+ * happily assigns `() => Promise<void>` to `() => void` (return-type
+ * bivariance for void). So the type could never have been the guard, and
+ * pretending it was is how an async sink gets registered by a future lane
+ * without anyone noticing. Declaring the async case makes it visible AND
+ * makes `emitDenial`'s rejection handling obviously load-bearing rather than
+ * defensive noise.
+ */
+export type TrpcAuditSink = (event: TrpcDenialEvent) => void | Promise<void>;
 
 let auditSink: TrpcAuditSink | null = null;
 
@@ -63,18 +74,36 @@ export function setTrpcAuditSink(sink: TrpcAuditSink | null): void {
  * Emit a denial, and NEVER let that emission affect the request.
  *
  * The two call sites are the RBAC choke point for every admin-gated mutation
- * in the product and the authentication gate in front of it. A throw escaping
- * here would not lose an audit row — it would replace a clean FORBIDDEN or
- * UNAUTHORIZED with a 500 on every denied call, and (worse) a sink that
- * threw on the SUCCESS path would break the product outright. The registered
- * sink is itself fire-and-forget, but this boundary does not get to assume
- * that: `apps/backend/src/trpc/rbac-denial-audit.test.ts` registers a sink
- * that throws, and deleting this try/catch makes that case fail with the
- * sink's own error in place of FORBIDDEN.
+ * in the product and the authentication gate in front of it. A failure
+ * escaping here would not lose an audit row — it would replace a clean
+ * FORBIDDEN or UNAUTHORIZED with a 500 on every denied call, and (worse) a
+ * sink that failed on the SUCCESS path would break the product outright.
+ *
+ * THREE failure modes are swallowed, and all three are reachable:
+ *
+ *  1. `build()` throwing. The event is constructed from `ctx.user` and
+ *     `ctx.audit`, which are typed `any`/optional — a property access on a
+ *     hostile or exotic object can throw. Building INSIDE the guard is why
+ *     this takes a thunk instead of a finished event: with the construction
+ *     outside, a throwing getter on `ctx.user` would turn the rethrown
+ *     FORBIDDEN into an INTERNAL_SERVER_ERROR.
+ *  2. The sink throwing synchronously.
+ *  3. The sink REJECTING. `TrpcAuditSink` allows `Promise<void>` (and even a
+ *     `=> void` signature could not have excluded it — see the type). An
+ *     unhandled rejection is process death under Node's default
+ *     `--unhandled-rejections=throw`, i.e. the entire gateway, not one
+ *     request. `Promise.resolve(...)` normalises the sync and async cases so
+ *     one `.catch` covers both.
+ *
+ * `apps/backend/src/trpc/rbac-denial-audit.test.ts` registers a throwing sink
+ * and a rejecting sink and asserts the caller still gets its normal denial.
  */
-function emitDenial(event: TrpcDenialEvent): void {
+function emitDenial(build: () => TrpcDenialEvent): void {
   try {
-    auditSink?.(event);
+    const event = build();
+    void Promise.resolve(auditSink?.(event)).catch(() => {
+      // Swallowed by design — see above.
+    });
   } catch {
     // Swallowed by design — see above.
   }
@@ -144,8 +173,10 @@ export const protectedProcedure = t.procedure.use(
       // Every unauthenticated tRPC attempt in the product funnels through this
       // one branch, so one emit here covers the whole surface. Emitted BEFORE
       // the throw, and by a helper that cannot throw, so the caller still gets
-      // its normal UNAUTHORIZED whatever the audit sink does.
-      emitDenial({
+      // its normal UNAUTHORIZED whatever the audit sink does. The event is
+      // built inside the thunk so even reading `ctx.audit` happens under the
+      // guard.
+      emitDenial(() => ({
         action: "authn.denied",
         actor_type: "anonymous",
         actor_id: null,
@@ -154,7 +185,7 @@ export const protectedProcedure = t.procedure.use(
         type,
         http_status: 401,
         audit: ctx.audit,
-      });
+      }));
       throw new TRPCError({
         code: "UNAUTHORIZED",
         message: "You must be logged in to access this resource",
@@ -207,16 +238,25 @@ export const adminProcedure = protectedProcedure.use(
       // directly unit-testable predicate (admin-procedure.test.ts calls it with
       // no context at all), and rethrown untouched so the FORBIDDEN the caller
       // sees is byte-identical to before.
-      const actor = actorFields(ctx.user);
-      emitDenial({
-        action: "rbac.denied",
-        actor_type: "user",
-        actor_id: actor.id,
-        actor_label: actor.label,
-        path,
-        type,
-        http_status: 403,
-        audit: ctx.audit,
+      //
+      // `actorFields(ctx.user)` is evaluated INSIDE the thunk. `ctx.user` is
+      // typed `any` and reaches here from JSON, but a property read on an
+      // exotic object can throw, and outside the thunk that throw would
+      // replace this rethrown FORBIDDEN with an INTERNAL_SERVER_ERROR — the
+      // audit path silently changing the security answer, which is the one
+      // thing it must never do.
+      emitDenial(() => {
+        const actor = actorFields(ctx.user);
+        return {
+          action: "rbac.denied",
+          actor_type: "user",
+          actor_id: actor.id,
+          actor_label: actor.label,
+          path,
+          type,
+          http_status: 403,
+          audit: ctx.audit,
+        };
       });
       throw error;
     }

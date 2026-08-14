@@ -1,4 +1,4 @@
-import { db } from "../index";
+import { auditDb } from "../audit-db";
 import { auditLogTable } from "../schema";
 
 export interface AuditLogEntry {
@@ -37,10 +37,18 @@ export interface AuditLogEntry {
  * imports this module LAZILY to keep its own module graph DB-free for unit
  * tests (same doctrine as `tool-call-audit.repo.ts` and
  * `consumer-identity-resolver.ts`).
+ *
+ * CONNECTION ISOLATION: this is the one repository that does NOT use the
+ * shared `db` from `../index`. It writes through `auditDb`, a two-connection
+ * pool with a 1s checkout timeout, so that an unauthenticated request flood —
+ * which emits one INSERT per refused request by design — cannot exhaust the
+ * connections the AUTH path needs to refuse it. Read `../audit-db` before
+ * changing this import back; the failure mode it prevents is "logging the
+ * attack starves the code that stops the attack".
  */
 export class AuditLogRepository {
   async record(entry: AuditLogEntry): Promise<void> {
-    await db.insert(auditLogTable).values(entry);
+    await auditDb.insert(auditLogTable).values(entry);
   }
 }
 
