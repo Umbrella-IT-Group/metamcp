@@ -6,7 +6,7 @@ import {
   OAuthClient,
   OAuthClientCreateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, gt, isNull, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, lt, notExists, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import {
@@ -68,6 +68,60 @@ export class OAuthRepository {
       .returning({ client_id: oauthClientsTable.client_id });
 
     return deleted.length > 0;
+  }
+
+  // Retention sweep for anonymous dynamic registrations: delete clients that
+  // were created longer ago than `olderThanDays` and have NEVER produced an
+  // authorization code or an access token.
+  //
+  // `/oauth/register` needs no credential, so this is the only table in the
+  // schema an unauthenticated caller can grow without bound. See
+  // ../../routers/oauth/client-retention.ts for why "no child rows" is a sound
+  // never-used test here (it rests on the 365-day refresh TTL keeping a token
+  // row alive for any client that ever paired) and for the env that tunes it.
+  //
+  // NOT EXISTS rather than a LEFT JOIN with an IS NULL: the join form would
+  // multiply the client row by its children before filtering, and postgres can
+  // answer the anti-join directly off the two client_id indexes. `returning`
+  // gives the caller a real count, so the log line reports what happened
+  // instead of that the statement ran.
+  async pruneUnusedClients(olderThanDays: number): Promise<number> {
+    if (!Number.isFinite(olderThanDays) || olderThanDays <= 0) return 0;
+
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+
+    const deleted = await db
+      .delete(oauthClientsTable)
+      .where(
+        and(
+          lt(oauthClientsTable.created_at, cutoff),
+          notExists(
+            db
+              .select({ one: sql`1` })
+              .from(oauthAuthorizationCodesTable)
+              .where(
+                eq(
+                  oauthAuthorizationCodesTable.client_id,
+                  oauthClientsTable.client_id,
+                ),
+              ),
+          ),
+          notExists(
+            db
+              .select({ one: sql`1` })
+              .from(oauthAccessTokensTable)
+              .where(
+                eq(
+                  oauthAccessTokensTable.client_id,
+                  oauthClientsTable.client_id,
+                ),
+              ),
+          ),
+        ),
+      )
+      .returning({ client_id: oauthClientsTable.client_id });
+
+    return deleted.length;
   }
 
   // ===== Authorization Codes =====

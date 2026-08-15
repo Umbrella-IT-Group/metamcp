@@ -14,6 +14,7 @@ import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
+import { isOAuthServedPath } from "./routers/oauth/utils";
 import publicEndpointsRouter from "./routers/public-metamcp";
 import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
@@ -35,6 +36,14 @@ app.use(auditContextMiddleware);
 app.use((req, res, next) => {
   if (req.path.startsWith("/mcp-proxy/") || req.path.startsWith("/metamcp/")) {
     // Skip JSON parsing for all MCP proxy routes and public endpoints to allow raw stream access
+    next();
+  } else if (isOAuthServedPath(req.path)) {
+    // Skipped so the OAuth router's OWN parser binds. body-parser marks a
+    // request as read (`req._body`) and every later parser no-ops against it,
+    // so whichever one runs FIRST sets the ceiling — which meant `/oauth/*`
+    // inherited 50mb here and the router's own limit never applied. The
+    // anonymous, no-credential `POST /oauth/register` was the write that
+    // ceiling governed. See OAUTH_BODY_LIMIT in ./routers/oauth/utils.
     next();
   } else {
     express.json({ limit: "50mb" })(req, res, next);
