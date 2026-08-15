@@ -10,6 +10,14 @@
  * lib/metamcp/mcp-server-pool.test.ts); they assert the impl calls the
  * right cascade, honors the owner trust boundary, and treats the
  * namespace fan-out as best-effort without swallowing a primary failure.
+ *
+ * The trust boundary has two halves and only one of them is expressible as
+ * ownership. A PUBLIC server carries no `user_id`, so the owner comparison
+ * is vacuously true for every caller and each of them used to reach the
+ * cascade — which drops every pooled connection to a shared server. The
+ * `isAdmin` argument, threaded from `ctx.user.role` at the router, is what
+ * decides that half; the suite below pins both halves and the deliberate
+ * non-exemption of admins on someone else's private server.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -108,6 +116,7 @@ describe("mcpServers.reconnect implementation", () => {
     const result = await mcpServersImplementations.reconnect(
       { uuid: "server-1" },
       "user-1",
+      true,
     );
 
     expect(result.success).toBe(true);
@@ -141,6 +150,7 @@ describe("mcpServers.reconnect implementation", () => {
     const result = await mcpServersImplementations.reconnect(
       { uuid: "server-1" },
       "user-1",
+      true,
     );
 
     expect(result.success).toBe(true);
@@ -153,14 +163,55 @@ describe("mcpServers.reconnect implementation", () => {
     expect(clearOverrideCache).not.toHaveBeenCalled();
   });
 
-  it("lets a user reconnect a public (unowned) server", async () => {
+  it("denies a NON-ADMIN reconnecting a public (unowned) server and runs no cascade", async () => {
+    // The BFLA this argument exists for: `user_id` is NULL on a public
+    // server, so the owner comparison below it passes for everyone. Any
+    // member could drop every pooled connection to a shared server.
     vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(
       fakeServer({ user_id: null }),
     );
 
     const result = await mcpServersImplementations.reconnect(
       { uuid: "server-1" },
-      "anyone",
+      "member-1",
+      false,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("Access denied");
+    expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
+    expect(serverErrorTracker.resetServerErrorState).not.toHaveBeenCalled();
+    expect(
+      namespaceMappingsRepository.findNamespacesByServerUuid,
+    ).not.toHaveBeenCalled();
+  });
+
+  it("lets an ADMIN reconnect a public (unowned) server", async () => {
+    vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(
+      fakeServer({ user_id: null }),
+    );
+
+    const result = await mcpServersImplementations.reconnect(
+      { uuid: "server-1" },
+      "admin-1",
+      true,
+    );
+
+    expect(result.success).toBe(true);
+    expect(mcpServerPool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a NON-ADMIN owner reconnect their OWN private server", async () => {
+    // The reason this is not adminProcedure: gating the whole mutation on
+    // role would take this away.
+    vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(
+      fakeServer({ user_id: "owner-A" }),
+    );
+
+    const result = await mcpServersImplementations.reconnect(
+      { uuid: "server-1" },
+      "owner-A",
+      false,
     );
 
     expect(result.success).toBe(true);
@@ -175,12 +226,32 @@ describe("mcpServers.reconnect implementation", () => {
     const result = await mcpServersImplementations.reconnect(
       { uuid: "server-1" },
       "user-B",
+      false,
     );
 
     expect(result.success).toBe(false);
     expect(result.message).toContain("Access denied");
     expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
     expect(serverErrorTracker.resetServerErrorState).not.toHaveBeenCalled();
+  });
+
+  it("does not exempt an ADMIN from another user's PRIVATE server", async () => {
+    // Deliberate, and unchanged by the public-server gate: an admin who
+    // needs to act on a member's own server has the admin-gated
+    // update/delete paths for it.
+    vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(
+      fakeServer({ user_id: "owner-A" }),
+    );
+
+    const result = await mcpServersImplementations.reconnect(
+      { uuid: "server-1" },
+      "admin-1",
+      true,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("Access denied");
+    expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
   });
 
   it("returns not-found and runs no cascade when the server does not exist", async () => {
@@ -191,6 +262,7 @@ describe("mcpServers.reconnect implementation", () => {
     const result = await mcpServersImplementations.reconnect(
       { uuid: "missing" },
       "user-1",
+      false,
     );
 
     expect(result.success).toBe(false);
@@ -207,6 +279,7 @@ describe("mcpServers.reconnect implementation", () => {
     const result = await mcpServersImplementations.reconnect(
       { uuid: "server-1" },
       "user-1",
+      true,
     );
 
     expect(result.success).toBe(false);
@@ -225,6 +298,7 @@ describe("mcpServers.reconnect implementation", () => {
     const result = await mcpServersImplementations.reconnect(
       { uuid: "server-1" },
       "user-1",
+      true,
     );
 
     // Primary cascade already dropped the connections + fired list_changed;

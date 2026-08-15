@@ -1,7 +1,10 @@
 import express from "express";
 
-import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
+import { betterAuthMcpMiddleware } from "@/middleware/better-auth-mcp.middleware";
+import { INTERNAL_ERROR_BODY } from "@/middleware/error-handler.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
+import { requireAdminMcpMiddleware } from "@/middleware/require-admin-mcp.middleware";
+import { requireEnabledMcpMiddleware } from "@/middleware/require-enabled-mcp.middleware";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
@@ -14,18 +17,54 @@ const adminRouter = express.Router();
 adminRouter.use(express.json());
 
 /**
+ * The gate both routes below carry, session-authenticated and admin-only.
+ *
+ * These two routes are mounted on the PUBLIC `/metamcp` router next to the
+ * API-key data plane, and they used to be gated by `authenticateApiKey`
+ * alone — the same key any endpoint consumer holds, with no role check. That
+ * made two estate-wide operations reachable by every API key on the gateway:
+ * `reset-errors` with no body resets the circuit breaker for EVERY server in
+ * ERROR state and triggers a re-initialization sweep, and `error-status`
+ * answers with `findAll()`, the whole server inventory, not the servers
+ * behind the endpoint named in the URL. Neither operation is scoped to the
+ * endpoint the caller authenticated against, so scoping the key would not
+ * have been enough: this is an operator control panel, and it belongs on the
+ * human plane with the rest of them.
+ *
+ * Same three middlewares, same order, as the whole `/mcp-proxy` surface
+ * (`routers/mcp-proxy.ts`): authenticate from the session cookie, re-read
+ * `users.disabled` for that id, then check the role. Applied INLINE per route
+ * rather than through `adminRouter.use()` on purpose — this router is
+ * `use()`d by `public-metamcp.ts` ahead of the endpoint data plane's own
+ * fall-through, so a router-level session middleware here would sit in front
+ * of API-key traffic that must never be asked for a cookie.
+ *
+ * `lookupEndpoint` stays FIRST, ahead of authentication, so an unknown
+ * endpoint name still answers 404 rather than 401. That ordering is
+ * unchanged from the API-key version, so it discloses nothing it did not
+ * disclose before.
+ *
+ * Spelled out on each route below rather than hoisted into a shared array,
+ * so a route added to this file later has to state its own gate instead of
+ * inheriting one by accident.
+ */
+
+/**
  * POST /metamcp/admin/reset-errors
  *
  * Resets ERROR state for MCP servers without requiring a full backend restart.
  * Optionally targets a specific server by UUID, or resets all if no UUID given.
  *
  * Body: { "serverUuid": "optional-specific-uuid" }
- * Auth: Same API key as MCP endpoints (X-API-Key header)
+ * Auth: better-auth session cookie, enabled account, admin role — see the
+ * block above.
  */
 adminRouter.post(
   "/:endpoint_name/admin/reset-errors",
   lookupEndpoint,
-  authenticateApiKey,
+  betterAuthMcpMiddleware,
+  requireEnabledMcpMiddleware,
+  requireAdminMcpMiddleware,
   async (req, res) => {
     try {
       const { serverUuid } = req.body || {};
@@ -72,12 +111,13 @@ adminRouter.post(
             : "No servers were in ERROR state.",
       });
     } catch (error) {
+      // The detail goes to the server log and nowhere else, the same rule
+      // the terminal handler follows (@/middleware/error-handler.middleware,
+      // whose body constant this is). The failures reachable here come from
+      // the repository and the pool, so `error.message` routinely names
+      // internal hosts, table names and server UUIDs.
       logger.error("Admin API: Error resetting server errors:", error);
-      res.status(500).json({
-        success: false,
-        error: "Failed to reset server errors",
-        message: error instanceof Error ? error.message : String(error),
-      });
+      res.status(500).json(INTERNAL_ERROR_BODY);
     }
   },
 );
@@ -85,12 +125,19 @@ adminRouter.post(
 /**
  * GET /metamcp/admin/error-status
  *
- * Returns current error status of all servers (for diagnostics).
+ * Returns current error status of all servers (for diagnostics). The
+ * `findAll()` below is the whole inventory rather than the endpoint's own
+ * servers, which is why this needs the same admin gate as the reset route
+ * and not merely a scoped key.
+ *
+ * Auth: better-auth session cookie, enabled account, admin role.
  */
 adminRouter.get(
   "/:endpoint_name/admin/error-status",
   lookupEndpoint,
-  authenticateApiKey,
+  betterAuthMcpMiddleware,
+  requireEnabledMcpMiddleware,
+  requireAdminMcpMiddleware,
   async (req, res) => {
     try {
       const allServers = await mcpServersRepository.findAll();

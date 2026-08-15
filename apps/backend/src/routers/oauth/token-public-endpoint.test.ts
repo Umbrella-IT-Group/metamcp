@@ -51,6 +51,17 @@ vi.mock("../../db/repositories", () => ({
   usersRepository: usersRepositoryMock,
 }));
 
+// The RFC 7662 credential gate on /oauth/introspect lives in its own module
+// and has its own tests (./introspection-auth.test.ts). Stubbed to "authorized"
+// here so the branches this file was written for stay reachable — without it
+// every introspect assertion below would collapse into the same 401.
+vi.mock("./introspection-auth", () => ({
+  requireIntrospectionCredential: vi.fn(async () => ({
+    ok: true,
+    userId: null,
+  })),
+}));
+
 const { default: tokenRouter } = await import("./token");
 
 const CLIENT_ID = "mcp_client_test";

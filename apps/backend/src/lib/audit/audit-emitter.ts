@@ -23,8 +23,25 @@ import logger from "@/utils/logger";
  *      rather than re-attempting the import per event);
  *   3. the write itself is a detached promise with a `.catch`.
  *
- * Failures log at debug only. An audit sink that shouts on every write error
- * turns a database blip into a log flood on the exact paths that are hottest.
+ * Failures are RATE-LIMITED WARNs, and both halves of that are load-bearing.
+ *
+ * WARN, because silent loss is indistinguishable from no attack. `audit_log`
+ * carries BEFORE UPDATE / DELETE / TRUNCATE triggers and no prune path
+ * (migration 0028), so a row that was never written can never be recovered,
+ * and the audit pool is deliberately `max: 2` with a 1s checkout timeout
+ * (`db/audit-db`) — dropping rows under flood is DESIGNED behaviour rather
+ * than a fault. Dropping them INVISIBLY is the fault: production runs
+ * `LOG_LEVEL=info`, whose console floor in `utils/logger` is INFO, so a debug
+ * line reaches `app.log` but never the console an operator actually watches. A
+ * responder reading the container log mid-incident would see a clean log while
+ * the table quietly lost the rows they came to read.
+ *
+ * RATE-LIMITED, because the original debug was not simply a mistake. These
+ * emitters sit on the hottest denial paths in the gateway and a database
+ * outage fails EVERY one of them, so a line per failure is a flood that buries
+ * its own cause. At most one line a minute, each carrying a running count of
+ * rows lost since startup, says the same thing and stays readable. See
+ * `reportAuditWriteFailure` for why the count is a total and not a delta.
  *
  * Same discipline (and the same lazy-import trick) as
  * `lib/metamcp/metamcp-middleware/auditing.functional.ts`, which has carried
@@ -102,6 +119,62 @@ export function setAuditSinkForTesting(
   auditSink = sink;
 }
 
+/** How long one reported failure suppresses the next report. */
+const AUDIT_FAILURE_REPORT_INTERVAL_MS = 60 * 1000;
+
+let auditFailuresTotal = 0;
+let lastAuditFailureReportAt = 0;
+
+/** Test seam: forget the counter and the throttle window. */
+export function resetAuditFailureReportingForTesting(): void {
+  auditFailuresTotal = 0;
+  lastAuditFailureReportAt = 0;
+}
+
+/**
+ * Make a dropped audit row DETECTABLE without making an outage unreadable.
+ *
+ * The count is what turns the line into a signal: "1 row lost" is a connection
+ * that got recycled, "18,400 rows lost" is the sink being down during
+ * something. The first failure reports IMMEDIATELY — detection must not wait
+ * out a window — so that first line necessarily says 1, and the throttle then
+ * holds the next report back.
+ *
+ * A RUNNING TOTAL since startup, not a per-window delta, and that is the
+ * non-obvious part. A delta is stranded whenever the burst that produced it
+ * stops before the next report fires: the line saying "49 more" never prints,
+ * and silent loss is the exact thing this function exists to end. A total
+ * cannot be stranded the same way — whenever the next line prints, it still
+ * accounts for every failure that came before it. The cost is that two lines
+ * must be subtracted to get a rate, which is the normal shape of a counter.
+ *
+ * Deliberately WARN and not ERROR. A lost audit row is a degraded record, not
+ * a failed request — the caller was still authenticated, still authorised or
+ * refused, still answered. Routing it to `error.log` would put it in front of
+ * whatever pages on ERROR, and an audit sink that pages on a database blip is
+ * an audit sink someone eventually turns off.
+ */
+function reportAuditWriteFailure(
+  stage: "write" | "emit",
+  error: unknown,
+): void {
+  auditFailuresTotal += 1;
+  const now = Date.now();
+  // The `!== 0` half matters under a mocked clock: a suite that pins Date to
+  // the epoch would otherwise have its very first failure silently swallowed.
+  if (
+    lastAuditFailureReportAt !== 0 &&
+    now - lastAuditFailureReportAt < AUDIT_FAILURE_REPORT_INTERVAL_MS
+  ) {
+    return;
+  }
+  lastAuditFailureReportAt = now;
+  logger.warn(
+    `[audit] ${stage} failed, ${auditFailuresTotal} audit row(s) lost since startup (request unaffected):`,
+    error,
+  );
+}
+
 /**
  * Record a security event. Returns immediately; the write happens detached.
  *
@@ -113,13 +186,13 @@ export function emit(event: AuditEvent): void {
     void resolveSink()
       .then((sink) => sink?.(event))
       .catch((error) => {
-        logger.debug("[audit] write failed (ignored):", error);
+        reportAuditWriteFailure("write", error);
       });
   } catch (error) {
     // Defence in depth: `resolveSink()` is async and should never throw
     // synchronously, but a future refactor that makes it sync must not be
     // able to turn a logging failure into a 500 on the auth path.
-    logger.debug("[audit] emit failed (ignored):", error);
+    reportAuditWriteFailure("emit", error);
   }
 }
 
@@ -144,6 +217,34 @@ export interface AuditRequestContext {
 }
 
 /**
+ * Clamp budgets for the two envelope fields a CALLER controls.
+ *
+ * `actor_user_agent` and `actor_ip` are the only columns outside `detail` that
+ * arrive verbatim from a request header, and both are written on paths that
+ * need no credential at all: every no-credential 401 on `/metamcp/*` emits,
+ * and so does every anonymous `protectedProcedure` miss on `/trpc`. Node caps
+ * a header block at `http.maxHeaderSize` (16KB by default), so these were
+ * never truly unbounded — but 16KB per row is not a bound worth writing to an
+ * append-only table. Migration 0028 gives `audit_log` BEFORE UPDATE / DELETE /
+ * TRUNCATE triggers and no prune path, so a row's SIZE is exactly as permanent
+ * as its contents, and `clampAuditText` below already applies that reasoning
+ * to `detail`. These two columns were simply never routed through it.
+ *
+ * 512 for the User-Agent: real agent strings — browsers, `claude-mcp/*`,
+ * curl — run well under 200 characters, so 512 leaves a padded one still
+ * identifiable while capping what one request can cost the archive.
+ *
+ * 64 for the IP: the longest legitimate value this column can hold is an IPv6
+ * address, whose maximum textual form (the IPv4-mapped shape,
+ * `0:0:0:0:0:ffff:255.255.255.255` written out in full) is 45 characters, plus
+ * room for a zone id. Anything past that is not an address, so truncating it
+ * costs no evidence: the row still records that a malformed value was
+ * presented, which is the part a responder reads.
+ */
+export const AUDIT_USER_AGENT_MAX = 512;
+export const AUDIT_IP_MAX = 64;
+
+/**
  * Build the request half of the envelope.
  *
  * `actor_ip` comes from the middleware's CF-Connecting-IP read, NOT from
@@ -158,8 +259,12 @@ export function auditRequestContext(
   const attributed = req as AuditAttributedRequest | undefined | null;
   const ua = attributed?.headers?.["user-agent"];
   return {
+    // `auditClientIp` is already clamped where it is stamped, in
+    // middleware/audit-context.middleware — clamping again here would only
+    // hide a regression there.
     actor_ip: attributed?.auditClientIp ?? null,
-    actor_user_agent: typeof ua === "string" ? ua : null,
+    actor_user_agent:
+      typeof ua === "string" ? clampAuditText(ua, AUDIT_USER_AGENT_MAX) : null,
     request_id: attributed?.auditRequestId ?? null,
   };
 }
@@ -264,9 +369,19 @@ export function auditContextFromHook(context: unknown): AuditRequestContext {
       | null
       | undefined;
     const bags = [candidate?.headers, candidate?.request?.headers];
+    // Clamped here too, and not only in `auditRequestContext`. This path reads
+    // the User-Agent straight off the caller's headers rather than from the
+    // relay, and `readHeader` falls through to `request.headers` — the bag the
+    // caller filled — when the relay's own bag cannot answer. It runs on
+    // sign-up and sign-in, which are reachable without a session, so leaving
+    // it unclamped would leave the hole open on the one path an anonymous
+    // caller can drive.
+    const ip = readHeader(bags, AUDIT_CLIENT_IP_HEADER);
+    const ua = readHeader(bags, "user-agent");
     return {
-      actor_ip: readHeader(bags, AUDIT_CLIENT_IP_HEADER),
-      actor_user_agent: readHeader(bags, "user-agent"),
+      actor_ip: ip === null ? null : clampAuditText(ip, AUDIT_IP_MAX),
+      actor_user_agent:
+        ua === null ? null : clampAuditText(ua, AUDIT_USER_AGENT_MAX),
       request_id: readHeader(bags, AUDIT_REQUEST_ID_HEADER),
     };
   } catch {

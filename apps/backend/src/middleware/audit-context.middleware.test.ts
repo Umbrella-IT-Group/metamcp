@@ -17,6 +17,7 @@ import express from "express";
 import { describe, expect, it } from "vitest";
 
 import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
+import { AUDIT_IP_MAX } from "@/lib/audit/audit-emitter";
 
 import {
   auditContextMiddleware,
@@ -91,6 +92,31 @@ describe("resolveClientIp", () => {
   it("treats an empty header as absent rather than as an IP of ''", () => {
     expect(resolveClientIp({ [CLIENT_IP_HEADER]: "   " })).toBeUndefined();
     expect(resolveClientIp({})).toBeUndefined();
+  });
+
+  /**
+   * The clamp lives here rather than at each emitter because every audit row's
+   * `actor_ip` and every relay-stamped `x-audit-client-ip` is read from what
+   * this function returns. `audit_log` is append-only by trigger (migration
+   * 0028), so an oversized value written once is permanent.
+   */
+  it("clamps an absurdly long header value rather than storing it whole", () => {
+    const hostile = "9".repeat(4_000);
+
+    const resolved = resolveClientIp({ [CLIENT_IP_HEADER]: hostile });
+
+    expect(resolved).toHaveLength(AUDIT_IP_MAX);
+    expect(resolved).toBe(hostile.slice(0, AUDIT_IP_MAX));
+  });
+
+  it("leaves a full-length IPv6 address with a zone id intact", () => {
+    // The longest value this column can legitimately hold: the IPv4-mapped
+    // IPv6 form written out in full (45 characters) plus a zone id. If the
+    // budget ever stops covering this, it is too small.
+    const longest = "0000:0000:0000:0000:0000:ffff:255.255.255.255%eth0";
+
+    expect(longest.length).toBeLessThan(AUDIT_IP_MAX);
+    expect(resolveClientIp({ [CLIENT_IP_HEADER]: longest })).toBe(longest);
   });
 
   it("does NOT fall back to X-Forwarded-For", () => {
