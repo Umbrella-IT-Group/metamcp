@@ -20,6 +20,7 @@ vi.mock("@/utils/logger", () => ({
 const {
   assertPublicMcpUrl,
   createGuardedFetch,
+  createPinnedAgent,
   isBlockedSsrfAddress,
   NOT_A_PERMITTED_TARGET,
   TOO_MANY_REDIRECTS,
@@ -61,6 +62,11 @@ describe("isBlockedSsrfAddress — IPv4", () => {
     ["100.127.255.255", "carrier-grade NAT, top of the /10"],
     ["224.0.0.1", "multicast"],
     ["255.255.255.255", "broadcast"],
+    ["192.0.0.1", "IETF protocol assignments"],
+    ["192.0.0.170", "IETF protocol assignments (NAT64 discovery)"],
+    ["192.88.99.1", "6to4 relay anycast"],
+    ["198.18.0.1", "benchmarking, bottom of the /15"],
+    ["198.19.255.255", "benchmarking, top of the /15"],
   ])("blocks %s (%s)", (address) => {
     expect(isBlockedSsrfAddress(address)).not.toBeNull();
   });
@@ -80,6 +86,11 @@ describe("isBlockedSsrfAddress — IPv4", () => {
     ["172.32.0.0"],
     ["192.167.255.255"],
     ["192.169.0.0"],
+    ["192.0.1.1"],
+    ["192.88.98.255"],
+    ["192.88.100.0"],
+    ["198.17.255.255"],
+    ["198.20.0.0"],
     ["223.255.255.255"],
   ])("allows %s", (address) => {
     expect(isBlockedSsrfAddress(address)).toBeNull();
@@ -103,6 +114,9 @@ describe("isBlockedSsrfAddress — IPv6", () => {
     ["::127.0.0.1", "IPv4-compatible loopback"],
     ["64:ff9b::169.254.169.254", "NAT64 to the metadata address"],
     ["2002:7f00:1::", "6to4 wrapping loopback"],
+    ["::ffff:0:7f00:1", "IPv4-translated (SIIT) loopback"],
+    ["::ffff:0:a9fe:a9fe", "IPv4-translated (SIIT) metadata address"],
+    ["64:ff9b:1::1", "local-use NAT64 prefix"],
   ])("blocks %s (%s)", (address) => {
     expect(isBlockedSsrfAddress(address)).not.toBeNull();
   });
@@ -209,14 +223,18 @@ describe("assertPublicMcpUrl — what must keep working", () => {
   it("accepts a public server and returns the parsed URL", async () => {
     // The flow the whole check has to preserve: point the Inspector at a
     // server that is not in the database yet and connect to it.
-    const url = await assertPublicMcpUrl("https://mcp.example.com/sse?x=1", {
-      lookup: resolvesTo(PUBLIC_V4),
-    });
+    const { url, addresses } = await assertPublicMcpUrl(
+      "https://mcp.example.com/sse?x=1",
+      { lookup: resolvesTo(PUBLIC_V4) },
+    );
     expect(url.href).toBe("https://mcp.example.com/sse?x=1");
+    // The addresses come back so the caller can PIN to them instead of letting
+    // the HTTP client resolve the name a second time.
+    expect(addresses).toEqual([PUBLIC_V4]);
   });
 
   it("accepts a public IPv6 answer", async () => {
-    const url = await assertPublicMcpUrl("https://mcp.example.com/mcp", {
+    const { url } = await assertPublicMcpUrl("https://mcp.example.com/mcp", {
       lookup: resolvesTo("2606:4700:4700::1111"),
     });
     expect(url.hostname).toBe("mcp.example.com");
@@ -224,7 +242,7 @@ describe("assertPublicMcpUrl — what must keep working", () => {
 
   it("accepts a public IP literal without asking a resolver", async () => {
     const lookup = resolvesTo("10.0.0.1");
-    const url = await assertPublicMcpUrl(`https://${PUBLIC_V4}/mcp`, {
+    const { url } = await assertPublicMcpUrl(`https://${PUBLIC_V4}/mcp`, {
       lookup,
     });
     expect(url.hostname).toBe(PUBLIC_V4);
@@ -235,10 +253,13 @@ describe("assertPublicMcpUrl — what must keep working", () => {
 describe("assertPublicMcpUrl — the allowlist escape hatch", () => {
   it("lets an explicitly allowed host through the range check", async () => {
     const lookup = resolvesTo("10.0.0.5");
-    const url = await assertPublicMcpUrl("http://internal.example.com/mcp", {
-      lookup,
-      allowedHosts: ["internal.example.com"],
-    });
+    const { url } = await assertPublicMcpUrl(
+      "http://internal.example.com/mcp",
+      {
+        lookup,
+        allowedHosts: ["internal.example.com"],
+      },
+    );
     expect(url.hostname).toBe("internal.example.com");
     expect(lookup).not.toHaveBeenCalled();
   });
@@ -246,19 +267,25 @@ describe("assertPublicMcpUrl — the allowlist escape hatch", () => {
   it("reads the allowlist from MCP_PROXY_URL_ALLOWED_HOSTS", async () => {
     process.env.MCP_PROXY_URL_ALLOWED_HOSTS =
       " Internal.Example.com , host.docker.internal ";
-    const url = await assertPublicMcpUrl("http://host.docker.internal:3000/", {
-      lookup: resolvesTo("172.17.0.1"),
-    });
+    const { url } = await assertPublicMcpUrl(
+      "http://host.docker.internal:3000/",
+      {
+        lookup: resolvesTo("172.17.0.1"),
+      },
+    );
     expect(url.hostname).toBe("host.docker.internal");
   });
 
   it("matches a trailing-dot host against a plain allowlist entry", async () => {
     // "example.com." and "example.com" are the same name to a resolver, so
     // they must be the same name to the allowlist.
-    const url = await assertPublicMcpUrl("http://internal.example.com./mcp", {
-      lookup: resolvesTo("10.0.0.5"),
-      allowedHosts: ["internal.example.com"],
-    });
+    const { url } = await assertPublicMcpUrl(
+      "http://internal.example.com./mcp",
+      {
+        lookup: resolvesTo("10.0.0.5"),
+        allowedHosts: ["internal.example.com"],
+      },
+    );
     expect(url.hostname).toBe("internal.example.com.");
   });
 
@@ -457,6 +484,9 @@ describe("createGuardedFetch", () => {
     await expect(guarded("https://mcp.example.com/mcp")).rejects.toThrow(
       TOO_MANY_REDIRECTS,
     );
+    // Pins the cap itself: hop 0 plus MAX_REDIRECT_HOPS follow-ups, then stop.
+    // Without this the chain could grow to any length and still "pass".
+    expect(baseFetch.mock.calls.length).toBe(6);
   });
 
   it("returns a normal response untouched", async () => {
@@ -469,5 +499,215 @@ describe("createGuardedFetch", () => {
     const response = await guarded("https://mcp.example.com/mcp");
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("ok");
+  });
+});
+
+/**
+ * The refusal must carry no information about WHY.
+ *
+ * `rejects.toThrow(str)` is a SUBSTRING match, so every refusal test above
+ * would still pass if the message grew a "because 10.0.0.5 is private" tail.
+ * These assert equality, and that the host never appears.
+ */
+describe("assertPublicMcpUrl — the refusal is an oracle-free constant", () => {
+  const messageFor = async (
+    url: string,
+    options: Parameters<typeof assertPublicMcpUrl>[1] = {},
+  ) => {
+    try {
+      await assertPublicMcpUrl(url, options);
+      throw new Error("expected a refusal");
+    } catch (error) {
+      return (error as Error).message;
+    }
+  };
+
+  it("is identical for a private literal, a private answer, and a dead name", async () => {
+    const literal = await messageFor("http://10.1.2.3/mcp");
+    const resolved = await messageFor("https://a.example.com/mcp", {
+      lookup: resolvesTo("10.0.0.5"),
+    });
+    const dead = await messageFor("https://b.example.com/mcp", {
+      lookup: vi.fn(async () => {
+        throw new Error("ENOTFOUND");
+      }),
+    });
+
+    expect(literal).toBe(NOT_A_PERMITTED_TARGET);
+    expect(resolved).toBe(NOT_A_PERMITTED_TARGET);
+    expect(dead).toBe(NOT_A_PERMITTED_TARGET);
+    // Told apart, these three answer "is this address internal" and "does this
+    // name exist" — the two questions a blind SSRF is asking.
+    expect(new Set([literal, resolved, dead]).size).toBe(1);
+  });
+
+  it("never names the host or the address it refused", async () => {
+    const message = await messageFor("https://leaky.example.com/mcp", {
+      lookup: resolvesTo("169.254.169.254"),
+    });
+
+    expect(message).not.toContain("leaky");
+    expect(message).not.toContain("169.254");
+    expect(message).not.toContain("10.");
+  });
+});
+
+describe("createGuardedFetch — the connection is pinned to the validated address", () => {
+  const ok = () => new Response("ok", { status: 200 });
+
+  it("connects to the pinned address even when the name cannot resolve AT ALL", async () => {
+    // The pin, proven at socket level. `.invalid` is guaranteed unresolvable
+    // (RFC 2606), so a connection that still succeeds can only have used the
+    // pinned address — which is precisely what a rebind cannot influence,
+    // because the second resolution never happens.
+    const { createServer } = await import("node:http");
+    const { fetch: undiciFetch } = await import("undici");
+
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("pinned");
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const { port } = server.address() as { port: number };
+
+    const agent = createPinnedAgent(["127.0.0.1"]);
+    try {
+      const response = await undiciFetch(
+        `http://this-name-cannot-resolve.invalid:${port}/`,
+        { dispatcher: agent },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("pinned");
+    } finally {
+      await agent.close();
+      server.close();
+    }
+  });
+
+  it("hands the transport a dispatcher built from the validated answer", async () => {
+    // A resolver that turns hostile immediately after validation. It must be
+    // consulted exactly once: everything after that rides the pin.
+    const lookup = vi
+      .fn()
+      .mockResolvedValueOnce([PUBLIC_V4])
+      .mockResolvedValue(["169.254.169.254"]);
+    const dispatchers: unknown[] = [];
+    const baseFetch = vi.fn(
+      async (_url: URL, _init: RequestInit, dispatcher?: unknown) => {
+        dispatchers.push(dispatcher);
+        return ok();
+      },
+    );
+
+    const guarded = createGuardedFetch({ baseFetch, lookup });
+    await guarded("https://rebind.example.com/mcp");
+
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(dispatchers[0]).toBeDefined();
+  });
+
+  it("does NOT pin an allowlisted host, which is trusted by name", async () => {
+    const dispatchers: unknown[] = [];
+    const baseFetch = vi.fn(
+      async (_url: URL, _init: RequestInit, dispatcher?: unknown) => {
+        dispatchers.push(dispatcher);
+        return ok();
+      },
+    );
+
+    const guarded = createGuardedFetch({
+      baseFetch,
+      allowedHosts: ["host.docker.internal"],
+      allowlistOrigin: "http://host.docker.internal:3000",
+      lookup: resolvesTo("172.17.0.1"),
+    });
+    await guarded("http://host.docker.internal:3000/sse");
+
+    expect(dispatchers[0]).toBeUndefined();
+  });
+});
+
+describe("createGuardedFetch — the allowlist covers hop 0 only", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+
+  const ALLOWED = "host.docker.internal";
+  // The allowlisted host resolves PRIVATE — that is the whole reason it needs
+  // an allowlist entry. Everything else is public.
+  const lookup = vi.fn(async (hostname: string) =>
+    hostname === ALLOWED ? ["172.17.0.1"] : [PUBLIC_V4],
+  );
+  const guardWith = (baseFetch: unknown) =>
+    createGuardedFetch({
+      baseFetch: baseFetch as never,
+      allowedHosts: [ALLOWED],
+      allowlistOrigin: "http://host.docker.internal:3000",
+      lookup,
+    });
+
+  it("still connects to the operator's own allowlisted URL", async () => {
+    const baseFetch = vi.fn(async () => ok());
+    const response = await guardWith(baseFetch)(
+      "http://host.docker.internal:3000/sse",
+    );
+
+    expect(response.status).toBe(200);
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("REFUSES a public server that redirects into the allowlisted host", async () => {
+    // The hole this closes: an entry meant to unblock the operator's own
+    // internal host would otherwise unblock an attacker's 302 into it.
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        redirect(302, "http://host.docker.internal:3000/sse"),
+      )
+      .mockResolvedValueOnce(ok());
+
+    await expect(
+      guardWith(baseFetch)("https://attacker.example.com/mcp"),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("REFUSES an allowlisted destination reached from another origin", async () => {
+    // The SSE back-channel shape: the endpoint is chosen by the REMOTE server,
+    // so it is not the URL the operator vouched for even at hop 0.
+    const baseFetch = vi.fn(async () => ok());
+
+    await expect(
+      guardWith(baseFetch)("http://host.docker.internal:9999/hijacked"),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+    expect(baseFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("createGuardedFetch — every hop is re-validated, not just the first", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+
+  it("catches an internal target on the SECOND hop", async () => {
+    // Pins the loop rather than the first iteration: a check written as
+    // `if (hop === 0)` passes every other redirect test in this file.
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://second.example.com/b"))
+      .mockResolvedValueOnce(redirect(302, "http://169.254.169.254/"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+    });
+
+    await expect(guarded("https://first.example.com/a")).rejects.toThrow(
+      NOT_A_PERMITTED_TARGET,
+    );
+    // Two connections happened; the third was refused before it was opened.
+    expect(baseFetch).toHaveBeenCalledTimes(2);
   });
 });

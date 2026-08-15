@@ -39,6 +39,7 @@
     "pg": "^8.16.0",
     "shell-quote": "^1.8.4",
     "spawn-rx": "^5.1.2",
+    "undici": "^7",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -2,6 +2,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 
 import { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { Agent, fetch as undiciFetch } from "undici";
 
 import logger from "@/utils/logger";
 
@@ -90,7 +91,22 @@ const BLOCKED_IPV4_RANGES: readonly Ipv4Range[] = [
     why: "link-local, including the cloud instance-metadata address",
   },
   { base: "172.16.0.0", prefix: 12, why: "private (RFC 1918)" },
+  {
+    base: "192.0.0.0",
+    prefix: 24,
+    why: "IETF protocol assignments (RFC 6890)",
+  },
+  {
+    base: "192.88.99.0",
+    prefix: 24,
+    why: "6to4 relay anycast (RFC 7526) — reaches a relay, not a server",
+  },
   { base: "192.168.0.0", prefix: 16, why: "private (RFC 1918)" },
+  {
+    base: "198.18.0.0",
+    prefix: 15,
+    why: "benchmarking (RFC 2544) — several VPN/SD-WAN products address their private fabric here",
+  },
   { base: "224.0.0.0", prefix: 4, why: "multicast" },
   { base: "240.0.0.0", prefix: 4, why: "reserved, including broadcast" },
 ];
@@ -192,6 +208,19 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
     return inner ? `IPv4-mapped ::ffff:0:0/96 -> ${inner}` : null;
   }
 
+  // ::ffff:0:0:0/96 — the IPv4-TRANSLATED form (SIIT, RFC 2765). Same idea as
+  // the mapped form one hextet to the left, and mutually exclusive with it
+  // because that one requires bytes 8-9 to be zero.
+  if (
+    allZero(bytes, 0, 8) &&
+    bytes[8] === 0xff &&
+    bytes[9] === 0xff &&
+    allZero(bytes, 10, 12)
+  ) {
+    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12));
+    return inner ? `IPv4-translated ::ffff:0:0:0/96 -> ${inner}` : null;
+  }
+
   // ::/96 — the deprecated IPv4-compatible form. `::` and `::1` live in this
   // prefix but are the unspecified and loopback addresses, not v4 wrappers.
   if (allZero(bytes, 0, 12)) {
@@ -200,6 +229,22 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
     }
     const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12));
     return inner ? `IPv4-compatible ::/96 -> ${inner}` : null;
+  }
+
+  // 64:ff9b:1::/48 — the LOCAL-USE NAT64 prefix (RFC 8215). Unlike the
+  // well-known prefix below, the embedded v4 sits at a position that depends on
+  // the deployed prefix length, so there is nothing dependable to unwrap and
+  // judge. It is refused wholesale: a local NAT64 prefix exists precisely to
+  // reach the local v4 network.
+  if (
+    bytes[0] === 0x00 &&
+    bytes[1] === 0x64 &&
+    bytes[2] === 0xff &&
+    bytes[3] === 0x9b &&
+    bytes[4] === 0x00 &&
+    bytes[5] === 0x01
+  ) {
+    return "64:ff9b:1::/48 local-use NAT64";
   }
 
   // 64:ff9b::/96 — the well-known NAT64 prefix. A NAT64 gateway forwards to
@@ -323,14 +368,48 @@ export interface McpUrlGuardOptions {
   lookup?: (hostname: string) => Promise<string[]>;
   /** Overrides `MCP_PROXY_URL_ALLOWED_HOSTS`. */
   allowedHosts?: Iterable<string>;
-  /** Transport seam for `createGuardedFetch`. Production uses global fetch. */
-  baseFetch?: FetchLike;
+  /** Transport seam for `createGuardedFetch`. Production uses undici's fetch. */
+  baseFetch?: PinnedFetch;
+  /**
+   * The ONE origin at which an allowlist entry may apply — the URL the
+   * operator typed, already validated by the route. Every other destination
+   * this fetch is asked for (a redirect target, the SSE back-channel endpoint
+   * the remote server names) validates with an EMPTY allowlist.
+   *
+   * Without this the allowlist is a hole rather than an exemption: an
+   * attacker's public server answers `302 http://host.docker.internal/` and
+   * the entry that was meant to unblock the operator's own Docker host
+   * unblocks the attacker's redirect into it instead.
+   */
+  allowlistOrigin?: string;
 }
 
 /**
- * Caller-supplied text is logged through `JSON.stringify`, never interpolated
- * raw: an embedded newline in a hostname would otherwise forge whole log
- * lines, and a refused URL is by definition attacker-chosen.
+ * The result of a passed check: the parsed URL, plus the addresses it resolved
+ * to at that instant.
+ *
+ * `addresses` is what closes DNS rebinding. Validating a NAME and then handing
+ * the URL to an HTTP client means the client resolves it a second time, and
+ * nothing makes the second answer match the first — glibc and musl
+ * getaddrinfo do not cache without nscd, which no container here runs, so a
+ * TTL-0 record simply answers again. Callers pin the socket to these addresses
+ * instead.
+ *
+ * EMPTY means "no pin": the host matched the operator's allowlist, was never
+ * resolved here, and is trusted by configuration rather than by address.
+ */
+export interface ValidatedMcpTarget {
+  url: URL;
+  addresses: string[];
+}
+
+/**
+ * Build the single refusal Error and log the real reason beside it.
+ *
+ * CALLER CONTRACT: `reason` is interpolated raw, so anything caller-supplied
+ * inside it — a hostname above all — must already be `JSON.stringify`'d by the
+ * caller. A refused URL is by definition attacker-chosen, and an unescaped
+ * newline in one forges whole log lines.
  */
 const refuse = (reason: string): Error => {
   logger.warn(`MCP proxy remote URL refused: ${reason}`);
@@ -340,13 +419,14 @@ const refuse = (reason: string): Error => {
 /**
  * Validate that a remote MCP URL names a public destination, or throw.
  *
- * Returns the parsed URL so callers connect to the value that was checked
- * rather than re-parsing the string.
+ * Returns the parsed URL together with the addresses it resolved to, so the
+ * caller connects to the value that was checked rather than re-parsing the
+ * string or re-resolving the name.
  */
 export const assertPublicMcpUrl = async (
   rawUrl: string | URL,
   options: McpUrlGuardOptions = {},
-): Promise<URL> => {
+): Promise<ValidatedMcpTarget> => {
   let url: URL;
   try {
     url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
@@ -366,7 +446,9 @@ export const assertPublicMcpUrl = async (
   const allowedHosts = options.allowedHosts
     ? new Set([...options.allowedHosts].map(normalizeHostname))
     : allowedHostsFromEnv();
-  if (allowedHosts.has(hostname)) return url;
+  // No addresses: an allowlisted host is trusted by NAME, so there is nothing
+  // to pin it to and the connection resolves normally.
+  if (allowedHosts.has(hostname)) return { url, addresses: [] };
 
   // An IP literal needs no resolver. WHATWG URL parsing has already normalised
   // every alternate IPv4 spelling for us — `http://2130706433/`,
@@ -397,7 +479,99 @@ export const assertPublicMcpUrl = async (
     }
   }
 
-  return url;
+  return { url, addresses };
+};
+
+/**
+ * A `connect.lookup` that answers ONLY with addresses already validated.
+ *
+ * This is the pin. undici calls it in place of getaddrinfo when opening the
+ * socket, so the hostname it is handed is ignored entirely and the connection
+ * cannot land anywhere the check above did not clear. Everything else about
+ * the request still derives from the URL, `Host` and the TLS SNI included.
+ */
+const pinnedLookup =
+  (addresses: string[]) =>
+  (
+    _hostname: string,
+    options: { all?: boolean },
+    callback: (
+      err: NodeJS.ErrnoException | null,
+      address: string | { address: string; family: number }[],
+      family?: number,
+    ) => void,
+  ): void => {
+    const entries = addresses.map((address) => ({
+      address,
+      family: address.includes(":") ? 6 : 4,
+    }));
+    if (options?.all) {
+      callback(null, entries);
+      return;
+    }
+    callback(null, entries[0].address, entries[0].family);
+  };
+
+/**
+ * An undici dispatcher whose connections can only land on `addresses`.
+ *
+ * Exported for the test that proves the pin at socket level: given a hostname
+ * that cannot resolve at all, a request through this agent still connects.
+ */
+export const createPinnedAgent = (addresses: string[]): Agent =>
+  new Agent({ connect: { lookup: pinnedLookup(addresses) } });
+
+/**
+ * What `createGuardedFetch` calls, and the reason it is undici's `fetch` rather
+ * than the global one: `dispatcher` is the only way to reach `connect.lookup`,
+ * and the global fetch on this runtime takes its dispatcher from a different
+ * copy of undici than the `Agent` above comes from.
+ *
+ * The undici response is re-wrapped in a NATIVE `Response` streaming from the
+ * same body, so every consumer downstream — the MCP SDK, the `eventsource`
+ * package — sees the global class it type-checks and `instanceof`-checks
+ * against. `url` and `redirected` are restored by hand because a constructed
+ * `Response` reports an empty url, and `eventsource` resolves a relative SSE
+ * endpoint against exactly that.
+ *
+ * The dispatcher travels as its OWN argument rather than on the init object.
+ * `@types/node` declares `RequestInit.dispatcher` against the undici copy
+ * bundled with Node, which is a different major from the `Agent` here, so
+ * putting it on the init makes the two type worlds collide for no benefit.
+ */
+type PinnedFetch = (
+  url: URL,
+  init: RequestInit,
+  dispatcher?: Agent,
+) => Promise<Response>;
+
+const pinnedFetch: PinnedFetch = async (url, init, dispatcher) => {
+  const response = await undiciFetch(url, {
+    ...(init as unknown as Parameters<typeof undiciFetch>[1]),
+    dispatcher,
+  });
+
+  const wrapped = new Response(
+    // 204/205/304 must be constructed with a null body; undici gives null.
+    response.body as unknown as ConstructorParameters<typeof Response>[0],
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: [...response.headers] as [string, string][],
+    },
+  );
+  Object.defineProperty(wrapped, "url", { value: response.url });
+  Object.defineProperty(wrapped, "redirected", { value: response.redirected });
+  return wrapped;
+};
+
+/** The origin of a fetch input, or undefined when it does not parse. */
+const originOf = (input: string | URL): string | undefined => {
+  try {
+    return (input instanceof URL ? input : new URL(input)).origin;
+  } catch {
+    return undefined;
+  }
 };
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -429,52 +603,92 @@ const FORWARDABLE_ON_ORIGIN_CHANGE = new Set([
 ]);
 
 /**
- * A `fetch` that validates its destination before every connection, including
- * each redirect hop.
+ * A `fetch` that validates its destination before every connection, PINS the
+ * socket to the address it validated, and re-validates every redirect hop.
  *
  * Handed to both remote transports as their `fetch` implementation, so it
  * covers the requests the route handler never sees: SSE's POST back-channel
  * goes to the endpoint the REMOTE SERVER advertises, and the streamable-HTTP
  * transport reconnects on its own schedule.
  *
+ * DNS REBINDING IS CLOSED BY PINNING, not narrowed by timing. Validating a
+ * NAME and handing the URL onward means the HTTP client resolves it a second
+ * time, and nothing makes the second answer agree with the first: glibc and
+ * musl getaddrinfo hold no cache of their own without nscd, which none of
+ * these containers run, so a TTL-0 record just answers again — and the second
+ * answer is the one the socket uses. Instead the validated addresses go into
+ * an undici `Agent` whose `connect.lookup` returns ONLY those, so the socket
+ * lands on the address that was checked and the name is never resolved twice.
+ * `Host` and the TLS SNI still come from the URL, so virtual hosting and
+ * certificate validation are unaffected.
+ *
  * REDIRECTS ARE FOLLOWED HERE, NOT BY THE HTTP CLIENT. Left at the default
  * `redirect: "follow"`, undici resolves and connects to a `Location` target
  * itself, with none of these checks applied to it — so a URL that validates as
  * public could answer `302 Location: http://169.254.169.254/` and win. Manual
- * following puts every hop back through `assertPublicMcpUrl`.
+ * following puts every hop back through `assertPublicMcpUrl` AND gives every
+ * hop its own pin.
  *
- * KNOWN RESIDUAL — DNS REBINDING. This validates the name and then hands the
- * URL to `fetch`, which resolves it a second time; a host whose records change
- * between those two resolutions can still be answered with an internal address
- * on the second. Closing that would mean pinning the connection to the
- * validated IP, which needs a dispatcher-level `lookup` hook that Node does
- * not expose on the built-in fetch — the alternative is reimplementing the
- * HTTP client on `node:https` for a transport that streams SSE, which is a
- * larger regression risk than the window it closes. The window is narrowed
- * rather than left open: the check runs immediately before each connect,
- * re-runs on every request the transport makes rather than once per session,
- * and both resolutions go through the same platform resolver, so anything
- * cached between them agrees.
+ * THE ALLOWLIST APPLIES TO HOP 0 ONLY, and only at the origin the operator
+ * actually typed (`allowlistOrigin`). Everything else — redirect targets, the
+ * back-channel endpoint the remote server chooses — is judged with an empty
+ * allowlist. Otherwise the entry that unblocks the operator's own internal
+ * host also unblocks an attacker's `302` into it.
  */
 export const createGuardedFetch = (
   options: McpUrlGuardOptions = {},
 ): FetchLike => {
-  const baseFetch = options.baseFetch ?? fetch;
+  const baseFetch = options.baseFetch ?? pinnedFetch;
+
+  /**
+   * One dispatcher per validated address set, for the life of this transport.
+   * Rebuilding an Agent per request would throw away connection reuse, which
+   * on the streamable-HTTP transport is a TLS handshake for every JSON-RPC
+   * message. Keyed by the addresses, so a host that legitimately moves gets a
+   * new pool rather than a stale one.
+   */
+  const agents = new Map<string, Agent>();
+  const agentFor = (addresses: string[]): Agent | undefined => {
+    if (addresses.length === 0) return undefined;
+    const key = [...addresses].sort().join(",");
+    let agent = agents.get(key);
+    if (!agent) {
+      agent = createPinnedAgent(addresses);
+      agents.set(key, agent);
+    }
+    return agent;
+  };
 
   return async (input, init) => {
-    let target = await assertPublicMcpUrl(input, options);
+    // Hop 0 is the only destination an allowlist entry can speak for, and only
+    // when it is the origin the route already validated.
+    const firstHopOptions =
+      options.allowlistOrigin !== undefined &&
+      originOf(input) !== options.allowlistOrigin
+        ? { ...options, allowedHosts: [] }
+        : options;
+    const laterHopOptions: McpUrlGuardOptions = {
+      ...options,
+      allowedHosts: [],
+    };
+
+    let target = await assertPublicMcpUrl(input, firstHopOptions);
     let method = init?.method ?? "GET";
     let body = init?.body ?? undefined;
     let headers = new Headers(init?.headers);
 
     for (let hop = 0; ; hop += 1) {
-      const response = await baseFetch(target, {
-        ...init,
-        method,
-        body,
-        headers,
-        redirect: "manual",
-      });
+      const response = await baseFetch(
+        target.url,
+        {
+          ...init,
+          method,
+          body,
+          headers,
+          redirect: "manual",
+        },
+        agentFor(target.addresses),
+      );
 
       const location = REDIRECT_STATUSES.has(response.status)
         ? response.headers.get("location")
@@ -490,13 +704,13 @@ export const createGuardedFetch = (
         throw new Error(TOO_MANY_REDIRECTS);
       }
 
-      let next: URL;
+      let nextUrl: URL;
       try {
-        next = new URL(location, target);
+        nextUrl = new URL(location, target.url);
       } catch {
         throw refuse("redirect target is not a parsable URL");
       }
-      next = await assertPublicMcpUrl(next, options);
+      const next = await assertPublicMcpUrl(nextUrl, laterHopOptions);
 
       if (
         response.status === 303 ||
@@ -522,7 +736,12 @@ export const createGuardedFetch = (
         throw new Error(UNREPLAYABLE_REDIRECT_BODY);
       }
 
-      if (next.origin !== target.origin) {
+      if (next.url.origin !== target.url.origin) {
+        // The body is deliberately still replayed across an origin change on a
+        // 307/308. It is a JSON-RPC message, not a credential — the credentials
+        // are in the headers, and those are dropped here. Refusing instead
+        // would break a legitimate http->https upgrade mid-session, which is
+        // the common cross-origin redirect in practice.
         headers = new Headers(
           [...headers.entries()].filter(([name]) =>
             FORWARDABLE_ON_ORIGIN_CHANGE.has(name),

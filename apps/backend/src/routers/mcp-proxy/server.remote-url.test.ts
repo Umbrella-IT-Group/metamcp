@@ -22,8 +22,10 @@
 import express from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const { loggerInfo } = vi.hoisted(() => ({ loggerInfo: vi.fn() }));
+
 vi.mock("@/utils/logger", () => ({
-  default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  default: { info: loggerInfo, warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 const {
@@ -531,5 +533,43 @@ describe("remote transports — whose row may supply the stored headers", () => 
     const headers = streamableClientConstructions[0].opts.requestInit.headers;
     expect(headers["x-vendor-api-key"]).toBeUndefined();
     expect(JSON.stringify(headers)).not.toContain("SOMEONE-ELSES-SECRET");
+  });
+});
+
+describe("the SSE connect log", () => {
+  it("records origin and path but NEVER the query string", async () => {
+    // Hosted MCP servers routinely carry the credential in the query
+    // (`?api_key=`, `?token=`), so logging the full url writes a live secret
+    // into app.log — the same leak this line already avoids for the header
+    // VALUES by logging only header names.
+    await getSse({
+      transportType: "SSE",
+      url: "https://mcp.example.com/sse?api_key=SUPER-SECRET&token=ALSO-SECRET",
+    });
+
+    const line = loggerInfo.mock.calls
+      .map((call) => String(call[0]))
+      .find((text) => text.startsWith("SSE transport:"));
+
+    expect(line).toBeDefined();
+    expect(line).toContain("https://mcp.example.com/sse");
+    expect(line).not.toContain("SUPER-SECRET");
+    expect(line).not.toContain("ALSO-SECRET");
+    expect(line).not.toContain("api_key");
+  });
+
+  it("keeps the url JSON-escaped so a newline cannot forge a log line", async () => {
+    await getSse({
+      transportType: "SSE",
+      url: "https://mcp.example.com/sse%0A%0Afake",
+    });
+
+    const line = loggerInfo.mock.calls
+      .map((call) => String(call[0]))
+      .find((text) => text.startsWith("SSE transport:"));
+
+    expect(line).toBeDefined();
+    // The escape sequence survives as TEXT rather than as a real break.
+    expect(line).not.toMatch(/\n\n/);
   });
 });

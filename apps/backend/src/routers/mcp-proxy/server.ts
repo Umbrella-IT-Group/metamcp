@@ -527,11 +527,16 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     // keys into app.log on every SSE connect. The names are what a connectivity
     // problem is actually diagnosed from; the values never were.
     //
-    // The url is JSON.stringify'd for the same reason the transportType above
-    // is: it is caller-supplied, so interpolating it raw lets an embedded
-    // newline forge whole log lines.
+    // ORIGIN AND PATH ONLY — never the query string. Hosted MCP servers
+    // routinely carry their credential in it (`?api_key=`, `?token=`), so
+    // logging the full url writes that key into app.log, which is the same
+    // leak this line already avoids for the header values. It is still
+    // JSON.stringify'd for the reason the transportType line above is: the
+    // value is caller-supplied, and an embedded newline forges log lines.
     logger.info(
-      `SSE transport: url=${JSON.stringify(url)}, headers=[${Object.keys(headers).join(", ")}]`,
+      `SSE transport: url=${JSON.stringify(
+        target.url.origin + target.url.pathname,
+      )}, headers=[${Object.keys(headers).join(", ")}]`,
     );
 
     // Every request this transport makes goes through the guard, not just the
@@ -540,9 +545,18 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     // input that never passes through this handler — and `eventSourceInit.fetch`
     // takes precedence over the `fetch` option inside the SDK, so both have to
     // be set for the stream and the POSTs to be covered.
-    const guardedFetch = createGuardedFetch();
+    // `allowlistOrigin` is what keeps an MCP_PROXY_URL_ALLOWED_HOSTS entry from
+    // becoming a hole: the exemption applies to the origin the operator typed
+    // and to nothing else this transport is later told to fetch.
+    //
+    // Back-channel coverage rests on the PINNED SDK (1.30.0) honouring
+    // `opts.fetch` for the POST to the server-advertised endpoint. If that pin
+    // moves, re-check `client/sse.js` still routes that POST through it.
+    const guardedFetch = createGuardedFetch({
+      allowlistOrigin: target.url.origin,
+    });
 
-    const transport = new SSEClientTransport(target, {
+    const transport = new SSEClientTransport(target.url, {
       eventSourceInit: {
         fetch: (url, init) => guardedFetch(url, { ...init, headers }),
       },
@@ -584,11 +598,11 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
 
     // Covers the transport's own reconnects and every redirect hop, which the
     // one-shot check above cannot reach.
-    const transport = new StreamableHTTPClientTransport(target, {
+    const transport = new StreamableHTTPClientTransport(target.url, {
       requestInit: {
         headers,
       },
-      fetch: createGuardedFetch(),
+      fetch: createGuardedFetch({ allowlistOrigin: target.url.origin }),
     });
     await transport.start();
     return transport;
