@@ -332,6 +332,34 @@ export const apiKeysImplementations = {
   ): Promise<z.infer<typeof ValidateApiKeyResponseSchema>> => {
     try {
       const result = await apiKeysRepository.validateApiKey(input.key);
+
+      // Owner-disabled gate (migration 0027). The DATA plane already refuses a
+      // disabled owner's key — the api-key/OAuth middleware runs
+      // findDisabledIdentity around validateApiKey and answers 403 with an
+      // account_disabled audit event — so this procedure is the last surface
+      // that would still call such a key "valid". Nothing authenticates
+      // through it (it is an oracle for the admin UI), which is why the check
+      // belongs HERE and not inside validateApiKey: pushing it into the
+      // repository would add a users read to the hot auth path and strip the
+      // middleware's containment response of the very audit event an
+      // investigation greps for. The cost is one query on a cold path, and the
+      // benefit is that the two planes can no longer disagree about the same
+      // key.
+      //
+      // user_id NULL is a public / service key with no owner to disable —
+      // there is nothing to check, and calling isDisabled(undefined) would
+      // match no row and fail CLOSED, silently invalidating every public key.
+      if (result.valid && result.user_id) {
+        if (await usersRepository.isDisabled(result.user_id)) {
+          // Bare not-valid, with no user_id / key_uuid: `validate` is a
+          // protectedProcedure any member may call with an arbitrary key
+          // string, so a distinct "exists but the owner is disabled" answer
+          // would widen the key oracle instead of narrowing it. A disabled
+          // owner's key is indistinguishable from a key that does not exist.
+          return { valid: false };
+        }
+      }
+
       // Deliberately does NOT echo the key's endpoint scope. `validate` is a
       // protectedProcedure any member can call with an arbitrary key string;
       // returning endpoint_uuid would widen the existing key oracle (a caller

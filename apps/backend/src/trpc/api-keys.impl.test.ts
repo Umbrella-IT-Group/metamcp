@@ -13,7 +13,11 @@
  *  - the admin cross-user listing (listAll) drops the full secret and carries
  *    owner email + last_used_at,
  *  - update/delete route to the owner-scoped repo methods for members and the
- *    ownership-bypass methods for admins.
+ *    ownership-bypass methods for admins,
+ *  - the update readback drops the full secret and carries only a prefix
+ *    (security review fix), on BOTH the admin and the member branch,
+ *  - `validate` refuses a key whose OWNER is disabled (migration 0027), while
+ *    a public/service key (user_id NULL) is unaffected.
  *
  * The repository is mocked (its barrel reaches db/index, which needs a live
  * DATABASE_URL); the real serializer is used so the response shaping is
@@ -26,6 +30,7 @@ import {
   CreateApiKeyRequestSchema,
   ListApiKeysResponseSchema,
   UpdateApiKeyRequestSchema,
+  UpdateApiKeyResponseSchema,
 } from "@repo/zod-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -42,7 +47,8 @@ vi.mock("@/utils/logger", () => ({
 // constructs it once at module load. endpointsRepoMock backs the exported
 // endpointsRepository singleton the impl uses to verify a scope target
 // exists; usersRepoMock backs the usersRepository singleton it uses to
-// verify an acts-as identity target exists (migration 0024).
+// verify an acts-as identity target exists (migration 0024) and to check
+// whether a validated key's owner is disabled (migration 0027).
 const { repoMock, endpointsRepoMock, usersRepoMock } = vi.hoisted(() => ({
   repoMock: {
     create: vi.fn(),
@@ -52,12 +58,14 @@ const { repoMock, endpointsRepoMock, usersRepoMock } = vi.hoisted(() => ({
     updateAsAdmin: vi.fn(),
     delete: vi.fn(),
     deleteAsAdmin: vi.fn(),
+    validateApiKey: vi.fn(),
   },
   endpointsRepoMock: {
     findByUuid: vi.fn(),
   },
   usersRepoMock: {
     findById: vi.fn(),
+    isDisabled: vi.fn(),
   },
 }));
 
@@ -72,6 +80,7 @@ vi.mock("../db/repositories", () => ({
     updateAsAdmin = repoMock.updateAsAdmin;
     delete = repoMock.delete;
     deleteAsAdmin = repoMock.deleteAsAdmin;
+    validateApiKey = repoMock.validateApiKey;
   },
   endpointsRepository: endpointsRepoMock,
   usersRepository: usersRepoMock,
@@ -828,6 +837,111 @@ describe("api-keys update — admin ownership bypass", () => {
   });
 });
 
+// Security review fix. `update` is a plain protectedProcedure — a member may
+// rename or revoke their OWN key through it, an admin any key — and the
+// readback used to carry `key` raw. That re-disclosed on every rename a
+// secret the design shows exactly once, at mint time. These tests pin the
+// masking on BOTH repo branches (owner-scoped and admin bypass) and at the
+// tRPC `.output()` schema, the two layers between the DB row and the wire.
+describe("api-keys update — readback never returns a usable secret", () => {
+  // Realistic shape: sk_mt_ + 64 chars, the generator's format.
+  const RAW_KEY = `sk_mt_${"c".repeat(64)}`;
+
+  const updatedRow = {
+    uuid: "k",
+    name: "renamed",
+    key: RAW_KEY,
+    created_at: new Date("2026-07-03T00:00:00Z"),
+    is_active: false,
+  };
+
+  it("admin branch (updateAsAdmin) returns a prefix instead of the raw value", async () => {
+    repoMock.updateAsAdmin.mockResolvedValue(updatedRow);
+
+    const result = await apiKeysImplementations.update(
+      { uuid: "k", is_active: false },
+      "admin-1",
+      true,
+    );
+
+    // The old field is gone entirely, not merely overwritten.
+    expect((result as Record<string, unknown>).key).toBeUndefined();
+    expect(result.key_prefix).toBe("sk_mt_cccc…");
+  });
+
+  it("member branch (update) returns a prefix instead of the raw value", async () => {
+    repoMock.update.mockResolvedValue(updatedRow);
+
+    const result = await apiKeysImplementations.update(
+      { uuid: "k", name: "renamed" },
+      "member-1",
+      false,
+    );
+
+    expect((result as Record<string, unknown>).key).toBeUndefined();
+    expect(result.key_prefix).toBe("sk_mt_cccc…");
+  });
+
+  it("carries NO full-length sk_mt_ token anywhere in either branch's payload", async () => {
+    repoMock.updateAsAdmin.mockResolvedValue(updatedRow);
+    repoMock.update.mockResolvedValue(updatedRow);
+
+    // Same whole-payload hunt the list tests use: this assertion stays true no
+    // matter which field a future regression smuggles the secret through.
+    // `sk_mt_` + 16 chars is far longer than the 4 characters a prefix exposes
+    // and far shorter than a real key, so it fires on a leak and never on a
+    // legitimate prefix.
+    for (const isAdmin of [true, false]) {
+      const payload = JSON.stringify(
+        await apiKeysImplementations.update(
+          { uuid: "k", is_active: false },
+          isAdmin ? "admin-1" : "member-1",
+          isAdmin,
+        ),
+      );
+      expect(payload).not.toMatch(/sk_mt_[A-Za-z0-9_-]{16,}/);
+      expect(payload).not.toContain(RAW_KEY);
+    }
+  });
+
+  it("still returns the non-secret fields the readback is for", async () => {
+    repoMock.updateAsAdmin.mockResolvedValue(updatedRow);
+
+    const result = await apiKeysImplementations.update(
+      { uuid: "k", is_active: false },
+      "admin-1",
+      true,
+    );
+
+    expect(result).toMatchObject({
+      uuid: "k",
+      name: "renamed",
+      created_at: new Date("2026-07-03T00:00:00Z"),
+      is_active: false,
+    });
+    // A prefix must be a genuine truncation of the original, not a rename.
+    expect(RAW_KEY.startsWith(result.key_prefix.slice(0, -1))).toBe(true);
+    expect(result.key_prefix.length).toBeLessThan(RAW_KEY.length);
+  });
+
+  // Second layer: the tRPC router declares this schema as `.output()`, so a
+  // serializer that regressed and re-added `key` would still have it stripped
+  // before the response leaves the server. Zod objects strip unknown keys.
+  it("UpdateApiKeyResponseSchema strips a smuggled full key value", () => {
+    const parsed = UpdateApiKeyResponseSchema.parse({
+      uuid: "44444444-4444-4444-8444-444444444444",
+      name: "regressed",
+      key: RAW_KEY,
+      key_prefix: "sk_mt_cccc…",
+      created_at: new Date(),
+      is_active: true,
+    });
+
+    expect(parsed).not.toHaveProperty("key");
+    expect(JSON.stringify(parsed)).not.toContain(RAW_KEY);
+  });
+});
+
 describe("api-keys delete — member scoped vs admin bypass", () => {
   it("member revoke of another user's key is rejected (owner-scoped repo throws not-found)", async () => {
     // The owner-scoped delete() WHERE (uuid AND user_id === caller, only —
@@ -949,5 +1063,95 @@ describe("api-keys — public key isolation from members (BLOCKER fix)", () => {
 
     expect(result.success).toBe(true);
     expect(repoMock.deleteAsAdmin).toHaveBeenCalledWith("public-key");
+  });
+});
+
+// Migration 0027 consistency. The DATA plane already refuses a disabled
+// owner's key — the api-key/OAuth middleware wraps validateApiKey in
+// findDisabledIdentity and answers 403 with an account_disabled audit event
+// (see middleware/api-key-disabled-account.test.ts) — but this procedure kept
+// answering "valid" for the same credential. Nothing authenticates through
+// it, so the gap is a low-severity oracle inconsistency rather than an
+// authentication bypass; the fix lives here, in the cold path, precisely so
+// the middleware's containment response and its audit event stay intact.
+describe("api-keys validate — owner-disabled gate", () => {
+  const OWNED_KEY = `sk_mt_${"d".repeat(64)}`;
+  const PUBLIC_KEY = `sk_mt_${"e".repeat(64)}`;
+
+  it("reports an active key as valid when its owner is enabled", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: "owner-1",
+      key_uuid: "key-1",
+    });
+    usersRepoMock.isDisabled.mockResolvedValue(false);
+
+    const result = await apiKeysImplementations.validate({ key: OWNED_KEY });
+
+    expect(result).toEqual({
+      valid: true,
+      user_id: "owner-1",
+      key_uuid: "key-1",
+    });
+    expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("owner-1");
+  });
+
+  it("reports a disabled owner's key as not-valid, with no identifying detail", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: "owner-1",
+      key_uuid: "key-1",
+    });
+    usersRepoMock.isDisabled.mockResolvedValue(true);
+
+    const result = await apiKeysImplementations.validate({ key: OWNED_KEY });
+
+    // Indistinguishable from a key that does not exist — echoing user_id or
+    // key_uuid alongside valid: false would widen the oracle this procedure
+    // already is.
+    expect(result).toEqual({ valid: false });
+    expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("owner-1");
+  });
+
+  it("skips the owner check for a public/service key (user_id NULL) and still reports valid", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: null,
+      key_uuid: "key-pub",
+    });
+
+    const result = await apiKeysImplementations.validate({ key: PUBLIC_KEY });
+
+    // A public key has no owner to disable. isDisabled(undefined) would match
+    // no row and fail CLOSED, silently invalidating every public key — so the
+    // skip is load-bearing, not an optimisation.
+    expect(result).toEqual({ valid: true, key_uuid: "key-pub" });
+    expect(usersRepoMock.isDisabled).not.toHaveBeenCalled();
+  });
+
+  it("does not look up an owner for a key that failed validation", async () => {
+    repoMock.validateApiKey.mockResolvedValue({ valid: false });
+
+    const result = await apiKeysImplementations.validate({
+      key: "sk_mt_not-a-real-key",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(usersRepoMock.isDisabled).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the owner lookup itself throws", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: "owner-1",
+      key_uuid: "key-1",
+    });
+    usersRepoMock.isDisabled.mockRejectedValue(
+      new Error("database unreachable"),
+    );
+
+    const result = await apiKeysImplementations.validate({ key: OWNED_KEY });
+
+    expect(result).toEqual({ valid: false });
   });
 });

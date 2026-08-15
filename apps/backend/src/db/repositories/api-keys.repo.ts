@@ -293,6 +293,13 @@ export class ApiKeysRepository {
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
+        // Read back solely so ApiKeysSerializer.serializeApiKey can derive the
+        // non-reversible key_prefix from it; the raw value stops there and
+        // never reaches the response (UpdateApiKeyResponseSchema has no `key`
+        // field to carry it). Kept here rather than prefixed in SQL so the ONE
+        // masking rule stays in the serializer, where the list surfaces share
+        // it — a second copy in a `.returning()` is exactly the drift that
+        // rule exists to prevent.
         key: apiKeysTable.key,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
@@ -341,6 +348,8 @@ export class ApiKeysRepository {
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
+        // Prefix source only, same reasoning as update() above — the raw value
+        // is consumed by the serializer and never reaches the response.
         key: apiKeysTable.key,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,

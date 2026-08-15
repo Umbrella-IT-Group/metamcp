@@ -172,10 +172,22 @@ export const UpdateApiKeyRequestSchema = z.object({
   is_active: z.boolean().optional(),
 });
 
+// Update readback (rename / activate / revoke). Deliberately omits the full
+// `key` secret and carries only the non-reversible prefix, exactly like the
+// list surfaces below.
+//
+// Security review finding: this schema used to type `key` as the full string
+// and the serializer returned it raw, so the response to a plain rename
+// re-disclosed a usable credential to any member holding the key's uuid. The
+// raw key is shown exactly once, at mint time
+// (CreateApiKeyResponseSchema above). Because this is the tRPC `.output()`
+// schema, keeping key out of it is also the second half of the defense: a
+// serializer that regressed and re-added `key` would have it stripped here
+// before the response leaves the server.
 export const UpdateApiKeyResponseSchema = z.object({
   uuid: z.string().uuid(),
   name: z.string(),
-  key: z.string(),
+  key_prefix: z.string(),
   created_at: z.date(),
   is_active: z.boolean(),
 });
