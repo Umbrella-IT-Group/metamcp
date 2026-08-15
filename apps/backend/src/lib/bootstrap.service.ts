@@ -341,7 +341,8 @@ function parseEnvConfig(): EnvConfig {
 
     // Registration controls. Upstream defaults BOTH of these OPEN, so an
     // unset variable on a template-derived deploy silently re-opens
-    // self-registration — the entry vector this fork was hardened against.
+    // self-registration — an unauthenticated account-creation exposure on a
+    // gateway whose whole access model assumes accounts are provisioned.
     // Absence is therefore read as DISABLED here: the lock is structural, not
     // a line someone has to remember to add to a new `.env`. `parseBool`
     // returns the default for an unparseable value as well as an undefined
