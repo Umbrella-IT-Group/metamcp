@@ -27,7 +27,7 @@ function activeRow(
     user_id: "user-1",
     entra_oid: "oid-1",
     tenant_id: "tid-1",
-    entra_upn: "alex@umbrellaitgroup.com",
+    entra_upn: "admin@example.com",
     rt_ciphertext: encryptRefreshToken("stored-rt", KEK, "k1"),
     kek_id: "k1",
     scopes_granted: "User.Read Mail.ReadWrite",

@@ -15,7 +15,7 @@ import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
  * reached through the frontend's in-container Next.js rewrite —
  * `oauth/utils.ts` already documents that for the consent limiter. An audit
  * log whose `actor_ip` column says `127.0.0.1` on every row does not answer
- * the one question an incident responder asks first, so this reads
+ * the one question a responder asks first, so this reads
  * `CF-Connecting-IP` instead.
  *
  * TRUST ASSUMPTION, stated because it is load-bearing: `CF-Connecting-IP` is

@@ -53,8 +53,8 @@ export const createUsersRouter = (implementations: {
     // cannot reach the wire even if a serializer is edited carelessly.
 
     // Admin only: enumerate every account with its live access-path counts.
-    // This procedure did not exist before the 2026-08-13 incident — accounts
-    // were invisible in the GUI, so a self-registered attacker was too.
+    // Before this procedure existed, accounts were invisible in the GUI, so a
+    // self-registered attacker was too.
     list: adminProcedure.output(ListUsersResponseSchema).query(async () => {
       return implementations.list();
     }),
@@ -76,7 +76,7 @@ export const createUsersRouter = (implementations: {
       }),
 
     // Admin only: lock or unlock an account (migration 0027). The
-    // incident-response primitive — unlike revoke, a disabled account cannot
+    // containment primitive — unlike revoke, a disabled account cannot
     // sign back in; unlike delete, everything is preserved as evidence.
     // Enforced in two places (auth.ts session hook + the tRPC context), so
     // both new logins and already-issued sessions are stopped.
@@ -91,7 +91,7 @@ export const createUsersRouter = (implementations: {
     // codes deleted; API keys that can act as this identity deactivated; M365
     // delegation reset) while KEEPING the account row. The caller's own id is
     // passed through so the impl can refuse self-revocation, which would sign
-    // the responding administrator out mid-incident.
+    // the responding administrator out mid-response.
     revokeAccess: adminProcedure
       .input(RevokeUserAccessRequestSchema)
       .output(RevokeUserAccessResponseSchema)

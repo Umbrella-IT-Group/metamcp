@@ -3,7 +3,7 @@
  *
  *  1. Console-mirror THRESHOLD semantics — each mode mirrors its own level
  *     AND everything more severe. Regression guard for the 2026-07-14
- *     incident where LOG_LEVEL=info showed a clean `docker logs` while
+ *     outage where LOG_LEVEL=info showed a clean `docker logs` while
  *     app.log carried 278 cap-refusal WARNs (old "info" mode mirrored ONLY
  *     level==="INFO").
  *  2. Size-based, dependency-free, crash-safe log rotation.

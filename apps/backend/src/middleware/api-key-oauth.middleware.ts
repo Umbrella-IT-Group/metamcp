@@ -4,6 +4,7 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { ApiKeysRepository } from "../db/repositories/api-keys.repo";
+import { oauthRepository } from "../db/repositories/oauth.repo";
 import { usersRepository } from "../db/repositories/users.repo";
 import {
   type AuditActorType,
@@ -59,15 +60,63 @@ function getBaseUrl(req: express.Request): string {
 }
 
 /**
- * Validates OAuth bearer token using MCP token introspection
- * @param token OAuth bearer token
- * @param req Express request object
- * @returns OAuth validation result
+ * Validate an OAuth bearer token against the stored token row.
+ *
+ * THIS USED TO BE AN HTTP CALL TO OUR OWN /oauth/introspect, once per
+ * OAuth-authenticated MCP request. Three things were wrong with that, in
+ * increasing order of consequence: it spent a whole socket, request parse and
+ * JSON round-trip to run a query this process could run directly; it made the
+ * data plane depend on the gateway being reachable from inside its own
+ * container; and it meant the ONLY realistic traffic on a public,
+ * unauthenticated endpoint was our own, which is what made that endpoint
+ * impossible to rate-limit without throttling every MCP client on the gateway
+ * (`trust proxy` is off, so they all share one `req.ip` bucket). Reading the
+ * row here takes the internal traffic off the public endpoint entirely, so
+ * bounding it costs legitimate callers nothing. Same query, same repository —
+ * `oauthRepository.getAccessToken` is exactly what the introspect handler
+ * calls.
+ *
+ * The expiry check is replicated from that handler. The expired row is
+ * deliberately NOT deleted here, unlike there, and the reason is NOT that
+ * something else sweeps it — `oauthRepository.cleanupExpired()` deletes a
+ * token row only when the refresh token is ALSO expired or null, so a row with
+ * a dead 24h access token and a live 365d refresh token is never swept and
+ * should not be. The reason is that deleting is WRONG on this path:
+ * `deleteAccessToken` removes the whole row, refresh token included, so the
+ * old self-call was destroying a client's live refresh token every time it
+ * arrived with a just-expired access token — turning a routine "refresh now"
+ * into "re-authorize from scratch". A read path must not revoke.
+ *
+ * `users.disabled` is deliberately NOT checked here either — see
+ * findDisabledIdentity below and the matching note in routers/oauth/token.ts:
+ * this stays a pure token-row lookup and the two call sites resolve the
+ * account. That is also what makes the refusal HONEST. Through introspection,
+ * a disabled account's token came back `active: false`, so the caller was told
+ * "invalid_token" and its retries counted against the shared failed-attempt
+ * limiter — one locked-out account's still-running connector could 429 every
+ * other client behind the same IP. It now reaches the account check and is
+ * refused as `account_disabled`, with the audit row that says so.
+ *
+ * TWO ACCEPTED SIDE EFFECTS of that 401 -> 403 move, recorded because they are
+ * the price of it and neither is obvious from the diff:
+ *
+ *  (a) The refusal is now DISTINGUISHABLE. A caller learns that its token is
+ *      real and the account behind it is locked (403) rather than that the
+ *      token is simply bad (401) — a small oracle for someone holding a stolen
+ *      credential. Accepted: they already hold the credential, `/oauth/token`
+ *      answers the same question through refresh, and an operator reading
+ *      `account_disabled` rows during a lockout is worth more than denying
+ *      that inference.
+ *  (b) A disabled account's requests are UNBOUNDED. They cost two DB round
+ *      trips each (token row, then `isDisabled`) and are counted by NO
+ *      limiter, because the failed-attempt limiter is only reached from the
+ *      invalid-credential branch. A connector retrying in a tight loop after
+ *      its owner is locked out therefore keeps costing queries indefinitely.
+ *      Accepted for now — it needs a live credential, and the audit rows make
+ *      it visible — but it is the thing to bound if disable is ever used on an
+ *      account with a busy machine client.
  */
-async function validateOAuthToken(
-  token: string,
-  req: express.Request,
-): Promise<{
+async function validateOAuthToken(token: string): Promise<{
   valid: boolean;
   user_id?: string;
   scopes?: string[];
@@ -76,51 +125,27 @@ async function validateOAuthToken(
   try {
     // Check if this is our MCP OAuth token format
     if (token.startsWith("mcp_token_")) {
-      // For MCP tokens, use introspection endpoint to validate
-      // This allows us to check against the stored token data
-      try {
-        const baseUrl = getBaseUrl(req);
-        const introspectUrl = new URL("/oauth/introspect", baseUrl);
+      const tokenData = await oauthRepository.getAccessToken(token);
 
-        const introspectRequest = new Request(introspectUrl.toString(), {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ token }),
-        });
-
-        const introspectResponse = await fetch(introspectRequest);
-
-        if (!introspectResponse.ok) {
-          return { valid: false, error: "Token introspection failed" };
-        }
-
-        const introspectData = (await introspectResponse.json()) as {
-          active?: boolean;
-          sub?: string;
-          scope?: string;
-        };
-
-        if (!introspectData.active) {
-          return { valid: false, error: "Token is not active" };
-        }
-
-        return {
-          valid: true,
-          user_id: introspectData.sub,
-          // Fall back to the scope this server grants, not "admin". Nothing
-          // reads `scopes` for an authorization decision today (the gate is
-          // the better-auth session role), but a write-only field that says
-          // "admin" is the exact string a future reader would trust.
-          scopes: introspectData.scope
-            ? introspectData.scope.split(" ")
-            : [GRANTED_OAUTH_SCOPE],
-        };
-      } catch (error) {
-        logger.error("Error introspecting MCP token:", error);
-        return { valid: false, error: "Token validation failed" };
+      if (!tokenData) {
+        return { valid: false, error: "Token is not active" };
       }
+
+      if (Date.now() > tokenData.expires_at.getTime()) {
+        return { valid: false, error: "Token is not active" };
+      }
+
+      return {
+        valid: true,
+        user_id: tokenData.user_id,
+        // Fall back to the scope this server grants, not "admin". Nothing
+        // reads `scopes` for an authorization decision today (the gate is
+        // the better-auth session role), but a write-only field that says
+        // "admin" is the exact string a future reader would trust.
+        scopes: tokenData.scope
+          ? tokenData.scope.split(" ")
+          : [GRANTED_OAUTH_SCOPE],
+      };
     }
 
     // Token is not a recognized MCP token format
@@ -222,7 +247,7 @@ function extractAuthToken(
  * Record a refused MCP bearer attempt to the durable audit log.
  *
  * THIS IS THE STOLEN-KEY DETECTOR, and its absence is the single largest
- * forensic gap the 2026-08-13 incident exposed. This middleware is the layer
+ * forensic gap a security review exposed. This middleware is the layer
  * every machine-plane caller passes through — API keys and OAuth bearer
  * tokens, i.e. the credential class the attacker actually held — and until
  * now it wrote NOTHING on refusal. Not a log line, not a counter. A stolen
@@ -242,7 +267,7 @@ function extractAuthToken(
  * first request (that 401 IS the OAuth discovery handshake). They carry
  * `reason: "no_credential"` so a query can exclude them in one predicate.
  * Dropping them at the source instead would also drop unauthenticated
- * endpoint scanning, which is exactly the recon phase this incident began
+ * endpoint scanning, which is exactly the recon phase such an attack begins
  * with. Volume management belongs in Phase 2 retention, not in deciding not
  * to see it.
  *
@@ -435,7 +460,7 @@ export const authenticateApiKey = async (
 
       // If token looks like OAuth token or came from Authorization header, try OAuth first
       if (isOAuthLikeToken || source === "authorization") {
-        const oauthResult = await validateOAuthToken(token, req);
+        const oauthResult = await validateOAuthToken(token);
 
         if (oauthResult.valid) {
           // `users.disabled` gate (migration 0027) — see findDisabledIdentity.
@@ -600,7 +625,7 @@ export const authenticateApiKey = async (
       }
 
       // Validate OAuth token
-      const oauthResult = await validateOAuthToken(token, req);
+      const oauthResult = await validateOAuthToken(token);
 
       if (oauthResult.valid) {
         // `users.disabled` gate (migration 0027) — see findDisabledIdentity.

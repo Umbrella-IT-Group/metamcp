@@ -2,7 +2,7 @@ import { z } from "zod";
 
 // ===== User administration (Access dashboard) =====
 //
-// Incident 2026-08-13: self-registered member accounts were INVISIBLE. The
+// Self-registration abuse: member accounts were INVISIBLE. The
 // gateway had no users page and no list-users procedure at all, so the only
 // way to learn an account existed was to open a psql shell. These schemas are
 // the wire contract for the admin surface that closes that gap.
@@ -35,13 +35,14 @@ export const UserListItemSchema = z.object({
   // defaults to 7 days in this fork — so this is the last time the session
   // cookie was renewed, NOT the last request. An account active minutes ago
   // can legitimately read as six days stale, which is exactly the kind of
-  // number that gets misread during an incident. `active_session_count` and
-  // the API-key `last_used_at` on the keys tab are the finer-grained signals.
+  // number that gets misread during a live response. `active_session_count`
+  // and the API-key `last_used_at` on the keys tab are the finer-grained
+  // signals.
   //
   // NULL when the user has never held a session, or when every session they
   // had has been deleted (including by revokeAccess).
   last_session_refresh_at: z.date().nullable(),
-  // Live (non-expired) session count. The incident question "is this account
+  // Live (non-expired) session count. The response question "is this account
   // signed in right now" reads straight off this.
   active_session_count: z.number().int(),
   // Live (non-expired) OAuth access tokens. An account can hold zero sessions
@@ -60,7 +61,7 @@ export const ListUsersResponseSchema = z.object({
   // True total in the table, which may exceed `users.length` — the listing is
   // capped so a signup flood cannot make the page unusable at the exact
   // moment it matters. The UI says "showing N of TOTAL" rather than silently
-  // truncating, because a missing row on this screen is the incident.
+  // truncating, because a missing row on this screen is the failure.
   total: z.number().int(),
 });
 

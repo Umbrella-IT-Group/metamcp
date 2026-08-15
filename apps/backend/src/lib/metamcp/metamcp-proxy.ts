@@ -236,7 +236,7 @@ export const createServer = async (
     // degraded-response tripwire after the fan-out completes. A failure
     // here must be LOUD: a swallowed failure returns a "successful"
     // 0-tool namespace and nobody notices until a human runs
-    // `docker restart metamcp` (incident 2026-06-11).
+    // `docker restart metamcp` (the zero-tool outage).
     const failedServers: string[] = [];
 
     // Track visited servers to detect circular references - reset on each call
@@ -470,7 +470,7 @@ export const createServer = async (
     // returned (partial truth beats a hard error for the surviving
     // servers) but the failure must be loud enough for log-based
     // monitoring to catch — this exact silent-degradation mode ran for
-    // weeks before incident 2026-06-11.
+    // weeks before the zero-tool outage.
     if (failedServers.length > 0) {
       logger.error(
         `tools/list DEGRADED for namespace ${namespaceUuid}: ${failedServers.length}/${allServerEntries.length} backend server(s) failed (${failedServers.join(", ")}); returning ${allTools.length} tools`,
@@ -634,8 +634,8 @@ export const createServer = async (
         // landing in that gap sees `getSession` return `undefined` for
         // the owning server too, so the loop never even checks its name
         // and this would otherwise fall straight to "Unknown tool"
-        // despite the tool being real (Umbrella-MCP-Server tools/call
-        // 404 during reconnect).
+        // despite the tool being real (observed as a tools/call 404
+        // during an upstream reconnect).
         //
         // Use the DB `toolsTable` (populated by the last successful
         // tools/list sync) as last-known-good routing to find the

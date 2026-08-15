@@ -8,7 +8,7 @@ import { DatabaseMcpServer, McpServer } from "@repo/zod-types";
  * disclosure being fixed here arose in the first place: `mcpServers.list` and
  * `.get` are `protectedProcedure` (members legitimately see the server
  * inventory), and they were handing every member the connection URL of each
- * backend MCP (`http://mcp-autotask:3000` and friends — an internal Docker
+ * backend MCP (`http://some-backend:3000` and friends — an internal Docker
  * network map) alongside `env`, `bearerToken`, `headers`, `command` and
  * `args`, which routinely carry API credentials.
  *

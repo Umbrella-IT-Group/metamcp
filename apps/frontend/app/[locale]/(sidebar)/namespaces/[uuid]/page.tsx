@@ -95,7 +95,6 @@ export default function NamespaceDetailPage({
     command: "", // Not needed for metamcp proxy
     args: "",
     url: `/mcp-proxy/metamcp/${uuid}/sse`, // Connect to metamcp proxy endpoint
-    env: {},
     bearerToken: undefined,
     isMetaMCP: true, // Indicate this is a MetaMCP connection
     includeInactiveServers: true, // Include all servers regardless of status in namespace management

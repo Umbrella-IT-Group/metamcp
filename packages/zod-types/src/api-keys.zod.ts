@@ -193,7 +193,7 @@ export const DeleteApiKeyResponseSchema = z.object({
 // ('everyone') key. Deliberately omits the full `key` secret and carries only
 // a non-reversible prefix, exactly like the admin view below.
 //
-// Pentest finding 2026-08-13: this schema used to type `key` as the full
+// Security review finding: this schema used to type `key` as the full
 // string and the serializer returned it raw, so any self-registered member
 // could read every public key — gateway-wide production credentials — in
 // plaintext. Because this is the tRPC `.output()` schema, keeping key out of

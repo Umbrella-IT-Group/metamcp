@@ -55,7 +55,6 @@ interface UseConnectionOptions {
   command: string;
   args: string;
   url: string;
-  env: Record<string, string>;
   bearerToken?: string;
   headerName?: string;
   onNotification?: (notification: Notification) => void;
@@ -75,7 +74,6 @@ export function useConnection({
   command,
   args,
   url,
-  env,
   bearerToken,
   headerName,
   onNotification,
@@ -422,9 +420,19 @@ export function useConnection({
                 `/mcp-proxy/server/stdio`,
                 getAppUrl(),
               );
+              // The proxy spawns what the `mcp_servers` row says and nothing
+              // else, so the uuid is the only parameter it needs. `command`
+              // and `args` are still sent because the backend falls back to
+              // matching them against a registered row when no uuid arrives
+              // (an older bundle in a still-open tab). `env` is deliberately
+              // NOT sent: it is ignored on arrival and it carries this
+              // server's secrets through a query string.
+              mcpProxyServerUrl.searchParams.append(
+                "mcpServerUuid",
+                mcpServerUuid,
+              );
               mcpProxyServerUrl.searchParams.append("command", command);
               mcpProxyServerUrl.searchParams.append("args", args);
-              mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
               transportOptions = {
                 authProvider: authProvider,
                 eventSourceInit: {

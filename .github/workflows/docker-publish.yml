@@ -5,8 +5,8 @@ name: Build and Push to GHCR
 # keeps future upstream-merge diffs small — but its trigger is defused
 # below. Its main-branch tag path pushes :latest — on this fork, the
 # umbrella-build.yml push-to-`umbrella` path is the ONLY thing allowed to
-# write :latest, because that's the image Watchtower pulls onto
-# mcp-host-prod. Any semver tag reachable from our `main` (which mirrors
+# write :latest, because that's the image Watchtower pulls onto the
+# deploy host. Any semver tag reachable from our `main` (which mirrors
 # upstream's `main`) would fire this workflow and overwrite the umbrella
 # deploy image out from under Watchtower with an untested upstream build.
 # Triggers are pinned to workflow_dispatch only until/unless this fork
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_overwrite_latest:
-        description: "Overwrite the umbrella :latest deploy image with an upstream build? (Watchtower will pull it onto mcp-host-prod.)"
+        description: "Overwrite the umbrella :latest deploy image with an upstream build? (Watchtower will pull it onto the deploy host.)"
         type: choice
         options:
           - "no"

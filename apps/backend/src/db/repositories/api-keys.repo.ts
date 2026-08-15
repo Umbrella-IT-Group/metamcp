@@ -233,7 +233,7 @@ export class ApiKeysRepository {
     }
 
     // Throttled, fire-and-forget last-used stamp. This is the hot auth path
-    // for every public-endpoint request (Tara / n8n / Claude clients), so the
+    // for every public-endpoint request (n8n / Claude / other clients), so the
     // write is (a) throttled to the 15-min window in api-keys.last-used.ts and
     // (b) never awaited and never allowed to reject — a telemetry write must
     // not add latency to, or fail, request authentication.
@@ -308,7 +308,7 @@ export class ApiKeysRepository {
   // Member-scoped delete: uuid AND owned-by-this-user ONLY. Same reasoning as
   // update() above — a public key is not deletable through this path, only
   // through deleteAsAdmin. Without this, any member could DELETE a key every
-  // other consumer (Tara/n8n/Claude) authenticates with, using a uuid they
+  // other consumer (n8n/Claude/other clients) authenticates with, using a uuid they
   // can read off their own `list` query.
   async delete(uuid: string, userId: string) {
     const [deletedApiKey] = await db

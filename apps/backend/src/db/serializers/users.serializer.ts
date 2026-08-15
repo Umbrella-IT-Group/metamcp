@@ -35,7 +35,7 @@ export class UsersSerializer {
   // password hash on `accounts.password`, and the session token on
   // `sessions.token`), but "there is nothing secret in this table right now"
   // is a property of the schema at one point in time, not a guarantee, and
-  // this is the surface the 2026-08-13 incident made administrator-visible.
+  // this is the surface the access review made administrator-visible.
   //
   // Same discipline as serializeAdminApiKeyList / serializeOAuthClientList:
   // the serializer drops, the router's `.output()` schema re-checks. Two

@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 
+import { credentialedCorsOrigin } from "../lib/cors-policy";
 import { betterAuthMcpMiddleware } from "../middleware/better-auth-mcp.middleware";
 import { requireAdminMcpMiddleware } from "../middleware/require-admin-mcp.middleware";
 import { requireEnabledMcpMiddleware } from "../middleware/require-enabled-mcp.middleware";
@@ -12,9 +13,15 @@ const mcpProxyRouter = express.Router();
 
 // Apply security middleware for MCP proxy communication
 mcpProxyRouter.use(helmet());
+// Session-authenticated and admin-gated (see the block below), so the origin
+// is resolved against the shared allowlist rather than handed the raw
+// `APP_URL`: an unset or empty APP_URL is falsy and the cors package answers a
+// falsy origin with the literal `*` beside `credentials: true`, while a
+// trailing slash makes the string comparison miss and drops CORS for the app's
+// own frontend. See ../lib/cors-policy.
 mcpProxyRouter.use(
   cors({
-    origin: process.env.APP_URL,
+    origin: credentialedCorsOrigin,
     credentials: true,
     allowedHeaders: [
       "Content-Type",
@@ -44,10 +51,14 @@ mcpProxyRouter.use((req, res, next) => {
 // load-bearing: betterAuthMcpMiddleware populates `req.user` from the session
 // cookie, requireEnabledMcpMiddleware then re-reads `users.disabled` for that
 // id, and requireAdminMcpMiddleware reads `req.user.role`. The admin
-// restriction is not incidental hardening — the STDIO branch of
-// /server/{stdio,sse,mcp} spawns a query-string-supplied command with the
-// backend's environment, so session-only access was remote code execution
-// for any member. See middleware/require-admin-mcp.middleware.ts.
+// restriction is not accidental hardening — the STDIO branch of
+// /server/{stdio,sse,mcp} spawns a process with the backend's environment, so
+// session-only access was remote code execution for any member back when the
+// command came off the query string. It now comes from the `mcp_servers` row
+// only (see mcp-proxy/server.ts findRegisteredStdioServer), which makes these
+// two layers independent: the gate decides WHO may start a server, the
+// resolver decides WHICH servers exist to be started, and neither is the
+// other's backstop. See middleware/require-admin-mcp.middleware.ts.
 //
 // The disabled gate sits between the two because a valid cookie is not a
 // valid ACCOUNT: nothing else on this router re-reads `users.disabled`, so

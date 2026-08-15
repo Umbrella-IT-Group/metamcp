@@ -1,7 +1,7 @@
 /**
  * The OAuth plane's audit rows.
  *
- * The 2026-08-13 incident ran on this exact chain: an anonymously registered
+ * Credential-theft abuse runs on this exact chain: an anonymously registered
  * client, a consent grant, an authorization code, a 24h access token and the
  * 365d refresh token behind it. Every step of it was silent — `/oauth/register`
  * accepts a client with no credential at all and left no durable record that it
@@ -294,7 +294,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
       path: "/oauth/register",
       body: {
         client_name: "Definitely Claude",
-        // Loopback, because since FIND-023 that is the only shape an
+        // Loopback, because since the host allowlist that is the only shape an
         // anonymous caller can still register besides the Anthropic hosts —
         // and it makes the point better: the NAME is the lie the consent
         // screen shows, and no host allowlist constrains it.
@@ -355,7 +355,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
     // target is a jsonb column in a table with DELETE/TRUNCATE triggers and
     // no prune path, so every byte written is permanent.
     //
-    // One allowlisted host with 40 distinct long PATHS, because FIND-023's
+    // One allowlisted host with 40 distinct long PATHS, because the
     // host allowlist refuses 40 distinct hosts — and the clamp this test
     // exists for bounds length, which the path carries just as well. The
     // amplification is real either way: the allowlist caps the host set, not

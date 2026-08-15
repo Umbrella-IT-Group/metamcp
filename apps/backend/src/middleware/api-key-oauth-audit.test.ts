@@ -1,7 +1,7 @@
 /**
  * The stolen-key detector: audit emission on the MCP bearer path.
  *
- * During the 2026-08-13 incident this middleware — the layer every API key and
+ * Under credential-theft abuse this middleware — the layer every API key and
  * every OAuth bearer token passes through — wrote NOTHING when it refused a
  * credential. Not a log line, not a counter. A stolen key being tried against
  * endpoint after endpoint looked exactly like no traffic at all. These tests
@@ -40,6 +40,15 @@ vi.mock("../db/repositories/api-keys.repo", () => ({
 
 vi.mock("../db/repositories/users.repo", () => ({
   usersRepository: { isDisabled: isDisabledMock },
+}));
+
+// The middleware validates a bearer token by reading the token row directly
+// (it used to call its own /oauth/introspect over HTTP), so oauth.repo is on
+// the module-load import chain and reaches db/index like the other two. No
+// test in this file takes the OAuth branch — every endpoint here has
+// enable_oauth false — so the lookup answering `null` is never reached.
+vi.mock("../db/repositories/oauth.repo", () => ({
+  oauthRepository: { getAccessToken: vi.fn().mockResolvedValue(null) },
 }));
 
 const { authenticateApiKey } = await import("./api-key-oauth.middleware");

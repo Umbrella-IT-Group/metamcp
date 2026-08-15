@@ -3,7 +3,7 @@ name: Umbrella — Build & Push (umbrella branch)
 # Umbrella IT Group fork — see UMBRELLA_FORK.md.
 # Builds and publishes the deployable line on every push to `umbrella`.
 # Image lands at ghcr.io/umbrella-it-group/metamcp:<sha> + :latest.
-# Watchtower on mcp-host-prod (scope=umbrella) picks up :latest within ~5 min.
+# Watchtower on the deploy host (scope=umbrella) picks up :latest within ~5 min.
 #
 # Also runs build-only (no login, no push, no tags) on PRs targeting
 # `umbrella` — this is the only build check a PR gets before merge. Until
@@ -122,7 +122,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          # mcp-host-prod is amd64-only; arm64 cross-build doubles CI time
+          # The deploy host is amd64-only; arm64 cross-build doubles CI time
           # for an artifact nothing consumes. Re-add if we ever publish for
           # a community arm64 host.
           platforms: linux/amd64

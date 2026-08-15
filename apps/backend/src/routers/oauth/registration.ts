@@ -81,7 +81,7 @@ registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
       // arrays verbatim would hand an anonymous caller a multi-megabyte
       // write per request into a jsonb column with DELETE/TRUNCATE triggers
       // and no prune path — turning the table that exists to survive an
-      // incident into a disk-exhaustion vector. `rateLimitToken` does not
+      // attack into a disk-exhaustion vector. `rateLimitToken` does not
       // save it: it keys on `req.ip`, which is the same loopback address for
       // every caller behind the in-container rewrite, so it is one global
       // bucket. `redirect_uri_count` preserves the fact that truncation

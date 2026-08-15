@@ -9,7 +9,7 @@
  *  - scope immutability: the update schemas/paths do not carry endpoint_uuid
  *    at all — a key's scope is fixed at mint time,
  *  - the member-facing listing (list) drops the full secret for EVERY key,
- *    public keys included (pentest fix 2026-08-13),
+ *    public keys included (security review fix),
  *  - the admin cross-user listing (listAll) drops the full secret and carries
  *    owner email + last_used_at,
  *  - update/delete route to the owner-scoped repo methods for members and the
@@ -593,7 +593,7 @@ describe("api-keys update — acts-as identity is immutable by omission", () => 
   });
 });
 
-// Pentest fix 2026-08-13 (CRITICAL). `list` is a plain protectedProcedure and
+// Security review fix (CRITICAL). `list` is a plain protectedProcedure and
 // findAccessibleToUser deliberately returns the caller's own keys PLUS every
 // public ('everyone') key — so when the serializer emitted `key` raw, any
 // self-registered member could read the gateway-wide production keys in

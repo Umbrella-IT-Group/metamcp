@@ -1,7 +1,7 @@
 /**
  * Admin gate for the Access dashboard's two NET-NEW routers.
  *
- * Incident 2026-08-13: an attacker's self-registered member accounts were
+ * Self-registration abuse: an attacker's member accounts were
  * invisible because no surface listed users. The fix adds one — and a user
  * listing is itself a disclosure (every account's email, role and live
  * session count in one response), while `delete` removes an identity and

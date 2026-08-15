@@ -54,13 +54,13 @@ export interface RequestWithSessionRecoveryOptions<T> {
  * resources/list, resources/templates/list).
  *
  * `tools/call` and the dynamic-find path in `metamcp-proxy.ts` have had
- * this cascade since PR #13/#16; the OpenAPI bridge since the 2026-05-14
+ * this cascade since PR #13/#16; the OpenAPI bridge since its own
  * regression fix. The aggregate list handlers were the remaining gap:
  * their catch blocks logged-and-continued, so a dead pooled session
  * (e.g. after a Watchtower swap of the backend container) made the
  * namespace return a "successful" 0-tool response on every request,
  * forever — the swallowed error meant the zombie connection was never
- * invalidated (incident 2026-06-11, Umbrella-MCP-Server#229).
+ * invalidated (observed in production as a 24h zero-tool outage).
  *
  * Throws when the error is non-recoverable, when no fresh session could
  * be established, or when the retry on the fresh session fails — the

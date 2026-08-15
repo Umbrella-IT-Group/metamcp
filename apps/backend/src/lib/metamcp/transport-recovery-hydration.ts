@@ -38,8 +38,8 @@
  * connector until a full client refresh (which drops the cached
  * sessionId and forces a fresh `initialize`). A `/mcp` reconnect does
  * NOT clear it — it reuses the same cached sessionId and hits the same
- * dead transport. (Root-caused on mcp-host-prod 2026-05-27: every
- * stored `mcp_sessions` row carried the current capability_hash, so the
+ * dead transport. (Root-caused against a live deployment: every stored
+ * `mcp_sessions` row carried the current capability_hash, so the
  * PR #22/#23/#24 capability machinery was never the cause — recovery was
  * "succeeding" and then 400-ing on the first call.)
  *

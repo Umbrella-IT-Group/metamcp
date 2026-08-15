@@ -158,8 +158,8 @@ export const usersTable = pgTable("users", {
   // (MCP-server / namespace / endpoint create-update-delete + all API-key
   // administration) through `adminProcedure`. NOT NULL default 'member' so
   // every pre-existing and future account is least-privilege until it is
-  // explicitly promoted — migration 0020 seeds alex@umbrellaitgroup.com to
-  // 'admin'. Surfaced into the better-auth session via `user.additionalFields`
+  // explicitly promoted — migration 0020 seeds the bootstrap operator account
+  // to 'admin'. Surfaced into the better-auth session via `user.additionalFields`
   // in auth.ts with `input: false`, so a user cannot self-escalate by
   // sending a role on sign-up / update.
   role: text("role").notNull().default("member"),
@@ -169,7 +169,7 @@ export const usersTable = pgTable("users", {
   // unauthenticated rather than waiting out the 30-day expiry. Both halves
   // are required — either alone leaves a real path in.
   //
-  // The incident-response middle tier: revoking access lets the account sign
+  // The containment middle tier: revoking access lets the account sign
   // straight back in, and deleting it destroys the evidence AND cascades into
   // other users' endpoints and API keys. Disabling locks the account while
   // preserving it whole.

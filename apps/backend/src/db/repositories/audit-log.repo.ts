@@ -22,8 +22,8 @@ export interface AuditLogEntry {
  *
  * INSERT-only, and that is the whole design. There is deliberately no
  * `pruneOlderThan` here — unlike its sibling `tool-call-audit.repo.ts`, which
- * hard-DELETEs on a timer. The operator requirement out of the 2026-08-13
- * incident is an archive with no application or admin path that empties it,
+ * hard-DELETEs on a timer. The operator requirement here is an archive with
+ * no application or admin path that empties it,
  * so the method simply does not exist to be called, mis-wired into a cleanup
  * interval, or exposed through a tRPC procedure later. Retention past the
  * WORM-export horizon is an ops-only partition drop (Phase 2), not code.

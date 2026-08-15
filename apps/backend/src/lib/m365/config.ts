@@ -1,15 +1,15 @@
 /**
  * Environment-derived configuration for the M365 delegated-token broker.
  *
- * All values come from the `metamcp-m365.env` SOPS-vaulted env file
- * (Umbrella-Cloud-Vault `secrets/mcp-host/metamcp-m365.env.enc`, mounted
- * via compose `env_file` with `required: false`). The broker must boot
+ * All values come from the `metamcp-m365.env` env file (kept encrypted at
+ * rest in a secrets repo and mounted via compose `env_file` with
+ * `required: false`). The broker must boot
  * CLEANLY when the file is absent — `isM365BrokerConfigured()` gates
  * every route and the injection path, returning typed `not_configured`
  * errors instead of crashing. This lets the fork image deploy before the
  * Entra app registration exists (the admin-consent morning gate).
  *
- * Design doc: Umbrella-MCP-Server `docs/M365_DELEGATED_MCP_DESIGN.md` §4.1.
+ * Design doc: internal M365 delegated-MCP design, §4.1.
  */
 
 /**

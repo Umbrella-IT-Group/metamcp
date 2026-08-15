@@ -5,7 +5,7 @@ import logger from "@/utils/logger";
 /**
  * The gateway's terminal error handler.
  *
- * Redteam re-verification 2026-08-14, live-confirmed against production: a
+ * Found by a security review: a
  * POST of malformed JSON to any non-proxy route —
  * `curl -X POST .../trpc/x -H 'Content-Type: application/json' --data-binary '{bad'`
  * — came back with a full stack trace. `express.json()` rejects the body
@@ -134,7 +134,7 @@ export const errorHandler = (
   const status = resolveErrorStatus(err);
 
   if (status < 500) {
-    // Logged at debug: a caller sending broken input is not an incident, and
+    // Logged at debug: a caller sending broken input is not an attack, and
     // an unauthenticated route that anyone can POST garbage to would let a
     // higher level be used to flood the log.
     logger.debug(

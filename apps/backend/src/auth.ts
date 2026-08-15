@@ -183,8 +183,8 @@ export const auth = betterAuth({
 
           if (isSsoRegistration) {
             if (isSsoSignupDisabled) {
-              // The incident's front door, from the inside. When
-              // self-registration was open on 2026-08-13 the accounts that
+              // The abuse's front door, from the inside. When
+              // self-registration was open the accounts that
               // walked through it left no trace beyond the `users` rows
               // themselves; when it is CLOSED, the attempts that bounce off
               // it leave nothing at all — and a burst of them is the clearest
@@ -230,7 +230,7 @@ export const auth = betterAuth({
         // attacker working from the session they already hold for a month.
         // Together the two halves mean "disabled" takes effect on the very
         // next request, which is the only definition of disabled worth
-        // shipping during an incident.
+        // shipping during a live investigation.
         //
         // Throwing (rather than returning `false`) is deliberate: better-auth
         // treats a `false` return as "abort and return null", which surfaces

@@ -1,7 +1,7 @@
 /**
  * `audit_log` is append-only, and this proves it two ways.
  *
- * The operator requirement out of the 2026-08-13 incident is an audit archive
+ * The operator requirement behind this is an audit archive
  * with NO application or admin path that empties it. Two things enforce that:
  * a repository with no delete/update/prune method (audit-log.repo.ts), and the
  * database triggers migration 0028 installs. The repository half is enforced
@@ -16,7 +16,7 @@
  * Layer 2 (opt-in via TEST_DATABASE_URL): the triggers are exercised against a
  * REAL Postgres. A trigger that exists in a .sql file and a trigger that
  * actually refuses a DELETE are different claims, and only the second one is
- * worth anything the morning after an incident.
+ * worth anything the morning after an attack.
  *
  *   docker run -d --name metamcp-audit-test -e POSTGRES_PASSWORD=test \
  *     -e POSTGRES_USER=test -e POSTGRES_DB=metamcp_test \

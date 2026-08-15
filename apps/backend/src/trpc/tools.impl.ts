@@ -20,7 +20,7 @@ import { toolsSyncCache } from "../lib/metamcp/tools-sync-cache";
  * skips the "tools unchanged" branch. These two procedures are called by the
  * inspector and the server detail pages on every refresh, so emitting on the
  * no-op branches would put an admin-triggered, unbounded stream of rows that
- * record nothing into the same table an incident is read from. A row here
+ * record nothing into the same table an investigation is read from. A row here
  * means the shared tools catalog for an MCP server changed.
  */
 

@@ -2,12 +2,18 @@
  * Integration tests for the two gates on /mcp-proxy — the member-role RCE and
  * the disabled-account lockout.
  *
- * GET /mcp-proxy/server/stdio takes `command`, `args` and `env` off the
- * QUERY STRING and spawns them with the backend's full environment
- * (`mcp-proxy/server.ts` `createTransport` ->
- * `ProcessManagedStdioTransport.start`). Its only gate was
+ * GET /mcp-proxy/server/stdio spawns a process with the backend's full
+ * environment (`mcp-proxy/server.ts` `createTransport` ->
+ * `ProcessManagedStdioTransport.start`), and used to take the `command`,
+ * `args` and `env` for it straight off the QUERY STRING. Its only gate was
  * `betterAuthMcpMiddleware`, a session check with no role check, so any
  * member-role account could execute commands on the gateway host.
+ *
+ * The command is now sourced from the `mcp_servers` row (see
+ * `mcp-proxy/server.spawn-source.test.ts`), but that is the OTHER half of the
+ * defence and this suite deliberately does not depend on it: the query shape
+ * below is kept verbatim because what these tests pin is that a non-admin is
+ * refused BEFORE any of it is looked at.
  *
  * The second gate answers the other half of the same question. Being an admin
  * is not the same as being an ALLOWED admin: `users.disabled` (migration
@@ -309,7 +315,7 @@ describe("/mcp-proxy — the gate is fail-closed", () => {
 describe("/mcp-proxy — the disabled-account gate", () => {
   it("refuses a DISABLED ADMIN on the STDIO spawn route", async () => {
     // The whole point of the gate: role alone said yes. Disable is the
-    // incident-response button, and until this check it did not reach the one
+    // containment button, and until this check it did not reach the one
     // route on this gateway that runs commands.
     signInAs("admin");
     h.isDisabled.mockResolvedValue(true);

@@ -5,6 +5,7 @@ import express from "express";
 import helmet from "helmet";
 
 import { trpcDenialSink } from "../lib/audit/trpc-denial-sink";
+import { credentialedCorsOrigin } from "../lib/cors-policy";
 import { createContext } from "../trpc";
 import { apiKeysImplementations } from "../trpc/api-keys.impl";
 import { configImplementations } from "../trpc/config.impl";
@@ -52,9 +53,16 @@ const trpcRouter = express.Router();
 
 // Apply security middleware for frontend communication
 trpcRouter.use(helmet());
+// Every procedure on this router is session-authenticated, so the origin is
+// resolved against the shared allowlist rather than handed the raw `APP_URL`.
+// A bare `origin: process.env.APP_URL` has two failure modes the allowlist does
+// not: an unset or empty APP_URL is falsy, and the cors package answers a
+// falsy origin with the literal `*` — beside `credentials: true` — while a
+// trailing slash or a case difference makes the string comparison miss and
+// silently drops CORS for the app's own frontend. See ../lib/cors-policy.
 trpcRouter.use(
   cors({
-    origin: process.env.APP_URL,
+    origin: credentialedCorsOrigin,
     credentials: true,
   }),
 );

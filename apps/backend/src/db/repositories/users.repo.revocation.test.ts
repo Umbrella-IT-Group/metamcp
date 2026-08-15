@@ -17,7 +17,7 @@
  *    still live while the caller was told the revoke failed — the reported
  *    state was a lie in both directions.
  *  - `revokeAccess` DEACTIVATES keys rather than deleting them, and leaves
- *    the `users` row alone: the account record is the incident evidence.
+ *    the `users` row alone: the account record is the forensic evidence.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -151,7 +151,7 @@ describe("UsersRepository.revokeAccess", () => {
       oauthAccessTokensTable,
       oauthAuthorizationCodesTable,
     ]);
-    // The account itself survives — it is the incident record.
+    // The account itself survives — it is the forensic record.
     expect(deleteCalls).not.toContain(usersTable);
 
     // API keys are DEACTIVATED, not deleted: `is_active` is the revocation

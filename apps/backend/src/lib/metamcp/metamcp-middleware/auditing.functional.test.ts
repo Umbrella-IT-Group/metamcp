@@ -12,7 +12,7 @@ import { MetaMCPHandlerContext } from "./functional-middleware";
 const context: MetaMCPHandlerContext = {
   namespaceUuid: "ns-123",
   sessionId: "sess-456",
-  clientName: "Tara connector",
+  clientName: "example connector",
 };
 
 const makeRequest = (args?: Record<string, unknown>): CallToolRequest =>
@@ -45,7 +45,7 @@ describe("auditing middleware DB write-through", () => {
     const entry = recorder.mock.calls[0][0];
     expect(entry.server_name).toBe("autotask");
     expect(entry.tool_name).toBe("search");
-    expect(entry.client_name).toBe("Tara connector");
+    expect(entry.client_name).toBe("example connector");
     expect(entry.namespace_uuid).toBe("ns-123");
     expect(entry.session_id).toBe("sess-456");
     expect(entry.success).toBe(true);

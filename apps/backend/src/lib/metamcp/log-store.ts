@@ -3,7 +3,7 @@ import logger from "@/utils/logger";
 // Event class for a log entry. Lets the Live Logs view show real activity
 // (connections, tool calls, who's connecting) and filter by kind.
 //   connection — gateway↔backend connect attempt / success / transport drop
-//   client     — a CONSUMER (claude.ai/Tara/n8n) opened a session at an endpoint
+//   client     — a CONSUMER (claude.ai/n8n/agents) opened a session at an endpoint
 //   tool_call  — a tools/call proxied to a backend (name, duration, ok/fail)
 //   server     — backend-emitted output (stderr) or a server config error
 //   system     — gateway lifecycle / pool events
@@ -125,8 +125,8 @@ class MetaMcpLogStore {
 
   // There is deliberately no clearLogs(). Its only caller was the `logs.clear`
   // tRPC mutation, removed with migration 0028's audit_log: the one admin
-  // gesture that erased the live security view mid-incident. Leaving an unused
-  // wipe method behind is how it comes back. The buffer still rolls at
+  // gesture that erased the live security view mid-investigation. Leaving an
+  // unused wipe method behind is how it comes back. The buffer still rolls at
   // maxLogs — bounded, but never emptied on command.
 
   addListener(listener: (log: MetaMcpLogEntry) => void): () => void {
