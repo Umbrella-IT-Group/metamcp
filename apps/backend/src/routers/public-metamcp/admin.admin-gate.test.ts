@@ -18,9 +18,10 @@
  *  - `better-auth-mcp.middleware`, so a session can be simulated without a
  *    database, leaving `req.user` exactly as better-auth does,
  *  - `users.repo`, so the disabled lookup answers on command,
- *  - the endpoints repo, so the REAL `lookupEndpoint` runs (the 404-for-an-
- *    unknown-endpoint ordering is part of what is pinned here) without
- *    postgres,
+ *  - the endpoints repo, so the REAL `lookupEndpointAfterAuth` runs without
+ *    postgres (where it sits in the chain is part of what is pinned here: an
+ *    anonymous caller must not be able to tell a real endpoint name from an
+ *    invented one, while an authenticated admin still gets a plain 404),
  *  - the mcp-servers repo, the error tracker and `lib/startup`, so the
  *    handlers' own side effects are observable and `@/db` stays out of the
  *    import graph.
@@ -268,13 +269,42 @@ describe("/metamcp/:endpoint_name/admin/* — the disabled-account gate", () => 
   });
 });
 
-describe("/metamcp/:endpoint_name/admin/* — lookup still runs first", () => {
+describe("/metamcp/:endpoint_name/admin/* — lookup runs behind the gate", () => {
   it.each(surface)(
-    "an unknown endpoint is 404, not 401, on %s %s",
+    "an anonymous caller cannot tell a real endpoint from an invented one on %s %s",
     async (method, path) => {
-      // Ordering pin: `lookupEndpoint` stays ahead of authentication so a
-      // typo answers "no such endpoint" rather than "sign in". This is the
-      // ordering the API-key version had, so the gate discloses nothing new.
+      // ENUMERATION-ORACLE PIN, and the reason `lookupEndpoint` moved behind
+      // the gate. It used to run first, so a signed-out caller got 404 for a
+      // name that does not exist and 401 for one that does: a free
+      // does-this-exist answer for every guess, on routes anyone can reach.
+      // Real name first, with no session.
+      const real = await fetch(`${baseUrl}${path}`, { method });
+      const realBody = await real.text();
+
+      // Then a name the repository refuses to resolve. Nothing about the
+      // answer may differ, and the lookup must not have been consulted at
+      // all: an unauthenticated request should not reach the database.
+      h.findByName.mockResolvedValue(undefined);
+      const invented = await fetch(
+        `${baseUrl}${path.replace("autotask", "no-such-endpoint")}`,
+        { method },
+      );
+
+      expect(real.status).toBe(401);
+      expect(invented.status).toBe(real.status);
+      expect(await invented.text()).toBe(realBody);
+      expect(h.findByName).not.toHaveBeenCalled();
+      expectNoEstateAccess();
+    },
+  );
+
+  it.each(surface)(
+    "an authenticated admin still gets an honest 404 for an unknown endpoint on %s %s",
+    async (method, path) => {
+      // The 404 is not deleted, it is MOVED behind the gate. An operator who
+      // has proven who they are is exactly who should be told a name is
+      // wrong, and they can already list every endpoint in the admin UI.
+      signInAs("admin");
       h.findByName.mockResolvedValue(undefined);
 
       const response = await fetch(

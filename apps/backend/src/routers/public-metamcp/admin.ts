@@ -2,7 +2,7 @@ import express from "express";
 
 import { betterAuthMcpMiddleware } from "@/middleware/better-auth-mcp.middleware";
 import { INTERNAL_ERROR_BODY } from "@/middleware/error-handler.middleware";
-import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
+import { lookupEndpointAfterAuth } from "@/middleware/lookup-endpoint-middleware";
 import { requireAdminMcpMiddleware } from "@/middleware/require-admin-mcp.middleware";
 import { requireEnabledMcpMiddleware } from "@/middleware/require-enabled-mcp.middleware";
 import logger from "@/utils/logger";
@@ -39,10 +39,24 @@ adminRouter.use(express.json());
  * fall-through, so a router-level session middleware here would sit in front
  * of API-key traffic that must never be asked for a cookie.
  *
- * `lookupEndpoint` stays FIRST, ahead of authentication, so an unknown
- * endpoint name still answers 404 rather than 401. That ordering is
- * unchanged from the API-key version, so it discloses nothing it did not
- * disclose before.
+ * `lookupEndpointAfterAuth` now runs LAST, behind the whole gate, and that
+ * reordering is a fix rather than a tidy-up. `lookupEndpoint` used to run
+ * first, so an unknown endpoint
+ * name answered 404 rather than 401 -- convenient for a typo, but it made
+ * these two routes an endpoint-enumeration oracle for callers with no session
+ * at all: 404 meant "no such name", anything else meant "that name is real".
+ * The data plane's own version of that hole is closed inside
+ * `lookup-endpoint-middleware` by answering unknown names with the ordinary
+ * authentication challenge, which it must do because `authenticateApiKey`
+ * needs `req.endpoint` to pick an auth mode. Here there is no such
+ * constraint: none of the three gate middlewares reads `req.endpoint` (they
+ * read cookies, `req.user.id` and `req.user.role`), and neither do these two
+ * handlers, which answer estate-wide from `mcpServersRepository.findAll()`.
+ * So the lookup can simply move behind them, in its `afterAuthentication`
+ * form. An anonymous caller now gets the identical session 401
+ * for every name, real or invented, and the honest 404 survives for the
+ * authenticated administrator who is the only one who should be able to tell
+ * the difference.
  *
  * Spelled out on each route below rather than hoisted into a shared array,
  * so a route added to this file later has to state its own gate instead of
@@ -61,10 +75,10 @@ adminRouter.use(express.json());
  */
 adminRouter.post(
   "/:endpoint_name/admin/reset-errors",
-  lookupEndpoint,
   betterAuthMcpMiddleware,
   requireEnabledMcpMiddleware,
   requireAdminMcpMiddleware,
+  lookupEndpointAfterAuth,
   async (req, res) => {
     try {
       const { serverUuid } = req.body || {};
@@ -134,10 +148,10 @@ adminRouter.post(
  */
 adminRouter.get(
   "/:endpoint_name/admin/error-status",
-  lookupEndpoint,
   betterAuthMcpMiddleware,
   requireEnabledMcpMiddleware,
   requireAdminMcpMiddleware,
+  lookupEndpointAfterAuth,
   async (req, res) => {
     try {
       const allServers = await mcpServersRepository.findAll();
