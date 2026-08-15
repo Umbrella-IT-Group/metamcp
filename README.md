@@ -1,7 +1,7 @@
 # MetaMCP — Umbrella IT Group fork
 
 > **A maintained downstream fork of [`metatool-ai/metamcp`](https://github.com/metatool-ai/metamcp).**
-> Upstream went effectively unmaintained from **2026-02-08 through mid-June 2026**. During that window we carried the community's open PRs plus our own incident-driven fixes on the [`umbrella`](https://github.com/Umbrella-IT-Group/metamcp/tree/umbrella) branch — the default and deployable line of this repo. `main` mirrors upstream. MIT-licensed; upstream copyright preserved. Full change record: [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md).
+> Upstream went effectively unmaintained from **2026-02-08 through mid-June 2026**. During that window we carried the community's open PRs plus our own reliability and security-hardening fixes on top of upstream, on the [`umbrella`](https://github.com/Umbrella-IT-Group/metamcp/tree/umbrella) branch — the default and deployable line of this repo. `main` mirrors upstream. MIT-licensed; upstream copyright preserved. Full change record: [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md).
 
 <div align="center">
 
@@ -40,7 +40,7 @@
 
 MetaMCP is a genuinely useful piece of infrastructure, and its author was candid about the maintenance slowdown (see upstream's [`recent-updates.md`](recent-updates.md)). For roughly four months there were no merges upstream while real, spec-level bugs sat in open PRs — chief among them an OAuth defect that disconnected Claude.ai custom MCP connectors every 60 minutes.
 
-We run MetaMCP as the production gateway in front of every internal MCP server at Umbrella IT Group. When upstream stalled, we needed those fixes on a line we could deploy. So `umbrella` became that line: community PRs upstream hadn't reviewed yet, plus our own patches for problems we hit in production. In June 2026 upstream revived on its `ai-dev` branch and merged a large batch of community work — including several of our contributions. We reconciled which of our deltas converged upstream and made a deliberate decision to keep running our own line (details in [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md)).
+When upstream stalled, those fixes needed to live on a line that could actually be built and shipped. So `umbrella` became that line: community PRs upstream hadn't reviewed yet, plus patches for defects that surface in long-running gateway deployments. In June 2026 upstream revived on its `ai-dev` branch and merged a large batch of community work — including several contributions from this fork. We reconciled which deltas converged upstream and made a deliberate decision to keep maintaining a separate line (details in [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md)).
 
 ## Stability
 
@@ -48,19 +48,19 @@ Upstream's `ai-dev` README links this repository directly, in its "Latest Update
 
 > There is also a community maintained fork (ty a lot!): https://github.com/Umbrella-IT-Group/metamcp
 
-Two things to read honestly here. Upstream frames `ai-dev` as its **experimental** line — its own README asks you to *"test before you build the image based on this branch"* because it *"contains ai agent changes"* — and offers this fork as the community-maintained alternative. Upstream does **not** use the word "stable"; that framing is ours, and it is an operational claim, not an upstream endorsement.
+Two things to read honestly here. Upstream frames `ai-dev` as its **experimental** line — its own README asks you to *"test before you build the image based on this branch"* because it *"contains ai agent changes"* — and offers this fork as the community-maintained alternative. Upstream does **not** use the word "stable"; that framing is this fork's, not an upstream endorsement.
 
 What we can state factually:
 
-- The `umbrella` branch runs the production MCP gateway at Umbrella IT Group, serving live Claude.ai custom connectors, Claude Code, n8n workflows, and internal agents.
+- `umbrella` is the maintained, deployable line of this repo: every change lands there first, and the published image is built from it.
 - Every merge to `umbrella` passes type-check, lint, backend `vitest`, and a full production Docker build before it ships.
-- The fixes here were driven by real incidents on that gateway, and each ships with regression tests (the fork carries 300+ backend test cases beyond the upstream baseline).
+- The fixes here are reliability and security-hardening fixes on top of upstream, and each ships with regression tests (the fork carries 300+ backend test cases beyond the upstream baseline).
 
 We make **no guarantee for your environment**. Read [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the full per-change record, and test the image before you depend on it — the same advice upstream gives for `ai-dev`.
 
 ## What we focus on
 
-One thing: **reliability of a self-hosted gateway that stays connected**. The consumers we care about — Claude.ai custom connectors, Claude Code, n8n, and our own agents — hold long-lived sessions and reconnect poorly when a backend or the gateway restarts under them. Our work concentrates on four properties:
+One thing: **reliability of a self-hosted gateway that stays connected**. The consumers this fork targets — Claude.ai custom connectors, Claude Code, n8n, and long-running agents — hold long-lived sessions and reconnect poorly when a backend or the gateway restarts under them. Our work concentrates on four properties:
 
 - **Session survival across restarts** — a gateway restart, a backend container swap, or a transport drop should be transparent to connected clients, not a manual `reconnect` ritual.
 - **OAuth longevity** — connectors authenticate once and stay authenticated, instead of dropping on a hardcoded 1-hour token.
@@ -112,7 +112,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 These are deliberate, documented differences from `metatool-ai/metamcp`.
 
 - **Single-tenant posture.** This gateway serves a single organization and connects to each backend MCP server using shared, static, per-server service credentials configured on the gateway. We do not model per-caller identity flowing through to backends (with one scoped exception, below).
-- **We declined the multi-tenant per-server header-forwarding path (upstream [#256](https://github.com/metatool-ai/metamcp/pull/256)).** That PR forwards per-client headers to backends to enable cross-tenant routing. It merged upstream, but it does not fit our model: our backends authenticate via shared service credentials, so per-client header forwarding adds attack surface and complexity for a capability we deliberately don't want. We do not carry it.
+- **We declined the multi-tenant per-server header-forwarding path (upstream [#256](https://github.com/metatool-ai/metamcp/pull/256)).** That PR forwards per-client headers to backends to enable cross-tenant routing. It merged upstream, but it does not fit this fork's model: backends authenticate via shared service credentials, so per-client header forwarding adds attack surface and complexity for a capability the fork deliberately doesn't want. We do not carry it.
 - **Default-public visibility, OAuth-on endpoints.** New namespaces/endpoints/servers default to "Everyone" ownership and new endpoints default OAuth-on — an Umbrella-specific policy stance, not upstream's default.
 - **Per-user Microsoft 365 delegated-token broker** (Umbrella-specific extension). A scoped, opt-in exception to the single-tenant posture: for one designated backend, the gateway mints a per-user delegated Graph token request-scoped via `AsyncLocalStorage`, with encrypted token custody. Upstream has no per-user backend-credential concept; this lives entirely in our line.
 - **Branding.** MetaMCP wordmarks are replaced with the Umbrella IT Group brandmark on the sidebar and browser tab. Cosmetic and fork-specific.

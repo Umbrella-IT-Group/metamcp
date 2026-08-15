@@ -217,8 +217,8 @@ export const apiKeysImplementations = {
   // reasoning was wrong: a public key being distributed to its intended
   // consumers out-of-band is not the same as every self-registered member
   // being able to read it on demand, and `list` is reachable by any member.
-  // A pentest recovered three live gateway-wide production keys through
-  // exactly this call (2026-08-13). The convenience is gone deliberately;
+  // A member-role caller could read live gateway-wide production keys through
+  // exactly this call. The convenience is gone deliberately;
   // an operator who needs gateway access gets an endpoint-scoped key minted
   // for them instead (create is admin-only and scope is mandatory).
   list: async (
