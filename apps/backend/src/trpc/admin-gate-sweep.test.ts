@@ -8,11 +8,14 @@
  * below, which now asserts absence.
  *
  * Pre-condition verified by code inspection: `namespaces.refreshTools`
- * (member-accessible, kept as-is — see namespaces-curation-admin.test.ts)
- * calls `toolsRepository.bulkUpsert` directly from
- * `apps/backend/src/trpc/namespaces.impl.ts`, never routing through the
- * `tools.create`/`tools.sync` tRPC procedures gated here. Gating those two
- * procedures therefore has no effect on the refreshTools member path.
+ * (still protectedProcedure, so a non-admin owner keeps it — see
+ * namespaces-curation-admin.test.ts) calls `toolsRepository.bulkUpsert`
+ * directly from `apps/backend/src/trpc/namespaces.impl.ts`, never routing
+ * through the `tools.create`/`tools.sync` tRPC procedures gated here.
+ * Gating those two procedures therefore had no effect on the refreshTools
+ * path — which is why that path needed its own gate for the PUBLIC-namespace
+ * case, added in the impl and pinned by
+ * `namespaces.refresh-tools.impl.test.ts`.
  */
 
 import {
@@ -75,7 +78,7 @@ describe("tools.create / tools.sync — admin gate", () => {
  *
  * The gate was never the problem: the procedure only emptied the in-memory
  * ring buffer, but it was the one admin gesture that erased the live security
- * view mid-incident, and it is the exact affordance the post-2026-08-13
+ * view mid-investigation, and it is the exact affordance the operator
  * requirement forbids — no application or admin path that clears the record.
  * An admin-gated wipe is still a wipe.
  *

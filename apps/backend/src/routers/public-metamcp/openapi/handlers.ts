@@ -105,7 +105,7 @@ export const createOriginalListToolsHandler = (
             if (!isRecoverableBackendError(error)) {
               throw error;
             }
-            // 2026-05-14 regression mirror — the OpenAPI tools/list
+            // Regression mirror — the OpenAPI tools/list
             // path also needs PR #13/#15/#16's recovery cascade. Without
             // it, a single backend restart leaves the namespace's tool
             // catalog empty until metamcp itself bounces. Invalidate
@@ -303,9 +303,9 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     try {
       return (await callOnce(targetSession)) as CallToolResult;
     } catch (error) {
-      // 2026-05-14 regression — the OpenAPI bridge had its own fork of
+      // Regression — the OpenAPI bridge had its own fork of
       // the tools/call handler that pre-dated PR #13/#15/#16's recovery
-      // wiring in `metamcp-proxy.ts`. Tara + any OpenAPI consumer
+      // wiring in `metamcp-proxy.ts`. Any OpenAPI consumer
       // (registry-sync worker, external integration) hit this handler
       // and got bare `Error POSTing ... HTTP 404 ... Session not found`
       // pass-through with zero invalidation. Mirror the

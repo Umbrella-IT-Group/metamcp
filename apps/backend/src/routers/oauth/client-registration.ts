@@ -1,5 +1,5 @@
 import {
-  OAuthClientCreateInput,
+  OAuthClientRegistrationDraft,
   OAuthGrantTypeEnum,
   OAuthResponseTypeEnum,
   OAuthTokenEndpointAuthMethodEnum,
@@ -23,7 +23,7 @@ import {
  * skipped the auth-method check could be stored with a method the token
  * endpoint refuses to honour.
  *
- * That sharing also means the FIND-023 host allowlist covers the admin UI's
+ * That sharing also means the redirect_uri host allowlist covers the admin UI's
  * create-client dialog, not just anonymous DCR. Deliberate: an admin who needs
  * a callback host outside `DCR_REDIRECT_URI_ALLOWED_HOSTS` changes that env
  * var, which leaves a deployment-visible record of the decision, rather than
@@ -59,14 +59,95 @@ export interface ClientRegistrationInput {
   software_version?: unknown;
 }
 
+/**
+ * `client` is a DRAFT: every column except `registration_source`.
+ *
+ * This core is deliberately the one place that cannot know which door a
+ * registration came through — it is shared precisely so the RULES cannot
+ * differ between the anonymous DCR endpoint and the admin dialog. Provenance
+ * is the one thing that legitimately does differ, so each caller stamps it
+ * when it persists (see OAuthClientRegistrationDraft in @repo/zod-types).
+ */
 export type ClientRegistrationResult =
-  | { ok: true; client: OAuthClientCreateInput }
+  | { ok: true; client: OAuthClientRegistrationDraft }
   | { ok: false; error: string; error_description: string };
 
 const VALID_GRANT_TYPES: readonly string[] = OAuthGrantTypeEnum.options;
 const VALID_RESPONSE_TYPES: readonly string[] = OAuthResponseTypeEnum.options;
 const VALID_AUTH_METHODS: readonly string[] =
   OAuthTokenEndpointAuthMethodEnum.options;
+
+/**
+ * Size caps on the untrusted registration body.
+ *
+ * WHY THESE EXIST AT ALL. `POST /oauth/register` takes no credential — that is
+ * RFC 7591's design, not a gap — and every field below is written verbatim
+ * into `oauth_clients`, a table with cascade children and, until the retention
+ * sweep in ./index.ts, no prune path whatsoever. Nothing capped the input, so
+ * one anonymous request could store a multi-megabyte `redirect_uris` array,
+ * and 45 never-used client rows had already accumulated from junk
+ * registrations. Validating the SHAPE of a redirect URI while leaving its
+ * LENGTH unbounded is what turned an audit table into a disk-exhaustion
+ * primitive.
+ *
+ * WHY THESE NUMBERS. They are the smallest values that no real client comes
+ * near. A connector registers one or two callbacks (claude.ai's is under 50
+ * characters); ten at 512 is an order of magnitude of headroom on both axes.
+ * MAX_CLIENT_NAME_LENGTH is 255 to match the `.max(255)` the admin UI's
+ * CreateOAuthClientRequestSchema already enforces in @repo/zod-types — the two
+ * mint paths share this core precisely so a rule cannot differ between them.
+ *
+ * Over-cap input is refused with the RFC 7591 error pair this endpoint already
+ * emits (`invalid_redirect_uri` for the callback list, `invalid_request` for
+ * everything else). No new error code: a registered client would not recognise
+ * one, and the caps are a size rule, not a new failure mode.
+ */
+export const MAX_REDIRECT_URIS = 10;
+export const MAX_REDIRECT_URI_LENGTH = 512;
+export const MAX_CLIENT_NAME_LENGTH = 255;
+/** client_uri, logo_uri, tos_uri, policy_uri — all URLs, same budget. */
+export const MAX_METADATA_URI_LENGTH = 512;
+export const MAX_CONTACTS = 10;
+export const MAX_CONTACT_LENGTH = 255;
+export const MAX_SOFTWARE_ID_LENGTH = 255;
+export const MAX_SOFTWARE_VERSION_LENGTH = 64;
+
+type RegistrationRejection = Extract<ClientRegistrationResult, { ok: false }>;
+
+/**
+ * Cap one optional string field.
+ *
+ * Rejects a non-string outright rather than letting the `(x as string) || null`
+ * cast below carry it into the insert: `client_name` is `text NOT NULL`, so an
+ * object or array reaching the driver is either a stored `[object Object]` or a
+ * 500 on an anonymous endpoint, and neither is an answer. `undefined`/`null`
+ * mean "not supplied", which every one of these fields allows.
+ */
+function checkOptionalString(
+  value: unknown,
+  field: string,
+  max: number,
+): RegistrationRejection | null {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value !== "string") {
+    return {
+      ok: false,
+      error: "invalid_request",
+      error_description: `${field} must be a string`,
+    };
+  }
+
+  if (value.length > max) {
+    return {
+      ok: false,
+      error: "invalid_request",
+      error_description: `${field} exceeds the maximum length of ${max} characters`,
+    };
+  }
+
+  return null;
+}
 
 /**
  * Validate a registration request and mint the client row for it.
@@ -109,11 +190,32 @@ export function buildClientRegistration(
     };
   }
 
+  // Size before shape. Both caps below run ahead of the per-URI parse loop so
+  // that an oversized payload is refused on the cheapest possible work — the
+  // point of a cap on an anonymous endpoint is to not do the expensive thing.
+  if (redirect_uris.length > MAX_REDIRECT_URIS) {
+    return {
+      ok: false,
+      error: "invalid_redirect_uri",
+      error_description: `redirect_uris must contain at most ${MAX_REDIRECT_URIS} entries`,
+    };
+  }
+
+  for (const uri of redirect_uris) {
+    if (typeof uri === "string" && uri.length > MAX_REDIRECT_URI_LENGTH) {
+      return {
+        ok: false,
+        error: "invalid_redirect_uri",
+        error_description: `Invalid redirect URI: each entry must be at most ${MAX_REDIRECT_URI_LENGTH} characters`,
+      };
+    }
+  }
+
   // OAuth 2.1 Security: Validate redirect URIs.
   //
   // `isAllowedRedirectUri` — scheme, userinfo, fragment, exact-match loopback,
   // and the non-loopback host allowlist. See its doc comment for why each rule
-  // exists; FIND-023 is the reason it replaced the old scheme-only check.
+  // exists; the scheme-only check it replaced accepted attacker-controlled hosts.
   //
   // The 400 pair below is unchanged apart from a trailing parenthesised reason:
   // the allowlist is default-on, so a registration that used to succeed can now
@@ -129,6 +231,72 @@ export function buildClientRegistration(
         error: "invalid_redirect_uri",
         error_description: `Invalid redirect URI: ${uri}. Must use secure scheme and valid format. (${check.reason})`,
       };
+    }
+  }
+
+  // Optional metadata caps. Placed AFTER the redirect-URI rules so the
+  // documented "redirect URIs are validated before anything else" ordering
+  // still holds, and BEFORE the value-set checks below so no oversized field
+  // survives to the insert regardless of which other rule a payload also
+  // breaks.
+  const metadataRejection =
+    checkOptionalString(client_name, "client_name", MAX_CLIENT_NAME_LENGTH) ??
+    checkOptionalString(client_uri, "client_uri", MAX_METADATA_URI_LENGTH) ??
+    checkOptionalString(logo_uri, "logo_uri", MAX_METADATA_URI_LENGTH) ??
+    checkOptionalString(tos_uri, "tos_uri", MAX_METADATA_URI_LENGTH) ??
+    checkOptionalString(policy_uri, "policy_uri", MAX_METADATA_URI_LENGTH) ??
+    checkOptionalString(software_id, "software_id", MAX_SOFTWARE_ID_LENGTH) ??
+    checkOptionalString(
+      software_version,
+      "software_version",
+      MAX_SOFTWARE_VERSION_LENGTH,
+    );
+
+  if (metadataRejection) {
+    return metadataRejection;
+  }
+
+  // `contacts` is the one array that is stored verbatim (the redirect list is
+  // parsed URI by URI above), so it needs both bounds: how many, and how long
+  // each. A non-string element is refused for the same reason as the scalar
+  // fields — the column is `text[]`, and the driver is not the place to find
+  // out what an object serialises to.
+  if (contacts !== undefined && contacts !== null) {
+    if (!Array.isArray(contacts)) {
+      return {
+        ok: false,
+        error: "invalid_request",
+        error_description: "contacts must be an array of strings",
+      };
+    }
+
+    if (contacts.length > MAX_CONTACTS) {
+      return {
+        ok: false,
+        error: "invalid_request",
+        error_description: `contacts must contain at most ${MAX_CONTACTS} entries`,
+      };
+    }
+
+    for (const contact of contacts) {
+      // Not `checkOptionalString`: that helper treats null/undefined as "field
+      // omitted", which is right for a scalar and wrong for an ELEMENT — a
+      // null inside the array is a value being stored, not an absence.
+      if (typeof contact !== "string") {
+        return {
+          ok: false,
+          error: "invalid_request",
+          error_description: "contacts must be an array of strings",
+        };
+      }
+
+      if (contact.length > MAX_CONTACT_LENGTH) {
+        return {
+          ok: false,
+          error: "invalid_request",
+          error_description: `contacts entries must be at most ${MAX_CONTACT_LENGTH} characters`,
+        };
+      }
     }
   }
 

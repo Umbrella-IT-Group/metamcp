@@ -155,8 +155,8 @@ export const createConfigRouter = (implementations: {
     // is held, how many reconnects are attempted before the breaker trips,
     // and how long a stolen session cookie stays good — which is exactly the
     // information that tunes a resource-exhaustion attempt against the
-    // backend pool (the failure mode of the 2026-07-14 METAMCP-POOL-1
-    // incident) rather than merely attempting one.
+    // backend pool (the failure mode of the 2026-07-14 pool-cap outage)
+    // rather than merely attempting one.
     //
     // Safe to gate because nothing pre-auth reads them. Every frontend call
     // site is inside the authenticated app shell, which `middleware.ts`

@@ -2,7 +2,7 @@
  * No-secret-leak AND driver-decode contract for the two Access-dashboard
  * listings.
  *
- * Redaction half: the 2026-08-13 pentest recovered three live gateway API
+ * Redaction half: a security review recovered three live gateway API
  * keys from a list route that returned `key` raw (see api-keys.serializer.ts).
  * These two listings are new surfaces of the same shape — one enumerates
  * accounts, the other enumerates live OAuth grants — so they get the same
@@ -209,7 +209,7 @@ describe("UsersSerializer.serializeUserList", () => {
   it("still reports a real `false` as enabled (regression guard)", () => {
     // Fail-closed must not become "always closed": the ordinary case is an
     // enabled account, and badging every account disabled would be its own
-    // incident.
+    // bug.
     for (const serialized of UsersSerializer.serializeUserList([dbUser])) {
       expect(serialized.disabled).toBe(false);
     }

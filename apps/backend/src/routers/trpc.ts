@@ -5,6 +5,8 @@ import express from "express";
 import helmet from "helmet";
 
 import { trpcDenialSink } from "../lib/audit/trpc-denial-sink";
+import { credentialedCorsOrigin } from "../lib/cors-policy";
+import { trpcRateLimitMiddleware } from "../middleware/trpc-rate-limit.middleware";
 import { createContext } from "../trpc";
 import { apiKeysImplementations } from "../trpc/api-keys.impl";
 import { configImplementations } from "../trpc/config.impl";
@@ -52,12 +54,27 @@ const trpcRouter = express.Router();
 
 // Apply security middleware for frontend communication
 trpcRouter.use(helmet());
+// Every procedure on this router is session-authenticated, so the origin is
+// resolved against the shared allowlist rather than handed the raw `APP_URL`.
+// A bare `origin: process.env.APP_URL` has two failure modes the allowlist does
+// not: an unset or empty APP_URL is falsy, and the cors package answers a
+// falsy origin with the literal `*` — beside `credentials: true` — while a
+// trailing slash or a case difference makes the string comparison miss and
+// silently drops CORS for the app's own frontend. See ../lib/cors-policy.
 trpcRouter.use(
   cors({
-    origin: process.env.APP_URL,
+    origin: credentialedCorsOrigin,
     credentials: true,
   }),
 );
+
+// Per-caller request cap, AFTER cors on purpose. The cors middleware answers
+// and ends the OPTIONS preflight itself, so mounting here keeps preflights out
+// of the budget entirely, and it means a 429 carries the CORS headers the
+// browser needs to surface it as a 429 rather than as an opaque network
+// failure. See ../middleware/trpc-rate-limit.middleware for the keying
+// decision, which is the part that matters.
+trpcRouter.use(trpcRateLimitMiddleware);
 
 // Better-auth integration now handled in tRPC context
 

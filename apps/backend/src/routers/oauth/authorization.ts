@@ -18,6 +18,7 @@ import {
   generateSecureAuthCode,
   getBaseUrl,
   GRANTED_OAUTH_SCOPE,
+  isAllowedRedirectUri,
   isConsentDecisionRateLimited,
   type OAuthParams,
   rateLimitAuth,
@@ -118,7 +119,7 @@ function clearConsentCookie(
  * POST /oauth/authorize/decision is the ONLY place this server mints an
  * authorization code, so it is the only place a human grants a client access
  * to their account here — which makes it the single highest-value row in the
- * OAuth half of the taxonomy. The 2026-08-13 incident turned on exactly this
+ * OAuth half of the taxonomy. Credential-theft abuse turns on exactly this
  * chain (code -> 24h access token -> 365d refresh token) at a time when there
  * was no consent screen at all and nothing anywhere recorded that a grant had
  * happened.
@@ -226,6 +227,36 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
       return res.status(400).json({
         error: "invalid_request",
         error_description: "Invalid redirect_uri format or insecure scheme",
+      });
+    }
+
+    // The registration-time host allowlist, applied AGAIN at authorize.
+    //
+    // Registration is where this rule was first enforced, and enforcing it only
+    // there leaves a gap with a specific shape: the check binds the rows written
+    // AFTER it shipped, and says nothing about a row that was already in
+    // `oauth_clients`. `/oauth/register` is anonymous, so anything registered
+    // before the allowlist existed — or through any future path that writes a
+    // client row — reaches this endpoint with whatever redirect_uri it stored,
+    // and the only remaining check below is that the URI is one of the client's
+    // OWN registered values. For an attacker-registered client that is trivially
+    // true. Re-checking here means a code cannot be sent to an off-allowlist
+    // host no matter how the client row got there.
+    //
+    // Defense in depth, not a fix for a live hole: the store was verified clean
+    // (zero off-allowlist rows) when this landed. It is kept IN ADDITION to
+    // validateRedirectUri above rather than replacing it, so nothing this
+    // endpoint used to refuse becomes acceptable — notably the production
+    // loopback rule, which only that checker has.
+    //
+    // `error` and the leading sentence are byte-identical to the refusal above;
+    // the parenthesised reason is appended for the same reason it is at
+    // registration, so an operator can tell WHICH rule refused the URI.
+    const allowlistCheck = isAllowedRedirectUri(redirect_uri);
+    if (!allowlistCheck.ok) {
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description: `Invalid redirect_uri format or insecure scheme (${allowlistCheck.reason})`,
       });
     }
 

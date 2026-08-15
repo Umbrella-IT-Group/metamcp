@@ -7,6 +7,19 @@ export class ApiKeysSerializer {
     return `${key.slice(0, 10)}…`;
   }
 
+  // Update readback (rename / activate / revoke). Emits the same
+  // non-reversible prefix as the two list surfaces below rather than the raw
+  // secret.
+  //
+  // Security review finding: this used to return `key` raw, so the response
+  // to a plain rename handed the caller back a usable credential. `update` is
+  // a protectedProcedure any member may call against their OWN keys, so the
+  // readback re-disclosed a secret that is meant to be shown exactly once, at
+  // mint time (serializeCreateApiKeyResponse). A readback of a mutation the
+  // caller already identified by uuid needs no credential material at all.
+  //
+  // Same rename-don't-mask rule as serializeApiKeyList below, for the same
+  // fail-to-compile reason.
   static serializeApiKey(dbApiKey: {
     uuid: string;
     name: string;
@@ -17,7 +30,7 @@ export class ApiKeysSerializer {
     return {
       uuid: dbApiKey.uuid,
       name: dbApiKey.name,
-      key: dbApiKey.key,
+      key_prefix: ApiKeysSerializer.keyPrefix(dbApiKey.key),
       created_at: dbApiKey.created_at,
       is_active: dbApiKey.is_active,
     };
@@ -27,7 +40,7 @@ export class ApiKeysSerializer {
   // key). Drops the full `key` secret for all of them and emits only the
   // non-reversible prefix, same as the admin view below.
   //
-  // Pentest finding 2026-08-13: this used to return `key` raw. Any
+  // Security review finding: this used to return `key` raw. Any
   // self-registered member could read every public key — gateway-wide
   // production credentials — in plaintext; three live keys were recovered
   // that way. The reachability is what makes it critical: `list` is a plain

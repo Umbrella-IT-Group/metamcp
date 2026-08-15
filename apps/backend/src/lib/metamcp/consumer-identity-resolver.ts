@@ -1,6 +1,6 @@
 /**
  * Resolves an authenticated request's consumer to a human-readable identity
- * (api-key name like "Tara connector", or the OAuth user's email). Imported
+ * (api-key name like "example connector", or the OAuth user's email). Imported
  * ONLY by the router layer (which always runs with a live DB) — never by the
  * audit middleware, so the middleware's module graph stays DB-free for tests.
  *
@@ -24,7 +24,7 @@ import { db } from "../../db/index";
 import { apiKeysTable, usersTable } from "../../db/schema";
 
 export interface ClientIdentity {
-  /** Human-readable label: api-key name (e.g. "Tara connector") or OAuth user email. */
+  /** Human-readable label: api-key name (e.g. "example connector") or OAuth user email. */
   name: string;
   /** Stable id: api_keys.uuid or the OAuth user_id. */
   id?: string;
@@ -78,7 +78,7 @@ async function resolveActsAsLabel(actsAsUserId: string): Promise<string> {
     return label;
   } catch {
     // Keep serving the last-known label if we have one (stale beats a
-    // shape change mid-incident); otherwise the short-id fallback. Never
+    // shape change mid-investigation); otherwise the short-id fallback. Never
     // fail identity resolution over a label lookup.
     return cached?.label ?? `user ${short(actsAsUserId)}`;
   }

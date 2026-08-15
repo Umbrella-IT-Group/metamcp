@@ -1,7 +1,7 @@
 /**
  * Unit tests for the users tRPC implementation:
  *  - an administrator cannot revoke, disable or delete THEMSELVES (each of
- *    the three would lock the responder out of the console mid-incident, and
+ *    the three would lock the responder out of the console mid-response, and
  *    self-delete can leave a deployment with no administrator at all),
  *  - a miss is reported as a miss rather than a cheerful success — believing
  *    you cut off an attacker who is still connected is the expensive failure,

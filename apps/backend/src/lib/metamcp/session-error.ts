@@ -12,10 +12,10 @@
  *   Error POSTing to endpoint (HTTP 404):
  *   {"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
  *
- * Production observation 2026-05-08: in some flows the SDK error reaches us
+ * Production observation: in some flows the SDK error reaches us
  * wrapped (e.g. via `.cause` from a higher-layer handler, or stringified
  * after passing through a non-Error rejection). The simple
- * `error.message.includes(...)` check missed all 138 events emitted between
+ * `error.message.includes(...)` check missed every event emitted between
  * a backend container restart and a manual MetaMCP restart, even though the
  * rendered string clearly contained all three matched substrings. To prevent
  * that gap from re-opening on the next backend deploy, this detector now:
@@ -57,7 +57,7 @@ const NOT_CONNECTED = "Not connected";
 // JSON-RPC code -32603 = "Internal error". MetaMCP's tRPC bridge wraps
 // the SDK-thrown "Not connected" rejection into this envelope before it
 // reaches the consumer (Claude.ai connector, n8n httpRequest node, etc.).
-// Production observation 2026-05-14: consumer-side connectors see
+// Production observation: consumer-side connectors see
 // `-32603 "Not connected"` rather than the raw SDK Error, and the
 // session-lost detector misses it. Pair the code with the
 // "Not connected" message so we don't false-positive on every -32603
@@ -143,15 +143,14 @@ function objectHasTransportLostCode(candidate: unknown): boolean {
  * each has a tight predicate that doesn't false-positive on the much
  * larger noise floor of unrelated -32603 / 404 errors.
  *
- * Production observation 2026-05-14: rapid-deploy cadence on the autotask
- * MCP backend (Watchtower pulls + container restarts within a 5-min
- * window) produced disconnect windows where the consumer-side connector
- * saw `-32603 "Not connected"` on every call. The session-lost detector
+ * Production observation: a rapid-deploy cadence on a backend MCP server
+ * (image pulls + container restarts inside a few minutes) produced
+ * disconnect windows where the consumer-side connector saw
+ * `-32603 "Not connected"` on every call. The session-lost detector
  * missed all of these; the recovery path in `metamcp-proxy.ts` never
- * fired. Operator quote (2026-05-14): "It's not acceptable for having
- * MCP servers down or needing reboots after small change applications."
- * This detector + the matching recovery wiring in `metamcp-proxy.ts`
- * close that gap.
+ * fired — so a routine backend redeploy left the gateway needing a manual
+ * reboot, which is not an acceptable operating cost. This detector + the
+ * matching recovery wiring in `metamcp-proxy.ts` close that gap.
  */
 export function isBackendTransportLostError(error: unknown): boolean {
   if (error == null) {

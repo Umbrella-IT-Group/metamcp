@@ -19,7 +19,7 @@ const SEVERITY_RANK: Record<"DEBUG" | "INFO" | "WARN" | "ERROR", number> = {
 
 // Minimum severity each console mode mirrors to stdout/stderr. Threshold
 // semantics: a mode mirrors its own level AND everything MORE severe.
-// This is the fix for the 2026-07-14 incident where prod (LOG_LEVEL=info)
+// This is the fix for the 2026-07-14 outage where prod (LOG_LEVEL=info)
 // showed a clean `docker logs` while app.log carried 278 cap-refusal WARNs —
 // the old logic mirrored ONLY level==="INFO" for the "info" mode, so WARN
 // and ERROR never reached the console. Operators watch the console; a mode
@@ -65,8 +65,9 @@ export class Logger {
   private errorFile: WriteStream | null;
   private consoleMode: "all" | "info" | "errors-only" | "none";
 
-  // Rotation bookkeeping. app.log grew 98MB in 25h in prod with no external
-  // logrotate inside the container; we roll a single generation in-process.
+  // Rotation bookkeeping. app.log grows tens of megabytes a day in production
+  // with no external logrotate inside the container; we roll a single
+  // generation in-process.
   private readonly logFilePath: string;
   private readonly errorFilePath: string;
   private readonly maxSizeBytes: number;

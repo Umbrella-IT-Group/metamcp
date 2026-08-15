@@ -27,8 +27,7 @@
  * arrives directly from `login.microsoftonline.com` over TLS in a
  * confidential-client exchange, not from the user agent.
  *
- * Design doc: Umbrella-MCP-Server `docs/M365_DELEGATED_MCP_DESIGN.md`
- * §4.3 + §5.1.
+ * Design doc: internal M365 delegated-MCP design, §4.3 + §5.1.
  */
 import { createHash, randomBytes } from "node:crypto";
 

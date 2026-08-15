@@ -81,9 +81,13 @@ export const createNamespacesRouter = (
       userId: string,
       actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceToolOverridesResponseSchema>>;
+    // `isAdmin` decides whether a PUBLIC (unowned) namespace may be
+    // refreshed, for the reason spelled out at the procedure below. Threaded
+    // from `ctx.user.role` at the call site, like `get`'s flag above.
     refreshTools: (
       input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>>;
   },
 ) => {
@@ -192,15 +196,27 @@ export const createNamespacesRouter = (
         );
       }),
 
-    // Protected (deliberate): re-lists tools over the existing pooled
-    // connection — an operational nudge, not a config mutation (it changes
-    // no row a member couldn't already read). Do not fold into the RBAC
-    // gate above.
+    // Protected (deliberate) at the PROCEDURE level so a non-admin owner can
+    // still refresh a namespace they own — but the "not a config mutation"
+    // half of the old note here was wrong, and the impl now enforces the
+    // correction. The tools in the input are caller-supplied, and the impl
+    // upserts their description and inputSchema into the shared `tools`
+    // catalog and writes ACTIVE namespace tool mappings from them, so a
+    // caller who can reach it for a namespace can rewrite what downstream
+    // MCP clients are told a tool does and re-activate mappings that
+    // `updateToolStatus` (adminProcedure) had switched off. On a PUBLIC
+    // namespace the impl's ownership test is vacuous, so the role is what
+    // has to decide it — threaded below, same shape as `reconnect` on the
+    // mcpServers router.
     refreshTools: protectedProcedure
       .input(RefreshNamespaceToolsRequestSchema)
       .output(RefreshNamespaceToolsResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.refreshTools(input, ctx.user.id);
+        return await implementations.refreshTools(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
   });
 };

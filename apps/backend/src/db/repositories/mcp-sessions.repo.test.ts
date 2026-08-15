@@ -5,8 +5,8 @@
  * the repository produces against the DB layer (INSERT … ON CONFLICT
  * DO NOTHING, SELECT … LIMIT 1, UPDATE … last_seen_at, DELETE … WHERE
  * last_seen_at < cutoff). They do NOT exercise the postgres engine
- * itself — that's covered by the manual validation in the task spec
- * §Validation (post-deploy restart test on mcp-host-prod).
+ * itself — that's covered by manual validation against a real deployment
+ * (a post-deploy restart test).
  *
  * The router-side lazy-recovery behavior + cross-namespace defense +
  * auth-mismatch refusal live in the streamable-http integration tests

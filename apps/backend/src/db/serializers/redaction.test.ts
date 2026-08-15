@@ -1,6 +1,6 @@
 /**
- * FIND-004 / #98: the server serializers returned every backend MCP's
- * connection URL and credential material to any authenticated member.
+ * Credential disclosure (#98): the server serializers returned every backend
+ * MCP's connection URL and credential material to any authenticated member.
  *
  * `mcpServers.list`, `mcpServers.get` and `namespaces.get` are all
  * `protectedProcedure` — members legitimately see the server inventory in
@@ -21,21 +21,21 @@ import { describe, expect, it } from "vitest";
 import { McpServersSerializer } from "./mcp-servers.serializer";
 import { NamespacesSerializer } from "./namespaces.serializer";
 
-// Shaped like a real row: the internal Docker URL is the FIND-004 leak, the
+// Shaped like a real row: the internal Docker URL is the connection-URL leak, the
 // bearer token / env / headers are #98.
-const SECRET_URL = "http://mcp-autotask:3000";
+const SECRET_URL = "http://internal-backend:3000";
 const SECRET_TOKEN = "sk_live_do_not_disclose";
-const SECRET_ENV = { AUTOTASK_API_KEY: "at_secret_value" };
+const SECRET_ENV = { BACKEND_API_KEY: "at_secret_value" };
 const SECRET_HEADERS = { "X-Tenant": "umbrella-internal" };
-const SECRET_COMMAND = "/usr/local/bin/mcp-autotask";
+const SECRET_COMMAND = "/usr/local/bin/internal-backend";
 const SECRET_ARGS = ["--tenant", "umbrella", "--token", "arg_secret"];
 
 const CREATED_AT = new Date("2026-08-13T12:00:00.000Z");
 
 const dbServer = {
   uuid: "11111111-1111-4111-8111-111111111111",
-  name: "mcp-autotask",
-  description: "Autotask PSA bridge",
+  name: "internal-backend",
+  description: "Internal PSA bridge",
   type: "STREAMABLE_HTTP",
   command: SECRET_COMMAND,
   args: SECRET_ARGS,
@@ -63,7 +63,7 @@ const SECRETS = [
   SECRET_URL,
   SECRET_TOKEN,
   "at_secret_value",
-  "AUTOTASK_API_KEY",
+  "BACKEND_API_KEY",
   "umbrella-internal",
   SECRET_COMMAND,
   "arg_secret",
@@ -77,8 +77,8 @@ const expectMetadataIntact = (server: {
   created_at: string;
 }) => {
   expect(server.uuid).toBe(dbServer.uuid);
-  expect(server.name).toBe("mcp-autotask");
-  expect(server.description).toBe("Autotask PSA bridge");
+  expect(server.name).toBe("internal-backend");
+  expect(server.description).toBe("Internal PSA bridge");
   expect(server.created_at).toBe(CREATED_AT.toISOString());
 };
 

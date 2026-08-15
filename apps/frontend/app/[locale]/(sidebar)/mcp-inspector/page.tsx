@@ -94,7 +94,6 @@ function McpInspectorContent() {
     command: selectedServer?.command || "",
     args: selectedServer?.args?.join(" ") || "",
     url: selectedServer?.url || "",
-    env: selectedServer?.env || {},
     bearerToken: selectedServer?.bearerToken || undefined,
     onNotification,
     onStdErrNotification,

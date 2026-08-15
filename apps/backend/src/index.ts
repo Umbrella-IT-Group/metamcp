@@ -1,11 +1,7 @@
 import express from "express";
 
-import { auth } from "./auth";
-import {
-  auditRequestContext,
-  stampAuditHeaders,
-} from "./lib/audit/audit-emitter";
-import { emitAuthRelayEvent } from "./lib/audit/auth-relay-audit";
+import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { globalBodyParser } from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -15,6 +11,7 @@ import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { errorHandler } from "./middleware/error-handler.middleware";
+import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -35,94 +32,32 @@ const app = express();
 // trust assumption and for why `trust proxy` is deliberately NOT set with it.
 app.use(auditContextMiddleware);
 
-// Global JSON middleware for non-proxy routes
-app.use((req, res, next) => {
-  if (req.path.startsWith("/mcp-proxy/") || req.path.startsWith("/metamcp/")) {
-    // Skip JSON parsing for all MCP proxy routes and public endpoints to allow raw stream access
-    next();
-  } else {
-    express.json({ limit: "50mb" })(req, res, next);
-  }
-});
+// Global JSON middleware for non-proxy routes.
+//
+// The branches live in ./lib/global-body-parser rather than inline here for
+// one reason: this file calls `app.listen()` at module scope and so cannot be
+// imported by a test. Inline, the only available coverage was a test that
+// hand-copied these branches into a model app — which stayed green when the
+// real ones were deleted. See that module's header for what each lane does and
+// why the OAuth skip is what makes the 256kb router limit bind at all.
+app.use(globalBodyParser);
 
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);
 
-// Mount better-auth routes by calling auth API directly
-app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api/auth")) {
-    try {
-      // Create a web Request object from Express request
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const headers = new Headers();
+// `/api/auth` answers with the session cookie and with session contents, so it
+// gets a CORS policy chosen here rather than whatever an earlier-mounted router
+// leaves behind — which is what it had. An allowlisted origin is echoed back
+// specifically; every other origin gets no `Access-Control-Allow-Origin` at
+// all. Never `*` and never a blind reflection of the caller's `Origin`: either
+// one turns a cookie-authenticated response into a cross-site read. The
+// allowlist and the reasoning live in ./lib/cors-policy.
+app.use(authApiCorsMiddleware);
 
-      // Copy headers from Express request
-      Object.entries(req.headers).forEach(([key, value]) => {
-        if (value) {
-          headers.set(key, Array.isArray(value) ? value[0] : value);
-        }
-      });
-
-      // Hand the Express request's audit attribution across the relay seam.
-      // better-auth's `databaseHooks` (auth.ts) see only this Request, so
-      // without these two the signup and session rows they emit would carry a
-      // null request_id and could not be joined to the auth.login.* row from
-      // the same HTTP call. Must run AFTER the copy loop above, which brings
-      // the CALLER's headers in verbatim — including any it invented under
-      // these names. See lib/audit/audit-emitter for why the absent case
-      // deletes rather than skips.
-      const auditContext = auditRequestContext(req);
-      stampAuditHeaders(headers, auditContext);
-
-      // Create Request object
-      const request = new Request(url.toString(), {
-        method: req.method,
-        headers,
-        body:
-          req.method !== "GET" && req.method !== "HEAD"
-            ? JSON.stringify(req.body)
-            : undefined,
-      });
-
-      // Call better-auth directly
-      const response = await auth.handler(request);
-
-      // Convert Response back to Express response
-      res.status(response.status);
-
-      // Copy headers
-      response.headers.forEach((value, key) => {
-        res.setHeader(key, value);
-      });
-
-      // Send body
-      const body = await response.text();
-
-      // Record the outcome AFTER better-auth has answered and BEFORE the
-      // response goes out, so the row describes a verdict that has actually
-      // been reached. Fire-and-forget and never throws — see
-      // lib/audit/auth-relay-audit; a logging failure here must not turn a
-      // successful sign-in into a 500 (the catch below would answer one).
-      emitAuthRelayEvent({
-        path: req.path,
-        status: response.status,
-        requestBody: req.body,
-        responseBody: body,
-        audit: auditContext,
-      });
-
-      res.send(body);
-    } catch (error) {
-      logger.error("Auth route error:", error);
-      res.status(500).json({
-        error: "Internal server error",
-        details: error instanceof Error ? error.message : String(error),
-      });
-    }
-    return;
-  }
-  next();
-});
+// Mount better-auth routes by calling auth API directly. The relay body lives
+// in ./routers/auth-relay so it can be imported by a test — this file cannot,
+// because it calls `app.listen()` at module scope.
+app.use(authApiRelay);
 
 // Umbrella fork: M365 delegated-token broker enrollment routes
 // (better-auth session-gated; boots cleanly when the broker env is
@@ -211,7 +146,7 @@ const gracefulShutdown = async (signal: string) => {
     const { metaMcpServerPool } = await import(
       "./lib/metamcp/metamcp-server-pool"
     );
-    // Track A4 (METAMCP-POOL-1): clear the public-session idle-TTL
+    // Part of the pool-cap work: clear the public-session idle-TTL
     // sweeper's timer on shutdown, same dispose discipline as PR #70's
     // tools sweep (`toolsSweepTimer` cleared in `mcp-server-pool.ts`'s
     // `cleanupAll`) — a sync call, no need for the Promise.allSettled

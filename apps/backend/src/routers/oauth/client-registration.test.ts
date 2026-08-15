@@ -141,7 +141,7 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
   it("passes explicit values through", () => {
     const result = buildClientRegistration({
       // An allowlisted host: this test is about metadata pass-through, and
-      // since FIND-023 an arbitrary vendor host would fail before any of the
+      // since the host allowlist an arbitrary vendor host would fail before any of the
       // fields below were reached.
       redirect_uris: [CLAUDE_AI_CALLBACK],
       client_name: "My App",
@@ -261,5 +261,175 @@ describe("buildClientRegistration — value-set validation", () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBe("invalid_redirect_uri");
+  });
+});
+
+describe("buildClientRegistration — input caps", () => {
+  // `POST /oauth/register` takes no credential and every field here is stored
+  // verbatim in a table with cascade children. Before these caps a single
+  // anonymous request could write a multi-megabyte row, and 45 junk clients
+  // had accumulated. Each assertion below pins one cap AND the error pair it
+  // uses, because reusing the RFC 7591 codes is what keeps registered clients
+  // able to read the refusal.
+
+  const uriOfLength = (length: number) =>
+    // A real allowlisted host, padded in the PATH — so the only thing wrong
+    // with this URI is its length. A padded HOST would be refused by the
+    // allowlist first and the test would pass for the wrong reason.
+    `https://claude.ai/${"a".repeat(length - "https://claude.ai/".length)}`;
+
+  it("rejects more than 10 redirect_uris", () => {
+    const result = buildClientRegistration({
+      redirect_uris: Array.from({ length: 11 }, () => CLAUDE_AI_CALLBACK),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("invalid_redirect_uri");
+      expect(result.error_description).toContain("at most 10");
+    }
+  });
+
+  it("accepts exactly 10 redirect_uris", () => {
+    const result = buildClientRegistration({
+      redirect_uris: Array.from({ length: 10 }, () => CLAUDE_AI_CALLBACK),
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a redirect_uri longer than 512 characters", () => {
+    const result = buildClientRegistration({
+      redirect_uris: [CLAUDE_AI_CALLBACK, uriOfLength(513)],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("invalid_redirect_uri");
+      expect(result.error_description).toContain("at most 512");
+    }
+  });
+
+  it("accepts a redirect_uri of exactly 512 characters", () => {
+    // The boundary in the passing direction. Without it, an off-by-one that
+    // rejected everything at the cap would still satisfy the test above.
+    const result = buildClientRegistration({
+      redirect_uris: [uriOfLength(512)],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a client_name longer than 255 characters", () => {
+    // 255 is the same bound CreateOAuthClientRequestSchema puts on the admin
+    // UI path, which is the point: one shared core, one rule.
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      client_name: "n".repeat(256),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("invalid_request");
+      expect(result.error_description).toContain("client_name");
+      expect(result.error_description).toContain("255");
+    }
+  });
+
+  it("accepts a client_name of exactly 255 characters", () => {
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      client_name: "n".repeat(255),
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.client.client_name).toHaveLength(255);
+  });
+
+  it("caps every optional metadata URI at 512", () => {
+    for (const field of ["client_uri", "logo_uri", "tos_uri", "policy_uri"]) {
+      const result = buildClientRegistration({
+        redirect_uris: CLAUDE_CALLBACKS,
+        [field]: `https://example.com/${"a".repeat(512)}`,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe("invalid_request");
+        expect(result.error_description).toContain(field);
+      }
+    }
+  });
+
+  it("caps software_id at 255 and software_version at 64", () => {
+    const tooLongId = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      software_id: "s".repeat(256),
+    });
+    expect(tooLongId.ok).toBe(false);
+    if (!tooLongId.ok) {
+      expect(tooLongId.error_description).toContain("software_id");
+    }
+
+    const tooLongVersion = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      software_version: "v".repeat(65),
+    });
+    expect(tooLongVersion.ok).toBe(false);
+    if (!tooLongVersion.ok) {
+      expect(tooLongVersion.error_description).toContain("software_version");
+    }
+  });
+
+  it("caps contacts by count and by element length", () => {
+    const tooMany = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      contacts: Array.from({ length: 11 }, () => "ops@example.com"),
+    });
+    expect(tooMany.ok).toBe(false);
+    if (!tooMany.ok) {
+      expect(tooMany.error).toBe("invalid_request");
+      expect(tooMany.error_description).toContain("at most 10");
+    }
+
+    const tooLong = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      contacts: ["ops@example.com", "c".repeat(256)],
+    });
+    expect(tooLong.ok).toBe(false);
+    if (!tooLong.ok) {
+      expect(tooLong.error_description).toContain("at most 255");
+    }
+  });
+
+  it("rejects a non-string where a string is expected, rather than storing it", () => {
+    // The `(x as string) || null` cast these fields go through does not
+    // narrow anything at runtime, so an object used to reach the insert.
+    for (const contacts of [{ ops: "ops@example.com" }, [null], [12345]]) {
+      const result = buildClientRegistration({
+        redirect_uris: CLAUDE_CALLBACKS,
+        contacts,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toBe("invalid_request");
+    }
+
+    const objectName = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      client_name: { toString: () => "Claude" },
+    });
+    expect(objectName.ok).toBe(false);
+  });
+
+  it("leaves a normal Claude registration untouched", () => {
+    // The regression guard for all of the above: the caps must be invisible to
+    // the only registration shape that actually matters.
+    const result = buildClientRegistration({
+      redirect_uris: CLAUDE_CALLBACKS,
+      client_name: "Claude",
+      client_uri: "https://claude.ai",
+      contacts: ["support@anthropic.com"],
+      software_id: "claude-connector",
+      software_version: "1.0.0",
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.client.redirect_uris).toEqual(CLAUDE_CALLBACKS);
+      expect(result.client.client_name).toBe("Claude");
+      expect(result.client.contacts).toEqual(["support@anthropic.com"]);
+    }
   });
 });

@@ -10,7 +10,7 @@ import { type AuditOutcome, emit } from "./audit-emitter";
  * Until Phase 1B the second half was entirely missing — the config toggles
  * that decide whether anyone can register an account, the API-key mints, the
  * OAuth-client registrations and the account disable/enable switches all
- * happened without leaving a single durable row. The 2026-08-13 incident was
+ * happened without leaving a single durable row. The last investigation was
  * read from `app.log` and inference for exactly that reason.
  *
  * A pure mapping function, deliberately: it exists so ~25 call sites cannot

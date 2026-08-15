@@ -3,7 +3,7 @@
  *
  * Two emitters, one contract. `auth-relay-audit.ts` reads the `/api/auth`
  * relay's HTTP verdict; `auth-hook-audit.ts` reads better-auth's database
- * hooks. Between them they cover the events the 2026-08-13 incident review
+ * hooks. Between them they cover the events the last security review
  * had to infer: who tried to sign in and failed, who registered an account,
  * who was refused registration, and which sessions existed.
  *
@@ -34,7 +34,9 @@ vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
 const {
   AUDIT_CLIENT_IP_HEADER,
+  AUDIT_IP_MAX,
   AUDIT_REQUEST_ID_HEADER,
+  AUDIT_USER_AGENT_MAX,
   setAuditSinkForTesting,
   stampAuditHeaders,
 } = await import("./audit-emitter");
@@ -355,6 +357,79 @@ describe("auth.signup.denied — registration refused because signup is closed",
     });
   });
 
+  it("clamps an oversized User-Agent and IP arriving through the HOOK path", async () => {
+    // `actor_user_agent` and `actor_ip` are the only columns outside `detail`
+    // written verbatim from a request header, and this is the path an
+    // anonymous caller can drive: sign-up and sign-in run before anybody is
+    // authenticated. `audit_log` has UPDATE/DELETE/TRUNCATE triggers and no
+    // prune path (migration 0028), so an oversized row is permanent.
+    //
+    // `auditRequestContext` (the express path) has its own clamp test; this is
+    // the OTHER entry point, `auditContextFromHook`, which reads better-auth's
+    // header bag rather than the middleware-stamped fields. Without this case
+    // both clamps there could be deleted with the suite still green.
+    const hostileUserAgent = "U".repeat(20_000);
+    const hostileIp = "9".repeat(4_000);
+
+    emitSignupDenied(
+      { email: "walkin@example.invalid" },
+      {
+        headers: new Headers({
+          [AUDIT_CLIENT_IP_HEADER]: hostileIp,
+          "user-agent": hostileUserAgent,
+        }),
+      },
+      "basic",
+    );
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].actor_user_agent).toHaveLength(AUDIT_USER_AGENT_MAX);
+    expect(rows[0].actor_user_agent).toBe(
+      hostileUserAgent.slice(0, AUDIT_USER_AGENT_MAX),
+    );
+    expect(rows[0].actor_ip).toHaveLength(AUDIT_IP_MAX);
+    expect(rows[0].actor_ip).toBe(hostileIp.slice(0, AUDIT_IP_MAX));
+  });
+
+  it("clamps them on the FALL-THROUGH bag too, the one the caller filled", async () => {
+    // `readHeader` falls through to `context.request.headers` when the relay's
+    // own bag cannot answer, and that bag is the caller's own headers. A clamp
+    // applied to only one of the two bags would leave the hole open on exactly
+    // the path this is meant to close.
+    emitSignupDenied(
+      { email: "walkin@example.invalid" },
+      {
+        headers: { "user-agent": "not-a-Headers-instance" },
+        request: {
+          headers: new Headers({
+            [AUDIT_CLIENT_IP_HEADER]: "9".repeat(4_000),
+            "user-agent": "U".repeat(20_000),
+          }),
+        },
+      },
+      "basic",
+    );
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].actor_user_agent).toHaveLength(AUDIT_USER_AGENT_MAX);
+    expect(rows[0].actor_ip).toHaveLength(AUDIT_IP_MAX);
+  });
+
+  it("leaves a real User-Agent and a real IP untouched", async () => {
+    // The clamp is a ceiling, not a policy: a row that truncated a genuine
+    // agent string or a full IPv6 address would cost evidence rather than
+    // save space, so both budgets have to stay above the real values.
+    emitSignupDenied({ email: "walkin@example.invalid" }, hookContext, "basic");
+    await flush();
+
+    expect(rows[0].actor_user_agent).toBe(AUDIT.actor_user_agent);
+    expect(rows[0].actor_ip).toBe(AUDIT.actor_ip);
+    // The longest legitimate value the column can hold, spelled out in full.
+    expect("0:0:0:0:0:ffff:255.255.255.255".length).toBeLessThan(AUDIT_IP_MAX);
+  });
+
   it("degrades to nulls rather than throwing when there is no hook context", async () => {
     // better-auth types the context `GenericEndpointContext | null`. A throw
     // here would break sign-up to record it.
@@ -429,7 +504,7 @@ describe("auth.signup / session lifecycle", () => {
   it("session.revoke separates a swept expiry from a deliberate kill", async () => {
     // One verb covers sign-out, expiry sweeping and bulk revocation. Without
     // this field "which sessions were killed on purpose" — the question asked
-    // during an incident — is unanswerable from the row.
+    // during an investigation — is unanswerable from the row.
     emitSessionRevoked(
       {
         id: "sess-old",

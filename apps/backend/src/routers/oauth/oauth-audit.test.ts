@@ -1,7 +1,7 @@
 /**
  * The OAuth plane's audit rows.
  *
- * The 2026-08-13 incident ran on this exact chain: an anonymously registered
+ * Credential-theft abuse runs on this exact chain: an anonymously registered
  * client, a consent grant, an authorization code, a 24h access token and the
  * 365d refresh token behind it. Every step of it was silent — `/oauth/register`
  * accepts a client with no credential at all and left no durable record that it
@@ -294,7 +294,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
       path: "/oauth/register",
       body: {
         client_name: "Definitely Claude",
-        // Loopback, because since FIND-023 that is the only shape an
+        // Loopback, because since the host allowlist that is the only shape an
         // anonymous caller can still register besides the Anthropic hosts —
         // and it makes the point better: the NAME is the lie the consent
         // screen shows, and no host allowlist constrains it.
@@ -346,20 +346,22 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
     expect(rows[0].detail).toMatchObject({ has_client_secret: true });
   });
 
-  it("CLAMPS the caller-supplied arrays — this endpoint takes no credential", async () => {
-    // Without a clamp this emit is a write-amplification primitive: the JSON
-    // body limit is 50mb, `buildClientRegistration` validates each URI's
-    // scheme and host but bounds neither the array nor its elements, and
-    // `rateLimitToken` keys on `req.ip` — the same loopback address for every
-    // caller behind the in-container rewrite, i.e. one global bucket. The
-    // target is a jsonb column in a table with DELETE/TRUNCATE triggers and
-    // no prune path, so every byte written is permanent.
+  it("REFUSES an oversized registration outright — nothing is written at all", async () => {
+    // This emit used to be the last line of defence against write
+    // amplification on an endpoint that takes no credential: the body limit
+    // was 50mb, `buildClientRegistration` bounded neither the redirect array
+    // nor its elements, and the target is a jsonb column in a table with
+    // DELETE/TRUNCATE triggers. The clamp bounded the ROW; nothing bounded the
+    // INPUT.
     //
-    // One allowlisted host with 40 distinct long PATHS, because FIND-023's
-    // host allowlist refuses 40 distinct hosts — and the clamp this test
-    // exists for bounds length, which the path carries just as well. The
-    // amplification is real either way: the allowlist caps the host set, not
-    // the number or size of URIs.
+    // The input caps in ./client-registration close that at the front, which
+    // is a strictly better outcome than a clamped row: the request is refused
+    // before `upsertClient` and before the emit, so an oversized payload costs
+    // one 400 and writes nothing to either table.
+    //
+    // One allowlisted host with 40 distinct long PATHS, because the host
+    // allowlist refuses 40 distinct hosts — the size, which is what is under
+    // test, rides in the path just as well.
     const manyUris = Array.from(
       { length: 40 },
       (_, i) => `https://claude.ai/${i}/${"p".repeat(2000)}`,
@@ -371,6 +373,38 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
       body: {
         client_name: "N".repeat(5000),
         redirect_uris: manyUris,
+      },
+    });
+    await flush();
+
+    expect(res.statusCode).toBe(400);
+    expect(oauthRepositoryMock.upsertClient).not.toHaveBeenCalled();
+    expect(rows).toEqual([]);
+  });
+
+  it("CLAMPS what the caps still let through", async () => {
+    // Belt and braces, and the belt still has to hold: the caps bound the
+    // input, this clamp bounds what the audit row copies out of it. The
+    // largest registration the caps ACCEPT is 10 redirect URIs of 512
+    // characters with a 255-character name, so that is what is sent — the
+    // worst case that can still reach the emit.
+    //
+    // The array-truncation leg of the clamp (40 entries down to 10) is no
+    // longer reachable over HTTP, because the cap refuses that body first. It
+    // stays in `clampAuditTextList` deliberately: this emit is one call site,
+    // and a bound that only exists at the caller is a bound the next call site
+    // does not get.
+    const maxUris = Array.from(
+      { length: 10 },
+      (_, i) => `https://claude.ai/${i}/${"p".repeat(490)}`,
+    );
+
+    const res = await dispatch(registrationRouter, {
+      method: "POST",
+      path: "/oauth/register",
+      body: {
+        client_name: "N".repeat(255),
+        redirect_uris: maxUris,
       },
     });
     await flush();
@@ -387,8 +421,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
     for (const uri of detail.redirect_uris) {
       expect(uri.length).toBeLessThanOrEqual(512);
     }
-    // Truncation is recorded rather than hidden.
-    expect(detail.redirect_uri_count).toBe(40);
+    expect(detail.redirect_uri_count).toBe(10);
     // The whole row stays small enough that a flood cannot fill a disk.
     expect(JSON.stringify(rows[0]).length).toBeLessThan(8000);
   });

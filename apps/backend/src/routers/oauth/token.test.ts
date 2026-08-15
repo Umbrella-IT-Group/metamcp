@@ -51,6 +51,17 @@ vi.mock("../../db/repositories", () => ({
   usersRepository: usersRepositoryMock,
 }));
 
+// The RFC 7662 credential gate on /oauth/introspect lives in its own module
+// and has its own tests (./introspection-auth.test.ts). Stubbed to "authorized"
+// here so the branches this file was written for stay reachable — without it
+// every introspect assertion below would collapse into the same 401.
+vi.mock("./introspection-auth", () => ({
+  requireIntrospectionCredential: vi.fn(async () => ({
+    ok: true,
+    userId: null,
+  })),
+}));
+
 const { default: tokenRouter } = await import("./token");
 
 const CLIENT_ID = "mcp_client_test";
@@ -263,7 +274,9 @@ describe("POST /oauth/token — authorization_code success logging", () => {
     expect(line).not.toContain("\n");
     expect(line.split("\n")).toHaveLength(1);
     // The hostile name survives only in escaped form, clamped to 100 chars.
-    expect(line).toContain(`client_name=${JSON.stringify(forged.slice(0, 100))}`);
+    expect(line).toContain(
+      `client_name=${JSON.stringify(forged.slice(0, 100))}`,
+    );
   });
 });
 
@@ -320,7 +333,7 @@ describe("POST /oauth/token — refresh_token success logging", () => {
  * minted before the lock is good for 365 days here, and an authorization code
  * minted in the seconds before the lock stays redeemable for its full 10-minute
  * TTL. Either one hands a locked-out account a fresh 24h access token, which is
- * exactly the credential chain the 2026-08-13 incident turned on.
+ * exactly the credential chain credential-theft abuse turns on.
  *
  * Each test asserts three things together, because any one alone can pass while
  * the guard is useless: the grant is REFUSED, no token was minted

@@ -57,7 +57,7 @@ const NO_IMPACT = {
  * Admin surface over the account list — the Users section of the Access
  * dashboard.
  *
- * Incident 2026-08-13: an attacker's self-registered member accounts were
+ * Self-registration abuse: an attacker's member accounts were
  * invisible, because MetaMCP has no users page and no list-users procedure.
  * Every access path (API keys, OAuth clients, endpoints) had an admin view;
  * the accounts those paths belong to did not.
@@ -66,7 +66,7 @@ const NO_IMPACT = {
  *   revokeAccess — sever live access; the account can sign straight back in
  *   setDisabled  — lock the account out; everything preserved as evidence
  *   delete       — destroy the account and everything the FK graph reaches
- * Disable is the incident-response primitive: it is the only one that both
+ * Disable is the containment primitive: it is the only one that both
  * stops the attacker and keeps the record of who they were.
  *
  * Every procedure in the matching router is `adminProcedure` — there is no
@@ -76,7 +76,7 @@ const NO_IMPACT = {
  * ALL THREE TIERS EMIT (`user.disabled.set` / `user.enabled.set`,
  * `user.access.revoked`, `user.delete`), and that is not symmetry for its own
  * sake: these are the operations an administrator performs WHILE containing
- * an incident, so they are the ones an after-action review reads first. They
+ * an attack, so they are the ones an after-action review reads first. They
  * also tear their targets down with raw drizzle rather than through
  * better-auth, so no `databaseHooks` sink sees them — an emitter here is the
  * only way they are recorded at all.
@@ -199,7 +199,7 @@ export const usersImplementations = {
   ): Promise<z.infer<typeof RevokeUserAccessResponseSchema>> => {
     // Self-revocation is refused rather than allowed-with-a-warning: it would
     // delete the caller's own session mid-request, signing the administrator
-    // out in the middle of an incident response. There is a Sign out button
+    // out in the middle of a live response. There is a Sign out button
     // for the legitimate version of this.
     if (input.user_id === actorUserId) {
       throw new TRPCError({
@@ -239,8 +239,8 @@ export const usersImplementations = {
       // values may be recorded — `audit_log` is append-only with no prune
       // path, so a token copied in here outlives the revocation that was
       // supposed to kill it. The counts answer "how much access was cut",
-      // which is the question an incident review actually asks; the email is
-      // clamped because it is the only free-text field in the row.
+      // which is the question an after-action review actually asks; the
+      // email is clamped because it is the only free-text field in the row.
       emitAdminEvent(actor, {
         action: "user.access.revoked",
         target_type: "user",
@@ -300,8 +300,8 @@ export const usersImplementations = {
 
       // Recorded BEFORE the delete: once the rows are gone there is no way to
       // reconstruct what the cascade took, and the cross-user reach (other
-      // people's endpoints and production keys) is exactly what an incident
-      // review will ask about.
+      // people's endpoints and production keys) is exactly what an
+      // after-action review will ask about.
       const impact = await usersRepository.previewDeleteImpact(input.user_id);
 
       const deleted = await usersRepository.deleteById(input.user_id);
@@ -331,7 +331,8 @@ export const usersImplementations = {
       // come from the impact preview taken above for the same reason: after
       // the cascade there is nothing left to count, and the CROSS-USER reach
       // (other people's endpoints and production keys) is exactly what an
-      // incident review asks about. Counts and one email, never a key value.
+      // after-action review asks about. Counts and one email, never a key
+      // value.
       emitAdminEvent(actor, {
         action: "user.delete",
         target_type: "user",

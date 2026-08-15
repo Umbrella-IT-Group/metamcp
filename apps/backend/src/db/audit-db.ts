@@ -13,7 +13,7 @@ import * as schema from "./schema";
  * the two hottest denial paths in the gateway, and one of them is reachable
  * with no credential at all: every no-credential 401 on `/metamcp/*` emits,
  * and so does every 429. That is deliberate — unauthenticated endpoint
- * scanning is exactly the recon this incident began with, and not logging it
+ * scanning is exactly the recon such an attack begins with, and not logging it
  * is how the last one stayed invisible. But it also makes an unauthenticated
  * flood a 1:1 request-to-INSERT amplifier, and the failed-attempt rate limiter
  * cannot damp it: that limiter keys on `req.ip`, which behind the

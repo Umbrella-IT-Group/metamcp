@@ -1,8 +1,8 @@
 /**
  * Unit tests for `McpServerPool.invalidateServerConnection`.
  *
- * The unit-under-test is the invalidation cascade introduced after the
- * 2026-05-14T17:29Z production case where PR #13's recovery path
+ * The unit-under-test is the invalidation cascade introduced after a
+ * production case where PR #13's recovery path
  * engaged correctly (detector fired, `invalidateServerConnection`
  * logged), but the recovery's retry call ALSO got `Not connected`
  * because the cap-reuse branch in `getSession` handed back a stale
@@ -112,7 +112,7 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
   });
 
   it("cascades to every other session's slot for the same serverUuid", async () => {
-    // Pre-2026-05-14 bug: only session-A's slot got invalidated; sessions
+    // The original bug: only session-A's slot got invalidated; sessions
     // B + C kept their stale clients, and the next getSession() hit the
     // cap-reuse branch which handed one back to the recovery path.
     const clientA = makeFakeClient();
@@ -416,7 +416,8 @@ describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
 // grows until the cap is hit — then EVERY new connection is refused,
 // including the recreation a backend needs after a Watchtower restart.
 // The pool deadlocked on "connection limit reached" until a manual
-// `docker restart metamcp` (observed 2026-05-27, autotask wedged 8+min).
+// `docker restart metamcp` (observed against a live deployment: a
+// backend stayed wedged for minutes after a redeploy).
 //
 // evictOneForCapacity reclaims one slot by DESTROYING (not recycling)
 // the least-valuable connection: idle first, then oldest active.
@@ -515,7 +516,7 @@ describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sw
   // silently (no socket, no onclose/onerror). At the per-server cap every
   // slot is active, so the idle health check sees nothing and the
   // cap-reuse branch in getSession serves the zombies forever
-  // (incident 2026-06-11). The sweep pings distinct active clients and
+  // (the zero-tool outage). The sweep pings distinct active clients and
   // cascade-invalidates after two consecutive failed sweeps.
 
   type PingableFakeClient = FakeClient & {
@@ -686,7 +687,7 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
   // only request-path reset (cold-start warmup) requires the WHOLE pool
   // to be empty — which never happens while other namespaces hold live
   // connections. Observed as the unkillable "No session for: autotask"
-  // loop in incident 2026-06-11.
+  // loop in the zero-tool outage.
 
   type ProbeInternals = {
     activeSessions: Record<string, unknown>;

@@ -39,7 +39,7 @@ import {
 describe("planPreservedApiKeyRestores — endpoint scope survives user recreate", () => {
   it("re-resolves a scoped key to the endpoint's CURRENT uuid by name (uuid changed across recreate)", () => {
     const scoped: PreservedApiKey = {
-      name: "tara-autotask",
+      name: "consumer-autotask",
       key: "sk_mt_scoped",
       is_active: true,
       // The uuid captured BEFORE the recreate — stale by restore time.
@@ -59,7 +59,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
     expect(skipped).toEqual([]);
     expect(restores).toEqual([
       {
-        name: "tara-autotask",
+        name: "consumer-autotask",
         key: "sk_mt_scoped",
         user_id: "user-1",
         is_active: true,

@@ -22,12 +22,12 @@ type AuthenticatedRequest = express.Request & {
  * touches none of them, and `requireAdminMcpMiddleware` next to it tests
  * `role` and nothing else. Sessions live 30 days in this fork
  * (BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS), so a DISABLED ADMIN kept
- * `/mcp-proxy/server/stdio` — which reads `command`, `args` and `env` off the
- * query string and hands them to `spawn()` with the backend's environment
- * (see `require-admin-mcp.middleware.ts` for the full chain) — for the
- * remaining life of a cookie they already held. That is arbitrary command
- * execution on the gateway host outliving the button whose entire purpose is
- * to end an account's access.
+ * `/mcp-proxy/server/stdio` — which hands a command to `spawn()` with the
+ * backend's environment (see `require-admin-mcp.middleware.ts` for the full
+ * chain, including why that command is now sourced from the `mcp_servers` row
+ * instead of the query string) — for the remaining life of a cookie they
+ * already held. That is process execution on the gateway host outliving the
+ * button whose entire purpose is to end an account's access.
  *
  * Mounted at the parent router (`routers/mcp-proxy.ts`) between authentication
  * and the role gate, so it covers both sub-routers and anything mounted under
@@ -45,6 +45,12 @@ type AuthenticatedRequest = express.Request & {
  *    an async express middleware that rejects hands nothing to `next(err)`,
  *    so the request would hang until the client gave up instead of being
  *    refused — and a hang on a spawn-capable route is not a safe failure.
+ *
+ * Second consumer, so "the ENTIRE `/mcp-proxy` surface" above is now where
+ * this gate started rather than everywhere it runs: the two operator routes
+ * in `routers/public-metamcp/admin.ts` (`reset-errors`, `error-status`) apply
+ * it per route, in the same position — after authentication, before the role
+ * gate — for the same reason.
  */
 export const requireEnabledMcpMiddleware = async (
   req: express.Request,

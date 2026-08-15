@@ -6,7 +6,7 @@
  *   F1 — `createIdleServer` had no in-flight guard and overwrote the
  *        idle slot without cleaning up the loser, leaking its backend
  *        ConnectedClients under a temp `idle_<ns>_<ts>` sessionId
- *        forever (the incident-#229 cap-exhaustion end state via the
+ *        forever (the cap-exhaustion end state via the
  *        admin-edit route). Plus the generation counter: an in-flight
  *        creation that straddles an invalidation must discard its
  *        pre-change-config result.

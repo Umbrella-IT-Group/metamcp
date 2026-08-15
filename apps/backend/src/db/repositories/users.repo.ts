@@ -16,8 +16,8 @@ import {
 /**
  * Hard ceiling on the admin user listing.
  *
- * The page this feeds is the one an operator opens DURING an incident, and
- * the incident that motivated it was self-registration abuse — precisely the
+ * The page this feeds is the one an operator opens DURING an attack, and
+ * the abuse that motivated it was self-registration — precisely the
  * scenario that produces thousands of accounts. An unbounded listing gets
  * slowest exactly when it is needed most, so the query takes a LIMIT and the
  * response reports the true total separately. See `listAll`.
@@ -151,7 +151,7 @@ export function buildUserListQuery(now: Date, limit: number = USER_LIST_LIMIT) {
  * accounts that exist, and lock or remove one.
  *
  * That enumeration used to be deliberately absent ("the admin UI takes a user
- * id, it does not enumerate accounts"). The 2026-08-13 incident overturned
+ * id, it does not enumerate accounts"). Self-registration abuse overturned
  * that call: an attacker's self-registered member accounts were invisible in
  * the GUI, because no surface anywhere listed users. An access path that
  * cannot be seen cannot be audited, so the listing is now the point.
@@ -227,7 +227,7 @@ export class UsersRepository {
   /**
    * Accounts, newest first, capped at `limit`, plus the true total so the UI
    * can say "showing 500 of 4,312" instead of silently truncating. A silent
-   * truncation on this screen would recreate the incident in miniature: the
+   * truncation on this screen would recreate the failure in miniature: the
    * account you are hunting is simply not rendered.
    */
   async listAll(now: Date = new Date(), limit: number = USER_LIST_LIMIT) {
@@ -426,7 +426,7 @@ export class UsersRepository {
    * authorization codes are deleted, API keys that can act as this identity
    * are deactivated, and the M365 delegation is forced back to
    * `reauth_required` — but the row, its email, and its creation timestamp
-   * survive for the incident write-up. Deleting first destroys the
+   * survive for the after-action write-up. Deleting first destroys the
    * authoritative record of who the account was.
    *
    * Five statements, ONE TRANSACTION. They used to run under `Promise.all`,

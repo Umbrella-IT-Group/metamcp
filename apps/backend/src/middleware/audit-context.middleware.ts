@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 
 import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
+import { AUDIT_IP_MAX, clampAuditText } from "@/lib/audit/audit-emitter";
 
 /**
  * Stamps the two per-request fields every audit row needs: a request id and
@@ -15,7 +16,7 @@ import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
  * reached through the frontend's in-container Next.js rewrite —
  * `oauth/utils.ts` already documents that for the consent limiter. An audit
  * log whose `actor_ip` column says `127.0.0.1` on every row does not answer
- * the one question an incident responder asks first, so this reads
+ * the one question a responder asks first, so this reads
  * `CF-Connecting-IP` instead.
  *
  * TRUST ASSUMPTION, stated because it is load-bearing: `CF-Connecting-IP` is
@@ -63,6 +64,12 @@ export const CLIENT_IP_HEADER = "cf-connecting-ip";
  * header is absent (direct-to-origin calls, local development): a NULL
  * `actor_ip` is an honest "not known", while a fabricated one would be read
  * as evidence.
+ *
+ * CLAMPED HERE, at the stamping site, rather than at each emitter. Every audit
+ * row's `actor_ip` and every `x-audit-client-ip` the `/api/auth` relay stamps
+ * are read from `auditClientIp`, so bounding it once here bounds all of them,
+ * and a future emitter cannot forget to. See AUDIT_IP_MAX in
+ * `lib/audit/audit-emitter` for why 64 loses no evidence.
  */
 export function resolveClientIp(
   headers: express.Request["headers"],
@@ -75,7 +82,7 @@ export function resolveClientIp(
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
-  return trimmed === "" ? undefined : trimmed;
+  return trimmed === "" ? undefined : clampAuditText(trimmed, AUDIT_IP_MAX);
 }
 
 export const auditContextMiddleware = (

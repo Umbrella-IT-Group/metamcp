@@ -1,7 +1,7 @@
 /**
  * `users.disabled` enforcement on the DATA plane — authenticateApiKey.
  *
- * This is the plane the 2026-08-13 incident actually ran on. Wave 2 first
+ * This is the plane the credential-theft abuse actually ran on. Wave 2 first
  * shipped disable at the login and OAuth-authorize planes only, which locked
  * the doors an attacker holding a live bearer token or API key never uses:
  * OAuth access tokens live 24h here, refresh tokens 365d, and API keys never
@@ -14,27 +14,34 @@
  * owner and, for an admin key carrying an acts-as binding (migration 0024),
  * the user it impersonates. Either being disabled must refuse.
  *
- * Driven as real express middleware against fake req/res. Both repositories
- * are mocked at the module seam — the middleware constructs an ApiKeysRepository
- * at module load and users.repo reaches db/index, which throws without
- * DATABASE_URL. The OAuth path's introspection round-trip (validateOAuthToken
- * fetches this server's own /oauth/introspect) is stubbed on global fetch.
+ * Driven as real express middleware against fake req/res. All three
+ * repositories are mocked at the module seam — the middleware constructs an
+ * ApiKeysRepository at module load, and users.repo / oauth.repo reach db/index,
+ * which throws without DATABASE_URL.
+ *
+ * `globalThis.fetch` is stubbed to THROW rather than to answer. The OAuth
+ * branch used to validate a bearer token by calling this server's own
+ * /oauth/introspect over HTTP; it now reads the token row directly. A stub that
+ * answered would let that round-trip come back unnoticed, so the stub is a
+ * tripwire and one test asserts it was never touched.
  */
 
 import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { validateApiKeyMock, isDisabledMock, loggerMock } = vi.hoisted(() => ({
-  validateApiKeyMock: vi.fn(),
-  isDisabledMock: vi.fn(),
-  loggerMock: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
+const { validateApiKeyMock, isDisabledMock, getAccessTokenMock, loggerMock } =
+  vi.hoisted(() => ({
+    validateApiKeyMock: vi.fn(),
+    isDisabledMock: vi.fn(),
+    getAccessTokenMock: vi.fn(),
+    loggerMock: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+  }));
 
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
@@ -46,6 +53,10 @@ vi.mock("../db/repositories/api-keys.repo", () => ({
 
 vi.mock("../db/repositories/users.repo", () => ({
   usersRepository: { isDisabled: isDisabledMock },
+}));
+
+vi.mock("../db/repositories/oauth.repo", () => ({
+  oauthRepository: { getAccessToken: getAccessTokenMock },
 }));
 
 const { authenticateApiKey } = await import("./api-key-oauth.middleware");
@@ -150,12 +161,14 @@ async function authenticate(options: {
 
 const realFetch = globalThis.fetch;
 
-/** Stub this server's own /oauth/introspect for validateOAuthToken. */
-globalThis.fetch = (async () =>
-  new Response(
-    JSON.stringify({ active: true, sub: OWNER_ID, scope: "admin" }),
-    { status: 200, headers: { "content-type": "application/json" } },
-  )) as typeof fetch;
+// A TRIPWIRE, not a stub: nothing in this middleware may make an HTTP call any
+// more. Validating a bearer token by asking our own /oauth/introspect over the
+// network is the thing that was removed, and a stub that answered politely
+// would hide its return.
+const fetchTripwire = vi.fn(() => {
+  throw new Error("authenticateApiKey must not make HTTP calls");
+});
+globalThis.fetch = fetchTripwire as unknown as typeof fetch;
 
 afterAll(() => {
   globalThis.fetch = realFetch;
@@ -168,6 +181,15 @@ beforeEach(() => {
   // so a test that forgets fails OPEN here and its assertion catches it —
   // rather than passing because the default happened to refuse everyone.
   isDisabledMock.mockResolvedValue(false);
+  // Default: the bearer token resolves to a live, unexpired row.
+  getAccessTokenMock.mockResolvedValue({
+    access_token: OAUTH_TOKEN,
+    client_id: "mcp_client_test",
+    user_id: OWNER_ID,
+    scope: "admin",
+    expires_at: new Date(Date.now() + 60 * 60 * 1000),
+    created_at: new Date(Date.now() - 60 * 1000),
+  });
   validateApiKeyMock.mockResolvedValue({
     valid: true,
     user_id: OWNER_ID,
@@ -227,6 +249,55 @@ describe("authenticateApiKey — OAuth bearer token plane", () => {
     expect(res.body?.error).toBe("access_denied");
     // It must NOT fall through and re-try the same string as an API key.
     expect(validateApiKeyMock).not.toHaveBeenCalled();
+  });
+
+  it("validates the bearer token in-process, with no HTTP call at all", async () => {
+    // The self-call this replaced ran on EVERY OAuth-authenticated MCP
+    // request, which is what made /oauth/introspect impossible to bound: the
+    // only real traffic on that public endpoint was ours, arriving from one
+    // shared IP. With the round-trip gone, a limiter there cannot reach us.
+    const { served } = await authenticate({
+      endpoint: oauthEndpoint,
+      headers,
+    });
+
+    expect(served).toBe(true);
+    expect(fetchTripwire).not.toHaveBeenCalled();
+    expect(getAccessTokenMock).toHaveBeenCalledWith(OAUTH_TOKEN);
+  });
+
+  it("refuses an EXPIRED token without serving the request", async () => {
+    // The expiry check lived in the introspect handler; dropping the
+    // round-trip without replicating it would have honoured dead tokens.
+    getAccessTokenMock.mockResolvedValue({
+      access_token: OAUTH_TOKEN,
+      client_id: "mcp_client_test",
+      user_id: OWNER_ID,
+      scope: "admin",
+      expires_at: new Date(Date.now() - 1000),
+      created_at: new Date(Date.now() - 3600_000),
+    });
+
+    const { served, res } = await authenticate({
+      endpoint: oauthEndpoint,
+      headers,
+    });
+
+    expect(served).toBe(false);
+    expect(res.statusCode).toBe(401);
+    expect(fetchTripwire).not.toHaveBeenCalled();
+  });
+
+  it("refuses a bearer token with no row behind it", async () => {
+    getAccessTokenMock.mockResolvedValue(null);
+
+    const { served, res } = await authenticate({
+      endpoint: oauthEndpoint,
+      headers,
+    });
+
+    expect(served).toBe(false);
+    expect(res.statusCode).toBe(401);
   });
 
   it("names the account in the log so the operator can see who was refused", async () => {

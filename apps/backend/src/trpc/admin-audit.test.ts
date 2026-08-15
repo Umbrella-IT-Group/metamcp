@@ -5,7 +5,7 @@
  * anyone holding one — could re-open self-registration, mint a gateway-wide
  * API key, register an OAuth client or lock an account out, and the only
  * evidence afterwards was the affected row's own `updated_at`. That is the
- * 2026-08-13 incident's front door, so the config toggles are the highest
+ * abuse's front door, so the config toggles are the highest
  * priority in this file.
  *
  * Driven through the REAL production path — the real `@repo/trpc` routers,
@@ -228,13 +228,13 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// Config toggles — the incident's front door
+// Config toggles — the abuse's front door
 // ---------------------------------------------------------------------------
 
 describe("config.signup_disabled.set — the toggle that re-opens registration", () => {
   it("records the actor and BOTH the old and the new value", async () => {
     // The new value alone cannot answer "did this change anything?", which is
-    // the first question asked of a toggle during an incident review.
+    // the first question asked of a toggle during an after-action review.
     configServiceMock.isSignupDisabled.mockResolvedValue(true);
     configServiceMock.setSignupDisabled.mockResolvedValue(undefined);
 
@@ -475,7 +475,7 @@ describe("apikey.create — an admin mints a credential", () => {
 });
 
 // ---------------------------------------------------------------------------
-// users.disabled — the incident-response primitive
+// users.disabled — the containment primitive
 // ---------------------------------------------------------------------------
 
 describe("user.disabled.set / user.enabled.set", () => {
@@ -537,9 +537,9 @@ describe("user.disabled.set / user.enabled.set", () => {
   });
 });
 
-describe("user.access.revoked / user.delete — the incident-response actions", () => {
+describe("user.access.revoked / user.delete — the containment actions", () => {
   // These are the two operations an administrator performs WHILE containing an
-  // incident: severing an attacker's live access, and destroying the account.
+  // attack: severing an attacker's live access, and destroying the account.
   // They tear their targets down with raw drizzle, so no better-auth hook sees
   // them — without an emitter here the table would record deleting one API key
   // but not wiping an entire identity.
@@ -687,7 +687,7 @@ describe("user.access.revoked / user.delete — the incident-response actions", 
       own_endpoints: 3,
       own_mcp_servers: 1,
       own_api_keys: 4,
-      // The cross-user reach is what an incident review asks about first.
+      // The cross-user reach is what an after-action review asks about first.
       other_users_endpoints: 5,
       other_users_api_keys: 6,
       sessions: 3,

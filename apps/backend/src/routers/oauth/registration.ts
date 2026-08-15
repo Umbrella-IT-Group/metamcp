@@ -10,7 +10,11 @@ import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
 import { buildClientRegistration } from "./client-registration";
-import { getBaseUrl, GRANTED_OAUTH_SCOPE, rateLimitToken } from "./utils";
+import {
+  getBaseUrl,
+  GRANTED_OAUTH_SCOPE,
+  rateLimitRegistration,
+} from "./utils";
 
 const registrationRouter = express.Router();
 
@@ -19,158 +23,180 @@ const registrationRouter = express.Router();
  * Allows clients to dynamically register with the authorization server
  * Implementation follows RFC 7591 with OAuth 2.1 security enhancements
  */
-registrationRouter.post("/oauth/register", rateLimitToken, async (req, res) => {
-  try {
-    // Check if body was parsed correctly
-    if (!req.body || typeof req.body !== "object") {
-      return res.status(400).json({
-        error: "invalid_request",
-        error_description: "Request body is missing or malformed",
+// `rateLimitRegistration`, NOT the token endpoint's limiter this route used to
+// share: one bucket meant anonymous registration traffic could spend the budget
+// a paired connector's token exchange needed. See rateLimitRegistration.
+registrationRouter.post(
+  "/oauth/register",
+  rateLimitRegistration,
+  async (req, res) => {
+    try {
+      // Check if body was parsed correctly
+      if (!req.body || typeof req.body !== "object") {
+        return res.status(400).json({
+          error: "invalid_request",
+          error_description: "Request body is missing or malformed",
+        });
+      }
+
+      // Validate + mint through the shared registration core, so this public
+      // DCR endpoint and the admin UI's tRPC create path apply one identical
+      // rule set (see ./client-registration.ts). The error pair it returns is
+      // already the RFC 7591 shape this endpoint has always emitted.
+      const registration = buildClientRegistration(req.body);
+
+      if (!registration.ok) {
+        return res.status(400).json({
+          error: registration.error,
+          error_description: registration.error_description,
+        });
+      }
+
+      // `registration_source: "dcr"` is stamped HERE rather than inside the
+      // shared core, because this is the door — the core serves both. It is
+      // what makes a row from this anonymous endpoint eligible for the
+      // retention sweep, and what keeps the admin dialog's rows out of it. See
+      // ./client-retention.ts.
+      const clientRegistration = {
+        ...registration.client,
+        registration_source: "dcr" as const,
+      };
+      const clientSecret = clientRegistration.client_secret;
+
+      // Store the client registration
+      await oauthRepository.upsertClient(clientRegistration);
+
+      // The highest-signal anonymous write this gateway accepts, and until now
+      // it was invisible. RFC 7591 dynamic registration needs no credential, so
+      // anyone who can reach /oauth/register can add a client that a signed-in
+      // human may then be asked to approve — and `client_name` is whatever that
+      // caller typed, which is how a consent screen ends up saying "Claude".
+      // Emitted AFTER upsertClient, so a row here means a client that exists.
+      //
+      // actor_type is `anonymous`, honestly: there is no session, no key and no
+      // prior client identity on this request. The IP is the only attribution
+      // available, which is precisely why the CF-Connecting-IP middleware had
+      // to land before this lane. `client_secret` is never recorded — it is
+      // returned to the caller once, in the response below, and nowhere else.
+      const audit = auditRequestContext(req);
+      emit({
+        actor_type: "anonymous",
+        actor_id: null,
+        actor_label: null,
+        actor_ip: audit.actor_ip,
+        actor_user_agent: audit.actor_user_agent,
+        action: "oauth.dcr.register",
+        target_type: "oauth_client",
+        target_id: clientRegistration.client_id,
+        outcome: "success",
+        request_id: audit.request_id,
+        http_status: 201,
+        // EVERY caller-supplied field here is clamped, and on this endpoint
+        // that is a hard requirement rather than tidiness: `/oauth/register`
+        // takes no credential, and the target is a jsonb column in a table
+        // with DELETE/TRUNCATE triggers, so every byte written is permanent.
+        //
+        // Three controls now stand in front of this clamp, and it is kept
+        // anyway. The body limit is 256kb rather than the app-wide 50mb
+        // (OAUTH_BODY_LIMIT), `buildClientRegistration` caps the redirect
+        // array and every element and metadata field it stores, and the
+        // registration rate limit is its own bucket keyed on the real caller
+        // IP instead of one process-global `req.ip` budget. What survives all
+        // three is a payload that is legal but still worth writing compactly
+        // a thousand times over — and a clamp that only exists at the caller
+        // is a clamp the next call site does not get.
+        // `redirect_uri_count` preserves the fact that truncation happened.
+        detail: {
+          client_name: clientRegistration.client_name
+            ? clampAuditText(clientRegistration.client_name, 100)
+            : null,
+          redirect_uris: clampAuditTextList(
+            clientRegistration.redirect_uris,
+            10,
+            512,
+          ),
+          redirect_uri_count: Array.isArray(clientRegistration.redirect_uris)
+            ? clientRegistration.redirect_uris.length
+            : 0,
+          grant_types: clampAuditTextList(
+            clientRegistration.grant_types,
+            10,
+            64,
+          ),
+          token_endpoint_auth_method: clampAuditText(
+            clientRegistration.token_endpoint_auth_method,
+            64,
+          ),
+          has_client_secret: Boolean(clientSecret),
+        },
       });
-    }
 
-    // Validate + mint through the shared registration core, so this public
-    // DCR endpoint and the admin UI's tRPC create path apply one identical
-    // rule set (see ./client-registration.ts). The error pair it returns is
-    // already the RFC 7591 shape this endpoint has always emitted.
-    const registration = buildClientRegistration(req.body);
-
-    if (!registration.ok) {
-      return res.status(400).json({
-        error: registration.error,
-        error_description: registration.error_description,
-      });
-    }
-
-    const clientRegistration = registration.client;
-    const clientSecret = clientRegistration.client_secret;
-
-    // Store the client registration
-    await oauthRepository.upsertClient(clientRegistration);
-
-    // The highest-signal anonymous write this gateway accepts, and until now
-    // it was invisible. RFC 7591 dynamic registration needs no credential, so
-    // anyone who can reach /oauth/register can add a client that a signed-in
-    // human may then be asked to approve — and `client_name` is whatever that
-    // caller typed, which is how a consent screen ends up saying "Claude".
-    // Emitted AFTER upsertClient, so a row here means a client that exists.
-    //
-    // actor_type is `anonymous`, honestly: there is no session, no key and no
-    // prior client identity on this request. The IP is the only attribution
-    // available, which is precisely why the CF-Connecting-IP middleware had
-    // to land before this lane. `client_secret` is never recorded — it is
-    // returned to the caller once, in the response below, and nowhere else.
-    const audit = auditRequestContext(req);
-    emit({
-      actor_type: "anonymous",
-      actor_id: null,
-      actor_label: null,
-      actor_ip: audit.actor_ip,
-      actor_user_agent: audit.actor_user_agent,
-      action: "oauth.dcr.register",
-      target_type: "oauth_client",
-      target_id: clientRegistration.client_id,
-      outcome: "success",
-      request_id: audit.request_id,
-      http_status: 201,
-      // EVERY caller-supplied field here is clamped, and on this endpoint
-      // that is a hard requirement rather than tidiness. `/oauth/register`
-      // takes no credential and the JSON body limit is 50mb, while
-      // `buildClientRegistration` validates each redirect URI's SCHEME but
-      // caps neither the array length nor the element length. Copying those
-      // arrays verbatim would hand an anonymous caller a multi-megabyte
-      // write per request into a jsonb column with DELETE/TRUNCATE triggers
-      // and no prune path — turning the table that exists to survive an
-      // incident into a disk-exhaustion vector. `rateLimitToken` does not
-      // save it: it keys on `req.ip`, which is the same loopback address for
-      // every caller behind the in-container rewrite, so it is one global
-      // bucket. `redirect_uri_count` preserves the fact that truncation
-      // happened.
-      detail: {
-        client_name: clientRegistration.client_name
-          ? clampAuditText(clientRegistration.client_name, 100)
-          : null,
-        redirect_uris: clampAuditTextList(
-          clientRegistration.redirect_uris,
-          10,
-          512,
-        ),
-        redirect_uri_count: Array.isArray(clientRegistration.redirect_uris)
-          ? clientRegistration.redirect_uris.length
-          : 0,
-        grant_types: clampAuditTextList(clientRegistration.grant_types, 10, 64),
-        token_endpoint_auth_method: clampAuditText(
+      // Prepare response according to RFC 7591 with OAuth 2.1 guidance.
+      // getBaseUrl, not `req.get("host")`: every request reaches this router
+      // through the Next.js proxy, so the Host header is the container-internal
+      // `localhost:12009`. Building the advertised endpoints from it both leaked
+      // the internal listener to an anonymous caller and handed registering
+      // clients token/authorize URLs they cannot reach. getBaseUrl prefers
+      // APP_URL, then X-Forwarded-Host.
+      const baseUrl = getBaseUrl(req);
+      const response: any = {
+        client_id: clientRegistration.client_id,
+        client_name: clientRegistration.client_name,
+        redirect_uris: clientRegistration.redirect_uris,
+        grant_types: clientRegistration.grant_types,
+        response_types: clientRegistration.response_types,
+        token_endpoint_auth_method:
           clientRegistration.token_endpoint_auth_method,
-          64,
-        ),
-        has_client_secret: Boolean(clientSecret),
-      },
-    });
+        scope: clientRegistration.scope,
 
-    // Prepare response according to RFC 7591 with OAuth 2.1 guidance.
-    // getBaseUrl, not `req.get("host")`: every request reaches this router
-    // through the Next.js proxy, so the Host header is the container-internal
-    // `localhost:12009`. Building the advertised endpoints from it both leaked
-    // the internal listener to an anonymous caller and handed registering
-    // clients token/authorize URLs they cannot reach. getBaseUrl prefers
-    // APP_URL, then X-Forwarded-Host.
-    const baseUrl = getBaseUrl(req);
-    const response: any = {
-      client_id: clientRegistration.client_id,
-      client_name: clientRegistration.client_name,
-      redirect_uris: clientRegistration.redirect_uris,
-      grant_types: clientRegistration.grant_types,
-      response_types: clientRegistration.response_types,
-      token_endpoint_auth_method: clientRegistration.token_endpoint_auth_method,
-      scope: clientRegistration.scope,
+        // OAuth 2.1 Security Information
+        oauth_compliance: "OAuth 2.1",
+        pkce_required: true,
+        pkce_methods_supported: ["S256"],
 
-      // OAuth 2.1 Security Information
-      oauth_compliance: "OAuth 2.1",
-      pkce_required: true,
-      pkce_methods_supported: ["S256"],
+        // Endpoint information for the client
+        authorization_endpoint: `${baseUrl}/oauth/authorize`,
+        token_endpoint: `${baseUrl}/oauth/token`,
+        userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
+        revocation_endpoint: `${baseUrl}/oauth/revoke`,
+      };
 
-      // Endpoint information for the client
-      authorization_endpoint: `${baseUrl}/oauth/authorize`,
-      token_endpoint: `${baseUrl}/oauth/token`,
-      userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
-      revocation_endpoint: `${baseUrl}/oauth/revoke`,
-    };
+      // Include client_secret only if one was generated
+      if (clientSecret) {
+        response.client_secret = clientSecret;
+        response.security_note =
+          "Store client_secret securely. For public clients, use PKCE instead.";
+      } else {
+        response.security_note =
+          "This client uses PKCE for security. Ensure code_challenge and code_challenge_method are included in authorization requests.";
+      }
 
-    // Include client_secret only if one was generated
-    if (clientSecret) {
-      response.client_secret = clientSecret;
-      response.security_note =
-        "Store client_secret securely. For public clients, use PKCE instead.";
-    } else {
-      response.security_note =
-        "This client uses PKCE for security. Ensure code_challenge and code_challenge_method are included in authorization requests.";
+      // Include optional metadata if provided
+      if (clientRegistration.client_uri)
+        response.client_uri = clientRegistration.client_uri;
+      if (clientRegistration.logo_uri)
+        response.logo_uri = clientRegistration.logo_uri;
+      if (clientRegistration.contacts)
+        response.contacts = clientRegistration.contacts;
+      if (clientRegistration.tos_uri)
+        response.tos_uri = clientRegistration.tos_uri;
+      if (clientRegistration.policy_uri)
+        response.policy_uri = clientRegistration.policy_uri;
+      if (clientRegistration.software_id)
+        response.software_id = clientRegistration.software_id;
+      if (clientRegistration.software_version)
+        response.software_version = clientRegistration.software_version;
+
+      res.status(201).json(response);
+    } catch (error) {
+      logger.error("Error in OAuth registration endpoint:", error);
+      res.status(500).json({
+        error: "server_error",
+        error_description: "Internal server error during client registration",
+      });
     }
-
-    // Include optional metadata if provided
-    if (clientRegistration.client_uri)
-      response.client_uri = clientRegistration.client_uri;
-    if (clientRegistration.logo_uri)
-      response.logo_uri = clientRegistration.logo_uri;
-    if (clientRegistration.contacts)
-      response.contacts = clientRegistration.contacts;
-    if (clientRegistration.tos_uri)
-      response.tos_uri = clientRegistration.tos_uri;
-    if (clientRegistration.policy_uri)
-      response.policy_uri = clientRegistration.policy_uri;
-    if (clientRegistration.software_id)
-      response.software_id = clientRegistration.software_id;
-    if (clientRegistration.software_version)
-      response.software_version = clientRegistration.software_version;
-
-    res.status(201).json(response);
-  } catch (error) {
-    logger.error("Error in OAuth registration endpoint:", error);
-    res.status(500).json({
-      error: "server_error",
-      error_description: "Internal server error during client registration",
-    });
-  }
-});
+  },
+);
 
 /**
  * OAuth 2.0 Dynamic Client Registration Information Endpoint

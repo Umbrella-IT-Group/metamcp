@@ -5,7 +5,7 @@
  * `or(eq(user_id, userId), isNull(user_id))` — the `isNull` branch also
  * matched PUBLIC ('everyone') keys, so any member holding a public key's
  * uuid (visible via their own `list` query) could deactivate or DELETE a key
- * every other consumer (Tara/n8n/Claude) authenticates with. The fix narrows
+ * every other consumer (n8n/Claude/other clients) authenticates with. The fix narrows
  * the member-scoped predicate to `eq(user_id, userId)` only; public keys are
  * now mutable exclusively through `updateAsAdmin`/`deleteAsAdmin`.
  *

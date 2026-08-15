@@ -114,9 +114,10 @@ const SESSION_TERMINATE_TIMEOUT_MS = 2000;
  *
  * WHY THIS EXISTS: the SDK's `Protocol.close()` only closes the LOCAL
  * transport — it never emits the spec DELETE, so every pool teardown left
- * the backend holding a live session object forever. Measured on prod
- * 2026-08-13: 1027 sessions created / 0 terminated against a single
- * backend, ~1.17MB retained each, one backend OOM-cycling every ~4 days.
+ * the backend holding a live session object forever. Measured against a
+ * live deployment: sessions were created and never terminated against a
+ * single backend, roughly a megabyte retained each, walking that backend
+ * into a slow OOM cycle.
  * The SDK ships `terminateSession()` for exactly this, but its only call
  * site was the admin-only Inspector DELETE route — never the production
  * pool.

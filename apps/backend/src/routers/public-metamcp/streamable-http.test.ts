@@ -1,6 +1,6 @@
 /**
  * Targeted tests for the two highest-risk behaviors flagged in the
- * foreman review of METAMCP-POOL-1 / PR #72 (fixes round):
+ * review of the pool-cap work / PR #72 (fixes round):
  *
  *   (a) the idle-TTL sweep reap variant (`reapIdleSession`) preserves the
  *       `mcp_sessions` row — unlike the client-DELETE variant
@@ -171,7 +171,7 @@ beforeEach(() => {
   ).mockResolvedValue(undefined);
 });
 
-describe("reapIdleSession vs cleanupSession — row-preservation contract (item 1 / METAMCP-POOL-1)", () => {
+describe("reapIdleSession vs cleanupSession — row-preservation contract (item 1 / pool-cap review)", () => {
   it("reapIdleSession (the sweep reap variant) does NOT delete the mcp_sessions row", async () => {
     await reapIdleSession("sess-reap-1");
 
@@ -202,7 +202,7 @@ describe("reapIdleSession vs cleanupSession — row-preservation contract (item 
   });
 });
 
-describe("recoverPersistedSession — succeeds against a row reapIdleSession leaves behind (item 1 / METAMCP-POOL-1)", () => {
+describe("recoverPersistedSession — succeeds against a row reapIdleSession leaves behind (item 1 / pool-cap review)", () => {
   it("recovers when the mcp_sessions row is present and matches (the exact state a sweep reap leaves)", async () => {
     const sessionId = "sess-recover-1";
     const rawToken = "test-api-key-value";
@@ -298,7 +298,7 @@ describe("recoverPersistedSession — succeeds against a row reapIdleSession lea
   });
 });
 
-describe("dispatchTracked — in-flight guard around a long-lived dispatch (item 7b / METAMCP-POOL-1)", () => {
+describe("dispatchTracked — in-flight guard around a long-lived dispatch (item 7b / pool-cap review)", () => {
   it("holds the session in-flight for the full duration of an open standalone GET stream, then releases it", async () => {
     const sessionId = "sess-stream-1";
     publicSessionSweeper.beginTracking(sessionId);

@@ -60,6 +60,10 @@ vi.mock("../db/repositories/endpoints.repo", () => ({
 vi.mock("./public-metamcp/openapi", async () => ({
   openApiRouter: (await import("express")).Router(),
 }));
+// The admin router's own gate is pinned by
+// `public-metamcp/admin.admin-gate.test.ts`, which drives the real router —
+// this stub only keeps `@/db` out of this file's import graph and asserts
+// nothing about those routes.
 vi.mock("./public-metamcp/admin", async () => ({
   default: (await import("express")).Router(),
 }));

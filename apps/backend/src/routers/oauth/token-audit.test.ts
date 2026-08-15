@@ -48,6 +48,17 @@ vi.mock("../../db/repositories", () => ({
   usersRepository: usersRepositoryMock,
 }));
 
+// The RFC 7662 credential gate on /oauth/introspect lives in its own module
+// and has its own tests (./introspection-auth.test.ts). Stubbed to "authorized"
+// here so the branches this file was written for stay reachable — without it
+// every introspect assertion below would collapse into the same 401.
+vi.mock("./introspection-auth", () => ({
+  requireIntrospectionCredential: vi.fn(async () => ({
+    ok: true,
+    userId: null,
+  })),
+}));
+
 const { default: tokenRouter } = await import("./token");
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 
@@ -331,10 +342,11 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
   });
 
   it("writes NOTHING for an unknown token — the unauthenticated write amplifier", async () => {
-    // /oauth/revoke and /oauth/introspect have no rate limiter, and RFC 7009
-    // requires a 200 for garbage. One row per invented string would be an
-    // attacker-controlled INSERT into a table nobody can prune, recording
-    // only a value the caller made up. Documented decision, see token.ts.
+    // RFC 7009 requires a 200 for garbage, so one row per invented string
+    // would be an attacker-controlled INSERT into a table nobody can prune,
+    // recording only a value the caller made up. The failure-only limiter now
+    // on both endpoints bounds the RATE of those requests but not the row
+    // count, so this decision is unchanged. See token.ts.
     oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
     oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
 
@@ -368,11 +380,126 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
     expect(rows).toEqual([]);
   });
 
+  it("DOES record a revocation refused because the client does not match", async () => {
+    // The highest-signal event either endpoint produces: someone presenting a
+    // REAL, currently-issued token while naming a client it was not issued to.
+    // Bounded like the other two emitting branches — it cannot be reached with
+    // an invented string — so it is not the replay amplifier the unknown-token
+    // branch would be.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: liveToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 3600000),
+      created_at: new Date(),
+    });
+
+    const res = await post(
+      { token: liveToken, client_id: "mcp_client_somebody_else" },
+      "/oauth/revoke",
+    );
+    await flush();
+
+    expect(res.statusCode).toBe(400);
+    // The token must SURVIVE a refused revocation.
+    expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.revoke",
+      outcome: "failure",
+      actor_id: USER_ID,
+      target_id: CLIENT_ID,
+      http_status: 400,
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "client_mismatch",
+      token_type: "access_token",
+      presented_client_id: "mcp_client_somebody_else",
+      token_sha256: sha256(liveToken),
+    });
+    // Still a fingerprint only — the refusal path is not an exemption.
+    expect(serialized()).not.toContain(liveToken);
+  });
+
+  it("clamps the presented client_id, which is unauthenticated request text", async () => {
+    // `audit_log` has no prune path, so a row's SIZE is as permanent as its
+    // contents and any un-clamped request value is a write amplifier. Same
+    // rule the DCR redirect_uris follow.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: liveToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 3600000),
+      created_at: new Date(),
+    });
+
+    await post(
+      { token: liveToken, client_id: "z".repeat(5000) },
+      "/oauth/revoke",
+    );
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(
+      (rows[0].detail as { presented_client_id: string }).presented_client_id
+        .length,
+    ).toBe(100);
+    expect(serialized().length).toBeLessThan(8000);
+  });
+
+  it("records the mismatch on the REFRESH token branch too", async () => {
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue({
+      access_token: liveToken,
+      refresh_token: "mcp_refresh_value",
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 3600000),
+      created_at: new Date(),
+    });
+
+    await post(
+      { token: "mcp_refresh_value", client_id: "mcp_client_somebody_else" },
+      "/oauth/revoke",
+    );
+    await flush();
+
+    expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].detail).toMatchObject({
+      reason: "client_mismatch",
+      token_type: "refresh_token",
+    });
+  });
+
+  it("writes NOTHING when client_id is omitted — the non-blocking path", async () => {
+    // Omitting client_id skips the comparison entirely, which is deliberate
+    // for secretless public clients. It is an ordinary successful revocation
+    // and must not produce a mismatch row.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: liveToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      expires_at: new Date(Date.now() + 3600000),
+      created_at: new Date(),
+    });
+
+    await post({ token: liveToken }, "/oauth/revoke");
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].outcome).toBe("success");
+  });
+
   it("DOES record an introspection refused because the account is disabled", async () => {
     // Bounded by the same argument in reverse: it needs a real token that
     // belongs to a locked-out account, i.e. a credential an administrator has
     // already acted against — and a relying party still asking about it is
-    // exactly what an incident responder wants to see.
+    // exactly what a responder wants to see.
     oauthRepositoryMock.getAccessToken.mockResolvedValue({
       access_token: liveToken,
       client_id: CLIENT_ID,

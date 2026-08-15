@@ -233,7 +233,7 @@ export class ApiKeysRepository {
     }
 
     // Throttled, fire-and-forget last-used stamp. This is the hot auth path
-    // for every public-endpoint request (Tara / n8n / Claude clients), so the
+    // for every public-endpoint request (n8n / Claude / other clients), so the
     // write is (a) throttled to the 15-min window in api-keys.last-used.ts and
     // (b) never awaited and never allowed to reject — a telemetry write must
     // not add latency to, or fail, request authentication.
@@ -293,6 +293,13 @@ export class ApiKeysRepository {
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
+        // Read back solely so ApiKeysSerializer.serializeApiKey can derive the
+        // non-reversible key_prefix from it; the raw value stops there and
+        // never reaches the response (UpdateApiKeyResponseSchema has no `key`
+        // field to carry it). Kept here rather than prefixed in SQL so the ONE
+        // masking rule stays in the serializer, where the list surfaces share
+        // it — a second copy in a `.returning()` is exactly the drift that
+        // rule exists to prevent.
         key: apiKeysTable.key,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
@@ -308,7 +315,7 @@ export class ApiKeysRepository {
   // Member-scoped delete: uuid AND owned-by-this-user ONLY. Same reasoning as
   // update() above — a public key is not deletable through this path, only
   // through deleteAsAdmin. Without this, any member could DELETE a key every
-  // other consumer (Tara/n8n/Claude) authenticates with, using a uuid they
+  // other consumer (n8n/Claude/other clients) authenticates with, using a uuid they
   // can read off their own `list` query.
   async delete(uuid: string, userId: string) {
     const [deletedApiKey] = await db
@@ -341,6 +348,8 @@ export class ApiKeysRepository {
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
+        // Prefix source only, same reasoning as update() above — the raw value
+        // is consumed by the serializer and never reaches the response.
         key: apiKeysTable.key,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,

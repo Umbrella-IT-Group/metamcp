@@ -1,9 +1,9 @@
 /**
  * Unit tests for the OpenAPI bridge recovery cascade.
  *
- * Pre-2026-05-14 the OpenAPI bridge (`handlers.ts`) had its own fork
+ * Before this fix the OpenAPI bridge (`handlers.ts`) had its own fork
  * of the tools/call + tools/list handlers from `metamcp-proxy.ts`,
- * and never got PR #13 / #15 / #16's recovery wiring. Tara + any
+ * and never got PR #13 / #15 / #16's recovery wiring. Any
  * OpenAPI consumer hit a backend MCP container restart and got a
  * bare `Error POSTing ... HTTP 404 ... Session not found` pass-through.
  *
@@ -232,7 +232,7 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
 describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
   // Parity with metamcp-proxy.ts's PR #28 tripwire. The Grafana alert
   // greps `DEGRADED for namespace`; before this, OpenAPI-path
-  // degradation (Tara, n8n, registry-sync) never produced the line.
+  // degradation (n8n, registry-sync, other clients) never produced the line.
 
   beforeEach(() => {
     vi.clearAllMocks();

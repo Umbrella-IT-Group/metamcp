@@ -39,6 +39,8 @@ import {
 } from "@repo/zod-types";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { INTEGRATION_DB_LOCK_KEY } from "./integration-db-lock";
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 
 // `describe.skipIf` rather than a silent early return: a skipped suite is
@@ -84,12 +86,28 @@ beforeAll(async () => {
     "../serializers/oauth-tokens.serializer"
   ));
 
+  // Serialize against every other TEST_DATABASE_URL suite before touching a
+  // shared table. vitest runs test FILES in parallel workers by default, and
+  // this file TRUNCATEs — so a second integration file (client-retention) that
+  // seeds its own rows would have them deleted mid-run, intermittently and
+  // with an error message pointing at the wrong file. A postgres session-level
+  // advisory lock is the coordination that works across processes; the key is
+  // shared by every integration suite and its value is arbitrary. Released
+  // implicitly when the pool closes in afterAll, and by the explicit unlock
+  // there so the release does not depend on that.
+  await db.execute(
+    `SELECT pg_advisory_lock(${INTEGRATION_DB_LOCK_KEY})` as never,
+  );
+
   await seed();
 });
 
 afterAll(async () => {
   if (!TEST_DATABASE_URL || !db) return;
   await truncate();
+  await db.execute(
+    `SELECT pg_advisory_unlock(${INTEGRATION_DB_LOCK_KEY})` as never,
+  );
   const { pool } = await import("../index");
   await pool.end();
 });
@@ -637,7 +655,7 @@ describeIfDb("revokeAccess against real postgres", () => {
       .where(eq(schema.m365UserTokensTable.user_id, MEMBER_ID));
     expect(m365?.status).toBe("reauth_required");
 
-    // The account itself survives — it is the incident evidence.
+    // The account itself survives — it is the forensic evidence.
     const [user] = await db
       .select({ id: schema.usersTable.id })
       .from(schema.usersTable)

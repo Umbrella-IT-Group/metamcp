@@ -50,8 +50,7 @@
  * process (i.e., 95%+ of restarts) are never touched.
  *
  * Remove this module when Anthropic's MCP connector ships
- * spec-compliant 404 handling. Counterpart IDEAS entry in the
- * operator's COWORK repo tracks the upstream-fix expectation.
+ * spec-compliant 404 handling.
  *
  * ============================================================
  * Operational behaviour

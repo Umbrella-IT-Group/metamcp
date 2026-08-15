@@ -58,7 +58,7 @@ describe("SDK SSE keep-alive contract", () => {
 
   it("stays a public option we can turn down or off if a consumer ever needs it", () => {
     // Not exercised in production today; asserted so the escape hatch is
-    // known to exist before someone needs it in an incident. `< 1` is the
+    // known to exist before someone needs it under pressure. `< 1` is the
     // SDK's documented disable value.
     expect(
       resolvedKeepAliveMs(
