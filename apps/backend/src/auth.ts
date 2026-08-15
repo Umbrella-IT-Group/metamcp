@@ -15,6 +15,7 @@ import {
   emitSignupCreated,
   emitSignupDenied,
 } from "./lib/audit/auth-hook-audit";
+import { isBootstrapSignupAllowed } from "./lib/bootstrap-signup-override";
 import { configService } from "./lib/config.service";
 import logger from "./utils/logger";
 
@@ -174,6 +175,23 @@ export const auth = betterAuth({
           const isSignupDisabled = await configService.isSignupDisabled();
           const isSsoSignupDisabled = await configService.isSsoSignupDisabled();
 
+          // The bootstrap exemption. Bootstrap onboards its configured
+          // administrators through THIS route, and this fork stores
+          // DISABLE_SIGNUP=true from the first boot onward, so without the
+          // exemption a restart with BOOTSTRAP_RECREATE_USER=true deletes the
+          // administrator (and its API keys) and is then refused permission to
+          // recreate it. The flag is false for every request that arrives over
+          // HTTP: it is only ever true inside the pre-listen bootstrap pass,
+          // and lib/bootstrap-signup-override.ts carries the full argument for
+          // why that leaves no reachable open-signup window.
+          //
+          // Applied to BOTH branches rather than only the basic-auth one:
+          // `isSsoRegistration` below is a path heuristic, not a fact about the
+          // caller, so scoping the exemption by branch would make bootstrap's
+          // success depend on how better-auth happens to label the request.
+          // The flag itself is what scopes this, and it is scoped to bootstrap.
+          const isBootstrapSignup = isBootstrapSignupAllowed();
+
           // Determine if this is an SSO/OAuth registration by checking the request path
           // OAuth/SSO registrations typically come through callback endpoints
           const isSsoRegistration =
@@ -182,7 +200,7 @@ export const auth = betterAuth({
             context?.path?.includes("/oidc/");
 
           if (isSsoRegistration) {
-            if (isSsoSignupDisabled) {
+            if (isSsoSignupDisabled && !isBootstrapSignup) {
               // The abuse's front door, from the inside. When
               // self-registration was open the accounts that
               // walked through it left no trace beyond the `users` rows
@@ -197,7 +215,7 @@ export const auth = betterAuth({
               );
             }
           } else {
-            if (isSignupDisabled) {
+            if (isSignupDisabled && !isBootstrapSignup) {
               emitSignupDenied(user, context, "basic");
               throw new Error("New user registration is currently disabled.");
             }

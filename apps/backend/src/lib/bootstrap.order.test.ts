@@ -19,11 +19,15 @@
  *    and leave an audit row when, and only when, a boot actually moves one of
  *    them. Both live in the entrypoint, so neither is reachable from a unit
  *    test of the parser;
- *  - the registration lock is written AFTER the configured users are created,
- *    which is what stops the fail-closed default from locking bootstrap out
- *    of its own onboarding path (`ensureUser` signs users up through the very
- *    route DISABLE_SIGNUP closes). Only the entrypoint's statement ORDER can
- *    show this.
+ *  - the registration lock is written AFTER the configured users are created
+ *    (the cheap second line behind the exemption below);
+ *  - the BOOTSTRAP SIGNUP EXEMPTION is opened around the user pass and closed
+ *    in a `finally` after it, including when that pass throws. This is what
+ *    actually keeps a closed gateway able to recreate its own administrator:
+ *    `ensureUser` signs users up through the very route DISABLE_SIGNUP closes,
+ *    and the flag PERSISTS, so on every boot after the first the stored `true`
+ *    is what refuses and no ordering inside a boot can help. Only the
+ *    entrypoint can show the flag's lifetime.
  *
  * Env-driven config: each test writes the BOOTSTRAP_* vars it needs and the
  * suite restores the original environment afterwards.
@@ -32,15 +36,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // auth.ts throws without BETTER_AUTH_SECRET and connects to postgres.
 //
-// `authCallLog` records the length of `statementLog` at each sign-up call.
-// That is the handle the create-before-lock ordering assertion needs: the
-// real signup route refuses once DISABLE_SIGNUP is stored, so "which came
-// first, the sign-up or the config write" is the whole safety property, and
-// nothing in the statement log alone can answer it (`ensureUser` creates
-// users through `auth.handler`, not through a logged insert).
+// `authCallLog` records, per sign-up call, the length of `statementLog` and
+// whether the bootstrap exemption was open. Neither is visible in the
+// statement log (`ensureUser` creates users through `auth.handler`, not
+// through a logged insert), and both are safety properties: the first answers
+// "which came first, the sign-up or the config write", the second answers
+// "was bootstrap allowed through the gate that refuses everyone else".
 const { authHandlerMock, authCallLog } = vi.hoisted(() => ({
   authHandlerMock: vi.fn(),
-  authCallLog: [] as { statementsAtCall: number }[],
+  authCallLog: [] as {
+    statementsAtCall: number;
+    bootstrapSignupAllowed: boolean;
+  }[],
 }));
 vi.mock("../auth", () => ({ auth: { handler: authHandlerMock } }));
 
@@ -78,6 +85,14 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
      * `readRegistrationFlag`.
      */
     configFindFirstQueue: [] as (Record<string, unknown> | Error | undefined)[],
+    /**
+     * What `DISABLE_SIGNUP` ALREADY holds in the database when this boot
+     * starts. Distinct from `configFindFirstQueue`, which models the audit
+     * comparison read: this one drives the signup GATE inside the stand-in
+     * `auth.handler` below, and `true` is the boot-2+ state every restart of a
+     * deployed gateway is in.
+     */
+    storedSignupDisabled: false,
     /** Response `auth.handler` resolves with (the Better Auth sign-up POST). */
     authHandlerResponse: {
       ok: true,
@@ -200,6 +215,12 @@ import {
   namespacesTable,
 } from "../db/schema";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
+// NOT mocked, deliberately: this module is half the fix under test, and the
+// entrypoint's use of it is what these tests observe.
+import {
+  isBootstrapSignupAllowed,
+  setBootstrapSignupAllowed,
+} from "./bootstrap-signup-override";
 
 const BOOTSTRAP_ENV_KEYS = [
   "BOOTSTRAP_USER_EMAIL",
@@ -236,11 +257,35 @@ beforeEach(() => {
   // Same reason, plus one more: the response has to come from a fixture the
   // tests mutate rather than from `mockResolvedValue`, because a resolved
   // value would replace this recorder.
+  //
+  // The `storedSignupDisabled` branch is a STAND-IN for `auth.ts`'s
+  // `databaseHooks.user.create.before` gate, which cannot run here (`../auth`
+  // is mocked wholesale — bootstrap will not drive a live better-auth
+  // instance). It reproduces the one decision that matters, `refuse unless the
+  // bootstrap exemption is open`, against the REAL exemption module, so these
+  // tests bite on bootstrap's half of the fix: forget to open the exemption and
+  // the recreate scenarios below fail exactly as production would.
+  //
+  // What it deliberately does NOT prove is that the real hook honours the
+  // exemption. That is `src/auth-signup-gate.test.ts`, which drives the
+  // configured hook itself. Change one file and change the other.
   authHandlerMock.mockImplementation(async () => {
-    authCallLog.push({ statementsAtCall: statementLog.length });
+    const bootstrapSignupAllowed = isBootstrapSignupAllowed();
+    authCallLog.push({
+      statementsAtCall: statementLog.length,
+      bootstrapSignupAllowed,
+    });
+    if (readFixtures.storedSignupDisabled && !bootstrapSignupAllowed) {
+      return {
+        ok: false,
+        status: 403,
+        text: async () => "New user registration is currently disabled.",
+      };
+    }
     return readFixtures.authHandlerResponse;
   });
   readFixtures.authHandlerResponse = { ok: true, text: async () => "" };
+  readFixtures.storedSignupDisabled = false;
   readFixtures.preservedKeyRows = [];
   readFixtures.endpointRows = [];
   readFixtures.userRows = [];
@@ -262,6 +307,10 @@ afterEach(() => {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
+  // The exemption is process-global, so a regression that leaks it `true` would
+  // otherwise disarm every gate assertion in the tests that follow. Each test
+  // asserts the flag's final state itself, BEFORE this runs.
+  setBootstrapSignupAllowed(false);
   vi.restoreAllMocks();
 });
 
@@ -816,5 +865,160 @@ describe("registration controls — fail-closed defaults and audited boot-time f
       target_id: "DISABLE_SIGNUP",
       detail: { old_value: null, new_value: true, source: "bootstrap_env" },
     });
+  });
+});
+
+describe("bootstrap signup exemption — the boot-2+ recreate lockout", () => {
+  function warnLines(): string[] {
+    return (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+  }
+
+  it("recreates the administrator on a boot where DISABLE_SIGNUP is ALREADY stored true", async () => {
+    // The regression this exemption exists for, and the reason ordering alone
+    // was not a fix. This is not a fresh database: a previous boot already
+    // wrote DISABLE_SIGNUP=true, so the gate is closed before the entrypoint
+    // runs a single statement. BOOTSTRAP_RECREATE_USER=true (what example.env
+    // ships) means `ensureUser` DELETES the administrator and its user-scoped
+    // API keys FIRST. Without the exemption the re-signup that follows is
+    // refused and the deploy comes up with no administrator, registration
+    // closed, and the connector keys unrecoverable, on an ordinary restart.
+    arrangeRecreateScenario();
+    readFixtures.storedSignupDisabled = true;
+    // The audit comparison read agrees: this boot re-asserts what is stored.
+    readFixtures.configFindFirstQueue = [{ value: "true" }, { value: "true" }];
+
+    await initializeEnvironmentConfiguration();
+
+    // The destructive half genuinely ran, so this is the real hazard path.
+    expect(
+      statementLog.some((s) => s.op === "delete" && s.table === apiKeysTable),
+    ).toBe(true);
+
+    // The sign-up POST was issued and was NOT refused: no sign-up failure, and
+    // no credential-loss warning. These two lines ARE the lockout when the
+    // exemption is missing, so they come first, ahead of any assertion about
+    // the mechanism.
+    expect(authCallLog).toHaveLength(1);
+    expect(warnLines().find((line) => line.includes("sign-up failed"))).toBe(
+      undefined,
+    );
+    expect(
+      warnLines().find((line) => line.includes("CANNOT be restored")),
+    ).toBe(undefined);
+
+    // The administrator came back, and so did the preserved key, carrying its
+    // original secret and the fresh ids.
+    const apiKeyInserts = statementLog.filter(
+      (s) => s.op === "insert" && s.table === apiKeysTable,
+    );
+    expect(apiKeyInserts).toHaveLength(1);
+    expect(apiKeyInserts[0].values).toMatchObject({
+      name: "consumer-scoped",
+      key: "sk_mt_preserved_secret",
+      user_id: "new-user-id",
+      endpoint_uuid: "fresh-ep-uuid",
+    });
+
+    // ... and it got through because the exemption was open, not by accident.
+    expect(authCallLog[0].bootstrapSignupAllowed).toBe(true);
+
+    // And the boot still leaves registration closed. The exemption is for
+    // bootstrap's own accounts, not a reopening.
+    const signupWrite = statementLog.find(
+      (s) =>
+        s.op === "insert" &&
+        s.table === configTable &&
+        s.values?.id === "DISABLE_SIGNUP",
+    );
+    expect(signupWrite?.values).toMatchObject({ value: "true" });
+  });
+
+  it("closes the exemption once the user pass is done", async () => {
+    // The flag must not outlive the pass. `index.ts` awaits this entrypoint
+    // before `app.listen()`, so `false` here means no request can ever meet an
+    // open exemption.
+    arrangeRecreateScenario();
+    readFixtures.storedSignupDisabled = true;
+
+    await initializeEnvironmentConfiguration();
+
+    expect(authCallLog[0].bootstrapSignupAllowed).toBe(true);
+    expect(isBootstrapSignupAllowed()).toBe(false);
+  });
+
+  /**
+   * `bootstrapUsers` guards each user individually, so the only way to make the
+   * pass itself throw is to fail something ABOVE that guard: the banner it logs
+   * before the loop. Contrived as an injection site, exact as a code path.
+   */
+  function throwOutOfBootstrapUsers() {
+    process.env.BOOTSTRAP_USER_EMAIL = "admin@example.com";
+    process.env.BOOTSTRAP_USER_PASSWORD = "hunter2hunter2";
+    (console.log as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (line: unknown) => {
+        if (String(line).includes("Bootstrapping")) {
+          throw new Error("user pass exploded");
+        }
+      },
+    );
+  }
+
+  it("closes the exemption even when the user pass THROWS", async () => {
+    throwOutOfBootstrapUsers();
+
+    // The entrypoint swallows it (bootstrap never fails a boot by itself) ...
+    await expect(initializeEnvironmentConfiguration()).resolves.toBeUndefined();
+
+    // ... having genuinely gone through the catch, so this is the throw path
+    // and not a quiet success ...
+    expect(
+      warnLines().find((line) => line.includes("Users bootstrap failed")),
+    ).toBeDefined();
+    // ... before any sign-up was attempted ...
+    expect(authCallLog).toHaveLength(0);
+    // ... and the exemption is shut. A clear at the tail of the `try` leaves it
+    // OPEN here, which is the regression this case is for.
+    expect(isBootstrapSignupAllowed()).toBe(false);
+  });
+
+  it("closes the exemption even when the ERROR HANDLING itself throws", async () => {
+    // This is what `finally` buys over a clear placed after the whole
+    // try/catch. Today's catch swallows, so a trailing clear would still run on
+    // the case above and the two placements look interchangeable. They are not:
+    // let the catch's own logging fail (or let a future change rethrow) and a
+    // trailing clear is skipped, leaving the gateway listening with the signup
+    // gate held open for the life of the process.
+    throwOutOfBootstrapUsers();
+    (console.warn as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (line: unknown) => {
+        if (String(line).includes("Users bootstrap failed")) {
+          throw new Error("logging exploded");
+        }
+      },
+    );
+
+    // The boot fails outright here, which is allowed: `startup.ts` is what
+    // decides whether a failed bootstrap stops the process (BOOTSTRAP_FAIL_HARD).
+    await expect(initializeEnvironmentConfiguration()).rejects.toThrow(
+      "logging exploded",
+    );
+
+    // What is NOT allowed is failing with the gate left open.
+    expect(isBootstrapSignupAllowed()).toBe(false);
+  });
+
+  it("never opens the exemption on a guarded (BOOTSTRAP_ONLY_FIRST_RUN) boot", async () => {
+    // The early return creates no users, so it must not touch the flag either.
+    process.env.BOOTSTRAP_ONLY_FIRST_RUN = "true";
+    process.env.BOOTSTRAP_USER_EMAIL = "admin@example.com";
+    process.env.BOOTSTRAP_USER_PASSWORD = "hunter2hunter2";
+    readFixtures.configFindFirstQueue = [{ value: "true" }];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(authCallLog).toHaveLength(0);
+    expect(isBootstrapSignupAllowed()).toBe(false);
   });
 });

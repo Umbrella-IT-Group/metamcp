@@ -15,6 +15,7 @@ import {
   usersTable,
 } from "../db/schema";
 import { emitAdminEvent } from "./audit/admin-event";
+import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
 
 /**
  * Environment-based bootstrap for MetaMCP.
@@ -443,21 +444,27 @@ async function readRegistrationFlag(key: string): Promise<boolean | null> {
  * Apply the two registration controls (applied every run), leaving an audit
  * row for any flag this boot actually moved.
  *
- * CALL THIS AFTER `bootstrapUsers`, NEVER BEFORE. The ordering is
- * load-bearing, not cosmetic. `ensureUser` creates its accounts by POSTing to
- * Better Auth's own `/api/auth/sign-up/email` through `auth.handler`, which
- * runs the `databaseHooks.user.create.before` hook in `auth.ts`, and that hook
- * THROWS once `DISABLE_SIGNUP` is `true`. Writing the lock first therefore
- * locks bootstrap out of its own onboarding path: with the fail-closed
- * defaults a fresh database would come up with NO administrator at all, and a
- * `BOOTSTRAP_RECREATE_USER=true` run would delete the existing administrator
- * and then fail to recreate it. Creating the configured users first and
- * locking behind them is what makes the fail-closed default safe on a first
- * boot.
+ * WHAT MAKES THE FAIL-CLOSED DEFAULT SAFE IS NOT THIS FUNCTION'S POSITION.
+ * `ensureUser` creates its accounts by POSTing to Better Auth's own
+ * `/api/auth/sign-up/email` through `auth.handler`, which runs the
+ * `databaseHooks.user.create.before` hook in `auth.ts`, and that hook THROWS
+ * while `DISABLE_SIGNUP` is `true`. Because these writes PERSIST, the flag is
+ * already stored `true` at the top of every boot after the first, so no
+ * ordering inside a single boot can keep bootstrap out of its own refusal. The
+ * actual fix is the bootstrap exemption in
+ * `lib/bootstrap-signup-override.ts`: the entrypoint opens it around the
+ * bootstrap user pass and closes it in a `finally`, so bootstrap can create (or
+ * recreate) its administrators no matter what the stored flag says, while every
+ * request that arrives over HTTP still meets the closed gate.
  *
- * The gap this opens is not reachable: the whole sequence runs inside
- * `initializeOnStartup()`, which `index.ts` awaits BEFORE `app.listen()`, so
- * no request can arrive while signup is briefly still open.
+ * CALL THIS AFTER `bootstrapUsers` ANYWAY. The ordering is no longer what
+ * carries the property, but it is the cheap second line: it keeps the stored
+ * flag from moving until the accounts this boot is responsible for exist, so a
+ * future change that drops or misplaces the exemption degrades to a failed
+ * first boot rather than to a delete-then-refuse on an established deploy.
+ * There is no reachable gap either way: the whole sequence runs inside
+ * `initializeOnStartup()`, which `index.ts` awaits BEFORE `app.listen()`, so no
+ * request can arrive while any of it is in flight.
  *
  * These two writes are the same authority as the admin UI's signup toggles,
  * exercised by the environment instead of by a person: a container restart
@@ -1541,15 +1548,33 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
     return;
   }
 
-  // Bootstrap all users
+  // Bootstrap all users, with the signup gate held open for this pass ONLY.
+  //
+  // `ensureUser` onboards through Better Auth's `/api/auth/sign-up/email`, the
+  // very route `DISABLE_SIGNUP` closes, and this fork stores that flag `true`,
+  // so from the second boot onward the gate would refuse bootstrap its own
+  // administrator. With BOOTSTRAP_RECREATE_USER=true the delete has already
+  // happened by then, which is how a plain restart ends up with no admin and no
+  // connector keys. The exemption is what prevents that; the `finally` is what
+  // keeps it from outliving this pass NO MATTER HOW THAT PASS ENDS. `finally`
+  // rather than a clear after the block, which today would be equivalent only
+  // because the catch below swallows: a failure inside the error handling
+  // itself, or a future change that rethrows, would skip a trailing clear and
+  // leave the gate open for the life of the process.
+  // Nothing is listening yet (see `initializeOnStartup` / `app.listen`), so the
+  // window is not reachable from outside the process. Full argument:
+  // lib/bootstrap-signup-override.ts.
   let userMap: Map<string, string>;
   let pendingApiKeyRestores: PendingApiKeyRestore[];
+  setBootstrapSignupAllowed(true);
   try {
     ({ userMap, pendingApiKeyRestores } = await bootstrapUsers(config));
   } catch (err) {
     console.warn("⚠️ Users bootstrap failed:", err);
     userMap = new Map();
     pendingApiKeyRestores = [];
+  } finally {
+    setBootstrapSignupAllowed(false);
   }
 
   // Delete other users after bootstrapping configured users
@@ -1560,10 +1585,10 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
     console.warn("⚠️ User cleanup step failed:", err);
   }
 
-  // Registration controls, HERE and not earlier: every account this boot
-  // creates goes through the signup route these controls close (see
-  // applyRegistrationControls). Nothing below this line signs a user up, so
-  // this is the earliest safe point rather than the end of the run.
+  // Registration controls, HERE and not earlier. The bootstrap exemption above
+  // is what actually lets a closed gateway recreate its own administrator; this
+  // position is the second line behind it (see applyRegistrationControls), and
+  // it costs nothing because nothing below this line signs a user up.
   await applyRegistrationControls(config);
 
   // Bootstrap API keys. The pending-restore pairs let the log stay truthful
