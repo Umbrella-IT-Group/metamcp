@@ -67,7 +67,7 @@ export const createConfigRouter = (implementations: {
   router({
     // Deliberately public, and the only reads in this router that stay so.
     //
-    // Redteam re-verification 2026-08-14 flagged the whole `publicProcedure`
+    // security review re-verification 2026-08-14 flagged the whole `publicProcedure`
     // read cluster here: an anonymous caller could enumerate the gateway's
     // operational configuration from `/trpc`. The MCP timeout/attempt/session
     // getters had no reason to be reachable that way and are now
@@ -147,7 +147,7 @@ export const createConfigRouter = (implementations: {
         );
       }),
 
-    // Authenticated read (redteam re-verification 2026-08-14). This and the
+    // Authenticated read (security review re-verification 2026-08-14). This and the
     // four getters below were `publicProcedure`, so an anonymous caller could
     // read the gateway's MCP retry/timeout budget and session lifetime from
     // `/trpc` with no credentials. Individually each is a number; together

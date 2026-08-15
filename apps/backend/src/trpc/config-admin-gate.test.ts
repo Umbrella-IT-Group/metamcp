@@ -88,7 +88,7 @@ describe("config write surface — admin gate", () => {
 });
 
 /**
- * The config READ surface, split by who may read it (redteam re-verification
+ * The config READ surface, split by who may read it (security review re-verification
  * 2026-08-14).
  *
  * The write surface was admin-gated in 2026-07-14 (above); the reads were all

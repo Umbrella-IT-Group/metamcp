@@ -1,8 +1,8 @@
 /**
  * Tests for the registration-time redirect_uri gate — FIND-023 (HIGH,
- * incident 65394).
+ * a security review).
  *
- * The red-team re-run registered all of the URIs in RED_TEAM_CASES below
+ * The security review re-run registered all of the URIs in security review_CASES below
  * against the live gateway and got a 201 for every one of them; only
  * `javascript:` and `data:` were refused. Because `POST /oauth/register` takes
  * no credential, each of those 201s is a client a signed-in human can be
@@ -36,16 +36,16 @@ import {
 } from "./utils";
 
 /**
- * Every URI the 2026-08-14 red-team run got a 201 for, paired with the rule
+ * Every URI the 2026-08-14 security review run got a 201 for, paired with the rule
  * that now refuses it. Pinning the REASON and not just the boolean is what
  * stops a future edit from passing this suite for the wrong reason (e.g. a
  * scheme bug that happens to reject the userinfo case).
  */
-const RED_TEAM_CASES: ReadonlyArray<[string, RedirectUriRejectionReason]> = [
+const security review_CASES: ReadonlyArray<[string, RedirectUriRejectionReason]> = [
   ["https://evil.com/callback", "host_not_allowed"],
-  ["https://mcp.umbrellaitgroup.com.evil.com/callback", "host_not_allowed"],
+  ["https://your-gateway.example.com.evil.com/callback", "host_not_allowed"],
   // Real host is evil.com; the part that reads as ours is userinfo.
-  ["https://mcp.umbrellaitgroup.com@evil.com/callback", "userinfo_present"],
+  ["https://your-gateway.example.com@evil.com/callback", "userinfo_present"],
   ["http://localhost:12009/callback", "gateway_internal_port"],
   ["https://claude.ai/api/mcp/auth_callback#stolen", "fragment_present"],
   ["http://evil.com/callback", "insecure_scheme_non_loopback"],
@@ -86,8 +86,8 @@ afterEach(() => {
   }
 });
 
-describe("isAllowedRedirectUri — the red-team cases", () => {
-  it.each(RED_TEAM_CASES)("rejects %s (%s)", (uri, reason) => {
+describe("isAllowedRedirectUri — the security review cases", () => {
+  it.each(security review_CASES)("rejects %s (%s)", (uri, reason) => {
     const result = isAllowedRedirectUri(uri);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe(reason);
@@ -284,8 +284,8 @@ describe("resolveDcrAllowedHosts — operator override", () => {
 });
 
 describe("buildClientRegistration — FIND-023 at the registration surface", () => {
-  it("refuses every red-team URI with the RFC 7591 error contract intact", () => {
-    for (const [uri] of RED_TEAM_CASES) {
+  it("refuses every security review URI with the RFC 7591 error contract intact", () => {
+    for (const [uri] of security review_CASES) {
       const result = buildClientRegistration({ redirect_uris: [uri] });
       expect(result.ok).toBe(false);
       if (result.ok) continue;

@@ -68,7 +68,7 @@ export function generateSecureClientSecret(): string {
  * redirect_uris of clients that are ALREADY stored, and re-validating those
  * rows mid-incident is a separate, evidence-gated decision (see the
  * "belt-and-suspenders" note on `isAllowedRedirectUri`). Registration-time
- * enforcement plus removal of the red-team test clients is what closes
+ * enforcement plus removal of the security review test clients is what closes
  * FIND-023; adopting the strict checker here too is the planned follow-up.
  */
 export function validateRedirectUri(
@@ -124,7 +124,7 @@ export function validateRedirectUri(
  * every request reaches this router through the Next.js rewrite, so
  * `localhost:12009` is the gateway talking to itself. No external OAuth client
  * has a callback listener there, which makes `http://localhost:12009/...` a
- * pure attack shape — the red-team run registered exactly that. Kept in step
+ * pure attack shape — the security review run registered exactly that. Kept in step
  * with index.ts by `redirect-uri-allowlist.test.ts`, which reads the literal
  * back out of that file; a bare duplicated number would drift silently.
  */
@@ -136,8 +136,8 @@ export const GATEWAY_INTERNAL_PORT = 12009;
  * Locked to the Anthropic connector hosts because that is what the live data
  * says is real: of the 65 clients registered against this gateway before
  * 2026-08-14, every legitimate redirect_uri was loopback or one of these, and
- * every other host (evil.com, `mcp.umbrellaitgroup.com.evil.com`,
- * `…@evil.com`) was a red-team probe. An allowlist is therefore the cheapest
+ * every other host (evil.com, `your-gateway.example.com.evil.com`,
+ * `…@evil.com`) was a security review probe. An allowlist is therefore the cheapest
  * complete fix for FIND-023: DCR is anonymous, so anything short of "the
  * server decides which hosts are acceptable" leaves an attacker free to
  * register a client whose consent screen shows a plausible name and whose code
@@ -215,13 +215,13 @@ export function resolveDcrAllowedHosts(): string[] {
 }
 
 /**
- * The registration-time redirect_uri gate — FIND-023 (HIGH, incident 65394).
+ * The registration-time redirect_uri gate — FIND-023 (HIGH, a security review).
  *
  * `POST /oauth/register` takes no credential, so whatever passes this function
  * is a host a signed-in human can later be asked to approve on the consent
  * screen. Before it existed the endpoint 201-accepted `https://evil.com`, the
- * lookalike `https://mcp.umbrellaitgroup.com.evil.com`, and the userinfo trick
- * `https://mcp.umbrellaitgroup.com@evil.com` (whose real host is evil.com but
+ * lookalike `https://your-gateway.example.com.evil.com`, and the userinfo trick
+ * `https://your-gateway.example.com@evil.com` (whose real host is evil.com but
  * which reads as ours to a human skimming the URL). Only `javascript:`/`data:`
  * were refused.
  *
@@ -238,7 +238,7 @@ export function resolveDcrAllowedHosts(): string[] {
  *  5. Loopback is an EXACT hostname match, any port except the gateway's own
  *     internal listener.
  *  6. Non-loopback hosts must match the allowlist exactly. Exact, not suffix:
- *     a suffix rule is what makes `mcp.umbrellaitgroup.com.evil.com` look
+ *     a suffix rule is what makes `your-gateway.example.com.evil.com` look
  *     legitimate, and it would also hand every `*.claude.ai` subdomain — user
  *     content included — a valid callback.
  */
