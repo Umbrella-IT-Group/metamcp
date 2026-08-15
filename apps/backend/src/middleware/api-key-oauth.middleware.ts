@@ -77,9 +77,15 @@ function getBaseUrl(req: express.Request): string {
  * calls.
  *
  * The expiry check is replicated from that handler. The expired row is
- * deliberately NOT deleted here, unlike there: this is a read path on every
- * MCP request, and `oauthRepository.cleanupExpired()` already sweeps expired
- * rows every five minutes (routers/oauth/index.ts).
+ * deliberately NOT deleted here, unlike there, and the reason is NOT that
+ * something else sweeps it — `oauthRepository.cleanupExpired()` deletes a
+ * token row only when the refresh token is ALSO expired or null, so a row with
+ * a dead 24h access token and a live 365d refresh token is never swept and
+ * should not be. The reason is that deleting is WRONG on this path:
+ * `deleteAccessToken` removes the whole row, refresh token included, so the
+ * old self-call was destroying a client's live refresh token every time it
+ * arrived with a just-expired access token — turning a routine "refresh now"
+ * into "re-authorize from scratch". A read path must not revoke.
  *
  * `users.disabled` is deliberately NOT checked here either — see
  * findDisabledIdentity below and the matching note in routers/oauth/token.ts:
@@ -90,6 +96,25 @@ function getBaseUrl(req: express.Request): string {
  * limiter — one locked-out account's still-running connector could 429 every
  * other client behind the same IP. It now reaches the account check and is
  * refused as `account_disabled`, with the audit row that says so.
+ *
+ * TWO ACCEPTED SIDE EFFECTS of that 401 -> 403 move, recorded because they are
+ * the price of it and neither is obvious from the diff:
+ *
+ *  (a) The refusal is now DISTINGUISHABLE. A caller learns that its token is
+ *      real and the account behind it is locked (403) rather than that the
+ *      token is simply bad (401) — a small oracle for someone holding a stolen
+ *      credential. Accepted: they already hold the credential, `/oauth/token`
+ *      answers the same question through refresh, and an operator reading
+ *      `account_disabled` rows during a lockout is worth more than denying
+ *      that inference.
+ *  (b) A disabled account's requests are UNBOUNDED. They cost two DB round
+ *      trips each (token row, then `isDisabled`) and are counted by NO
+ *      limiter, because the failed-attempt limiter is only reached from the
+ *      invalid-credential branch. A connector retrying in a tight loop after
+ *      its owner is locked out therefore keeps costing queries indefinitely.
+ *      Accepted for now — it needs a live credential, and the audit rows make
+ *      it visible — but it is the thing to bound if disable is ever used on an
+ *      account with a busy machine client.
  */
 async function validateOAuthToken(token: string): Promise<{
   valid: boolean;

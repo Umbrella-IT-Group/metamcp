@@ -566,7 +566,13 @@ async function handleRefreshTokenGrant(
  *    That one is bounded by the same argument in reverse — it requires a real
  *    token belonging to a locked-out account, i.e. a credential an
  *    administrator has already acted against, and a relying party still asking
- *    about it is exactly what an incident responder wants to see.
+ *    about it is exactly what an operator wants to see.
+ *  - REVOKE refused because the CLIENT DOES NOT MATCH: emitted, and it is the
+ *    highest-signal event either endpoint produces. Same bound as the two
+ *    above: it cannot be reached without presenting a REAL, currently-issued
+ *    token, and it is rate-limited on top, so it is not replay amplification.
+ *    A caller naming a different client than the token was issued to is not a
+ *    confused client.
  *
  * The token is recorded as a fingerprint only, matching `emitTokenIssued`, so
  * an operator can follow one credential from mint to revocation by hash.
@@ -579,6 +585,14 @@ function emitTokenLifecycle(
     userId: string;
     token: string;
     outcome: "success" | "failure";
+    /**
+     * Defaults to 200 because every other caller here answers 200 — including
+     * the refusals, which is the point of RFC 7662's `{active:false}` and RFC
+     * 7009's 200-to-garbage. The client-mismatch refusal is the one that does
+     * not, and a row claiming 200 for a 400 would misreport the only wire fact
+     * the table carries about that request.
+     */
+    httpStatus?: number;
     detail?: Record<string, unknown>;
   },
 ): void {
@@ -595,7 +609,7 @@ function emitTokenLifecycle(
     target_id: fields.clientId,
     outcome: fields.outcome,
     request_id: audit.request_id,
-    http_status: 200,
+    http_status: fields.httpStatus ?? 200,
     detail: {
       token_sha256: fingerprint.sha256,
       token_last4: fingerprint.last4,
@@ -618,6 +632,17 @@ function emitTokenLifecycle(
  * A caller presenting a token this server issued therefore never scores, no
  * matter how often it asks. Only tokens that resolve to nothing — invented,
  * expired, or presented with a client_id they were not issued to — count.
+ *
+ * THE RESIDUAL, STATED PLAINLY RATHER THAN IMPLIED AWAY: the bucket is still
+ * per-IP and `trust proxy` is still off, so failure-only makes legitimate
+ * traffic incapable of filling the bucket — it does NOT make the bucket
+ * un-fillable. Anyone who can reach these endpoints can spend it with 20
+ * invented-token POSTs and hold it there indefinitely, and everyone sharing
+ * that source address is refused with them. That is accepted, not solved, and
+ * it is only acceptable because the gateway's own traffic no longer arrives
+ * here at all: `api-key-oauth.middleware.ts` reads the token row in-process, so
+ * no MCP client depends on this endpoint answering. Anything that reintroduces
+ * an internal caller must revisit this decision first.
  *
  * Split into check and record on purpose: the check runs BEFORE the database
  * lookup, so refusing costs nothing, and `isCurrentlyLimited` is used rather
@@ -804,29 +829,75 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
     }
 
     /**
-     * RFC 7009 §2.1: the server "MUST verify whether the token was issued to
-     * the client making the revocation request". Without this a caller holding
-     * any valid token could revoke it while claiming to be a different client,
-     * and — more usefully to an attacker — a client_id supplied here was simply
-     * ignored, so nothing distinguished the legitimate holder from anyone else.
+     * RFC 7009 §2.1 asks the server to "verify whether the token was issued to
+     * the client making the revocation request". This check is NON-BLOCKING
+     * when client_id is absent, mirroring handleRefreshTokenGrant above, so
+     * BE CLEAR ABOUT WHAT IT DOES AND DOES NOT BUY: it does not stop anyone
+     * holding a stolen token from revoking it, because omitting client_id
+     * skips the comparison entirely. The MUST is not satisfied and cannot be
+     * satisfied here — these are secretless public PKCE clients, so a supplied
+     * client_id is an unauthenticated claim either way, and refusing the
+     * clients that omit it would break revocation for the ones least able to
+     * protect a token in the first place. Revocation destroying a credential
+     * is also the safe direction to fail.
      *
-     * NON-BLOCKING when client_id is absent, mirroring handleRefreshTokenGrant
-     * above: these are public clients with no secret, many of which omit
-     * client_id entirely on revocation, and refusing those would break
-     * revocation for the clients most in need of it.
+     * What it does buy is a signal: a caller that names a DIFFERENT client
+     * than the token was issued to is not a confused client, and that mismatch
+     * is the highest-value event either of these endpoints produces.
      */
     const clientMismatch = (tokenClientId: string): boolean =>
       Boolean(client_id) && tokenClientId !== client_id;
+
+    /**
+     * Refuse a revocation whose client_id names someone else, loudly.
+     *
+     * This branch IS audited, unlike the other refusals on these two endpoints,
+     * and the reason is the one that governs every emit decision in this file
+     * (see emitTokenLifecycle): replay amplification. An unknown-token refusal
+     * records a string the caller invented and can be repeated forever. This
+     * one requires a REAL, currently-issued token presented under the wrong
+     * client — it cannot be produced without already holding a live credential,
+     * and it is rate-limited on top. Bounded, and it answers the question an
+     * operator actually asks: "did anyone use this credential from somewhere it
+     * was not issued to?"
+     */
+    const refuseClientMismatch = (
+      tokenData: { client_id: string; user_id: string },
+      tokenType: "access_token" | "refresh_token",
+    ): express.Response => {
+      recordPublicOAuthEndpointFailure(req, "revoke");
+      logger.warn(
+        `[oauth] revoke rejected reason=client_mismatch token_client=${tokenData.client_id} presented_client=${JSON.stringify(String(client_id).slice(0, 100))} user=${tokenData.user_id}`,
+      );
+      emitTokenLifecycle(req, {
+        action: "oauth.token.revoke",
+        clientId: tokenData.client_id,
+        userId: tokenData.user_id,
+        token,
+        outcome: "failure",
+        httpStatus: 400,
+        detail: {
+          reason: "client_mismatch",
+          token_type: tokenType,
+          // Clamped: `client_id` is unauthenticated request text on an
+          // endpoint that takes no credential, and `audit_log` has no prune
+          // path, so an unbounded value here is a write-amplification
+          // primitive. Recorded because "which client did they claim to be" is
+          // the whole content of the event.
+          presented_client_id: String(client_id).slice(0, 100),
+        },
+      });
+      return res.status(400).json({
+        error: "invalid_client",
+        error_description: "Client ID does not match",
+      });
+    };
 
     // Try revoking as access token
     const accessTokenData = await oauthRepository.getAccessToken(token);
     if (accessTokenData) {
       if (clientMismatch(accessTokenData.client_id)) {
-        recordPublicOAuthEndpointFailure(req, "revoke");
-        return res.status(400).json({
-          error: "invalid_client",
-          error_description: "Client ID does not match",
-        });
+        return refuseClientMismatch(accessTokenData, "access_token");
       }
       await oauthRepository.deleteAccessToken(token);
       emitTokenLifecycle(req, {
@@ -842,11 +913,7 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
       const tokenData = await oauthRepository.getByRefreshToken(token);
       if (tokenData) {
         if (clientMismatch(tokenData.client_id)) {
-          recordPublicOAuthEndpointFailure(req, "revoke");
-          return res.status(400).json({
-            error: "invalid_client",
-            error_description: "Client ID does not match",
-          });
+          return refuseClientMismatch(tokenData, "refresh_token");
         }
         await oauthRepository.deleteAccessToken(tokenData.access_token);
         emitTokenLifecycle(req, {
