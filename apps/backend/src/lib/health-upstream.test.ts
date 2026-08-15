@@ -51,7 +51,7 @@ const LIVENESS = {
 
 const DETAIL = {
   pool: { idle: 3, active: 4, max_total_connections: 100 },
-  servers: [{ uuid: "srv-1", name: "mcp-autotask" }],
+  servers: [{ uuid: "srv-1", name: "internal-backend" }],
 };
 
 /** A request with (or without) a session cookie. */
@@ -92,7 +92,7 @@ describe("buildUpstreamHealthBody — what an unauthenticated prober sees", () =
   it("leaks no server name or uuid anywhere in the serialised body", () => {
     const body = buildUpstreamHealthBody(LIVENESS, null);
 
-    expect(JSON.stringify(body)).not.toContain("mcp-autotask");
+    expect(JSON.stringify(body)).not.toContain("internal-backend");
     expect(JSON.stringify(body)).not.toContain("srv-1");
   });
 });

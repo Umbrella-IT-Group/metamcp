@@ -3,7 +3,7 @@ import logger from "@/utils/logger";
 // Event class for a log entry. Lets the Live Logs view show real activity
 // (connections, tool calls, who's connecting) and filter by kind.
 //   connection — gateway↔backend connect attempt / success / transport drop
-//   client     — a CONSUMER (claude.ai/Tara/n8n) opened a session at an endpoint
+//   client     — a CONSUMER (claude.ai/n8n/agents) opened a session at an endpoint
 //   tool_call  — a tools/call proxied to a backend (name, duration, ok/fail)
 //   server     — backend-emitted output (stderr) or a server config error
 //   system     — gateway lifecycle / pool events

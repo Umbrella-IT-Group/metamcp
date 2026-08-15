@@ -65,8 +65,9 @@ export class Logger {
   private errorFile: WriteStream | null;
   private consoleMode: "all" | "info" | "errors-only" | "none";
 
-  // Rotation bookkeeping. app.log grew 98MB in 25h in prod with no external
-  // logrotate inside the container; we roll a single generation in-process.
+  // Rotation bookkeeping. app.log grows tens of megabytes a day in production
+  // with no external logrotate inside the container; we roll a single
+  // generation in-process.
   private readonly logFilePath: string;
   private readonly errorFilePath: string;
   private readonly maxSizeBytes: number;

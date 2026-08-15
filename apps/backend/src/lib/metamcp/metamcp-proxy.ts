@@ -634,8 +634,8 @@ export const createServer = async (
         // landing in that gap sees `getSession` return `undefined` for
         // the owning server too, so the loop never even checks its name
         // and this would otherwise fall straight to "Unknown tool"
-        // despite the tool being real (Umbrella-MCP-Server tools/call
-        // 404 during reconnect).
+        // despite the tool being real (observed as a tools/call 404
+        // during an upstream reconnect).
         //
         // Use the DB `toolsTable` (populated by the last successful
         // tools/list sync) as last-known-good routing to find the

@@ -4,11 +4,11 @@ import logger from "@/utils/logger";
  * Idle-TTL sweeper for public-endpoint (API-key / OAuth) StreamableHTTP
  * sessions.
  *
- * WHY THIS EXISTS (the 2026-07-14 pool-cap outage):
+ * WHY THIS EXISTS (the pool-cap outage):
  * A public endpoint session is created per API-key request stream and is
  * only torn down when the client sends an explicit `DELETE`. Most clients
- * never send it, so sessions accumulate indefinitely (prod: 241 → 1363
- * sessions in 17h). Each holds backend pool connections; once the global
+ * never send it, so under sustained load public sessions accumulate
+ * indefinitely. Each holds backend pool connections; once the global
  * backend pool reaches `MAX_TOTAL_CONNECTIONS` every new connect
  * LRU-evicts a LIVE connection, surfacing as transient
  * "Failed to re-initialize session ... after backend session loss"
@@ -56,7 +56,7 @@ import logger from "@/utils/logger";
  * threshold).
  */
 
-// 24h default. Long-idle-but-real consumers (e.g. Hermes/Tara connecting a
+// 24h default. Long-idle-but-real consumers (e.g. an agent connecting a
 // namespace once and calling tools sporadically across a workday) must
 // survive an idle stretch; a shorter default would reap a live consumer
 // mid-day and force a reconnect. Generous by design — the cap-saturation
@@ -209,7 +209,7 @@ export class PublicSessionSweeper {
    * Seed tracking for a session at the two legitimate "this session now
    * exists in memory" moments: fresh creation and lazy recovery after a
    * reap. Unconditional by design — `touch()` / `markInFlight()` /
-   * `markSettled()` below are deliberately guarded (foreman review, PR
+   * `markSettled()` below are deliberately guarded (code review, PR
    * #72 fixes round) so a trailing call that lands after `forget()` has
    * already run (a request racing a concurrent DELETE, or a reap's own
    * teardown) can't resurrect a zombie tracking entry for a session
@@ -251,7 +251,7 @@ export class PublicSessionSweeper {
    * re-stamps activity). No-op if the session isn't tracked: a trailing
    * `markSettled` that lands after a concurrent DELETE's `forget()` has
    * already run must not resurrect the entry — the un-guarded version of
-   * this method previously did exactly that (foreman review, PR #72
+   * this method previously did exactly that (code review, PR #72
    * fixes round).
    */
   markSettled(sessionId: string): void {
@@ -299,7 +299,7 @@ export class PublicSessionSweeper {
    * Candidates are processed SEQUENTIALLY, with a recheck (still idle
    * beyond TTL AND still no in-flight request) evaluated fresh
    * immediately before each individual `reapSession` call — not just
-   * once at snapshot time (foreman review, PR #72 fixes round). The
+   * once at snapshot time (code review, PR #72 fixes round). The
    * initial scan below is a snapshot; a real request can land on any
    * not-yet-reaped candidate while an EARLIER candidate's reap is
    * awaiting real I/O (transport close, backend pool teardown), and

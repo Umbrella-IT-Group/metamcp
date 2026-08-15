@@ -6,8 +6,8 @@
  * tool result (and, when the consumer supports SEP-1036, a URL-mode
  * elicitation carrying the enrollment link) instead of an opaque 500.
  *
- * Design doc: Umbrella-MCP-Server `docs/M365_DELEGATED_MCP_DESIGN.md`
- * §4.3 (enrollment + re-auth, lazy + elicitation-driven) and §5.5.
+ * Design doc: internal M365 delegated-MCP design, §4.3 (enrollment +
+ * re-auth, lazy + elicitation-driven) and §5.5.
  */
 
 export type M365BrokerErrorCode =

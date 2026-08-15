@@ -116,7 +116,7 @@ beforeEach(() => {
   entraExchange = vi.fn();
 });
 
-function signInAs(userId: string, email = "alex@umbrellaitgroup.com") {
+function signInAs(userId: string, email = "admin@example.com") {
   getSessionMock.mockResolvedValue({ user: { id: userId, email } });
 }
 function signedOut() {
@@ -139,7 +139,7 @@ function goodExchangeBody(overrides: Record<string, unknown> = {}) {
     JSON.stringify({
       oid: "oid-abc",
       tid: "tid-1",
-      preferred_username: "alex@umbrellaitgroup.com",
+      preferred_username: "admin@example.com",
     }),
   ).toString("base64url");
   return {

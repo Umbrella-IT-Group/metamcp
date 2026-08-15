@@ -9,9 +9,9 @@
  * `100`/`5` and bypass the constructor's env-parse defaults entirely since
  * commit 806c2b2. THIS file exercises `getInstance()` itself, the actual
  * prod path, proving the two real outages it traces to are fixed:
- *   - 2026-07-14 MAX_TOTAL_CONNECTIONS=400 cap raise (Umbrella-MCP-Server
- *     PR #406) — never took effect; pool silently kept enforcing 100.
- *   - 2026-05-08 MAX_CONNECTIONS_PER_SERVER=50 — never took effect; pool
+ *   - a MAX_TOTAL_CONNECTIONS=400 cap raise — never took effect; pool
+ *     silently kept enforcing 100.
+ *   - a MAX_CONNECTIONS_PER_SERVER=50 raise — never took effect; pool
  *     silently kept enforcing 5.
  *
  * `getInstance()` is a singleton, so honoring env across independent test

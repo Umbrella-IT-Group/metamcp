@@ -215,18 +215,17 @@ export class McpServerPool {
   /**
    * Get the singleton instance.
    *
-   * FIX (2026-07-14 audit finding, confirmed independently): this used to
+   * FIX (audit finding, confirmed independently): this used to
    * hardcode `100` for maxTotalConnections and default
    * maxConnectionsPerServer to a literal `5`, both supplied unconditionally
    * — so the constructor's own MAX_TOTAL_CONNECTIONS /
    * MAX_CONNECTIONS_PER_SERVER env-parse defaults, just above, were dead
    * code since this method's introduction (commit 806c2b2): every value
    * getting an explicit argument, even the caller's default, means
-   * `parseInt(...) || "100"` never runs. Two real outages trace to this:
-   * the 2026-07-14
-   * MAX_TOTAL_CONNECTIONS=400 cap raise (Umbrella-MCP-Server PR #406) never
-   * took effect — the pool silently kept enforcing 100 — and the 2026-05-08
-   * MAX_CONNECTIONS_PER_SERVER=50 change likewise never took effect (pool
+   * `parseInt(...) || "100"` never runs. Two real outages trace to this: a
+   * MAX_TOTAL_CONNECTIONS=400 cap raise never took effect — the pool
+   * silently kept enforcing 100 — and a MAX_CONNECTIONS_PER_SERVER=50
+   * change likewise never took effect (pool
    * enforced 5). All three params are now optional with NO default here, so
    * an omitted/undefined argument falls through to the constructor's own
    * default expression instead of this method silently overriding it.
@@ -923,8 +922,8 @@ export class McpServerPool {
    * `canCreateConnection` refused EVERY new connection, including the
    * recreation a backend needs after its container restarts (Watchtower).
    * The pool then deadlocked until a manual `docker restart metamcp`
-   * (observed 2026-05-27: autotask wedged on "connection limit reached"
-   * for 8+ minutes after a redeploy).
+   * (observed against a live deployment: a backend stayed wedged on
+   * "connection limit reached" for minutes after a redeploy).
    *
    * Eviction reclaims capacity by DESTROYING (not recycling) the
    * least-valuable slot: an idle session first (no upstream client depends
@@ -1174,7 +1173,7 @@ export class McpServerPool {
     // hand back one of those stale clients to satisfy the recovery
     // request — and the retry would immediately fail with the same
     // "Not connected" envelope that triggered the recovery to begin
-    // with. Production observation 2026-05-14T17:29Z (Captain): detector
+    // with. Production observation: the detector
     // fired correctly, recovery attempted re-init, recovery's retry call
     // ALSO got "Not connected", forcing a manual `docker restart metamcp`.
     //
@@ -1508,8 +1507,8 @@ export class McpServerPool {
     // UI delete, CI-sync prune, direct DB) leaves its serverParamsCache entry
     // behind; the ERROR-gated recreation loop below then reconnects to a
     // backend that no longer exists — a zombie reconnect every sweep, forever
-    // (observed 2026-06-29: the renamed `endpoints` server logged 297 failed
-    // reconnects in 40 min, flooding the Live Logs view). The registry is the
+    // (observed in production: a renamed server logged hundreds of failed
+    // reconnects inside an hour, flooding the Live Logs view). The registry is the
     // source of truth; any pooled uuid absent from it is dead. One indexed
     // findAll() per 60s sweep. Guarded so a unit-test repo mock (no findAll)
     // or a transient DB blip can't take the health sweep down.

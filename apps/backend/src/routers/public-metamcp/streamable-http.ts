@@ -525,7 +525,7 @@ export async function recoverPersistedSession(
  * its MetaMCP/backend pool connections. `deleteRow` controls whether the
  * persisted `mcp_sessions` row is ALSO dropped — this is the one axis on
  * which the two public wrappers below (`cleanupSession`, `reapIdleSession`)
- * differ, and the distinction is load-bearing (foreman review, PR #72
+ * differ, and the distinction is load-bearing (code review, PR #72
  * fixes round):
  *
  *   - `deleteRow: true` (client DELETE, the age-based `sessionLifetime`

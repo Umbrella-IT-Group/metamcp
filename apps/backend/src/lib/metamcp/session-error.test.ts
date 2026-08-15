@@ -122,7 +122,7 @@ describe("isBackendTransportLostError", () => {
   });
 
   it("matches the consumer-side -32603 envelope MetaMCP returns to Claude.ai / n8n", () => {
-    // Production observation 2026-05-14: consumer-side connectors see
+    // Production observation: consumer-side connectors see
     // the tRPC bridge's wrapped envelope rather than the raw SDK Error.
     const envelope = {
       jsonrpc: "2.0",
@@ -205,7 +205,7 @@ describe("isRecoverableBackendError", () => {
     expect(isRecoverableBackendError(new Error("Not connected"))).toBe(true);
   });
 
-  it("fires on the consumer-side -32603 envelope (2026-05-14 production case)", () => {
+  it("fires on the consumer-side -32603 envelope (production case)", () => {
     const envelope = {
       jsonrpc: "2.0",
       id: "server-error",

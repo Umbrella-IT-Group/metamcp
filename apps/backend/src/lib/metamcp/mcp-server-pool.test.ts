@@ -1,8 +1,8 @@
 /**
  * Unit tests for `McpServerPool.invalidateServerConnection`.
  *
- * The unit-under-test is the invalidation cascade introduced after the
- * 2026-05-14T17:29Z production case where PR #13's recovery path
+ * The unit-under-test is the invalidation cascade introduced after a
+ * production case where PR #13's recovery path
  * engaged correctly (detector fired, `invalidateServerConnection`
  * logged), but the recovery's retry call ALSO got `Not connected`
  * because the cap-reuse branch in `getSession` handed back a stale
@@ -112,7 +112,7 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
   });
 
   it("cascades to every other session's slot for the same serverUuid", async () => {
-    // Pre-2026-05-14 bug: only session-A's slot got invalidated; sessions
+    // The original bug: only session-A's slot got invalidated; sessions
     // B + C kept their stale clients, and the next getSession() hit the
     // cap-reuse branch which handed one back to the recovery path.
     const clientA = makeFakeClient();
@@ -416,7 +416,8 @@ describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
 // grows until the cap is hit — then EVERY new connection is refused,
 // including the recreation a backend needs after a Watchtower restart.
 // The pool deadlocked on "connection limit reached" until a manual
-// `docker restart metamcp` (observed 2026-05-27, autotask wedged 8+min).
+// `docker restart metamcp` (observed against a live deployment: a
+// backend stayed wedged for minutes after a redeploy).
 //
 // evictOneForCapacity reclaims one slot by DESTROYING (not recycling)
 // the least-valuable connection: idle first, then oldest active.

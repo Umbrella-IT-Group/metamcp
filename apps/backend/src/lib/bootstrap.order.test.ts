@@ -212,7 +212,7 @@ function arrangeRecreateScenario(options?: { apiKeysEnv?: string }) {
   // the identity-binding scenarios override this fixture.
   readFixtures.preservedKeyRows = [
     {
-      name: "tara-scoped",
+      name: "consumer-scoped",
       key: "sk_mt_preserved_secret",
       is_active: true,
       user_id: "old-user-id",
@@ -265,7 +265,7 @@ describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residua
     // the restored key carries the fresh uuid re-resolved by NAME — never
     // the stale preserved uuid.
     expect(apiKeyInserts[0].values).toMatchObject({
-      name: "tara-scoped",
+      name: "consumer-scoped",
       key: "sk_mt_preserved_secret",
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
@@ -282,13 +282,13 @@ describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residua
 describe("bootstrapApiKeys log truth — pending restore for the same (user_id, name)", () => {
   it("amends the 'Created ... API key' line instead of presenting the doomed fresh value as live", async () => {
     // The config declares a key with the SAME name as the preserved key
-    // ("tara-scoped", owned by the recreated user): bootstrapApiKeys mints
+    // ("consumer-scoped", owned by the recreated user): bootstrapApiKeys mints
     // it fresh, then the deferred restore's onConflictDoUpdate overwrites
     // it. The minted value never survives startup, so the log must not
     // present its mask as the live credential.
     arrangeRecreateScenario({
       apiKeysEnv: JSON.stringify([
-        { name: "tara-scoped", user_email: "admin@example.com" },
+        { name: "consumer-scoped", user_email: "admin@example.com" },
       ]),
     });
     // bootstrapApiKeys' existence probe: the key is gone (the recreate
@@ -301,7 +301,7 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
       console.log as unknown as ReturnType<typeof vi.fn>
     ).mock.calls.map((call) => String(call[0]));
     const createdLine = logCalls.find((line) =>
-      line.includes('Created private API key "tara-scoped"'),
+      line.includes('Created private API key "consumer-scoped"'),
     );
     expect(createdLine).toBeDefined();
     // Amended: names the pending restore, and does NOT log a masked value
@@ -366,7 +366,7 @@ describe("ensureUser early-return credential loss — preserved keys warned loud
     expect(lossLine).toBeDefined();
     expect(lossLine).toContain("1 preserved API key(s)");
     expect(lossLine).toContain("admin@example.com");
-    expect(lossLine).toContain("tara-scoped"); // names…
+    expect(lossLine).toContain("consumer-scoped"); // names…
     expect(lossLine).not.toContain("sk_mt_preserved_secret"); // …never values
 
     // And the restore really never ran — no api_keys insert at all.
@@ -389,7 +389,7 @@ describe("ensureUser early-return credential loss — preserved keys warned loud
       line.includes("CANNOT be restored"),
     );
     expect(lossLine).toBeDefined();
-    expect(lossLine).toContain("tara-scoped");
+    expect(lossLine).toContain("consumer-scoped");
     expect(lossLine).not.toContain("sk_mt_preserved_secret");
   });
 
@@ -486,7 +486,7 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     // destroyed — and never restored (it violates the ownership invariant).
     readFixtures.preservedKeyRows = [
       {
-        name: "tara-scoped",
+        name: "consumer-scoped",
         key: "sk_mt_preserved_secret",
         is_active: true,
         user_id: "old-user-id",
@@ -523,6 +523,6 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
       (s) => s.op === "insert" && s.table === apiKeysTable,
     );
     expect(apiKeyInserts).toHaveLength(1);
-    expect(apiKeyInserts[0].values).toMatchObject({ name: "tara-scoped" });
+    expect(apiKeyInserts[0].values).toMatchObject({ name: "consumer-scoped" });
   });
 });

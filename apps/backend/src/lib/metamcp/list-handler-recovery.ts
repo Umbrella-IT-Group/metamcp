@@ -54,7 +54,7 @@ export interface RequestWithSessionRecoveryOptions<T> {
  * resources/list, resources/templates/list).
  *
  * `tools/call` and the dynamic-find path in `metamcp-proxy.ts` have had
- * this cascade since PR #13/#16; the OpenAPI bridge since the 2026-05-14
+ * this cascade since PR #13/#16; the OpenAPI bridge since its own
  * regression fix. The aggregate list handlers were the remaining gap:
  * their catch blocks logged-and-continued, so a dead pooled session
  * (e.g. after a Watchtower swap of the backend container) made the

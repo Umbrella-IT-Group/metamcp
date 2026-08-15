@@ -65,8 +65,8 @@ export const CONSENT_CSRF_COOKIE = "oauth_consent_csrf";
  * The `__Host-` prefix is a browser-enforced contract: the cookie is accepted
  * only with Secure and Path=/ and NO Domain attribute, which locks it to this
  * exact host. That matters because a sibling subdomain — anything else under
- * umbrellaitgroup.com — can otherwise set a cookie that is sent to this host
- * too. It could not forge a valid nonce, but it could plant a same-named one
+ * the gateway's parent domain — can otherwise set a cookie that is sent to
+ * this host too. It could not forge a valid nonce, but it could plant one
  * and jam consent for every user indefinitely. A `__Host-` cookie cannot be
  * planted by a sibling at all. The prefix requires Secure, so plain-http local
  * stacks keep the unprefixed name.
