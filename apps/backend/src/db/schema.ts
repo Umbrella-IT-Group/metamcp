@@ -169,7 +169,7 @@ export const usersTable = pgTable("users", {
   // unauthenticated rather than waiting out the 30-day expiry. Both halves
   // are required — either alone leaves a real path in.
   //
-  // The incident-response middle tier: revoking access lets the account sign
+  // The containment middle tier: revoking access lets the account sign
   // straight back in, and deleting it destroys the evidence AND cascades into
   // other users' endpoints and API keys. Disabling locks the account while
   // preserving it whole.

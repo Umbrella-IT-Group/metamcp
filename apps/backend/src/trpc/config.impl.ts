@@ -28,12 +28,12 @@ async function previousValue<T>(read: () => Promise<T>): Promise<T | null> {
  * setter here was completely silent: an administrator (or anyone holding an
  * admin session) could re-open self-registration, turn basic auth back on, or
  * stretch the session lifetime, and the only evidence afterwards was the
- * config row's `updated_at`. That is the 2026-08-13 incident's front door, so
+ * config row's `updated_at`. That is the abuse's front door, so
  * the five AUTH-POSTURE writes — signup, SSO signup, basic auth, session
  * lifetime, and the generic `setConfig` escape hatch that can reach all of
  * them — emit an attributed `config.*.set` row carrying old AND new value.
  * The new value alone does not answer "did this change anything?", which is
- * the first question asked of a toggle during an incident.
+ * the first question asked of a toggle during an investigation.
  *
  * The four MCP tuning setters (`setMcpResetTimeoutOnProgress`,
  * `setMcpTimeout`, `setMcpMaxTotalTimeout`, `setMcpMaxAttempts`) deliberately

@@ -78,7 +78,7 @@ async function resolveActsAsLabel(actsAsUserId: string): Promise<string> {
     return label;
   } catch {
     // Keep serving the last-known label if we have one (stale beats a
-    // shape change mid-incident); otherwise the short-id fallback. Never
+    // shape change mid-investigation); otherwise the short-id fallback. Never
     // fail identity resolution over a label lookup.
     return cached?.label ?? `user ${short(actsAsUserId)}`;
   }

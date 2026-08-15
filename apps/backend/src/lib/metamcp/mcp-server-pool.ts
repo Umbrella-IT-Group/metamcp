@@ -222,7 +222,7 @@ export class McpServerPool {
    * MAX_CONNECTIONS_PER_SERVER env-parse defaults, just above, were dead
    * code since this method's introduction (commit 806c2b2): every value
    * getting an explicit argument, even the caller's default, means
-   * `parseInt(...) || "100"` never runs. Two real incidents trace to this:
+   * `parseInt(...) || "100"` never runs. Two real outages trace to this:
    * the 2026-07-14
    * MAX_TOTAL_CONNECTIONS=400 cap raise (Umbrella-MCP-Server PR #406) never
    * took effect — the pool silently kept enforcing 100 — and the 2026-05-08
@@ -1598,7 +1598,7 @@ export class McpServerPool {
           // every connectMetaMcpClient attempt and nothing on the
           // request path resets it while other servers keep the pool
           // non-empty — observed as the unkillable
-          // `No session for: autotask` loop (incident 2026-06-11).
+          // `No session for: autotask` loop (the zero-tool outage).
           // Instead of staying open forever, let one reconnect attempt
           // through per probe interval: reset the gate and warm an
           // idle session. If the backend is genuinely back this heals
@@ -1625,8 +1625,7 @@ export class McpServerPool {
     // the onclose/onerror drop detectors from PR #20. At the per-server
     // cap every slot is active: the idle loop above sees nothing, the
     // cap can block idle recreation, and getSession's cap-reuse branch
-    // hands the zombies out blind — indefinitely (incident 2026-06-11,
-    // Umbrella-MCP-Server#229).
+    // hands the zombies out blind — indefinitely (the zero-tool outage).
     if (this.activeHealthCheckEnabled) {
       await this.checkActiveSessionHealth();
     }

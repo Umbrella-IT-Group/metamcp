@@ -69,7 +69,7 @@ const messageColor = (level: string) =>
 
 // Read-only view. The "Clear logs" button and its confirm dialog were removed
 // with migration 0028's audit_log: they were the one admin gesture that
-// erased the live security view mid-incident. See
+// erased the live security view mid-investigation. See
 // packages/trpc/src/routers/frontend/logs.ts — the procedure behind them no
 // longer exists.
 export default function LiveLogsPage() {

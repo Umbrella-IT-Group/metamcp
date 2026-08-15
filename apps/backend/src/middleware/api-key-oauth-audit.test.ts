@@ -1,7 +1,7 @@
 /**
  * The stolen-key detector: audit emission on the MCP bearer path.
  *
- * During the 2026-08-13 incident this middleware — the layer every API key and
+ * Under credential-theft abuse this middleware — the layer every API key and
  * every OAuth bearer token passes through — wrote NOTHING when it refused a
  * credential. Not a log line, not a counter. A stolen key being tried against
  * endpoint after endpoint looked exactly like no traffic at all. These tests

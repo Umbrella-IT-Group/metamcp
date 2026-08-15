@@ -167,7 +167,7 @@ export class MetaMcpServerPool {
     // assignment silently orphaned the first instance — leaking its
     // backend ConnectedClients under a temp `idle_<ns>_<ts>` sessionId
     // forever (persistent sessions never expire), ratcheting the
-    // backend pool toward cap exhaustion: the incident-#229 end state
+    // backend pool toward cap exhaustion: the end state reached
     // via the admin-edit route.
     if (
       this.idleServers[namespaceUuid] ||

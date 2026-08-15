@@ -23,9 +23,9 @@ export const createLogsRouter = (
     // READ IS THE ENTIRE SURFACE. There was a `clear` mutation here; it was
     // removed with migration 0028's audit_log. It only emptied the in-memory
     // ring buffer, but it was the one admin gesture that erased the live
-    // security view mid-incident, and no system whose promise is an immutable
-    // record should offer one. Do not add it back — `admin-gate-sweep.test.ts`
-    // asserts the procedure does not exist.
+    // security view mid-investigation, and no system whose promise is an
+    // immutable record should offer one. Do not add it back —
+    // `admin-gate-sweep.test.ts` asserts the procedure does not exist.
     get: adminProcedure
       .input(GetLogsRequestSchema)
       .output(GetLogsResponseSchema)

@@ -149,8 +149,8 @@ const sessionManager =
 // request IDLE time, not session CREATION age. The age-based timer keys off
 // `configService.getSessionLifetime()`, which is null in prod (persistent
 // sessions never expire) so it never fires — that is exactly why public
-// sessions accumulated to backend-pool exhaustion (2026-07-14 incident,
-// METAMCP-POOL-1). The sweeper reuses `reapIdleSession` (defined below) — a
+// sessions accumulated to backend-pool exhaustion (the 2026-07-14 pool-cap
+// outage). The sweeper reuses `reapIdleSession` (defined below) — a
 // ROW-PRESERVING cleanup variant, NOT the same variant a client DELETE uses
 // (`cleanupSession`, which also drops the `mcp_sessions` row). See
 // `reapIdleSession`'s own doc comment for why that distinction is load-
@@ -345,7 +345,7 @@ export async function recoverPersistedSession(
     // DB error during recovery is a hard miss — fall through to the
     // existing 404 path. Logged so post-mortem can correlate with
     // postgres availability events; this is operational noise, not
-    // a security incident.
+    // a security event.
     logger.error(
       `mcp_sessions lookup failed for session ${sessionId}; treating as not-found.`,
       error,
@@ -725,7 +725,7 @@ startMcpSessionPruner();
  * the running reap counters — i.e. precisely how long an abandoned session
  * survives, how often the gateway looks, and how many it is carrying right
  * now. Together those size a resource-exhaustion attempt against the backend
- * pool cap (the failure mode of the 2026-07-14 METAMCP-POOL-1 incident) and
+ * pool cap (the failure mode of the 2026-07-14 pool-cap outage) and
  * time it to land between sweeps. Served to anyone who could reach the host,
  * it was reconnaissance.
  *

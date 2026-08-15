@@ -51,7 +51,7 @@ mcpProxyRouter.use((req, res, next) => {
 // load-bearing: betterAuthMcpMiddleware populates `req.user` from the session
 // cookie, requireEnabledMcpMiddleware then re-reads `users.disabled` for that
 // id, and requireAdminMcpMiddleware reads `req.user.role`. The admin
-// restriction is not incidental hardening — the STDIO branch of
+// restriction is not accidental hardening — the STDIO branch of
 // /server/{stdio,sse,mcp} spawns a process with the backend's environment, so
 // session-only access was remote code execution for any member back when the
 // command came off the query string. It now comes from the `mcp_servers` row

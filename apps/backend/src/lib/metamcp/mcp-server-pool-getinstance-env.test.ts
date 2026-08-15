@@ -8,7 +8,7 @@
  * through `getInstance()` — confirmed by independent audit to hardcode
  * `100`/`5` and bypass the constructor's env-parse defaults entirely since
  * commit 806c2b2. THIS file exercises `getInstance()` itself, the actual
- * prod path, proving the two real incidents it traces to are fixed:
+ * prod path, proving the two real outages it traces to are fixed:
  *   - 2026-07-14 MAX_TOTAL_CONNECTIONS=400 cap raise (Umbrella-MCP-Server
  *     PR #406) — never took effect; pool silently kept enforcing 100.
  *   - 2026-05-08 MAX_CONNECTIONS_PER_SERVER=50 — never took effect; pool
@@ -84,7 +84,7 @@ describe("McpServerPool.getInstance — honors MAX_TOTAL_CONNECTIONS / MAX_CONNE
     }
   });
 
-  it("THE incident regression: getInstance() reflects env when called with no arguments (the real prod call shape)", () => {
+  it("THE regression: getInstance() reflects env when called with no arguments (the real prod call shape)", () => {
     process.env.MAX_TOTAL_CONNECTIONS = "400";
     process.env.MAX_CONNECTIONS_PER_SERVER = "50";
 

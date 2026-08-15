@@ -141,7 +141,7 @@ describe("buildClientRegistration — OAuth 2.1 defaults", () => {
   it("passes explicit values through", () => {
     const result = buildClientRegistration({
       // An allowlisted host: this test is about metadata pass-through, and
-      // since FIND-023 an arbitrary vendor host would fail before any of the
+      // since the host allowlist an arbitrary vendor host would fail before any of the
       // fields below were reached.
       redirect_uris: [CLAUDE_AI_CALLBACK],
       client_name: "My App",

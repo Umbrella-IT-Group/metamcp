@@ -315,7 +315,7 @@ describe("/mcp-proxy — the gate is fail-closed", () => {
 describe("/mcp-proxy — the disabled-account gate", () => {
   it("refuses a DISABLED ADMIN on the STDIO spawn route", async () => {
     // The whole point of the gate: role alone said yes. Disable is the
-    // incident-response button, and until this check it did not reach the one
+    // containment button, and until this check it did not reach the one
     // route on this gateway that runs commands.
     signInAs("admin");
     h.isDisabled.mockResolvedValue(true);

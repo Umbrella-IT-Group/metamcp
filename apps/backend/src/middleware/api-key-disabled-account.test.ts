@@ -1,7 +1,7 @@
 /**
  * `users.disabled` enforcement on the DATA plane — authenticateApiKey.
  *
- * This is the plane the 2026-08-13 incident actually ran on. Wave 2 first
+ * This is the plane the credential-theft abuse actually ran on. Wave 2 first
  * shipped disable at the login and OAuth-authorize planes only, which locked
  * the doors an attacker holding a live bearer token or API key never uses:
  * OAuth access tokens live 24h here, refresh tokens 365d, and API keys never

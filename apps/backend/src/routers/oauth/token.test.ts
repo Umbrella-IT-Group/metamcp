@@ -320,7 +320,7 @@ describe("POST /oauth/token — refresh_token success logging", () => {
  * minted before the lock is good for 365 days here, and an authorization code
  * minted in the seconds before the lock stays redeemable for its full 10-minute
  * TTL. Either one hands a locked-out account a fresh 24h access token, which is
- * exactly the credential chain the 2026-08-13 incident turned on.
+ * exactly the credential chain credential-theft abuse turns on.
  *
  * Each test asserts three things together, because any one alone can pass while
  * the guard is useless: the grant is REFUSED, no token was minted

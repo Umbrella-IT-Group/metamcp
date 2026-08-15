@@ -637,7 +637,7 @@ describeIfDb("revokeAccess against real postgres", () => {
       .where(eq(schema.m365UserTokensTable.user_id, MEMBER_ID));
     expect(m365?.status).toBe("reauth_required");
 
-    // The account itself survives — it is the incident evidence.
+    // The account itself survives — it is the forensic evidence.
     const [user] = await db
       .select({ id: schema.usersTable.id })
       .from(schema.usersTable)

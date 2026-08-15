@@ -247,7 +247,7 @@ function extractAuthToken(
  * Record a refused MCP bearer attempt to the durable audit log.
  *
  * THIS IS THE STOLEN-KEY DETECTOR, and its absence is the single largest
- * forensic gap the 2026-08-13 incident exposed. This middleware is the layer
+ * forensic gap a security review exposed. This middleware is the layer
  * every machine-plane caller passes through — API keys and OAuth bearer
  * tokens, i.e. the credential class the attacker actually held — and until
  * now it wrote NOTHING on refusal. Not a log line, not a counter. A stolen
@@ -267,7 +267,7 @@ function extractAuthToken(
  * first request (that 401 IS the OAuth discovery handshake). They carry
  * `reason: "no_credential"` so a query can exclude them in one predicate.
  * Dropping them at the source instead would also drop unauthenticated
- * endpoint scanning, which is exactly the recon phase this incident began
+ * endpoint scanning, which is exactly the recon phase such an attack begins
  * with. Volume management belongs in Phase 2 retention, not in deciding not
  * to see it.
  *

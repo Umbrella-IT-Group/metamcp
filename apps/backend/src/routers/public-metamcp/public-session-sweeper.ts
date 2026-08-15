@@ -4,7 +4,7 @@ import logger from "@/utils/logger";
  * Idle-TTL sweeper for public-endpoint (API-key / OAuth) StreamableHTTP
  * sessions.
  *
- * WHY THIS EXISTS (2026-07-14 pool-cap incident, METAMCP-POOL-1):
+ * WHY THIS EXISTS (the 2026-07-14 pool-cap outage):
  * A public endpoint session is created per API-key request stream and is
  * only torn down when the client sends an explicit `DELETE`. Most clients
  * never send it, so sessions accumulate indefinitely (prod: 241 → 1363

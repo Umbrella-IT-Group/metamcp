@@ -46,7 +46,7 @@
   "disableUser": "Disable account",
   "enableUser": "Enable account",
   "disableConfirmTitle": "Disable {{email}}?",
-  "disableConfirmDescription": "Blocks every gateway path in, starting with this account's next request: sign-in, OAuth authorization, existing OAuth and bearer tokens, API keys — including admin keys acting as this account — the admin console, and the MCP proxy. Nothing is deleted and nothing is invalidated: the account, its history, its owned resources and its credentials are all preserved for the incident record, Enable restores access at any time, and Revoke is what tears down the sessions, tokens and keys permanently.",
+  "disableConfirmDescription": "Blocks every gateway path in, starting with this account's next request: sign-in, OAuth authorization, existing OAuth and bearer tokens, API keys — including admin keys acting as this account — the admin console, and the MCP proxy. Nothing is deleted and nothing is invalidated: the account, its history, its owned resources and its credentials are all preserved for the audit record, Enable restores access at any time, and Revoke is what tears down the sessions, tokens and keys permanently.",
   "disableConfirmAction": "Disable account",
   "disabling": "Disabling...",
   "enableConfirmTitle": "Enable {{email}}?",

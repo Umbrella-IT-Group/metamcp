@@ -1,14 +1,13 @@
 /**
- * Tests for the registration-time redirect_uri gate — FIND-023 (HIGH,
- * a security review).
+ * Tests for the registration-time redirect_uri gate — a HIGH-severity
+ * security review finding: redirect_uri was validated by scheme only.
  *
- * The security review re-run registered all of the URIs in REJECTED_URI_CASES below
- * against the live gateway and got a 201 for every one of them; only
- * `javascript:` and `data:` were refused. Because `POST /oauth/register` takes
- * no credential, each of those 201s is a client a signed-in human can be
- * phished into approving on the consent screen, with the authorization code
- * landing on the attacker's host. So every case here is a URI that WAS
- * accepted in production and must not be again.
+ * The review registered all of the URIs in REJECTED_URI_CASES below and got a
+ * 201 for every one of them; only `javascript:` and `data:` were refused.
+ * Because `POST /oauth/register` takes no credential, each of those 201s is a
+ * client a signed-in human can be phished into approving on the consent
+ * screen, with the authorization code landing on the attacker's host. So
+ * every case here is a URI that WAS accepted and must not be again.
  *
  * The other half matters just as much and is asserted just as explicitly: the
  * allowlist is default-on, so LEGIT_CASES pins the shapes the 65 already-
@@ -36,7 +35,7 @@ import {
 } from "./utils";
 
 /**
- * Every URI the 2026-08-14 security review run got a 201 for, paired with the rule
+ * Every URI the security review got a 201 for, paired with the rule
  * that now refuses it. Pinning the REASON and not just the boolean is what
  * stops a future edit from passing this suite for the wrong reason (e.g. a
  * scheme bug that happens to reject the userinfo case).
@@ -126,7 +125,7 @@ describe("isAllowedRedirectUri — the security review cases", () => {
   });
 
   it("rejects userinfo even when the host itself IS allowlisted", () => {
-    // The mirror of the FIND-023 trick: here the readable part is the evil
+    // The mirror of the lookalike-host trick: here the readable part is the evil
     // host and the real one is ours. Still refused — a URI whose authority a
     // human and a parser disagree about has no business in a client record.
     const result = isAllowedRedirectUri("https://evil.com@claude.ai/callback");
@@ -284,7 +283,7 @@ describe("resolveDcrAllowedHosts — operator override", () => {
   });
 });
 
-describe("buildClientRegistration — FIND-023 at the registration surface", () => {
+describe("buildClientRegistration — the redirect_uri gate at the registration surface", () => {
   it("refuses every security review URI with the RFC 7591 error contract intact", () => {
     for (const [uri] of REJECTED_URI_CASES) {
       const result = buildClientRegistration({ redirect_uris: [uri] });
@@ -302,7 +301,7 @@ describe("buildClientRegistration — FIND-023 at the registration surface", () 
   });
 
   it("still registers every client shape that exists today", () => {
-    // The load-bearing half of FIND-023: locking DCR to Claude + loopback
+    // The load-bearing half of the fix: locking DCR to Claude + loopback
     // must not take the live connectors down.
     const result = buildClientRegistration({
       redirect_uris: [...LEGIT_CASES],

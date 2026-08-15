@@ -1,5 +1,5 @@
 /**
- * FIND-007: tRPC error responses disclosed internal stack traces.
+ * Stack-trace disclosure: tRPC error responses leaked internal stack traces.
  *
  * `@trpc/server` attaches `data.stack` to every error shape whenever its
  * `isDev` flag is on, and `isDev` defaults to

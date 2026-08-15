@@ -1,6 +1,6 @@
 /**
- * FIND-004 / #98: the server serializers returned every backend MCP's
- * connection URL and credential material to any authenticated member.
+ * Credential disclosure (#98): the server serializers returned every backend
+ * MCP's connection URL and credential material to any authenticated member.
  *
  * `mcpServers.list`, `mcpServers.get` and `namespaces.get` are all
  * `protectedProcedure` — members legitimately see the server inventory in
@@ -21,7 +21,7 @@ import { describe, expect, it } from "vitest";
 import { McpServersSerializer } from "./mcp-servers.serializer";
 import { NamespacesSerializer } from "./namespaces.serializer";
 
-// Shaped like a real row: the internal Docker URL is the FIND-004 leak, the
+// Shaped like a real row: the internal Docker URL is the connection-URL leak, the
 // bearer token / env / headers are #98.
 const SECRET_URL = "http://mcp-autotask:3000";
 const SECRET_TOKEN = "sk_live_do_not_disclose";

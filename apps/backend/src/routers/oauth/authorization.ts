@@ -118,7 +118,7 @@ function clearConsentCookie(
  * POST /oauth/authorize/decision is the ONLY place this server mints an
  * authorization code, so it is the only place a human grants a client access
  * to their account here — which makes it the single highest-value row in the
- * OAuth half of the taxonomy. The 2026-08-13 incident turned on exactly this
+ * OAuth half of the taxonomy. Credential-theft abuse turns on exactly this
  * chain (code -> 24h access token -> 365d refresh token) at a time when there
  * was no consent screen at all and nothing anywhere recorded that a grant had
  * happened.

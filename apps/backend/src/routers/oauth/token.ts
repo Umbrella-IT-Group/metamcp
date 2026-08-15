@@ -371,7 +371,7 @@ async function handleAuthorizationCodeGrant(
   // in the seconds before the admin pressed disable stays redeemable for its
   // full 10-minute TTL — and one redemption here buys a 24h access token plus
   // a 365d refresh token. Guarding only the mint would leave that ten-minute
-  // window open on the exact credential chain the incident turned on.
+  // window open on the exact credential chain the abuse turns on.
   //
   // Placed before the single-use delete below for the same reason as the
   // refresh path: a refused grant leaves no wreckage, so re-enabling the

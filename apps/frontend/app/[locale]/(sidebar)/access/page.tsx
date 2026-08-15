@@ -45,7 +45,7 @@ import { trpc } from "@/lib/trpc";
  * The Access dashboard — one admin surface listing EVERY way into this
  * gateway.
  *
- * Built after the 2026-08-13 incident, where an attacker's self-registered
+ * Built after self-registration abuse, where an attacker's self-registered
  * member accounts went unnoticed because MetaMCP has no users page at all:
  * API keys, OAuth clients and endpoints each had an admin view, but the
  * accounts those grants belong to were visible only in psql. An access path
@@ -158,7 +158,7 @@ export default function AccessPage() {
   // Revoking, disabling or deleting a user changes the token list, the key
   // list and the user list at once, so all three are invalidated — showing a
   // stale "1 active session" next to an account that was just cut off is
-  // exactly the wrong answer during an incident.
+  // exactly the wrong answer during a live response.
   const invalidateAccessViews = () => {
     utils.frontend.users.list.invalidate();
     utils.frontend.oauthTokens.list.invalidate();
@@ -430,7 +430,7 @@ export default function AccessPage() {
               </Table>
             </div>
             {/* The cap is stated, never silent: an account missing from this
-                screen is the incident repeating itself. */}
+                screen is the failure repeating itself. */}
             {!usersQuery.isError && users.length > 0 && (
               <p className="text-xs text-muted-foreground">
                 {t("access:showingCount", {

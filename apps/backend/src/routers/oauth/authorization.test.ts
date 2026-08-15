@@ -1161,8 +1161,8 @@ describe("GET /oauth/consent/info", () => {
  * The guards these tests pin used to sit on two different handlers — the old
  * authorize fast path and the old /oauth/callback mint — and the consent fix
  * deleted both. Re-homing them is not a refactor: an account disabled during
- * an incident that could still complete an authorization would walk away with
- * a fresh 30-day MCP access token, which is precisely the credential the
+ * a live response that could still complete an authorization would walk away
+ * with a fresh 30-day MCP access token, which is precisely the credential the
  * disable was pressed to take away.
  *
  * Both sites are covered because they fail differently. The GET is the door a

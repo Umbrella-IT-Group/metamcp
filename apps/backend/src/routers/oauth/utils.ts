@@ -66,10 +66,10 @@ export function generateSecureClientSecret(): string {
  * only checker `buildClientRegistration` calls. This one is deliberately left
  * in place for `/oauth/authorize`: the stricter rules would also apply to the
  * redirect_uris of clients that are ALREADY stored, and re-validating those
- * rows mid-incident is a separate, evidence-gated decision (see the
+ * rows mid-investigation is a separate, evidence-gated decision (see the
  * "belt-and-suspenders" note on `isAllowedRedirectUri`). Registration-time
  * enforcement plus removal of the security review test clients is what closes
- * FIND-023; adopting the strict checker here too is the planned follow-up.
+ * the gap; adopting the strict checker here too is the planned follow-up.
  */
 export function validateRedirectUri(
   uri: string,
@@ -138,7 +138,7 @@ export const GATEWAY_INTERNAL_PORT = 12009;
  * 2026-08-14, every legitimate redirect_uri was loopback or one of these, and
  * every other host (evil.com, `your-gateway.example.com.evil.com`,
  * `…@evil.com`) was a security review probe. An allowlist is therefore the cheapest
- * complete fix for FIND-023: DCR is anonymous, so anything short of "the
+ * complete fix: DCR is anonymous, so anything short of "the
  * server decides which hosts are acceptable" leaves an attacker free to
  * register a client whose consent screen shows a plausible name and whose code
  * lands on their own host.
@@ -215,7 +215,8 @@ export function resolveDcrAllowedHosts(): string[] {
 }
 
 /**
- * The registration-time redirect_uri gate — FIND-023 (HIGH, a security review).
+ * The registration-time redirect_uri gate — a HIGH-severity security review
+ * finding: redirect_uri was validated by scheme only.
  *
  * `POST /oauth/register` takes no credential, so whatever passes this function
  * is a host a signed-in human can later be asked to approve on the consent

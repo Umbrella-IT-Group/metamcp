@@ -27,7 +27,7 @@ export class ApiKeysSerializer {
   // key). Drops the full `key` secret for all of them and emits only the
   // non-reversible prefix, same as the admin view below.
   //
-  // Pentest finding 2026-08-13: this used to return `key` raw. Any
+  // Security review finding: this used to return `key` raw. Any
   // self-registered member could read every public key — gateway-wide
   // production credentials — in plaintext; three live keys were recovered
   // that way. The reachability is what makes it critical: `list` is a plain

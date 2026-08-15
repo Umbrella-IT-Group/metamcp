@@ -515,7 +515,7 @@ describe("McpServerPool.checkActiveSessionHealth — zombie active-connection sw
   // silently (no socket, no onclose/onerror). At the per-server cap every
   // slot is active, so the idle health check sees nothing and the
   // cap-reuse branch in getSession serves the zombies forever
-  // (incident 2026-06-11). The sweep pings distinct active clients and
+  // (the zero-tool outage). The sweep pings distinct active clients and
   // cascade-invalidates after two consecutive failed sweeps.
 
   type PingableFakeClient = FakeClient & {
@@ -686,7 +686,7 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
   // only request-path reset (cold-start warmup) requires the WHOLE pool
   // to be empty — which never happens while other namespaces hold live
   // connections. Observed as the unkillable "No session for: autotask"
-  // loop in incident 2026-06-11.
+  // loop in the zero-tool outage.
 
   type ProbeInternals = {
     activeSessions: Record<string, unknown>;

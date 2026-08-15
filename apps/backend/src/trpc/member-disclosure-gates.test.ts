@@ -1,5 +1,5 @@
 /**
- * The router half of the FIND-004 / #98 fix.
+ * The router half of the credential-disclosure (#98) fix.
  *
  * `redaction.test.ts` proves the serializers redact when told to. This file
  * proves the routers actually TELL them to — that `isAdmin` is derived from

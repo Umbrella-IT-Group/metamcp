@@ -3,7 +3,7 @@
  *
  * Two emitters, one contract. `auth-relay-audit.ts` reads the `/api/auth`
  * relay's HTTP verdict; `auth-hook-audit.ts` reads better-auth's database
- * hooks. Between them they cover the events the 2026-08-13 incident review
+ * hooks. Between them they cover the events the last security review
  * had to infer: who tried to sign in and failed, who registered an account,
  * who was refused registration, and which sessions existed.
  *
@@ -429,7 +429,7 @@ describe("auth.signup / session lifecycle", () => {
   it("session.revoke separates a swept expiry from a deliberate kill", async () => {
     // One verb covers sign-out, expiry sweeping and bulk revocation. Without
     // this field "which sessions were killed on purpose" — the question asked
-    // during an incident — is unanswerable from the row.
+    // during an investigation — is unanswerable from the row.
     emitSessionRevoked(
       {
         id: "sess-old",

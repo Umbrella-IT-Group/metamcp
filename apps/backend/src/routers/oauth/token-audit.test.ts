@@ -488,7 +488,7 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
     // Bounded by the same argument in reverse: it needs a real token that
     // belongs to a locked-out account, i.e. a credential an administrator has
     // already acted against — and a relying party still asking about it is
-    // exactly what an incident responder wants to see.
+    // exactly what a responder wants to see.
     oauthRepositoryMock.getAccessToken.mockResolvedValue({
       access_token: liveToken,
       client_id: CLIENT_ID,

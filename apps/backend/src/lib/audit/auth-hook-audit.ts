@@ -160,7 +160,7 @@ export function emitSessionRevoked(session: unknown, context: unknown): void {
     target_id: hookField(session, "id"),
     outcome: "success",
     // One verb covers sign-out, expiry sweeping and a deliberate bulk
-    // revocation, and during an incident "which sessions were killed on
+    // revocation, and during an investigation "which sessions were killed on
     // purpose" is the question actually being asked. `already_expired`
     // separates them: a session whose `expiresAt` had already passed was
     // swept, one still in date was ended by somebody. Carried in `detail`

@@ -272,9 +272,9 @@ export const apiKeysImplementations = {
           });
 
       // Deactivating a key is a REVOCATION and gets its own verb — during an
-      // incident "which credentials were killed, by whom, when" is a question
-      // asked directly of the action column, and burying it inside a generic
-      // `apikey.update` alongside renames would make it un-greppable.
+      // investigation "which credentials were killed, by whom, when" is a
+      // question asked directly of the action column, and burying it inside a
+      // generic `apikey.update` alongside renames would make it un-greppable.
       emitAdminEvent(actor, {
         action: input.is_active === false ? "apikey.revoke" : "apikey.update",
         target_type: "api_key",

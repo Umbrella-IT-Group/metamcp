@@ -32,7 +32,7 @@ import { sanitizeName } from "./utils";
  * the latched failure belongs to a DIFFERENT server than the tool being
  * called — in both cases the caller should re-throw its original error.
  *
- * Gated on ownership: routing an unrelated tool can incidentally
+ * Gated on ownership: routing an unrelated tool can inadvertently
  * probe-connect the m365 backend (dynamic-find walks every server in the
  * namespace) and latch a failure that must not hijack the real tool's
  * error. Only the injected m365 server can ever latch here today.

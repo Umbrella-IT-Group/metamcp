@@ -60,7 +60,7 @@ export interface RequestWithSessionRecoveryOptions<T> {
  * (e.g. after a Watchtower swap of the backend container) made the
  * namespace return a "successful" 0-tool response on every request,
  * forever — the swallowed error meant the zombie connection was never
- * invalidated (incident 2026-06-11, Umbrella-MCP-Server#229).
+ * invalidated (observed in production as a 24h zero-tool outage).
  *
  * Throws when the error is non-recoverable, when no fresh session could
  * be established, or when the retry on the fresh session fails — the

@@ -23,7 +23,7 @@ import {
  * skipped the auth-method check could be stored with a method the token
  * endpoint refuses to honour.
  *
- * That sharing also means the FIND-023 host allowlist covers the admin UI's
+ * That sharing also means the redirect_uri host allowlist covers the admin UI's
  * create-client dialog, not just anonymous DCR. Deliberate: an admin who needs
  * a callback host outside `DCR_REDIRECT_URI_ALLOWED_HOSTS` changes that env
  * var, which leaves a deployment-visible record of the decision, rather than
@@ -113,7 +113,7 @@ export function buildClientRegistration(
   //
   // `isAllowedRedirectUri` — scheme, userinfo, fragment, exact-match loopback,
   // and the non-loopback host allowlist. See its doc comment for why each rule
-  // exists; FIND-023 is the reason it replaced the old scheme-only check.
+  // exists; the scheme-only check it replaced accepted attacker-controlled hosts.
   //
   // The 400 pair below is unchanged apart from a trailing parenthesised reason:
   // the allowlist is default-on, so a registration that used to succeed can now

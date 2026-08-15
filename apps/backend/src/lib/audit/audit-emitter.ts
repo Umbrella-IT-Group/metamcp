@@ -283,7 +283,7 @@ export function auditContextFromHook(context: unknown): AuditRequestContext {
  * primitive unless it is clamped at the emitter: the JSON body limit is 50mb
  * and `/oauth/register` is unauthenticated, so one anonymous request could
  * otherwise push megabytes into a jsonb column nobody can delete from. The
- * point of the table is to survive an incident, not to be the vector for the
+ * point of the table is to survive an attack, not to be the vector for the
  * next one.
  *
  * Clamping is lossy on purpose. A redirect URI truncated at 512 characters
