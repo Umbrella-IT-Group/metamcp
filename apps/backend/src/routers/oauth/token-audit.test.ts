@@ -331,10 +331,11 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
   });
 
   it("writes NOTHING for an unknown token — the unauthenticated write amplifier", async () => {
-    // /oauth/revoke and /oauth/introspect have no rate limiter, and RFC 7009
-    // requires a 200 for garbage. One row per invented string would be an
-    // attacker-controlled INSERT into a table nobody can prune, recording
-    // only a value the caller made up. Documented decision, see token.ts.
+    // RFC 7009 requires a 200 for garbage, so one row per invented string
+    // would be an attacker-controlled INSERT into a table nobody can prune,
+    // recording only a value the caller made up. The failure-only limiter now
+    // on both endpoints bounds the RATE of those requests but not the row
+    // count, so this decision is unchanged. See token.ts.
     oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
     oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
 
