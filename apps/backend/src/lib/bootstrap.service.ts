@@ -14,6 +14,7 @@ import {
   namespacesTable,
   usersTable,
 } from "../db/schema";
+import { emitAdminEvent } from "./audit/admin-event";
 
 /**
  * Environment-based bootstrap for MetaMCP.
@@ -338,14 +339,24 @@ function parseEnvConfig(): EnvConfig {
       false,
     ),
 
-    // Registration controls
+    // Registration controls. Upstream defaults BOTH of these OPEN, so an
+    // unset variable on a template-derived deploy silently re-opens
+    // self-registration — the entry vector this fork was hardened against.
+    // Absence is therefore read as DISABLED here: the lock is structural, not
+    // a line someone has to remember to add to a new `.env`. `parseBool`
+    // returns the default for an unparseable value as well as an undefined
+    // one, so a typo (`BOOTSTRAP_DISABLE_REGISTRATION_UI=flase`) also fails
+    // closed rather than opening the door. A fresh install onboards its
+    // first administrator through `BOOTSTRAP_USERS`, not UI self-register;
+    // `validateConfig` already warns on the disabled-and-no-users combination
+    // so that path cannot lock an operator out silently.
     disableUiRegistration: parseBool(
       process.env.BOOTSTRAP_DISABLE_REGISTRATION_UI,
-      false,
+      true,
     ),
     disableSsoRegistration: parseBool(
       process.env.BOOTSTRAP_DISABLE_REGISTRATION_SSO,
-      false,
+      true,
     ),
 
     // Array configurations
@@ -381,6 +392,29 @@ async function getConfigValue(key: string): Promise<string | null> {
     where: eq(configTable.id, key),
   });
   return row?.value ?? null;
+}
+
+/**
+ * Read a registration-control flag for the `old_value` half of an audit row,
+ * in the SAME shape the UI setter records it (`trpc/config.impl.ts` ->
+ * `previousValue`), so a bootstrap row and an administrator's row are
+ * comparable in the ledger rather than two different encodings of the same
+ * fact.
+ *
+ * A missing row is `false`, not `null`: that is exactly what
+ * `configService.isSignupDisabled()` reports for it, and it is the honest
+ * reading — no row means the control was never engaged. `null` is reserved
+ * for a read that FAILED, which then compares unequal to any boolean and so
+ * makes the change-detection assume-changed. Over-reporting one redundant row
+ * after a database blip is the cheap failure; losing the row that says
+ * registration was reopened at boot is not.
+ */
+async function readRegistrationFlag(key: string): Promise<boolean | null> {
+  try {
+    return (await getConfigValue(key)) === "true";
+  } catch {
+    return null;
+  }
 }
 
 async function shouldSkipBootstrap(config: EnvConfig): Promise<boolean> {
@@ -1378,24 +1412,71 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
 
   validateConfig(config);
 
-  // Registration controls (applied every run)
+  // Registration controls (applied every run).
+  //
+  // These two writes are the same authority as the admin UI's signup toggles,
+  // exercised by the environment instead of by a person: a container restart
+  // carrying a changed (or newly absent) BOOTSTRAP_DISABLE_REGISTRATION_* can
+  // flip who may create an account, and until now it did so with no durable
+  // evidence at all — the only trace was the config row's `updated_at`. They
+  // therefore emit the SAME per-key `config.*.set` actions the UI setters emit
+  // (`trpc/config.impl.ts`), so an investigation reads one timeline instead of
+  // correlating audit rows against container logs. `source: "bootstrap_env"`
+  // is what separates the two origins; the absent actor is what makes the row
+  // `actor_type: "system"` rather than a phantom administrator.
+  //
+  // Only a genuine CHANGE is recorded. Bootstrap re-asserts both flags on
+  // EVERY start, so emitting unconditionally would bury the one restart that
+  // moved a flag under a row per restart that did not.
   console.log("🔧 Setting registration controls...");
   try {
+    const key = ConfigKeyEnum.enum.DISABLE_SIGNUP;
+    const next = config.disableUiRegistration;
+    const previous = await readRegistrationFlag(key);
     await upsertConfig(
-      ConfigKeyEnum.enum.DISABLE_SIGNUP,
-      config.disableUiRegistration.toString(),
+      key,
+      next.toString(),
       "Whether new user signup is disabled",
     );
+    // After the write, never before: a row claiming signup was reopened by a
+    // call that then threw would be worse than no row at all.
+    if (previous !== next) {
+      emitAdminEvent(undefined, {
+        action: "config.signup_disabled.set",
+        target_type: "config_key",
+        target_id: key,
+        detail: {
+          old_value: previous,
+          new_value: next,
+          source: "bootstrap_env",
+        },
+      });
+    }
   } catch (err) {
     console.warn("⚠️ Failed to set UI registration control:", err);
   }
 
   try {
+    const key = ConfigKeyEnum.enum.DISABLE_SSO_SIGNUP;
+    const next = config.disableSsoRegistration;
+    const previous = await readRegistrationFlag(key);
     await upsertConfig(
-      ConfigKeyEnum.enum.DISABLE_SSO_SIGNUP,
-      config.disableSsoRegistration.toString(),
+      key,
+      next.toString(),
       "Whether new user signup via SSO/OAuth is disabled",
     );
+    if (previous !== next) {
+      emitAdminEvent(undefined, {
+        action: "config.sso_signup_disabled.set",
+        target_type: "config_key",
+        target_id: key,
+        detail: {
+          old_value: previous,
+          new_value: next,
+          source: "bootstrap_env",
+        },
+      });
+    }
   } catch (err) {
     console.warn("⚠️ Failed to set SSO registration control:", err);
   }

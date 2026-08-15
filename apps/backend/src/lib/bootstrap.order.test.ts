@@ -14,7 +14,11 @@
  *    caught), and it carries the endpoint's FRESH uuid re-resolved by name;
  *  - `ensureUser` itself issues NO api_keys insert — the deferred-restore
  *    contract means the ONLY api_keys insert in a restore run is the
- *    deferred one.
+ *    deferred one;
+ *  - the registration controls resolve FAIL-CLOSED from an unset environment
+ *    and leave an audit row when, and only when, a boot actually moves one of
+ *    them. Both live in the entrypoint, so neither is reachable from a unit
+ *    test of the parser.
  *
  * Env-driven config: each test writes the BOOTSTRAP_* vars it needs and the
  * suite restores the original environment afterwards.
@@ -51,6 +55,14 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
     usersFindFirstQueue: [] as (Record<string, unknown> | undefined)[],
     /** FIFO responses for db.query.apiKeysTable.findFirst */
     apiKeysFindFirstQueue: [] as (Record<string, unknown> | undefined)[],
+    /**
+     * FIFO responses for db.query.configTable.findFirst — the PRE-existing
+     * config rows the registration-control audit compares against. Order is
+     * the entrypoint's read order: DISABLE_SIGNUP, then DISABLE_SSO_SIGNUP.
+     * An exhausted queue yields `undefined` (the row does not exist), which
+     * is the fresh-database case.
+     */
+    configFindFirstQueue: [] as (Record<string, unknown> | undefined)[],
   };
 
   // Import the real tables lazily inside the factory-safe closure — the
@@ -130,7 +142,11 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
       },
       namespacesTable: { findFirst: vi.fn(() => Promise.resolve(undefined)) },
       endpointsTable: { findFirst: vi.fn(() => Promise.resolve(undefined)) },
-      configTable: { findFirst: vi.fn(() => Promise.resolve(undefined)) },
+      configTable: {
+        findFirst: vi.fn(() =>
+          Promise.resolve(readFixtures.configFindFirstQueue.shift()),
+        ),
+      },
     },
   };
 
@@ -138,7 +154,28 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
 });
 vi.mock("../db", () => ({ db: dbMock }));
 
-import { apiKeysTable, endpointsTable, namespacesTable } from "../db/schema";
+/**
+ * One recorded `emitAdminEvent` call. `statementsAtEmit` is the length of
+ * `statementLog` at emit time — the handle the ordering assertion uses to
+ * prove the row was emitted AFTER its config write, not before it.
+ */
+type EmittedAdminEvent = {
+  actor: unknown;
+  event: Record<string, unknown>;
+  statementsAtEmit: number;
+};
+const { emitAdminEventMock, emitLog } = vi.hoisted(() => ({
+  emitAdminEventMock: vi.fn(),
+  emitLog: [] as EmittedAdminEvent[],
+}));
+vi.mock("./audit/admin-event", () => ({ emitAdminEvent: emitAdminEventMock }));
+
+import {
+  apiKeysTable,
+  configTable,
+  endpointsTable,
+  namespacesTable,
+} from "../db/schema";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
 
 const BOOTSTRAP_ENV_KEYS = [
@@ -163,11 +200,21 @@ const savedEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
   vi.clearAllMocks();
   statementLog.length = 0;
+  emitLog.length = 0;
+  // Re-applied per test rather than baked into the hoisted `vi.fn()`: the
+  // suite's `restoreAllMocks` teardown drops implementations, and the recorder
+  // needs `statementLog`, which only exists once the hoisted block has run.
+  emitAdminEventMock.mockImplementation(
+    (actor: unknown, event: Record<string, unknown>) => {
+      emitLog.push({ actor, event, statementsAtEmit: statementLog.length });
+    },
+  );
   readFixtures.preservedKeyRows = [];
   readFixtures.endpointRows = [];
   readFixtures.userRows = [];
   readFixtures.usersFindFirstQueue = [];
   readFixtures.apiKeysFindFirstQueue = [];
+  readFixtures.configFindFirstQueue = [];
   for (const key of BOOTSTRAP_ENV_KEYS) {
     savedEnv[key] = process.env[key];
     delete process.env[key];
@@ -524,5 +571,110 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     );
     expect(apiKeyInserts).toHaveLength(1);
     expect(apiKeyInserts[0].values).toMatchObject({ name: "consumer-scoped" });
+  });
+});
+
+describe("registration controls — fail-closed defaults and audited boot-time flips", () => {
+  /** Index of the `upsertConfig` write issued for one config key, or -1. */
+  function configWriteIndex(key: string): number {
+    return statementLog.findIndex(
+      (s) =>
+        s.op === "insert" && s.table === configTable && s.values?.id === key,
+    );
+  }
+
+  function configWrite(key: string): Record<string, unknown> | undefined {
+    const index = configWriteIndex(key);
+    return index === -1 ? undefined : statementLog[index].values;
+  }
+
+  it("resolves BOTH controls to DISABLED when neither env var is set", async () => {
+    // `beforeEach` deletes every BOOTSTRAP_* key, so this is the deploy that
+    // never mentioned the variables at all — the case upstream leaves open.
+    await initializeEnvironmentConfiguration();
+
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "true" });
+    expect(configWrite("DISABLE_SSO_SIGNUP")).toMatchObject({ value: "true" });
+  });
+
+  it("still honours an explicit false — the default is a default, not an override", async () => {
+    process.env.BOOTSTRAP_DISABLE_REGISTRATION_UI = "false";
+    process.env.BOOTSTRAP_DISABLE_REGISTRATION_SSO = "false";
+
+    await initializeEnvironmentConfiguration();
+
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "false" });
+    expect(configWrite("DISABLE_SSO_SIGNUP")).toMatchObject({ value: "false" });
+  });
+
+  it("falls closed on an unparseable value — a typo must not reopen registration", async () => {
+    process.env.BOOTSTRAP_DISABLE_REGISTRATION_UI = "flase";
+
+    await initializeEnvironmentConfiguration();
+
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "true" });
+  });
+
+  it("emits one attributed row per flag that actually CHANGED, after the write", async () => {
+    // Pre-existing rows say registration is OPEN; the unset env now resolves
+    // to DISABLED, so both flags move. Queue order is the entrypoint's read
+    // order: DISABLE_SIGNUP first, then DISABLE_SSO_SIGNUP.
+    readFixtures.configFindFirstQueue = [
+      { value: "false" },
+      { value: "false" },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(emitLog).toHaveLength(2);
+    const [signup, ssoSignup] = emitLog;
+
+    // No actor bundle: `admin-event.ts` stamps that `actor_type: "system"`,
+    // which is the truth — no administrator is behind a container restart.
+    expect(signup.actor).toBeUndefined();
+    expect(signup.event).toEqual({
+      action: "config.signup_disabled.set",
+      target_type: "config_key",
+      target_id: "DISABLE_SIGNUP",
+      detail: { old_value: false, new_value: true, source: "bootstrap_env" },
+    });
+    expect(ssoSignup.actor).toBeUndefined();
+    expect(ssoSignup.event).toEqual({
+      action: "config.sso_signup_disabled.set",
+      target_type: "config_key",
+      target_id: "DISABLE_SSO_SIGNUP",
+      detail: { old_value: false, new_value: true, source: "bootstrap_env" },
+    });
+
+    // Emitted AFTER the write it describes — a row claiming a flag moved, from
+    // a boot whose write then threw, would be worse than no row at all.
+    const writeIndex = configWriteIndex("DISABLE_SIGNUP");
+    expect(writeIndex).toBeGreaterThanOrEqual(0);
+    expect(signup.statementsAtEmit).toBeGreaterThan(writeIndex);
+  });
+
+  it("emits nothing when a restart re-asserts what is already stored", async () => {
+    readFixtures.configFindFirstQueue = [{ value: "true" }, { value: "true" }];
+
+    await initializeEnvironmentConfiguration();
+
+    // The writes still happen — bootstrap re-asserts both flags every run ...
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "true" });
+    expect(configWrite("DISABLE_SSO_SIGNUP")).toMatchObject({ value: "true" });
+    // ... but they leave no rows, so the one restart that DID move a flag is
+    // not buried under a row for every restart that did not.
+    expect(emitAdminEventMock).not.toHaveBeenCalled();
+    expect(emitLog).toHaveLength(0);
+  });
+
+  it("emits for the flag that moved and stays silent on the one that did not", async () => {
+    // SSO already disabled, UI still open: exactly one flag changes.
+    readFixtures.configFindFirstQueue = [{ value: "false" }, { value: "true" }];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(emitLog.map((e) => e.event.action)).toEqual([
+      "config.signup_disabled.set",
+    ]);
   });
 });
