@@ -156,7 +156,7 @@ cp example.env .env   # then edit .env
 docker compose up -d
 ```
 
-If you change `APP_URL`, access the app only from that URL — MetaMCP enforces CORS against it. The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
+If you change `APP_URL`, access the app only from that URL. MetaMCP applies CORS per route: the OAuth discovery endpoints allow any origin, while the app and API routes (`/api/auth`, `/trpc`, `/mcp-proxy`, `/metamcp`) are restricted to an allowlist of `APP_URL` plus any origins you add to `EXTRA_TRUSTED_ORIGINS` (comma-separated). The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
 
 ### Local development
 
