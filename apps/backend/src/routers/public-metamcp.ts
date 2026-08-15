@@ -4,18 +4,29 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
+import { credentialedCorsOrigin } from "../lib/cors-policy";
 import { isAdminHealthRequest } from "../lib/health-upstream";
-import { openApiRouter } from "./public-metamcp/openapi";
 import adminRouter from "./public-metamcp/admin";
+import { openApiRouter } from "./public-metamcp/openapi";
 import sseRouter from "./public-metamcp/sse";
 import streamableHttpRouter from "./public-metamcp/streamable-http";
 
 const publicEndpointsRouter = express.Router();
 
-// Enable CORS for all public endpoint routes
+// `origin: true` reflected whatever `Origin` the caller sent straight back
+// into `Access-Control-Allow-Origin`, next to
+// `Access-Control-Allow-Credentials: true` — the pairing that lets any site a
+// victim visits read a credentialed response from this host. These routes
+// authenticate with `X-API-Key` rather than the session cookie, so a browser
+// would not have carried anything worth stealing today; the allowlist is here
+// because a reflected origin plus credentials must not be one route change
+// away from mattering. Trusted origins get their own origin echoed back,
+// everyone else gets no grant at all. A browser-based third-party client that
+// needs to call these endpoints cross-origin belongs in
+// `EXTRA_TRUSTED_ORIGINS`. See ../lib/cors-policy.
 publicEndpointsRouter.use(
   cors({
-    origin: true, // Allow all origins
+    origin: credentialedCorsOrigin,
     credentials: true,
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: [

@@ -6,6 +6,7 @@ import {
   stampAuditHeaders,
 } from "./lib/audit/audit-emitter";
 import { emitAuthRelayEvent } from "./lib/audit/auth-relay-audit";
+import { authApiCorsMiddleware, isCorsResponseHeader } from "./lib/cors-policy";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -14,7 +15,10 @@ import {
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
-import { errorHandler } from "./middleware/error-handler.middleware";
+import {
+  errorHandler,
+  INTERNAL_ERROR_BODY,
+} from "./middleware/error-handler.middleware";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -47,6 +51,15 @@ app.use((req, res, next) => {
 
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);
+
+// `/api/auth` answers with the session cookie and with session contents, so it
+// gets a CORS policy chosen here rather than whatever an earlier-mounted router
+// leaves behind — which is what it had. An allowlisted origin is echoed back
+// specifically; every other origin gets no `Access-Control-Allow-Origin` at
+// all. Never `*` and never a blind reflection of the caller's `Origin`: either
+// one turns a cookie-authenticated response into a cross-site read. The
+// allowlist and the reasoning live in ./lib/cors-policy.
+app.use(authApiCorsMiddleware);
 
 // Mount better-auth routes by calling auth API directly
 app.use(async (req, res, next) => {
@@ -90,8 +103,12 @@ app.use(async (req, res, next) => {
       // Convert Response back to Express response
       res.status(response.status);
 
-      // Copy headers
+      // Copy headers, minus any CORS grant. better-auth emits none today, so
+      // this changes nothing now; it is here so a future release that starts
+      // emitting one cannot silently replace the deliberate policy applied by
+      // `authApiCorsMiddleware` above with an upstream default.
       response.headers.forEach((value, key) => {
+        if (isCorsResponseHeader(key)) return;
         res.setHeader(key, value);
       });
 
@@ -113,11 +130,15 @@ app.use(async (req, res, next) => {
 
       res.send(body);
     } catch (error) {
+      // The detail goes to the server log and nowhere else, same rule the
+      // terminal handler below follows (./middleware/error-handler.middleware,
+      // and `INTERNAL_ERROR_BODY` is its body). This relay reaches better-auth,
+      // the drizzle adapter and postgres, so `error.message` here is routinely
+      // a driver error naming internal hosts, table and column names — and
+      // `/api/auth/*` is unauthenticated by definition, so whoever provokes the
+      // failure needs no credentials to read what came back.
       logger.error("Auth route error:", error);
-      res.status(500).json({
-        error: "Internal server error",
-        details: error instanceof Error ? error.message : String(error),
-      });
+      res.status(500).json(INTERNAL_ERROR_BODY);
     }
     return;
   }
