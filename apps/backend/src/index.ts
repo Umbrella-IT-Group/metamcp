@@ -1,12 +1,6 @@
 import express from "express";
 
-import { auth } from "./auth";
-import {
-  auditRequestContext,
-  stampAuditHeaders,
-} from "./lib/audit/audit-emitter";
-import { emitAuthRelayEvent } from "./lib/audit/auth-relay-audit";
-import { authApiCorsMiddleware, isCorsResponseHeader } from "./lib/cors-policy";
+import { authApiCorsMiddleware } from "./lib/cors-policy";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -15,10 +9,8 @@ import {
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
-import {
-  errorHandler,
-  INTERNAL_ERROR_BODY,
-} from "./middleware/error-handler.middleware";
+import { errorHandler } from "./middleware/error-handler.middleware";
+import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -61,89 +53,10 @@ app.use(oauthRouter);
 // allowlist and the reasoning live in ./lib/cors-policy.
 app.use(authApiCorsMiddleware);
 
-// Mount better-auth routes by calling auth API directly
-app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api/auth")) {
-    try {
-      // Create a web Request object from Express request
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const headers = new Headers();
-
-      // Copy headers from Express request
-      Object.entries(req.headers).forEach(([key, value]) => {
-        if (value) {
-          headers.set(key, Array.isArray(value) ? value[0] : value);
-        }
-      });
-
-      // Hand the Express request's audit attribution across the relay seam.
-      // better-auth's `databaseHooks` (auth.ts) see only this Request, so
-      // without these two the signup and session rows they emit would carry a
-      // null request_id and could not be joined to the auth.login.* row from
-      // the same HTTP call. Must run AFTER the copy loop above, which brings
-      // the CALLER's headers in verbatim — including any it invented under
-      // these names. See lib/audit/audit-emitter for why the absent case
-      // deletes rather than skips.
-      const auditContext = auditRequestContext(req);
-      stampAuditHeaders(headers, auditContext);
-
-      // Create Request object
-      const request = new Request(url.toString(), {
-        method: req.method,
-        headers,
-        body:
-          req.method !== "GET" && req.method !== "HEAD"
-            ? JSON.stringify(req.body)
-            : undefined,
-      });
-
-      // Call better-auth directly
-      const response = await auth.handler(request);
-
-      // Convert Response back to Express response
-      res.status(response.status);
-
-      // Copy headers, minus any CORS grant. better-auth emits none today, so
-      // this changes nothing now; it is here so a future release that starts
-      // emitting one cannot silently replace the deliberate policy applied by
-      // `authApiCorsMiddleware` above with an upstream default.
-      response.headers.forEach((value, key) => {
-        if (isCorsResponseHeader(key)) return;
-        res.setHeader(key, value);
-      });
-
-      // Send body
-      const body = await response.text();
-
-      // Record the outcome AFTER better-auth has answered and BEFORE the
-      // response goes out, so the row describes a verdict that has actually
-      // been reached. Fire-and-forget and never throws — see
-      // lib/audit/auth-relay-audit; a logging failure here must not turn a
-      // successful sign-in into a 500 (the catch below would answer one).
-      emitAuthRelayEvent({
-        path: req.path,
-        status: response.status,
-        requestBody: req.body,
-        responseBody: body,
-        audit: auditContext,
-      });
-
-      res.send(body);
-    } catch (error) {
-      // The detail goes to the server log and nowhere else, same rule the
-      // terminal handler below follows (./middleware/error-handler.middleware,
-      // and `INTERNAL_ERROR_BODY` is its body). This relay reaches better-auth,
-      // the drizzle adapter and postgres, so `error.message` here is routinely
-      // a driver error naming internal hosts, table and column names — and
-      // `/api/auth/*` is unauthenticated by definition, so whoever provokes the
-      // failure needs no credentials to read what came back.
-      logger.error("Auth route error:", error);
-      res.status(500).json(INTERNAL_ERROR_BODY);
-    }
-    return;
-  }
-  next();
-});
+// Mount better-auth routes by calling auth API directly. The relay body lives
+// in ./routers/auth-relay so it can be imported by a test — this file cannot,
+// because it calls `app.listen()` at module scope.
+app.use(authApiRelay);
 
 // Umbrella fork: M365 delegated-token broker enrollment routes
 // (better-auth session-gated; boots cleanly when the broker env is

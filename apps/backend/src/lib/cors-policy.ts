@@ -17,12 +17,21 @@ import express from "express";
  * response. Routes that need credentials call in here instead and get back a
  * specific, known origin or no `Access-Control-Allow-Origin` at all.
  *
- * The allowlist inputs deliberately mirror the ones better-auth's own
- * `trustedOrigins` is built from in ../auth (`APP_URL` plus the comma-separated
- * `EXTRA_TRUSTED_ORIGINS`) rather than importing that module: `auth.ts`
- * constructs the drizzle adapter at import time and throws without a database,
- * and a CORS decision must not be able to drag postgres into a router's import
- * graph.
+ * The allowlist reads the same two environment variables better-auth's own
+ * `trustedOrigins` is built from in ../auth, rather than importing that module:
+ * `auth.ts` constructs the drizzle adapter at import time and throws without a
+ * database, and a CORS decision must not be able to drag postgres into a
+ * router's import graph.
+ *
+ * The two lists are NOT equivalent, deliberately. better-auth's is nine
+ * hardcoded loopback origins plus `EXTRA_TRUSTED_ORIGINS`, with `APP_URL`
+ * trusted separately as its `baseURL` rather than as a list member. This one
+ * is `APP_URL` plus `EXTRA_TRUSTED_ORIGINS`, and it admits loopback ONLY when
+ * `APP_URL` is itself loopback — so on a deployed gateway it is STRICTER than
+ * better-auth's, which keeps trusting `http://localhost:3000` in production.
+ * That divergence is the point: better-auth's list gates CSRF on requests the
+ * caller already has a cookie for, while this one decides who may READ a
+ * credentialed response.
  */
 
 /**
@@ -40,17 +49,29 @@ const LOOPBACK_HOSTNAMES = new Set([
 
 /**
  * Reduce an origin-ish string to its canonical `scheme://host[:port]` form, or
- * null if it is not a parseable absolute URL.
+ * null if it is not an http(s) origin.
  *
  * Everything downstream compares and ECHOES this normalised value rather than
  * the caller's bytes, so a header that differs only in case or trailing slash
  * still matches, and nothing the caller wrote is ever copied into a response
  * header verbatim.
+ *
+ * The scheme check is not cosmetic. WHATWG gives every NON-special scheme an
+ * opaque origin, which `URL.origin` serialises as the literal string "null" —
+ * so `app://anything`, `moz-extension://anything`, `file://` and `data:` all
+ * normalise to the SAME value. Without this guard, one exotic-scheme entry in
+ * `EXTRA_TRUSTED_ORIGINS` would match every browser extension and packaged-app
+ * origin at once, and answer all of them `Access-Control-Allow-Origin: null`
+ * beside `Access-Control-Allow-Credentials: true`. `null` is also the Origin a
+ * sandboxed iframe or a privacy-redirected navigation sends, which is exactly
+ * the caller a credentialed grant must never be handed to.
  */
 function normalizeOrigin(value: string | undefined): string | null {
   if (!value) return null;
   try {
-    return new URL(value.trim()).origin;
+    const url = new URL(value.trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url.origin;
   } catch {
     return null;
   }
@@ -143,11 +164,15 @@ const authApiCors = cors({
 /**
  * Mounted immediately ahead of the `/api/auth` relay in ../index.
  *
- * Clearing the two headers first is the belt to the path guard in
- * ../routers/oauth: `authApiCors` sets no `Access-Control-Allow-Origin` for an
- * untrusted origin, so anything an earlier router already wrote would survive
- * as this route's answer. Clearing makes "not trusted" mean no grant, whatever
- * ran before.
+ * Clearing first is the belt to the path guard in ../routers/oauth:
+ * `authApiCors` sets no `Access-Control-Allow-Origin` for an untrusted origin,
+ * so anything an earlier router already wrote would survive as this route's
+ * answer. Clearing makes "not trusted" mean no grant, whatever ran before.
+ *
+ * EVERY `Access-Control-*` header goes, not just the origin and credentials
+ * pair: `-Expose-Headers` names response headers a cross-origin reader may see
+ * and `-Allow-Methods`/`-Allow-Headers` widen a preflight, so leaving those
+ * behind would keep pieces of a neighbour's policy on a route that has its own.
  */
 export const authApiCorsMiddleware = (
   req: express.Request,
@@ -156,8 +181,17 @@ export const authApiCorsMiddleware = (
 ) => {
   if (!req.path.startsWith("/api/auth")) return next();
 
-  res.removeHeader("Access-Control-Allow-Origin");
-  res.removeHeader("Access-Control-Allow-Credentials");
+  for (const name of res.getHeaderNames()) {
+    if (isCorsResponseHeader(name)) res.removeHeader(name);
+  }
+
+  // The cors package adds `Vary: Origin` only on the branch that GRANTS an
+  // origin — when the resolver answers `false` it calls `next()` having set no
+  // headers at all. Without a Vary here, a shared cache that saw the
+  // grant-less answer to an untrusted origin could replay it to the trusted
+  // one, and the app's own requests would start failing CORS. Availability,
+  // not disclosure: the cached response carries no grant to leak.
+  res.vary("Origin");
 
   return authApiCors(req, res, next);
 };

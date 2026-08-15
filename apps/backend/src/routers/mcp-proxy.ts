@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 
+import { credentialedCorsOrigin } from "../lib/cors-policy";
 import { betterAuthMcpMiddleware } from "../middleware/better-auth-mcp.middleware";
 import { requireAdminMcpMiddleware } from "../middleware/require-admin-mcp.middleware";
 import { requireEnabledMcpMiddleware } from "../middleware/require-enabled-mcp.middleware";
@@ -12,9 +13,15 @@ const mcpProxyRouter = express.Router();
 
 // Apply security middleware for MCP proxy communication
 mcpProxyRouter.use(helmet());
+// Session-authenticated and admin-gated (see the block below), so the origin
+// is resolved against the shared allowlist rather than handed the raw
+// `APP_URL`: an unset or empty APP_URL is falsy and the cors package answers a
+// falsy origin with the literal `*` beside `credentials: true`, while a
+// trailing slash makes the string comparison miss and drops CORS for the app's
+// own frontend. See ../lib/cors-policy.
 mcpProxyRouter.use(
   cors({
-    origin: process.env.APP_URL,
+    origin: credentialedCorsOrigin,
     credentials: true,
     allowedHeaders: [
       "Content-Type",

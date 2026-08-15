@@ -89,7 +89,14 @@ oauthRouter.use((req, res, next) => {
   return served ? oauthCors(req, res, next) : next();
 });
 
-// Apply middleware for OAuth-specific routes
+// Apply middleware for OAuth-specific routes.
+//
+// `securityHeaders` is deliberately NOT put behind the guard above. It has the
+// same unprefixed reach — it lands on every route in the app — but what it
+// lands is hardening (`X-Frame-Options: DENY`, `nosniff`, a referrer policy, a
+// CSP), so the spread is wanted. Scoping it would REMOVE those headers from
+// every non-OAuth route, which is the wrong direction. Only the CORS policy
+// needed scoping, because CORS is the one that grants rather than restricts.
 oauthRouter.use(securityHeaders);
 oauthRouter.use(jsonParsingMiddleware);
 oauthRouter.use(urlencodedParsingMiddleware);
