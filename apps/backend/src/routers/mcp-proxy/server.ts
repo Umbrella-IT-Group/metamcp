@@ -9,9 +9,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { McpServerErrorStatusEnum, McpServerTypeEnum } from "@repo/zod-types";
+import {
+  DatabaseMcpServer,
+  McpServerErrorStatusEnum,
+  McpServerTypeEnum,
+} from "@repo/zod-types";
 import express from "express";
-import { parse as shellParseArgs } from "shell-quote";
 import { findActualExecutable } from "spawn-rx";
 
 import logger from "@/utils/logger";
@@ -74,55 +77,137 @@ const setStdioCooldown = (
   stdioCommandCooldowns.set(key, Date.now() + STDIO_COOLDOWN_DURATION);
 };
 
-// Function to extract server UUID from STDIO command
-const extractServerUuidFromStdioCommand = async (
-  command: string,
-  args: string[],
-): Promise<string | null> => {
-  try {
-    // For filesys server, the command is typically: npx @modelcontextprotocol/server-filesystem /workspaceFolder
-    // We need to find the server in the database that matches this command pattern
+/** What a STDIO proxy session was actually started with. */
+export interface StdioSpawnParams {
+  serverUuid: string;
+  serverName: string;
+  errorStatus: string | null;
+  cmd: string;
+  args: string[];
+  env: Record<string, string>;
+}
 
-    // First, try to find by command and args pattern
-    const fullCommand = `${command} ${args.join(" ")}`;
-    logger.info(`Looking for server with command: ${fullCommand}`);
+/** Single string form of a command line, used only to IDENTIFY a row. */
+const commandLine = (command: string, args: string): string =>
+  `${command} ${args}`.trim();
 
-    // Look for servers that match this command pattern
-    const servers = await mcpServersRepository.findAll();
-    logger.info(`Found ${servers.length} servers in database`);
+/**
+ * Find the registered `mcp_servers` row a STDIO proxy request is asking to
+ * start, or throw.
+ *
+ * The request IDENTIFIES a server; it does not describe one. That distinction
+ * is the whole point of this function: the spawn parameters used to be read
+ * straight off the query string, so whatever `command` a caller sent is what
+ * the backend executed with its own environment. Sourcing them from the row
+ * instead means an unregistered command has nowhere to come from.
+ *
+ * Two ways to identify, in order:
+ *  - `mcpServerUuid`, which is what the UI sends and is unambiguous.
+ *  - the FULL command line, matched exactly against a registered STDIO row.
+ *    This exists so a browser still holding an older bundle keeps working; it
+ *    is not a second source of truth, because the matched row's stored values
+ *    are what gets spawned either way. Matching is deliberately on the whole
+ *    line and never on the executable alone — a `command`-only match would
+ *    accept `npx <anything>` the moment one registered server used `npx`.
+ */
+const findRegisteredStdioServer = async (
+  req: express.Request,
+): Promise<DatabaseMcpServer> => {
+  const requestedUuid =
+    typeof req.query.mcpServerUuid === "string"
+      ? req.query.mcpServerUuid
+      : undefined;
 
-    for (const server of servers) {
-      if (server.type === "STDIO" && server.command) {
-        const serverCommand = `${server.command} ${(server.args || []).join(" ")}`;
-        logger.info(
-          `Checking server ${server.name} (${server.uuid}): ${serverCommand}`,
-        );
-        if (serverCommand === fullCommand) {
-          logger.info(
-            `Found exact match for server ${server.name} (${server.uuid})`,
-          );
-          return server.uuid;
-        }
-      }
+  if (requestedUuid) {
+    const server = await mcpServersRepository.findByUuid(requestedUuid);
+    if (
+      !server ||
+      server.type !== McpServerTypeEnum.enum.STDIO ||
+      !server.command
+    ) {
+      throw new Error(
+        "No registered STDIO MCP server matches this request. Connect to a server that exists in the server list.",
+      );
     }
-
-    // If no exact match, try to find by command only (for cases where args might vary)
-    for (const server of servers) {
-      if (server.type === "STDIO" && server.command === command) {
-        logger.info(
-          `Found command-only match for server ${server.name} (${server.uuid})`,
-        );
-        return server.uuid;
-      }
-    }
-
-    logger.info(`No server found for command: ${fullCommand}`);
-    return null;
-  } catch (error) {
-    logger.error("Error extracting server UUID from STDIO command:", error);
-    return null;
+    return server;
   }
+
+  const requested = commandLine(
+    typeof req.query.command === "string" ? req.query.command : "",
+    typeof req.query.args === "string" ? req.query.args : "",
+  );
+  const servers = await mcpServersRepository.findAll();
+  const server = servers.find(
+    (candidate) =>
+      candidate.type === McpServerTypeEnum.enum.STDIO &&
+      candidate.command &&
+      commandLine(candidate.command, (candidate.args || []).join(" ")) ===
+        requested,
+  );
+
+  if (!server) {
+    // The refused command is NOT echoed: it is caller-controlled text, and the
+    // reason a request lands here at all is usually that someone sent one.
+    logger.warn(
+      "STDIO proxy request refused: no registered server matches the requested command",
+    );
+    throw new Error(
+      "No registered STDIO MCP server matches this request. Connect to a server that exists in the server list.",
+    );
+  }
+
+  return server;
 };
+
+/**
+ * Build the spawn parameters for a resolved server row.
+ *
+ * `args` comes from the stored array rather than from a shell-parse of the
+ * request's flattened string, so an argument that legitimately contains a
+ * space survives instead of being split into two.
+ */
+const buildStdioSpawnParams = (server: DatabaseMcpServer): StdioSpawnParams => {
+  const env = {
+    ...process.env,
+    ...defaultEnvironment,
+    ...resolveEnvVariables(server.env || {}),
+  } as Record<string, string>;
+
+  const { cmd, args } = findActualExecutable(
+    server.command || "",
+    server.args || [],
+  );
+
+  return {
+    serverUuid: server.uuid,
+    serverName: server.name,
+    errorStatus: server.error_status ?? null,
+    cmd,
+    args,
+    env,
+  };
+};
+
+/**
+ * Resolve what a STDIO proxy request may spawn, from the server record only.
+ *
+ * Exported for unit tests (server.spawn-source.test.ts); the production caller
+ * is `createTransport` below.
+ */
+export const resolveStdioSpawnParams = async (
+  req: express.Request,
+): Promise<StdioSpawnParams> =>
+  buildStdioSpawnParams(await findRegisteredStdioServer(req));
+
+/**
+ * Spawn parameters resolved for THIS request.
+ *
+ * The crash and cooldown handlers on the routes below need the same values the
+ * process was actually started with. They used to re-derive them from the query
+ * string, which no longer decides anything — re-deriving would key the cooldown
+ * on one command line while the process ran another.
+ */
+const resolvedStdioParams = new WeakMap<express.Request, StdioSpawnParams>();
 
 // Function to check if server is in error state
 const checkServerErrorStatus = async (serverUuid: string): Promise<boolean> => {
@@ -191,8 +276,8 @@ const serverRouter = express.Router();
 // Auth (session) and authorization (admin-only) are applied once by the
 // parent router in `routers/mcp-proxy.ts`, so every route below is already
 // admin-gated by the time it runs. Do NOT mount this router anywhere else:
-// /stdio, /sse and POST /mcp all reach `createTransport`, which spawns a
-// query-string-supplied command with the backend's environment.
+// /stdio, /sse and POST /mcp all reach `createTransport`, which starts a
+// registered MCP server with the backend's environment.
 
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by web app sessionId
 const serverTransports: Map<string, Transport> = new Map<string, Transport>(); // Server Transports by web app sessionId
@@ -234,21 +319,23 @@ const cleanupSession = async (sessionId: string) => {
 
 const createTransport = async (req: express.Request): Promise<Transport> => {
   const query = req.query;
-  logger.info("Query parameters:", JSON.stringify(query));
+  // Only the transport type is logged. The whole query used to be dumped here,
+  // and an older client still sends its server's `env` in it — i.e. that line
+  // wrote vendor API keys into the application log. Nothing on this path reads
+  // the query for spawn input any more, so there is nothing left worth logging.
+  logger.info(
+    `MCP proxy connection request: transportType=${query.transportType}`,
+  );
 
   const transportType = query.transportType as string;
 
   if (transportType === McpServerTypeEnum.enum.STDIO) {
-    const command = query.command as string;
-    const origArgs = shellParseArgs(query.args as string) as string[];
-    const queryEnv = query.env ? JSON.parse(query.env as string) : {};
-
-    // Resolve environment variable placeholders
-    const resolvedQueryEnv = resolveEnvVariables(queryEnv);
-
-    const env = { ...process.env, ...defaultEnvironment, ...resolvedQueryEnv };
-
-    const { cmd, args } = findActualExecutable(command, origArgs);
+    // Command, args and env come from the `mcp_servers` row and nowhere else.
+    // `query.command` / `query.args` / `query.env` are no longer read as spawn
+    // input at all — see findRegisteredStdioServer.
+    const spawnParams = await resolveStdioSpawnParams(req);
+    const { cmd, args, env } = spawnParams;
+    resolvedStdioParams.set(req, spawnParams);
 
     // Check if this command is in cooldown
     if (isStdioInCooldown(cmd, args, env)) {
@@ -263,18 +350,20 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       }
     }
 
-    // Check if the server is in error state
-    const serverUuid = await extractServerUuidFromStdioCommand(cmd, args);
-    if (serverUuid) {
-      const isInError = await checkServerErrorStatus(serverUuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
+    // Check if the server is in error state. Read off the row already loaded
+    // above rather than re-fetching it by uuid.
+    if (spawnParams.errorStatus === McpServerErrorStatusEnum.enum.ERROR) {
+      logger.info(
+        `Server ${spawnParams.serverName} (${spawnParams.serverUuid}) is in ERROR state`,
+      );
+      throw new Error(
+        `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
+      );
     }
 
-    logger.info(`STDIO transport: command=${cmd}, args=${args}`);
+    logger.info(
+      `STDIO transport: server=${spawnParams.serverName} (${spawnParams.serverUuid})`,
+    );
 
     const transport = new ProcessManagedStdioTransport({
       command: cmd,
@@ -416,18 +505,11 @@ serverRouter.post("/mcp", async (req, res) => {
             `StreamableHttp STDIO process crashed with code: ${exitCode}, signal: ${signal}`,
           );
 
-          // Try to extract server UUID from the command/args
-          const query = req.query;
-          const command = query.command as string;
-          const origArgs = shellParseArgs(query.args as string) as string[];
+          const spawnParams = resolvedStdioParams.get(req);
 
-          const serverUuid = await extractServerUuidFromStdioCommand(
-            command,
-            origArgs,
-          );
-
-          if (serverUuid) {
+          if (spawnParams) {
             // Report crash to server pool
+            const { serverUuid } = spawnParams;
             mcpServerPool
               .handleServerCrashWithoutNamespace(serverUuid, exitCode, signal)
               .catch((error) => {
@@ -438,7 +520,7 @@ serverRouter.post("/mcp", async (req, res) => {
               });
           } else {
             logger.warn(
-              `Could not determine server UUID for crashed StreamableHttp STDIO process: ${command} ${origArgs.join(" ")}`,
+              "Could not determine server UUID for crashed StreamableHttp STDIO process",
             );
           }
         };
@@ -603,23 +685,10 @@ serverRouter.get("/stdio", async (req, res) => {
         `STDIO process crashed with code: ${exitCode}, signal: ${signal}`,
       );
 
-      // Try to extract server UUID from the command/args
-      const query = req.query;
-      const command = query.command as string;
-      const origArgs = shellParseArgs(query.args as string) as string[];
+      const spawnParams = resolvedStdioParams.get(req);
 
-      logger.info(
-        `STDIO crash handler called for command: ${command} ${origArgs.join(" ")}`,
-      );
-
-      // For filesys server, the server UUID might be in the args or we need to derive it
-      // For now, we'll use a fallback approach to find the server UUID
-      const serverUuid = await extractServerUuidFromStdioCommand(
-        command,
-        origArgs,
-      );
-
-      if (serverUuid) {
+      if (spawnParams) {
+        const { serverUuid } = spawnParams;
         logger.info(
           `Reporting crash to server pool for server UUID: ${serverUuid}`,
         );
@@ -634,7 +703,7 @@ serverRouter.get("/stdio", async (req, res) => {
           });
       } else {
         logger.warn(
-          `Could not determine server UUID for crashed STDIO process: ${command} ${origArgs.join(" ")}`,
+          "Could not determine server UUID for crashed STDIO process",
         );
       }
     };
@@ -646,19 +715,10 @@ serverRouter.get("/stdio", async (req, res) => {
     // Handle transport close events
     stdinTransport.onclose = () => {
       const runTime = Date.now() - commandStartTime;
-      if (runTime < QUICK_FAILURE_THRESHOLD) {
+      const spawnParams = resolvedStdioParams.get(req);
+      if (runTime < QUICK_FAILURE_THRESHOLD && spawnParams) {
         // Process failed quickly, likely a startup error
-        const query = req.query;
-        const command = query.command as string;
-        const origArgs = shellParseArgs(query.args as string) as string[];
-        const queryEnv = query.env ? JSON.parse(query.env as string) : {};
-        const resolvedQueryEnv = resolveEnvVariables(queryEnv);
-        const env = {
-          ...process.env,
-          ...defaultEnvironment,
-          ...resolvedQueryEnv,
-        };
-        const { cmd, args } = findActualExecutable(command, origArgs);
+        const { cmd, args, env } = spawnParams;
 
         setStdioCooldown(cmd, args, env);
         logger.info(
@@ -690,21 +750,13 @@ serverRouter.get("/stdio", async (req, res) => {
           logger.error("Command not found, transports removed");
         } else {
           // Check for common startup errors that should trigger cooldown
+          const spawnParams = resolvedStdioParams.get(req);
           if (
-            errorContent.includes("ENOENT") ||
-            errorContent.includes("no such file or directory")
+            spawnParams &&
+            (errorContent.includes("ENOENT") ||
+              errorContent.includes("no such file or directory"))
           ) {
-            const query = req.query;
-            const command = query.command as string;
-            const origArgs = shellParseArgs(query.args as string) as string[];
-            const queryEnv = query.env ? JSON.parse(query.env as string) : {};
-            const resolvedQueryEnv = resolveEnvVariables(queryEnv);
-            const env = {
-              ...process.env,
-              ...defaultEnvironment,
-              ...resolvedQueryEnv,
-            };
-            const { cmd, args } = findActualExecutable(command, origArgs);
+            const { cmd, args, env } = spawnParams;
 
             setStdioCooldown(cmd, args, env);
             logger.info(

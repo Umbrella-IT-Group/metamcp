@@ -45,9 +45,13 @@ mcpProxyRouter.use((req, res, next) => {
 // cookie, requireEnabledMcpMiddleware then re-reads `users.disabled` for that
 // id, and requireAdminMcpMiddleware reads `req.user.role`. The admin
 // restriction is not incidental hardening — the STDIO branch of
-// /server/{stdio,sse,mcp} spawns a query-string-supplied command with the
-// backend's environment, so session-only access was remote code execution
-// for any member. See middleware/require-admin-mcp.middleware.ts.
+// /server/{stdio,sse,mcp} spawns a process with the backend's environment, so
+// session-only access was remote code execution for any member back when the
+// command came off the query string. It now comes from the `mcp_servers` row
+// only (see mcp-proxy/server.ts findRegisteredStdioServer), which makes these
+// two layers independent: the gate decides WHO may start a server, the
+// resolver decides WHICH servers exist to be started, and neither is the
+// other's backstop. See middleware/require-admin-mcp.middleware.ts.
 //
 // The disabled gate sits between the two because a valid cookie is not a
 // valid ACCOUNT: nothing else on this router re-reads `users.disabled`, so
