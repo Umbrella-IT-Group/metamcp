@@ -548,6 +548,7 @@ export const mcpServersImplementations = {
   reconnect: async (
     input: z.infer<typeof ReconnectMcpServerRequestSchema>,
     userId: string,
+    isAdmin: boolean,
   ): Promise<z.infer<typeof ReconnectMcpServerResponseSchema>> => {
     try {
       // Check if server exists and user has permission to act on it
@@ -560,8 +561,30 @@ export const mcpServersImplementations = {
         };
       }
 
-      // Only server owner can reconnect their own servers, only admin can
-      // reconnect public servers — same trust boundary as update/delete.
+      // Only the server owner can reconnect their own server, and only an
+      // admin can reconnect a PUBLIC one. The public half is the half the
+      // ownership test cannot make: `user_id` is NULL on a public server, so
+      // the check below is vacuously true for every caller and each of them
+      // reached the cascade underneath — which tears down every active and
+      // idle pooled connection for that server and forces every downstream
+      // consumer to re-list. On the shared servers this gateway exists to
+      // serve, that is any member being able to interrupt everyone's traffic
+      // on demand. The role arrives from `ctx.user.role` at the router
+      // (packages/trpc/src/routers/frontend/mcp-servers.ts) rather than being
+      // re-derived here, so it is the same session role `adminProcedure`
+      // gates on. Ordered public-first because it is the broader denial.
+      if (!server.user_id && !isAdmin) {
+        return {
+          success: false as const,
+          message:
+            "Access denied: Only an administrator can reconnect a public server",
+        };
+      }
+
+      // Someone else's PRIVATE server, unchanged: not admin-exempt either,
+      // because an admin who needs to act on a member's own server has the
+      // admin-gated update/delete paths for it and does not need a second
+      // route into it here.
       if (server.user_id && server.user_id !== userId) {
         return {
           success: false as const,

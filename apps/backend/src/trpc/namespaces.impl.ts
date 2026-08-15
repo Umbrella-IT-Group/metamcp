@@ -727,6 +727,7 @@ export const namespacesImplementations = {
   refreshTools: async (
     input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
     userId: string,
+    isAdmin: boolean,
   ): Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>> => {
     try {
       // First, check if user has permission to refresh tools for this namespace
@@ -738,6 +739,31 @@ export const namespacesImplementations = {
         return {
           success: false as const,
           message: "Namespace not found",
+        };
+      }
+
+      // A PUBLIC namespace has no `user_id`, so the ownership test below is
+      // vacuously true for every caller and each of them reached the writes
+      // underneath. Those writes are not a refresh of what the upstream
+      // server reported: the tool list arrives IN THE REQUEST, and it is
+      // upserted straight into the shared `tools` catalog (description and
+      // tool_schema overwritten per mcp_server_uuid + name, on a server
+      // resolved by NAME across the whole estate) and then written as ACTIVE
+      // namespace tool mappings. So a caller reaching this on a public
+      // namespace can rewrite what every downstream MCP client is told a
+      // tool does, and switch back on the mappings `updateToolStatus`
+      // (adminProcedure) exists to switch off. The role is threaded from the
+      // router rather than re-derived here, matching `mcpServers.reconnect`.
+      //
+      // This costs no member workflow: the only producer of this payload is
+      // the namespace page's MetaMCP connection, which rides
+      // `/mcp-proxy/metamcp/:uuid/sse` and has been admin-only since that
+      // router's gate (routers/mcp-proxy.ts).
+      if (!namespace.user_id && !isAdmin) {
+        return {
+          success: false as const,
+          message:
+            "Access denied: Only an administrator can refresh tools for a public namespace",
         };
       }
 

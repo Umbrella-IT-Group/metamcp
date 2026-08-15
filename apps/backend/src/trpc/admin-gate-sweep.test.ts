@@ -8,11 +8,14 @@
  * below, which now asserts absence.
  *
  * Pre-condition verified by code inspection: `namespaces.refreshTools`
- * (member-accessible, kept as-is — see namespaces-curation-admin.test.ts)
- * calls `toolsRepository.bulkUpsert` directly from
- * `apps/backend/src/trpc/namespaces.impl.ts`, never routing through the
- * `tools.create`/`tools.sync` tRPC procedures gated here. Gating those two
- * procedures therefore has no effect on the refreshTools member path.
+ * (still protectedProcedure, so a non-admin owner keeps it — see
+ * namespaces-curation-admin.test.ts) calls `toolsRepository.bulkUpsert`
+ * directly from `apps/backend/src/trpc/namespaces.impl.ts`, never routing
+ * through the `tools.create`/`tools.sync` tRPC procedures gated here.
+ * Gating those two procedures therefore had no effect on the refreshTools
+ * path — which is why that path needed its own gate for the PUBLIC-namespace
+ * case, added in the impl and pinned by
+ * `namespaces.refresh-tools.impl.test.ts`.
  */
 
 import {
