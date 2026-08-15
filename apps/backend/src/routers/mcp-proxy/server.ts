@@ -269,28 +269,64 @@ export const resolveStdioSpawnParams = async (
  */
 const resolvedStdioParams = new WeakMap<express.Request, StdioSpawnParams>();
 
-// Function to check if server is in error state
-const checkServerErrorStatus = async (serverUuid: string): Promise<boolean> => {
-  try {
-    const server = await mcpServersRepository.findByUuid(serverUuid);
-    if (!server) {
-      logger.info(`Server ${serverUuid} not found`);
-      return false;
-    }
+/**
+ * Refusal for a remote-transport request whose caller cannot be identified.
+ * Same wording discipline as NO_SUCH_SERVER above: it describes nothing about
+ * the estate.
+ */
+const NO_REMOTE_SERVER_CONTEXT =
+  "Unable to establish who is making this request. Sign in again and retry.";
 
-    const isInError =
-      server.error_status === McpServerErrorStatusEnum.enum.ERROR;
-    if (isInError) {
-      logger.info(`Server ${server.name} (${serverUuid}) is in ERROR state`);
-    }
-    return isInError;
-  } catch (error) {
-    logger.error(
-      `Error checking server error status for ${serverUuid}:`,
-      error,
+/**
+ * Find the registered `mcp_servers` row that describes a REMOTE (SSE or
+ * STREAMABLE_HTTP) destination, SCOPED TO WHAT THE CALLER MAY SEE, or
+ * undefined when nothing they can see matches.
+ *
+ * The row does NOT authorise the connection — `assertPublicMcpUrl` decides
+ * whether a destination may be reached at all, and an unregistered public URL
+ * is meant to connect. What the row supplies is STORED CREDENTIALS: its
+ * `headers` jsonb is merged into every outbound request, and that jsonb is
+ * where a server's vendor API keys live.
+ *
+ * So the lookup used to be `findAll()` — every row in the installation — and
+ * matched on the URL the CALLER sent. Naming another user's PRIVATE server's
+ * URL therefore merged THAT user's stored API keys into a request whose
+ * destination the caller chose. The admin gate on this router answers "may
+ * this person use the proxy at all", not "whose stored credentials may they
+ * spend". Same predicate as the server list itself (`findAllAccessibleToUser`:
+ * public rows plus the caller's own), and the same reasoning as the STDIO
+ * resolver above.
+ *
+ * Returns undefined rather than throwing when nothing matches, deliberately.
+ * A URL with no row is the "point the Inspector at a server that is not saved
+ * yet" flow and must still connect — just with no stored headers attached. It
+ * also means an inaccessible row and a nonexistent row produce IDENTICAL
+ * behaviour, so this cannot be used to test whether a given URL is registered
+ * to somebody else.
+ */
+const findAccessibleRemoteServer = async (
+  req: express.Request,
+  transportType: string,
+  url: string,
+): Promise<DatabaseMcpServer | undefined> => {
+  const user = (req as express.Request & { user?: SessionUser }).user;
+  const userId = user?.id;
+
+  if (!userId) {
+    // Fail closed. The gates ahead of this router already refuse a session
+    // without a user id, so reaching here means the chain changed — and the
+    // fallback that "helpfully" widens to every row is the bug being fixed.
+    logger.warn(
+      "Remote MCP proxy request refused: no session user on the request",
     );
-    return false;
+    throw new Error(NO_REMOTE_SERVER_CONTEXT);
   }
+
+  const accessible = await mcpServersRepository.findAllAccessibleToUser(userId);
+
+  return accessible.find(
+    (candidate) => candidate.type === transportType && candidate.url === url,
+  );
 };
 
 // Function to get HTTP headers.
@@ -458,18 +494,25 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     // flow that has to keep working.
     const target = await assertPublicMcpUrl(url);
 
-    // Check if the server is in error state (for SSE, we need to find server by URL)
-    const servers = await mcpServersRepository.findAll();
-    const matchingServer = servers.find(
-      (server) => server.type === "SSE" && server.url === url,
+    // Find the row this URL belongs to, among the rows the caller may see.
+    // Its stored `headers` are merged below, so an unscoped lookup here hands
+    // out another user's vendor API keys — see findAccessibleRemoteServer.
+    const matchingServer = await findAccessibleRemoteServer(
+      req,
+      transportType,
+      url,
     );
-    if (matchingServer) {
-      const isInError = await checkServerErrorStatus(matchingServer.uuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
+
+    // Error state is read off the row already loaded rather than re-fetched by
+    // uuid: the re-fetch was a second, UNSCOPED lookup of a row we are already
+    // holding, which is the exact call this fix exists to remove from the path.
+    if (matchingServer?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
+      logger.info(
+        `Server ${matchingServer.name} (${matchingServer.uuid}) is in ERROR state`,
+      );
+      throw new Error(
+        `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
+      );
     }
 
     // Merge custom headers from database with passthrough headers from request
@@ -483,8 +526,12 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     // object wrote both the caller's bearer token and the server's vendor API
     // keys into app.log on every SSE connect. The names are what a connectivity
     // problem is actually diagnosed from; the values never were.
+    //
+    // The url is JSON.stringify'd for the same reason the transportType above
+    // is: it is caller-supplied, so interpolating it raw lets an embedded
+    // newline forge whole log lines.
     logger.info(
-      `SSE transport: url=${url}, headers=[${Object.keys(headers).join(", ")}]`,
+      `SSE transport: url=${JSON.stringify(url)}, headers=[${Object.keys(headers).join(", ")}]`,
     );
 
     // Every request this transport makes goes through the guard, not just the
@@ -512,18 +559,21 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     // Same destination check as the SSE branch above — see ./url-guard.
     const target = await assertPublicMcpUrl(url);
 
-    // Check if the server is in error state (for STREAMABLE_HTTP, we need to find server by URL)
-    const servers = await mcpServersRepository.findAll();
-    const matchingServer = servers.find(
-      (server) => server.type === "STREAMABLE_HTTP" && server.url === url,
+    // Same caller-scoped row lookup and same in-memory error-state read as the
+    // SSE branch above — see findAccessibleRemoteServer.
+    const matchingServer = await findAccessibleRemoteServer(
+      req,
+      transportType,
+      url,
     );
-    if (matchingServer) {
-      const isInError = await checkServerErrorStatus(matchingServer.uuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
+
+    if (matchingServer?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
+      logger.info(
+        `Server ${matchingServer.name} (${matchingServer.uuid}) is in ERROR state`,
+      );
+      throw new Error(
+        `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
+      );
     }
 
     // Merge custom headers from database with passthrough headers from request
