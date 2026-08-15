@@ -74,9 +74,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # NOTE: lint + check-types are intentionally not gated here. Upstream
-  # `main` has pre-existing eslint warnings under `--max-warnings 0` and
-  # a tRPC type error in apps/frontend/lib/trpc.ts that aren't caused by
+  # NOTE: this workflow builds the image and nothing else. Tests and
+  # check-types run in umbrella-ci.yml, on the same push/PR-to-`umbrella`
+  # triggers — the frontend tRPC type error this note used to cite is gone,
+  # so check-types is green and gated there. `lint` is still deliberately
+  # ungated anywhere: upstream `main` carries pre-existing eslint warnings
+  # that `--max-warnings 0` turns into a failure, and they aren't caused by
   # our cherry-picks. Upstream itself only runs docker-publish on tags so
   # these never get noticed there. Tracked as a follow-up — see
   # UMBRELLA_FORK.md "Our own patches" backlog.

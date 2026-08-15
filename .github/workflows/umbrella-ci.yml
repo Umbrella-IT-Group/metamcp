@@ -1,0 +1,84 @@
+name: Umbrella — Test & Typecheck (umbrella branch)
+
+# Umbrella IT Group fork — see UMBRELLA_FORK.md.
+# umbrella-build.yml proves the Dockerfile still produces an image; it has
+# never run the test suite or tsc. That gap is not theoretical: a mechanical
+# rename landed an identifier with a space in it, the file stopped parsing,
+# and a whole file's worth of assertions dropped out of every run with
+# nothing anywhere to notice. This workflow is the thing that notices.
+#
+# Deliberately has NO `paths:` filter, unlike umbrella-build.yml. A required
+# status check that is path-filtered never reports at all on a PR that misses
+# the filter, and GitHub then blocks that PR forever waiting on a status that
+# is never coming. Running on every push/PR is what makes this job safe to
+# mark required in branch protection (context name: `test-and-typecheck`).
+
+on:
+  push:
+    branches:
+      - umbrella
+  pull_request:
+    branches:
+      - umbrella
+  workflow_dispatch:
+
+# Nothing here publishes, so a superseded run has no residual value — unlike
+# the push-to-`umbrella` image build, which queues instead of cancelling so
+# every commit keeps its own :sha tag and attestation. Cancelling on both
+# paths just stops paying for an answer about a commit nobody is on anymore.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-typecheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `version:` input on purpose. pnpm/action-setup reads the root
+      # package.json `packageManager` field when the input is omitted, and
+      # hard-errors if an input and that field disagree — so leaving it out
+      # keeps the repo's own pin the single source of truth and means a
+      # future bump to `packageManager` doesn't silently skip CI. (The
+      # Dockerfile installs its own, newer pnpm; that's the image's
+      # business, not this job's.)
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the Node the Dockerfile installs (nodesource setup_20.x),
+          # so a type or runtime error CI catches is one the image would hit.
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # MANDATORY before anything typechecks or imports, and the reason is
+      # not obvious: `@repo/zod-types` and `@repo/trpc` are consumed through
+      # their `dist/`, which is gitignored and therefore never present on a
+      # fresh checkout, and turbo's `check-types`/`test` tasks do not depend
+      # on `^build`. Skipping this doesn't fail as "missing build" — it fails
+      # as ~30 test files that can't resolve their imports plus a wall of
+      # TS2307, which reads like a code break and sends the reader hunting in
+      # the wrong place. zod-types first: trpc's types are built against it.
+      - run: pnpm --filter @repo/zod-types build
+      - run: pnpm --filter @repo/trpc build
+
+      # No DATABASE_URL, and deliberately no TEST_DATABASE_URL either. The
+      # postgres integration cases gate themselves on TEST_DATABASE_URL
+      # (`describe.skipIf`), so they skip here and every other case runs
+      # against no infrastructure at all. Standing up a real database to
+      # un-skip them is a separate decision with its own cost, not something
+      # to smuggle in behind a unit-test gate.
+      - run: pnpm -C apps/backend test
+      - run: pnpm -C apps/frontend test
+
+      # Root script — `turbo run check-types` across backend, frontend and
+      # @repo/zod-types. `lint` stays out: apps/frontend carries pre-existing
+      # eslint warnings that `--max-warnings 0` turns into a hard failure, so
+      # gating it today would just make this check permanently red.
+      - run: pnpm check-types
