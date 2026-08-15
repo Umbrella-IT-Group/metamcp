@@ -178,6 +178,25 @@ describe("namespaces.refreshTools implementation — access gate", () => {
     expect(toolsRepository.bulkUpsert).not.toHaveBeenCalled();
   });
 
+  it("does not exempt an ADMIN from someone else's PRIVATE namespace", async () => {
+    // Deliberate, and unchanged by the public-namespace gate: the role
+    // decides only the unowned case. Mirrors the reconnect suite's
+    // admin-non-exemption test — an admin who needs to act on a member's own
+    // namespace has the admin-gated update/curation paths for it.
+    vi.mocked(namespacesRepository.findByUuid).mockResolvedValue(
+      fakeNamespace({ user_id: "owner-A" }),
+    );
+
+    const result = await refresh("admin-1", true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("Access denied");
+    expect(toolsRepository.bulkUpsert).not.toHaveBeenCalled();
+    expect(
+      namespaceMappingsRepository.bulkUpsertNamespaceToolMappings,
+    ).not.toHaveBeenCalled();
+  });
+
   it("returns not-found and writes nothing when the namespace does not exist", async () => {
     vi.mocked(namespacesRepository.findByUuid).mockResolvedValue(
       undefined as never,
