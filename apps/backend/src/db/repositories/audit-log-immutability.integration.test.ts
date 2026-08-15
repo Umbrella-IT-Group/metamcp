@@ -89,13 +89,20 @@ describe("drizzle journal", () => {
     const [entry] = journal.entries.filter((e) => e.tag === "0028_audit_log");
     expect(entry).toBeDefined();
 
-    const others = journal.entries.filter((e) => e.tag !== "0028_audit_log");
-    const maxOther = Math.max(...others.map((e) => e.when));
+    // EARLIER entries only, which is what the name has always claimed. This
+    // compared against every OTHER entry until 0029 was added, and passed only
+    // because 0028 happened to be last — so the first migration to land after
+    // it failed this assertion despite being perfectly ordered. The property
+    // that actually matters is one-directional: nothing BEFORE 0028 may have a
+    // `when` at or above it. Whether later migrations exceed it is their own
+    // business, and the monotonicity test below covers the journal as a whole.
+    const earlier = journal.entries.filter((e) => e.idx < entry.idx);
+    const maxEarlier = Math.max(...earlier.map((e) => e.when));
 
     // drizzle applies only entries whose `when` exceeds the max already
     // applied. Get this wrong and the migration is skipped in production
     // WITHOUT an error — the audit table simply never exists.
-    expect(entry.when).toBeGreaterThan(maxOther);
+    expect(entry.when).toBeGreaterThan(maxEarlier);
     expect(entry.idx).toBe(28);
   });
 
