@@ -16,6 +16,7 @@ import {
 } from "@repo/zod-types";
 import express from "express";
 import { findActualExecutable } from "spawn-rx";
+import { z } from "zod";
 
 import logger from "@/utils/logger";
 
@@ -92,6 +93,40 @@ const commandLine = (command: string, args: string): string =>
   `${command} ${args}`.trim();
 
 /**
+ * One refusal string for every way a request can fail to name a server the
+ * caller may start. Unknown uuid, malformed uuid, wrong transport type, a
+ * command line nobody registered, and somebody else's private server all
+ * answer identically — the alternative tells a caller which of those it hit,
+ * which is a server-enumeration oracle on a route that starts processes.
+ */
+const NO_SUCH_SERVER =
+  "No registered STDIO MCP server matches this request. Connect to a server that exists in the server list.";
+
+/**
+ * Guard rail, deliberately kept even though nothing today can trip it.
+ *
+ * `mcp_servers.uuid` is a Postgres `uuid` column, so a value that is not one
+ * makes the driver raise 22P02 instead of matching no row — and the value here
+ * is caller-supplied, including the literal string "undefined" that a stale
+ * bundle sends. Uncaught on this path, that surfaces as a 500 serialising a
+ * driver error object.
+ *
+ * It cannot happen as the code stands, because the ownership scope below
+ * resolves by filtering an already-fetched set IN MEMORY and no caller-supplied
+ * uuid reaches the database at all. This check exists so that the day someone
+ * reintroduces a by-uuid lookup for efficiency — the obvious optimisation —
+ * they inherit the validation rather than the driver error. Being unreachable
+ * is the reason it is cheap, not a reason to drop it.
+ */
+const uuidSchema = z.string().uuid();
+
+/**
+ * The session user, as `betterAuthMcpMiddleware` leaves it on the request.
+ * Mirrors the shape `requireAdminMcpMiddleware` reads.
+ */
+type SessionUser = { id?: string; role?: string };
+
+/**
  * Find the registered `mcp_servers` row a STDIO proxy request is asking to
  * start, or throw.
  *
@@ -109,25 +144,52 @@ const commandLine = (command: string, args: string): string =>
  *    are what gets spawned either way. Matching is deliberately on the whole
  *    line and never on the executable alone — a `command`-only match would
  *    accept `npx <anything>` the moment one registered server used `npx`.
+ *
+ * SCOPED TO WHAT THE CALLER MAY SEE, by the same predicate the server list
+ * itself uses (`findAllAccessibleToUser`: public rows plus the caller's own).
+ * The admin gate on this router answers "may this person use the proxy at
+ * all", not "whose servers may they start" — without this scope an admin could
+ * name another user's PRIVATE server, one that never appears in their own UI,
+ * and drive its tools with that user's stored `env` secrets. Being able to
+ * reach a route is not the same as being entitled to every row behind it.
  */
 const findRegisteredStdioServer = async (
   req: express.Request,
 ): Promise<DatabaseMcpServer> => {
+  const user = (req as express.Request & { user?: SessionUser }).user;
+  const userId = user?.id;
+
+  if (!userId) {
+    // Fail closed. The gates ahead of this router already refuse a session
+    // without a user id, so reaching here means the chain changed.
+    logger.warn("STDIO proxy request refused: no session user on the request");
+    throw new Error(NO_SUCH_SERVER);
+  }
+
+  const accessible = await mcpServersRepository.findAllAccessibleToUser(userId);
+
   const requestedUuid =
     typeof req.query.mcpServerUuid === "string"
       ? req.query.mcpServerUuid
       : undefined;
 
   if (requestedUuid) {
-    const server = await mcpServersRepository.findByUuid(requestedUuid);
-    if (
-      !server ||
-      server.type !== McpServerTypeEnum.enum.STDIO ||
-      !server.command
-    ) {
-      throw new Error(
-        "No registered STDIO MCP server matches this request. Connect to a server that exists in the server list.",
+    if (!uuidSchema.safeParse(requestedUuid).success) {
+      logger.warn("STDIO proxy request refused: malformed server identifier");
+      throw new Error(NO_SUCH_SERVER);
+    }
+
+    const server = accessible.find(
+      (candidate) =>
+        candidate.uuid === requestedUuid &&
+        candidate.type === McpServerTypeEnum.enum.STDIO &&
+        candidate.command,
+    );
+    if (!server) {
+      logger.warn(
+        "STDIO proxy request refused: no accessible server matches the requested identifier",
       );
+      throw new Error(NO_SUCH_SERVER);
     }
     return server;
   }
@@ -136,8 +198,7 @@ const findRegisteredStdioServer = async (
     typeof req.query.command === "string" ? req.query.command : "",
     typeof req.query.args === "string" ? req.query.args : "",
   );
-  const servers = await mcpServersRepository.findAll();
-  const server = servers.find(
+  const server = accessible.find(
     (candidate) =>
       candidate.type === McpServerTypeEnum.enum.STDIO &&
       candidate.command &&
@@ -151,9 +212,7 @@ const findRegisteredStdioServer = async (
     logger.warn(
       "STDIO proxy request refused: no registered server matches the requested command",
     );
-    throw new Error(
-      "No registered STDIO MCP server matches this request. Connect to a server that exists in the server list.",
-    );
+    throw new Error(NO_SUCH_SERVER);
   }
 
   return server;
@@ -323,8 +382,13 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
   // and an older client still sends its server's `env` in it — i.e. that line
   // wrote vendor API keys into the application log. Nothing on this path reads
   // the query for spawn input any more, so there is nothing left worth logging.
+  //
+  // JSON.stringify, not bare interpolation: the value is caller-supplied, so an
+  // embedded newline would forge whole log lines. The dump this replaced
+  // escaped CRLF for free by virtue of being stringified; interpolating one
+  // field out of it would quietly give that back.
   logger.info(
-    `MCP proxy connection request: transportType=${query.transportType}`,
+    `MCP proxy connection request: transportType=${JSON.stringify(query.transportType)}`,
   );
 
   const transportType = query.transportType as string;
@@ -406,8 +470,13 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       ...getHttpHeaders(req, transportType),
     };
 
+    // Header NAMES only. `headers` is the row's stored `headers` jsonb merged
+    // with the request's passthrough `authorization`, so stringifying the whole
+    // object wrote both the caller's bearer token and the server's vendor API
+    // keys into app.log on every SSE connect. The names are what a connectivity
+    // problem is actually diagnosed from; the values never were.
     logger.info(
-      `SSE transport: url=${url}, headers=${JSON.stringify(headers)}`,
+      `SSE transport: url=${url}, headers=[${Object.keys(headers).join(", ")}]`,
     );
 
     const transport = new SSEClientTransport(new URL(url), {
