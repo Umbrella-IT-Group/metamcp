@@ -18,7 +18,12 @@
  *  - the registration controls resolve FAIL-CLOSED from an unset environment
  *    and leave an audit row when, and only when, a boot actually moves one of
  *    them. Both live in the entrypoint, so neither is reachable from a unit
- *    test of the parser.
+ *    test of the parser;
+ *  - the registration lock is written AFTER the configured users are created,
+ *    which is what stops the fail-closed default from locking bootstrap out
+ *    of its own onboarding path (`ensureUser` signs users up through the very
+ *    route DISABLE_SIGNUP closes). Only the entrypoint's statement ORDER can
+ *    show this.
  *
  * Env-driven config: each test writes the BOOTSTRAP_* vars it needs and the
  * suite restores the original environment afterwards.
@@ -26,8 +31,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // auth.ts throws without BETTER_AUTH_SECRET and connects to postgres.
-const { authHandlerMock } = vi.hoisted(() => ({
+//
+// `authCallLog` records the length of `statementLog` at each sign-up call.
+// That is the handle the create-before-lock ordering assertion needs: the
+// real signup route refuses once DISABLE_SIGNUP is stored, so "which came
+// first, the sign-up or the config write" is the whole safety property, and
+// nothing in the statement log alone can answer it (`ensureUser` creates
+// users through `auth.handler`, not through a logged insert).
+const { authHandlerMock, authCallLog } = vi.hoisted(() => ({
   authHandlerMock: vi.fn(),
+  authCallLog: [] as { statementsAtCall: number }[],
 }));
 vi.mock("../auth", () => ({ auth: { handler: authHandlerMock } }));
 
@@ -60,9 +73,16 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
      * config rows the registration-control audit compares against. Order is
      * the entrypoint's read order: DISABLE_SIGNUP, then DISABLE_SSO_SIGNUP.
      * An exhausted queue yields `undefined` (the row does not exist), which
-     * is the fresh-database case.
+     * is the fresh-database case. An `Error` in the queue is a FAILED read
+     * rather than a row — the only handle a test has on the catch inside
+     * `readRegistrationFlag`.
      */
-    configFindFirstQueue: [] as (Record<string, unknown> | undefined)[],
+    configFindFirstQueue: [] as (Record<string, unknown> | Error | undefined)[],
+    /** Response `auth.handler` resolves with (the Better Auth sign-up POST). */
+    authHandlerResponse: {
+      ok: true,
+      text: async () => "",
+    } as { ok: boolean; status?: number; text: () => Promise<string> },
   };
 
   // Import the real tables lazily inside the factory-safe closure — the
@@ -143,9 +163,12 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
       namespacesTable: { findFirst: vi.fn(() => Promise.resolve(undefined)) },
       endpointsTable: { findFirst: vi.fn(() => Promise.resolve(undefined)) },
       configTable: {
-        findFirst: vi.fn(() =>
-          Promise.resolve(readFixtures.configFindFirstQueue.shift()),
-        ),
+        findFirst: vi.fn(() => {
+          const next = readFixtures.configFindFirstQueue.shift();
+          return next instanceof Error
+            ? Promise.reject(next)
+            : Promise.resolve(next);
+        }),
       },
     },
   };
@@ -201,6 +224,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   statementLog.length = 0;
   emitLog.length = 0;
+  authCallLog.length = 0;
   // Re-applied per test rather than baked into the hoisted `vi.fn()`: the
   // suite's `restoreAllMocks` teardown drops implementations, and the recorder
   // needs `statementLog`, which only exists once the hoisted block has run.
@@ -209,6 +233,14 @@ beforeEach(() => {
       emitLog.push({ actor, event, statementsAtEmit: statementLog.length });
     },
   );
+  // Same reason, plus one more: the response has to come from a fixture the
+  // tests mutate rather than from `mockResolvedValue`, because a resolved
+  // value would replace this recorder.
+  authHandlerMock.mockImplementation(async () => {
+    authCallLog.push({ statementsAtCall: statementLog.length });
+    return readFixtures.authHandlerResponse;
+  });
+  readFixtures.authHandlerResponse = { ok: true, text: async () => "" };
   readFixtures.preservedKeyRows = [];
   readFixtures.endpointRows = [];
   readFixtures.userRows = [];
@@ -276,7 +308,7 @@ function arrangeRecreateScenario(options?: { apiKeysEnv?: string }) {
   // an identity binding) — post-recreate state with the FRESH user id.
   readFixtures.userRows = [{ id: "new-user-id", email: "admin@example.com" }];
 
-  authHandlerMock.mockResolvedValue({ ok: true, text: async () => "" });
+  readFixtures.authHandlerResponse = { ok: true, text: async () => "" };
 }
 
 describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residual)", () => {
@@ -399,11 +431,11 @@ describe("ensureUser early-return credential loss — preserved keys warned loud
 
   it("warns with preserved-key count + names (never values) when Better Auth sign-up fails after the keys were deleted", async () => {
     arrangeRecreateScenario();
-    authHandlerMock.mockResolvedValue({
+    readFixtures.authHandlerResponse = {
       ok: false,
       status: 500,
       text: async () => "boom",
-    });
+    };
 
     await initializeEnvironmentConfiguration();
 
@@ -588,6 +620,18 @@ describe("registration controls — fail-closed defaults and audited boot-time f
     return index === -1 ? undefined : statementLog[index].values;
   }
 
+  function warnLines(): string[] {
+    return (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+  }
+
+  function logLines(): string[] {
+    return (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+  }
+
   it("resolves BOTH controls to DISABLED when neither env var is set", async () => {
     // `beforeEach` deletes every BOOTSTRAP_* key, so this is the deploy that
     // never mentioned the variables at all — the case upstream leaves open.
@@ -676,5 +720,101 @@ describe("registration controls — fail-closed defaults and audited boot-time f
     expect(emitLog.map((e) => e.event.action)).toEqual([
       "config.signup_disabled.set",
     ]);
+  });
+
+  it("creates the configured user BEFORE writing the lock, so a fresh boot still gets its admin", async () => {
+    // The first boot the reordering exists for: fresh database, fail-closed
+    // defaults, one configured administrator. `ensureUser` onboards through
+    // Better Auth's `/api/auth/sign-up/email`, and `auth.ts`'s
+    // `user.create.before` hook THROWS once DISABLE_SIGNUP is stored, so a
+    // lock written first leaves this deploy with no administrator at all.
+    process.env.BOOTSTRAP_USER_EMAIL = "admin@example.com";
+    process.env.BOOTSTRAP_USER_PASSWORD = "hunter2hunter2";
+    // ensureUser: the existing-user probe (nothing there), then the
+    // post-sign-up re-read.
+    readFixtures.usersFindFirstQueue = [
+      undefined,
+      { id: "new-user-id", email: "admin@example.com" },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    // The lock still lands — this is a fail-closed boot, not an exemption.
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "true" });
+    expect(configWrite("DISABLE_SSO_SIGNUP")).toMatchObject({ value: "true" });
+
+    // And the sign-up POST was issued while both locks were still absent: it
+    // saw a statement log shorter than the index either write landed at.
+    expect(authCallLog).toHaveLength(1);
+    expect(authCallLog[0].statementsAtCall).toBeLessThanOrEqual(
+      configWriteIndex("DISABLE_SIGNUP"),
+    );
+    expect(authCallLog[0].statementsAtCall).toBeLessThanOrEqual(
+      configWriteIndex("DISABLE_SSO_SIGNUP"),
+    );
+  });
+
+  it("still asserts both controls on a guarded (BOOTSTRAP_ONLY_FIRST_RUN) boot", async () => {
+    process.env.BOOTSTRAP_ONLY_FIRST_RUN = "true";
+    process.env.BOOTSTRAP_USER_EMAIL = "admin@example.com";
+    process.env.BOOTSTRAP_USER_PASSWORD = "hunter2hunter2";
+    // The completion-marker read comes first on this path, ahead of the two
+    // registration reads; "true" sends the entrypoint down the early return.
+    readFixtures.configFindFirstQueue = [{ value: "true" }];
+
+    await initializeEnvironmentConfiguration();
+
+    // Genuinely the guarded path: a user WAS configured and was not created.
+    expect(authCallLog).toHaveLength(0);
+    expect(logLines()).toContain(
+      "✅ Environment-based configuration initialized (guarded)",
+    );
+
+    // The controls are "applied every run" controls, and a guarded boot is
+    // still a run: skipping them would leave registration wherever the last
+    // unguarded boot (or an administrator) left it.
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "true" });
+    expect(configWrite("DISABLE_SSO_SIGNUP")).toMatchObject({ value: "true" });
+    // The audit half runs here too (no stored rows, so both flags moved).
+    expect(emitLog.map((e) => e.event.action)).toEqual([
+      "config.signup_disabled.set",
+      "config.sso_signup_disabled.set",
+    ]);
+  });
+
+  it("survives a failed read of the current value and records old_value: null", async () => {
+    // The DISABLE_SIGNUP read throws; the DISABLE_SSO_SIGNUP read succeeds and
+    // matches what this boot wants, so only the unreadable flag emits.
+    readFixtures.configFindFirstQueue = [
+      new Error("connection terminated unexpectedly"),
+      { value: "true" },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    // The boot completed and the write still happened ...
+    expect(logLines()).toContain(
+      "✅ Environment-based configuration initialized successfully",
+    );
+    expect(configWrite("DISABLE_SIGNUP")).toMatchObject({ value: "true" });
+
+    // ... the failed read was said out loud, because the row it produces is
+    // degraded and the log line is what says why ...
+    const warnLine = warnLines().find((line) =>
+      line.includes("registration-control audit"),
+    );
+    expect(warnLine).toBeDefined();
+    expect(warnLine).toContain("DISABLE_SIGNUP");
+
+    // ... and exactly one row was emitted: `null` compares unequal to any
+    // boolean, so an unreadable flag is assumed changed (over-reporting beats
+    // losing the row that says registration reopened), while the flag that
+    // read cleanly as already-true stayed silent.
+    expect(emitLog).toHaveLength(1);
+    expect(emitLog[0].event).toMatchObject({
+      action: "config.signup_disabled.set",
+      target_id: "DISABLE_SIGNUP",
+      detail: { old_value: null, new_value: true, source: "bootstrap_env" },
+    });
   });
 });

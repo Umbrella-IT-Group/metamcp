@@ -341,16 +341,29 @@ function parseEnvConfig(): EnvConfig {
 
     // Registration controls. Upstream defaults BOTH of these OPEN, so an
     // unset variable on a template-derived deploy silently re-opens
-    // self-registration — an unauthenticated account-creation exposure on a
+    // self-registration, an unauthenticated account-creation exposure on a
     // gateway whose whole access model assumes accounts are provisioned.
-    // Absence is therefore read as DISABLED here: the lock is structural, not
-    // a line someone has to remember to add to a new `.env`. `parseBool`
-    // returns the default for an unparseable value as well as an undefined
-    // one, so a typo (`BOOTSTRAP_DISABLE_REGISTRATION_UI=flase`) also fails
-    // closed rather than opening the door. A fresh install onboards its
-    // first administrator through `BOOTSTRAP_USERS`, not UI self-register;
-    // `validateConfig` already warns on the disabled-and-no-users combination
-    // so that path cannot lock an operator out silently.
+    // Absence is therefore read as DISABLED here, and `parseBool` returns the
+    // default for an unparseable value as well as an undefined one, so a typo
+    // (`BOOTSTRAP_DISABLE_REGISTRATION_UI=flase`) also fails closed rather
+    // than opening the door.
+    //
+    // What keeps a fresh install from locking ITSELF out is ORDERING, not a
+    // warning: `applyRegistrationControls` runs AFTER `bootstrapUsers`, so
+    // `BOOTSTRAP_USERS` onboards the first administrator through the signup
+    // route while it is still open and the lock lands behind it. See that
+    // function's comment for why the reverse order self-locks.
+    // (`validateConfig`'s lockout warning does NOT cover this case: it only
+    // fires when `config.users.length === 0`, and the dangerous combination
+    // is disabled-WITH-users-configured, where the users exist to be created
+    // and the refusal would be silent.)
+    //
+    // The lock is structural for a BOOTSTRAP-ENABLED deploy only. A
+    // `BOOTSTRAP_ENABLE=false` deploy never reaches this entrypoint at all
+    // (`startup.ts`), writes no config row, and `configService`'s readers
+    // treat a missing row as `false`, so such a deploy keeps upstream's
+    // open-by-absent-row behaviour and has to close registration by hand in
+    // the admin UI.
     disableUiRegistration: parseBool(
       process.env.BOOTSTRAP_DISABLE_REGISTRATION_UI,
       true,
@@ -413,9 +426,111 @@ async function getConfigValue(key: string): Promise<string | null> {
 async function readRegistrationFlag(key: string): Promise<boolean | null> {
   try {
     return (await getConfigValue(key)) === "true";
-  } catch {
+  } catch (err) {
+    // Said out loud, because the resulting audit row is degraded: it will
+    // carry `old_value: null` and be emitted even if nothing moved, so the
+    // log line is what tells an investigator the null is a failed read rather
+    // than a state the flag was ever in.
+    console.warn(
+      `⚠️ Failed to read current ${key} for the registration-control audit; assuming changed:`,
+      err,
+    );
     return null;
   }
+}
+
+/**
+ * Apply the two registration controls (applied every run), leaving an audit
+ * row for any flag this boot actually moved.
+ *
+ * CALL THIS AFTER `bootstrapUsers`, NEVER BEFORE. The ordering is
+ * load-bearing, not cosmetic. `ensureUser` creates its accounts by POSTing to
+ * Better Auth's own `/api/auth/sign-up/email` through `auth.handler`, which
+ * runs the `databaseHooks.user.create.before` hook in `auth.ts`, and that hook
+ * THROWS once `DISABLE_SIGNUP` is `true`. Writing the lock first therefore
+ * locks bootstrap out of its own onboarding path: with the fail-closed
+ * defaults a fresh database would come up with NO administrator at all, and a
+ * `BOOTSTRAP_RECREATE_USER=true` run would delete the existing administrator
+ * and then fail to recreate it. Creating the configured users first and
+ * locking behind them is what makes the fail-closed default safe on a first
+ * boot.
+ *
+ * The gap this opens is not reachable: the whole sequence runs inside
+ * `initializeOnStartup()`, which `index.ts` awaits BEFORE `app.listen()`, so
+ * no request can arrive while signup is briefly still open.
+ *
+ * These two writes are the same authority as the admin UI's signup toggles,
+ * exercised by the environment instead of by a person: a container restart
+ * carrying a changed (or newly absent) BOOTSTRAP_DISABLE_REGISTRATION_* can
+ * flip who may create an account, and until now it did so with no durable
+ * evidence at all, the only trace being the config row's `updated_at`. They
+ * therefore emit the SAME per-key `config.*.set` actions the UI setters emit
+ * (`trpc/config.impl.ts`), so an investigation reads one timeline instead of
+ * correlating audit rows against container logs. `source: "bootstrap_env"` is
+ * what separates the two origins; the absent actor is what makes the row
+ * `actor_type: "system"` rather than a phantom administrator.
+ *
+ * Only a genuine CHANGE is recorded. Bootstrap re-asserts both flags on EVERY
+ * start, so emitting unconditionally would bury the one restart that moved a
+ * flag under a row per restart that did not.
+ */
+async function applyRegistrationControls(config: EnvConfig): Promise<void> {
+  console.log("🔧 Setting registration controls...");
+  try {
+    const key = ConfigKeyEnum.enum.DISABLE_SIGNUP;
+    const next = config.disableUiRegistration;
+    const previous = await readRegistrationFlag(key);
+    await upsertConfig(
+      key,
+      next.toString(),
+      "Whether new user signup is disabled",
+    );
+    // After the write, never before: a row claiming signup was reopened by a
+    // call that then threw would be worse than no row at all.
+    if (previous !== next) {
+      emitAdminEvent(undefined, {
+        action: "config.signup_disabled.set",
+        target_type: "config_key",
+        target_id: key,
+        detail: {
+          old_value: previous,
+          new_value: next,
+          source: "bootstrap_env",
+        },
+      });
+    }
+  } catch (err) {
+    console.warn("⚠️ Failed to set UI registration control:", err);
+  }
+
+  try {
+    const key = ConfigKeyEnum.enum.DISABLE_SSO_SIGNUP;
+    const next = config.disableSsoRegistration;
+    const previous = await readRegistrationFlag(key);
+    await upsertConfig(
+      key,
+      next.toString(),
+      "Whether new user signup via SSO/OAuth is disabled",
+    );
+    if (previous !== next) {
+      emitAdminEvent(undefined, {
+        action: "config.sso_signup_disabled.set",
+        target_type: "config_key",
+        target_id: key,
+        detail: {
+          old_value: previous,
+          new_value: next,
+          source: "bootstrap_env",
+        },
+      });
+    }
+  } catch (err) {
+    console.warn("⚠️ Failed to set SSO registration control:", err);
+  }
+
+  console.log(
+    `✓ Registration controls set: UI=${!config.disableUiRegistration}, SSO=${!config.disableSsoRegistration}`,
+  );
 }
 
 async function shouldSkipBootstrap(config: EnvConfig): Promise<boolean> {
@@ -1413,82 +1528,15 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
 
   validateConfig(config);
 
-  // Registration controls (applied every run).
-  //
-  // These two writes are the same authority as the admin UI's signup toggles,
-  // exercised by the environment instead of by a person: a container restart
-  // carrying a changed (or newly absent) BOOTSTRAP_DISABLE_REGISTRATION_* can
-  // flip who may create an account, and until now it did so with no durable
-  // evidence at all — the only trace was the config row's `updated_at`. They
-  // therefore emit the SAME per-key `config.*.set` actions the UI setters emit
-  // (`trpc/config.impl.ts`), so an investigation reads one timeline instead of
-  // correlating audit rows against container logs. `source: "bootstrap_env"`
-  // is what separates the two origins; the absent actor is what makes the row
-  // `actor_type: "system"` rather than a phantom administrator.
-  //
-  // Only a genuine CHANGE is recorded. Bootstrap re-asserts both flags on
-  // EVERY start, so emitting unconditionally would bury the one restart that
-  // moved a flag under a row per restart that did not.
-  console.log("🔧 Setting registration controls...");
-  try {
-    const key = ConfigKeyEnum.enum.DISABLE_SIGNUP;
-    const next = config.disableUiRegistration;
-    const previous = await readRegistrationFlag(key);
-    await upsertConfig(
-      key,
-      next.toString(),
-      "Whether new user signup is disabled",
-    );
-    // After the write, never before: a row claiming signup was reopened by a
-    // call that then threw would be worse than no row at all.
-    if (previous !== next) {
-      emitAdminEvent(undefined, {
-        action: "config.signup_disabled.set",
-        target_type: "config_key",
-        target_id: key,
-        detail: {
-          old_value: previous,
-          new_value: next,
-          source: "bootstrap_env",
-        },
-      });
-    }
-  } catch (err) {
-    console.warn("⚠️ Failed to set UI registration control:", err);
-  }
-
-  try {
-    const key = ConfigKeyEnum.enum.DISABLE_SSO_SIGNUP;
-    const next = config.disableSsoRegistration;
-    const previous = await readRegistrationFlag(key);
-    await upsertConfig(
-      key,
-      next.toString(),
-      "Whether new user signup via SSO/OAuth is disabled",
-    );
-    if (previous !== next) {
-      emitAdminEvent(undefined, {
-        action: "config.sso_signup_disabled.set",
-        target_type: "config_key",
-        target_id: key,
-        detail: {
-          old_value: previous,
-          new_value: next,
-          source: "bootstrap_env",
-        },
-      });
-    }
-  } catch (err) {
-    console.warn("⚠️ Failed to set SSO registration control:", err);
-  }
-
-  console.log(
-    `✓ Registration controls set: UI=${!config.disableUiRegistration}, SSO=${!config.disableSsoRegistration}`,
-  );
-
   // One-time bootstrap guard
   const skipBootstrap = await shouldSkipBootstrap(config);
   if (skipBootstrap) {
+    // A guarded boot creates no users, so there is no create-before-lock
+    // ordering to honour here; the flags are still asserted because they are
+    // "applied every run" controls, and skipping them would leave a
+    // BOOTSTRAP_ONLY_FIRST_RUN deploy's registration state wherever the last
+    // unguarded boot (or an administrator) happened to leave it.
+    await applyRegistrationControls(config);
     console.log("✅ Environment-based configuration initialized (guarded)");
     return;
   }
@@ -1511,6 +1559,12 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
   } catch (err) {
     console.warn("⚠️ User cleanup step failed:", err);
   }
+
+  // Registration controls, HERE and not earlier: every account this boot
+  // creates goes through the signup route these controls close (see
+  // applyRegistrationControls). Nothing below this line signs a user up, so
+  // this is the earliest safe point rather than the end of the run.
+  await applyRegistrationControls(config);
 
   // Bootstrap API keys. The pending-restore pairs let the log stay truthful
   // for a config-declared key the deferred restore will overwrite (see

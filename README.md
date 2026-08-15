@@ -156,6 +156,8 @@ cp example.env .env   # then edit .env
 docker compose up -d
 ```
 
+Edit `.env` before that first `docker compose up`, specifically the bootstrap account. This fork ships **registration closed** (`BOOTSTRAP_DISABLE_REGISTRATION_UI=true`, see [Registration controls](#registration-controls)), so nobody can self-register a first administrator through the UI: the account bootstrap creates is the only way in. Out of the box that is `example.env`'s placeholder `BOOTSTRAP_USER_EMAIL` / `BOOTSTRAP_USER_PASSWORD` pair (`test@user.example` / `changeme`), which is not credentials you want on a running gateway. Set `BOOTSTRAP_USERS` (a JSON array, the recommended form) or those two single-user variables to real values first.
+
 If you change `APP_URL`, access the app only from that URL. MetaMCP applies CORS per route: the OAuth discovery endpoints allow any origin, while the app and API routes (`/api/auth`, `/trpc`, `/mcp-proxy`, `/metamcp`) are restricted to an allowlist of `APP_URL` plus any origins you add to `EXTRA_TRUSTED_ORIGINS` (comma-separated). The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
 
 ### Local development
@@ -169,7 +171,18 @@ pnpm dev
 
 ## Configuration
 
-Standard upstream configuration (Postgres, `APP_URL`, OIDC/SSO, rate limits, registration controls) is unchanged — see [`example.env`](example.env). The fork adds the following env knobs. All are optional; defaults are shown.
+Standard upstream configuration (Postgres, `APP_URL`, OIDC/SSO, rate limits) is unchanged; see [`example.env`](example.env). The registration controls are the one upstream knob whose DEFAULT this fork changes; everything else below is additive. All are optional; defaults are shown.
+
+### Registration controls
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BOOTSTRAP_DISABLE_REGISTRATION_UI` | `true` (upstream: `false`) | Disable self-service signup in the web UI. |
+| `BOOTSTRAP_DISABLE_REGISTRATION_SSO` | `true` (upstream: `false`) | Disable account creation on a first SSO/OIDC login. |
+
+Both fail closed: an unset variable, or an unparseable one, reads as `true`, so a deploy that never mentions them does not silently run with open self-registration. Provision accounts through `BOOTSTRAP_USERS` instead, or flip a control off deliberately.
+
+Two limits worth knowing. Bootstrap writes these to the `config` table on every run, **after** it has created the configured users, so the closed default cannot lock a first boot out of its own onboarding (the users are created while signup is still open, and the lock lands behind them; nothing is listening yet either way, since this all runs before the HTTP server starts). And they are only asserted when bootstrap runs at all: a `BOOTSTRAP_ENABLE=false` deploy writes no row, which upstream's readers treat as open, so such a deploy keeps upstream's behaviour and has to close registration by hand in the admin UI.
 
 ### OAuth and session lifetimes
 
