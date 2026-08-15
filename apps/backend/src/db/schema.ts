@@ -7,6 +7,7 @@ import {
   McpServerErrorStatusEnum,
   McpServerStatusEnum,
   McpServerTypeEnum,
+  type OAuthClientRegistrationSource,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
 import {
@@ -488,52 +489,80 @@ export const configTable = pgTable("config", {
 });
 
 // OAuth Registered Clients table
-export const oauthClientsTable = pgTable("oauth_clients", {
-  client_id: text("client_id").primaryKey(),
-  client_secret: text("client_secret"),
-  client_name: text("client_name").notNull(),
-  redirect_uris: text("redirect_uris")
-    .array()
-    .notNull()
-    .default(sql`'{}'::text[]`),
-  grant_types: text("grant_types")
-    .array()
-    .notNull()
-    .default(sql`'{"authorization_code","refresh_token"}'::text[]`),
-  response_types: text("response_types")
-    .array()
-    .notNull()
-    .default(sql`'{"code"}'::text[]`),
-  token_endpoint_auth_method: text("token_endpoint_auth_method")
-    .notNull()
-    .default("none"),
-  // Matches GRANTED_OAUTH_SCOPE ("mcp"), the one scope this server ever
-  // issues. The default used to be "admin", so a row written without an
-  // explicit scope — and every legacy row — recorded an administrative-
-  // sounding grant for a caller who was never an administrator. Scope carries
-  // no privilege here (checkOAuthAccess authorizes on user id + endpoint
-  // ownership and never reads it), so this is honest labelling rather than an
-  // access change — but handleRefreshTokenGrant copies the stored scope
-  // forward on every refresh, so a wrong default persists indefinitely.
-  // Migration 0026 flips the column default and rewrites the legacy rows.
-  // (Numbered 0026, not 0025: an earlier renumber left 0025 unused — the
-  // journal jumps idx 24 -> 26 — and this comment named the pre-renumber
-  // file until 2026-08-14.)
-  scope: text("scope").default("mcp"),
-  client_uri: text("client_uri"),
-  logo_uri: text("logo_uri"),
-  contacts: text("contacts").array(),
-  tos_uri: text("tos_uri"),
-  policy_uri: text("policy_uri"),
-  software_id: text("software_id"),
-  software_version: text("software_version"),
-  created_at: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-  updated_at: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const oauthClientsTable = pgTable(
+  "oauth_clients",
+  {
+    client_id: text("client_id").primaryKey(),
+    client_secret: text("client_secret"),
+    client_name: text("client_name").notNull(),
+    redirect_uris: text("redirect_uris")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    grant_types: text("grant_types")
+      .array()
+      .notNull()
+      .default(sql`'{"authorization_code","refresh_token"}'::text[]`),
+    response_types: text("response_types")
+      .array()
+      .notNull()
+      .default(sql`'{"code"}'::text[]`),
+    token_endpoint_auth_method: text("token_endpoint_auth_method")
+      .notNull()
+      .default("none"),
+    // Matches GRANTED_OAUTH_SCOPE ("mcp"), the one scope this server ever
+    // issues. The default used to be "admin", so a row written without an
+    // explicit scope — and every legacy row — recorded an administrative-
+    // sounding grant for a caller who was never an administrator. Scope carries
+    // no privilege here (checkOAuthAccess authorizes on user id + endpoint
+    // ownership and never reads it), so this is honest labelling rather than an
+    // access change — but handleRefreshTokenGrant copies the stored scope
+    // forward on every refresh, so a wrong default persists indefinitely.
+    // Migration 0026 flips the column default and rewrites the legacy rows.
+    // (Numbered 0026, not 0025: an earlier renumber left 0025 unused — the
+    // journal jumps idx 24 -> 26 — and this comment named the pre-renumber
+    // file until 2026-08-14.)
+    scope: text("scope").default("mcp"),
+    client_uri: text("client_uri"),
+    logo_uri: text("logo_uri"),
+    contacts: text("contacts").array(),
+    tos_uri: text("tos_uri"),
+    policy_uri: text("policy_uri"),
+    software_id: text("software_id"),
+    software_version: text("software_version"),
+    // Which mint path wrote this row. Read by exactly one query: the retention
+    // sweep in db/repositories/oauth.repo.ts, which deletes only 'dcr'.
+    //
+    // NULLABLE WITH NO DEFAULT, both on purpose. No default because a
+    // forgotten insert path must land as "unknown" (never swept) rather than
+    // inherit "dcr" (swept) — the column exists to protect rows, so its
+    // failure mode has to point at keeping them. Nullable because rows written
+    // before migration 0029 have a provenance nobody recorded, and inventing
+    // one for them would be the same guess the column was added to eliminate.
+    //
+    // `$type` narrows the TS type from `string`; the CHECK below is what makes
+    // that narrowing true of the DATA rather than just of the code, since psql
+    // is a routine ops path here and could otherwise write a third value the
+    // sweep would silently never match.
+    registration_source: text(
+      "registration_source",
+    ).$type<OAuthClientRegistrationSource>(),
+    created_at: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updated_at: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // Migration 0029. NULL stays legal — it is the honest value for every row
+    // that predates the column.
+    check(
+      "oauth_clients_registration_source_valid",
+      sql`${table.registration_source} IS NULL OR ${table.registration_source} IN ('dcr', 'admin')`,
+    ),
+  ],
+);
 
 // OAuth Authorization Codes table
 export const oauthAuthorizationCodesTable = pgTable(

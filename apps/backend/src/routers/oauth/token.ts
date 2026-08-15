@@ -12,6 +12,7 @@ import {
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import { requireIntrospectionCredential } from "./introspection-auth";
 import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
@@ -102,7 +103,9 @@ function logTokenIssued(fields: {
     // log. stringify escapes both and supplies the surrounding quotes, keeping
     // benign output byte-identical. Length-clamped so a hostile registration
     // cannot bloat the log line.
-    parts.push(`client_name=${JSON.stringify(fields.clientName.slice(0, 100))}`);
+    parts.push(
+      `client_name=${JSON.stringify(fields.clientName.slice(0, 100))}`,
+    );
   }
   parts.push(`user=${fields.userId}`);
   parts.push(`token=...${lastFour(fields.accessToken)}`);
@@ -165,11 +168,7 @@ function emitTokenIssued(
 /**
  * Issue a new access token + refresh token pair and store them.
  */
-async function issueTokenPair(
-  clientId: string,
-  userId: string,
-  scope: string,
-) {
+async function issueTokenPair(clientId: string, userId: string, scope: string) {
   const accessToken = generateSecureAccessToken();
   const refreshToken = generateSecureRefreshToken();
 
@@ -179,8 +178,7 @@ async function issueTokenPair(
     scope,
     expires_at: Date.now() + ACCESS_TOKEN_EXPIRY * 1000,
     refresh_token: refreshToken,
-    refresh_token_expires_at:
-      Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    refresh_token_expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
   });
 
   return { accessToken, refreshToken };
@@ -621,13 +619,18 @@ function emitTokenLifecycle(
 /**
  * Failure-only rate limiting for /oauth/introspect and /oauth/revoke.
  *
- * Both endpoints take no credential — RFC 7662 §2.1 says an introspection
- * endpoint MUST require authorization, and there is nothing here to require it
- * of: the clients are secretless public PKCE clients. Bounding the traffic by
- * FAILURE is the substitute, and it has to be by failure rather than by
+ * /oauth/revoke takes no credential and cannot: the clients are secretless
+ * public PKCE clients, revocation already requires the token value, and
+ * destroying a credential is the safe direction to fail. Bounding that traffic
+ * by FAILURE is the substitute, and it has to be by failure rather than by
  * request. `rateLimitToken`, the per-IP limiter already on /oauth/token, would
- * be an outage on these two: `trust proxy` is deliberately off, so every
- * caller through the tunnel shares ONE `req.ip` bucket.
+ * be an outage on it: `trust proxy` is deliberately off, so every caller
+ * through the tunnel shares ONE `req.ip` bucket.
+ *
+ * /oauth/introspect now DOES require one (see ./introspection-auth, which
+ * carries the RFC 7662 §2.1 reasoning). It keeps this limiter regardless,
+ * running ahead of the credential check so that anonymous spraying is bounded
+ * by the same budget as unresolvable tokens instead of being free.
  *
  * A caller presenting a token this server issued therefore never scores, no
  * matter how often it asks. Only tokens that resolve to nothing — invented,
@@ -681,12 +684,45 @@ function sendPublicOAuthEndpointRateLimited(
 
 /**
  * OAuth 2.0 Token Introspection Endpoint
- * Allows clients to introspect access tokens
+ * Allows first-party resource servers to introspect access tokens
  */
 tokenRouter.post("/oauth/introspect", async (req, res) => {
   try {
     if (isPublicOAuthEndpointLimited(req, "introspect")) {
       return sendPublicOAuthEndpointRateLimited(res, "introspect");
+    }
+
+    // RFC 7662 §2.1: this endpoint MUST require authorization, and until now
+    // it required none — an anonymous caller could ask it whether any token
+    // value was live and get back `scope`, `client_id` and `sub`. See
+    // ./introspection-auth for what credential is required, why an API key is
+    // the right one, and why /oauth/revoke is deliberately left public.
+    //
+    // Placed AFTER the limiter check and counted as a failure, so anonymous
+    // spraying is bounded by the same budget as unresolvable tokens rather
+    // than being free. The residual is the one already documented on
+    // isPublicOAuthEndpointLimited: the bucket is per-IP with `trust proxy`
+    // off, so it can be held down by anyone who can reach the endpoint. That
+    // was accepted when no legitimate caller depended on this route, and
+    // gating it does not change who depends on it.
+    const credential = await requireIntrospectionCredential(req);
+    if (!credential.ok) {
+      recordPublicOAuthEndpointFailure(req, "introspect");
+      logger.info(
+        `[oauth] introspect refused reason=${credential.reason} — RFC 7662 requires an authenticated caller`,
+      );
+      // 401 with a challenge, per RFC 7662 §2.3. No audit row: the request
+      // carries no identity to attribute one to, and an anonymous caller who
+      // can be refused for free must not be able to write to `audit_log`,
+      // which has no prune path.
+      return res
+        .status(401)
+        .set("WWW-Authenticate", 'Bearer realm="oauth-introspection"')
+        .json({
+          error: "invalid_client",
+          error_description:
+            "Token introspection requires a first-party API key",
+        });
     }
 
     // Check if body was parsed correctly
@@ -802,6 +838,33 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
 /**
  * OAuth 2.0 Token Revocation Endpoint
  * Allows clients to revoke access tokens or refresh tokens
+ *
+ * DELIBERATELY UNAUTHENTICATED, and it is the only public OAuth endpoint left
+ * that way after `/oauth/introspect` was gated. That asymmetry is a decision,
+ * not an oversight, so it is recorded here where the next reviewer will look
+ * rather than only in ./introspection-auth.ts.
+ *
+ * The two endpoints ask opposite questions. Introspection HANDS OUT the answer
+ * to "is this credential live, and whose is it?", which RFC 7662 §2.1 says
+ * MUST be authorized — it is a validation oracle for a stolen token and a
+ * user-id disclosure, and it is replayable. Revocation DESTROYS a credential,
+ * and it cannot be reached without already presenting the token value, so an
+ * attacker gains nothing they did not already have. Failing in the direction
+ * of destroying credentials is the safe direction to fail.
+ *
+ * RFC 7009 §2.1 asks the server to verify the token was issued to the
+ * requesting client, and the CLIENT REALITY here is why that cannot become a
+ * gate: these are secretless public PKCE clients
+ * (`token_endpoint_auth_method: "none"`), so they hold nothing to authenticate
+ * WITH. Requiring a credential would break revocation for exactly the clients
+ * least able to protect a token in the first place — the claude.ai and Claude
+ * Code connectors among them. The non-blocking `client_id` comparison below is
+ * what is achievable, and what it buys is a signal rather than a barrier; see
+ * its own comment.
+ *
+ * The compensating controls are the failure-only rate limiter this handler
+ * opens with (`isPublicOAuthEndpointLimited`) and the audited client-mismatch
+ * branch. Revisit this only if revocation ever stops requiring the token value.
  */
 tokenRouter.post("/oauth/revoke", async (req, res) => {
   try {

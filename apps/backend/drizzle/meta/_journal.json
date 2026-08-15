@@ -197,6 +197,13 @@
       "when": 1786838400000,
       "tag": "0028_audit_log",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1786924800000,
+      "tag": "0029_oauth_client_registration_source",
+      "breakpoints": true
     }
   ]
 }
