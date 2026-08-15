@@ -30,9 +30,11 @@ const { loggerMock } = vi.hoisted(() => ({
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
 const {
+  AUDIT_USER_AGENT_MAX,
   auditRequestContext,
   credentialFingerprint,
   emit,
+  resetAuditFailureReportingForTesting,
   setAuditSinkForTesting,
 } = await import("./audit-emitter");
 
@@ -47,6 +49,10 @@ const EVENT = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The failure reporter throttles to one line a minute PROCESS-WIDE, so
+  // without this every case after the first would observe silence for the
+  // wrong reason and assert nothing.
+  resetAuditFailureReportingForTesting();
 });
 
 afterEach(() => {
@@ -82,7 +88,7 @@ describe("emit — fire and forget", () => {
     expect(() => emit(EVENT)).not.toThrow();
     await flush();
 
-    expect(loggerMock.debug).toHaveBeenCalled();
+    expect(loggerMock.warn).toHaveBeenCalled();
   });
 
   it("swallows a sink that REJECTS (the database-down case)", async () => {
@@ -91,7 +97,7 @@ describe("emit — fire and forget", () => {
     expect(() => emit(EVENT)).not.toThrow();
     await flush();
 
-    expect(loggerMock.debug).toHaveBeenCalled();
+    expect(loggerMock.warn).toHaveBeenCalled();
   });
 
   it("is a no-op with no sink resolved (no database in this process)", async () => {
@@ -100,18 +106,81 @@ describe("emit — fire and forget", () => {
     expect(() => emit(EVENT)).not.toThrow();
     await flush();
 
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    expect(loggerMock.debug).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A lost audit row must be VISIBLE, and visible without being a flood.
+ *
+ * These two properties pull against each other, which is why they are pinned
+ * together. Production runs LOG_LEVEL=info, whose console floor in
+ * utils/logger is INFO — so the old debug line reached app.log but never the
+ * console a responder reads during an incident, which is the same as not
+ * existing. WARN fixes that; the throttle is what keeps the fix from turning a
+ * database outage on the hottest denial paths into a log flood that buries its
+ * own cause.
+ */
+describe("failure reporting", () => {
+  it("reports the first write failure at WARN, not debug", async () => {
+    setAuditSinkForTesting(() => Promise.reject(new Error("boom")));
+
+    emit(EVENT);
+    await flush();
+
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
     expect(loggerMock.debug).not.toHaveBeenCalled();
   });
 
-  it("never logs a failure above debug — a DB blip must not flood the log", async () => {
+  it("stays below ERROR — a dropped row must never page anyone", async () => {
     setAuditSinkForTesting(() => Promise.reject(new Error("boom")));
 
     emit(EVENT);
     await flush();
 
     expect(loggerMock.error).not.toHaveBeenCalled();
-    expect(loggerMock.warn).not.toHaveBeenCalled();
     expect(loggerMock.info).not.toHaveBeenCalled();
+  });
+
+  it("throttles a burst to ONE line", async () => {
+    setAuditSinkForTesting(() => Promise.reject(new Error("boom")));
+
+    for (let i = 0; i < 50; i += 1) emit(EVENT);
+    await flush();
+
+    // A database outage fails every call on the hottest paths in the gateway.
+    // One line, not fifty.
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries the FULL loss forward once the window rolls over", async () => {
+    // Only Date is faked; setTimeout stays real so `flush()` still resolves.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      setAuditSinkForTesting(() => Promise.reject(new Error("boom")));
+
+      for (let i = 0; i < 50; i += 1) emit(EVENT);
+      await flush();
+      expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+      expect(loggerMock.warn.mock.calls[0]?.[0]).toContain("1 audit row(s)");
+
+      vi.setSystemTime(Date.now() + 61_000);
+      emit(EVENT);
+      await flush();
+
+      // The window is a window, not a one-shot latch: a sink that has been
+      // failing since boot has to keep saying so.
+      expect(loggerMock.warn).toHaveBeenCalledTimes(2);
+      // 50 + 1. This is the assertion that pins the counter as a running
+      // total: a per-window delta would have stranded the 49 the first line
+      // could not carry, and stranded loss is silent loss.
+      expect(loggerMock.warn.mock.calls[1]?.[0]).toContain(
+        "51 audit row(s) lost",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -177,5 +246,34 @@ describe("auditRequestContext", () => {
       actor_user_agent: null,
       request_id: null,
     });
+  });
+
+  /**
+   * `actor_user_agent` is caller-controlled text on paths that need no
+   * credential, and `audit_log` has UPDATE/DELETE/TRUNCATE triggers and no
+   * prune path (migration 0028) — so an oversized value is permanent. Node
+   * caps a header block at 16KB, which bounds it but not usefully.
+   */
+  it("clamps an over-long User-Agent instead of storing it whole", () => {
+    const hostile = "U".repeat(20_000);
+
+    const { actor_user_agent } = auditRequestContext({
+      headers: { "user-agent": hostile },
+    } as never);
+
+    expect(actor_user_agent).toHaveLength(AUDIT_USER_AGENT_MAX);
+    expect(actor_user_agent).toBe(hostile.slice(0, AUDIT_USER_AGENT_MAX));
+  });
+
+  it("leaves a real User-Agent untouched — the clamp is a ceiling, not a policy", () => {
+    const real =
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+    expect(real.length).toBeLessThan(AUDIT_USER_AGENT_MAX);
+    expect(
+      auditRequestContext({ headers: { "user-agent": real } } as never)
+        .actor_user_agent,
+    ).toBe(real);
   });
 });
