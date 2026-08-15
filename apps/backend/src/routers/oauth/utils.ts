@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "crypto";
 import express from "express";
 
+import { resolveClientIp } from "@/middleware/audit-context.middleware";
 import logger from "@/utils/logger";
 
 // OAuth 2.0 Authorization Parameters interface
@@ -63,13 +64,18 @@ export function generateSecureClientSecret(): string {
  * Prevents open redirect vulnerabilities
  *
  * SUPERSEDED AT REGISTRATION by `isAllowedRedirectUri` below, which is the
- * only checker `buildClientRegistration` calls. This one is deliberately left
- * in place for `/oauth/authorize`: the stricter rules would also apply to the
- * redirect_uris of clients that are ALREADY stored, and re-validating those
- * rows mid-investigation is a separate, evidence-gated decision (see the
- * "belt-and-suspenders" note on `isAllowedRedirectUri`). Registration-time
- * enforcement plus removal of the security review test clients is what closes
- * the gap; adopting the strict checker here too is the planned follow-up.
+ * only checker `buildClientRegistration` calls.
+ *
+ * STILL LIVE AT `/oauth/authorize`, where it now runs ALONGSIDE
+ * `isAllowedRedirectUri` rather than instead of it. The follow-up this comment
+ * used to describe (apply the strict checker at authorize too, once the stored
+ * rows had been verified clean) has landed; this one is kept because it is not
+ * a subset of the other. It carries the production-only rules — HTTPS required
+ * and loopback / RFC 1918 hosts refused when NODE_ENV is `production` — that
+ * the registration-time checker deliberately does not have, since an installed
+ * client legitimately registers a loopback callback. Dropping it in favour of
+ * the newer checker would therefore have OPENED something at authorize, which
+ * is the wrong direction for a hardening change.
  */
 export function validateRedirectUri(
   uri: string,
@@ -374,6 +380,47 @@ export function getBaseUrl(req: express.Request): string {
 }
 
 /**
+ * Path prefixes the OAuth router actually serves, matched whole-segment so
+ * `/oauthsomething` is not mistaken for one of ours.
+ *
+ * Lives here rather than in ./index.ts because TWO files need the same answer
+ * and a second copy would drift: the router uses it to scope its anonymous
+ * CORS policy, and `apps/backend/src/index.ts` uses it to steer these paths
+ * away from the global 50mb body parser (see OAUTH_BODY_LIMIT).
+ */
+export const OAUTH_SERVED_PREFIXES = ["/oauth", "/.well-known"] as const;
+
+/** Whole-segment prefix test for the paths above. */
+export function isOAuthServedPath(path: string): boolean {
+  return OAUTH_SERVED_PREFIXES.some(
+    (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+  );
+}
+
+/**
+ * Body-size ceiling for every `/oauth/*` POST.
+ *
+ * These routes used to ride the app-wide `express.json({ limit: "50mb" })`
+ * registered ahead of the router in `apps/backend/src/index.ts`: because that
+ * parser had already consumed and parsed the stream, the 10mb limit written
+ * here never bound anything. So the largest single anonymous write this
+ * gateway accepted was 50mb, on `/oauth/register`, which needs no credential
+ * and stores what it is given.
+ *
+ * 256kb is chosen against the real bodies: a DCR registration under the caps in
+ * ./client-registration.ts is a few kilobytes at worst, a token exchange and a
+ * consent decision are a few hundred bytes. It is roughly two orders of
+ * magnitude of headroom over the largest legitimate request and roughly two
+ * hundred times smaller than what an anonymous caller could previously send.
+ *
+ * The parser must stay AHEAD of the rate limiters on these routes (it is
+ * router-level middleware, they are per-route), so an oversized body is
+ * refused with a 413 by the parser rather than being read in full and then
+ * counted.
+ */
+export const OAUTH_BODY_LIMIT = "256kb";
+
+/**
  * Middleware to add JSON parsing for OAuth POST endpoints
  */
 export function jsonParsingMiddleware(
@@ -388,7 +435,7 @@ export function jsonParsingMiddleware(
 
   if (needsJsonParsing) {
     return express.json({
-      limit: "10mb",
+      limit: OAUTH_BODY_LIMIT,
       type: "application/json",
     })(req, res, next);
   }
@@ -411,7 +458,7 @@ export function urlencodedParsingMiddleware(
   if (needsUrlencodedParsing) {
     return express.urlencoded({
       extended: true,
-      limit: "10mb",
+      limit: OAUTH_BODY_LIMIT,
     })(req, res, next);
   }
   next();
@@ -476,6 +523,7 @@ class RateLimiter {
 const authEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
 const tokenEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 10 attempts per 1 minute
 const consentDecisionLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 decisions per user per 1 minute
+const registrationEndpointLimiter = new RateLimiter(30, 1 * 60 * 1000); // 30 registrations per caller IP per 1 minute
 
 // Clean up rate limiter entries every 10 minutes
 setInterval(
@@ -483,6 +531,7 @@ setInterval(
     authEndpointLimiter.cleanup();
     tokenEndpointLimiter.cleanup();
     consentDecisionLimiter.cleanup();
+    registrationEndpointLimiter.cleanup();
   },
   10 * 60 * 1000,
 );
@@ -560,6 +609,69 @@ export function rateLimitToken(
   }
 
   next();
+}
+
+/**
+ * Rate limiting middleware for the RFC 7591 dynamic-registration endpoint.
+ *
+ * WHY /oauth/register CANNOT SHARE /oauth/token's BUCKET. It did, and that was
+ * a denial-of-service against pairing rather than a control on it: both routes
+ * carried `rateLimitToken`, which keys on `req.ip`, and `trust proxy` is
+ * deliberately off (see audit-context.middleware), so every caller through the
+ * tunnel lands in ONE bucket. 20 anonymous registrations in a minute therefore
+ * spent the budget that legitimate claude.ai token exchanges needed, and the
+ * connector's exchange came back 429. The endpoint an attacker can reach for
+ * free must not be able to close the endpoint a paired client depends on.
+ *
+ * KEYED ON CF-Connecting-IP, not `req.ip`. Cloudflare overwrites that header at
+ * the edge on every request, so it is per-CALLER instead of per-container, and
+ * this limiter finally bounds what it is named for. The trust assumption is
+ * exactly the one audit-context.middleware documents at length: it holds only
+ * while the Cloudflare Tunnel is the sole ingress. `req.ip` remains the
+ * fallback for direct-to-origin and local development, where it degrades to
+ * the single shared bucket this endpoint had before.
+ *
+ * THE RESIDUAL, PLAINLY: per-IP keying means the ceiling is per source
+ * address, not global, so a distributed caller is not bounded by this at all.
+ * That is deliberate. What bounds the damage of registration flooding is the
+ * pair of changes it ships with — the input caps in ./client-registration.ts
+ * (how big a row can be) and the retention sweep in ./client-retention.ts (how
+ * long a never-used row survives) — and unlike a global ceiling, neither of
+ * them can refuse a real connector trying to pair.
+ */
+export function rateLimitRegistration(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  const identifier =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
+
+  if (registrationEndpointLimiter.isRateLimited(`register:${identifier}`)) {
+    logger.info(
+      `[RATE LIMIT] Registration endpoint rate limited for IP: ${identifier} - Too many registration attempts`,
+    );
+    return res.status(429).json({
+      error: "too_many_requests",
+      error_description:
+        "Too many registration attempts. Please try again later.",
+    });
+  }
+
+  next();
+}
+
+/**
+ * Test-only, same rationale as resetConsentDecisionRateLimitForTests: the
+ * limiter lives at module scope, so without this one file's registration tests
+ * spend another file's budget and the failure shows up as a 429 that a
+ * negative assertion happily accepts. Production never calls this.
+ */
+export function resetRegistrationRateLimitForTests(): void {
+  registrationEndpointLimiter.clear();
 }
 
 /**

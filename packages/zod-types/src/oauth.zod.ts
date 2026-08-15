@@ -17,6 +17,23 @@ export const OAuthTokensSchema = z.object({
   refresh_token: z.string().optional(),
 });
 
+/**
+ * Which mint path wrote an `oauth_clients` row.
+ *
+ * "dcr"   — the anonymous RFC 7591 `POST /oauth/register` endpoint.
+ * "admin" — an authenticated administrator through the OAuth Clients UI.
+ *
+ * This exists ONLY so the retention sweep can tell the two apart, and it has
+ * to exist because nothing else can. Both paths call the same
+ * `buildClientRegistration` core and therefore the same
+ * `generateSecureClientId()`, so every client_id from either door reads
+ * `mcp_client_<random>` — the prefix is not a discriminator. An admin who
+ * pre-provisions a partner client days before the partner pairs it owns a row
+ * that is legitimately unused, and deleting it is a support incident, so the
+ * sweep must never guess.
+ */
+export const OAuthClientRegistrationSourceEnum = z.enum(["dcr", "admin"]);
+
 // OAuth Client schema for registered clients
 export const OAuthClientSchema = z.object({
   client_id: z.string(),
@@ -34,6 +51,11 @@ export const OAuthClientSchema = z.object({
   policy_uri: z.string().nullable(),
   software_id: z.string().nullable(),
   software_version: z.string().nullable(),
+  // Nullable on READ and never on write: every row minted since migration 0029
+  // carries its provenance, but rows that predate the column cannot have one
+  // invented for them. NULL therefore means "unknown", which the sweep treats
+  // as not-DCR and leaves alone.
+  registration_source: OAuthClientRegistrationSourceEnum.nullable().optional(),
   created_at: z.date(),
   updated_at: z.date().optional(),
 });
@@ -80,6 +102,12 @@ export const OAuthClientCreateInputSchema = z.object({
   policy_uri: z.string().nullable().optional(),
   software_id: z.string().nullable().optional(),
   software_version: z.string().nullable().optional(),
+  // REQUIRED on write, unlike the nullable read field above, so the compiler
+  // refuses any new persist path that does not say which door the client came
+  // through. A row minted without provenance is a row the retention sweep has
+  // to guess about, and the whole point of this column is that it never
+  // guesses.
+  registration_source: OAuthClientRegistrationSourceEnum,
   created_at: z.date(),
   updated_at: z.date().optional(),
 });
@@ -191,6 +219,23 @@ export type DatabaseOAuthSession = z.infer<typeof DatabaseOAuthSessionSchema>;
 export type OAuthClient = z.infer<typeof OAuthClientSchema>;
 export type OAuthClientCreateInput = z.infer<
   typeof OAuthClientCreateInputSchema
+>;
+export type OAuthClientRegistrationSource = z.infer<
+  typeof OAuthClientRegistrationSourceEnum
+>;
+/**
+ * A minted client row that does not yet know which door it came through.
+ *
+ * `buildClientRegistration` returns this rather than a full
+ * `OAuthClientCreateInput` because it is shared by both mint paths and so is
+ * the one place that genuinely cannot know the answer. Each caller stamps its
+ * own `registration_source` on the way to `upsertClient`, and because that
+ * field is required on the create input, a caller that forgets does not
+ * compile.
+ */
+export type OAuthClientRegistrationDraft = Omit<
+  OAuthClientCreateInput,
+  "registration_source"
 >;
 export type OAuthAuthorizationCode = z.infer<
   typeof OAuthAuthorizationCodeSchema

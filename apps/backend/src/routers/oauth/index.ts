@@ -8,11 +8,13 @@ import {
   toolCallAuditRepository,
 } from "../../db/repositories";
 import authorizationRouter from "./authorization";
+import { sweepUnusedDcrClients } from "./client-retention";
 import metadataRouter from "./metadata";
 import registrationRouter from "./registration";
 import tokenRouter from "./token";
 import userinfoRouter from "./userinfo";
 import {
+  isOAuthServedPath,
   jsonParsingMiddleware,
   securityHeaders,
   urlencodedParsingMiddleware,
@@ -46,17 +48,15 @@ setInterval(
         logger.error("Error pruning tool_call_audit:", error);
       }
     }
+    // Rides this interval rather than one of its own for the same reason the
+    // tool-audit prune does: `cleanupExpired` above already runs here, the
+    // work is a single bounded DELETE, and a second timer would be a second
+    // thing to reason about at shutdown. Errors are logged and swallowed here
+    // deliberately — see sweepUnusedDcrClients, which never throws.
+    await sweepUnusedDcrClients();
   },
   5 * 60 * 1000,
 );
-
-/**
- * Path prefixes this router actually serves, matched whole-segment so
- * `/oauthsomething` is not mistaken for one of ours. Kept in sync with the
- * sub-router route tables below: every route they register begins with
- * `/oauth/` or `/.well-known/`.
- */
-const OAUTH_SERVED_PREFIXES = ["/oauth", "/.well-known"] as const;
 
 // OAuth discovery, registration and token exchange are consumed by arbitrary
 // MCP clients that this gateway has never seen before, so these paths answer
@@ -82,12 +82,9 @@ const oauthCors = cors({
 // it, and because the cors package answers preflights itself, so did the
 // OPTIONS leg of every other route in the app. The guard keeps the policy on
 // the paths it was written for.
-oauthRouter.use((req, res, next) => {
-  const served = OAUTH_SERVED_PREFIXES.some(
-    (prefix) => req.path === prefix || req.path.startsWith(`${prefix}/`),
-  );
-  return served ? oauthCors(req, res, next) : next();
-});
+oauthRouter.use((req, res, next) =>
+  isOAuthServedPath(req.path) ? oauthCors(req, res, next) : next(),
+);
 
 // Apply middleware for OAuth-specific routes.
 //

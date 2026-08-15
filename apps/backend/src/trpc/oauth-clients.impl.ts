@@ -55,7 +55,18 @@ export const oauthClientsImplementations = {
       });
     }
 
-    const client = registration.client;
+    // `registration_source: "admin"` is what exempts this row from the
+    // retention sweep in ../routers/oauth/client-retention.ts. Pre-provisioning
+    // a partner's client here and handing the credentials over days before they
+    // pair is the normal way this dialog is used, so an admin-minted client
+    // that has never produced a token is not junk — it is waiting. The
+    // anonymous DCR endpoint stamps "dcr" at its own door for the same reason:
+    // the shared mint core cannot tell them apart, since both draw their
+    // client_id from generateSecureClientId.
+    const client = {
+      ...registration.client,
+      registration_source: "admin" as const,
+    };
 
     try {
       await oauthRepository.upsertClient(client);

@@ -1,6 +1,7 @@
 import express from "express";
 
 import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { globalBodyParser } from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -31,15 +32,15 @@ const app = express();
 // trust assumption and for why `trust proxy` is deliberately NOT set with it.
 app.use(auditContextMiddleware);
 
-// Global JSON middleware for non-proxy routes
-app.use((req, res, next) => {
-  if (req.path.startsWith("/mcp-proxy/") || req.path.startsWith("/metamcp/")) {
-    // Skip JSON parsing for all MCP proxy routes and public endpoints to allow raw stream access
-    next();
-  } else {
-    express.json({ limit: "50mb" })(req, res, next);
-  }
-});
+// Global JSON middleware for non-proxy routes.
+//
+// The branches live in ./lib/global-body-parser rather than inline here for
+// one reason: this file calls `app.listen()` at module scope and so cannot be
+// imported by a test. Inline, the only available coverage was a test that
+// hand-copied these branches into a model app — which stayed green when the
+// real ones were deleted. See that module's header for what each lane does and
+// why the OAuth skip is what makes the 256kb router limit bind at all.
+app.use(globalBodyParser);
 
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);
