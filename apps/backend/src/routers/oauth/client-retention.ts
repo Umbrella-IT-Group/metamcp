@@ -13,6 +13,28 @@ import { oauthRepository } from "../../db/repositories";
  * caps in ./client-registration.ts bound how BIG each row can be; this bounds
  * how MANY there are.
  *
+ * WHAT COUNTS AS "DYNAMICALLY REGISTERED", which is the first condition and
+ * the one that is not obvious. `oauth_clients` has TWO mint paths — this
+ * endpoint, and the admin UI's create-client dialog — and they are
+ * indistinguishable by client_id, because both go through the same
+ * `buildClientRegistration` core and therefore the same
+ * `generateSecureClientId()`. Every row from either door reads
+ * `mcp_client_<random>`. So the sweep matches on `registration_source`, the
+ * column migration 0029 added for exactly this: the DCR endpoint stamps
+ * `'dcr'`, the admin path stamps `'admin'`, and only `'dcr'` is ever deleted.
+ *
+ * That distinction is load-bearing rather than tidy. An admin-minted client
+ * with no tokens is the NORMAL state of a partner integration that has been
+ * pre-provisioned and not yet paired — the credentials are sitting in an email
+ * waiting for someone on the other end — so "never used" means something
+ * completely different on that path than it does on the anonymous one.
+ *
+ * Rows predating 0029 carry NULL and are never swept: their provenance was not
+ * recorded and cannot be reconstructed, so they are treated as possibly-admin.
+ * That leaves the original junk backlog in place, deletable from the admin UI;
+ * the sweep exists to bound what an anonymous caller can add from now on, and
+ * a fixed finite set of old rows is not that problem.
+ *
  * WHAT COUNTS AS "NEVER USED", and why that is a safe test on this deployment.
  * A client is swept only when it has zero authorization codes AND zero access
  * tokens AND was created longer ago than the retention window. The second

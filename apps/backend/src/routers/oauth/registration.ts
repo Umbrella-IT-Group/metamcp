@@ -52,7 +52,15 @@ registrationRouter.post(
         });
       }
 
-      const clientRegistration = registration.client;
+      // `registration_source: "dcr"` is stamped HERE rather than inside the
+      // shared core, because this is the door — the core serves both. It is
+      // what makes a row from this anonymous endpoint eligible for the
+      // retention sweep, and what keeps the admin dialog's rows out of it. See
+      // ./client-retention.ts.
+      const clientRegistration = {
+        ...registration.client,
+        registration_source: "dcr" as const,
+      };
       const clientSecret = clientRegistration.client_secret;
 
       // Store the client registration

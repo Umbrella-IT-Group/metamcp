@@ -71,14 +71,33 @@ export class OAuthRepository {
   }
 
   // Retention sweep for anonymous dynamic registrations: delete clients that
-  // were created longer ago than `olderThanDays` and have NEVER produced an
-  // authorization code or an access token.
+  // were minted by DCR, were created longer ago than `olderThanDays`, and have
+  // NEVER produced an authorization code or an access token. All three
+  // conditions, and the first is not optional.
   //
   // `/oauth/register` needs no credential, so this is the only table in the
   // schema an unauthenticated caller can grow without bound. See
   // ../../routers/oauth/client-retention.ts for why "no child rows" is a sound
   // never-used test here (it rests on the 365-day refresh TTL keeping a token
   // row alive for any client that ever paired) and for the env that tunes it.
+  //
+  // THE DISCRIMINATOR, and why it is a column rather than a client_id prefix.
+  // `oauth_clients` has two mint paths: this sweep's target, the anonymous DCR
+  // endpoint, and the admin UI's create-client dialog (trpc/oauth-clients.impl
+  // -> the same buildClientRegistration core). Both therefore call the same
+  // generateSecureClientId, so EVERY row from either door reads
+  // `mcp_client_<random>` — matching that prefix would delete admin-minted
+  // clients too, and an admin-minted client with no tokens is usually one that
+  // was pre-provisioned for a partner who has not paired yet. Migration 0029
+  // added `registration_source` so the two are distinguishable at all, and
+  // this equality is the only thing that reads it.
+  //
+  // `eq(..., "dcr")` and not `ne(..., "admin")`: the column is NULL for every
+  // row written before 0029, whose provenance nobody recorded. A NULL is an
+  // unknown, an unknown might be an admin's, and the safe reading of an
+  // unknown is to keep the row. `ne` would also drop them (SQL NULL
+  // comparisons are UNKNOWN, so neither predicate MATCHES a NULL — but stating
+  // the intent positively is what stops the next edit from getting it wrong).
   //
   // NOT EXISTS rather than a LEFT JOIN with an IS NULL: the join form would
   // multiply the client row by its children before filtering, and postgres can
@@ -94,6 +113,7 @@ export class OAuthRepository {
       .delete(oauthClientsTable)
       .where(
         and(
+          eq(oauthClientsTable.registration_source, "dcr"),
           lt(oauthClientsTable.created_at, cutoff),
           notExists(
             db

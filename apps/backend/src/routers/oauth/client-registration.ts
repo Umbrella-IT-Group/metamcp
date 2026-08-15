@@ -1,5 +1,5 @@
 import {
-  OAuthClientCreateInput,
+  OAuthClientRegistrationDraft,
   OAuthGrantTypeEnum,
   OAuthResponseTypeEnum,
   OAuthTokenEndpointAuthMethodEnum,
@@ -59,8 +59,17 @@ export interface ClientRegistrationInput {
   software_version?: unknown;
 }
 
+/**
+ * `client` is a DRAFT: every column except `registration_source`.
+ *
+ * This core is deliberately the one place that cannot know which door a
+ * registration came through — it is shared precisely so the RULES cannot
+ * differ between the anonymous DCR endpoint and the admin dialog. Provenance
+ * is the one thing that legitimately does differ, so each caller stamps it
+ * when it persists (see OAuthClientRegistrationDraft in @repo/zod-types).
+ */
 export type ClientRegistrationResult =
-  | { ok: true; client: OAuthClientCreateInput }
+  | { ok: true; client: OAuthClientRegistrationDraft }
   | { ok: false; error: string; error_description: string };
 
 const VALID_GRANT_TYPES: readonly string[] = OAuthGrantTypeEnum.options;

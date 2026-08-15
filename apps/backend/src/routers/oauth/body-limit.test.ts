@@ -11,14 +11,22 @@
  * The fix is an ordering one (the global parser now skips OAuth-served paths
  * so the router's own parser binds), and ordering is exactly the kind of thing
  * that looks right in a diff and is wrong on the wire. So these run over a
- * REAL socket against the REAL router, and the mount order below is copied
- * from ../../index — it is a model of that file, not that file, because
- * index.ts calls `app.listen` at module scope and cannot be imported.
+ * REAL socket against the REAL router.
+ *
+ * THE GLOBAL PARSER IS ALSO THE REAL ONE NOW. The first cut of this file
+ * hand-copied the branches out of ../../index into the model app below, on the
+ * grounds that index.ts calls `app.listen` at module scope and cannot be
+ * imported. That made the suite worthless as a regression guard for the very
+ * fix it was written for: deleting the OAuth skip from index.ts left every
+ * test here green, because the copy in the test still had it. The branches now
+ * live in ../../lib/global-body-parser, which index.ts mounts and this file
+ * imports, so the thing under test is the thing that runs.
  *
  * `rejects an oversized body even when the app-level parser is 50mb` is the
- * assertion that bites: without the skip in ../../index the request is parsed
- * by the big parser and reaches the handler, and every other test here still
- * passes.
+ * assertion that bites: remove the OAuth skip from ../../lib/global-body-parser
+ * and the request is parsed by the big parser and reaches the handler. The
+ * `unfixed` app is that broken wiring, stood up deliberately, so the
+ * before/after can be asserted in one test rather than described in a comment.
  */
 
 import type { Server } from "node:http";
@@ -58,6 +66,8 @@ process.env.BETTER_AUTH_SECRET = "test-secret-for-body-limit-suite";
 
 const { default: oauthRouter } = await import("./index");
 const { isOAuthServedPath, OAUTH_BODY_LIMIT } = await import("./utils");
+const { globalBodyParser, GLOBAL_JSON_BODY_LIMIT, RAW_STREAM_PREFIXES } =
+  await import("../../lib/global-body-parser");
 const { errorHandler } = await import(
   "../../middleware/error-handler.middleware"
 );
@@ -77,9 +87,15 @@ const CLAUDE_REGISTRATION = {
 /**
  * Build an app whose OAuth mount matches ../../index.
  *
- * `skipOAuthInGlobalParser` exists so the broken wiring can be stood up
- * alongside the fixed one: with it false, the app-level 50mb parser consumes
- * `/oauth/*` first and the router's own limit is dead code.
+ * `skipOAuthInGlobalParser` selects WHICH global parser is mounted, and the
+ * asymmetry is the point:
+ *
+ *  - true  -> the REAL `globalBodyParser` that ../../index mounts. Nothing
+ *             about its branching is restated here, so deleting the OAuth skip
+ *             from that module breaks this app.
+ *  - false -> a deliberate reconstruction of the PRE-FIX wiring, kept only as
+ *             the control the fixed app is compared against. It is allowed to
+ *             be a copy because it is modelling code that no longer exists.
  */
 async function startApp(skipOAuthInGlobalParser: boolean): Promise<{
   server: Server;
@@ -87,18 +103,20 @@ async function startApp(skipOAuthInGlobalParser: boolean): Promise<{
 }> {
   const app = express();
 
-  app.use((req, res, next) => {
-    if (
-      req.path.startsWith("/mcp-proxy/") ||
-      req.path.startsWith("/metamcp/")
-    ) {
-      next();
-    } else if (skipOAuthInGlobalParser && isOAuthServedPath(req.path)) {
-      next();
-    } else {
-      express.json({ limit: "50mb" })(req, res, next);
-    }
-  });
+  if (skipOAuthInGlobalParser) {
+    app.use(globalBodyParser);
+  } else {
+    app.use((req, res, next) => {
+      if (
+        req.path.startsWith("/mcp-proxy/") ||
+        req.path.startsWith("/metamcp/")
+      ) {
+        next();
+      } else {
+        express.json({ limit: GLOBAL_JSON_BODY_LIMIT })(req, res, next);
+      }
+    });
+  }
 
   app.use(oauthRouter);
 
@@ -106,6 +124,14 @@ async function startApp(skipOAuthInGlobalParser: boolean): Promise<{
   // limit, so the scoping is shown to be scoping rather than a global squeeze.
   app.post("/trpc/anything", (req, res) => {
     res.status(200).json({ received: typeof req.body === "object" });
+  });
+
+  // Stands in for the MCP data plane. These paths hand the socket to a
+  // transport that reads it itself, so the assertion is not about a SIZE at
+  // all: `req.body` must still be undefined here, because any parser running
+  // would have consumed the stream out from under that transport.
+  app.post("/metamcp/raw", (req, res) => {
+    res.status(200).json({ parsed: req.body !== undefined });
   });
 
   app.use(errorHandler);
@@ -206,6 +232,65 @@ describe("/oauth/* body limit", () => {
     });
 
     expect(response.status).toBe(200);
+  });
+});
+
+/**
+ * The lanes of ../../lib/global-body-parser, driven through the exported
+ * middleware itself.
+ *
+ * These overlap the suite above on purpose. That one asks "is the OAuth
+ * surface capped", which is the security question; this one asks "does the
+ * module index.ts mounts route each lane to the parser it claims to", which is
+ * the question that catches someone deleting a branch. Before the extraction
+ * there was no way to ask the second one at all.
+ */
+describe("globalBodyParser lanes", () => {
+  it("pins the global limit at 50mb", () => {
+    expect(GLOBAL_JSON_BODY_LIMIT).toBe("50mb");
+  });
+
+  it("binds the 256kb OAuth limit on an OAuth-served path", async () => {
+    // 300kb is under the 50mb global and over the 256kb OAuth limit, so a 413
+    // can only mean the OAuth parser is the one that bound. Drop the
+    // isOAuthServedPath branch from globalBodyParser and this returns 201.
+    const response = await postJson(
+      fixed.baseUrl,
+      "/oauth/register",
+      oversizedRegistration(),
+    );
+
+    expect(response.status).toBe(413);
+    expect(OAUTH_BODY_LIMIT).toBe("256kb");
+  });
+
+  it("binds the 50mb global limit on a non-OAuth path", async () => {
+    // The same 300kb body, one path over. If the OAuth limit had been applied
+    // globally rather than scoped, this would 413 too — which is the failure
+    // this half exists to rule out.
+    const response = await postJson(fixed.baseUrl, "/trpc/anything", {
+      blob: "x".repeat(OVERSIZED_BYTES),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ received: true });
+  });
+
+  it("leaves raw-stream paths with no parser at all", async () => {
+    const response = await postJson(fixed.baseUrl, "/metamcp/raw", {
+      anything: true,
+    });
+
+    expect(response.status).toBe(200);
+    // `parsed: true` would mean the JSON parser consumed the MCP data plane's
+    // stream — a different and worse bug than an oversized body.
+    expect(await response.json()).toEqual({ parsed: false });
+  });
+
+  it("declares the raw-stream prefixes as whole mount points", () => {
+    // Trailing slashes matter: without them `/metamcp-something` would also
+    // skip the parser and reach its handler with no body.
+    expect(RAW_STREAM_PREFIXES).toEqual(["/mcp-proxy/", "/metamcp/"]);
   });
 });
 

@@ -838,6 +838,33 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
 /**
  * OAuth 2.0 Token Revocation Endpoint
  * Allows clients to revoke access tokens or refresh tokens
+ *
+ * DELIBERATELY UNAUTHENTICATED, and it is the only public OAuth endpoint left
+ * that way after `/oauth/introspect` was gated. That asymmetry is a decision,
+ * not an oversight, so it is recorded here where the next reviewer will look
+ * rather than only in ./introspection-auth.ts.
+ *
+ * The two endpoints ask opposite questions. Introspection HANDS OUT the answer
+ * to "is this credential live, and whose is it?", which RFC 7662 §2.1 says
+ * MUST be authorized — it is a validation oracle for a stolen token and a
+ * user-id disclosure, and it is replayable. Revocation DESTROYS a credential,
+ * and it cannot be reached without already presenting the token value, so an
+ * attacker gains nothing they did not already have. Failing in the direction
+ * of destroying credentials is the safe direction to fail.
+ *
+ * RFC 7009 §2.1 asks the server to verify the token was issued to the
+ * requesting client, and the CLIENT REALITY here is why that cannot become a
+ * gate: these are secretless public PKCE clients
+ * (`token_endpoint_auth_method: "none"`), so they hold nothing to authenticate
+ * WITH. Requiring a credential would break revocation for exactly the clients
+ * least able to protect a token in the first place — the claude.ai and Claude
+ * Code connectors among them. The non-blocking `client_id` comparison below is
+ * what is achievable, and what it buys is a signal rather than a barrier; see
+ * its own comment.
+ *
+ * The compensating controls are the failure-only rate limiter this handler
+ * opens with (`isPublicOAuthEndpointLimited`) and the audited client-mismatch
+ * branch. Revisit this only if revocation ever stops requiring the token value.
  */
 tokenRouter.post("/oauth/revoke", async (req, res) => {
   try {
