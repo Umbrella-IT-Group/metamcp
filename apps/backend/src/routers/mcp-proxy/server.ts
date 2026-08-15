@@ -26,6 +26,7 @@ import { transformDockerUrl } from "../../lib/metamcp/client";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
+import { assertPublicMcpUrl, createGuardedFetch } from "./url-guard";
 
 const SSE_HEADERS_PASSTHROUGH = ["authorization"];
 const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
@@ -450,6 +451,13 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
   } else if (transportType === McpServerTypeEnum.enum.SSE) {
     const url = transformDockerUrl(query.url as string);
 
+    // The destination is caller-supplied, so it is checked BEFORE anything is
+    // opened and before the database is asked about it — see ./url-guard. The
+    // check is by address range rather than by "is this row registered",
+    // because pointing the Inspector at a not-yet-saved public server is a
+    // flow that has to keep working.
+    const target = await assertPublicMcpUrl(url);
+
     // Check if the server is in error state (for SSE, we need to find server by URL)
     const servers = await mcpServersRepository.findAll();
     const matchingServer = servers.find(
@@ -479,18 +487,30 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       `SSE transport: url=${url}, headers=[${Object.keys(headers).join(", ")}]`,
     );
 
-    const transport = new SSEClientTransport(new URL(url), {
+    // Every request this transport makes goes through the guard, not just the
+    // one validated above. The SSE back-channel POSTs to whatever endpoint the
+    // REMOTE server advertises in its `endpoint` event — remote-controlled
+    // input that never passes through this handler — and `eventSourceInit.fetch`
+    // takes precedence over the `fetch` option inside the SDK, so both have to
+    // be set for the stream and the POSTs to be covered.
+    const guardedFetch = createGuardedFetch();
+
+    const transport = new SSEClientTransport(target, {
       eventSourceInit: {
-        fetch: (url, init) => fetch(url, { ...init, headers }),
+        fetch: (url, init) => guardedFetch(url, { ...init, headers }),
       },
       requestInit: {
         headers,
       },
+      fetch: guardedFetch,
     });
     await transport.start();
     return transport;
   } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
     const url = transformDockerUrl(query.url as string);
+
+    // Same destination check as the SSE branch above — see ./url-guard.
+    const target = await assertPublicMcpUrl(url);
 
     // Check if the server is in error state (for STREAMABLE_HTTP, we need to find server by URL)
     const servers = await mcpServersRepository.findAll();
@@ -512,10 +532,13 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       ...getHttpHeaders(req, transportType),
     };
 
-    const transport = new StreamableHTTPClientTransport(new URL(url), {
+    // Covers the transport's own reconnects and every redirect hop, which the
+    // one-shot check above cannot reach.
+    const transport = new StreamableHTTPClientTransport(target, {
       requestInit: {
         headers,
       },
+      fetch: createGuardedFetch(),
     });
     await transport.start();
     return transport;
