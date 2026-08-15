@@ -1424,6 +1424,64 @@ async function bootstrapEndpoints(
   }
 }
 
+/**
+ * Passwords that `example.env` has, at some point, shipped for the BOOTSTRAP
+ * ADMINISTRATOR account.
+ *
+ * `changeme` was the shipped default for the whole life of the file, so it is
+ * the first password anyone who has read this repository would try against a
+ * MetaMCP deployment, and a deployment that copied `example.env` and edited
+ * only the lines it noticed would still be running it. The replacement
+ * placeholder is listed for exactly the same reason: it is public, so it is
+ * guessable, and the point of a placeholder is that it must never survive to
+ * a running install.
+ *
+ * WARN rather than refuse, deliberately. This account is created at boot, so a
+ * hard failure would brick a deliberate throwaway local dev stack, and the
+ * common case here is a first-run operator who needs to be TOLD, not stopped.
+ * The warning is written to be impossible to skim past.
+ */
+const SHIPPED_PLACEHOLDER_PASSWORDS = new Set([
+  "changeme",
+  "REPLACE_ME__generate_a_strong_password",
+]);
+
+/**
+ * Warn, loudly, if a bootstrap account is being created with a password this
+ * repository publishes. Returns whether it warned, so a test can assert the
+ * warning rather than the predicate behind it.
+ *
+ * Exported for that test only; `validateConfig` below is the sole production
+ * caller and covers every configured user, so `BOOTSTRAP_USERS` entries are
+ * checked on the same footing as the single-user `BOOTSTRAP_USER_PASSWORD`.
+ */
+export function warnOnPlaceholderBootstrapPassword(
+  email: string | undefined,
+  password: string | undefined,
+): boolean {
+  if (!password || !SHIPPED_PLACEHOLDER_PASSWORDS.has(password)) return false;
+
+  console.warn(
+    "==============================================================",
+  );
+  console.warn(
+    `⚠️ INSECURE BOOTSTRAP PASSWORD: user ${email ?? "(no email)"} is configured ` +
+      `with a placeholder password published in example.env.`,
+  );
+  console.warn(
+    "     This is an ADMINISTRATOR account on this gateway and anyone who has " +
+      "read the repository knows this password.",
+  );
+  console.warn(
+    "     Set BOOTSTRAP_USER_PASSWORD (or the password in BOOTSTRAP_USERS) to " +
+      "a real secret and restart.",
+  );
+  console.warn(
+    "==============================================================",
+  );
+  return true;
+}
+
 function validateConfig(config: EnvConfig): void {
   if (
     config.disableUiRegistration &&
@@ -1454,6 +1512,7 @@ function validateConfig(config: EnvConfig): void {
         `⚠️ Password for ${user.email} is less than 8 characters. Consider using a stronger password.`,
       );
     }
+    warnOnPlaceholderBootstrapPassword(user.email, user.password);
   }
 
   if (config.recreateDefaultUser && !config.preserveApiKeysOnRecreate) {

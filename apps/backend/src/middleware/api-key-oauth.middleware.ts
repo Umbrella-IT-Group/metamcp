@@ -14,6 +14,11 @@ import {
   emit,
 } from "../lib/audit/audit-emitter";
 import {
+  sendApiKeyRequiredResponse,
+  sendAuthenticationRequiredChallenge,
+  sendOAuthChallengeResponse,
+} from "../lib/auth-challenge";
+import {
   authRateLimiter,
   getAuthRateLimitIdentifier,
 } from "../lib/auth-rate-limiter";
@@ -36,29 +41,6 @@ export interface ApiKeyAuthenticatedRequest extends express.Request {
 }
 
 const apiKeysRepository = new ApiKeysRepository();
-
-/**
- * Helper function to get the correct base URL from request
- * Prioritizes APP_URL environment variable, then checks proxy headers
- */
-function getBaseUrl(req: express.Request): string {
-  // Prioritize APP_URL environment variable
-  if (process.env.APP_URL) {
-    return process.env.APP_URL;
-  }
-
-  // Check for forwarded headers from Next.js proxy
-  const forwardedHost = req.headers["x-forwarded-host"] as string;
-  const forwardedProto = req.headers["x-forwarded-proto"] as string;
-
-  if (forwardedHost) {
-    const protocol = forwardedProto || "http";
-    return `${protocol}://${forwardedHost}`;
-  }
-
-  // Fallback to request host
-  return `${req.protocol}://${req.get("host")}`;
-}
 
 /**
  * Validate an OAuth bearer token against the stored token row.
@@ -318,6 +300,71 @@ function emitMcpAuthDenial(
 }
 
 /**
+ * Deployment escape hatch for an endpoint with BOTH auth toggles off.
+ *
+ * CONDITION 1 below used to `next()` such an endpoint straight through with a
+ * `// Pass through without authentication` comment, and that is exactly what
+ * it did: one mis-set pair of toggles in the admin UI published that
+ * namespace's entire tool set to anyone who could reach the gateway, with no
+ * credential to steal, no audit actor to name and no rate-limit bucket to
+ * fill. Nothing about the request announced it was public; it simply was. An
+ * MCP gateway serving an integration estate should not have a configuration
+ * that silently means "no authentication", so the default is now refusal and
+ * an operator who genuinely wants a public endpoint has to say so at the
+ * deployment level, where it is reviewable, rather than in a per-endpoint
+ * checkbox.
+ *
+ * Read per request rather than captured at module load: a security escape
+ * hatch must reflect the process environment as it is now, and a per-request
+ * `process.env` read costs nothing on a path that is about to make at least
+ * one database round-trip.
+ *
+ * Strict `"true"`: unset, empty, `1`, `yes` and `TRUE` are all OFF. This is
+ * the same comparison `BOOTSTRAP_DEBUG` and `TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL`
+ * use, and a gate that removes authentication should not be openable by a
+ * near-miss spelling.
+ */
+function unauthenticatedEndpointsAllowed(): boolean {
+  return process.env.ALLOW_UNAUTHENTICATED_ENDPOINTS === "true";
+}
+
+/**
+ * Endpoint uuids already named in a CONDITION 1 warning this process.
+ *
+ * Deduped because the warning describes a CONFIGURATION, which does not change
+ * between two requests a millisecond apart, while the requests hitting it can
+ * arrive as fast as a scanner can send them. Logging every one would turn an
+ * operator notice into a log-flood amplifier, and the misconfigured endpoint is
+ * unauthenticated, so an attacker controls the request rate. The durable
+ * per-request record still exists: every refusal emits an audit row via
+ * `emitMcpAuthDenial`, which is the queryable surface. This Set is only the
+ * "look at your logs" signal, and it resets on restart, so a misconfiguration
+ * that survives a redeploy is announced again.
+ */
+const warnedUnauthenticatedEndpoints = new Set<string>();
+
+function warnUnauthenticatedEndpoint(
+  endpoint: DatabaseEndpoint,
+  outcome: string,
+): void {
+  const key = endpoint.uuid || endpoint.name;
+  if (warnedUnauthenticatedEndpoints.has(key)) return;
+  warnedUnauthenticatedEndpoints.add(key);
+  logger.warn(
+    `[auth] endpoint "${endpoint.name}" (${endpoint.uuid}) has NO authentication configured: ${outcome}`,
+  );
+}
+
+/**
+ * Test seam for the dedupe Set above. Exported rather than made public state
+ * because a per-process Set is the right shape for the log-flood problem and
+ * the wrong shape for a test file that needs two independent cases.
+ */
+export function __resetUnauthenticatedEndpointWarnings(): void {
+  warnedUnauthenticatedEndpoints.clear();
+}
+
+/**
  * Enhanced authentication middleware organized by 4 clear conditions
  * to prevent infinite retry issues with MCP inspector
  */
@@ -334,7 +381,29 @@ export const authenticateApiKey = async (
 
   // ===== CONDITION 1: Both API key and OAuth OFF =====
   if (!endpoint?.enable_api_key_auth && !endpoint?.enable_oauth) {
-    return next(); // Pass through without authentication
+    // A missing endpoint record is a ROUTING bug, not a deliberate "publish
+    // this namespace" choice, so the escape hatch below deliberately does not
+    // cover it: there is no namespace an operator could have opted into and
+    // nothing downstream to serve. It fails closed unconditionally.
+    if (endpoint && unauthenticatedEndpointsAllowed()) {
+      warnUnauthenticatedEndpoint(
+        endpoint,
+        "served WITHOUT AUTHENTICATION because ALLOW_UNAUTHENTICATED_ENDPOINTS=true",
+      );
+      return next();
+    }
+
+    if (endpoint) {
+      warnUnauthenticatedEndpoint(
+        endpoint,
+        "REFUSED: both enable_api_key_auth and enable_oauth are off. Turn one on, or set ALLOW_UNAUTHENTICATED_ENDPOINTS=true to publish it unauthenticated on purpose",
+      );
+    }
+    emitMcpAuthDenial(req, endpoint, {
+      httpStatus: 401,
+      reason: "unauthenticated_endpoint_refused",
+    });
+    return sendAuthenticationRequiredChallenge(req, res);
   }
 
   try {
@@ -346,7 +415,7 @@ export const authenticateApiKey = async (
           httpStatus: 401,
           reason: "no_credential",
         });
-        return sendApiKeyRequiredResponse(res);
+        return sendApiKeyRequiredResponse(req, res);
       }
 
       // Validate API key
@@ -847,64 +916,4 @@ function checkOAuthAccess(
     allowed: false,
     message: `Access denied. This is a private endpoint owned by another user. You can only access public endpoints or endpoints you own.`,
   };
-}
-
-/**
- * Send API key required response (no WWW-Authenticate header to prevent OAuth flow)
- */
-function sendApiKeyRequiredResponse(res: express.Response): express.Response {
-  return res.status(401).json({
-    error: "authentication_required",
-    error_description: "Authentication required via API key",
-    supported_methods: [
-      "X-API-Key header",
-      "query parameter (api_key or apikey)",
-    ],
-    timestamp: new Date().toISOString(),
-  });
-}
-
-/**
- * Send OAuth challenge response with proper WWW-Authenticate header
- */
-function sendOAuthChallengeResponse(
-  req: express.Request,
-  res: express.Response,
-  endpoint: DatabaseEndpoint,
-): express.Response {
-  const baseUrl = getBaseUrl(req);
-
-  // Set WWW-Authenticate header for OAuth flow
-  const bearerChallenge = [
-    `Bearer realm="MetaMCP"`,
-    // Advertise the scope this server actually grants, not "admin" — the
-    // challenge is what an unauthenticated client copies into its next
-    // authorization request. See GRANTED_OAUTH_SCOPE.
-    `scope="${GRANTED_OAUTH_SCOPE}"`,
-    `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
-  ].join(", ");
-
-  res.set("WWW-Authenticate", bearerChallenge);
-
-  const authMethods = ["Authorization header (Bearer token)"];
-
-  // Add API key methods if also enabled
-  if (endpoint.enable_api_key_auth) {
-    authMethods.push("X-API-Key header");
-    if (endpoint.use_query_param_auth) {
-      authMethods.push("query parameter (api_key or apikey)");
-    }
-  }
-
-  const errorDescription = endpoint.enable_api_key_auth
-    ? "Authentication required via OAuth bearer token or API key"
-    : "Authentication required via OAuth bearer token";
-
-  return res.status(401).json({
-    error: "authentication_required",
-    error_description: errorDescription,
-    resource_metadata: `${baseUrl}/.well-known/oauth-protected-resource`,
-    supported_methods: authMethods,
-    timestamp: new Date().toISOString(),
-  });
 }
