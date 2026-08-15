@@ -16,8 +16,9 @@
  *    ownership-bypass methods for admins,
  *  - the update readback drops the full secret and carries only a prefix
  *    (security review fix), on BOTH the admin and the member branch,
- *  - `validate` refuses a key whose OWNER is disabled (migration 0027), while
- *    a public/service key (user_id NULL) is unaffected.
+ *  - `validate` refuses a key whose OWNER is disabled (migration 0027), and
+ *    equally one whose acts-as identity is disabled, while a public/service
+ *    key (user_id NULL) and an unscoped key's inert binding are unaffected.
  *
  * The repository is mocked (its barrel reaches db/index, which needs a live
  * DATABASE_URL); the real serializer is used so the response shaping is
@@ -86,6 +87,10 @@ vi.mock("../db/repositories", () => ({
   usersRepository: usersRepoMock,
 }));
 
+// lib/api-key-identity deliberately needs no mock: the impl's disabled-identity
+// gate resolves an acts-as binding through the REAL resolveActsAsUserId, the
+// same pure function the data-plane middleware runs, so the two planes cannot
+// drift on the identity-requires-scope pairing (migration 0024).
 import { apiKeysImplementations } from "./api-keys.impl";
 
 beforeEach(() => {
@@ -1119,6 +1124,12 @@ describe("api-keys validate — owner-disabled gate", () => {
       user_id: null,
       key_uuid: "key-pub",
     });
+    // Deliberately armed to answer "disabled" for ANY id. isDisabled must
+    // never be reached on this path, and arming it is what makes the test
+    // bite: with a bare vi.fn() (resolving undefined) dropping the NULL-owner
+    // guard would still leave the key reported valid, so the regression this
+    // test exists to catch would pass unnoticed.
+    usersRepoMock.isDisabled.mockResolvedValue(true);
 
     const result = await apiKeysImplementations.validate({ key: PUBLIC_KEY });
 
@@ -1153,5 +1164,90 @@ describe("api-keys validate — owner-disabled gate", () => {
     const result = await apiKeysImplementations.validate({ key: OWNED_KEY });
 
     expect(result).toEqual({ valid: false });
+  });
+});
+
+// The other half of the parity: the data plane refuses on
+// findDisabledIdentity([user_id, actsAsUserId]) — BOTH legs — so checking only
+// the owner here left an enabled admin's acts-as key still reported "valid"
+// while impersonating an account that was just locked out, which is exactly
+// the containment case migration 0027 was written for. Resolution goes
+// through the middleware's own resolveActsAsUserId so the
+// identity-requires-scope pairing (migration 0024) reads the same on both
+// planes.
+describe("api-keys validate — acts-as identity disabled gate", () => {
+  const ACTS_AS_KEY = `sk_mt_${"f".repeat(64)}`;
+  const ENDPOINT_UUID = "11111111-1111-4111-8111-111111111111";
+
+  it("reports an admin's acts-as key not-valid when the impersonated identity is disabled", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: "admin-owner",
+      key_uuid: "key-actsas",
+      endpoint_uuid: ENDPOINT_UUID,
+      acts_as_user_id: "locked-victim",
+    });
+    // The owner is a perfectly healthy admin; only the identity the key acts
+    // as is locked out.
+    usersRepoMock.isDisabled.mockImplementation(
+      async (userId: string) => userId === "locked-victim",
+    );
+
+    const result = await apiKeysImplementations.validate({ key: ACTS_AS_KEY });
+
+    // Same bare not-valid as the owner leg: which of the two identities is
+    // disabled is not disclosed.
+    expect(result).toEqual({ valid: false });
+    expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("admin-owner");
+    expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("locked-victim");
+  });
+
+  it("reports the same key valid when both identities are enabled, without echoing the binding", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: "admin-owner",
+      key_uuid: "key-actsas",
+      endpoint_uuid: ENDPOINT_UUID,
+      acts_as_user_id: "delegate-1",
+    });
+    usersRepoMock.isDisabled.mockResolvedValue(false);
+
+    const result = await apiKeysImplementations.validate({ key: ACTS_AS_KEY });
+
+    // acts_as_user_id and endpoint_uuid stay server-side for the same reason
+    // scope does: this procedure is a key oracle any member can call.
+    expect(result).toEqual({
+      valid: true,
+      user_id: "admin-owner",
+      key_uuid: "key-actsas",
+    });
+    expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("delegate-1");
+  });
+
+  it("ignores an acts-as binding on an unscoped key, matching the data plane", async () => {
+    repoMock.validateApiKey.mockResolvedValue({
+      valid: true,
+      user_id: "admin-owner",
+      key_uuid: "key-unscoped",
+      // Unscoped row that still carries a binding — the shape migration 0024's
+      // CHECK forbids but psql / admin_cli can still write. resolveActsAsUserId
+      // fail-closes it to undefined on BOTH planes, so the binding is inert
+      // here too and a locked-out delegate does not invalidate the key.
+      endpoint_uuid: null,
+      acts_as_user_id: "locked-victim",
+    });
+    usersRepoMock.isDisabled.mockImplementation(
+      async (userId: string) => userId === "locked-victim",
+    );
+
+    const result = await apiKeysImplementations.validate({ key: ACTS_AS_KEY });
+
+    expect(result).toEqual({
+      valid: true,
+      user_id: "admin-owner",
+      key_uuid: "key-unscoped",
+    });
+    expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("admin-owner");
+    expect(usersRepoMock.isDisabled).not.toHaveBeenCalledWith("locked-victim");
   });
 });
