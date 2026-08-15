@@ -212,8 +212,8 @@ describe("POST /oauth/introspect — anonymous callers are refused", () => {
 
   it("does not accept an OAuth access token as its own credential", async () => {
     // Presenting the very token under inspection must not authorize the
-    // inspection — that would leave the oracle open to anyone holding one
-    // stolen credential, which is the 2026-08-13 scenario exactly.
+    // inspection: that would leave the oracle open to anyone already holding
+    // one stolen credential, which is the threat the gate exists for.
     const res = await post(
       "/oauth/introspect",
       { token: LIVE_TOKEN },
