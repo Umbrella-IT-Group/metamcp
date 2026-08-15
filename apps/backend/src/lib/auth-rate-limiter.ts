@@ -96,13 +96,21 @@ export class AuthRateLimiter {
 // Create rate limiter instance for failed authentication attempts
 export const authRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
 
-// Clean up rate limiter entries every 10 minutes
+// Clean up rate limiter entries every 10 minutes.
+//
+// `unref` because this sweep is housekeeping and must never own the process's
+// lifetime — that belongs to the HTTP server in `index.ts`. Without it, merely
+// IMPORTING this module (a test file, a CLI script, anything that reaches
+// `AuthRateLimiter` or the identifier helpers below) registers a 10-minute
+// timer that keeps the event loop alive until something force-exits, which is
+// a hang with no visible cause. Same treatment as the sibling sweep in
+// `middleware/trpc-rate-limit.middleware`.
 setInterval(
   () => {
     authRateLimiter.cleanup();
   },
   10 * 60 * 1000,
-);
+).unref();
 
 /**
  * Get rate limiting identifier for authentication attempts

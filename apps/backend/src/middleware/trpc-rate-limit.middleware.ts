@@ -2,6 +2,7 @@ import express from "express";
 
 import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
 import { AuthRateLimiter } from "@/lib/auth-rate-limiter";
+import logger from "@/utils/logger";
 
 /**
  * A per-caller request cap on `/trpc`, which had none.
@@ -58,9 +59,11 @@ import { AuthRateLimiter } from "@/lib/auth-rate-limiter";
  * minute per IP, which is the property that matters; a per-batch cap would
  * need the tRPC adapter to expose one.
  *
- * NOTE it does NOT emit an audit row for a 429. Logging every refusal on the
- * path whose write volume is the thing being limited would reintroduce the
- * amplifier one layer up.
+ * NOTE it does NOT emit an audit row for a 429. Writing a row per refusal on
+ * the path whose write volume is the thing being limited would reintroduce the
+ * amplifier one layer up. A refusal is reported to the LOG instead, throttled
+ * to one line a minute — see `reportRefusal` for why silence was not an option
+ * either.
  */
 
 /** Requests per window, per client IP. Deliberately far above real UI burst. */
@@ -74,9 +77,67 @@ const trpcRateLimiter = new AuthRateLimiter(
 
 // The limiter's Map grows one entry per distinct client IP per window, so an
 // address-rotating flood would otherwise leak memory for the life of the
-// process. `unref` so this timer never holds the event loop open — a
-// housekeeping sweep must not be the reason a test run or a shutdown hangs.
+// process. `unref` because a housekeeping sweep must not be the reason a test
+// run or a shutdown hangs: this process's lifetime is owned by the HTTP server
+// in `index.ts`, never by a cleanup timer. The sibling sweep in
+// `lib/auth-rate-limiter` — a module this one imports, so it is registered
+// either way — is unref'd for the same reason.
 setInterval(() => trpcRateLimiter.cleanup(), 10 * 60 * 1000).unref();
+
+/** How long one reported refusal suppresses the next report. */
+const REFUSAL_REPORT_INTERVAL_MS = 60 * 1000;
+
+let refusalsTotal = 0;
+let lastRefusalReportAt = 0;
+
+/** Test seam: forget the counter and the throttle window. */
+export function resetTrpcRefusalReportingForTesting(): void {
+  refusalsTotal = 0;
+  lastRefusalReportAt = 0;
+}
+
+/**
+ * Make a refusal DETECTABLE without re-creating the amplifier.
+ *
+ * The 429 path deliberately writes no audit row (see the header). But a
+ * limiter nobody can observe is indistinguishable from no limiter at all: a
+ * flood would show up only as users reporting that the dashboard is failing,
+ * and an operator could not separate that from an unrelated outage. A log line
+ * costs an append to a rotating file rather than a row in an append-only table
+ * with no prune path, which is why it is the safe place to be loud.
+ *
+ * Same shape as `reportAuditWriteFailure` in `lib/audit/audit-emitter`, for the
+ * same reasons: the FIRST refusal reports immediately because detection must
+ * not wait out a window, and the count is a RUNNING TOTAL since startup rather
+ * than a per-window delta, because a delta is stranded whenever the burst that
+ * produced it stops before the next report fires. WARN and not ERROR — a
+ * refused request is this control working, and an alert that pages on the
+ * control working is an alert someone turns off.
+ *
+ * The IP is JSON-stringified rather than interpolated raw: it arrives as a
+ * header value, and an embedded newline in an interpolated log line forges
+ * whole log entries — the same defect this fork already fixed on the mcp-proxy
+ * connect line. Its length is bounded where it is stamped
+ * (`middleware/audit-context.middleware`, AUDIT_IP_MAX), so it cannot pad the
+ * line either.
+ */
+function reportRefusal(clientIp: string): void {
+  refusalsTotal += 1;
+  const now = Date.now();
+  // The `!== 0` half matters under a mocked clock: a suite that pins Date to
+  // the epoch would otherwise have its very first refusal silently swallowed.
+  if (
+    lastRefusalReportAt !== 0 &&
+    now - lastRefusalReportAt < REFUSAL_REPORT_INTERVAL_MS
+  ) {
+    return;
+  }
+  lastRefusalReportAt = now;
+  logger.warn(
+    `[trpc] rate limit refused ${JSON.stringify(clientIp)}, ` +
+      `${refusalsTotal} request(s) refused since startup`,
+  );
+}
 
 /**
  * Factory so a test can supply a limiter with a small budget instead of
@@ -96,9 +157,12 @@ export function createTrpcRateLimitMiddleware(
       return;
     }
 
-    // Namespaced so `/trpc` volume cannot spend the budget of the endpoint
-    // data plane or the public OAuth routes, which share the class but not the
-    // key space.
+    // The `trpc:` prefix is descriptive, not load-bearing: `trpcRateLimiter`
+    // is its own `AuthRateLimiter` INSTANCE with its own Map, so `/trpc` volume
+    // could not reach the endpoint data plane's or the public OAuth routes'
+    // budgets even unprefixed. It is kept so an identifier read out of a heap
+    // dump or a debugger names where it came from, and so that moving this onto
+    // a shared instance later cannot silently merge the key spaces.
     if (limiter.isRateLimited(`trpc:${clientIp}`)) {
       // Retry-After is the window length rather than the exact remainder — the
       // limiter exposes no remainder, and an upper bound is the safe direction
@@ -107,6 +171,7 @@ export function createTrpcRateLimitMiddleware(
         "Retry-After",
         String(Math.ceil(TRPC_RATE_LIMIT_WINDOW_MS / 1000)),
       );
+      reportRefusal(clientIp);
       res.status(429).json({ error: "Too many requests" });
       return;
     }
