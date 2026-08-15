@@ -5,6 +5,10 @@ import {
   credentialFingerprint,
   emit,
 } from "@/lib/audit/audit-emitter";
+import {
+  authRateLimiter,
+  getPublicOAuthRateLimitIdentifier,
+} from "@/lib/auth-rate-limiter";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
@@ -537,8 +541,10 @@ async function handleRefreshTokenGrant(
  * Record an introspection or revocation of a token that ACTUALLY EXISTS.
  *
  * WHAT IS AND IS NOT EMITTED HERE, because both endpoints are unauthenticated
- * and neither carries a rate limiter (unlike /oauth/token and /oauth/register,
- * which have `rateLimitToken`), and `audit_log` has no prune path:
+ * and `audit_log` has no prune path. Both now carry a FAILURE-only limiter
+ * (see isPublicOAuthEndpointLimited below), which bounds unresolvable-token
+ * spam but deliberately does NOT bound the success paths — so every "is this
+ * branch replayable?" judgement below still stands unchanged:
  *
  *  - UNKNOWN token, either endpoint: NOTHING. One anonymous request would
  *    equal one permanent INSERT recording a string the caller invented, and
@@ -552,14 +558,21 @@ async function handleRefreshTokenGrant(
  *    one stolen credential — the 2026-08-13 scenario exactly — can replay it
  *    forever, each replay a permanent row. And the event has little to add:
  *    `oauth.token.issue` already recorded that this credential exists, under
- *    the same fingerprint. Bounding it properly means mounting a rate limiter
- *    on a public endpoint, which is a behaviour change for existing resource
- *    servers and belongs to whoever can verify it against live traffic.
+ *    the same fingerprint. The failure-only limiter does not change this: a
+ *    caller replaying a REAL token never scores against it, by design, so the
+ *    branch is exactly as unbounded as it was. Bounding the ROW COUNT needs a
+ *    prune path on `audit_log`, not a limiter on the endpoint.
  *  - INTROSPECT reporting INACTIVE because the ACCOUNT IS DISABLED: emitted.
  *    That one is bounded by the same argument in reverse — it requires a real
  *    token belonging to a locked-out account, i.e. a credential an
  *    administrator has already acted against, and a relying party still asking
- *    about it is exactly what an incident responder wants to see.
+ *    about it is exactly what an operator wants to see.
+ *  - REVOKE refused because the CLIENT DOES NOT MATCH: emitted, and it is the
+ *    highest-signal event either endpoint produces. Same bound as the two
+ *    above: it cannot be reached without presenting a REAL, currently-issued
+ *    token, and it is rate-limited on top, so it is not replay amplification.
+ *    A caller naming a different client than the token was issued to is not a
+ *    confused client.
  *
  * The token is recorded as a fingerprint only, matching `emitTokenIssued`, so
  * an operator can follow one credential from mint to revocation by hash.
@@ -572,6 +585,14 @@ function emitTokenLifecycle(
     userId: string;
     token: string;
     outcome: "success" | "failure";
+    /**
+     * Defaults to 200 because every other caller here answers 200 — including
+     * the refusals, which is the point of RFC 7662's `{active:false}` and RFC
+     * 7009's 200-to-garbage. The client-mismatch refusal is the one that does
+     * not, and a row claiming 200 for a 400 would misreport the only wire fact
+     * the table carries about that request.
+     */
+    httpStatus?: number;
     detail?: Record<string, unknown>;
   },
 ): void {
@@ -588,7 +609,7 @@ function emitTokenLifecycle(
     target_id: fields.clientId,
     outcome: fields.outcome,
     request_id: audit.request_id,
-    http_status: 200,
+    http_status: fields.httpStatus ?? 200,
     detail: {
       token_sha256: fingerprint.sha256,
       token_last4: fingerprint.last4,
@@ -598,13 +619,79 @@ function emitTokenLifecycle(
 }
 
 /**
+ * Failure-only rate limiting for /oauth/introspect and /oauth/revoke.
+ *
+ * Both endpoints take no credential — RFC 7662 §2.1 says an introspection
+ * endpoint MUST require authorization, and there is nothing here to require it
+ * of: the clients are secretless public PKCE clients. Bounding the traffic by
+ * FAILURE is the substitute, and it has to be by failure rather than by
+ * request. `rateLimitToken`, the per-IP limiter already on /oauth/token, would
+ * be an outage on these two: `trust proxy` is deliberately off, so every
+ * caller through the tunnel shares ONE `req.ip` bucket.
+ *
+ * A caller presenting a token this server issued therefore never scores, no
+ * matter how often it asks. Only tokens that resolve to nothing — invented,
+ * expired, or presented with a client_id they were not issued to — count.
+ *
+ * THE RESIDUAL, STATED PLAINLY RATHER THAN IMPLIED AWAY: the bucket is still
+ * per-IP and `trust proxy` is still off, so failure-only makes legitimate
+ * traffic incapable of filling the bucket — it does NOT make the bucket
+ * un-fillable. Anyone who can reach these endpoints can spend it with 20
+ * invented-token POSTs and hold it there indefinitely, and everyone sharing
+ * that source address is refused with them. That is accepted, not solved, and
+ * it is only acceptable because the gateway's own traffic no longer arrives
+ * here at all: `api-key-oauth.middleware.ts` reads the token row in-process, so
+ * no MCP client depends on this endpoint answering. Anything that reintroduces
+ * an internal caller must revisit this decision first.
+ *
+ * Split into check and record on purpose: the check runs BEFORE the database
+ * lookup, so refusing costs nothing, and `isCurrentlyLimited` is used rather
+ * than `isRateLimited` because the latter counts the question it is asked.
+ */
+function isPublicOAuthEndpointLimited(
+  req: express.Request,
+  route: "introspect" | "revoke",
+): boolean {
+  return authRateLimiter.isCurrentlyLimited(
+    getPublicOAuthRateLimitIdentifier(req, route),
+  );
+}
+
+function recordPublicOAuthEndpointFailure(
+  req: express.Request,
+  route: "introspect" | "revoke",
+): void {
+  authRateLimiter.recordFailedAttempt(
+    getPublicOAuthRateLimitIdentifier(req, route),
+  );
+}
+
+function sendPublicOAuthEndpointRateLimited(
+  res: express.Response,
+  route: "introspect" | "revoke",
+): express.Response {
+  logger.info(
+    `[RATE LIMIT] /oauth/${route} rate limited after repeated unresolvable tokens`,
+  );
+  return res.status(429).json({
+    error: "too_many_requests",
+    error_description: "Too many failed token lookups. Please try again later.",
+  });
+}
+
+/**
  * OAuth 2.0 Token Introspection Endpoint
  * Allows clients to introspect access tokens
  */
 tokenRouter.post("/oauth/introspect", async (req, res) => {
   try {
+    if (isPublicOAuthEndpointLimited(req, "introspect")) {
+      return sendPublicOAuthEndpointRateLimited(res, "introspect");
+    }
+
     // Check if body was parsed correctly
     if (!req.body || typeof req.body !== "object") {
+      recordPublicOAuthEndpointFailure(req, "introspect");
       return res.status(400).json({
         error: "invalid_request",
         error_description: "Request body is missing or malformed",
@@ -614,6 +701,7 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     const { token } = req.body;
 
     if (!token) {
+      recordPublicOAuthEndpointFailure(req, "introspect");
       return res.status(400).json({
         error: "invalid_request",
         error_description: "Missing token parameter",
@@ -624,6 +712,7 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     const tokenData = await oauthRepository.getAccessToken(token);
 
     if (!tokenData || !token.startsWith("mcp_token_")) {
+      recordPublicOAuthEndpointFailure(req, "introspect");
       return res.json({
         active: false,
       });
@@ -631,6 +720,10 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
 
     // Check if token has expired
     if (Date.now() > tokenData.expires_at.getTime()) {
+      // Counted: an expired token is still a token that resolves to nothing,
+      // and a caller replaying one indefinitely is the shape being bounded. A
+      // real client hits this at most once, when its own token ages out.
+      recordPublicOAuthEndpointFailure(req, "introspect");
       await oauthRepository.deleteAccessToken(token);
       return res.json({
         active: false,
@@ -660,6 +753,12 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     // token-row lookup — the data plane it feeds does its own isDisabled
     // check on the resolved identity, and one plane's account policy has no
     // business hiding inside the other's lookup.
+    //
+    // Deliberately NOT counted against the failure limiter: the credential is
+    // real and was issued by this server, so a relying party asking about it
+    // is a legitimate caller doing the right thing. Counting it would let one
+    // locked-out account's still-running client spend the shared per-IP budget
+    // and refuse everyone else — the outage this limiter is shaped to avoid.
     if (await usersRepository.isDisabled(tokenData.user_id)) {
       logger.warn(
         `[oauth] introspect reported inactive reason=disabled client=${tokenData.client_id} user=${tokenData.user_id}`,
@@ -706,26 +805,100 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
  */
 tokenRouter.post("/oauth/revoke", async (req, res) => {
   try {
+    if (isPublicOAuthEndpointLimited(req, "revoke")) {
+      return sendPublicOAuthEndpointRateLimited(res, "revoke");
+    }
+
     // Check if body was parsed correctly
     if (!req.body || typeof req.body !== "object") {
+      recordPublicOAuthEndpointFailure(req, "revoke");
       return res.status(400).json({
         error: "invalid_request",
         error_description: "Request body is missing or malformed",
       });
     }
 
-    const { token } = req.body;
+    const { token, client_id } = req.body;
 
     if (!token) {
+      recordPublicOAuthEndpointFailure(req, "revoke");
       return res.status(400).json({
         error: "invalid_request",
         error_description: "Missing token parameter",
       });
     }
 
+    /**
+     * RFC 7009 §2.1 asks the server to "verify whether the token was issued to
+     * the client making the revocation request". This check is NON-BLOCKING
+     * when client_id is absent, mirroring handleRefreshTokenGrant above, so
+     * BE CLEAR ABOUT WHAT IT DOES AND DOES NOT BUY: it does not stop anyone
+     * holding a stolen token from revoking it, because omitting client_id
+     * skips the comparison entirely. The MUST is not satisfied and cannot be
+     * satisfied here — these are secretless public PKCE clients, so a supplied
+     * client_id is an unauthenticated claim either way, and refusing the
+     * clients that omit it would break revocation for the ones least able to
+     * protect a token in the first place. Revocation destroying a credential
+     * is also the safe direction to fail.
+     *
+     * What it does buy is a signal: a caller that names a DIFFERENT client
+     * than the token was issued to is not a confused client, and that mismatch
+     * is the highest-value event either of these endpoints produces.
+     */
+    const clientMismatch = (tokenClientId: string): boolean =>
+      Boolean(client_id) && tokenClientId !== client_id;
+
+    /**
+     * Refuse a revocation whose client_id names someone else, loudly.
+     *
+     * This branch IS audited, unlike the other refusals on these two endpoints,
+     * and the reason is the one that governs every emit decision in this file
+     * (see emitTokenLifecycle): replay amplification. An unknown-token refusal
+     * records a string the caller invented and can be repeated forever. This
+     * one requires a REAL, currently-issued token presented under the wrong
+     * client — it cannot be produced without already holding a live credential,
+     * and it is rate-limited on top. Bounded, and it answers the question an
+     * operator actually asks: "did anyone use this credential from somewhere it
+     * was not issued to?"
+     */
+    const refuseClientMismatch = (
+      tokenData: { client_id: string; user_id: string },
+      tokenType: "access_token" | "refresh_token",
+    ): express.Response => {
+      recordPublicOAuthEndpointFailure(req, "revoke");
+      logger.warn(
+        `[oauth] revoke rejected reason=client_mismatch token_client=${tokenData.client_id} presented_client=${JSON.stringify(String(client_id).slice(0, 100))} user=${tokenData.user_id}`,
+      );
+      emitTokenLifecycle(req, {
+        action: "oauth.token.revoke",
+        clientId: tokenData.client_id,
+        userId: tokenData.user_id,
+        token,
+        outcome: "failure",
+        httpStatus: 400,
+        detail: {
+          reason: "client_mismatch",
+          token_type: tokenType,
+          // Clamped: `client_id` is unauthenticated request text on an
+          // endpoint that takes no credential, and `audit_log` has no prune
+          // path, so an unbounded value here is a write-amplification
+          // primitive. Recorded because "which client did they claim to be" is
+          // the whole content of the event.
+          presented_client_id: String(client_id).slice(0, 100),
+        },
+      });
+      return res.status(400).json({
+        error: "invalid_client",
+        error_description: "Client ID does not match",
+      });
+    };
+
     // Try revoking as access token
     const accessTokenData = await oauthRepository.getAccessToken(token);
     if (accessTokenData) {
+      if (clientMismatch(accessTokenData.client_id)) {
+        return refuseClientMismatch(accessTokenData, "access_token");
+      }
       await oauthRepository.deleteAccessToken(token);
       emitTokenLifecycle(req, {
         action: "oauth.token.revoke",
@@ -739,6 +912,9 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
       // Try revoking as refresh token
       const tokenData = await oauthRepository.getByRefreshToken(token);
       if (tokenData) {
+        if (clientMismatch(tokenData.client_id)) {
+          return refuseClientMismatch(tokenData, "refresh_token");
+        }
         await oauthRepository.deleteAccessToken(tokenData.access_token);
         emitTokenLifecycle(req, {
           action: "oauth.token.revoke",
@@ -748,8 +924,12 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
           outcome: "success",
           detail: { token_type: "refresh_token" },
         });
+      } else {
+        // RFC 7009: return success even if token doesn't exist — but count it.
+        // The 200 is what makes this endpoint an unauthenticated oracle worth
+        // spraying, and a caller whose tokens never resolve is not a client.
+        recordPublicOAuthEndpointFailure(req, "revoke");
       }
-      // RFC 7009: return success even if token doesn't exist
     }
 
     // RFC 7009 specifies that revocation endpoint should return 200 OK

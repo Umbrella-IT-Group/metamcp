@@ -41,6 +41,13 @@ vi.mock("../db/repositories/users.repo", () => ({
   usersRepository: { isDisabled: vi.fn() },
 }));
 
+// Same again for oauth.repo: the middleware now validates a bearer token by
+// reading the token row directly instead of calling its own /oauth/introspect
+// over HTTP, so that repository is on the module-load import chain too.
+vi.mock("../db/repositories/oauth.repo", () => ({
+  oauthRepository: { getAccessToken: vi.fn() },
+}));
+
 import {
   checkApiKeyAccess,
   resolveActsAsUserId,

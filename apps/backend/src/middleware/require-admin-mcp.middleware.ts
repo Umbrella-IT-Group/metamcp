@@ -12,12 +12,17 @@ type AuthenticatedRequest = express.Request & {
  *
  * Why the whole surface, not just one route: `/mcp-proxy/*` is the MCP
  * Inspector, an operator dev tool that proxies a browser session straight at
- * an arbitrary MCP transport. Its STDIO branch reads `command`, `args` and
- * `env` from the QUERY STRING and hands them to `spawn()` with the backend's
- * full `process.env` (`routers/mcp-proxy/server.ts` `createTransport` ->
- * `ProcessManagedStdioTransport.start`), so being able to reach this router
- * at all is arbitrary command execution on the gateway host as the gateway
- * user. Until this gate the only check was `betterAuthMcpMiddleware`, which
+ * an MCP transport. Its STDIO branch hands a command to `spawn()` with the
+ * backend's full `process.env` (`routers/mcp-proxy/server.ts`
+ * `createTransport` -> `ProcessManagedStdioTransport.start`), so being able to
+ * reach this router at all starts processes on the gateway host as the gateway
+ * user. That command used to be read from the QUERY STRING, which made it
+ * arbitrary command execution; it now comes from the `mcp_servers` row only
+ * (`findRegisteredStdioServer`), so what is reachable here is "start any
+ * REGISTERED server" rather than "run anything". This gate is still what
+ * decides who may do that, and it is not the sourcing fix's backstop nor the
+ * other way round. Until this gate the only check was
+ * `betterAuthMcpMiddleware`, which
  * proves a valid session and nothing else — every member-role account could
  * run commands on the gateway. Gating route-by-route would leave the next
  * route added to this router unprotected, so the gate sits at the parent

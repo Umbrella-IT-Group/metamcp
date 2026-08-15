@@ -42,6 +42,15 @@ vi.mock("../db/repositories/users.repo", () => ({
   usersRepository: { isDisabled: isDisabledMock },
 }));
 
+// The middleware validates a bearer token by reading the token row directly
+// (it used to call its own /oauth/introspect over HTTP), so oauth.repo is on
+// the module-load import chain and reaches db/index like the other two. No
+// test in this file takes the OAuth branch — every endpoint here has
+// enable_oauth false — so the lookup answering `null` is never reached.
+vi.mock("../db/repositories/oauth.repo", () => ({
+  oauthRepository: { getAccessToken: vi.fn().mockResolvedValue(null) },
+}));
+
 const { authenticateApiKey } = await import("./api-key-oauth.middleware");
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 

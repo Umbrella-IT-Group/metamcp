@@ -50,6 +50,14 @@ vi.mock("../../db/repositories/users.repo", () => ({
   usersRepository: { isDisabled: isDisabledMock },
 }));
 
+// The bearer middleware reads the token row directly now (it used to call its
+// own /oauth/introspect over HTTP), so oauth.repo is on its module-load import
+// chain and reaches db/index like the two above. This suite drives only the
+// API-key branch, so the lookup is never reached.
+vi.mock("../../db/repositories/oauth.repo", () => ({
+  oauthRepository: { getAccessToken: vi.fn().mockResolvedValue(null) },
+}));
+
 const { authenticateApiKey } = await import(
   "../../middleware/api-key-oauth.middleware"
 );

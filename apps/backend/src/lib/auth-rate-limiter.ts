@@ -45,6 +45,23 @@ export class AuthRateLimiter {
     return false;
   }
 
+  /**
+   * Read-only "is this identifier already over budget?".
+   *
+   * `isRateLimited` COUNTS the call it is asked about, which makes it the wrong
+   * question for a gate that runs BEFORE the work: on an endpoint whose success
+   * path must never accumulate — see getPublicOAuthRateLimitIdentifier — the
+   * check itself would become the thing that eventually refuses a legitimate
+   * caller. This one only reads, so the count moves only when something
+   * actually failed.
+   */
+  isCurrentlyLimited(identifier: string): boolean {
+    const record = this.attempts.get(identifier);
+    if (!record) return false;
+    if (Date.now() > record.resetTime) return false;
+    return record.count >= this.maxAttempts;
+  }
+
   recordFailedAttempt(identifier: string): void {
     const now = Date.now();
     const record = this.attempts.get(identifier);
@@ -98,4 +115,35 @@ export function getAuthRateLimitIdentifier(
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   const endpointId = endpoint.uuid || endpoint.name || "unknown";
   return `${ip}:${endpointId}`;
+}
+
+/**
+ * Rate-limit identifier for the UNAUTHENTICATED OAuth token endpoints —
+ * /oauth/introspect and /oauth/revoke.
+ *
+ * FAILURE-ONLY, and that is a hard requirement rather than a preference. This
+ * fork deliberately does not set express `trust proxy` (see
+ * middleware/audit-context.middleware for why), so `req.ip` is the same
+ * in-container address for every caller arriving through the tunnel: one
+ * bucket for the entire organisation. A limiter that counted SUCCESSES here
+ * would therefore let any single busy client throttle everyone else's MCP
+ * traffic — an outage caused by the control meant to prevent one.
+ *
+ * Counting only failures is safe against exactly that, because a legitimate
+ * caller presents a token this server previously issued and never scores.
+ * Only invented, expired or wrong-client tokens accumulate, which is the
+ * traffic worth refusing. It is the workable substitute for RFC 7662 §2.1's
+ * "MUST require authorization": the clients here are secretless public PKCE
+ * clients, so there is no credential to require.
+ *
+ * Keyed per route so spam at one endpoint cannot spend the other's budget, and
+ * namespaced away from the endpoint data plane's identifiers so it cannot
+ * spend that budget either.
+ */
+export function getPublicOAuthRateLimitIdentifier(
+  req: express.Request,
+  route: "introspect" | "revoke",
+): string {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  return `oauth-public:${route}:${ip}`;
 }
