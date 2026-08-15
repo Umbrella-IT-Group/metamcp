@@ -24,11 +24,21 @@ vi.mock("@/utils/logger", () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// The registration router reaches the repository only after the body passes
+// validation, and the router-level assertion below deliberately sends a body
+// that never does — so nothing here should ever be called.
+const upsertClientMock = vi.fn();
+
+vi.mock("../../db/repositories", () => ({
+  oauthRepository: { upsertClient: upsertClientMock },
+}));
+
 const {
   rateLimitRegistration,
   rateLimitToken,
   resetRegistrationRateLimitForTests,
 } = await import("./utils");
+const { default: registrationRouter } = await import("./registration");
 
 /** The registration bucket's budget. */
 const REGISTRATION_BUDGET = 30;
@@ -124,9 +134,9 @@ describe("rateLimitRegistration", () => {
   });
 
   it("does not spend the token endpoint's budget", () => {
-    // THE regression. Exhaust registration for a caller, then show that a
-    // token exchange from the very same source is untouched — that is what a
-    // claude.ai connector does immediately after the consent screen.
+    // Exhaust registration for a caller, then show that a token exchange from
+    // the very same source is untouched — that is what a claude.ai connector
+    // does immediately after the consent screen.
     for (let i = 0; i < REGISTRATION_BUDGET + 5; i += 1) {
       register("203.0.113.14");
     }
@@ -138,5 +148,82 @@ describe("rateLimitRegistration", () => {
     });
     expect(tokenExchange.passed).toBe(true);
     expect(tokenExchange.status).toBe(200);
+  });
+});
+
+describe("POST /oauth/register — the route is wired to its own limiter", () => {
+  /**
+   * THE regression, driven through the REAL route rather than the middleware.
+   *
+   * The tests above prove `rateLimitRegistration` behaves; only this one
+   * proves `/oauth/register` USES it. Put `rateLimitToken` back on the route
+   * — the exact revert this change guards against — and every assertion above
+   * still passes while this one fails.
+   *
+   * The bodies are deliberately invalid, so `buildClientRegistration` refuses
+   * them with a 400 and neither the repository nor the audit emitter is
+   * reached: the limiter is route middleware and runs first, which is the only
+   * thing under test.
+   */
+  async function registerViaRouter(clientIp: string): Promise<Outcome> {
+    const outcome: Outcome = { status: 200, passed: false };
+    let settle: () => void;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+
+    const req = {
+      method: "POST",
+      url: "/oauth/register",
+      originalUrl: "/oauth/register",
+      baseUrl: "",
+      path: "/oauth/register",
+      body: { client_name: "no redirect uris" },
+      headers: { "cf-connecting-ip": clientIp },
+      ip: SHARED_REQ_IP,
+      socket: { remoteAddress: SHARED_REQ_IP },
+    } as unknown as express.Request;
+
+    const res = {
+      status(code: number) {
+        outcome.status = code;
+        return res;
+      },
+      json() {
+        settle();
+        return res;
+      },
+    } as unknown as express.Response;
+
+    await new Promise<void>((resolve, reject) => {
+      (registrationRouter as unknown as express.RequestHandler)(
+        req,
+        res,
+        (err?: unknown) => (err ? reject(err) : resolve()),
+      );
+      settled.then(resolve);
+    });
+
+    return outcome;
+  }
+
+  it("429s past the registration budget without touching the token budget", async () => {
+    const CALLER = "203.0.113.20";
+
+    for (let i = 0; i < REGISTRATION_BUDGET; i += 1) {
+      const within = await registerViaRouter(CALLER);
+      // A refused-as-invalid registration, i.e. it got past the limiter.
+      expect(within.status).toBe(400);
+    }
+
+    expect((await registerViaRouter(CALLER)).status).toBe(429);
+    expect(upsertClientMock).not.toHaveBeenCalled();
+
+    // The connector's token exchange, from the same source, still goes through.
+    const tokenExchange = run(rateLimitToken, {
+      clientIp: CALLER,
+      reqIp: SHARED_REQ_IP,
+    });
+    expect(tokenExchange.passed).toBe(true);
   });
 });
