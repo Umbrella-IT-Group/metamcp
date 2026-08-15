@@ -2,7 +2,7 @@
  * Tests for the registration-time redirect_uri gate — FIND-023 (HIGH,
  * a security review).
  *
- * The security review re-run registered all of the URIs in security review_CASES below
+ * The security review re-run registered all of the URIs in REJECTED_URI_CASES below
  * against the live gateway and got a 201 for every one of them; only
  * `javascript:` and `data:` were refused. Because `POST /oauth/register` takes
  * no credential, each of those 201s is a client a signed-in human can be
@@ -41,26 +41,27 @@ import {
  * stops a future edit from passing this suite for the wrong reason (e.g. a
  * scheme bug that happens to reject the userinfo case).
  */
-const security review_CASES: ReadonlyArray<[string, RedirectUriRejectionReason]> = [
-  ["https://evil.com/callback", "host_not_allowed"],
-  ["https://your-gateway.example.com.evil.com/callback", "host_not_allowed"],
-  // Real host is evil.com; the part that reads as ours is userinfo.
-  ["https://your-gateway.example.com@evil.com/callback", "userinfo_present"],
-  ["http://localhost:12009/callback", "gateway_internal_port"],
-  ["https://claude.ai/api/mcp/auth_callback#stolen", "fragment_present"],
-  ["http://evil.com/callback", "insecure_scheme_non_loopback"],
-  // A loopback label as a PREFIX — what a `startsWith` test would let through.
-  ["http://localhost.evil.com/callback", "insecure_scheme_non_loopback"],
-  ["https://localhost.evil.com/callback", "host_not_allowed"],
-  ["https://127.0.0.1.evil.com/callback", "host_not_allowed"],
-  // A loopback label as a SUFFIX — what an `endsWith` test would let through.
-  // `evil.localhost` and `notlocalhost` both end in the string "localhost"
-  // and neither is the loopback interface.
-  ["http://evil.localhost/callback", "insecure_scheme_non_loopback"],
-  ["https://evil.localhost/callback", "host_not_allowed"],
-  ["https://notlocalhost/callback", "host_not_allowed"],
-  ["https://x.127.0.0.1.example/callback", "host_not_allowed"],
-];
+const REJECTED_URI_CASES: ReadonlyArray<[string, RedirectUriRejectionReason]> =
+  [
+    ["https://evil.com/callback", "host_not_allowed"],
+    ["https://your-gateway.example.com.evil.com/callback", "host_not_allowed"],
+    // Real host is evil.com; the part that reads as ours is userinfo.
+    ["https://your-gateway.example.com@evil.com/callback", "userinfo_present"],
+    ["http://localhost:12009/callback", "gateway_internal_port"],
+    ["https://claude.ai/api/mcp/auth_callback#stolen", "fragment_present"],
+    ["http://evil.com/callback", "insecure_scheme_non_loopback"],
+    // A loopback label as a PREFIX — what a `startsWith` test would let through.
+    ["http://localhost.evil.com/callback", "insecure_scheme_non_loopback"],
+    ["https://localhost.evil.com/callback", "host_not_allowed"],
+    ["https://127.0.0.1.evil.com/callback", "host_not_allowed"],
+    // A loopback label as a SUFFIX — what an `endsWith` test would let through.
+    // `evil.localhost` and `notlocalhost` both end in the string "localhost"
+    // and neither is the loopback interface.
+    ["http://evil.localhost/callback", "insecure_scheme_non_loopback"],
+    ["https://evil.localhost/callback", "host_not_allowed"],
+    ["https://notlocalhost/callback", "host_not_allowed"],
+    ["https://x.127.0.0.1.example/callback", "host_not_allowed"],
+  ];
 
 /**
  * The shapes the live client rows actually use. Loopback covers the installed
@@ -87,7 +88,7 @@ afterEach(() => {
 });
 
 describe("isAllowedRedirectUri — the security review cases", () => {
-  it.each(security review_CASES)("rejects %s (%s)", (uri, reason) => {
+  it.each(REJECTED_URI_CASES)("rejects %s (%s)", (uri, reason) => {
     const result = isAllowedRedirectUri(uri);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe(reason);
@@ -285,7 +286,7 @@ describe("resolveDcrAllowedHosts — operator override", () => {
 
 describe("buildClientRegistration — FIND-023 at the registration surface", () => {
   it("refuses every security review URI with the RFC 7591 error contract intact", () => {
-    for (const [uri] of security review_CASES) {
+    for (const [uri] of REJECTED_URI_CASES) {
       const result = buildClientRegistration({ redirect_uris: [uri] });
       expect(result.ok).toBe(false);
       if (result.ok) continue;
