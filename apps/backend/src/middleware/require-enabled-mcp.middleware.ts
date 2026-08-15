@@ -45,6 +45,12 @@ type AuthenticatedRequest = express.Request & {
  *    an async express middleware that rejects hands nothing to `next(err)`,
  *    so the request would hang until the client gave up instead of being
  *    refused — and a hang on a spawn-capable route is not a safe failure.
+ *
+ * Second consumer, so "the ENTIRE `/mcp-proxy` surface" above is now where
+ * this gate started rather than everywhere it runs: the two operator routes
+ * in `routers/public-metamcp/admin.ts` (`reset-errors`, `error-status`) apply
+ * it per route, in the same position — after authentication, before the role
+ * gate — for the same reason.
  */
 export const requireEnabledMcpMiddleware = async (
   req: express.Request,

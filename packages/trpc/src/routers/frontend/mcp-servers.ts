@@ -64,9 +64,16 @@ export const createMcpServersRouter = (
       userId: string,
       actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateMcpServerResponseSchema>>;
+    // `isAdmin` decides whether a PUBLIC (unowned) server may be reconnected.
+    // The impl's owner check can only compare `user_id` against the caller,
+    // and a public server has none — so ownership alone cannot answer "may
+    // this member drop every pooled connection to a shared server". Threaded
+    // from `ctx.user.role` at the call site below, the same way `list`/`get`
+    // thread theirs, rather than re-derived in the impl.
     reconnect: (
       input: z.infer<typeof ReconnectMcpServerRequestSchema>,
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof ReconnectMcpServerResponseSchema>>;
   },
 ) => {
@@ -150,12 +157,19 @@ export const createMcpServersRouter = (
     // Protected (deliberate): Reconnect MCP server (drop pooled upstream
     // connection so tools re-list on next request — no gateway restart
     // required). Operational nudge, not a config mutation — do not fold into
-    // the RBAC gate above.
+    // the RBAC gate above: adminProcedure here would also take away a
+    // non-admin owner's ability to reconnect a server they own. The public
+    // (unowned) case is what needs the role, and it is decided in the impl
+    // from the flag threaded below.
     reconnect: protectedProcedure
       .input(ReconnectMcpServerRequestSchema)
       .output(ReconnectMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.reconnect(input, ctx.user.id);
+        return await implementations.reconnect(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
   });
 };

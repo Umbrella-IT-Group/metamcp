@@ -43,6 +43,12 @@ type AuthenticatedRequest = express.Request & {
  * Fail-closed by construction: the test is positive (`role === "admin"`
  * passes), so a missing user, a missing role, an unknown role, or any future
  * change to the session payload shape all land on 403 rather than on access.
+ *
+ * Second consumer, so "the ENTIRE `/mcp-proxy` surface" above is now where
+ * this gate started rather than everywhere it runs: the two operator routes
+ * in `routers/public-metamcp/admin.ts` (`reset-errors`, `error-status`) apply
+ * it per route, because their router shares a mount with the API-key data
+ * plane that must never be asked for a session cookie.
  */
 export const requireAdminMcpMiddleware = (
   req: express.Request,

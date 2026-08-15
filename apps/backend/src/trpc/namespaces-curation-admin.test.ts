@@ -5,9 +5,14 @@
  * updateToolOverrides change which servers/tools an agent sees through a
  * namespace — the same "destructive update" class as namespace
  * create/update/delete. refreshTools (namespaces) and reconnect
- * (mcpServers) are deliberately left member-accessible (operational nudges,
- * no config mutation) and are commented in-line at their router definitions
- * rather than re-tested here.
+ * (mcpServers) stay protectedProcedure so a non-admin OWNER can still act on
+ * what they own, and are commented in-line at their router definitions. That
+ * is a procedure-level statement only: both carry an impl-level admin gate
+ * for the PUBLIC (unowned) case, pinned by
+ * `namespaces.refresh-tools.impl.test.ts` and
+ * `mcp-servers.reconnect.impl.test.ts` — the "no config mutation" reading of
+ * refreshTools that this file used to carry was wrong, since it upserts
+ * caller-supplied tool descriptions and schemas into the shared catalog.
  *
  * Drives the real `createNamespacesRouter` (from @repo/trpc) with a
  * minimal implementations stub, through a real tRPC caller with different
@@ -105,7 +110,11 @@ describe("namespaces curation mutations — admin gate", () => {
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
-  it("refreshTools stays member-accessible (deliberate — operational, not curation)", async () => {
+  // Procedure level only: the impl denies a non-admin on a PUBLIC namespace
+  // (namespaces.refresh-tools.impl.test.ts). What this asserts is that the
+  // mutation is still reachable by a member at all, so a non-admin owner
+  // keeps it for their own namespace.
+  it("refreshTools stays member-accessible (deliberate — owners keep it)", async () => {
     const router = buildRouter();
 
     await expect(
