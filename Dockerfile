@@ -99,9 +99,13 @@ COPY --from=builder --chown=nextjs:nodejs /app/packages ./packages
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
+# Lockfile is required here so the prod install below can run --frozen-lockfile:
+# pin prod deps to the already-resolved graph instead of re-resolving
+# package.json ranges (which can silently drift from the committed lockfile).
+COPY --from=builder --chown=nextjs:nodejs /app/pnpm-lock.yaml ./
 
 # Install production dependencies only
-RUN pnpm install --prod
+RUN pnpm install --prod --frozen-lockfile
 
 # Install drizzle-kit locally in backend for migrations
 RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
