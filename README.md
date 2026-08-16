@@ -23,6 +23,7 @@
 - [Stability](#stability)
 - [What we focus on](#what-we-focus-on)
 - [What we added over upstream](#what-we-added-over-upstream)
+- [Security](#security)
 - [Where we diverged from upstream](#where-we-diverged-from-upstream)
 - [Branch model](#branch-model)
 - [Relationship to upstream and attribution](#relationship-to-upstream-and-attribution)
@@ -106,6 +107,28 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 - **`tools/list_changed` propagation** — the gateway advertises `listChanged: true` and forwards backend tool-list changes to clients, instead of requiring a reconnect to learn about new/removed tools.
 - **Full-definition tool hashing + periodic sweep** — tool-list drift is detected on the full `{name, description, inputSchema}` (not just names), and a periodic pull sweep catches updates that arrive as container replacements (where no push notification survives).
 - **Per-server "Reconnect Server"** — a UI action that flushes a single backend's pooled connection without restarting the gateway.
+
+## Security
+
+This fork treats the gateway as an internet-facing, multi-user service and hardens it
+accordingly. Beyond the reliability work above, the `umbrella` branch adds defense-in-depth
+across the management and OAuth surfaces:
+
+- **Role-based access control** on the management API and the Inspector/proxy routes — admin
+  actions and diagnostics require an admin session, not merely an authenticated one.
+- **Secret redaction** in API responses — API-key values, per-server credentials, and OAuth
+  tokens are never returned in list/get/update payloads.
+- **Fail-closed registration** — self-registration defaults to disabled and stays disabled
+  across restarts; unauthenticated endpoints require an explicit opt-in.
+- **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of
+  unused clients, and a dedicated rate-limit bucket.
+- **Hardened OAuth surface** — allowlisted redirect URIs at authorize time, authenticated token
+  introspection, and consent protection on the authorize flow.
+- **Tamper-evident audit logging** of authentication and administrative events.
+
+See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record, and [`SECURITY.md`](SECURITY.md)
+to report an issue. Several of these items apply to upstream unchanged; we coordinate them privately
+with the upstream maintainers before any public detail.
 
 ## Where we diverged from upstream
 
