@@ -1,5 +1,6 @@
 import express from "express";
 
+import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
 import { globalBodyParser } from "./lib/global-body-parser";
 import {
@@ -74,6 +75,16 @@ app.use("/mcp-proxy", mcpProxyRouter);
 app.use("/trpc", trpcRouter);
 
 async function start(): Promise<void> {
+  // FIRST, so the privilege the gateway is actually holding is the first thing
+  // in the boot log rather than something an operator has to go and prove by
+  // hand. Never fatal: a failed check must not turn a privilege question into
+  // an outage, but it is always logged — see ./db/runtime-role-check.
+  try {
+    await verifyRuntimeDatabaseRole();
+  } catch (err) {
+    logger.error("Runtime DB role check failed (continuing):", err);
+  }
+
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 

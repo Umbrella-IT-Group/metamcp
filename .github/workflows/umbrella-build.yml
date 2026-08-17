@@ -26,6 +26,11 @@ on:
       - "packages/**"
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      # The entrypoint shells out to scripts/, and the Dockerfile COPYs the
+      # whole directory, so a change confined to a script feeds the image
+      # like any source change. Omitted, it would leave the published image
+      # running the previous version of a script with nothing to say so.
+      - "scripts/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -40,6 +45,11 @@ on:
       - "packages/**"
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      # The entrypoint shells out to scripts/, and the Dockerfile COPYs the
+      # whole directory, so a change confined to a script feeds the image
+      # like any source change. Omitted, it would leave the published image
+      # running the previous version of a script with nothing to say so.
+      - "scripts/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"

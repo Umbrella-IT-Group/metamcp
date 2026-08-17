@@ -114,6 +114,12 @@ RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
 
+# Helper scripts the entrypoint shells out to. Separate files rather than more
+# functions inside docker-entrypoint.sh so the same artifact the image runs is
+# the one the test suite executes against a real Postgres.
+COPY --chown=nextjs:nodejs scripts ./scripts
+RUN chmod +x scripts/*.sh
+
 USER nextjs
 
 # Expose frontend port (Next.js)

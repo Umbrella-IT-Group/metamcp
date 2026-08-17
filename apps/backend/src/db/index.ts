@@ -3,19 +3,23 @@ import { Pool } from "pg";
 
 import logger from "@/utils/logger";
 
+import { resolveRuntimeConnection } from "./runtime-connection";
 import * as schema from "./schema";
 
-const { DATABASE_URL, POSTGRES_CA_CERT } = process.env;
+const { POSTGRES_CA_CERT } = process.env;
 
-if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL is not set");
-}
+// The RUNTIME connection, which is DATABASE_URL unless the optional
+// NOSUPERUSER role split is configured — see ./runtime-connection for why the
+// request path and `drizzle-kit migrate` want different privilege levels.
+// `drizzle.config.ts` deliberately keeps reading DATABASE_URL: migrations are
+// the DDL that needs ownership.
+export const runtimeConnection = resolveRuntimeConnection();
 
 // Use an explicit pg Pool so we can attach a global error handler.
 // This prevents unhandled 'error' events from bringing down the Node process
 // when the database terminates idle connections (e.g., during maintenance).
 export const pool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: runtimeConnection.connectionString,
   ...(POSTGRES_CA_CERT && {
     ssl: {
       ca: POSTGRES_CA_CERT,

@@ -3,6 +3,7 @@ import { Pool } from "pg";
 
 import logger from "@/utils/logger";
 
+import { resolveRuntimeConnection } from "./runtime-connection";
 import * as schema from "./schema";
 
 /**
@@ -40,21 +41,24 @@ import * as schema from "./schema";
  * queue for all of them. Two gives one in flight and one arriving without
  * meaningfully widening the footprint.
  *
- * Same DATABASE_URL and same TLS material as the main pool — this is
- * isolation of CONNECTIONS, not of credentials or of the database. The
- * Phase-2 role split (a NOSUPERUSER INSERT-only runtime role) is what makes it
- * isolation of privilege too, and this pool is where that connection string
- * will land when it does.
+ * Same connection string and same TLS material as the main pool — this is
+ * isolation of CONNECTIONS, not of the database. It becomes isolation of
+ * PRIVILEGE too once the optional NOSUPERUSER role split is configured, which
+ * is what `./runtime-connection` resolves: both pools then dial a role that
+ * holds INSERT and SELECT on `audit_log` and nothing else, so the append-only
+ * triggers migration 0028 installs stop being bypassable by the credential the
+ * gateway is holding while it serves requests.
  */
 
-const { DATABASE_URL, POSTGRES_CA_CERT } = process.env;
+const { POSTGRES_CA_CERT } = process.env;
 
-if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL is not set");
-}
+// Resolved here rather than imported from `./index` on purpose: this module
+// exists so the audit writer shares nothing with the main pool that it does
+// not have to, and the resolution is a pure function of the environment.
+export const auditRuntimeConnection = resolveRuntimeConnection();
 
 export const auditPool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: auditRuntimeConnection.connectionString,
   // The ceiling that makes this pool's contention its own problem.
   max: 2,
   // Fail fast instead of queueing forever. A caller that cannot get a
