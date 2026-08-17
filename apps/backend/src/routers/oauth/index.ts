@@ -1,6 +1,7 @@
 import cors from "cors";
 import express from "express";
 
+import { pruneGatewayEvents } from "@/lib/gateway-events/retention";
 import logger from "@/utils/logger";
 
 import {
@@ -48,6 +49,13 @@ setInterval(
         logger.error("Error pruning tool_call_audit:", error);
       }
     }
+    // Gateway activity history (migration 0031). Rides this interval for the
+    // same reasons as the tool-audit prune above. Unlike that one there is no
+    // "retain forever" branch to guard: GATEWAY_EVENTS_RETENTION_DAYS is
+    // floor-clamped to the table's 30-day immutability window, so the sweep
+    // always has a valid range to delete and can never reach inside it. Never
+    // throws — see lib/gateway-events/retention.
+    await pruneGatewayEvents();
     // Rides this interval rather than one of its own for the same reason the
     // tool-audit prune does: `cleanupExpired` above already runs here, the
     // work is a single bounded DELETE, and a second timer would be a second

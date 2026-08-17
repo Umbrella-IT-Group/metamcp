@@ -10,4 +10,5 @@ export * from "./users.repo";
 export * from "./m365-tokens.repo";
 export * from "./tool-call-audit.repo";
 export * from "./audit-log.repo";
+export * from "./gateway-events.repo";
 export { configRepo } from "./config.repo";

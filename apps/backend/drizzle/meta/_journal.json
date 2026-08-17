@@ -204,6 +204,13 @@
       "when": 1786924800000,
       "tag": "0029_oauth_client_registration_source",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0031_gateway_events",
+      "breakpoints": true
     }
   ]
 }

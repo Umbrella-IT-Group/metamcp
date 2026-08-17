@@ -806,3 +806,62 @@ export const auditLogTable = pgTable(
     index("audit_log_outcome_idx").on(table.outcome),
   ],
 );
+
+// Gateway activity history (migration 0031). The durable half of the Live
+// Logs page: the in-memory ring buffer in `lib/metamcp/log-store.ts` keeps the
+// last 2000 entries for the live tail, and every one of them that is not a
+// tool call is also written here so the history survives a restart.
+//
+// `tool_call` is deliberately NOT one of the categories. Those rows already
+// exist in `tool_call_audit` above, with more detail (params hash, latency,
+// namespace) than this envelope carries — writing them twice would double the
+// busiest write path in the gateway to store a poorer copy. The writer in
+// `lib/gateway-events/sink.ts` filters the category out.
+//
+// Retention differs from BOTH neighbours, which is the reason it is a third
+// table. `tool_call_audit` is prunable at any age; `audit_log` is never
+// prunable at all. This one is immutable for 30 days and prunable after —
+// migration 0031 installs an age-gated DELETE trigger plus unconditional
+// UPDATE/TRUNCATE blocks, and `lib/gateway-events/retention.ts` floor-clamps
+// the retention env to the same 30 days so the sweeper can never ask for a
+// deletion the database refuses.
+export const gatewayEventsTable = pgTable(
+  "gateway_events",
+  {
+    uuid: uuid("uuid")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    // Millisecond precision, matching migration 0031. The keyset cursor is a
+    // JavaScript Date, which cannot carry microseconds, so a finer column would
+    // hand back a cursor slightly earlier than the row it came from and skip
+    // every row sharing that millisecond.
+    occurred_at: timestamp("occurred_at", { withTimezone: true, precision: 3 })
+      .notNull()
+      .defaultNow(),
+    // connection | client | server | system. Text rather than a pgEnum for the
+    // same reason `audit_log.actor_type` is text: a new event class must never
+    // be able to make this INSERT fail.
+    category: text("category").notNull(),
+    // info | warn | error. Nullable because the column describes severity, and
+    // an event that arrives without one is still worth keeping.
+    level: text("level"),
+    server_uuid: uuid("server_uuid"),
+    server_name: text("server_name"),
+    client_name: text("client_name"),
+    session_id: text("session_id"),
+    message: text("message").notNull(),
+    // Small, clamped extras (tool name, duration, normalized error text).
+    // Nullable rather than defaulting to `{}` so "nothing to add" and "an empty
+    // object was supplied" stay distinguishable.
+    metadata: jsonb("metadata"),
+  },
+  (table) => [
+    // Mirrors the DESC indexes migration 0031 creates — the history view reads
+    // newest-first and pages with a keyset on (occurred_at, uuid).
+    index("gateway_events_occurred_at_idx").on(table.occurred_at.desc()),
+    index("gateway_events_category_occurred_at_idx").on(
+      table.category,
+      table.occurred_at.desc(),
+    ),
+  ],
+);

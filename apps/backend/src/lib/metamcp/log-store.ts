@@ -1,3 +1,4 @@
+import { recordGatewayEvent } from "@/lib/gateway-events/sink";
 import logger from "@/utils/logger";
 
 // Event class for a log entry. Lets the Live Logs view show real activity
@@ -28,6 +29,10 @@ export interface MetaMcpLogEntry {
   // user email). Present on tool_call + client events; absent on internal
   // gateway↔backend connection/server events (no consumer involved).
   clientName?: string;
+  // The MCP session this event belongs to, where one exists. Set on the
+  // client-session events emitted by the public StreamableHTTP router; absent
+  // on gateway↔backend connection/server events, which have no client session.
+  sessionId?: string;
   error?: string;
 }
 
@@ -58,6 +63,7 @@ class MetaMcpLogStore {
     toolName?: string;
     durationMs?: number;
     clientName?: string;
+    sessionId?: string;
     error?: unknown;
   }): void {
     const logEntry: MetaMcpLogEntry = {
@@ -71,6 +77,7 @@ class MetaMcpLogStore {
       toolName: entry.toolName,
       durationMs: entry.durationMs,
       clientName: entry.clientName,
+      sessionId: entry.sessionId,
       error: normalizeError(entry.error),
     };
 
@@ -101,6 +108,38 @@ class MetaMcpLogStore {
       } catch (err) {
         logger.error("Error notifying log listener:", err);
       }
+    });
+
+    // Durable half of the same event (`gateway_events`, migration 0031). The
+    // ring buffer above is 2000 entries and dies with the process; this is what
+    // makes "was this failing yesterday too?" answerable after a restart.
+    //
+    // Wired HERE rather than at each call site, and rather than through
+    // `addListener`, because coverage-by-construction is the point: every
+    // present and future emitter is persisted without anyone remembering to opt
+    // in, and a registration that lives somewhere else can be dropped in a
+    // refactor without a single test noticing. `recordGatewayEvent` is
+    // fire-and-forget, never throws, filters out `tool_call` (already persisted
+    // to `tool_call_audit` with more detail), and keeps this module's STATIC
+    // graph database-free via a lazy repository import — see
+    // lib/gateway-events/sink.
+    //
+    // LAST, deliberately. Everything above it — the ring push, the stdout
+    // mirror Promtail ships, the listener fan-out — is the behaviour this
+    // module had before there was a history to write, and none of it may become
+    // conditional on a database. Ordering it last means that even if the
+    // sink's own guarantees were broken by a future change, the worst outcome
+    // is a missing history row rather than a broken transport handler.
+    recordGatewayEvent({
+      category: logEntry.category,
+      level: logEntry.level,
+      serverUuid: logEntry.serverUuid,
+      serverName: logEntry.serverName,
+      clientName: logEntry.clientName,
+      sessionId: logEntry.sessionId,
+      message: logEntry.message,
+      metadata:
+        logEntry.error !== undefined ? { error: logEntry.error } : undefined,
     });
   }
 

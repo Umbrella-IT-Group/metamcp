@@ -918,6 +918,10 @@ streamableHttpRouter.post(
                 level: "info",
                 message: "client connected",
                 clientName: clientIdentity?.name,
+                // Carried into `gateway_events.session_id` so a session seen in
+                // the history can be joined to the `tool_call_audit` rows it
+                // produced — both columns hold the same MCP session id.
+                sessionId,
               });
             } catch (error) {
               logger.error(
