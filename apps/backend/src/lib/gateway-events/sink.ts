@@ -32,11 +32,13 @@ import {
  * STATIC module graph database-free: a dozen unit suites import modules that
  * import the log store, and none of them have a database.
  *
- * BACKPRESSURE IS DESIGNED, NOT ACCIDENTAL. The repository writes through the
- * two-connection audit pool with a 1s checkout timeout (`db/audit-db`), so
- * under a reconnect storm the eleventh concurrent insert errors instead of
- * queueing. Dropping a row there is the correct trade — a starved request path
- * is not — but dropping it INVISIBLY is not. Failures are rate-limited WARNs
+ * BACKPRESSURE IS DESIGNED, NOT ACCIDENTAL. The repository writes through its
+ * own two-connection pool with a 1s checkout timeout
+ * (`db/gateway-events-db` — deliberately not the audit pool, so an operational
+ * firehose cannot cost the gateway a security-audit row), so under a reconnect
+ * storm the third concurrent insert errors instead of queueing. Dropping a row
+ * there is the correct trade — a starved request path is not — but dropping it
+ * INVISIBLY is not. Failures are rate-limited WARNs
  * carrying a running total, for exactly the reasons `audit-emitter`'s
  * `reportAuditWriteFailure` spells out: production runs at LOG_LEVEL=info so a
  * debug line never reaches the console an operator watches, and one line per

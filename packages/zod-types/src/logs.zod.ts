@@ -102,7 +102,13 @@ export const GATEWAY_EVENT_SEARCH_MAX = 200;
  */
 export const GatewayEventCursorSchema = z.object({
   occurredAt: z.iso.datetime(),
-  uuid: z.string(),
+  // `z.uuid()`, not `z.string()`. The value is interpolated into a `::uuid`
+  // cast in the keyset comparison, so a malformed one is refused by POSTGRES
+  // (22P02) rather than by the boundary: the caller gets a 500 instead of a
+  // 400, and every tampered or truncated cursor writes a driver error into the
+  // gateway's own error log. Validating the shape where it arrives keeps a bad
+  // cursor a client error, which is what it is.
+  uuid: z.uuid(),
 });
 
 export const GetGatewayEventsRequestSchema = z

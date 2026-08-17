@@ -95,9 +95,22 @@ CREATE INDEX IF NOT EXISTS "gateway_events_category_occurred_at_idx" ON "gateway
 -- failure is loud and the record survives, which is the correct direction for
 -- the two to disagree in.
 --
--- What this does NOT stop, stated as plainly as 0028 states it: a superuser who
--- runs `SET session_replication_role = 'replica'` or drops the trigger. The
--- application connects as the cluster bootstrap superuser today, so a
+-- BREAK-GLASS, stated explicitly because "immutable" without an escape hatch
+-- described is a promise someone eventually discovers the hard way. There IS
+-- one, it requires a superuser, and using it is itself an audit-worthy act:
+--
+--   ALTER TABLE gateway_events DISABLE TRIGGER gateway_events_no_recent_delete;
+--   -- or, for the session:  SET session_replication_role = 'replica';
+--
+-- That is the ONLY way to reclaim space inside the window, and nothing in the
+-- application can reach it. Note in particular what a partial prune does: this
+-- trigger raises per row, and a raise aborts the whole statement, so a DELETE
+-- spanning the boundary rolls back completely and frees NOTHING rather than
+-- trimming the aged part. Retention therefore cannot creep inward by degrees,
+-- and an operator facing a full disk lowers GATEWAY_EVENTS_RETENTION_DAYS and
+-- waits for the window to pass, or breaks the glass on purpose and says so.
+--
+-- The application connects as the cluster bootstrap superuser today, so a
 -- `REVOKE UPDATE, DELETE` would be a no-op (superusers bypass grants) while a
 -- trigger is not bypassed by privilege. Closing the remaining gap needs a
 -- NOSUPERUSER runtime role; this is the interim and it is honest about it.

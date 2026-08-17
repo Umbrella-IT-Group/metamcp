@@ -44,3 +44,25 @@ export function joinPages(
 ): GatewayEvent[] {
   return [...(firstPage ?? []), ...extraPages.flat()];
 }
+
+/**
+ * Should a resolved "load older" fetch still be applied?
+ *
+ * A fetch is issued against one filter set and resolves some time later. If the
+ * operator changed a filter while it was in flight, the rows that come back
+ * belong to the PREVIOUS result set — appending them puts old-filter events
+ * underneath the new first page, and the cursor that arrives with them points
+ * into the old ordering, so every subsequent page compounds the mix. On an
+ * investigation surface that is worse than an error: the list looks like one
+ * coherent answer to the filters currently on screen.
+ *
+ * The epoch is bumped by the same effect that clears the loaded pages, so
+ * "the filters changed" and "the accumulated pages were discarded" are the same
+ * event by construction rather than by two conditions agreeing.
+ */
+export function isFetchStillCurrent(
+  epochAtDispatch: number,
+  epochNow: number,
+): boolean {
+  return epochAtDispatch === epochNow;
+}

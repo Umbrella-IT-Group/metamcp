@@ -11,7 +11,11 @@
 import type { GatewayEvent, GatewayEventCursor } from "@repo/zod-types";
 import { describe, expect, it } from "vitest";
 
-import { activeCursor, joinPages } from "./gateway-event-paging";
+import {
+  activeCursor,
+  isFetchStillCurrent,
+  joinPages,
+} from "./gateway-event-paging";
 
 const cursor = (uuid: string): GatewayEventCursor => ({
   occurredAt: "2026-08-17T12:00:00.000Z",
@@ -70,5 +74,23 @@ describe("joinPages", () => {
     expect(joinPages(undefined, [[event("a")]]).map((e) => e.uuid)).toEqual([
       "a",
     ]);
+  });
+});
+
+describe("isFetchStillCurrent", () => {
+  it("applies a page fetched under the filters still on screen", () => {
+    expect(isFetchStillCurrent(3, 3)).toBe(true);
+  });
+
+  it("discards a page whose filters changed while it was in flight", () => {
+    // Appending it would put previous-filter rows underneath the new first
+    // page, and the cursor arriving with them points into the old ordering, so
+    // every page after that compounds the mix. The result reads as one coherent
+    // answer to filters it does not describe.
+    expect(isFetchStillCurrent(3, 4)).toBe(false);
+  });
+
+  it("discards a page from several filter changes ago", () => {
+    expect(isFetchStillCurrent(1, 9)).toBe(false);
   });
 });

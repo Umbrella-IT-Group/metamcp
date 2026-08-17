@@ -452,6 +452,40 @@ describeIfDb("gateway_events against a REAL postgres", () => {
     expect(overreach).toHaveLength(GATEWAY_EVENT_PAGE_MAX + 1);
   });
 
+  /**
+   * The property the break-glass note in migration 0031 and the README both
+   * assert, verified rather than assumed: a deletion spanning the boundary
+   * frees NOTHING.
+   *
+   * The trigger raises per row and a raise aborts the whole statement, so a
+   * DELETE covering both aged and in-window rows rolls back completely. That is
+   * what makes "reclaiming space early needs a superuser" true rather than
+   * merely discouraged — there is no partial prune that creeps inward, and an
+   * operator who tries one gets an error and their disk usage unchanged.
+   */
+  it("rolls back a deletion that spans the window, freeing nothing", async () => {
+    const spanMarker = `itest-span-${Date.now()}`;
+    await db.execute(
+      `INSERT INTO gateway_events (occurred_at, category, message, server_name) VALUES
+         (now() - interval '60 days', 'system', 'aged', '${spanMarker}'),
+         (now() - interval '1 hour', 'system', 'recent', '${spanMarker}')` as never,
+    );
+
+    await expectRefusedWith(
+      db.execute(
+        `DELETE FROM gateway_events WHERE server_name = '${spanMarker}'` as never,
+      ),
+      /immutable for 30 days/,
+    );
+
+    // BOTH rows survive. The aged one was deletable on its own, and would have
+    // been gone if the statement had been allowed to partially succeed.
+    const rows = await db.execute(
+      `SELECT message FROM gateway_events WHERE server_name = '${spanMarker}' ORDER BY occurred_at` as never,
+    );
+    expect(rows.rows).toHaveLength(2);
+  });
+
   it("lists server names ordered and bounded by both ends of the window", async () => {
     const nameMarker = `itest-names-${Date.now()}`;
     await db.execute(

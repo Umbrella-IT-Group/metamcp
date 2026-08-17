@@ -36,6 +36,9 @@ vi.mock("../db/repositories/gateway-events.repo", () => ({
 
 const { logsImplementations } = await import("./logs.impl");
 
+/** A syntactically valid cursor uuid — the schema now requires one. */
+const CURSOR_UUID = "3f2b1c44-5d6e-4a7b-8c9d-0e1f2a3b4c5d";
+
 const row = (n: number) => ({
   uuid: `0000000${n}-0000-4000-8000-000000000000`,
   occurred_at: new Date(Date.UTC(2026, 7, 17, 12, 0, n)),
@@ -84,7 +87,7 @@ describe("getHistory — the query it issues", () => {
       serverName: "example-backend",
       clientName: "example-consumer",
       search: "hang up",
-      cursor: { occurredAt: cursorAt, uuid: "abc" },
+      cursor: { occurredAt: cursorAt, uuid: CURSOR_UUID },
       limit: 50,
     });
 
@@ -99,7 +102,7 @@ describe("getHistory — the query it issues", () => {
       // Renamed to the column casing the repository speaks, and parsed: the
       // contract carries ISO strings because the tRPC client has no data
       // transformer, so a Date never survives the wire.
-      cursor: { occurred_at: new Date(cursorAt), uuid: "abc" },
+      cursor: { occurred_at: new Date(cursorAt), uuid: CURSOR_UUID },
       // One more than the page size — see the pagination block below.
       limit: 51,
     });
@@ -117,6 +120,41 @@ describe("getHistory — the query it issues", () => {
       new Date(from),
       new Date(to),
     );
+  });
+
+  it("does NOT re-run the server-name scan on a cursor page", async () => {
+    // That query is a SELECT DISTINCT over the window, which no index can
+    // serve — a full scan of the range, on the main pool, costing more than the
+    // page it accompanies. The window is pinned for the whole paging run and
+    // the client keeps the first page's list, so paying it per page produced a
+    // value nobody read.
+    await logsImplementations.getHistory({
+      from: "2026-08-01T00:00:00.000Z",
+      cursor: {
+        occurredAt: "2026-08-01T12:00:00.000Z",
+        uuid: CURSOR_UUID,
+      },
+    });
+
+    expect(listServerNamesMock).not.toHaveBeenCalled();
+    // The rows themselves are still fetched — only the filter list is skipped.
+    expect(listMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an empty server-name list on a cursor page, not a stale one", async () => {
+    listServerNamesMock.mockResolvedValue(["should-not-be-read"]);
+
+    const result = await logsImplementations.getHistory({
+      from: "2026-08-01T00:00:00.000Z",
+      cursor: {
+        occurredAt: "2026-08-01T12:00:00.000Z",
+        uuid: CURSOR_UUID,
+      },
+    });
+
+    // An empty array is a valid response rather than a sentinel: a caller that
+    // asked for a cursor page already has the list.
+    expect(result.serverNames).toEqual([]);
   });
 
   it("passes a null upper bound when the caller gave no `to`", async () => {
@@ -260,8 +298,24 @@ describe("the input contract", () => {
     expect(parsed.search).toHaveLength(200);
   });
 
+  it("refuses a cursor whose uuid is not a uuid", () => {
+    // The value is interpolated into a `::uuid` cast in the keyset comparison,
+    // so without this the database refuses it (22P02) instead of the boundary:
+    // a tampered or truncated cursor becomes a 500 plus a driver error in the
+    // gateway's own log, rather than the client error it actually is.
+    expect(() =>
+      GetGatewayEventsRequestSchema.parse({
+        from: "2026-08-01T00:00:00.000Z",
+        cursor: { occurredAt: "2026-08-01T12:00:00.000Z", uuid: "abc" },
+      }),
+    ).toThrow();
+  });
+
   it("refuses a cursor without a pinned from", () => {
-    const cursor = { occurredAt: "2026-08-01T12:00:00.000Z", uuid: "abc" };
+    const cursor = {
+      occurredAt: "2026-08-01T12:00:00.000Z",
+      uuid: "3f2b1c44-5d6e-4a7b-8c9d-0e1f2a3b4c5d",
+    };
     // Without `from` the window is recomputed from the current clock on every
     // request, so its older edge slides forward between pages and the oldest
     // rows of a paging run disappear. A validation error is the honest answer;

@@ -93,13 +93,27 @@ export const logsImplementations = {
           ? { occurredAt: last.occurred_at.toISOString(), uuid: last.uuid }
           : null;
 
+      // FIRST PAGE ONLY, and the condition is the point rather than a
+      // micro-optimisation.
+      //
       // Scoped to the same window the rows came from — both ends of it — so the
       // filter offers the servers that actually appear in what the operator is
-      // looking at.
-      const serverNames = await gatewayEventsRepository.listServerNames(
-        from,
-        to,
-      );
+      // looking at. But that list is a `SELECT DISTINCT` over the window, which
+      // no index can serve: it is a full scan of the range, on the MAIN pool,
+      // and it costs more than the page it accompanies once the table is large.
+      //
+      // Paying it per page bought nothing at all. The window is pinned for the
+      // whole paging run (a cursor without a pinned `from` is refused), so the
+      // answer cannot change between page one and page four — and the client
+      // keeps the first page's list and discards what later pages carry. So
+      // every "load older" was re-running the most expensive query in the
+      // request to produce a value nobody read.
+      //
+      // An empty array is a valid response, not a sentinel: the caller that
+      // asked for a cursor page already has the list.
+      const serverNames = input.cursor
+        ? []
+        : await gatewayEventsRepository.listServerNames(from, to);
 
       return {
         success: true as const,

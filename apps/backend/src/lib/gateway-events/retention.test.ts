@@ -103,6 +103,28 @@ describe("resolveGatewayEventsRetentionDays", () => {
       "is not a number",
     );
   });
+
+  it("rejects a value that only STARTS as a number, rather than reading a prefix", async () => {
+    const { resolveGatewayEventsRetentionDays } = await loadWithEnv(undefined);
+
+    // `Number.parseInt` is not a validator: it takes the leading integer and
+    // discards the rest, so a typo would take effect as a number the operator
+    // never wrote — "1e9" silently meaning one day is the worst of them, since
+    // it clamps to the floor and looks deliberate.
+    expect(resolveGatewayEventsRetentionDays("30abc")).toBe(90);
+    expect(resolveGatewayEventsRetentionDays("1e9")).toBe(90);
+    expect(resolveGatewayEventsRetentionDays("90 days")).toBe(90);
+    expect(loggerMock.warn).toHaveBeenCalledTimes(3);
+  });
+
+  it("still accepts an integer with surrounding whitespace", async () => {
+    const { resolveGatewayEventsRetentionDays } = await loadWithEnv(undefined);
+
+    // A trailing space in an env file is a formatting accident, not a typo in
+    // the value; rejecting it would turn one into the other.
+    expect(resolveGatewayEventsRetentionDays(" 120 ")).toBe(120);
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
 });
 
 describe("the clamp is EFFECTIVE, not just computed", () => {

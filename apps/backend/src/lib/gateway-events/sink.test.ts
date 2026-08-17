@@ -71,9 +71,10 @@ describe("recordGatewayEvent — never breaks the caller", () => {
   });
 
   it("does not throw when the sink REJECTS — the pool-saturation case", async () => {
-    // What `db/audit-db` actually produces under load: the pool is capped at 2
-    // connections with a 1s checkout timeout, so the write rejects rather than
-    // queueing. Dropping the row is designed behaviour; throwing is not.
+    // What `db/gateway-events-db` actually produces under load: the pool is
+    // capped at 2 connections with a 1s checkout timeout, so the third
+    // concurrent write rejects rather than queueing. Dropping the row is
+    // designed behaviour; throwing is not.
     const saturated = vi
       .fn()
       .mockRejectedValue(new Error("timeout exceeded when trying to connect"));

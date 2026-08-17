@@ -48,7 +48,15 @@ export function resolveGatewayEventsRetentionDays(
     return GATEWAY_EVENTS_RETENTION_DEFAULT_DAYS;
   }
 
-  const parsed = Number.parseInt(raw, 10);
+  // Shape-checked BEFORE parsing, because `Number.parseInt` is not a validator:
+  // it reads a leading integer and silently discards whatever follows, so
+  // "30abc" becomes 30 and "1e9" becomes 1 — a typo in a retention setting
+  // quietly taking effect as a number the operator never wrote. Anything that
+  // is not entirely an integer falls through to the WARN below and the default,
+  // which is the same treatment "forever" already got.
+  const parsed = /^-?\d+$/.test(raw.trim())
+    ? Number.parseInt(raw, 10)
+    : Number.NaN;
   if (!Number.isFinite(parsed)) {
     logger.warn(
       `[gateway-events] GATEWAY_EVENTS_RETENTION_DAYS="${raw}" is not a number; using the ${GATEWAY_EVENTS_RETENTION_DEFAULT_DAYS}-day default`,

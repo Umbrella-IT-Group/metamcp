@@ -222,17 +222,23 @@ export default function LiveLogsPage() {
         </CardHeader>
         {view === "history" ? (
           <CardContent className="space-y-3">
-            {/* Three states, not two. A FAILED session lookup leaves roleLoaded
-                false and isAdmin false, and without its own branch that case
-                mounts the history with the query disabled — which renders as an
-                empty result and reads as "nothing was recorded". It has to say
-                what actually happened and offer the retry. */}
+            {/* Four states, not two, and the two extra ones both exist because
+                `isAdmin` starts false. A FAILED session lookup and a session
+                lookup still IN FLIGHT are each indistinguishable from "not an
+                admin" by that flag alone, and mounting the history in either
+                case renders the disabled query as an empty result — which reads
+                as "nothing was recorded". On an investigation surface that is
+                the one wrong answer that looks like a right one. */}
             {roleError ? (
               <p className="text-sm text-destructive">
                 Could not confirm your role, so recorded activity was not
                 loaded. Use Refresh above to retry.
               </p>
-            ) : roleLoaded && !isAdmin ? (
+            ) : !roleLoaded ? (
+              <p className="text-sm text-muted-foreground">
+                Checking access...
+              </p>
+            ) : !isAdmin ? (
               <p className="text-sm text-muted-foreground">
                 Recorded activity is available to administrators only.
               </p>

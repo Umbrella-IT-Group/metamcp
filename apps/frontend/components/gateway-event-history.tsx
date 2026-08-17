@@ -2,7 +2,7 @@
 
 import type { GatewayEvent, GatewayEventCursor } from "@repo/zod-types";
 import { Loader2, Search } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -15,7 +15,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { activeCursor, joinPages } from "@/lib/gateway-event-paging";
+import {
+  activeCursor,
+  isFetchStillCurrent,
+  joinPages,
+} from "@/lib/gateway-event-paging";
 import {
   categoryMeta,
   HISTORY_CATEGORIES,
@@ -119,7 +123,14 @@ export function GatewayEventHistory({ isAdmin }: { isAdmin: boolean }) {
   // three times and then losing all of it to an invisible refetch was reachable
   // without touching a control. The filter object is the thing that actually
   // invalidates a cursor, because a cursor points into one ordered result set.
+  //
+  // The epoch counter rides along so an in-flight "load older" can tell that
+  // the world moved under it — see loadMore. Bumped HERE, in the same effect
+  // that discards the pages, so the two can never disagree about whether a
+  // filter change happened.
+  const filterEpoch = useRef(0);
   useEffect(() => {
+    filterEpoch.current += 1;
     setExtraPages([]);
     setPagedCursor(null);
   }, [filters]);
@@ -130,17 +141,27 @@ export function GatewayEventHistory({ isAdmin }: { isAdmin: boolean }) {
 
   const loadMore = useCallback(async () => {
     if (!cursor) return;
+    // Captured BEFORE the await. A filter changed while this request is in
+    // flight makes its rows belong to a result set that is no longer on screen,
+    // and appending them would interleave old-filter events under the new first
+    // page while paging continued from a cursor into the old ordering.
+    const dispatchedAt = filterEpoch.current;
     setIsLoadingMore(true);
     try {
       const next = await utils.frontend.logs.history.fetch({
         ...filters,
         cursor,
       });
+      if (!isFetchStillCurrent(dispatchedAt, filterEpoch.current)) return;
       setExtraPages((pages) => [...pages, next.data]);
       // Null here ends the run — the button disappears rather than fetching an
       // empty page forever.
       setPagedCursor(next.nextCursor ?? null);
     } catch (error) {
+      // A failure from a superseded request is not worth a toast either: the
+      // operator has already moved on, and the filters they are looking at now
+      // loaded fine.
+      if (!isFetchStillCurrent(dispatchedAt, filterEpoch.current)) return;
       toast.error(
         error instanceof Error ? error.message : "Failed to load more events",
       );
