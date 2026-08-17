@@ -13,6 +13,11 @@ const context: MetaMCPHandlerContext = {
   namespaceUuid: "ns-123",
   sessionId: "sess-456",
   clientName: "example connector",
+  apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000001",
+  authMethod: "api_key",
+  userId: "user-owner-1",
+  callerIp: "203.0.113.7",
+  requestId: "req-aaaa",
 };
 
 const makeRequest = (args?: Record<string, unknown>): CallToolRequest =>
@@ -131,5 +136,94 @@ describe("auditing middleware DB write-through", () => {
 
     expect(result).toEqual({ content: [] });
     expect(okHandler).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("caller binding (migration 0030)", () => {
+  it("carries the credential, method, account, address and request id onto the row", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(makeRequest({ q: "printer" }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.api_key_uuid).toBe("3f7f8a1e-0000-4000-8000-000000000001");
+    expect(entry.auth_method).toBe("api_key");
+    expect(entry.user_id).toBe("user-owner-1");
+    expect(entry.caller_ip).toBe("203.0.113.7");
+    expect(entry.request_id).toBe("req-aaaa");
+  });
+
+  it("carries the same binding onto a FAILURE row", async () => {
+    // A denied or failing call is the one an investigation reads first, so it
+    // must be as attributable as a successful one.
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failing = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("denied"), { code: -32602 }));
+
+    const wrapped = createAuditingMiddleware()(failing);
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toThrow(
+      "denied",
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.api_key_uuid).toBe("3f7f8a1e-0000-4000-8000-000000000001");
+    expect(entry.user_id).toBe("user-owner-1");
+    expect(entry.caller_ip).toBe("203.0.113.7");
+    expect(entry.request_id).toBe("req-aaaa");
+  });
+
+  it("writes NULLs without throwing when no identity was resolved", async () => {
+    // An unauthenticated / passthrough endpoint resolves none of these. The
+    // row must still land: dropping it would leave the call unrecorded
+    // entirely, which is strictly worse than recording it un-attributed.
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const bare: MetaMCPHandlerContext = {
+      namespaceUuid: "ns-123",
+      sessionId: "sess-456",
+    };
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    const result = await wrapped(makeRequest({ a: 1 }), bare);
+    await flush();
+
+    expect(result).toEqual({ content: [] });
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.api_key_uuid).toBeNull();
+    expect(entry.auth_method).toBeNull();
+    expect(entry.user_id).toBeNull();
+    expect(entry.caller_ip).toBeNull();
+    expect(entry.request_id).toBeNull();
+    // The rest of the row is unaffected.
+    expect(entry.server_name).toBe("autotask");
+    expect(entry.success).toBe(true);
+  });
+
+  it("gives two calls on one session distinct request ids", async () => {
+    // The regression this guards: `clientName` is stamped once at session
+    // creation, and copying that pattern for `requestId` would brand every
+    // call in a long-lived session with the initialize request's id.
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(makeRequest({ a: 1 }), { ...context, requestId: "req-one" });
+    await wrapped(makeRequest({ a: 2 }), { ...context, requestId: "req-two" });
+    await flush();
+
+    expect(recorder).toHaveBeenCalledTimes(2);
+    expect(recorder.mock.calls[0][0].request_id).toBe("req-one");
+    expect(recorder.mock.calls[1][0].request_id).toBe("req-two");
+    // Same session id on both — the session is not the discriminator.
+    expect(recorder.mock.calls[0][0].session_id).toBe(
+      recorder.mock.calls[1][0].session_id,
+    );
   });
 });

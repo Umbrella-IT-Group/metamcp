@@ -37,6 +37,13 @@ type AuditRecorder = (entry: {
   success: boolean;
   error_code?: string | null;
   latency_ms?: number | null;
+  // Caller binding (migration 0030) — see lib/metamcp/caller-context for
+  // where each of these is resolved and what it may be trusted to mean.
+  api_key_uuid?: string | null;
+  auth_method?: string | null;
+  user_id?: string | null;
+  caller_ip?: string | null;
+  request_id?: string | null;
 }) => Promise<void>;
 
 let auditRecorder: AuditRecorder | null | undefined;
@@ -105,6 +112,16 @@ export function createAuditingMiddleware(): CallToolMiddleware {
     // (Streamable-HTTP sets it on the acquired instance; OpenAPI sets it
     // per-call). Undefined on auth-off / passthrough endpoints.
     const clientName = context.clientName;
+    // Caller binding — stamped alongside `clientName` by the router layer.
+    // Read once here so the success and failure rows below cannot drift apart
+    // if a concurrent request re-stamps the (pooled) context mid-call.
+    const caller = {
+      api_key_uuid: context.apiKeyUuid ?? null,
+      auth_method: context.authMethod ?? null,
+      user_id: context.userId ?? null,
+      caller_ip: context.callerIp ?? null,
+      request_id: context.requestId ?? null,
+    };
     const paramsHash = hashParams(request.params.arguments);
 
     try {
@@ -128,6 +145,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         params_hash: paramsHash,
         success: true,
         latency_ms: durationMs,
+        ...caller,
       });
       return result;
     } catch (error) {
@@ -152,6 +170,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         success: false,
         error_code: errorCode(error),
         latency_ms: durationMs,
+        ...caller,
       });
       throw error;
     }

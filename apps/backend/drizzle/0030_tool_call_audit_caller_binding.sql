@@ -1,0 +1,82 @@
+-- tool_call_audit caller binding: make a recorded tool call attributable.
+--
+-- The table already answered "what was called, when, and did it work". It
+-- could not answer "by whom", because the only identity column is
+-- `client_name` and that is a DISPLAY LABEL, not an identity: it is composed
+-- at call time from an api-key name plus a MUTABLE user email, it is NULL on
+-- every path that resolved no consumer, and it names no credential at all. So
+-- a row could describe a call and still leave an investigation with nothing to
+-- pivot on — rename the account, revoke the key, and the label stops matching
+-- anything that still exists.
+--
+-- These five columns are the pivot. Each is already resolved per request by
+-- middleware that runs before any tool handler; none of it reached the table.
+--
+--   api_key_uuid  the api_keys row that authenticated the request.
+--   auth_method   'api_key' | 'oauth'.
+--   user_id       the CREDENTIAL OWNER (api-key owner or OAuth subject).
+--   caller_ip     CF-Connecting-IP, the caller's real address.
+--   request_id    the per-request id audit_log rows also carry.
+--
+-- ALL FIVE ARE NULLABLE, and that is a requirement rather than a convenience.
+-- The write is fire-and-forget and its failure is swallowed by design (an
+-- audit write must never fail a tool call), so a NOT NULL here would not
+-- surface as an error — it would silently drop the audit row for every
+-- unauthenticated or passthrough call. Nullable means a partially-attributed
+-- row still lands, and NULL reads as the honest "not known" it is. Every row
+-- written before this migration keeps NULLs for the same reason: the facts
+-- were not recorded then and cannot be reconstructed now.
+--
+-- NO FOREIGN KEY on api_key_uuid, deliberately. `api_keys` rows are revoked as
+-- routine operations and `api_keys.user_id` cascades on user delete, so an FK
+-- would force one of two bad outcomes: the audit rows are deleted along with
+-- the key, or the key becomes undeletable. The audit trail must outlive the
+-- credential it names — a call attributed to a key that was revoked
+-- afterwards is exactly the row an investigation is looking for. The uuid is
+-- stored as a plain uuid so it still joins to `api_keys.uuid` when that row
+-- does exist.
+--
+-- WHY user_id IS NOT THE ACTS-AS TARGET. An admin key may carry an acts-as
+-- binding (migration 0024) and its delegated identity already appears in
+-- `client_name` as `key (as email)`. Recording that target here instead of the
+-- key's owner would make a delegated call indistinguishable from a direct one
+-- by that account. This column answers "whose credential", `client_name`
+-- answers "whose identity was exercised", and both are needed.
+--
+-- caller_ip TRUST ASSUMPTION, recorded because it is what makes the column
+-- evidence: CF-Connecting-IP is written by the Cloudflare edge and OVERWRITTEN
+-- on every request, so a client cannot forge it THROUGH Cloudflare. That holds
+-- only while the Cloudflare Tunnel is the sole ingress. Expose the origin any
+-- other way and the header becomes caller-controlled and every caller_ip in
+-- this table becomes an assertion by whoever sent it. Same assumption
+-- audit_log.actor_ip already runs on; see
+-- middleware/audit-context.middleware.ts.
+--
+-- Retention is unchanged: these columns live on the existing pruned table
+-- (TOOL_AUDIT_RETENTION_DAYS), not on the append-only audit_log.
+--
+-- Idempotent (ADD COLUMN IF NOT EXISTS) for the reason recorded on
+-- 0014_oauth_refresh_token: a re-run must not crash-loop a deployer.
+-- Journal "when" deliberately exceeds 0029's (1786924800000): drizzle only
+-- applies entries whose "when" is above the max already applied -- a renamed
+-- or renumbered migration without a "when" bump is SILENTLY SKIPPED. See
+-- UMBRELLA_FORK.md's migration-ordering note.
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "api_key_uuid" uuid;
+--> statement-breakpoint
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "auth_method" text;
+--> statement-breakpoint
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "user_id" text;
+--> statement-breakpoint
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "caller_ip" text;
+--> statement-breakpoint
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "request_id" text;
+--> statement-breakpoint
+-- Only api_key_uuid is indexed of the five. "What did this credential do" is
+-- the question a suspected key compromise forces first, and answering it
+-- without an index is a full scan of the busiest table in the schema. The
+-- other four are read once a row is already in hand — request_id joins a
+-- handful of rows, and caller_ip / user_id / auth_method are filters applied
+-- inside an already-bounded called_at window, which the existing
+-- tool_call_audit_called_at_idx serves. Every additional index is a permanent
+-- cost on an insert path that runs once per tool call.
+CREATE INDEX IF NOT EXISTS "tool_call_audit_api_key_uuid_idx" ON "tool_call_audit" ("api_key_uuid");

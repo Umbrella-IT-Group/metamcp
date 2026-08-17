@@ -14,6 +14,7 @@ import logger from "@/utils/logger";
 
 import { isAdminHealthRequest } from "../../lib/health-upstream";
 import { runWithM365UserContext } from "../../lib/m365/request-context";
+import { stampCallerContext } from "../../lib/metamcp/caller-context";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
   GATEWAY_BOOT_ID,
@@ -458,6 +459,7 @@ export async function recoverPersistedSession(
   // gone after a restart; authReq is the re-validated current caller).
   const recoveredIdentity = await resolveClientIdentity(authReq);
   mcpServerInstance.handlerContext.clientName = recoveredIdentity?.name;
+  stampCallerContext(mcpServerInstance.handlerContext, authReq);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
     onsessioninitialized: async (sid) => {
@@ -899,6 +901,12 @@ streamableHttpRouter.post(
         // Idle servers carry a placeholder sessionId, so we can't key by
         // sessionId — we set it directly on the instance we just acquired.
         mcpServerInstance.handlerContext.clientName = clientIdentity?.name;
+        // Caller binding for the tool_call_audit row (migration 0030). Set
+        // here AND re-set per request in the existing-session branch below:
+        // `requestId` and `callerIp` describe one request, so freezing them at
+        // session creation the way `clientName` is frozen would stamp every
+        // later call in the session with the initialize request's id.
+        stampCallerContext(mcpServerInstance.handlerContext, authReq);
 
         logger.info(
           `Using MetaMCP server instance for public endpoint session ${newSessionId} (endpoint: ${endpointName})`,
@@ -1077,6 +1085,34 @@ streamableHttpRouter.post(
             return;
           }
         }
+        // Re-stamp the caller binding for THIS request before dispatching it.
+        // The session was authenticated once, at initialize, and the identity
+        // half of the binding cannot change afterwards — a session is pinned
+        // to one auth principal (see `principalMatches`) — but `requestId` and
+        // `callerIp` are per-request facts, and without this every tool call
+        // for the life of the session would be audited under the initialize
+        // request's id and address.
+        //
+        // A pure map read, never a create: an instance the pool no longer
+        // holds means the transport is being served from lazy recovery, which
+        // stamps its own binding. Nothing is keyed on the handler context's
+        // own sessionId here — that is a placeholder on an idle-converted
+        // instance — only on the transport session id the pool itself
+        // assigned.
+        //
+        // KNOWN WINDOW, stated rather than papered over: the handler context
+        // is per-INSTANCE, not per-request, so two requests interleaving on
+        // one session can have the second overwrite the binding before the
+        // first's tool call is audited. Both requests carry the same
+        // credential and account (the principal is pinned), so the
+        // attribution stays correct; only `request_id` / `caller_ip` can be
+        // taken from the sibling request. Closing it properly needs a
+        // per-request context the MCP SDK's handler signature does not carry.
+        const activeInstance = metaMcpServerPool.getServerInstance(sessionId);
+        if (activeInstance) {
+          stampCallerContext(activeInstance.handlerContext, authReq);
+        }
+
         logger.info(`Handling POST for session ${sessionId}`);
         await dispatchTracked(authReq, transport, req, res, sessionId);
       } catch (error) {
