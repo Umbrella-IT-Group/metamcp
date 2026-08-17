@@ -211,6 +211,13 @@
       "when": 1787011200000,
       "tag": "0030_tool_call_audit_caller_binding",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0031_gateway_events",
+      "breakpoints": true
     }
   ]
 }

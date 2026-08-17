@@ -1,4 +1,9 @@
-import { GetLogsRequestSchema, GetLogsResponseSchema } from "@repo/zod-types";
+import {
+  GetGatewayEventsRequestSchema,
+  GetGatewayEventsResponseSchema,
+  GetLogsRequestSchema,
+  GetLogsResponseSchema,
+} from "@repo/zod-types";
 import { z } from "zod";
 
 import { adminProcedure, router } from "../../trpc";
@@ -11,6 +16,9 @@ export const createLogsRouter = (
     getLogs: (
       input: z.infer<typeof GetLogsRequestSchema>,
     ) => Promise<z.infer<typeof GetLogsResponseSchema>>;
+    getHistory: (
+      input: z.infer<typeof GetGatewayEventsRequestSchema>,
+    ) => Promise<z.infer<typeof GetGatewayEventsResponseSchema>>;
   },
 ) =>
   router({
@@ -31,5 +39,24 @@ export const createLogsRouter = (
       .output(GetLogsResponseSchema)
       .query(async ({ input }) => {
         return await implementations.getLogs(input);
+      }),
+
+    // Admin only: the DURABLE half of the same view (`gateway_events`,
+    // migration 0031). Same gate as `get` above and for the same reason — the
+    // rows are the same process-wide operational events, only persisted, so a
+    // member reading the history would learn exactly what reading the live tail
+    // would tell them. Gating this any lower would make the durable surface a
+    // way around the gate on the live one.
+    //
+    // READ-ONLY, like `get`. There is no clear, no delete and no export
+    // mutation here, and there must not be: the table is immutable for 30 days
+    // in the database (migration 0031 refuses UPDATE and TRUNCATE outright and
+    // DELETE inside the window), and an application path that appeared to empty
+    // it would either fail loudly or, worse, look like it worked.
+    history: adminProcedure
+      .input(GetGatewayEventsRequestSchema)
+      .output(GetGatewayEventsResponseSchema)
+      .query(async ({ input }) => {
+        return await implementations.getHistory(input);
       }),
   });

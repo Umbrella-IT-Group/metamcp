@@ -277,6 +277,12 @@ describe("logs.get — admin only", () => {
   const buildRouter = () =>
     createLogsRouter({
       getLogs: okImpl({ success: true, data: [], totalCount: 0 } as never),
+      getHistory: okImpl({
+        success: true,
+        data: [],
+        nextCursor: null,
+        serverNames: [],
+      } as never),
     });
 
   it("admin allowed", async () => {

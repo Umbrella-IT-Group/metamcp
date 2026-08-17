@@ -71,6 +71,12 @@ const buildRouter = () =>
     getLogs: vi
       .fn()
       .mockResolvedValue({ success: true, data: [], totalCount: 0 }),
+    getHistory: vi.fn().mockResolvedValue({
+      success: true,
+      data: [],
+      nextCursor: null,
+      serverNames: [],
+    }),
   });
 
 let rows: AuditRow[];
