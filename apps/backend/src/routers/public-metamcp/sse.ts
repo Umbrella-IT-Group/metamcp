@@ -10,6 +10,12 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
+import {
+  resolveCallerContext,
+  stampCallerContext,
+} from "../../lib/metamcp/caller-context";
+import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
+import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
   bindingMatches,
@@ -121,6 +127,18 @@ sseRouter.get(
         `Using MetaMCP server instance for public endpoint session ${sessionId}`,
       );
 
+      // Stamp the caller onto the acquired instance so tool calls arriving on
+      // the /message leg are attributable (migration 0030). Fallback carrier
+      // only — the authoritative per-request binding is entered on that leg
+      // itself; this covers the window before the first message and any call
+      // that reaches the auditing middleware outside a request scope.
+      const clientIdentity = await resolveClientIdentity(authReq);
+      stampCallerContext(
+        mcpServerInstance.handlerContext,
+        authReq,
+        clientIdentity?.name,
+      );
+
       // Bind the session to the endpoint it was opened on so the message leg
       // below can reject a sessionId replayed against a different endpoint.
       sessionManager.addSession(sessionId, webAppTransport, {
@@ -171,9 +189,21 @@ sseRouter.post(
         res.status(404).end("Session not found");
         return;
       }
-      await (resolution.transport as SSEServerTransport).handlePostMessage(
-        req,
-        res,
+      // This leg drives `tools/call` for every SSE consumer, so it needs the
+      // same request-scoped caller binding the Streamable-HTTP dispatch
+      // enters — without it these calls audited as fully un-attributed rows,
+      // which is indistinguishable from a path nobody uses. `authenticateApiKey`
+      // has already run above, so the identity is on the request; the instance
+      // stamped at stream-open cannot serve because the SSE session is
+      // long-lived and `requestId` / `callerIp` are per-message facts.
+      const clientIdentity = await resolveClientIdentity(authReq);
+      await runWithCallerContext(
+        { ...resolveCallerContext(authReq), clientName: clientIdentity?.name },
+        () =>
+          (resolution.transport as SSEServerTransport).handlePostMessage(
+            req,
+            res,
+          ),
       );
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);

@@ -12,8 +12,10 @@ import logger from "@/utils/logger";
 import { namespacesRepository } from "../../../db/repositories/namespaces.repo";
 import { configService } from "../../../lib/config.service";
 import { ConnectedClient } from "../../../lib/metamcp";
+import { CallerContext } from "../../../lib/metamcp/caller-context";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
 import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
+import { createAuditingMiddleware } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
@@ -382,14 +384,24 @@ export const createMiddlewareEnabledHandlers = (
   sessionId: string,
   namespaceUuid: string,
   clientName?: string,
+  caller?: CallerContext,
 ) => {
   // Create the handler context. OpenAPI is stateless (one deterministic
   // sessionId per namespace shared across consumers), so the calling
   // consumer's identity rides the per-call context here rather than the
   // session registry — no cross-consumer race.
+  //
+  // That property is why the caller binding is a plain parameter here and not
+  // stamped onto a pooled instance the way the Streamable-HTTP path has to do
+  // it: this context object is built fresh for one call and discarded, so
+  // `requestId` and `callerIp` cannot be overwritten by a concurrent request
+  // on the same shared `openapi_<namespace>` session id.
   const handlerContext: MetaMCPHandlerContext = {
     namespaceUuid,
     sessionId,
+    ...caller,
+    // Last, so the explicitly-passed label always wins over anything a future
+    // `CallerContext` field of the same name could carry.
     clientName,
   };
 
@@ -407,6 +419,18 @@ export const createMiddlewareEnabledHandlers = (
   )(originalListToolsHandler);
 
   const callToolWithMiddleware = compose(
+    // Outermost, matching the Streamable-HTTP chain in metamcp-proxy: records
+    // every call — including the ones the filter middleware below denies — to
+    // the Live Logs store and to tool_call_audit.
+    //
+    // This chain ran WITHOUT it until now, so every tool call made through the
+    // OpenAPI bridge executed with no audit row at all. The gap was invisible
+    // from the table: the rows the other path writes look the same, so the
+    // absence read as "these consumers were quiet" rather than "these
+    // consumers are not recorded". Both entry points reach the same backend
+    // servers with the same credentials, so both have to be recorded the same
+    // way for retention on this table to mean anything.
+    createAuditingMiddleware(),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
@@ -414,7 +438,6 @@ export const createMiddlewareEnabledHandlers = (
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     // Add more middleware here as needed
-    // createAuditingMiddleware(),
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);
 

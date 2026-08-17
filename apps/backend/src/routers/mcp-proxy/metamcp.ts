@@ -5,12 +5,49 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import express from "express";
 
+import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
+import { resolveCallerContext } from "../../lib/metamcp/caller-context";
+import {
+  CallerContext,
+  runWithCallerContext,
+} from "../../lib/metamcp/caller-context-store";
 import { createServer } from "../../lib/metamcp/index";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 
 const metamcpRouter = express.Router();
+
+/**
+ * The session user, as `betterAuthMcpMiddleware` leaves it on the request —
+ * same shape `requireAdminMcpMiddleware` and `mcp-proxy/server.ts` read.
+ */
+type SessionUser = { id?: string; role?: string };
+
+/**
+ * Caller binding for tool calls driven from the Inspector (migration 0030).
+ *
+ * Every route here is admin-session-gated by the parent router, so the actor
+ * is a better-auth user rather than a credential: there is no api-key uuid and
+ * no OAuth token to record. Without this the tool calls an admin makes while
+ * testing a namespace wrote fully un-attributed audit rows, which read exactly
+ * like rows from a path that lost its identity plumbing.
+ *
+ * `auth_method` is therefore a THIRD value, `session`, and it is the
+ * discriminator for this traffic — which is why no `clientName` label is
+ * invented here. That column means "the resolved consumer identity"
+ * (api-key name / OAuth user email) and there is no consumer on this surface.
+ * `callerIp` / `requestId` still come from `auditContextMiddleware`, which is
+ * mounted app-wide ahead of every router.
+ */
+export function inspectorCaller(req: express.Request): CallerContext {
+  const user = (req as express.Request & { user?: SessionUser }).user;
+  return {
+    ...resolveCallerContext(req as AuditAttributedRequest),
+    authMethod: "session",
+    userId: user?.id,
+  };
+}
 
 // Auth (session) and authorization (admin-only) are applied once by the
 // parent router in `routers/mcp-proxy.ts`, so every route below is already
@@ -143,10 +180,12 @@ metamcpRouter.post("/:uuid/mcp", async (req, res) => {
       });
       logger.info("Created MetaMCP StreamableHttp transport");
 
-      await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
-        req,
-        res,
-        req.body,
+      await runWithCallerContext(inspectorCaller(req), () =>
+        (webAppTransport as StreamableHTTPServerTransport).handleRequest(
+          req,
+          res,
+          req.body,
+        ),
       );
     } catch (error) {
       logger.error("Error in MetaMCP /mcp POST route:", error);
@@ -163,9 +202,8 @@ metamcpRouter.post("/:uuid/mcp", async (req, res) => {
       if (!transport) {
         res.status(404).end("Transport not found for sessionId " + sessionId);
       } else {
-        await (transport as StreamableHTTPServerTransport).handleRequest(
-          req,
-          res,
+        await runWithCallerContext(inspectorCaller(req), () =>
+          (transport as StreamableHTTPServerTransport).handleRequest(req, res),
         );
       }
     } catch (error) {
@@ -252,7 +290,9 @@ metamcpRouter.post("/:uuid/message", async (req, res) => {
       res.status(404).end("Session not found");
       return;
     }
-    await transport.handlePostMessage(req, res);
+    await runWithCallerContext(inspectorCaller(req), () =>
+      transport.handlePostMessage(req, res),
+    );
   } catch (error) {
     logger.error("Error in MetaMCP /message route:", error);
     res.status(500).json(error);

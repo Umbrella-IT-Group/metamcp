@@ -14,6 +14,11 @@ import logger from "@/utils/logger";
 
 import { isAdminHealthRequest } from "../../lib/health-upstream";
 import { runWithM365UserContext } from "../../lib/m365/request-context";
+import {
+  resolveCallerContext,
+  stampCallerContext,
+} from "../../lib/metamcp/caller-context";
+import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
   GATEWAY_BOOT_ID,
@@ -215,10 +220,20 @@ export async function dispatchTracked(
   req: express.Request,
   res: express.Response,
   sessionId: string,
+  clientName?: string,
 ): Promise<void> {
   publicSessionSweeper.markInFlight(sessionId);
   try {
-    await handleRequestWithUserContext(authReq, transport, req, res);
+    // Enter the request-scoped caller binding for the whole dispatch, so the
+    // auditing middleware attributes this call to THIS request rather than to
+    // whichever request last stamped the pooled handler context. Every
+    // Streamable-HTTP tool call reaches the transport through here, which is
+    // what makes the store the authoritative source rather than a best-effort
+    // one. See `lib/metamcp/caller-context-store`.
+    await runWithCallerContext(
+      { ...resolveCallerContext(authReq), clientName },
+      () => handleRequestWithUserContext(authReq, transport, req, res),
+    );
   } finally {
     publicSessionSweeper.markSettled(sessionId);
   }
@@ -457,7 +472,11 @@ export async function recoverPersistedSession(
   // post-restart tool calls stay attributed (the registry/in-memory state is
   // gone after a restart; authReq is the re-validated current caller).
   const recoveredIdentity = await resolveClientIdentity(authReq);
-  mcpServerInstance.handlerContext.clientName = recoveredIdentity?.name;
+  stampCallerContext(
+    mcpServerInstance.handlerContext,
+    authReq,
+    recoveredIdentity?.name,
+  );
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
     onsessioninitialized: async (sid) => {
@@ -844,6 +863,10 @@ streamableHttpRouter.get(
         }
       }
       logger.info(`Handling GET for session ${sessionId}`);
+      // No clientName resolved for the standalone GET stream: it carries only
+      // server-initiated notifications, never a tools/call, so nothing on this
+      // leg reaches the auditing middleware. The identity half of the binding
+      // still rides the store via dispatchTracked, which costs no lookup.
       await dispatchTracked(authReq, transport, req, res, sessionId);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
@@ -894,11 +917,20 @@ streamableHttpRouter.post(
           throw new Error("Failed to get MetaMCP server instance from pool");
         }
 
-        // Stamp the calling consumer onto the (possibly idle-warmed) instance's
-        // handler context so the audit middleware attributes tool calls to it.
-        // Idle servers carry a placeholder sessionId, so we can't key by
-        // sessionId — we set it directly on the instance we just acquired.
-        mcpServerInstance.handlerContext.clientName = clientIdentity?.name;
+        // Stamp the calling consumer + caller binding onto the (possibly
+        // idle-warmed) instance's handler context. Idle servers carry a
+        // placeholder sessionId, so we can't key by sessionId — we set it
+        // directly on the instance we just acquired.
+        //
+        // This is the FALLBACK carrier (migration 0030). The row an audit
+        // write actually uses comes from the request-scoped store entered in
+        // dispatchTracked; see `lib/metamcp/caller-context-store` for why a
+        // per-instance object cannot be the source of truth.
+        stampCallerContext(
+          mcpServerInstance.handlerContext,
+          authReq,
+          clientIdentity?.name,
+        );
 
         logger.info(
           `Using MetaMCP server instance for public endpoint session ${newSessionId} (endpoint: ${endpointName})`,
@@ -1001,7 +1033,14 @@ streamableHttpRouter.post(
         }
 
         // Now handle the request - server is guaranteed to be ready
-        await dispatchTracked(authReq, transport, req, res, newSessionId);
+        await dispatchTracked(
+          authReq,
+          transport,
+          req,
+          res,
+          newSessionId,
+          clientIdentity?.name,
+        );
       } catch (error) {
         logger.error("Error in public endpoint /mcp POST route:", error);
 
@@ -1084,8 +1123,43 @@ streamableHttpRouter.post(
             return;
           }
         }
+        // Refresh the pooled instance's fallback binding to THIS request.
+        //
+        // The authoritative binding for the audit row is the request-scoped
+        // store `dispatchTracked` enters below; this keeps the fallback from
+        // describing an older request. It matters because the handler context
+        // is per-INSTANCE while the facts on it are per-REQUEST: `requestId`
+        // and `callerIp` change on every call, and the instance is reached by
+        // an in-memory session lookup that resolves on namespace + endpoint
+        // rather than by re-deriving the caller from the credential presented
+        // now. Neither property makes the pooled object safe to audit from,
+        // which is exactly why the store exists — see
+        // `lib/metamcp/caller-context-store`.
+        //
+        // A pure map read, never a create: an instance the pool no longer
+        // holds means the transport is being served from lazy recovery, which
+        // stamps its own binding. Nothing is keyed on the handler context's
+        // own sessionId here — that is a placeholder on an idle-converted
+        // instance — only on the transport session id the pool itself
+        // assigned.
+        const activeInstance = metaMcpServerPool.getServerInstance(sessionId);
+        if (activeInstance) {
+          stampCallerContext(
+            activeInstance.handlerContext,
+            authReq,
+            clientIdentity?.name,
+          );
+        }
+
         logger.info(`Handling POST for session ${sessionId}`);
-        await dispatchTracked(authReq, transport, req, res, sessionId);
+        await dispatchTracked(
+          authReq,
+          transport,
+          req,
+          res,
+          sessionId,
+          clientIdentity?.name,
+        );
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);
 
