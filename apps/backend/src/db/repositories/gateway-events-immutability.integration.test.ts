@@ -346,6 +346,73 @@ describeIfDb("gateway_events against a REAL postgres", () => {
     expect(new Set(uuids).size).toBe(3);
   });
 
+  /**
+   * The one claim no unit test can make: an ordinary `metamcpLogStore.record()`
+   * call, with nothing mocked, ends up as a row.
+   *
+   * Every layer between the two is stubbed somewhere else — the sink's
+   * repository in `lib/gateway-events/sink.test.ts`, the store's sink in
+   * `lib/metamcp/log-store-persistence.test.ts` — so all of those suites would
+   * stay green if the lazy import in the sink resolved to nothing in a real
+   * process. This is the case that would catch it.
+   */
+  it("persists an ordinary log-store event end to end, with nothing mocked", async () => {
+    const storeMarker = `itest-store-${Date.now()}`;
+    const { metamcpLogStore } = await import("../../lib/metamcp/log-store");
+
+    metamcpLogStore.record({
+      category: "client",
+      serverName: storeMarker,
+      level: "info",
+      message: "client connected",
+      clientName: "example-consumer",
+      sessionId: "session-itest",
+    });
+
+    // The write is detached by design, so the assertion has to wait for it
+    // rather than for the call that scheduled it.
+    let rows = { rows: [] as unknown[] };
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      rows = (await db.execute(
+        `SELECT category, level, client_name, session_id, message FROM gateway_events WHERE server_name = '${storeMarker}'` as never,
+      )) as typeof rows;
+      if (rows.rows.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]).toMatchObject({
+      category: "client",
+      level: "info",
+      client_name: "example-consumer",
+      session_id: "session-itest",
+      message: "client connected",
+    });
+  });
+
+  it("does NOT persist a tool_call, even though the store rings one", async () => {
+    const toolMarker = `itest-tool-${Date.now()}`;
+    const { metamcpLogStore } = await import("../../lib/metamcp/log-store");
+
+    metamcpLogStore.record({
+      category: "tool_call",
+      serverName: toolMarker,
+      level: "info",
+      message: "example_tool (12ms)",
+      toolName: "example_tool",
+      durationMs: 12,
+    });
+
+    // Give the detached write the same chance to land as the case above, so a
+    // row that DID get written cannot pass this by being slow.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const rows = await db.execute(
+      `SELECT uuid FROM gateway_events WHERE server_name = '${toolMarker}'` as never,
+    );
+    expect(rows.rows).toHaveLength(0);
+  });
+
   it("treats a search term as a substring, not a LIKE pattern", async () => {
     const searchMarker = `itest-search-${Date.now()}`;
     await db.execute(
