@@ -3,6 +3,7 @@ import express from "express";
 
 import logger from "@/utils/logger";
 
+import { resolveCallerContext } from "../../../lib/metamcp/caller-context";
 import { resolveClientIdentity } from "../../../lib/metamcp/consumer-identity-resolver";
 import { metaMcpServerPool } from "../../../lib/metamcp/metamcp-server-pool";
 import { createMiddlewareEnabledHandlers } from "./handlers";
@@ -32,12 +33,19 @@ export const executeToolWithMiddleware = async (
     // tool_call log shows WHO called it. Carried on the per-call context.
     const clientIdentity = await resolveClientIdentity(req);
 
+    // Caller binding for the audit row (migration 0030): which credential,
+    // account, address and request. Resolved per call, from this request,
+    // because the OpenAPI session id is shared across every consumer of the
+    // namespace and therefore identifies nobody.
+    const caller = resolveCallerContext(req);
+
     // Create middleware-enabled handlers
     const { handlerContext, callToolWithMiddleware } =
       createMiddlewareEnabledHandlers(
         sessionId,
         namespaceUuid,
         clientIdentity?.name,
+        caller,
       );
 
     // Use middleware-enabled call tool handler

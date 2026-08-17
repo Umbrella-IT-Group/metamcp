@@ -10,6 +10,7 @@ import { resolveActsAsUserId } from "../lib/api-key-identity";
 import {
   type AuditActorType,
   auditRequestContext,
+  type AuditRequestFields,
   credentialFingerprint,
   emit,
 } from "../lib/audit/audit-emitter";
@@ -24,8 +25,16 @@ import {
 } from "../lib/auth-rate-limiter";
 import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
 
-// Extend Express Request interface for our custom properties
-export interface ApiKeyAuthenticatedRequest extends express.Request {
+// Extend Express Request interface for our custom properties.
+//
+// `AuditRequestFields` (auditRequestId / auditClientIp) is inherited rather
+// than assumed: `auditContextMiddleware` stamps those two on every request
+// and the tool-call audit path reads them off this type. Declared here, a
+// rename on the stamping side is a compile error at the read sites instead of
+// two silently NULL audit columns.
+export interface ApiKeyAuthenticatedRequest
+  extends express.Request,
+    AuditRequestFields {
   namespaceUuid: string;
   endpointName: string;
   endpoint: DatabaseEndpoint;
