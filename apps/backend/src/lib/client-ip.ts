@@ -33,9 +33,14 @@ export const CLIENT_IP_HEADER = "cf-connecting-ip";
  * row's `actor_ip` and every `x-audit-client-ip` the `/api/auth` relay stamps
  * are read from `auditClientIp`, so bounding it once here bounds all of them,
  * and a future emitter cannot forget to. See AUDIT_IP_MAX in
- * `lib/audit/audit-emitter` for why 64 loses no evidence. The bound does
- * double duty for the limiters: it is what stops a caller from spending
- * unbounded map memory by rotating a very long header value.
+ * `lib/audit/audit-emitter` for why 64 loses no evidence.
+ *
+ * WHAT THE CLAMP DOES AND DOES NOT BUY THE LIMITERS THAT KEY ON THIS. It
+ * bounds per-key SIZE, not key COUNT. A caller rotating the header still mints
+ * one map entry per distinct value — measured at 200k entries for 200k values
+ * — and those are reclaimed only by the ten-minute sweep in
+ * `lib/auth-rate-limiter`. What bounds the count is the edge overwriting the
+ * header, plus that sweep; it is not this line.
  */
 export function resolveClientIp(
   headers: express.Request["headers"],

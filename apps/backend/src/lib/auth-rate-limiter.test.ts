@@ -160,7 +160,7 @@ describe("getAuthRateLimitIdentifier", () => {
     expect(limiter.isCurrentlyLimited(first)).toBe(true);
   });
 
-  it("falls back to the socket address when the edge header is absent", () => {
+  it("walks req.ip then the socket address then the literal when the edge header is absent", () => {
     const endpoint = makeEndpoint(ENDPOINT_UUID);
 
     // Direct-to-origin and local development have no Cloudflare header. They
@@ -242,14 +242,56 @@ describe("getAuthRateLimitIdentifier", () => {
  * Re-keying the limiter per caller only helps if the per-caller allowance stays
  * where it was; quietly widening or narrowing it while the keys changed would
  * be invisible in the tests above.
+ *
+ * DRIVEN THROUGH THE PRODUCTION CALL PAIR, and that is the point of this block
+ * rather than an incidental detail. Every call site — three of them, in
+ * middleware/api-key-oauth.middleware — does `recordFailedAttempt(id)` and then
+ * `isRateLimited(id)`, and `isRateLimited` counts the question it is asked (see
+ * the `isCurrentlyLimited` docblock in the module under test, which exists
+ * because of exactly that). Two counts land per failed request, so the
+ * constructor argument of 20 buys about ten attempts a minute, not twenty. A
+ * test that drove `recordFailedAttempt` alone would pin the counter's arithmetic
+ * and quietly misreport the allowance the gateway actually enforces.
  */
-describe("the shared failed-auth limiter's budget", () => {
-  it("refuses on the twentieth failure in a window, not sooner", () => {
+describe("the failed-auth budget as the middleware actually spends it", () => {
+  /** What the three call sites do per failed request, in order. */
+  const failOnce = (identifier: string): boolean => {
+    authRateLimiter.recordFailedAttempt(identifier);
+    return authRateLimiter.isRateLimited(identifier);
+  };
+
+  it("serves ten failed attempts and refuses the eleventh", () => {
     // Unique per run: the limiter is module-scoped, so a fixed key would let
     // this test spend a budget another file's traffic is counting on.
     const identifier = `budget-pin:${randomUUID()}`;
 
-    for (let attempt = 0; attempt < 19; attempt += 1) {
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      expect(failOnce(identifier)).toBe(false);
+    }
+    expect(failOnce(identifier)).toBe(true);
+  });
+
+  it("keeps refusing for the rest of the window once the budget is gone", () => {
+    const identifier = `budget-pin:${randomUUID()}`;
+
+    for (let attempt = 1; attempt <= 11; attempt += 1) {
+      failOnce(identifier);
+    }
+
+    // Not a formality: `isRateLimited` mutates, so a limiter that refused once
+    // and then let the next request through would still satisfy the test above.
+    expect(failOnce(identifier)).toBe(true);
+    expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(true);
+  });
+
+  it("still allows the nominal twenty when only the counter is driven", () => {
+    // The other half of the discrepancy, pinned so the gap between the
+    // constructor argument and the enforced allowance stays visible: counting
+    // without asking reaches 20. If these two tests ever converge, the
+    // middleware's call pair changed and the docblocks above need rereading.
+    const identifier = `budget-pin:${randomUUID()}`;
+
+    for (let attempt = 1; attempt <= 19; attempt += 1) {
       authRateLimiter.recordFailedAttempt(identifier);
     }
     expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(false);

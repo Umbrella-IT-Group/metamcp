@@ -325,8 +325,11 @@ describe("mcp.auth.ratelimited — 429", () => {
     validateApiKeyMock.mockResolvedValue({ valid: false });
     const clientIp = "198.51.100.99";
 
-    // The limiter allows 20 failures per minute per (caller, endpoint), so one
-    // caller has to make all of these for the budget to run out.
+    // One caller has to make all of these for the budget to run out. The
+    // allowance is about ten failures a minute per (caller, endpoint) rather
+    // than the constructor's 20, because this middleware records the failure
+    // and then asks isRateLimited, which counts the asking too — see the
+    // budget block in lib/auth-rate-limiter.test. 21 stays comfortably past it.
     for (let attempt = 0; attempt < 21; attempt += 1) {
       await authenticate({ headers: { "x-api-key": API_KEY }, clientIp });
     }
