@@ -25,13 +25,27 @@ services:
     # Users can manually run ./docker-entrypoint-dev.sh when needed
     command: sleep infinity
     environment:
+      # POSTGRES_PASSWORD is REQUIRED and deliberately has no fallback: the
+      # default this line used to carry is published in this repository, and a
+      # devcontainer's Postgres is published on a host port like any other.
+      # Compose refuses to render with the message below rather than booting
+      # Postgres on a guessable credential.
+      #
+      # The message names `.devcontainer/.env`, not the repository root's
+      # `.env`, because by default compose resolves `.env` for `${...}`
+      # interpolation from the project directory, which defaults to the
+      # compose file's own folder (overridable via --project-directory or
+      # COMPOSE_ENV_FILES). `env_file: ../.env` below is a different
+      # mechanism — it passes the root file INTO the container and is not
+      # read for substitution here — so the root `.env` alone does not
+      # satisfy this by default.
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment or .devcontainer/.env (see example.env)}
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
       
-      DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:-m3t4mcp}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-metamcp_user}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment or .devcontainer/.env (see example.env)}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-metamcp_db}
       
       APP_URL: ${APP_URL:-http://localhost:12008}
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
@@ -57,7 +71,8 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-metamcp_db}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m3t4mcp}
+      # Required, no fallback — see the note in the app service above.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment or .devcontainer/.env (see example.env)}
     ports:
       - "${POSTGRES_EXTERNAL_PORT:-9433}:5432"
     volumes:
