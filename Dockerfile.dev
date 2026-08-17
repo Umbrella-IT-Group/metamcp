@@ -22,6 +22,17 @@ RUN apt-get update && apt-get install -y tini \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# psql, for the same reason the production image installs it: the entrypoint's
+# optional runtime-role step shells out to it. The dev stack reads the same
+# .env as the production compose, so an operator who turns the role split on
+# and then runs `docker compose -f docker-compose.dev.yml up` would otherwise
+# get an app dialling a role nothing ever created. This also promotes the dev
+# entrypoint's `pg_isready` wait from its "not found, relying on the compose
+# healthcheck" fallback to the real check.
+RUN apt-get update && apt-get install -y postgresql-client \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Development stage
 FROM base AS dev
 WORKDIR /app

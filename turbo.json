@@ -5,6 +5,8 @@
     "PORT",
     "APP_URL",
     "DATABASE_URL",
+    "RUNTIME_DATABASE_URL",
+    "METAMCP_RUNTIME_DB_ROLE",
     "BETTER_AUTH_SECRET",
     "NEXT_PUBLIC_APP_URL",
     "NEXT_PUBLIC_BRANDING_PRODUCT_NAME",
@@ -70,6 +72,12 @@
     "M365_SCOPES",
     "M365_INJECTED_SERVER_NAMES"
   ],
+  // Passed THROUGH to tasks without entering the hash. A secret in
+  // `globalEnv` mixes its VALUE into every task's cache key, so each
+  // developer's (and each rotation of) the runtime password would miss the
+  // whole shared cache. Nothing turbo builds depends on the value; only the
+  // running container does.
+  "globalPassThroughEnv": ["METAMCP_RUNTIME_DB_PASSWORD"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
