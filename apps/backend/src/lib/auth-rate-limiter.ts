@@ -1,6 +1,8 @@
 import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 
+import { resolveClientIp } from "@/lib/client-ip";
+
 /**
  * Simple in-memory rate limiter for failed authentication attempts
  * In production, use Redis or similar for distributed rate limiting
@@ -93,8 +95,13 @@ export class AuthRateLimiter {
   }
 }
 
-// Create rate limiter instance for failed authentication attempts
-export const authRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
+// Create rate limiter instance for failed authentication attempts.
+//
+// The ceiling reads 20 but the enforced allowance is about ten failures per
+// minute, because the middleware records a failure and then asks
+// `isRateLimited`, which counts the asking too. See the docblock on
+// `getAuthRateLimitIdentifier` below for the full account.
+export const authRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000);
 
 // Clean up rate limiter entries every 10 minutes.
 //
@@ -113,14 +120,74 @@ setInterval(
 ).unref();
 
 /**
- * Get rate limiting identifier for authentication attempts
- * Uses IP address and endpoint for rate limiting
+ * Rate-limit identifier for failed authentication attempts against an endpoint,
+ * keyed per (caller, endpoint).
+ *
+ * KEYED ON CF-Connecting-IP, not `req.ip`. It used to key on `req.ip`, and
+ * behind this deployment that is the same in-container address for every
+ * caller — the backend is reached through the frontend's Next.js rewrite, and
+ * `trust proxy` is deliberately off (middleware/audit-context.middleware
+ * documents why at length). So the budget was ONE bucket per endpoint for the
+ * entire world, which inverts what the limiter is for: rather than bounding a
+ * brute force, it handed anyone who could reach the endpoint a way to lock out
+ * every legitimate caller of it for the rest of the window, at a cost of
+ * eleven requests. A single consumer retrying a stale credential in a loop did
+ * the same thing by accident.
+ *
+ * WHAT THE BUDGET ACTUALLY IS, since the constructor argument reads 20 and the
+ * effective allowance is half that. Every call site pairs the two calls —
+ * `recordFailedAttempt(id)` and then `isRateLimited(id)` (three of them, in
+ * middleware/api-key-oauth.middleware) — and `isRateLimited` COUNTS the
+ * question it is asked, which is precisely the hazard `isCurrentlyLimited`
+ * exists to avoid and documents above. Two counts therefore land per failed
+ * request, so refusal arrives on the ELEVENTH failure in a window, not the
+ * twentieth: roughly ten failed attempts per minute per (caller, endpoint).
+ * That is the number to reason about, and the test file pins it by driving the
+ * production pair rather than the counter directly. It is written down rather
+ * than corrected because changing which method the middleware calls would
+ * change enforcement — a separate decision from re-keying, and not one this
+ * change makes.
+ *
+ * Cloudflare overwrites CF-Connecting-IP at the edge on every request, so it is
+ * per-CALLER rather than per-container. The trust assumption is exactly the one
+ * audit-context.middleware states: it holds only while the Cloudflare Tunnel is
+ * the sole ingress. `req.ip` stays the fallback for direct-to-origin and local
+ * development, where the identifier degrades to the shared bucket it was — no
+ * worse than before, and never a throw on an auth-failure path.
+ *
+ * THE NO-HEADER CLASS IS BUCKETED HERE, NOT EXEMPTED, which is the opposite of
+ * what `trpcRateLimitMiddleware` decides for the same class, so the divergence
+ * is deliberate. That limiter caps request RATE and can afford to wave through
+ * traffic that never crossed the tunnel; this one counts FAILED CREDENTIALS,
+ * and exempting a class would mean anyone able to omit the header gets no
+ * brute-force bound at all. Collapsing in-container and local-development
+ * callers into one shared bucket is the cheap failure of the two: it can only
+ * inconvenience callers that are already failing to authenticate.
+ *
+ * Same fix, same reasoning, as `rateLimitRegistration` in routers/oauth/utils
+ * and `trpcRateLimitMiddleware` in middleware/trpc-rate-limit.middleware.
+ *
+ * THE RESIDUAL, PLAINLY, in two parts. Per-IP keying bounds a source address,
+ * not a distributed caller; that is the same trade those two siblings took, and
+ * what it buys is that the control can no longer be turned into the outage.
+ * The second part is new and runs the other way: wherever CF-Connecting-IP is
+ * caller-settable, a caller mints a FRESH bucket per request and the
+ * failed-auth bound disappears entirely — where the old shared bucket, for all
+ * its faults, still capped them. That is not hypothetical at the artifact
+ * level: the shipped docker-compose publishes 12008 host-wide rather than
+ * binding loopback, so an origin reachable beside the tunnel is a deployment
+ * away. Same property, same re-check, as the header's trust assumption itself:
+ * it must be revisited before any change to how this service is published.
  */
 export function getAuthRateLimitIdentifier(
   req: express.Request,
   endpoint: DatabaseEndpoint,
 ): string {
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  const ip =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
   const endpointId = endpoint.uuid || endpoint.name || "unknown";
   return `${ip}:${endpointId}`;
 }

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 
 import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
-import { AUDIT_IP_MAX, clampAuditText } from "@/lib/audit/audit-emitter";
+import { resolveClientIp } from "@/lib/client-ip";
 
 /**
  * Stamps the two per-request fields every audit row needs: a request id and
@@ -54,36 +54,14 @@ import { AUDIT_IP_MAX, clampAuditText } from "@/lib/audit/audit-emitter";
  * properties on `req`; it reads no body and consumes no stream.
  */
 
-/** Cloudflare's single-value, edge-overwritten client IP header. */
-export const CLIENT_IP_HEADER = "cf-connecting-ip";
-
 /**
- * Pull the caller IP out of a header bag.
- *
- * Exported for tests. Returns undefined rather than a placeholder when the
- * header is absent (direct-to-origin calls, local development): a NULL
- * `actor_ip` is an honest "not known", while a fabricated one would be read
- * as evidence.
- *
- * CLAMPED HERE, at the stamping site, rather than at each emitter. Every audit
- * row's `actor_ip` and every `x-audit-client-ip` the `/api/auth` relay stamps
- * are read from `auditClientIp`, so bounding it once here bounds all of them,
- * and a future emitter cannot forget to. See AUDIT_IP_MAX in
- * `lib/audit/audit-emitter` for why 64 loses no evidence.
+ * Re-exported, not re-defined. The header name and the resolver moved to
+ * `lib/client-ip` once the rate limiters started keying on them too — a `lib/`
+ * module cannot import upward into `middleware/` without inverting this
+ * codebase's layering. That file carries the rationale; these re-exports keep
+ * every existing importer, and this file's own tests, pointed here.
  */
-export function resolveClientIp(
-  headers: express.Request["headers"],
-): string | undefined {
-  const raw = headers[CLIENT_IP_HEADER];
-  // Express lower-cases header names but an array is still possible if a
-  // caller sends the header twice. Take the first value; a duplicated
-  // CF-Connecting-IP is not something Cloudflare produces, so anything here
-  // is malformed input and picking deterministically beats throwing.
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed === "" ? undefined : clampAuditText(trimmed, AUDIT_IP_MAX);
-}
+export { CLIENT_IP_HEADER, resolveClientIp } from "@/lib/client-ip";
 
 export const auditContextMiddleware = (
   req: express.Request,

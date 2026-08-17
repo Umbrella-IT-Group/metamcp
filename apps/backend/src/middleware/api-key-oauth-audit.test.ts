@@ -130,30 +130,38 @@ let ipCounter = 0;
 async function authenticate(options: {
   endpoint?: DatabaseEndpoint;
   headers?: Record<string, string>;
-  rateLimitKey?: string;
+  clientIp?: string;
 }): Promise<{ served: boolean; res: FakeRes }> {
   ipCounter += 1;
+  // One caller identity drives both the limiter key and the audit attribution,
+  // exactly as production does — audit-context.middleware derives auditClientIp
+  // from this same header. getAuthRateLimitIdentifier keys on it, so this is
+  // the field that must be unique per request; passing an explicit clientIp is
+  // how the 429 test puts several requests in one bucket.
+  const clientIp = options.clientIp ?? `198.51.100.${ipCounter}`;
   const req = {
     method: "POST",
     url: "/mcp",
     headers: {
       "user-agent": "claude-mcp/1.0",
-      "cf-connecting-ip": CLIENT_IP,
+      "cf-connecting-ip": clientIp,
       ...(options.headers ?? {}),
     },
     query: {},
     protocol: "https",
     get: () => "mcp.example.com",
-    // getAuthRateLimitIdentifier keys on req.ip; a shared key is how the 429
-    // test drives the limiter over its threshold.
-    ip: options.rateLimitKey ?? `10.0.0.${ipCounter}`,
+    // Deliberately NOT varied. This is the single loopback address production
+    // sees for every caller behind the tunnel, so pinning it here means a
+    // regression back to keying the limiter on req.ip collapses these requests
+    // into one bucket and turns this suite red.
+    ip: "127.0.0.1",
     socket: { remoteAddress: "127.0.0.1" },
     endpoint: options.endpoint ?? makeEndpoint(),
     endpointName: "autotask",
     namespaceUuid: "33333333-3333-4333-8333-333333333333",
     // Stamped by audit-context.middleware in production.
     auditRequestId: "req-under-test",
-    auditClientIp: CLIENT_IP,
+    auditClientIp: clientIp,
   } as unknown as express.Request;
 
   const res = makeRes();
@@ -188,8 +196,11 @@ describe("mcp.auth.denied — refused credentials", () => {
   it("401 invalid api key: one row, fingerprinted, actor anonymous", async () => {
     validateApiKeyMock.mockResolvedValue({ valid: false });
 
+    // Pinned rather than left to the per-request default so the actor_ip
+    // assertion below reads a known value.
     const { res } = await authenticate({
       headers: { "x-api-key": API_KEY },
+      clientIp: CLIENT_IP,
     });
     await flush();
 
@@ -312,11 +323,15 @@ describe("mcp.auth.denied — refused credentials", () => {
 describe("mcp.auth.ratelimited — 429", () => {
   it("uses its own action so a brute force is queryable on one predicate", async () => {
     validateApiKeyMock.mockResolvedValue({ valid: false });
-    const rateLimitKey = "198.51.100.99";
+    const clientIp = "198.51.100.99";
 
-    // The limiter allows 20 failures per minute per (ip, endpoint).
+    // One caller has to make all of these for the budget to run out. The
+    // allowance is about ten failures a minute per (caller, endpoint) rather
+    // than the constructor's 20, because this middleware records the failure
+    // and then asks isRateLimited, which counts the asking too — see the
+    // budget block in lib/auth-rate-limiter.test. 21 stays comfortably past it.
     for (let attempt = 0; attempt < 21; attempt += 1) {
-      await authenticate({ headers: { "x-api-key": API_KEY }, rateLimitKey });
+      await authenticate({ headers: { "x-api-key": API_KEY }, clientIp });
     }
     await flush();
 

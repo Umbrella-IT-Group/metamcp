@@ -19,9 +19,11 @@ import logger from "@/utils/logger";
  * the same as bounding the writes, and this is the writes.
  *
  * KEYED ON `auditClientIp`, NOT `req.ip`, and that is the whole design.
- * `req.ip` is what the two identifiers in `lib/auth-rate-limiter` key on, and
- * both are documented there as a SINGLE SHARED ORG BUCKET: this fork
- * deliberately leaves express `trust proxy` unset (see
+ * `req.ip` is what `getPublicOAuthRateLimitIdentifier` in `lib/auth-rate-limiter`
+ * still keys on — the last identifier there documented as a SINGLE SHARED ORG
+ * BUCKET, its sibling `getAuthRateLimitIdentifier` having since moved to the
+ * edge-supplied client IP for the reasons given here: this fork deliberately
+ * leaves express `trust proxy` unset (see
  * `audit-context.middleware` for the reasoning), so behind the in-container
  * Next.js rewrite `req.ip` is the same loopback address for every human on
  * earth. A request-rate limiter on that key is not a limiter, it is a

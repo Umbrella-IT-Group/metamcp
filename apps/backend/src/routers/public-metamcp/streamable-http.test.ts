@@ -106,6 +106,7 @@ vi.mock("../../lib/metamcp/consumer-identity-resolver", () => ({
 vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
   metaMcpServerPool: {
     getServer: vi.fn(),
+    getServerInstance: vi.fn(),
     cleanupSession: vi.fn().mockResolvedValue(undefined),
     getMcpServerPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
     getPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
@@ -128,9 +129,14 @@ vi.mock("../../lib/metamcp/transport-recovery-hydration", () => ({
 // them below is the established convention in this repo's test files).
 import { mcpSessionsRepository } from "@/db/repositories/mcp-sessions.repo";
 import type { ApiKeyAuthenticatedRequest } from "@/middleware/api-key-oauth.middleware";
+import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
+import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
+import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 
 import type { M365UserContext } from "../../lib/m365/request-context";
 import { getM365UserContext } from "../../lib/m365/request-context";
+import type { CallerContext } from "../../lib/metamcp/caller-context-store";
+import { getCallerContext } from "../../lib/metamcp/caller-context-store";
 import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
@@ -932,5 +938,327 @@ describe("m365 identity gate (via dispatchTracked) — oauth + acts-as api keys 
       "utf8",
     );
     expect(streamableSource).toContain("runWithM365UserContext");
+  });
+});
+
+/**
+ * Caller binding for `tool_call_audit` (migration 0030).
+ *
+ * Two carriers, tested separately because they fail differently:
+ *
+ *  - the REQUEST-SCOPED store (`lib/metamcp/caller-context-store`), entered by
+ *    `dispatchTracked`, is what the auditing middleware actually reads. Delete
+ *    that wiring and every proxied tool call is audited from a pooled object
+ *    that belongs to whichever request stamped it last.
+ *  - the per-instance handler context is the fallback, stamped at session
+ *    creation, at lazy recovery, and again on each subsequent POST. Delete any
+ *    of those and the fallback goes stale or empty.
+ *
+ * Every stamp site below was deletable with the suite green before these
+ * tests existed.
+ */
+describe("caller binding — request-scoped store (the audited source)", () => {
+  function callerCapturingTransport(captured: {
+    caller: CallerContext | undefined;
+  }): StreamableHTTPServerTransport {
+    return {
+      handleRequest: vi.fn().mockImplementation(async () => {
+        captured.caller = getCallerContext();
+      }),
+    } as unknown as StreamableHTTPServerTransport;
+  }
+
+  async function dispatchAndCaptureCaller(
+    authReq: ApiKeyAuthenticatedRequest,
+    sessionId: string,
+    clientName?: string,
+  ): Promise<CallerContext | undefined> {
+    publicSessionSweeper.beginTracking(sessionId);
+    const captured: { caller: CallerContext | undefined } = {
+      caller: undefined,
+    };
+    await dispatchTracked(
+      authReq,
+      callerCapturingTransport(captured),
+      {} as express.Request,
+      {} as express.Response,
+      sessionId,
+      clientName,
+    );
+    return captured.caller;
+  }
+
+  it("carries THIS request's credential, account, address and request id into the dispatch", async () => {
+    const caller = await dispatchAndCaptureCaller(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000001",
+        apiKeyUserId: "key-owner-1",
+        headers: { "cf-connecting-ip": "203.0.113.7" },
+        auditRequestId: "req-aaaa",
+      }),
+      "sess-binding-1",
+      "example connector",
+    );
+
+    expect(caller).toEqual({
+      clientName: "example connector",
+      apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000001",
+      authMethod: "api_key",
+      userId: "key-owner-1",
+      actsAsUserId: undefined,
+      callerIp: "203.0.113.7",
+      requestId: "req-aaaa",
+    });
+  });
+
+  it("records an admin key's acts-as target separately from the key owner", async () => {
+    const caller = await dispatchAndCaptureCaller(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000002",
+        apiKeyUserId: "key-owner-1",
+        apiKeyActsAsUserId: "acted-as-user-1",
+        auditRequestId: "req-bbbb",
+      }),
+      "sess-binding-acts-as",
+    );
+
+    // Folding these into one column would make a delegated call read exactly
+    // like a direct one by the acted-as account.
+    expect(caller?.userId).toBe("key-owner-1");
+    expect(caller?.actsAsUserId).toBe("acted-as-user-1");
+  });
+
+  it("does not leak one request's binding into the next dispatch on the same session", async () => {
+    // The failure this guards is the whole reason the store exists: parallel
+    // or successive calls on one session share a pooled handler context.
+    const first = await dispatchAndCaptureCaller(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000001",
+        apiKeyUserId: "key-owner-1",
+        headers: { "cf-connecting-ip": "203.0.113.7" },
+        auditRequestId: "req-first",
+      }),
+      "sess-binding-shared",
+      "example connector",
+    );
+    const second = await dispatchAndCaptureCaller(
+      fakeAuthReq({
+        authMethod: "oauth",
+        oauthUserId: "oauth-user-9",
+        headers: { "cf-connecting-ip": "198.51.100.4" },
+        auditRequestId: "req-second",
+      }),
+      "sess-binding-shared",
+      "other consumer",
+    );
+
+    expect(first?.requestId).toBe("req-first");
+    expect(second?.requestId).toBe("req-second");
+    expect(second?.apiKeyUuid).toBeUndefined();
+    expect(second?.userId).toBe("oauth-user-9");
+    expect(second?.callerIp).toBe("198.51.100.4");
+  });
+
+  it("leaves the store empty outside a dispatch", async () => {
+    // "No store" must stay distinguishable from "a store that resolved
+    // nothing" — the auditing middleware falls back to the handler context on
+    // the first and not on the second.
+    await dispatchAndCaptureCaller(
+      fakeAuthReq({ authMethod: "api_key", apiKeyUuid: "u-1" }),
+      "sess-binding-scope",
+    );
+    expect(getCallerContext()).toBeUndefined();
+  });
+});
+
+describe("caller binding — per-instance fallback stamps", () => {
+  const fakeInstance = () => ({
+    server: { connect: vi.fn().mockResolvedValue(undefined) },
+    cleanup: vi.fn().mockResolvedValue(undefined),
+    handlerContext: {} as Record<string, unknown>,
+  });
+
+  it("lazy recovery re-stamps the rebuilt instance with the re-validated caller", async () => {
+    const sessionId = "sess-stamp-recovery";
+    const rawToken = "test-api-key-value";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({
+      session_id: sessionId,
+      namespace_uuid: "ns-1",
+      endpoint_name: "ep-1",
+      auth_principal: hashAuthPrincipal(rawToken, "api_key"),
+      auth_method: "api_key",
+      init_params: {},
+      created_at: new Date(),
+      last_seen_at: new Date(),
+      gateway_boot_id: GATEWAY_BOOT_ID,
+      capability_hash: GATEWAY_CAPABILITY_HASH,
+    });
+    const instance = fakeInstance();
+    (
+      metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(instance);
+
+    const result = await recoverPersistedSession(
+      sessionId,
+      fakeAuthReq({
+        namespaceUuid: "ns-1",
+        endpointName: "ep-1",
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000003",
+        apiKeyUserId: "key-owner-1",
+        headers: { "x-api-key": rawToken, "cf-connecting-ip": "203.0.113.7" },
+        auditRequestId: "req-recovery",
+      }),
+    );
+
+    expect(result.status).toBe("recovered");
+    expect(instance.handlerContext).toMatchObject({
+      clientName: "test-consumer",
+      apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000003",
+      authMethod: "api_key",
+      userId: "key-owner-1",
+      callerIp: "203.0.113.7",
+      requestId: "req-recovery",
+    });
+  });
+});
+
+describe("caller binding — the POST route stamps the instance it serves", () => {
+  let server: Server;
+  let baseUrl = "";
+  let instance: ReturnType<typeof makeInstance>;
+
+  const makeInstance = () => ({
+    server: { connect: vi.fn().mockResolvedValue(undefined) },
+    cleanup: vi.fn().mockResolvedValue(undefined),
+    handlerContext: {} as Record<string, unknown>,
+  });
+
+  beforeAll(async () => {
+    // The file-wide mocks for these three are bare `vi.fn()`s that never call
+    // next(), which is right for the unit tests above and would hang a real
+    // request. Give them the shape the production chain has: resolve the
+    // endpoint, stamp the identity the auth middleware would stamp, pass on.
+    vi.mocked(lookupEndpoint).mockImplementation(((
+      req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => {
+      Object.assign(req, {
+        namespaceUuid: "ns-1",
+        endpointName: "ep-1",
+        endpoint: { uuid: "ep-uuid-1", name: "ep-1" },
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000004",
+        apiKeyUserId: "key-owner-1",
+        // Stamped app-wide by auditContextMiddleware in production.
+        auditRequestId: "req-route",
+        auditClientIp: "203.0.113.7",
+      });
+      next();
+    }) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+    vi.mocked(rateLimitMiddleware).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+
+    const app = express();
+    app.use("/metamcp", streamableHttpRouter);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (typeof address === "object" && address) {
+      baseUrl = `http://127.0.0.1:${address.port}`;
+    }
+  });
+
+  afterAll(async () => {
+    // Restore the file-wide defaults — clearAllMocks does not reset
+    // implementations, so these would otherwise follow into any later block.
+    vi.mocked(lookupEndpoint).mockImplementation((() => undefined) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(
+      (() => undefined) as never,
+    );
+    vi.mocked(rateLimitMiddleware).mockImplementation(
+      (() => undefined) as never,
+    );
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  beforeEach(() => {
+    instance = makeInstance();
+  });
+
+  /**
+   * Drive one POST through the real router. The transport's own answer is
+   * irrelevant here (no MCP handshake is performed, so it refuses the body) —
+   * what is under test is the stamp the route applies before dispatching.
+   */
+  const post = (headers: Record<string, string> = {}) =>
+    fetch(`${baseUrl}/metamcp/ep-1/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...headers,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+
+  it("stamps the instance it acquires for a NEW session", async () => {
+    (
+      metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(instance);
+
+    await post();
+
+    expect(instance.handlerContext).toMatchObject({
+      clientName: "test-consumer",
+      apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000004",
+      authMethod: "api_key",
+      userId: "key-owner-1",
+      callerIp: "203.0.113.7",
+      requestId: "req-route",
+    });
+  });
+
+  it("re-stamps the pooled instance on a subsequent POST rather than leaving the initialize request's values", async () => {
+    // Seed a live in-memory session so the request takes the existing-session
+    // branch rather than falling into lazy recovery (which has its own stamp).
+    const sessionId = "sess-route-existing";
+    await seedBoundSession(sessionId, "ns-1", "ep-1");
+
+    // The state the bug produces: values frozen at session creation.
+    instance.handlerContext = {
+      clientName: "stale consumer",
+      requestId: "req-from-initialize",
+      callerIp: "198.51.100.99",
+      apiKeyUuid: "stale-uuid",
+    } as Record<string, unknown>;
+    (
+      metaMcpServerPool.getServerInstance as ReturnType<typeof vi.fn>
+    ).mockReturnValueOnce(instance);
+
+    await post({ "mcp-session-id": sessionId });
+
+    expect(instance.handlerContext).toMatchObject({
+      clientName: "test-consumer",
+      apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000004",
+      callerIp: "203.0.113.7",
+      requestId: "req-route",
+    });
+    await cleanupSession(sessionId);
   });
 });

@@ -16,6 +16,25 @@ export interface MetaMCPHandlerContext {
   // registry keyed by sessionId.
   clientName?: string;
   clientId?: string;
+  // Caller binding for the tool-call audit trail — the credential, account,
+  // address and request behind this call, as opposed to `clientName`'s display
+  // label. Stamped by the router layer via `lib/metamcp/caller-context`
+  // (`stampCallerContext`), which is also where each field's source and its
+  // trust assumptions are documented.
+  //
+  // FALLBACK CARRIER ONLY. This object is per-INSTANCE and instances are
+  // pooled, so it describes whichever request stamped it last. The
+  // authoritative per-request binding travels in the AsyncLocalStorage store
+  // in `lib/metamcp/caller-context-store`, which the auditing middleware
+  // prefers; see that file for why. All optional: an unauthenticated or
+  // passthrough path resolves none of them, and a NULL column is the honest
+  // answer there.
+  apiKeyUuid?: string;
+  authMethod?: string;
+  userId?: string;
+  actsAsUserId?: string;
+  callerIp?: string;
+  requestId?: string;
 }
 
 // Handler function types

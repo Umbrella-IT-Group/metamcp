@@ -13,6 +13,16 @@ export interface ToolCallAuditEntry {
   success: boolean;
   error_code?: string | null;
   latency_ms?: number | null;
+  // Caller binding (migration 0030): the credential, account, address and
+  // request behind the call, as opposed to `client_name`'s display label.
+  // Every one is nullable — a path that resolved no identity must still be
+  // able to write its row. See lib/metamcp/caller-context for the sources.
+  api_key_uuid?: string | null;
+  auth_method?: string | null;
+  user_id?: string | null;
+  acts_as_user_id?: string | null;
+  caller_ip?: string | null;
+  request_id?: string | null;
 }
 
 /**

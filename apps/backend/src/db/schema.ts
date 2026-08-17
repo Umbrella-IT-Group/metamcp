@@ -744,11 +744,51 @@ export const toolCallAuditTable = pgTable(
     success: boolean("success").notNull(),
     error_code: text("error_code"),
     latency_ms: integer("latency_ms"),
+    // Caller binding (migration 0030). `client_name` above is a DISPLAY
+    // LABEL — composed from a mutable email, empty wherever no identity was
+    // resolved — so it describes a call without attributing it. These five
+    // columns are the attribution: which credential, which auth method, which
+    // account, from which address, as part of which request.
+    //
+    // NO FOREIGN KEY on api_key_uuid, deliberately. `api_keys.user_id`
+    // cascades on user delete and keys are revoked routinely; an FK here
+    // would either delete the audit rows with the key or block the deletion.
+    // The audit trail has to outlive the credential it names — an attributed
+    // call whose key was revoked afterwards is precisely the row an
+    // investigation wants.
+    //
+    // `user_id` is the CREDENTIAL OWNER (api-key owner or OAuth subject);
+    // `acts_as_user_id` is the delegated identity an admin key exercised
+    // (`api_keys.acts_as_user_id`, migration 0024). Two columns, not one: one
+    // answers "whose credential", the other "whose identity was exercised",
+    // and collapsing them makes a delegated call indistinguishable from a
+    // direct one. The pair also appears inside `client_name` as
+    // `key (as email)`, but that string is composed from a mutable email
+    // through a cache that degrades to a short id on a read failure — a label,
+    // not something to query on.
+    //
+    // `caller_ip` is CF-Connecting-IP, bounded at AUDIT_IP_MAX where it is
+    // read; `request_id` is the audit-context middleware's per-request id,
+    // shared with `audit_log.request_id` so one request's control-plane and
+    // tool-plane records join.
+    api_key_uuid: uuid("api_key_uuid"),
+    auth_method: text("auth_method"),
+    user_id: text("user_id"),
+    acts_as_user_id: text("acts_as_user_id"),
+    caller_ip: text("caller_ip"),
+    request_id: text("request_id"),
   },
   (table) => [
     index("tool_call_audit_called_at_idx").on(table.called_at),
     index("tool_call_audit_tool_name_idx").on(table.tool_name),
     index("tool_call_audit_client_name_idx").on(table.client_name),
+    // Only api_key_uuid gets an index of the five. "What did this credential
+    // do" is the question a key compromise forces and it scans the whole
+    // table without one; the other four are read after a row is already in
+    // hand (request_id joins a handful of rows, caller_ip / user_id /
+    // auth_method are filters on an already-bounded time window). Every index
+    // is a cost on the insert path of a table written once per tool call.
+    index("tool_call_audit_api_key_uuid_idx").on(table.api_key_uuid),
   ],
 );
 
