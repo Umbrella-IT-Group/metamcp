@@ -179,18 +179,26 @@ SELECT format(
 --                    BE CLEAR ABOUT WHAT THE GRANT ALONE DOES. A granted
 --                    DELETE cannot distinguish "prune the aged tail" from
 --                    "empty the table", so the revokes here are not what
---                    bounds it. Migration 0032 is: an age-gated BEFORE DELETE
---                    trigger refuses any row whose called_at is inside the
---                    last 30 days, and BEFORE UPDATE / BEFORE TRUNCATE
---                    triggers refuse those verbs at any age. Revoking UPDATE
---                    and TRUNCATE here is still worth doing, because a grant
---                    stops the statement before the trigger has to, but the
---                    30-day window is what makes DELETE mean "prune".
---   gateway_events   Same grant shape as tool_call_audit, listed ahead of the
---                    migration that creates it. `to_regclass IS NOT NULL`
---                    below is the guard: an absent table is skipped, not an
---                    error, so this script is correct both before and after
---                    that migration lands.
+--                    bounds it. Migration 0032 is: BEFORE UPDATE / TRUNCATE
+--                    triggers that raise at any row age, plus a BEFORE DELETE
+--                    trigger that raises for any row whose called_at is
+--                    younger than 30 days. Revoking UPDATE and TRUNCATE here
+--                    is still worth doing, because a grant stops the
+--                    statement before the trigger has to, but the 30-day
+--                    window is what makes DELETE mean "prune".
+--   gateway_events   INSERT + SELECT + DELETE, the same grant shape as
+--                    tool_call_audit and, since 0032, the same exposure.
+--                    Migration 0031 gives this table the identical trigger
+--                    set: UPDATE and TRUNCATE raise at any row age, and
+--                    DELETE raises for anything younger than 30 days. So the
+--                    DELETE left standing here reaches only the aged tail,
+--                    and a statement spanning the boundary rolls back whole
+--                    rather than partially succeeding. That is exactly the
+--                    grant its retention sweeper needs and nothing beyond it.
+--
+--                    `to_regclass IS NOT NULL` below remains the guard for a
+--                    database that has not run 0031 yet: an absent table is
+--                    skipped, not an error.
 --
 -- TRUNCATE is revoked even though it was never granted above. It is the third
 -- wipe verb, it does not fire row-level triggers, and an operator who ran an

@@ -341,12 +341,18 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
     // An explicit expected set, not `size > 0`. A count assertion goes green
     // for the WRONG set as easily as the right one — including a walker that
     // regressed to finding one table when the repository has three.
+    //
+    // `gateway_events` (migration 0031) joined the set and is already in the
+    // REVOKE list below. Its policy is NOT audit_log's: it keeps DELETE,
+    // because its retention sweeper prunes it, and the migration's own
+    // age-gated DELETE trigger is what makes that grant mean "prune the aged
+    // tail" rather than "empty the table".
     expect(
       [...protectedTables].sort(),
       "a migration added or removed an immutability trigger: update this " +
         "expected set, and make sure the table is in the REVOKE list in " +
         "scripts/ensure-runtime-role.sh",
-    ).toEqual(["audit_log", "tool_call_audit"]);
+    ).toEqual(["audit_log", "gateway_events", "tool_call_audit"]);
 
     for (const table of protectedTables) {
       expect(

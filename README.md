@@ -101,6 +101,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 - **`/health/upstream` rollup** — a health endpoint reporting per-backend reachability and pool config, truthful for down HTTP/SSE backends (which never trip the STDIO crash breaker).
 - **Live Logs with consumer identity + tool-call auditing** — the Live Logs view records connection, tool-call, client-session, and server events with categories and filters; every proxied `tools/call` is audited with the authenticated caller (API-key name or OAuth email), tool, backend, duration, and outcome. A persistent `tool_call_audit` table stores a hash of arguments (never the raw args) with configurable retention.
+- **Durable gateway event history** — the Live Logs page has a **History** mode backed by a persistent `gateway_events` table, so connection, client-session, server and system activity survives a restart instead of living only in a 2000-entry in-memory buffer. Browsable by time range, category, level, server, client and message substring, with keyset paging. Rows are **immutable for 30 days** at the database level (UPDATE and TRUNCATE are refused at any age; DELETE is refused inside the window), and age out after `GATEWAY_EVENTS_RETENTION_DAYS`.
 
 ### No-reboot tool updates
 
@@ -148,6 +149,7 @@ role it authenticated as and whether that role is a superuser.
 | Ordinary application tables | `SELECT, INSERT, UPDATE, DELETE` | `TRUNCATE`, DDL | The gateway's normal working set. |
 | `audit_log` | `SELECT, INSERT` | `UPDATE, DELETE, TRUNCATE` | Append-only. Nothing prunes it in-app; its retention is a deliberate ops-level act performed as the owner. |
 | `tool_call_audit` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | `DELETE` stays because the `TOOL_AUDIT_RETENTION_DAYS` pruner removes aged rows, and migration `0032` narrows that `DELETE` to rows older than 30 days. See the note below. |
+| `gateway_events` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | Same shape and same reason: the `GATEWAY_EVENTS_RETENTION_DAYS` sweeper needs `DELETE`, and migration `0031` narrows it to rows older than 30 days. |
 | `drizzle` schema (migration journal) | nothing | everything | Never granted. A runtime role that can edit the journal can make a migration appear applied. |
 
 | Variable | Default | Purpose |
@@ -164,7 +166,7 @@ Cutover order:
 
 The dev stack (`docker-compose.dev.yml`) runs the same step from its own entrypoint, so it honours the switch too. Both compose files read the same `.env`.
 
-**How far the grants go on their own.** `audit_log` is refused all three wipe verbs, so its grants alone make it append-only. `tool_call_audit` has to keep `DELETE` for the pruner, so grants alone could not stop that credential emptying the table rather than pruning its aged tail. Migration `0032` closes the difference with database triggers: `UPDATE` and `TRUNCATE` are refused outright at any row age, and `DELETE` is refused for any row whose `called_at` is inside the last 30 days. The pruner is unaffected at its 90-day default, which is 60 days past that boundary. Setting `TOOL_AUDIT_RETENTION_DAYS` below 30 is the one configuration the trigger now overrules: the prune raises, the error is logged, and the rows survive.
+**How far the grants go on their own.** `audit_log` is refused all three wipe verbs, so its grants alone make it append-only. `tool_call_audit` and `gateway_events` both have to keep `DELETE` for their retention sweepers, so grants alone could not stop that credential emptying either table rather than pruning its aged tail. Migrations `0032` and `0031` close the difference with database triggers, identical on both: `UPDATE` and `TRUNCATE` are refused outright at any row age, and `DELETE` is refused for any row inside the last 30 days. Neither sweeper is affected at its 90-day default, which is 60 days past that boundary. Setting `TOOL_AUDIT_RETENTION_DAYS` below 30 is the one configuration a trigger now overrules: the prune raises, the error is logged, and the rows survive. (`GATEWAY_EVENTS_RETENTION_DAYS` cannot reach that state, because it is floor-clamped to 30 in the application.)
 
 **What none of this covers.** A superuser can still disable a trigger or set `session_replication_role`, and the owner of a table can disable its triggers. That break-glass path is left open on purpose, for a legal hold or a corrupted row, and using it is worth recording because at the database level it is indistinguishable from tampering. Enabling the split is what puts it out of the gateway's own reach: the runtime role is `NOSUPERUSER` and does not own these tables, so it holds neither lever.
 
@@ -290,7 +292,10 @@ One limit worth knowing: these controls are only asserted when bootstrap runs at
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOG_MAX_SIZE_MB` | `50` | In-container log-file rotation threshold. |
-| `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention (`0` = keep forever). Values below `30` do not shorten retention: migration `0032` makes rows undeletable inside a 30-day window, so the prune raises and logs instead. |
+| `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention (`0` = keep forever). Values below `30` do not shorten retention: migration `0032` makes rows undeletable inside a 30-day window, so the prune raises and the error is logged instead. |
+| `GATEWAY_EVENTS_RETENTION_DAYS` | `90` | `gateway_events` retention. Floor-clamped to 30 with a boot warning: rows are immutable for their first 30 days at the database level, so a lower value cannot take effect. There is no "keep forever" value. Reclaiming in-window space is a deliberate break-glass act, not a config change — see below. |
+
+**Break-glass on `gateway_events` and `tool_call_audit`.** Both carry the same 30-day window (migrations `0031` and `0032`), so the same rules apply to each. Nothing in the application can delete a row inside that window, and that includes the retention sweepers: a `DELETE` that touches even one in-window row raises, and the raise rolls back the entire statement, so a mixed-range prune reclaims nothing rather than partially succeeding. Reclaiming space early therefore requires a superuser at the database — `ALTER TABLE <table> DISABLE TRIGGER <table>_no_recent_delete`, or `SET session_replication_role = 'replica'` for the session — and re-enabling afterwards. Treat that as an audit-worthy act: it is the one operation that can remove evidence these tables exist to preserve, it leaves no trace in the table itself, and the ordinary answer to a full disk is to lower the retention variable toward its floor and wait for the window to pass.
 | `TOOLS_SWEEP_INTERVAL_SECONDS` | `60` | Periodic tool-definition drift sweep (`0` disables). |
 | `PUBLIC_SESSION_TTL_SECONDS` | `86400` (24h) | Idle-time TTL for public StreamableHTTP sessions before reap. |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `300` | Public-session sweeper interval (`0` disables). |

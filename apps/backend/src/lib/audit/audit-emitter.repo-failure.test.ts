@@ -212,6 +212,12 @@ describe("RBAC choke point with a failing audit_log", () => {
       getLogs: vi
         .fn()
         .mockResolvedValue({ success: true, data: [], totalCount: 0 }),
+      getHistory: vi.fn().mockResolvedValue({
+        success: true,
+        data: [],
+        nextCursor: null,
+        serverNames: [],
+      }),
     });
 
     await expect(
@@ -233,6 +239,12 @@ describe("RBAC choke point with a failing audit_log", () => {
       getLogs: vi
         .fn()
         .mockResolvedValue({ success: true, data: [], totalCount: 0 }),
+      getHistory: vi.fn().mockResolvedValue({
+        success: true,
+        data: [],
+        nextCursor: null,
+        serverNames: [],
+      }),
     });
 
     await expect(

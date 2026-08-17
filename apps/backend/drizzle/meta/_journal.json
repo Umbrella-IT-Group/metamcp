@@ -213,6 +213,13 @@
       "breakpoints": true
     },
     {
+      "idx": 31,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0031_gateway_events",
+      "breakpoints": true
+    },
+    {
       "idx": 32,
       "version": "7",
       "when": 1787184000000,
