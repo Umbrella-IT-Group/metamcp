@@ -32,10 +32,13 @@ services:
       # Postgres on a guessable credential.
       #
       # The message names `.devcontainer/.env`, not the repository root's
-      # `.env`, because compose interpolates against the compose file's own
-      # directory. `env_file: ../.env` below is a different mechanism — it
-      # passes the root file INTO the container and is not read for `${...}`
-      # substitution here — so the root `.env` alone does not satisfy this.
+      # `.env`, because by default compose resolves `.env` for `${...}`
+      # interpolation from the project directory, which defaults to the
+      # compose file's own folder (overridable via --project-directory or
+      # COMPOSE_ENV_FILES). `env_file: ../.env` below is a different
+      # mechanism — it passes the root file INTO the container and is not
+      # read for substitution here — so the root `.env` alone does not
+      # satisfy this by default.
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_USER: ${POSTGRES_USER:-metamcp_user}
