@@ -298,10 +298,10 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
       /\('public\.audit_log',\s+'UPDATE, DELETE, TRUNCATE'\)/,
     );
     // DELETE deliberately survives on tool_call_audit: its in-app pruner
-    // removes aged rows. Note this buys less than it looks like — that table
-    // carries no triggers yet, so the grant is unrestricted DELETE, not a
-    // prune. See the script's own comment; the age-gate trigger is a separate
-    // migration.
+    // removes aged rows. What bounds that grant is not this list but migration
+    // 0032's age-gated trigger, which refuses a DELETE of any row inside the
+    // last 30 days. The revokes here still matter for UPDATE and TRUNCATE,
+    // which a grant can stop before a trigger has to.
     expect(script).toMatch(
       /\('public\.tool_call_audit',\s+'UPDATE, TRUNCATE'\)/,
     );
@@ -346,7 +346,7 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
       "a migration added or removed an immutability trigger: update this " +
         "expected set, and make sure the table is in the REVOKE list in " +
         "scripts/ensure-runtime-role.sh",
-    ).toEqual(["audit_log"]);
+    ).toEqual(["audit_log", "tool_call_audit"]);
 
     for (const table of protectedTables) {
       expect(

@@ -147,7 +147,7 @@ role it authenticated as and whether that role is a superuser.
 |---|---|---|---|
 | Ordinary application tables | `SELECT, INSERT, UPDATE, DELETE` | `TRUNCATE`, DDL | The gateway's normal working set. |
 | `audit_log` | `SELECT, INSERT` | `UPDATE, DELETE, TRUNCATE` | Append-only. Nothing prunes it in-app; its retention is a deliberate ops-level act performed as the owner. |
-| `tool_call_audit` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | `DELETE` stays because the `TOOL_AUDIT_RETENTION_DAYS` pruner removes aged rows. See the note below — this table is **not** an immutable archive today. |
+| `tool_call_audit` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | `DELETE` stays because the `TOOL_AUDIT_RETENTION_DAYS` pruner removes aged rows, and migration `0032` narrows that `DELETE` to rows older than 30 days. See the note below. |
 | `drizzle` schema (migration journal) | nothing | everything | Never granted. A runtime role that can edit the journal can make a migration appear applied. |
 
 | Variable | Default | Purpose |
@@ -164,7 +164,9 @@ Cutover order:
 
 The dev stack (`docker-compose.dev.yml`) runs the same step from its own entrypoint, so it honours the switch too. Both compose files read the same `.env`.
 
-**What this does NOT cover.** Only `audit_log` currently has database triggers refusing mutation. `tool_call_audit` has none, so the `DELETE` the pruner needs is unrestricted — the runtime credential can empty that table, not merely prune its aged tail. Revoking `UPDATE` and `TRUNCATE` raises the cost of a rewrite and nothing more. The age-gated delete trigger that would make `DELETE` mean "prune" is a separate migration.
+**How far the grants go on their own.** `audit_log` is refused all three wipe verbs, so its grants alone make it append-only. `tool_call_audit` has to keep `DELETE` for the pruner, so grants alone could not stop that credential emptying the table rather than pruning its aged tail. Migration `0032` closes the difference with database triggers: `UPDATE` and `TRUNCATE` are refused outright at any row age, and `DELETE` is refused for any row whose `called_at` is inside the last 30 days. The pruner is unaffected at its 90-day default, which is 60 days past that boundary. Setting `TOOL_AUDIT_RETENTION_DAYS` below 30 is the one configuration the trigger now overrules: the prune raises, the error is logged, and the rows survive.
+
+**What none of this covers.** A superuser can still disable a trigger or set `session_replication_role`, and the owner of a table can disable its triggers. That break-glass path is left open on purpose, for a legal hold or a corrupted row, and using it is worth recording because at the database level it is indistinguishable from tampering. Enabling the split is what puts it out of the gateway's own reach: the runtime role is `NOSUPERUSER` and does not own these tables, so it holds neither lever.
 
 Leaving the variable unset is fully supported and changes nothing: the entrypoint step is
 skipped and the gateway connects with `DATABASE_URL` exactly as before.
@@ -288,7 +290,7 @@ One limit worth knowing: these controls are only asserted when bootstrap runs at
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOG_MAX_SIZE_MB` | `50` | In-container log-file rotation threshold. |
-| `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention (`0` = keep forever). |
+| `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention (`0` = keep forever). Values below `30` do not shorten retention: migration `0032` makes rows undeletable inside a 30-day window, so the prune raises and logs instead. |
 | `TOOLS_SWEEP_INTERVAL_SECONDS` | `60` | Periodic tool-definition drift sweep (`0` disables). |
 | `PUBLIC_SESSION_TTL_SECONDS` | `86400` (24h) | Idle-time TTL for public StreamableHTTP sessions before reap. |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `300` | Public-session sweeper interval (`0` disables). |

@@ -176,16 +176,16 @@ SELECT format(
 --                    rows past TOOL_AUDIT_RETENTION_DAYS, so DELETE has to
 --                    stay.
 --
---                    BE CLEAR ABOUT WHAT THAT COSTS. Unlike audit_log, this
---                    table carries NO triggers today — 0028 installed them on
---                    audit_log only. So a DELETE from the runtime credential
---                    is unrestricted: it can empty this table, not just prune
---                    the aged tail of it. Revoking UPDATE and TRUNCATE raises
---                    the cost of a rewrite and nothing more. The age-gated
---                    delete trigger that would make DELETE mean "prune" is
---                    queued as its own migration and is deliberately NOT in
---                    this change; until it lands, treat tool_call_audit as
---                    prunable-by-the-app, not as an immutable archive.
+--                    BE CLEAR ABOUT WHAT THE GRANT ALONE DOES. A granted
+--                    DELETE cannot distinguish "prune the aged tail" from
+--                    "empty the table", so the revokes here are not what
+--                    bounds it. Migration 0032 is: an age-gated BEFORE DELETE
+--                    trigger refuses any row whose called_at is inside the
+--                    last 30 days, and BEFORE UPDATE / BEFORE TRUNCATE
+--                    triggers refuse those verbs at any age. Revoking UPDATE
+--                    and TRUNCATE here is still worth doing, because a grant
+--                    stops the statement before the trigger has to, but the
+--                    30-day window is what makes DELETE mean "prune".
 --   gateway_events   Same grant shape as tool_call_audit, listed ahead of the
 --                    migration that creates it. `to_regclass IS NOT NULL`
 --                    below is the guard: an absent table is skipped, not an
