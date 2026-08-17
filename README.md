@@ -101,6 +101,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 - **`/health/upstream` rollup** — a health endpoint reporting per-backend reachability and pool config, truthful for down HTTP/SSE backends (which never trip the STDIO crash breaker).
 - **Live Logs with consumer identity + tool-call auditing** — the Live Logs view records connection, tool-call, client-session, and server events with categories and filters; every proxied `tools/call` is audited with the authenticated caller (API-key name or OAuth email), tool, backend, duration, and outcome. A persistent `tool_call_audit` table stores a hash of arguments (never the raw args) with configurable retention.
+- **Durable gateway event history** — the Live Logs page has a **History** mode backed by a persistent `gateway_events` table, so connection, client-session, server and system activity survives a restart instead of living only in a 2000-entry in-memory buffer. Browsable by time range, category, level, server, client and message substring, with keyset paging. Rows are **immutable for 30 days** at the database level (UPDATE and TRUNCATE are refused at any age; DELETE is refused inside the window), and age out after `GATEWAY_EVENTS_RETENTION_DAYS`.
 
 ### No-reboot tool updates
 
@@ -289,6 +290,9 @@ One limit worth knowing: these controls are only asserted when bootstrap runs at
 |---|---|---|
 | `LOG_MAX_SIZE_MB` | `50` | In-container log-file rotation threshold. |
 | `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention (`0` = keep forever). |
+| `GATEWAY_EVENTS_RETENTION_DAYS` | `90` | `gateway_events` retention. Floor-clamped to 30 with a boot warning: rows are immutable for their first 30 days at the database level, so a lower value cannot take effect. There is no "keep forever" value. Reclaiming in-window space is a deliberate break-glass act, not a config change — see below. |
+
+**Break-glass on `gateway_events`.** Nothing in the application can delete a row inside the 30-day window, and that includes the retention sweeper: a `DELETE` that touches even one in-window row raises, and the raise rolls back the entire statement, so a mixed-range prune reclaims nothing rather than partially succeeding. Reclaiming space early therefore requires a superuser at the database — `ALTER TABLE gateway_events DISABLE TRIGGER gateway_events_no_recent_delete`, or `SET session_replication_role = 'replica'` for the session — and re-enabling afterwards. Treat that as an audit-worthy act: it is the one operation that can remove evidence the table exists to preserve, it leaves no trace in `gateway_events` itself, and the ordinary answer to a full disk is to lower `GATEWAY_EVENTS_RETENTION_DAYS` and wait for the window to pass.
 | `TOOLS_SWEEP_INTERVAL_SECONDS` | `60` | Periodic tool-definition drift sweep (`0` disables). |
 | `PUBLIC_SESSION_TTL_SECONDS` | `86400` (24h) | Idle-time TTL for public StreamableHTTP sessions before reap. |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `300` | Public-session sweeper interval (`0` disables). |

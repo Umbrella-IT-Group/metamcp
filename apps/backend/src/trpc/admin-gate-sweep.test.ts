@@ -87,19 +87,31 @@ describe("tools.create / tools.sync — admin gate", () => {
  * TypeError, which is also what a typo in the test would produce.
  */
 describe("logs.clear — removed, not gated", () => {
-  // Shaped to satisfy GetLogsResponseSchema: `get` declares `.output()`, so a
-  // loose stub fails output validation rather than the gate under test.
+  // Shaped to satisfy the declared `.output()` schemas: both procedures declare
+  // one, so a loose stub fails output validation rather than the gate under
+  // test.
   const buildRouter = () =>
     createLogsRouter({
       getLogs: vi
         .fn()
         .mockResolvedValue({ success: true, data: [], totalCount: 0 }),
+      getHistory: vi.fn().mockResolvedValue({
+        success: true,
+        data: [],
+        nextCursor: null,
+        serverNames: [],
+      }),
     });
 
   it("the procedure does not exist on the router", () => {
     const procedures = buildRouter()._def.procedures;
 
-    expect(Object.keys(procedures)).toEqual(["get"]);
+    // The whole procedure map is asserted, not just `clear`'s absence: this is
+    // the router that used to carry a wipe, so any procedure appearing here
+    // should have to be named in a test rather than arriving unnoticed.
+    // `history` is the durable read added with migration 0031 — read-only, same
+    // admin gate as `get`.
+    expect(Object.keys(procedures).sort()).toEqual(["get", "history"]);
     expect("clear" in procedures).toBe(false);
   });
 
@@ -113,6 +125,20 @@ describe("logs.clear — removed, not gated", () => {
     await expect(router.createCaller(memberCtx).get({})).rejects.toMatchObject({
       code: "FORBIDDEN",
     });
+  });
+
+  it("logs.history carries the SAME admin gate as logs.get", async () => {
+    const router = buildRouter();
+
+    await expect(
+      router.createCaller(adminCtx).history({}),
+    ).resolves.toMatchObject({ success: true });
+
+    // The durable surface must not be a way around the gate on the live one —
+    // they render the same events.
+    await expect(
+      router.createCaller(memberCtx).history({}),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });
 

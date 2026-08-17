@@ -186,11 +186,21 @@ SELECT format(
 --                    queued as its own migration and is deliberately NOT in
 --                    this change; until it lands, treat tool_call_audit as
 --                    prunable-by-the-app, not as an immutable archive.
---   gateway_events   Same grant shape as tool_call_audit, listed ahead of the
---                    migration that creates it. `to_regclass IS NOT NULL`
---                    below is the guard: an absent table is skipped, not an
---                    error, so this script is correct both before and after
---                    that migration lands.
+--   gateway_events   INSERT + SELECT + DELETE, the same grant shape as
+--                    tool_call_audit but NOT the same exposure, and the
+--                    difference is the whole point of the shape. Migration
+--                    0031 gives this table BEFORE UPDATE / TRUNCATE triggers
+--                    that raise at any row age, plus a BEFORE DELETE trigger
+--                    that raises for anything younger than 30 days. So the
+--                    DELETE left standing here cannot empty the table the way
+--                    tool_call_audit's can: it reaches only the aged tail, and
+--                    a statement spanning the boundary rolls back whole rather
+--                    than partially succeeding. That is exactly the grant its
+--                    retention sweeper needs and nothing beyond it.
+--
+--                    `to_regclass IS NOT NULL` below remains the guard for a
+--                    database that has not run 0031 yet: an absent table is
+--                    skipped, not an error.
 --
 -- TRUNCATE is revoked even though it was never granted above. It is the third
 -- wipe verb, it does not fire row-level triggers, and an operator who ran an
