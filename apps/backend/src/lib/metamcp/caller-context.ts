@@ -1,7 +1,10 @@
 import type express from "express";
 
 import type { AuditRequestFields } from "@/lib/audit/audit-emitter";
-import { resolveClientIp } from "@/middleware/audit-context.middleware";
+// From `lib/client-ip`, not through the `audit-context.middleware` re-export:
+// this is a `lib/` module, and that file records why `lib/` importing
+// `middleware/` is the shape that becomes an import cycle.
+import { resolveClientIp } from "@/lib/client-ip";
 
 import type { CallerContext } from "./caller-context-store";
 import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middleware";
