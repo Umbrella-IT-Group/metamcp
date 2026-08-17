@@ -97,6 +97,40 @@ export const auth = betterAuth({
     },
   }),
   trustedOrigins,
+  // OFF EXPLICITLY, because it is currently off only by accident.
+  //
+  // better-auth defaults this to `enabled ?? isProduction`, so today the
+  // limiter is disabled purely because NODE_ENV is unset in the container.
+  // That makes a behaviour change hide inside an unrelated environment edit:
+  // the moment a deployment picks up `NODE_ENV=production` (which
+  // `example.env` ships on its first line), better-auth would silently start
+  // limiting every route under this handler at 100 requests per 10 seconds
+  // from an in-memory store, with nothing in this repository saying so.
+  //
+  // Silently is the problem, and the bucket is worse than the surprise. The
+  // key is `${ip}|${path}`, and better-auth resolves that ip from
+  // `x-forwarded-for` ONLY (its default `ipAddressHeaders`), never from
+  // `CF-Connecting-IP`. With no `trustedProxies` configured it accepts the
+  // header only when it holds exactly one entry, and behind this deployment's
+  // `client -> Cloudflare -> cloudflared -> Next.js rewrite -> express` chain
+  // it holds more than one, so the address resolves to null and the limiter
+  // falls back to the literal key `no-trusted-ip`. That is ONE shared bucket
+  // per path for every caller on the internet: 100 requests from any single
+  // source would refuse sign-in to everybody else for the rest of the window.
+  // An availability control an attacker can aim at other users is inverted,
+  // and it is the same defect that had to be fixed on this fork's own
+  // failed-auth limiter when it keyed on `req.ip`.
+  //
+  // These routes are already governed by limiters that resolve the caller
+  // correctly: `lib/auth-rate-limiter.ts` (failed-auth budget),
+  // `routers/oauth/utils.ts` (consent decisions) and
+  // `middleware/trpc-rate-limit.middleware.ts` all key on `CF-Connecting-IP`
+  // via `lib/client-ip`. Enabling this one would add a second, blunter
+  // limiter on top of them rather than cover a gap. Turning it on is
+  // therefore a deliberate act that has to come with per-caller keying
+  // (`advanced.ipAddress.ipAddressHeaders` / `trustedProxies`), not a
+  // side effect of setting NODE_ENV.
+  rateLimit: { enabled: false },
   plugins: [
     // Add generic OAuth plugin for OIDC support
     ...(oidcProviders.length > 0
