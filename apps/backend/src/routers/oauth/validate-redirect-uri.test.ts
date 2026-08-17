@@ -22,13 +22,22 @@
  * because the loopback interface is not reachable from off-box, which is not
  * true of `192.168.1.5`.
  *
+ * The last block drives the PAIR. `/oauth/authorize` runs this checker and
+ * then `isAllowedRedirectUri`, and only a URI both accept reaches a minted
+ * code — so "loopback is accepted here" is a claim about one gate, not about
+ * the endpoint, and the composed cases are what say which.
+ *
  * `NODE_ENV` is stubbed per test rather than set once at module scope so both
  * the production and the non-production expectations can live in one file.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { validateRedirectUri } from "./utils";
+import {
+  GATEWAY_INTERNAL_PORT,
+  isAllowedRedirectUri,
+  validateRedirectUri,
+} from "./utils";
 
 /**
  * The loopback shapes RFC 8252 §7.3 names: `localhost`, the IPv4 literal, and
@@ -121,19 +130,6 @@ describe("validateRedirectUri — what production still refuses", () => {
     expect(validateRedirectUri("")).toBe(false);
   });
 
-  it("still applies an explicit allowedHosts argument to a loopback URI", () => {
-    // The loopback exemption is from the NODE_ENV rules only. A caller that
-    // passes an explicit host list is stating the whole set of acceptable
-    // hosts, and loopback is not silently added to it.
-    vi.stubEnv("NODE_ENV", "production");
-    expect(
-      validateRedirectUri("http://localhost:54321/cb", ["example.com"]),
-    ).toBe(false);
-    expect(
-      validateRedirectUri("http://localhost:54321/cb", ["localhost"]),
-    ).toBe(true);
-  });
-
   it("does not treat a loopback label as loopback when it is a prefix or suffix", () => {
     // `localhost.evil.com` starts with a loopback label and `evil.localhost`
     // ends with one; neither is the loopback interface, so neither may inherit
@@ -147,5 +143,104 @@ describe("validateRedirectUri — what production still refuses", () => {
     ]) {
       expect(validateRedirectUri(`http://${host}/cb`)).toBe(false);
     }
+  });
+});
+
+describe("validateRedirectUri — the optional allowedHosts narrowing", () => {
+  it("still applies an explicit allowedHosts argument to a loopback URI", () => {
+    // The loopback exemption is from the NODE_ENV rules only. A caller that
+    // passes an explicit host list is stating the whole set of acceptable
+    // hosts, and loopback is not silently added to it.
+    vi.stubEnv("NODE_ENV", "production");
+    expect(
+      validateRedirectUri("http://localhost:54321/cb", ["example.com"]),
+    ).toBe(false);
+    expect(
+      validateRedirectUri("http://localhost:54321/cb", ["localhost"]),
+    ).toBe(true);
+  });
+
+  it("matches an IPv6 entry in either spelling", () => {
+    // The parser reports IPv6 hosts bracketed, so a raw comparison made the
+    // unbracketed `::1` — the spelling an operator would write, and the one
+    // LOOPBACK_HOSTNAMES uses — silently never match.
+    vi.stubEnv("NODE_ENV", "production");
+    for (const entry of ["::1", "[::1]"]) {
+      expect(validateRedirectUri("http://[::1]:9/cb", [entry])).toBe(true);
+    }
+    expect(validateRedirectUri("http://[::1]:9/cb", ["127.0.0.1"])).toBe(false);
+  });
+
+  it("normalises entry case and surrounding whitespace", () => {
+    // A raw comparison meant an uppercase entry matched nothing at all, since
+    // the parser lowercases the host it reports.
+    vi.stubEnv("NODE_ENV", "production");
+    for (const entry of ["EXAMPLE.COM", "  example.com  ", "Example.Com"]) {
+      expect(validateRedirectUri("https://example.com/cb", [entry])).toBe(true);
+    }
+  });
+
+  it("treats an EMPTY array as no restriction, unlike resolveDcrAllowedHosts", () => {
+    // Deliberate, and deliberately different from the sibling: an empty value
+    // for DCR_REDIRECT_URI_ALLOWED_HOSTS is documented as a configured
+    // "loopback only", whereas this parameter is an optional narrowing a
+    // caller opts into and an empty array is nothing opted into. The two are
+    // reached differently — the env is operator configuration, this is an
+    // argument — and no caller passes this one today. Pinned so the divergence
+    // is a decision on the record rather than something to be discovered.
+    vi.stubEnv("NODE_ENV", "production");
+    expect(validateRedirectUri("https://example.com/cb", [])).toBe(true);
+    expect(validateRedirectUri("http://127.0.0.1:8080/cb", [])).toBe(true);
+  });
+});
+
+describe("the composed authorize gate — both checkers in sequence", () => {
+  // `/oauth/authorize` runs validateRedirectUri and THEN isAllowedRedirectUri,
+  // so a URI reaches a minted code only if both accept it. Asserting the pair
+  // is what stops this change from being read as "loopback is now accepted at
+  // authorize" when the second gate still has the final say.
+
+  it("accepts a loopback callback through BOTH gates under production", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    for (const uri of LOOPBACK_URIS) {
+      expect(validateRedirectUri(uri)).toBe(true);
+      expect(isAllowedRedirectUri(uri)).toEqual({ ok: true });
+    }
+  });
+
+  it("lets the second gate refuse what the first one does not", () => {
+    // Both shapes pass validateRedirectUri — https, non-loopback, not a
+    // private range — and both are refused before a code is minted. This is
+    // the half of the pair that the loopback change must not weaken.
+    vi.stubEnv("NODE_ENV", "production");
+
+    const userinfo = "https://claude.ai@evil.example.com/cb";
+    expect(validateRedirectUri(userinfo)).toBe(true);
+    const userinfoCheck = isAllowedRedirectUri(userinfo);
+    expect(userinfoCheck.ok).toBe(false);
+    if (!userinfoCheck.ok) {
+      expect(userinfoCheck.reason).toBe("userinfo_present");
+    }
+
+    const offAllowlist = "https://evil.example.com/cb";
+    expect(validateRedirectUri(offAllowlist)).toBe(true);
+    const hostCheck = isAllowedRedirectUri(offAllowlist);
+    expect(hostCheck.ok).toBe(false);
+    if (!hostCheck.ok) {
+      expect(hostCheck.reason).toBe("host_not_allowed");
+    }
+  });
+
+  it("refuses the gateway's own loopback port at the second gate", () => {
+    // The one loopback shape the first gate now accepts and the second must
+    // not: nothing external listens on the gateway's internal port, so a
+    // redirect there is only ever the server being pointed at itself.
+    vi.stubEnv("NODE_ENV", "production");
+
+    const uri = `http://127.0.0.1:${GATEWAY_INTERNAL_PORT}/cb`;
+    expect(validateRedirectUri(uri)).toBe(true);
+    const check = isAllowedRedirectUri(uri);
+    expect(check.ok).toBe(false);
+    if (!check.ok) expect(check.reason).toBe("gateway_internal_port");
   });
 });

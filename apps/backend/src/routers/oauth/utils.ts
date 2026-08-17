@@ -69,12 +69,18 @@ export function generateSecureClientSecret(): string {
  * STILL LIVE AT `/oauth/authorize`, where it now runs ALONGSIDE
  * `isAllowedRedirectUri` rather than instead of it. The follow-up this comment
  * used to describe (apply the strict checker at authorize too, once the stored
- * rows had been verified clean) has landed; this one is kept because it is not
- * a subset of the other. It carries the production-only rules — HTTPS required
- * and RFC 1918 hosts refused when NODE_ENV is `production` — that the
- * registration-time checker deliberately does not have. Dropping it in favour
- * of the newer checker would therefore have OPENED something at authorize,
- * which is the wrong direction for a hardening change.
+ * rows had been verified clean) has landed.
+ *
+ * WHAT IS LEFT OF IT, EXACTLY — because under the default configuration it is
+ * now very nearly a subset of the other, and a future cleanup will want to
+ * know what would actually be lost by deleting it. Its scheme rule is
+ * subsumed: `isAllowedRedirectUri` already refuses plain http on a
+ * non-loopback host in EVERY environment, so nothing this one refuses on
+ * scheme grounds survives the other. The ONE surviving delta is the RFC 1918
+ * refusal under NODE_ENV=`production`, and it only ever binds when an operator
+ * has put a private-range host into DCR_REDIRECT_URI_ALLOWED_HOSTS: with the
+ * default allowlist the other checker refuses `192.168.x` as host_not_allowed
+ * anyway. That narrow case is the whole reason this function is still called.
  */
 export function validateRedirectUri(
   uri: string,
@@ -95,14 +101,16 @@ export function validateRedirectUri(
     const hostname = parsedUri.hostname.replace(/^\[|\]$/g, "").toLowerCase();
     const isLoopback = LOOPBACK_HOSTNAMES.has(hostname);
 
-    // Production requires HTTPS — EXCEPT on loopback, in every environment.
+    // Production requires HTTPS. Loopback is exempt from that requirement,
+    // and the exemption itself is unconditional — it holds in every
+    // environment, because it is a property of the host and not of NODE_ENV.
+    //
     // RFC 8252 §7.3 has a native app receive its authorization code on
     // `http://127.0.0.1:<ephemeral>`: plain http, on a port the OS assigns at
     // runtime, because an installed client has no other loopback shape
     // available to it. Refusing that hardens nothing reachable from the
     // network — the loopback interface is not routable off-box — it only
-    // removes the sole redirect such a client can offer, so the rule is tied
-    // to the host rather than to NODE_ENV.
+    // removes the sole redirect such a client can offer.
     if (
       process.env.NODE_ENV === "production" &&
       !isLoopback &&
@@ -124,9 +132,27 @@ export function validateRedirectUri(
       }
     }
 
-    // Check against allowed hosts if provided
+    // Check against allowed hosts if provided.
+    //
+    // Both sides are normalised the same way the loopback test above is, and
+    // for the same reason: a raw comparison silently failed whenever the two
+    // spellings differed, so `["::1"]` never matched `http://[::1]/` (the
+    // parser reports the host bracketed) and `["EXAMPLE.COM"]` never matched
+    // anything at all. Entries are bracket-stripped as well as trimmed and
+    // lowercased, so an operator may write an IPv6 host either way.
+    //
+    // An EMPTY array still means "no restriction", unlike
+    // `resolveDcrAllowedHosts`, where empty is a configured "loopback only".
+    // The two disagree because they are reached differently: this parameter is
+    // an optional narrowing a caller opts into, and no caller passes it today.
     if (allowedHosts && allowedHosts.length > 0) {
-      return allowedHosts.includes(parsedUri.hostname);
+      const normalisedAllowedHosts = allowedHosts.map((host) =>
+        host
+          .trim()
+          .toLowerCase()
+          .replace(/^\[|\]$/g, ""),
+      );
+      return normalisedAllowedHosts.includes(hostname);
     }
 
     return true;
