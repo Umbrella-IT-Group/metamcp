@@ -114,6 +114,28 @@ describe("example.env ships no usable credential", () => {
     );
   });
 
+  // Same pin for the compose files: their inline `${POSTGRES_PASSWORD:-...}`
+  // fallback is what actually booted real deployments on the published
+  // default, and an upstream cherry-pick is exactly the kind of change that
+  // silently re-introduces it.
+  it.each([
+    "docker-compose.yml",
+    "docker-compose.dev.yml",
+    "docker-compose.test.yml",
+    ".devcontainer/docker-compose.yml",
+  ])("%s carries no POSTGRES_PASSWORD fallback default", (composeFile) => {
+    const compose = readFileSync(
+      path.resolve(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "../../../..",
+        composeFile,
+      ),
+      "utf-8",
+    );
+    expect(compose).not.toContain("m3t4mcp");
+    expect(compose).not.toContain("POSTGRES_PASSWORD:-");
+  });
+
   it("documents the unauthenticated-endpoint flag as off by default", () => {
     expect(exampleEnv).toContain("# ALLOW_UNAUTHENTICATED_ENDPOINTS=false");
   });
