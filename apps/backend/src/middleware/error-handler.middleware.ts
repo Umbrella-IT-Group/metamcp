@@ -13,12 +13,17 @@ import logger from "@/utils/logger";
  * `packages/trpc/src/trpc.ts` or the backend's own) was on that path, and
  * nothing else was: the response was written by Express's built-in final
  * handler, which serialises `err.stack` whenever NODE_ENV is not
- * "production". Nothing in this image or its compose files ever sets
- * NODE_ENV, so that branch was always live. What an unauthenticated caller
- * got was absolute `/app/...` container paths, the pnpm store layout with
- * exact dependency names AND versions (`body-parser`, `raw-body`, …) and
- * node internals — a free dependency inventory to match against advisories,
- * from one request with no credentials.
+ * "production". This image and its compose files set no NODE_ENV of their
+ * own, though both compose files pass the whole `.env` in through
+ * `env_file:` and `example.env` ships `NODE_ENV=production` on its first
+ * line, so that branch is live on any deployment whose `.env` lacks the
+ * line and dead on one that kept it. Where it was live, what an
+ * unauthenticated caller got was absolute `/app/...` container paths, the
+ * pnpm store layout with exact dependency names AND versions
+ * (`body-parser`, `raw-body`, …) and node internals: a free dependency
+ * inventory to match against advisories, from one request with no
+ * credentials. This handler does not read the variable at all, so the same
+ * response goes out either way.
  *
  * Two failure classes, two constant bodies, no error text ever echoed:
  *
