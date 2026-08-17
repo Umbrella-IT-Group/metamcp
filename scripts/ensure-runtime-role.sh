@@ -32,21 +32,38 @@
 
 set -eu
 
-RUNTIME_ROLE="${METAMCP_RUNTIME_DB_ROLE:-metamcp_runtime}"
+# Blank means UNSET, matching `db/runtime-connection.ts` exactly.
+#
+# The two must agree or they disagree in a dangerous direction. The TS resolver
+# treats a whitespace-only value as unset (so the app keeps DATABASE_URL); if
+# this script instead accepted those spaces as a real password it would report
+# a converged role while the app served every request as the superuser — and
+# the reverse, a whitespace-only role name, creates a role literally named with
+# spaces that nothing ever connects as. Both were reachable before this gate.
+is_blank() {
+    case "$1" in
+        *[![:space:]]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
-if [ -z "${DATABASE_URL:-}" ]; then
+if [ -z "${DATABASE_URL:-}" ] || is_blank "${DATABASE_URL:-}"; then
     echo "ensure-runtime-role: DATABASE_URL is not set" >&2
     exit 1
 fi
 
-if [ -z "${METAMCP_RUNTIME_DB_PASSWORD:-}" ]; then
+if [ -z "${METAMCP_RUNTIME_DB_PASSWORD:-}" ] || is_blank "${METAMCP_RUNTIME_DB_PASSWORD:-}"; then
     echo "ensure-runtime-role: METAMCP_RUNTIME_DB_PASSWORD is not set" >&2
     exit 1
 fi
 
-if [ -z "$RUNTIME_ROLE" ]; then
-    echo "ensure-runtime-role: METAMCP_RUNTIME_DB_ROLE is empty" >&2
-    exit 1
+# Blank role name falls back to the default rather than erroring: that is what
+# the resolver does with the same input, and the two have to agree on which
+# role the app will dial.
+if is_blank "${METAMCP_RUNTIME_DB_ROLE:-}"; then
+    RUNTIME_ROLE="metamcp_runtime"
+else
+    RUNTIME_ROLE="$METAMCP_RUNTIME_DB_ROLE"
 fi
 
 echo "ensure-runtime-role: converging role '${RUNTIME_ROLE}'..."
@@ -67,6 +84,24 @@ psql "$DATABASE_URL" \
     -v runtime_role="$RUNTIME_ROLE" \
     -v runtime_password="$METAMCP_RUNTIME_DB_PASSWORD" \
     <<'SQL'
+-- FIRST statement, and it has to be first.
+--
+-- The CREATE below is a check-then-act: `WHERE NOT EXISTS (SELECT 1 FROM
+-- pg_roles ...)` is evaluated, and only then is CREATE ROLE executed. Two
+-- containers booting at once — a rolling restart, a replica set, a compose
+-- stack coming up after a host reboot — both see "absent" and both run the
+-- CREATE; the loser gets `role already exists`, ON_ERROR_STOP turns that into
+-- a non-zero exit, and docker-entrypoint.sh treats a non-zero exit as fatal.
+-- So the race does not corrupt anything, it just refuses to start a container
+-- for a reason that has nothing to do with that container. Reproduced.
+--
+-- A session-level advisory lock serialises the whole script instead. It is
+-- released when psql disconnects, including on a crash, so there is no stuck
+-- lock to clean up. `hashtext` of a fixed string keeps the key derived from
+-- something readable rather than a magic integer.
+SELECT pg_advisory_lock(hashtext('metamcp.ensure_runtime_role'))
+\gset _lock_
+
 -- `\gexec` rather than a DO block for every statement that needs a psql
 -- variable: psql does NOT interpolate :vars inside dollar-quoted strings, so
 -- `DO $$ ... :'runtime_role' ... $$` would send the literal text `:'runtime_role'`
@@ -139,11 +174,19 @@ SELECT format(
 --                    the owner, not something the gateway credential can do.
 --   tool_call_audit  INSERT + SELECT + DELETE. Its in-app pruner hard-deletes
 --                    rows past TOOL_AUDIT_RETENTION_DAYS, so DELETE has to
---                    stay. In-window immutability is carried by UPDATE being
---                    revoked plus the table's own triggers — which a
---                    NOSUPERUSER role can no longer bypass, and that is the
---                    entire point of this script.
---   gateway_events   Same shape as tool_call_audit, listed ahead of the
+--                    stay.
+--
+--                    BE CLEAR ABOUT WHAT THAT COSTS. Unlike audit_log, this
+--                    table carries NO triggers today — 0028 installed them on
+--                    audit_log only. So a DELETE from the runtime credential
+--                    is unrestricted: it can empty this table, not just prune
+--                    the aged tail of it. Revoking UPDATE and TRUNCATE raises
+--                    the cost of a rewrite and nothing more. The age-gated
+--                    delete trigger that would make DELETE mean "prune" is
+--                    queued as its own migration and is deliberately NOT in
+--                    this change; until it lands, treat tool_call_audit as
+--                    prunable-by-the-app, not as an immutable archive.
+--   gateway_events   Same grant shape as tool_call_audit, listed ahead of the
 --                    migration that creates it. `to_regclass IS NOT NULL`
 --                    below is the guard: an absent table is skipped, not an
 --                    error, so this script is correct both before and after

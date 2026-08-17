@@ -51,9 +51,16 @@ run_migrations() {
 # is fatal on purpose: the alternative is booting with the superuser credential
 # while the operator believes the split is on.
 ensure_runtime_role() {
-    if [ -z "${METAMCP_RUNTIME_DB_PASSWORD:-}" ]; then
-        return 0
-    fi
+    # Blank means UNSET, the same rule `db/runtime-connection.ts` applies. A
+    # whitespace-only value has to skip the step rather than enter it: the app
+    # will treat it as unset and keep DATABASE_URL, so converging a role here
+    # would grant privileges nothing uses, and letting the script refuse it
+    # would kill the container over a value the app is perfectly happy to
+    # ignore. Both sides agree that blank is off.
+    case "${METAMCP_RUNTIME_DB_PASSWORD:-}" in
+        *[![:space:]]*) ;;
+        *) return 0 ;;
+    esac
 
     if [ ! -x /app/scripts/ensure-runtime-role.sh ]; then
         echo "❌ METAMCP_RUNTIME_DB_PASSWORD is set but /app/scripts/ensure-runtime-role.sh is missing! Exiting..."

@@ -118,6 +118,24 @@ export function resolveRuntimeConnection(
     );
   }
 
+  // A host-less URL makes the swap below a SILENT NO-OP, so it is refused here
+  // rather than discovered later. `postgres:///db?host=/var/run/postgresql` is
+  // a form libpq accepts (unix socket in the query string), and for it WHATWG
+  // `URL` reports `host === ""` — which makes the `username`/`password` setters
+  // return without doing anything. The owner's connection string would come
+  // back byte-identical while `mode` said "derived", the entrypoint would print
+  // success, and the gateway would serve every request as the superuser with
+  // nothing anywhere saying so. That is the exact failure this whole module
+  // exists to prevent, so it is an error, not a fallback.
+  if (!url.host) {
+    throw new Error(
+      "METAMCP_RUNTIME_DB_PASSWORD is set but DATABASE_URL has no host " +
+        "(a socket-style URL such as postgres:///db?host=/var/run/postgresql); " +
+        "the runtime credentials cannot be substituted into it — " +
+        "set RUNTIME_DATABASE_URL explicitly instead",
+    );
+  }
+
   url.username = encodeURIComponent(role);
   url.password = encodeURIComponent(password);
 

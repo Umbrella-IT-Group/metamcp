@@ -147,7 +147,7 @@ role it authenticated as and whether that role is a superuser.
 |---|---|---|---|
 | Ordinary application tables | `SELECT, INSERT, UPDATE, DELETE` | `TRUNCATE`, DDL | The gateway's normal working set. |
 | `audit_log` | `SELECT, INSERT` | `UPDATE, DELETE, TRUNCATE` | Append-only. Nothing prunes it in-app; its retention is a deliberate ops-level act performed as the owner. |
-| `tool_call_audit` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | `DELETE` stays because the `TOOL_AUDIT_RETENTION_DAYS` pruner removes aged rows. In-window immutability is carried by the table's triggers — which a `NOSUPERUSER` role can no longer bypass. |
+| `tool_call_audit` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | `DELETE` stays because the `TOOL_AUDIT_RETENTION_DAYS` pruner removes aged rows. See the note below — this table is **not** an immutable archive today. |
 | `drizzle` schema (migration journal) | nothing | everything | Never granted. A runtime role that can edit the journal can make a migration appear applied. |
 
 | Variable | Default | Purpose |
@@ -160,7 +160,11 @@ Cutover order:
 
 1. Set `METAMCP_RUNTIME_DB_PASSWORD` in `.env` to a strong value.
 2. `docker compose up -d` (a recreate, not a restart — the variable has to reach the entrypoint).
-3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool. A `rolsuper=true` warning there means the split did not take.
+3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool. The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential` — that means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
+
+The dev stack (`docker-compose.dev.yml`) runs the same step from its own entrypoint, so it honours the switch too. Both compose files read the same `.env`.
+
+**What this does NOT cover.** Only `audit_log` currently has database triggers refusing mutation. `tool_call_audit` has none, so the `DELETE` the pruner needs is unrestricted — the runtime credential can empty that table, not merely prune its aged tail. Revoking `UPDATE` and `TRUNCATE` raises the cost of a rewrite and nothing more. The age-gated delete trigger that would make `DELETE` mean "prune" is a separate migration.
 
 Leaving the variable unset is fully supported and changes nothing: the entrypoint step is
 skipped and the gateway connects with `DATABASE_URL` exactly as before.

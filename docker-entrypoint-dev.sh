@@ -68,6 +68,33 @@ echo "🛠 Running database migrations (dev)..."
     fi
 )
 
+# Converge the optional NOSUPERUSER runtime role — same step, same script and
+# same ordering (after migrations, before the servers) as the production
+# entrypoint.
+#
+# This exists because the dev compose reads the SAME .env as the production
+# one. Without it, an operator who sets METAMCP_RUNTIME_DB_PASSWORD and then
+# brings up the dev stack gets an app dialling a role that was never created,
+# and the only symptom is a password-authentication failure that points at
+# nothing. Unset, this is a no-op and dev behaves exactly as before.
+#
+# scripts/ is present without a COPY: docker-compose.dev.yml bind-mounts the
+# repository at /app for hot reload.
+# Blank means UNSET, matching db/runtime-connection.ts and the production
+# entrypoint: a whitespace-only value skips the step, because the app will
+# treat it as unset too.
+case "${METAMCP_RUNTIME_DB_PASSWORD:-}" in
+  *[![:space:]]*)
+    echo "🔐 Ensuring runtime database role (dev)..."
+    if /app/scripts/ensure-runtime-role.sh; then
+        echo "✅ Runtime database role ready"
+    else
+        echo "❌ Failed to converge the runtime database role. See logs above."
+        exit 1
+    fi
+    ;;
+esac
+
 # Start the development servers with proper signal handling
 echo "🚀 Starting pnpm dev with turborepo..."
 echo "💡 This will start both frontend and backend in development mode"

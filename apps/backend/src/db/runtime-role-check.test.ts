@@ -35,6 +35,38 @@ let checkModule: CheckModule;
 let dbModule: DbModule;
 let auditDbModule: AuditDbModule;
 
+/**
+ * Runs `body` with the audit sink redirected into an array, and returns what
+ * was written. `emit()` is fire-and-forget, so the macrotask turn is what lets
+ * the detached write land — the same `flush` idiom the emitter's own suites
+ * use.
+ */
+async function captureEmissions(
+  body: () => Promise<void>,
+): Promise<CapturedEvent[]> {
+  const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
+  const rows: CapturedEvent[] = [];
+  setAuditSinkForTesting(async (event) => {
+    rows.push(event as CapturedEvent);
+  });
+  try {
+    await body();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    setAuditSinkForTesting(undefined);
+  }
+  return rows;
+}
+
+interface CapturedEvent {
+  actor_type: string;
+  action: string;
+  outcome: string;
+  target_type?: string | null;
+  target_id?: string | null;
+  detail?: Record<string, unknown>;
+}
+
 /** Replaces both pools' `query` with a canned `SELECT current_user` answer. */
 function stubPools(answer: { current_user: string; is_superuser: boolean }) {
   const stub = vi.fn(async () => ({ rows: [answer] }));
@@ -95,15 +127,111 @@ describe("verifyRuntimeDatabaseRole", () => {
   it("WARNS when the runtime connection turns out to be a superuser", async () => {
     const logger = (await import("@/utils/logger")).default;
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
-    stubPools({ current_user: "postgres", is_superuser: true });
+    stubPools({ current_user: "metamcp_runtime", is_superuser: true });
 
     await checkModule.verifyRuntimeDatabaseRole();
 
     expect(warn).toHaveBeenCalledTimes(2);
-    expect(String(warn.mock.calls[0][0])).toMatch(/IS a SUPERUSER/);
+    expect(String(warn.mock.calls[0][0])).toMatch(/rolsuper=true/);
     // The consequence is named, not just the fact — the log line has to be
-    // actionable to someone who did not write this file.
-    expect(String(warn.mock.calls[0][0])).toMatch(/bypassable/);
+    // actionable to someone who did not write this file, and the README
+    // quotes this wording as the failure to look for.
+    expect(String(warn.mock.calls[0][0])).toMatch(
+      /remain bypassable by this credential/,
+    );
+  });
+
+  it("records the failed split in audit_log, not only in the boot log", async () => {
+    // A WARN is seen by whoever is watching that container at that minute.
+    // The audit row is what makes "was the split ever effective?" a query, and
+    // what an alert can fire on.
+    const emitted = await captureEmissions(async () => {
+      vi.spyOn(
+        (await import("@/utils/logger")).default,
+        "warn",
+      ).mockImplementation(() => {});
+      stubPools({ current_user: "metamcp_runtime", is_superuser: true });
+      await checkModule.verifyRuntimeDatabaseRole();
+    });
+
+    // One per pool: both credentials are independently wrong here.
+    expect(emitted).toHaveLength(2);
+    for (const event of emitted) {
+      expect(event.action).toBe(checkModule.RUNTIME_SPLIT_INEFFECTIVE_ACTION);
+      expect(event.actor_type).toBe("system");
+      expect(event.outcome).toBe("failure");
+      expect(event.detail).toMatchObject({ reason: "superuser" });
+    }
+    expect(emitted.map((e) => e.detail?.pool).sort()).toEqual([
+      "audit pool",
+      "main pool",
+    ]);
+  });
+
+  it("emits nothing when the split IS effective", async () => {
+    // The row has to mean something. Emitting on the healthy path would make
+    // any alert built on it useless.
+    const emitted = await captureEmissions(async () => {
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      stubPools({ current_user: "metamcp_runtime", is_superuser: false });
+      await checkModule.verifyRuntimeDatabaseRole();
+    });
+
+    expect(emitted).toHaveLength(0);
+  });
+
+  it("reports BOTH faults when the connection is a superuser AND the wrong role", async () => {
+    // The likeliest way to get here is pointing the runtime at the owner
+    // string, which is wrong in both ways at once. An early return on the
+    // superuser branch would report one and hide the other.
+    const logger = (await import("@/utils/logger")).default;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const emitted = await captureEmissions(async () => {
+      stubPools({ current_user: "metamcp_user", is_superuser: true });
+      await checkModule.verifyRuntimeDatabaseRole();
+    });
+
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    expect(messages.filter((m) => /rolsuper=true/.test(m))).toHaveLength(2);
+    expect(messages.filter((m) => /expected role/.test(m))).toHaveLength(2);
+
+    const reasons = emitted.map((e) => e.detail?.reason).sort();
+    expect(reasons).toEqual([
+      "role_mismatch",
+      "role_mismatch",
+      "superuser",
+      "superuser",
+    ]);
+  });
+
+  it("still reports the healthy pool when the other pool's query fails", async () => {
+    // `Promise.all` would discard the good answer with the bad one, and the
+    // pool likeliest to fail is the audit pool (max: 2, 1s checkout timeout).
+    // The boot log would then carry one generic error instead of the privilege
+    // facts this check exists to report.
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const logger = (await import("@/utils/logger")).default;
+    const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+    (dbModule.pool as unknown as { query: unknown }).query = vi.fn(
+      async () => ({
+        rows: [{ current_user: "metamcp_runtime", is_superuser: false }],
+      }),
+    );
+    (auditDbModule.auditPool as unknown as { query: unknown }).query = vi.fn(
+      async () => {
+        throw new Error("timeout exceeded when trying to connect");
+      },
+    );
+
+    await checkModule.verifyRuntimeDatabaseRole();
+
+    expect(
+      log.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => /main pool/.test(l)),
+    ).toHaveLength(1);
+    expect(String(error.mock.calls[0][0])).toMatch(/audit pool/);
   });
 
   it("says so, and queries nothing, when no runtime role is configured", async () => {

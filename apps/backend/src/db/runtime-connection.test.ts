@@ -27,7 +27,8 @@ import {
   resolveRuntimeConnection,
 } from "./runtime-connection";
 
-const OWNER_URL = "postgresql://metamcp_user:m3t4mcp@postgres:5432/metamcp_db";
+const OWNER_URL =
+  "postgresql://metamcp_user:owner-pw-fixture@postgres:5432/metamcp_db";
 
 describe("resolveRuntimeConnection — unconfigured", () => {
   it("returns DATABASE_URL untouched when neither variable is set", () => {
@@ -63,7 +64,7 @@ describe("resolveRuntimeConnection — derived", () => {
   it("swaps only the credentials, preserving host, port, database and options", () => {
     const resolved = resolveRuntimeConnection({
       DATABASE_URL:
-        "postgresql://metamcp_user:m3t4mcp@db.internal:6432/metamcp_db?sslmode=require&application_name=gw",
+        "postgresql://metamcp_user:owner-pw-fixture@db.internal:6432/metamcp_db?sslmode=require&application_name=gw",
       METAMCP_RUNTIME_DB_PASSWORD: "runtime-secret",
     });
 
@@ -168,6 +169,51 @@ describe("resolveRuntimeConnection — derived", () => {
       }),
     ).toThrow(/not a parseable URL/);
   });
+
+  /**
+   * The nastiest shape this module can be handed, because it parses fine.
+   *
+   * `postgres:///db?host=/var/run/postgresql` is a URL libpq accepts (unix
+   * socket named in the query string), and WHATWG `URL` reports `host === ""`
+   * for it — which makes the `username`/`password` setters silently return
+   * without doing anything. Left unguarded, the OWNER string comes back byte
+   * for byte, `mode` still says "derived", the entrypoint prints success, and
+   * the gateway serves every request as the superuser. Nothing anywhere is
+   * wrong-looking. That is precisely the outcome this module exists to make
+   * impossible, so it must be an error and never a fallback.
+   */
+  it.each([
+    "postgres:///metamcp_db?host=/var/run/postgresql",
+    "postgresql:///metamcp_db",
+  ])("refuses the host-less DATABASE_URL %j instead of no-op'ing", (url) => {
+    let thrown: unknown;
+    try {
+      resolveRuntimeConnection({
+        DATABASE_URL: url,
+        METAMCP_RUNTIME_DB_PASSWORD: "runtime-secret",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/has no host/);
+    // Names the way out, not just the problem.
+    expect((thrown as Error).message).toMatch(/RUNTIME_DATABASE_URL/);
+  });
+
+  it("proves the guard is load-bearing: the swap really is a no-op there", () => {
+    // Pins the underlying platform behaviour the guard exists for. If a future
+    // Node made the setters work on a host-less URL, this fails and the guard
+    // can be revisited deliberately rather than left as cargo cult.
+    const url = new URL("postgres:///metamcp_db?host=/var/run/postgresql");
+    const before = url.toString();
+    url.username = "metamcp_runtime";
+    url.password = "runtime-secret";
+
+    expect(url.host).toBe("");
+    expect(url.toString()).toBe(before);
+  });
 });
 
 describe("resolveRuntimeConnection — explicit", () => {
@@ -198,18 +244,64 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
   it("agrees with the resolver on the default role name", () => {
     // A disagreement means the entrypoint grants one role and the app dials
     // another, and the only symptom is an authentication failure at boot.
-    expect(script).toContain(
-      `METAMCP_RUNTIME_DB_ROLE:-${DEFAULT_RUNTIME_DB_ROLE}`,
-    );
+    expect(script).toContain(`RUNTIME_ROLE="${DEFAULT_RUNTIME_DB_ROLE}"`);
   });
 
-  it("keeps audit_log append-only and leaves the pruners able to prune", () => {
+  it("applies the same empty-means-unset rule the resolver applies", () => {
+    // A whitespace-only value read as REAL by one side and as UNSET by the
+    // other is the dangerous disagreement: the script reports a converged role
+    // while the app keeps DATABASE_URL and serves every request as the
+    // superuser.
+    expect(script).toContain("is_blank()");
+    expect(script).toMatch(/is_blank "\$\{METAMCP_RUNTIME_DB_PASSWORD:-\}"/);
+    expect(script).toMatch(/is_blank "\$\{METAMCP_RUNTIME_DB_ROLE:-\}"/);
+  });
+
+  it.each([
+    ["docker-entrypoint.sh", "../../../../docker-entrypoint.sh"],
+    ["docker-entrypoint-dev.sh", "../../../../docker-entrypoint-dev.sh"],
+  ])(
+    "%s gates the step on the same blank-means-unset rule, and calls the shared script",
+    (_name, relative) => {
+      // Both entrypoints have to skip on a whitespace-only value rather than
+      // invoke the script with it: the script refuses such a value (correctly,
+      // it should never be called that way), and a `-n` gate would turn a
+      // value the APP happily ignores into a container that will not start.
+      const entrypoint = readFileSync(
+        path.resolve(__dirname, relative),
+        "utf8",
+      );
+
+      expect(entrypoint).toMatch(
+        /case "\$\{METAMCP_RUNTIME_DB_PASSWORD:-\}" in/,
+      );
+      expect(entrypoint).toContain("*[![:space:]]*)");
+      // The dev stack reads the same .env as production, so it has to run the
+      // same step or an operator who flips the switch gets an app dialling a
+      // role nothing created.
+      expect(entrypoint).toContain("/app/scripts/ensure-runtime-role.sh");
+    },
+  );
+
+  it("serialises itself so concurrent boots cannot race the CREATE ROLE", () => {
+    // The CREATE is a check-then-act; two containers starting together both
+    // see "absent" and the loser exits non-zero, which the entrypoint treats
+    // as fatal. The lock has to be taken before the first \gexec.
+    const lockAt = script.indexOf("pg_advisory_lock");
+    const createAt = script.indexOf("CREATE ROLE %I");
+    expect(lockAt).toBeGreaterThan(-1);
+    expect(lockAt).toBeLessThan(createAt);
+  });
+
+  it("keeps audit_log append-only and leaves the pruner able to prune", () => {
     expect(script).toMatch(
       /\('public\.audit_log',\s+'UPDATE, DELETE, TRUNCATE'\)/,
     );
-    // DELETE deliberately survives on the pruned tables: their in-app pruners
-    // remove aged rows. In-window immutability there is the triggers' job,
-    // and a NOSUPERUSER role can no longer bypass those.
+    // DELETE deliberately survives on tool_call_audit: its in-app pruner
+    // removes aged rows. Note this buys less than it looks like — that table
+    // carries no triggers yet, so the grant is unrestricted DELETE, not a
+    // prune. See the script's own comment; the age-gate trigger is a separate
+    // migration.
     expect(script).toMatch(
       /\('public\.tool_call_audit',\s+'UPDATE, TRUNCATE'\)/,
     );
@@ -219,11 +311,12 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
   });
 
   it("names every table that a migration protects with an immutability trigger", () => {
-    // The rule this enforces: if a migration installs a BEFORE
-    // UPDATE/DELETE/TRUNCATE trigger on a table, that table is an audit table,
-    // and the runtime role must not be left holding the grants the trigger is
-    // there to refuse. Without this, `ALTER DEFAULT PRIVILEGES` hands full DML
-    // on the next such table to the runtime role and nothing says so.
+    // The rule this enforces: if a migration installs a row- or
+    // statement-level trigger that guards a table against mutation, that table
+    // is an audit table, and the runtime role must not be left holding the
+    // grants the trigger is there to refuse. Without this, `ALTER DEFAULT
+    // PRIVILEGES` hands full DML on the next such table to the runtime role
+    // and nothing says so.
     const migrationDir = path.resolve(__dirname, "../../drizzle");
     const protectedTables = new Set<string>();
 
@@ -231,16 +324,29 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
       f.endsWith(".sql"),
     )) {
       const sql = readFileSync(path.join(migrationDir, file), "utf8");
+      // Deliberately wide. The first version of this walker matched only
+      // `CREATE TRIGGER <name> BEFORE <one verb> ON <bare name>`, which misses
+      // `CREATE OR REPLACE TRIGGER`, the multi-event `BEFORE UPDATE OR DELETE`
+      // form, AFTER triggers, and a schema-qualified target — every one of
+      // which is a perfectly ordinary way to write the next audit table's
+      // guard, and every one of which would have made this test pass while
+      // the table went unlisted.
       for (const match of sql.matchAll(
-        /CREATE TRIGGER\s+\w+\s+BEFORE\s+(?:UPDATE|DELETE|TRUNCATE)\s+ON\s+"?(\w+)"?/gi,
+        /CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+\w+\s+(?:BEFORE|AFTER|INSTEAD\s+OF)[^;]*?\bON\s+(?:"?public"?\.)?"?(\w+)"?/gi,
       )) {
         protectedTables.add(match[1]);
       }
     }
 
-    // Guards the guard: a regex that stopped matching would make this test
-    // vacuously green.
-    expect(protectedTables.size).toBeGreaterThan(0);
+    // An explicit expected set, not `size > 0`. A count assertion goes green
+    // for the WRONG set as easily as the right one — including a walker that
+    // regressed to finding one table when the repository has three.
+    expect(
+      [...protectedTables].sort(),
+      "a migration added or removed an immutability trigger: update this " +
+        "expected set, and make sure the table is in the REVOKE list in " +
+        "scripts/ensure-runtime-role.sh",
+    ).toEqual(["audit_log"]);
 
     for (const table of protectedTables) {
       expect(
