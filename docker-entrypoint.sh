@@ -36,6 +36,38 @@ run_migrations() {
     cd /app
 }
 
+# Umbrella fork: converge the optional NOSUPERUSER runtime role.
+#
+# Runs AFTER migrations and BEFORE either server process starts, and that order
+# is the whole design. Migrations are DDL and need the owner/superuser
+# credential in DATABASE_URL; the running gateway does not, and holding it is
+# what lets a compromised gateway rewrite its own audit trail (superusers
+# bypass GRANTs and can disable or drop a trigger). Granting after the
+# migration also means a table a migration created seconds ago is already in
+# `ALL TABLES IN SCHEMA public` when the grants run.
+#
+# Unset METAMCP_RUNTIME_DB_PASSWORD = the split is off and this is a no-op, so
+# an existing deployment behaves exactly as before on upgrade. A FAILURE here
+# is fatal on purpose: the alternative is booting with the superuser credential
+# while the operator believes the split is on.
+ensure_runtime_role() {
+    if [ -z "${METAMCP_RUNTIME_DB_PASSWORD:-}" ]; then
+        return 0
+    fi
+
+    if [ ! -x /app/scripts/ensure-runtime-role.sh ]; then
+        echo "❌ METAMCP_RUNTIME_DB_PASSWORD is set but /app/scripts/ensure-runtime-role.sh is missing! Exiting..."
+        exit 1
+    fi
+
+    if /app/scripts/ensure-runtime-role.sh; then
+        echo "✅ Runtime database role ready"
+    else
+        echo "❌ Failed to converge the runtime database role! Exiting..."
+        exit 1
+    fi
+}
+
 # Umbrella fork: white-label branding aliases.
 #
 # The frontend reads branding through next-runtime-env, which only republishes
@@ -71,6 +103,9 @@ wait_for_postgres
 
 # Run migrations
 run_migrations
+
+# Converge the runtime role (no-op unless the split is configured)
+ensure_runtime_role
 
 # Start backend in the background
 echo "Starting backend server..."

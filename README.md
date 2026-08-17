@@ -125,6 +125,50 @@ across the management and OAuth surfaces:
 - **Hardened OAuth surface** — allowlisted redirect URIs at authorize time, authenticated token
   introspection, and consent protection on the authorize flow.
 - **Tamper-evident audit logging** of authentication and administrative events.
+- **Optional NOSUPERUSER runtime database role** — the gateway can serve requests with a
+  credential that is allowed to append to the audit tables and not to rewrite them. See below.
+
+### Separating the runtime credential from the migration credential
+
+By default the gateway connects with `DATABASE_URL`, which on the `postgres:16-alpine` image
+is the cluster bootstrap **superuser**, and that same credential serves both `drizzle-kit
+migrate` and the running application. A superuser bypasses `GRANT`s outright and can disable a
+trigger for its own session or drop it, so the append-only triggers on `audit_log` are
+bypassable by the credential the gateway is holding every second it is running. Migrations
+genuinely need that privilege. Serving requests does not.
+
+Setting **`METAMCP_RUNTIME_DB_PASSWORD`** splits the two. The container entrypoint runs
+`scripts/ensure-runtime-role.sh` after migrations and before either server process starts; it
+creates (or converges) a `NOSUPERUSER LOGIN` role, grants it ordinary DML on the application
+tables, and revokes the verbs that define immutability. The backend then reports at boot which
+role it authenticated as and whether that role is a superuser.
+
+| Table | Runtime role keeps | Runtime role is refused | Why |
+|---|---|---|---|
+| Ordinary application tables | `SELECT, INSERT, UPDATE, DELETE` | `TRUNCATE`, DDL | The gateway's normal working set. |
+| `audit_log` | `SELECT, INSERT` | `UPDATE, DELETE, TRUNCATE` | Append-only. Nothing prunes it in-app; its retention is a deliberate ops-level act performed as the owner. |
+| `tool_call_audit` | `SELECT, INSERT, DELETE` | `UPDATE, TRUNCATE` | `DELETE` stays because the `TOOL_AUDIT_RETENTION_DAYS` pruner removes aged rows. In-window immutability is carried by the table's triggers — which a `NOSUPERUSER` role can no longer bypass. |
+| `drizzle` schema (migration journal) | nothing | everything | Never granted. A runtime role that can edit the journal can make a migration appear applied. |
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `METAMCP_RUNTIME_DB_PASSWORD` | unset | **The switch.** Password for the runtime role; setting it enables the split. |
+| `METAMCP_RUNTIME_DB_ROLE` | `metamcp_runtime` | Runtime role name. |
+| `RUNTIME_DATABASE_URL` | unset | Escape hatch: a full connection string used verbatim, for a separate host, a pooler, or a managed instance where the role is provisioned outside this repo. Wins over the two above, and does **not** run the entrypoint's ensure-role step. |
+
+Cutover order:
+
+1. Set `METAMCP_RUNTIME_DB_PASSWORD` in `.env` to a strong value.
+2. `docker compose up -d` (a recreate, not a restart — the variable has to reach the entrypoint).
+3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool. A `rolsuper=true` warning there means the split did not take.
+
+Leaving the variable unset is fully supported and changes nothing: the entrypoint step is
+skipped and the gateway connects with `DATABASE_URL` exactly as before.
+
+**Adding an audit table later:** the ensure-role script uses `ALTER DEFAULT PRIVILEGES`, so a
+table created by a future migration starts out fully writable by the runtime role. Any new
+append-only table must be added to the revoke list in `scripts/ensure-runtime-role.sh`; a test
+asserts that every table a migration protects with an immutability trigger appears there.
 
 See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record, and [`SECURITY.md`](SECURITY.md)
 to report an issue. Several of these items apply to upstream unchanged; we coordinate them privately
@@ -195,6 +239,8 @@ pnpm dev
 ## Configuration
 
 Standard upstream configuration (Postgres, `APP_URL`, OIDC/SSO, rate limits) is unchanged; see [`example.env`](example.env). Two upstream DEFAULTS change in this fork: the registration controls, and `POSTGRES_PASSWORD`, whose published compose default is removed rather than replaced (the variable is now required). Everything else below is additive. All are optional; defaults are shown.
+
+The database-credential variables (`METAMCP_RUNTIME_DB_PASSWORD`, `METAMCP_RUNTIME_DB_ROLE`, `RUNTIME_DATABASE_URL`) are documented with their grant matrix under [Security](#separating-the-runtime-credential-from-the-migration-credential) rather than repeated here.
 
 ### Registration controls
 

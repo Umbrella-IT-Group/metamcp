@@ -45,6 +45,27 @@ services:
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
 
       # ========================================================================
+      # NOSUPERUSER runtime database role (optional, off by default)
+      # ========================================================================
+      # DATABASE_URL above is the postgres:16-alpine bootstrap SUPERUSER, and
+      # it serves both `drizzle-kit migrate` and the running gateway. Superusers
+      # bypass GRANTs and can disable or drop a trigger, so the append-only
+      # triggers on `audit_log` are bypassable by the credential the gateway
+      # holds while it serves traffic. Setting the variable below splits the
+      # two: migrations keep DATABASE_URL, the request path gets a NOSUPERUSER
+      # role that can append to the audit tables and not rewrite them.
+      #
+      # No `environment:` entry is needed — `env_file: .env` above already
+      # passes these into the container. Uncomment in .env instead:
+      #
+      #   METAMCP_RUNTIME_DB_PASSWORD=<a strong password>   # the switch
+      #   METAMCP_RUNTIME_DB_ROLE=metamcp_runtime           # optional, this is the default
+      #
+      # Unset = today's behaviour, byte for byte. Cutover is: set the variable,
+      # `docker compose up -d`, then confirm the boot log line "Runtime DB role
+      # check ... rolsuper=false". See README § Security and example.env.
+
+      # ========================================================================
       # White-label branding (optional)
       # ========================================================================
       # Unset = the Umbrella branding this image has always shipped. Setting
