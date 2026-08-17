@@ -71,11 +71,10 @@ export function generateSecureClientSecret(): string {
  * used to describe (apply the strict checker at authorize too, once the stored
  * rows had been verified clean) has landed; this one is kept because it is not
  * a subset of the other. It carries the production-only rules — HTTPS required
- * and loopback / RFC 1918 hosts refused when NODE_ENV is `production` — that
- * the registration-time checker deliberately does not have, since an installed
- * client legitimately registers a loopback callback. Dropping it in favour of
- * the newer checker would therefore have OPENED something at authorize, which
- * is the wrong direction for a hardening change.
+ * and RFC 1918 hosts refused when NODE_ENV is `production` — that the
+ * registration-time checker deliberately does not have. Dropping it in favour
+ * of the newer checker would therefore have OPENED something at authorize,
+ * which is the wrong direction for a hardening change.
  */
 export function validateRedirectUri(
   uri: string,
@@ -89,21 +88,34 @@ export function validateRedirectUri(
       return false;
     }
 
-    // For production, only allow HTTPS
+    // Bracket-stripped so the IPv6 literal `[::1]` compares against `::1`, and
+    // matched EXACTLY via the shared set below — `localhost.evil.com` and
+    // `evil.localhost` both carry a loopback label and neither is the loopback
+    // interface.
+    const hostname = parsedUri.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const isLoopback = LOOPBACK_HOSTNAMES.has(hostname);
+
+    // Production requires HTTPS — EXCEPT on loopback, in every environment.
+    // RFC 8252 §7.3 has a native app receive its authorization code on
+    // `http://127.0.0.1:<ephemeral>`: plain http, on a port the OS assigns at
+    // runtime, because an installed client has no other loopback shape
+    // available to it. Refusing that hardens nothing reachable from the
+    // network — the loopback interface is not routable off-box — it only
+    // removes the sole redirect such a client can offer, so the rule is tied
+    // to the host rather than to NODE_ENV.
     if (
       process.env.NODE_ENV === "production" &&
+      !isLoopback &&
       parsedUri.protocol !== "https:"
     ) {
       return false;
     }
 
-    // Prevent localhost/private IPs in production
+    // Prevent private IPs in production. The loopback addresses are absent by
+    // design and not by omission: none of them falls in a private range, and
+    // unlike `192.168.1.5` they are not reachable by anything else on the LAN.
     if (process.env.NODE_ENV === "production") {
-      const hostname = parsedUri.hostname.toLowerCase();
       if (
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "::1" ||
         hostname.startsWith("192.168.") ||
         hostname.startsWith("10.") ||
         hostname.startsWith("172.")
