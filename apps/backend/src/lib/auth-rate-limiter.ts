@@ -1,6 +1,8 @@
 import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 
+import { resolveClientIp } from "@/lib/client-ip";
+
 /**
  * Simple in-memory rate limiter for failed authentication attempts
  * In production, use Redis or similar for distributed rate limiting
@@ -113,14 +115,43 @@ setInterval(
 ).unref();
 
 /**
- * Get rate limiting identifier for authentication attempts
- * Uses IP address and endpoint for rate limiting
+ * Rate-limit identifier for failed authentication attempts against an endpoint,
+ * keyed per (caller, endpoint).
+ *
+ * KEYED ON CF-Connecting-IP, not `req.ip`. It used to key on `req.ip`, and
+ * behind this deployment that is the same in-container address for every
+ * caller — the backend is reached through the frontend's Next.js rewrite, and
+ * `trust proxy` is deliberately off (middleware/audit-context.middleware
+ * documents why at length). So the 20-per-minute budget was ONE bucket per
+ * endpoint for the entire world, which inverts what the limiter is for: rather
+ * than bounding a brute force, it handed anyone who could reach the endpoint a
+ * way to lock out every legitimate caller of it for the rest of the window, at
+ * a cost of 20 requests. A single consumer retrying a stale credential in a
+ * loop did the same thing by accident.
+ *
+ * Cloudflare overwrites CF-Connecting-IP at the edge on every request, so it is
+ * per-CALLER rather than per-container. The trust assumption is exactly the one
+ * audit-context.middleware states: it holds only while the Cloudflare Tunnel is
+ * the sole ingress. `req.ip` stays the fallback for direct-to-origin and local
+ * development, where the identifier degrades to the shared bucket it was — no
+ * worse than before, and never a throw on an auth-failure path.
+ *
+ * Same fix, same reasoning, as `rateLimitRegistration` in routers/oauth/utils
+ * and `trpcRateLimitMiddleware` in middleware/trpc-rate-limit.middleware.
+ *
+ * THE RESIDUAL, PLAINLY: per-IP keying bounds a source address, not a
+ * distributed caller. That is the same trade those two siblings took; what it
+ * buys is that the control can no longer be turned into the outage.
  */
 export function getAuthRateLimitIdentifier(
   req: express.Request,
   endpoint: DatabaseEndpoint,
 ): string {
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  const ip =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
   const endpointId = endpoint.uuid || endpoint.name || "unknown";
   return `${ip}:${endpointId}`;
 }
