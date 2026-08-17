@@ -20,6 +20,7 @@ export interface ToolCallAuditEntry {
   api_key_uuid?: string | null;
   auth_method?: string | null;
   user_id?: string | null;
+  acts_as_user_id?: string | null;
   caller_ip?: string | null;
   request_id?: string | null;
 }

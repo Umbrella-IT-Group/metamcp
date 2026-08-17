@@ -757,16 +757,24 @@ export const toolCallAuditTable = pgTable(
     // call whose key was revoked afterwards is precisely the row an
     // investigation wants.
     //
-    // `user_id` is the CREDENTIAL OWNER (api-key owner or OAuth subject), not
-    // an admin key's acts-as target — that stays in `client_name` as
-    // `key (as email)` so a delegated call is still distinguishable from a
-    // direct one. `caller_ip` is CF-Connecting-IP, bounded at AUDIT_IP_MAX
-    // where it is read; `request_id` is the audit-context middleware's
-    // per-request id, shared with `audit_log.request_id` so one request's
-    // control-plane and tool-plane records join.
+    // `user_id` is the CREDENTIAL OWNER (api-key owner or OAuth subject);
+    // `acts_as_user_id` is the delegated identity an admin key exercised
+    // (`api_keys.acts_as_user_id`, migration 0024). Two columns, not one: one
+    // answers "whose credential", the other "whose identity was exercised",
+    // and collapsing them makes a delegated call indistinguishable from a
+    // direct one. The pair also appears inside `client_name` as
+    // `key (as email)`, but that string is composed from a mutable email
+    // through a cache that degrades to a short id on a read failure — a label,
+    // not something to query on.
+    //
+    // `caller_ip` is CF-Connecting-IP, bounded at AUDIT_IP_MAX where it is
+    // read; `request_id` is the audit-context middleware's per-request id,
+    // shared with `audit_log.request_id` so one request's control-plane and
+    // tool-plane records join.
     api_key_uuid: uuid("api_key_uuid"),
     auth_method: text("auth_method"),
     user_id: text("user_id"),
+    acts_as_user_id: text("acts_as_user_id"),
     caller_ip: text("caller_ip"),
     request_id: text("request_id"),
   },

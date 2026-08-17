@@ -109,3 +109,65 @@ describe("stampCallerContext — pooled contexts are reused across consumers", (
     expect(context.apiKeyUuid).toBe("3f7f8a1e-0000-4000-8000-000000000001");
   });
 });
+
+describe("resolveCallerContext — delegated identity and address provenance", () => {
+  it("records an admin key's acts-as target separately from the key owner", () => {
+    const caller = resolveCallerContext({
+      headers: {},
+      authMethod: "api_key",
+      apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000002",
+      apiKeyUserId: "key-owner-1",
+      apiKeyActsAsUserId: "acted-as-user-1",
+    });
+
+    // One column answers "whose credential", the other "whose identity was
+    // exercised". Folded together, a delegated call reads as a direct one.
+    expect(caller.userId).toBe("key-owner-1");
+    expect(caller.actsAsUserId).toBe("acted-as-user-1");
+  });
+
+  it("leaves the acts-as target unset for an unbound key", () => {
+    const caller = resolveCallerContext({
+      headers: {},
+      authMethod: "api_key",
+      apiKeyUserId: "key-owner-1",
+    });
+
+    expect(caller.actsAsUserId).toBeUndefined();
+  });
+
+  it("prefers the address the audit-context middleware already stamped", () => {
+    // Reading the same value `audit_log.actor_ip` records keeps the two tables
+    // from silently disagreeing about where one request came from.
+    const caller = resolveCallerContext({
+      headers: { "cf-connecting-ip": "198.51.100.4" },
+      auditClientIp: "203.0.113.7",
+    });
+
+    expect(caller.callerIp).toBe("203.0.113.7");
+  });
+
+  it("falls back to the header for a route that runs outside that middleware", () => {
+    const caller = resolveCallerContext({
+      headers: { "cf-connecting-ip": "198.51.100.4" },
+    });
+
+    expect(caller.callerIp).toBe("198.51.100.4");
+  });
+});
+
+describe("stampCallerContext — the consumer label travels with the binding", () => {
+  it("stamps the label and clears it for a caller that resolved none", () => {
+    const context: MetaMCPHandlerContext = {
+      namespaceUuid: "ns-1",
+      sessionId: "sess-1",
+    };
+    stampCallerContext(context, apiKeyRequest, "example connector");
+    expect(context.clientName).toBe("example connector");
+
+    // A pooled instance handed to a caller with no resolvable identity must
+    // not keep advertising the previous consumer's name.
+    stampCallerContext(context, { headers: {} });
+    expect(context.clientName).toBeUndefined();
+  });
+});

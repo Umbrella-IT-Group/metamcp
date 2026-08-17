@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { runWithCallerContext } from "../caller-context-store";
 import {
   createAuditingMiddleware,
   setAuditRecorderForTesting,
@@ -116,9 +117,7 @@ describe("auditing middleware DB write-through", () => {
   });
 
   it("never fails the tool call when the audit write rejects", async () => {
-    setAuditRecorderForTesting(
-      vi.fn().mockRejectedValue(new Error("db down")),
-    );
+    setAuditRecorderForTesting(vi.fn().mockRejectedValue(new Error("db down")));
 
     const wrapped = createAuditingMiddleware()(okHandler);
     const result = await wrapped(makeRequest({ a: 1 }), context);
@@ -225,5 +224,152 @@ describe("caller binding (migration 0030)", () => {
     expect(recorder.mock.calls[0][0].session_id).toBe(
       recorder.mock.calls[1][0].session_id,
     );
+  });
+});
+
+describe("caller binding — request-scoped store wins over the pooled context", () => {
+  // The handler context belongs to a POOLED server instance, so under
+  // parallel calls on one session it describes whichever request stamped it
+  // last, and the session it is reached through is resolved by namespace +
+  // endpoint rather than re-derived from the credential presented now. A row
+  // built from it can therefore name the wrong principal — worse than naming
+  // none. The request-scoped store is the authoritative source.
+  const stale: MetaMCPHandlerContext = {
+    namespaceUuid: "ns-123",
+    sessionId: "sess-456",
+    clientName: "previous consumer",
+    apiKeyUuid: "3f7f8a1e-0000-4000-8000-00000000000a",
+    authMethod: "api_key",
+    userId: "previous-owner",
+    callerIp: "198.51.100.99",
+    requestId: "req-previous",
+  };
+
+  it("attributes the call to the request in scope, not to the last stamp on the instance", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await runWithCallerContext(
+      {
+        clientName: "live consumer",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-00000000000b",
+        authMethod: "oauth",
+        userId: "live-user",
+        callerIp: "203.0.113.7",
+        requestId: "req-live",
+      },
+      () => wrapped(makeRequest({ a: 1 }), stale),
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.client_name).toBe("live consumer");
+    expect(entry.api_key_uuid).toBe("3f7f8a1e-0000-4000-8000-00000000000b");
+    expect(entry.auth_method).toBe("oauth");
+    expect(entry.user_id).toBe("live-user");
+    expect(entry.caller_ip).toBe("203.0.113.7");
+    expect(entry.request_id).toBe("req-live");
+    // The namespace/session halves still come from the handler context.
+    expect(entry.namespace_uuid).toBe("ns-123");
+    expect(entry.session_id).toBe("sess-456");
+  });
+
+  it("never mixes the two sources — a store with gaps does not backfill from the instance", async () => {
+    // Field-by-field coalescing would take api_key_uuid from the live request
+    // and request_id from the stale stamp: a row that looks complete and is
+    // false. One source, whole.
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await runWithCallerContext(
+      { authMethod: "session", userId: "admin-1" },
+      () => wrapped(makeRequest({ a: 1 }), stale),
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.auth_method).toBe("session");
+    expect(entry.user_id).toBe("admin-1");
+    expect(entry.api_key_uuid).toBeNull();
+    expect(entry.caller_ip).toBeNull();
+    expect(entry.request_id).toBeNull();
+    expect(entry.client_name).toBeNull();
+  });
+
+  it("falls back to the handler context when the call runs outside any request scope", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(makeRequest({ a: 1 }), stale);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.client_name).toBe("previous consumer");
+    expect(entry.request_id).toBe("req-previous");
+  });
+
+  it("records an acts-as target alongside the credential owner", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await runWithCallerContext(
+      {
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-00000000000c",
+        authMethod: "api_key",
+        userId: "key-owner-1",
+        actsAsUserId: "acted-as-user-1",
+      },
+      () => wrapped(makeRequest({ a: 1 }), stale),
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.user_id).toBe("key-owner-1");
+    expect(entry.acts_as_user_id).toBe("acted-as-user-1");
+  });
+});
+
+describe("a refused or failing call must not read as a successful one", () => {
+  // An MCP tool failure is a RESULT, not a throw: a gateway denial from the
+  // filter middleware (answered upstream as HTTP 403) and a backend tool's own
+  // error both come back as `isError: true` with a normal resolve. Recording
+  // those as success=true put them in exactly the bucket an investigation
+  // filters OUT while hunting denials.
+  it("writes success=false for an isError result", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const denied = vi.fn().mockResolvedValue({
+      isError: true,
+      content: [{ type: "text", text: 'Access denied to tool "search"' }],
+    });
+
+    const wrapped = createAuditingMiddleware()(denied);
+    const result = await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    // The result still passes through untouched — this middleware observes.
+    expect(result.isError).toBe(true);
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("tool_error");
+    // Still fully attributed: a denial is the row most worth attributing.
+    expect(entry.api_key_uuid).toBe("3f7f8a1e-0000-4000-8000-000000000001");
+  });
+
+  it("keeps success=true and no error code for an ordinary result", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(true);
+    expect(entry.error_code).toBeUndefined();
   });
 });

@@ -12,13 +12,19 @@
 -- These five columns are the pivot. Each is already resolved per request by
 -- middleware that runs before any tool handler; none of it reached the table.
 --
---   api_key_uuid  the api_keys row that authenticated the request.
---   auth_method   'api_key' | 'oauth'.
---   user_id       the CREDENTIAL OWNER (api-key owner or OAuth subject).
---   caller_ip     CF-Connecting-IP, the caller's real address.
---   request_id    the per-request id audit_log rows also carry.
+--   api_key_uuid     the api_keys row that authenticated the request.
+--   auth_method      'api_key' | 'oauth' on the endpoint paths, 'session' on
+--                    the admin Inspector surface. Deliberately plain text with
+--                    no CHECK: a new caller class must never be able to make
+--                    an audit INSERT fail, because a failed audit INSERT here
+--                    is swallowed and therefore a silently missing record.
+--   user_id          the CREDENTIAL OWNER (api-key owner, OAuth subject, or
+--                    session user).
+--   acts_as_user_id  the delegated identity an admin key exercised.
+--   caller_ip        CF-Connecting-IP, the caller's real address.
+--   request_id       the per-request id audit_log rows also carry.
 --
--- ALL FIVE ARE NULLABLE, and that is a requirement rather than a convenience.
+-- ALL SIX ARE NULLABLE, and that is a requirement rather than a convenience.
 -- The write is fire-and-forget and its failure is swallowed by design (an
 -- audit write must never fail a tool call), so a NOT NULL here would not
 -- surface as an error — it would silently drop the audit row for every
@@ -36,12 +42,19 @@
 -- stored as a plain uuid so it still joins to `api_keys.uuid` when that row
 -- does exist.
 --
--- WHY user_id IS NOT THE ACTS-AS TARGET. An admin key may carry an acts-as
--- binding (migration 0024) and its delegated identity already appears in
--- `client_name` as `key (as email)`. Recording that target here instead of the
--- key's owner would make a delegated call indistinguishable from a direct one
--- by that account. This column answers "whose credential", `client_name`
--- answers "whose identity was exercised", and both are needed.
+-- WHY acts_as_user_id IS ITS OWN COLUMN. An admin key may carry an acts-as
+-- binding (migration 0024): the key belongs to one account and its requests
+-- run as another. Folding that into `user_id` would make a delegated call
+-- indistinguishable from a direct one by the acted-as account — the single
+-- most misleading row this table could produce. So `user_id` answers "whose
+-- credential" and `acts_as_user_id` answers "whose identity was exercised",
+-- and a NULL in the second means the call was direct.
+--
+-- The pair does already appear inside `client_name`, rendered as
+-- `key (as email)`, but that string is not a substitute: it is composed at
+-- call time from a MUTABLE email through a 60s cache that degrades to
+-- `user <short-id>` when the lookup fails, so it is a label to read and not a
+-- value to query or join on.
 --
 -- caller_ip TRUST ASSUMPTION, recorded because it is what makes the column
 -- evidence: CF-Connecting-IP is written by the Cloudflare edge and OVERWRITTEN
@@ -67,16 +80,18 @@ ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "auth_method" text;
 --> statement-breakpoint
 ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "user_id" text;
 --> statement-breakpoint
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "acts_as_user_id" text;
+--> statement-breakpoint
 ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "caller_ip" text;
 --> statement-breakpoint
 ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "request_id" text;
 --> statement-breakpoint
--- Only api_key_uuid is indexed of the five. "What did this credential do" is
+-- Only api_key_uuid is indexed of the six. "What did this credential do" is
 -- the question a suspected key compromise forces first, and answering it
 -- without an index is a full scan of the busiest table in the schema. The
--- other four are read once a row is already in hand — request_id joins a
--- handful of rows, and caller_ip / user_id / auth_method are filters applied
--- inside an already-bounded called_at window, which the existing
--- tool_call_audit_called_at_idx serves. Every additional index is a permanent
--- cost on an insert path that runs once per tool call.
+-- other five are read once a row is already in hand — request_id joins a
+-- handful of rows, and caller_ip / user_id / acts_as_user_id / auth_method are
+-- filters applied inside an already-bounded called_at window, which the
+-- existing tool_call_audit_called_at_idx serves. Every additional index is a
+-- permanent cost on an insert path that runs once per tool call.
 CREATE INDEX IF NOT EXISTS "tool_call_audit_api_key_uuid_idx" ON "tool_call_audit" ("api_key_uuid");

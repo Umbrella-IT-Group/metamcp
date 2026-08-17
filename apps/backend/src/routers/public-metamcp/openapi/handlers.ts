@@ -399,8 +399,10 @@ export const createMiddlewareEnabledHandlers = (
   const handlerContext: MetaMCPHandlerContext = {
     namespaceUuid,
     sessionId,
-    clientName,
     ...caller,
+    // Last, so the explicitly-passed label always wins over anything a future
+    // `CallerContext` field of the same name could carry.
+    clientName,
   };
 
   // Create original handlers

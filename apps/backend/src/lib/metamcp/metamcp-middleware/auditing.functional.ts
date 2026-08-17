@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 
+import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import { parseToolName } from "../tool-name-parser";
-import { CallToolMiddleware } from "./functional-middleware";
+import {
+  CallToolMiddleware,
+  MetaMCPHandlerContext,
+} from "./functional-middleware";
 
 /**
  * Auditing middleware — records every proxied `tools/call` to the Live Logs
@@ -42,9 +46,30 @@ type AuditRecorder = (entry: {
   api_key_uuid?: string | null;
   auth_method?: string | null;
   user_id?: string | null;
+  acts_as_user_id?: string | null;
   caller_ip?: string | null;
   request_id?: string | null;
 }) => Promise<void>;
+
+/**
+ * Pick the caller binding for this call, from ONE source.
+ *
+ * The request-scoped store wins whenever the call is running inside one,
+ * because the handler context is per-INSTANCE and instances are pooled: under
+ * parallel calls on a single session it describes whichever request stamped
+ * it last, and on the Streamable-HTTP in-memory session lookup it is not
+ * re-derived from the credential presented on THIS request at all. The
+ * handler context remains the fallback for a call that reaches this
+ * middleware outside any request scope.
+ *
+ * ATOMIC, never field-by-field. Coalescing each field independently would let
+ * a row take its `api_key_uuid` from the live request and its `request_id`
+ * from a stale stamp — a row that looks complete and is false. One source or
+ * the other, whole.
+ */
+function selectCaller(context: MetaMCPHandlerContext): CallerContext {
+  return getCallerContext() ?? context;
+}
 
 let auditRecorder: AuditRecorder | null | undefined;
 
@@ -108,30 +133,39 @@ export function createAuditingMiddleware(): CallToolMiddleware {
     // call arrives without the gateway prefix.
     const serverName = parsed?.serverName ?? "unknown";
     const toolName = parsed?.originalToolName ?? fullName;
-    // Who is calling — stamped onto the handler context by the router layer
-    // (Streamable-HTTP sets it on the acquired instance; OpenAPI sets it
-    // per-call). Undefined on auth-off / passthrough endpoints.
-    const clientName = context.clientName;
-    // Caller binding — stamped alongside `clientName` by the router layer.
-    // Read once here so the success and failure rows below cannot drift apart
-    // if a concurrent request re-stamps the (pooled) context mid-call.
+    // Who is calling. Resolved ONCE, at entry, from a single source (see
+    // selectCaller) so the success and failure rows below cannot be built from
+    // different requests if a parallel call re-stamps the pooled context
+    // mid-flight. Undefined on auth-off / passthrough endpoints.
+    const source = selectCaller(context);
+    const clientName = source.clientName;
     const caller = {
-      api_key_uuid: context.apiKeyUuid ?? null,
-      auth_method: context.authMethod ?? null,
-      user_id: context.userId ?? null,
-      caller_ip: context.callerIp ?? null,
-      request_id: context.requestId ?? null,
+      api_key_uuid: source.apiKeyUuid ?? null,
+      auth_method: source.authMethod ?? null,
+      user_id: source.userId ?? null,
+      acts_as_user_id: source.actsAsUserId ?? null,
+      caller_ip: source.callerIp ?? null,
+      request_id: source.requestId ?? null,
     };
     const paramsHash = hashParams(request.params.arguments);
 
     try {
       const result = await handler(request, context);
       const durationMs = Math.round(performance.now() - start);
+      // An MCP tool failure is a RESULT, not a throw: both a gateway denial
+      // from the filter middleware (which answers HTTP 403 upstream) and a
+      // backend tool's own error come back as `isError: true` with a normal
+      // resolve. Recording those as success=true said "the tool ran" about a
+      // call that was refused — the exact rows an investigation would filter
+      // OUT while looking for denials.
+      const failed = result?.isError === true;
       metamcpLogStore.record({
         category: "tool_call",
         serverName,
-        level: "info",
-        message: `${toolName} (${durationMs}ms)`,
+        level: failed ? "error" : "info",
+        message: failed
+          ? `${toolName} returned an error (${durationMs}ms)`
+          : `${toolName} (${durationMs}ms)`,
         toolName,
         durationMs,
         clientName,
@@ -143,7 +177,12 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         server_name: serverName,
         tool_name: toolName,
         params_hash: paramsHash,
-        success: true,
+        success: !failed,
+        // No `code` exists on an isError result — the MCP shape carries the
+        // reason as human text in `content`, which is not something to put in
+        // an indexed column. A fixed marker keeps the class queryable and
+        // distinct from the protocol-level codes the catch branch records.
+        error_code: failed ? "tool_error" : undefined,
         latency_ms: durationMs,
         ...caller,
       });
