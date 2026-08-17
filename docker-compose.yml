@@ -39,7 +39,20 @@ services:
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
       
       # Auth configuration
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-your-super-secret-key-change-this-in-production}
+      #
+      # BETTER_AUTH_SECRET is REQUIRED and deliberately has no fallback, for
+      # the same reason POSTGRES_PASSWORD above has none. The literal this
+      # line used to default to is published in this repository, and this one
+      # is the SESSION SIGNING KEY: anyone holding it can mint a session
+      # cookie for any account, so a deployment that never set the variable
+      # was authenticating against a key the whole internet can read. It also
+      # keys the OAuth consent-request signatures.
+      #
+      # Unlike POSTGRES_PASSWORD there is no initdb coupling, so an existing
+      # deployment can change this value freely. Doing so invalidates every
+      # session and consent request signed with the old key, which logs
+      # everyone out once. That is the correct trade against a published key.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env (see example.env)}
       
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}

@@ -103,6 +103,9 @@ describe("example.env ships no usable credential", () => {
   it.each([
     ["BOOTSTRAP_USER_PASSWORD", "changeme"],
     ["POSTGRES_PASSWORD", "m3t4mcp"],
+    // The session SIGNING KEY, so the published default was worse than a
+    // weak password: it mints a valid cookie for any account without one.
+    ["BETTER_AUTH_SECRET", "your-super-secret-key-change-this-in-production"],
   ])("does not assign %s the old guessable default", (key, oldDefault) => {
     // Pinned against the file rather than trusted to review: the whole point
     // of these two lines is that they are copied verbatim into real
@@ -123,7 +126,7 @@ describe("example.env ships no usable credential", () => {
     "docker-compose.dev.yml",
     "docker-compose.test.yml",
     ".devcontainer/docker-compose.yml",
-  ])("%s carries no POSTGRES_PASSWORD fallback default", (composeFile) => {
+  ])("%s carries no credential fallback default", (composeFile) => {
     const compose = readFileSync(
       path.resolve(
         path.dirname(fileURLToPath(import.meta.url)),
@@ -134,6 +137,16 @@ describe("example.env ships no usable credential", () => {
     );
     expect(compose).not.toContain("m3t4mcp");
     expect(compose).not.toContain("POSTGRES_PASSWORD:-");
+    // The `:-` form is the whole hazard: it means "use the published literal
+    // when the operator set nothing", which is exactly how a deployment comes
+    // up on a signing key anyone can read. Only the `:?` required form is
+    // acceptable here, so the fallback SYNTAX is what gets pinned rather than
+    // just the old literal, which a rename would slip past.
+    expect(compose).not.toContain(
+      "your-super-secret-key-change-this-in-production",
+    );
+    expect(compose).not.toContain("BETTER_AUTH_SECRET:-");
+    expect(compose).toContain("BETTER_AUTH_SECRET:?");
   });
 
   it("documents the unauthenticated-endpoint flag as off by default", () => {
