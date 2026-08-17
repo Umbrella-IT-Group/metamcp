@@ -105,24 +105,36 @@ export const GatewayEventCursorSchema = z.object({
   uuid: z.string(),
 });
 
-export const GetGatewayEventsRequestSchema = z.object({
-  from: z.iso.datetime().optional(),
-  to: z.iso.datetime().optional(),
-  category: GatewayEventCategorySchema.optional(),
-  level: GatewayEventLevelSchema.optional(),
-  serverName: z.string().max(256).optional(),
-  clientName: z.string().max(256).optional(),
-  // Clamped rather than rejected: this is a filter box an operator types into
-  // during an investigation, and silently matching on the first 200 characters
-  // is a better answer than a validation error on a paste. The backend escapes
-  // LIKE metacharacters so the value stays a substring, not a pattern.
-  search: z
-    .string()
-    .transform((value) => value.slice(0, GATEWAY_EVENT_SEARCH_MAX))
-    .optional(),
-  cursor: GatewayEventCursorSchema.optional(),
-  limit: z.number().int().positive().max(GATEWAY_EVENT_PAGE_MAX).optional(),
-});
+export const GetGatewayEventsRequestSchema = z
+  .object({
+    from: z.iso.datetime().optional(),
+    to: z.iso.datetime().optional(),
+    category: GatewayEventCategorySchema.optional(),
+    level: GatewayEventLevelSchema.optional(),
+    serverName: z.string().max(256).optional(),
+    clientName: z.string().max(256).optional(),
+    // Clamped rather than rejected: this is a filter box an operator types into
+    // during an investigation, and silently matching on the first 200 characters
+    // is a better answer than a validation error on a paste. The backend escapes
+    // LIKE metacharacters so the value stays a substring, not a pattern.
+    search: z
+      .string()
+      .transform((value) => value.slice(0, GATEWAY_EVENT_SEARCH_MAX))
+      .optional(),
+    cursor: GatewayEventCursorSchema.optional(),
+    limit: z.number().int().positive().max(GATEWAY_EVENT_PAGE_MAX).optional(),
+  })
+  .refine((input) => !input.cursor || input.from !== undefined, {
+    // A caller that omits `from` gets a default window computed from the CURRENT
+    // time, which slides forward between requests. Paging on that default means
+    // page two is evaluated against a window whose older edge has moved past
+    // where page one stopped, so the oldest rows of the run vanish — a silent
+    // gap, which is the one outcome this surface must not produce. Rejecting the
+    // combination turns it into an error the caller can see and fix by pinning
+    // the window, which is what the history view already does.
+    message: "from must be pinned when paging with a cursor",
+    path: ["from"],
+  });
 
 export const GetGatewayEventsResponseSchema = z.object({
   success: z.literal(true),

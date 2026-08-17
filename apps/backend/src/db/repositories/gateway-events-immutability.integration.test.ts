@@ -195,12 +195,13 @@ describeIfDb("gateway_events against a REAL postgres", () => {
     // Deliberately no cleanup of the young row: removing it is exactly what is
     // blocked. Use a disposable database.
     //
-    // TWO pools to close. `record()` writes through the bounded audit pool (see
-    // ../audit-db) so a reconnect storm cannot starve the request path;
-    // leaving it open here hangs the vitest worker.
+    // TWO pools to close. `record()` writes through its own bounded pool (see
+    // ../gateway-events-db) so a chatty backend cannot starve the request path
+    // or the security-audit writer; leaving it open here hangs the vitest
+    // worker.
     const { pool } = await import("../index");
-    const { auditPool } = await import("../audit-db");
-    await Promise.all([pool.end(), auditPool.end()]);
+    const { gatewayEventsPool } = await import("../gateway-events-db");
+    await Promise.all([pool.end(), gatewayEventsPool.end()]);
   });
 
   it("accepts the INSERT the repository makes", async () => {
@@ -411,6 +412,68 @@ describeIfDb("gateway_events against a REAL postgres", () => {
       `SELECT uuid FROM gateway_events WHERE server_name = '${toolMarker}'` as never,
     );
     expect(rows.rows).toHaveLength(0);
+  });
+
+  /**
+   * The repository half of the pagination contract, against real rows.
+   *
+   * `logs.impl` asks for `pageSize + 1` and treats the extra row as evidence
+   * that a next page exists. The repository used to clamp that request back
+   * down to the page maximum, so at the largest page size — which is also the
+   * default — the probe row could not come back, the cursor was always null,
+   * and everything past the first page was unreachable. Nothing failed; rows
+   * simply stopped existing. Only a run with more rows than a full page shows
+   * it.
+   */
+  it("returns the probe row at a full-page request, so a next page is detectable", async () => {
+    const bulkMarker = `itest-bulk-${Date.now()}`;
+    await db.execute(
+      `INSERT INTO gateway_events (category, message, server_name)
+       SELECT 'system', 'bulk ' || g, '${bulkMarker}'
+       FROM generate_series(1, 250) AS g` as never,
+    );
+
+    const { GATEWAY_EVENT_PAGE_MAX } = await import(
+      "../../lib/gateway-events/bounds"
+    );
+
+    const probed = await gatewayEventsRepository.list({
+      serverName: bulkMarker,
+      limit: GATEWAY_EVENT_PAGE_MAX + 1,
+    });
+    expect(probed).toHaveLength(GATEWAY_EVENT_PAGE_MAX + 1);
+
+    // The ceiling is still a ceiling: one past the probe is refused, so a
+    // caller cannot ask for an unbounded page by inflating the limit.
+    const overreach = await gatewayEventsRepository.list({
+      serverName: bulkMarker,
+      limit: GATEWAY_EVENT_PAGE_MAX + 500,
+    });
+    expect(overreach).toHaveLength(GATEWAY_EVENT_PAGE_MAX + 1);
+  });
+
+  it("lists server names ordered and bounded by both ends of the window", async () => {
+    const nameMarker = `itest-names-${Date.now()}`;
+    await db.execute(
+      `INSERT INTO gateway_events (occurred_at, category, message, server_name) VALUES
+         (now() - interval '2 hours', 'system', 'in window', '${nameMarker}-b'),
+         (now() - interval '2 hours', 'system', 'in window', '${nameMarker}-a'),
+         (now() - interval '10 days', 'system', 'before window', '${nameMarker}-old')` as never,
+    );
+
+    const names = await gatewayEventsRepository.listServerNames(
+      new Date(Date.now() - 6 * 60 * 60 * 1000),
+      new Date(),
+    );
+
+    expect(names).toContain(`${nameMarker}-a`);
+    expect(names).toContain(`${nameMarker}-b`);
+    // Outside the window, so it must not populate a filter described as the
+    // servers seen in the window the operator is looking at.
+    expect(names).not.toContain(`${nameMarker}-old`);
+    // Ordered in SQL, which is what makes the LIMIT deterministic rather than
+    // an arbitrary subset that changes between page loads.
+    expect(names).toEqual([...names].sort());
   });
 
   it("treats a search term as a substring, not a LIKE pattern", async () => {

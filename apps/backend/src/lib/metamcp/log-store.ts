@@ -124,23 +124,38 @@ class MetaMcpLogStore {
     // graph database-free via a lazy repository import — see
     // lib/gateway-events/sink.
     //
-    // LAST, deliberately. Everything above it — the ring push, the stdout
-    // mirror Promtail ships, the listener fan-out — is the behaviour this
-    // module had before there was a history to write, and none of it may become
-    // conditional on a database. Ordering it last means that even if the
-    // sink's own guarantees were broken by a future change, the worst outcome
-    // is a missing history row rather than a broken transport handler.
-    recordGatewayEvent({
-      category: logEntry.category,
-      level: logEntry.level,
-      serverUuid: logEntry.serverUuid,
-      serverName: logEntry.serverName,
-      clientName: logEntry.clientName,
-      sessionId: logEntry.sessionId,
-      message: logEntry.message,
-      metadata:
-        logEntry.error !== undefined ? { error: logEntry.error } : undefined,
-    });
+    // LAST, and GUARDED, and the two together are what make the claim true.
+    //
+    // Last, because everything above it — the ring push, the stdout mirror
+    // Promtail ships, the listener fan-out — is the behaviour this module had
+    // before there was a history to write, and none of it may become
+    // conditional on a database.
+    //
+    // Guarded, because ordering alone only protects what runs BEFORE the call.
+    // `record()` is invoked from inside transport `onclose`/`onerror` handlers
+    // in `client.ts`, which go on to fire `onTransportDrop` — the reconnect and
+    // eviction callback — AFTER returning from here. A throw escaping this line
+    // would skip that, so a broken history write could stop a backend from
+    // being reconnected. `recordGatewayEvent` is built never to throw; this is
+    // the belt that makes a future change to it unable to reach the caller.
+    try {
+      recordGatewayEvent({
+        category: logEntry.category,
+        level: logEntry.level,
+        serverUuid: logEntry.serverUuid,
+        serverName: logEntry.serverName,
+        clientName: logEntry.clientName,
+        sessionId: logEntry.sessionId,
+        message: logEntry.message,
+        metadata:
+          logEntry.error !== undefined ? { error: logEntry.error } : undefined,
+      });
+    } catch (err) {
+      // Logged rather than swallowed: reaching here means the sink's own
+      // guarantees are broken, which is a real defect worth seeing, just not
+      // one worth breaking a reconnect over.
+      logger.error("Error persisting gateway event:", err);
+    }
   }
 
   /**

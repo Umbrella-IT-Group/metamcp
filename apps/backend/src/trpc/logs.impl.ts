@@ -58,6 +58,7 @@ export const logsImplementations = {
       const from = input.from
         ? new Date(input.from)
         : new Date(Date.now() - DEFAULT_HISTORY_WINDOW_MS);
+      const to = input.to ? new Date(input.to) : null;
       const limit = Math.min(
         input.limit ?? GATEWAY_EVENT_PAGE_MAX,
         GATEWAY_EVENT_PAGE_MAX,
@@ -70,7 +71,7 @@ export const logsImplementations = {
       // count taken a moment later can.
       const rows = await gatewayEventsRepository.list({
         from,
-        to: input.to ? new Date(input.to) : null,
+        to,
         category: input.category ?? null,
         level: input.level ?? null,
         serverName: input.serverName ?? null,
@@ -92,9 +93,13 @@ export const logsImplementations = {
           ? { occurredAt: last.occurred_at.toISOString(), uuid: last.uuid }
           : null;
 
-      // Scoped to the same window the rows came from, so the filter offers the
-      // servers that actually appear in what the operator is looking at.
-      const serverNames = await gatewayEventsRepository.listServerNames(from);
+      // Scoped to the same window the rows came from — both ends of it — so the
+      // filter offers the servers that actually appear in what the operator is
+      // looking at.
+      const serverNames = await gatewayEventsRepository.listServerNames(
+        from,
+        to,
+      );
 
       return {
         success: true as const,

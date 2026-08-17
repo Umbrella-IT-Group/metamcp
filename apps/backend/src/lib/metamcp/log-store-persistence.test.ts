@@ -120,6 +120,10 @@ describe("the pre-existing behaviour is independent of the history write", () =>
     const seen: string[] = [];
     const detach = metamcpLogStore.addListener((log) => seen.push(log.message));
 
+    // Does NOT propagate. `record()` runs inside transport onclose/onerror
+    // handlers that go on to fire the reconnect callback after it returns, so a
+    // throw here would skip the reconnect — ordering the call last protects
+    // what runs BEFORE it, and only the guard protects the caller.
     expect(() =>
       metamcpLogStore.record({
         category: "connection",
@@ -127,17 +131,20 @@ describe("the pre-existing behaviour is independent of the history write", () =>
         level: "warn",
         message: "Transport error (backend drop)",
       }),
-    ).toThrow();
+    ).not.toThrow();
     detach();
 
-    // Everything the store did before this feature existed still happened: the
-    // persistence call is ordered LAST precisely so a failure there cannot
-    // reach any of it.
+    // Everything the store did before this feature existed still happened.
     expect(metamcpLogStore.getLogCount()).toBe(before + 1);
     expect(metamcpLogStore.getLogs(1)[0]).toMatchObject({
       message: "Transport error (backend drop)",
     });
     expect(loggerMock.warn).toHaveBeenCalledTimes(1);
     expect(seen).toEqual(["Transport error (backend drop)"]);
+    // Reported, not swallowed: a sink that throws is a real defect.
+    expect(loggerMock.error).toHaveBeenCalledTimes(1);
+    expect(String(loggerMock.error.mock.calls[0][0])).toContain(
+      "Error persisting gateway event",
+    );
   });
 });

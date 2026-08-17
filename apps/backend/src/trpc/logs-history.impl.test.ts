@@ -105,13 +105,25 @@ describe("getHistory — the query it issues", () => {
     });
   });
 
-  it("scopes the server-name filter list to the same window as the rows", async () => {
+  it("scopes the server-name filter list to BOTH ends of the rows' window", async () => {
+    const from = "2026-08-01T00:00:00.000Z";
+    const to = "2026-08-02T00:00:00.000Z";
+    await logsImplementations.getHistory({ from, to });
+
+    // A name that stopped appearing months ago should not clutter a filter over
+    // the last hour, and neither should one that only appears after the window
+    // the operator asked for.
+    expect(listServerNamesMock).toHaveBeenCalledWith(
+      new Date(from),
+      new Date(to),
+    );
+  });
+
+  it("passes a null upper bound when the caller gave no `to`", async () => {
     const from = "2026-08-01T00:00:00.000Z";
     await logsImplementations.getHistory({ from });
 
-    // A name that stopped appearing months ago should not clutter a filter over
-    // the last hour.
-    expect(listServerNamesMock).toHaveBeenCalledWith(new Date(from));
+    expect(listServerNamesMock).toHaveBeenCalledWith(new Date(from), null);
   });
 });
 
@@ -171,6 +183,38 @@ describe("getHistory — pagination", () => {
 
     expect(listMock.mock.calls[0][0].limit).toBe(201);
   });
+
+  it("still reports a next page AT the maximum page size", async () => {
+    // The regression this exists for: the implementation asks for `limit + 1`
+    // as a probe, and the repository used to clamp that request back down to
+    // the page maximum. At the largest page size — which is also the DEFAULT —
+    // the probe row was therefore unrepresentable, `rows.length > limit` was
+    // never true, and every row past the first page became unreachable with no
+    // error anywhere. Asserting the cursor at the boundary, not just at a
+    // comfortable limit, is what makes that visible.
+    listMock.mockResolvedValue(
+      Array.from({ length: 201 }, (_, i) => row(i + 1)),
+    );
+
+    const result = await logsImplementations.getHistory({ limit: 200 });
+
+    expect(result.data).toHaveLength(200);
+    expect(result.nextCursor).not.toBeNull();
+  });
+
+  it("asks for exactly one row past the bound the repository enforces", async () => {
+    // Pins the two clamps against each other rather than each against itself.
+    // Both were individually correct while disagreeing about the same number,
+    // which is how the probe row went missing. The repository's own half of
+    // this contract is exercised against a real database in
+    // db/repositories/gateway-events-immutability.integration.test.ts.
+    const { GATEWAY_EVENT_PAGE_MAX: bound } = await import(
+      "@/lib/gateway-events/bounds"
+    );
+    await logsImplementations.getHistory({});
+
+    expect(listMock.mock.calls[0][0].limit).toBe(bound + 1);
+  });
 });
 
 describe("getHistory — failures", () => {
@@ -214,6 +258,21 @@ describe("the input contract", () => {
     });
 
     expect(parsed.search).toHaveLength(200);
+  });
+
+  it("refuses a cursor without a pinned from", () => {
+    const cursor = { occurredAt: "2026-08-01T12:00:00.000Z", uuid: "abc" };
+    // Without `from` the window is recomputed from the current clock on every
+    // request, so its older edge slides forward between pages and the oldest
+    // rows of a paging run disappear. A validation error is the honest answer;
+    // a silent gap on an investigation surface is not.
+    expect(() => GetGatewayEventsRequestSchema.parse({ cursor })).toThrow();
+    expect(
+      GetGatewayEventsRequestSchema.parse({
+        cursor,
+        from: "2026-08-01T00:00:00.000Z",
+      }).cursor,
+    ).toEqual(cursor);
   });
 
   it("refuses a page size past the maximum", () => {

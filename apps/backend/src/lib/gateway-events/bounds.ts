@@ -19,9 +19,22 @@ import {
  * can trim an oversized row, and the retention sweeper cannot reach it early.
  * Events are built from backend stderr, transport error text and connection
  * detail — none of which this gateway authors, and some of which an upstream
- * server can make arbitrarily long. Clamping at the writer is what keeps a
- * chatty backend from becoming a write-amplification primitive against a
- * table that cannot be pruned for a month.
+ * server can make arbitrarily long. Clamping at the writer is what stops one
+ * event from costing the archive an unbounded amount.
+ *
+ * WHAT THESE BOUNDS DO NOT DO, stated plainly because the distinction is easy
+ * to lose: they bound the size of a row, not the RATE of rows. A backend stuck
+ * in a reconnect loop emits on every attempt, and a chatty STDIO backend emits
+ * per stderr line, so row COUNT inside the 30-day window is bounded only by
+ * how badly something upstream is behaving. Nothing here samples, dedupes or
+ * throttles, and by design nothing can delete what it writes for 30 days. The
+ * mitigations that do exist are indirect: retention caps total history at
+ * `GATEWAY_EVENTS_RETENTION_DAYS`, and a backend flapping for weeks is a
+ * failure an operator sees by other means long before storage is the symptom.
+ * A sink-side rate limit is the obvious next step and is deliberately NOT here
+ * — silently dropping events is the exact failure this table was added to end,
+ * so which events may be dropped is a policy decision rather than an
+ * implementation detail.
  */
 
 /**
@@ -109,8 +122,8 @@ export function clampGatewayMetadata(
  * than what the operator typed, which on an investigation surface is worse
  * than a filter that errors. `\` is escaped first so escaping the others
  * cannot double-escape it. The caller pairs the result with an explicit
- * `ESCAPE '\'` so the behaviour does not depend on the server's
- * `standard_conforming_strings` setting.
+ * `ESCAPE '\'` so the escape character is stated rather than left to the
+ * server's default.
  */
 export function escapeLikePattern(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");

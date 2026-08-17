@@ -15,6 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { activeCursor, joinPages } from "@/lib/gateway-event-paging";
 import {
   categoryMeta,
   HISTORY_CATEGORIES,
@@ -36,9 +37,15 @@ import { trpc } from "@/lib/trpc";
  * looked different from the tail would make an operator second-guess whether
  * they were reading the same thing.
  *
- * The filter values are literal English strings, matching the live view's
- * category buttons: this is an internal admin surface and the operator works
- * in English.
+ * EVERY user-visible string here is a literal, deliberately, and it is a
+ * deviation from the rest of the page worth naming rather than leaving to be
+ * discovered. The page's headings and buttons resolve through `t("logs:…")`
+ * against `public/locales/{en,ko,zh}/logs.json`, but its category filter
+ * buttons have always been literal English on the same reasoning the live view
+ * states: this is an internal admin surface and the operator works in English.
+ * Adding half a namespace — English keys with no zh/ko translations, silently
+ * falling back — would look translated without being translated. If this
+ * surface is ever localised, all three files get the keys in one pass.
  */
 
 const RANGES = [
@@ -94,20 +101,32 @@ export function GatewayEventHistory({ isAdmin }: { isAdmin: boolean }) {
     [from, category, level, serverName, search],
   );
 
-  const { data, isLoading, isFetching, refetch } =
+  const { data, error, isError, isLoading, isFetching, refetch } =
     trpc.frontend.logs.history.useQuery(filters, { enabled: isAdmin });
 
   const utils = trpc.useUtils();
   const [extraPages, setExtraPages] = useState<GatewayEvent[][]>([]);
-  const [cursor, setCursor] = useState<GatewayEventCursor | null>(null);
+  const [pagedCursor, setPagedCursor] = useState<GatewayEventCursor | null>(
+    null,
+  );
   const [isLoadingMore, setIsLoadingMore] = useState(false);
 
-  // A new first page means a new filter set, so anything paged in under the old
-  // one is stale and its cursor points into the wrong result.
+  // Reset on the FILTERS, not on `data`.
+  //
+  // Keying this on the query result would discard every page the operator had
+  // loaded whenever the first page merely REFETCHED — a background revalidation
+  // is a new `data` identity with the same filters, so pressing "Load older"
+  // three times and then losing all of it to an invisible refetch was reachable
+  // without touching a control. The filter object is the thing that actually
+  // invalidates a cursor, because a cursor points into one ordered result set.
   useEffect(() => {
     setExtraPages([]);
-    setCursor(data?.nextCursor ?? null);
-  }, [data]);
+    setPagedCursor(null);
+  }, [filters]);
+
+  // Pure, and tested in lib/gateway-event-paging.test.ts: the frontend harness
+  // has no DOM, so the decisions worth pinning live outside the component.
+  const cursor = activeCursor(data?.nextCursor, pagedCursor, extraPages.length);
 
   const loadMore = useCallback(async () => {
     if (!cursor) return;
@@ -120,7 +139,7 @@ export function GatewayEventHistory({ isAdmin }: { isAdmin: boolean }) {
       setExtraPages((pages) => [...pages, next.data]);
       // Null here ends the run — the button disappears rather than fetching an
       // empty page forever.
-      setCursor(next.nextCursor ?? null);
+      setPagedCursor(next.nextCursor ?? null);
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to load more events",
@@ -131,7 +150,7 @@ export function GatewayEventHistory({ isAdmin }: { isAdmin: boolean }) {
   }, [cursor, filters, utils]);
 
   const events = useMemo(
-    () => [...(data?.data ?? []), ...extraPages.flat()],
+    () => joinPages(data?.data, extraPages),
     [data, extraPages],
   );
 
@@ -250,12 +269,25 @@ export function GatewayEventHistory({ isAdmin }: { isAdmin: boolean }) {
         </Button>
       </div>
 
+      {/* A failed query must NOT render as an empty result. On an investigation
+          surface "no recorded events match these filters" and "the query did
+          not run" lead to opposite conclusions, and the first one is the
+          reassuring one. */}
+      {isError && (
+        <div className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          Could not load recorded activity:{" "}
+          {error instanceof Error ? error.message : "unknown error"}
+        </div>
+      )}
+
       <div className="bg-black rounded-lg p-4 font-mono text-sm max-h-[600px] overflow-y-auto">
         {events.length === 0 ? (
           <div className="text-gray-400 text-center py-8">
             {isLoading
               ? "Loading history..."
-              : "No recorded events match these filters"}
+              : isError
+                ? "History unavailable"
+                : "No recorded events match these filters"}
           </div>
         ) : (
           <div className="space-y-1">

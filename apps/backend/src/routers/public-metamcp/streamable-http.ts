@@ -918,9 +918,12 @@ streamableHttpRouter.post(
                 level: "info",
                 message: "client connected",
                 clientName: clientIdentity?.name,
-                // Carried into `gateway_events.session_id` so a session seen in
-                // the history can be joined to the `tool_call_audit` rows it
-                // produced — both columns hold the same MCP session id.
+                // Carried into `gateway_events.session_id` so the history says
+                // WHICH session a client opened, not merely that one was
+                // opened. Deliberately not described as a join key onto
+                // `tool_call_audit`: that column is filled from
+                // `handlerContext.sessionId`, which on the warm path still
+                // holds the pool's placeholder id for an idle-promoted server.
                 sessionId,
               });
             } catch (error) {

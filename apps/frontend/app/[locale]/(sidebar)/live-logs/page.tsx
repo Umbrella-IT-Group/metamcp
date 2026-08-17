@@ -24,6 +24,11 @@ import { useLogsStore } from "@/lib/stores/logs-store";
 // on the cheap view.
 type LogView = "live" | "history";
 
+// The history controls are literal English rather than i18n keys, matching
+// this page's pre-existing category-filter buttons. See the note at the top of
+// components/gateway-event-history.tsx for why half a namespace is worse than
+// none.
+
 // Read-only view. The "Clear logs" button and its confirm dialog were removed
 // with migration 0028's audit_log: they were the one admin gesture that
 // erased the live security view mid-investigation. See
@@ -217,7 +222,17 @@ export default function LiveLogsPage() {
         </CardHeader>
         {view === "history" ? (
           <CardContent className="space-y-3">
-            {roleLoaded && !isAdmin ? (
+            {/* Three states, not two. A FAILED session lookup leaves roleLoaded
+                false and isAdmin false, and without its own branch that case
+                mounts the history with the query disabled — which renders as an
+                empty result and reads as "nothing was recorded". It has to say
+                what actually happened and offer the retry. */}
+            {roleError ? (
+              <p className="text-sm text-destructive">
+                Could not confirm your role, so recorded activity was not
+                loaded. Use Refresh above to retry.
+              </p>
+            ) : roleLoaded && !isAdmin ? (
               <p className="text-sm text-muted-foreground">
                 Recorded activity is available to administrators only.
               </p>

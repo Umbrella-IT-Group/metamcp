@@ -9,7 +9,7 @@ import {
   GATEWAY_EVENT_PAGE_MAX,
 } from "@/lib/gateway-events/bounds";
 
-import { auditDb } from "../audit-db";
+import { gatewayEventsDb } from "../gateway-events-db";
 import { db } from "../index";
 import { gatewayEventsTable } from "../schema";
 
@@ -53,24 +53,26 @@ export interface GatewayEventListFilters {
 /**
  * Persistence for the gateway activity history (migration 0031).
  *
- * THREE METHODS, ON TWO DIFFERENT POOLS, AND THE SPLIT IS THE DESIGN.
+ * FOUR METHODS, ON TWO DIFFERENT POOLS, AND THE SPLIT IS THE DESIGN.
  *
- * `record()` writes through `auditDb` — the deliberately tiny two-connection
- * pool with a 1s checkout timeout (`../audit-db`). Every non-tool-call entry
- * that reaches the Live Logs ring buffer is also written here, and the busiest
- * of those is the connection category: a backend flapping in a reconnect loop
- * emits on every attempt. Sharing the main pool would let that churn contend
- * for the same ten connections the request path uses, which is the failure
- * mode `../audit-db` exists to prevent. Under saturation the write fails fast
- * and the caller drops the row — see `lib/gateway-events/sink`, which is the
- * only thing that should ever call this method.
+ * `record()` writes through `gatewayEventsDb` — a deliberately tiny
+ * two-connection pool with a 1s checkout timeout (`../gateway-events-db`).
+ * Every non-tool-call entry that reaches the Live Logs ring buffer is also
+ * written here, and the busiest of those are the connection retry loop and
+ * backend stderr: a crash-looping backend is a write firehose. Sharing the
+ * main pool would let that churn contend for the same ten connections the
+ * request path uses. Sharing the AUDIT pool would be worse still — read
+ * `../gateway-events-db` for why an operational firehose must not be able to
+ * cost the gateway a security-audit row. Under saturation the write fails fast
+ * and the caller drops it — see `lib/gateway-events/sink`, which is the only
+ * thing that should ever call this method.
  *
- * `pruneOlderThan()` and `list()` use the MAIN pool. Neither belongs on the
- * audit pool: the prune is a single bounded DELETE on a timer and the list is
- * an admin-only query, and putting either on a two-connection pool would let
- * one of them stall the writer it is supposed to be isolated from. The
- * isolation that matters runs one way — the hot write path must not be
- * starved — not both.
+ * `pruneOlderThan()`, `list()` and `listServerNames()` use the MAIN pool.
+ * None of them belongs on a two-connection budget: the prune is a bounded
+ * DELETE on a timer and the reads are admin-only queries, and putting any of
+ * them there would let one stall the writer it is supposed to be isolated
+ * from. The isolation that matters runs one way — the hot write path must not
+ * be starved — not both.
  *
  * IMMUTABILITY. There is no `update()` and there never should be; migration
  * 0031 refuses UPDATE and TRUNCATE at every row age, and refuses DELETE for
@@ -79,7 +81,7 @@ export interface GatewayEventListFilters {
  */
 export class GatewayEventsRepository {
   async record(entry: GatewayEventEntry): Promise<void> {
-    await auditDb.insert(gatewayEventsTable).values({
+    await gatewayEventsDb.insert(gatewayEventsTable).values({
       category: entry.category,
       level: entry.level ?? null,
       server_uuid: entry.server_uuid ?? null,
@@ -164,9 +166,19 @@ export class GatewayEventsRepository {
       );
     }
 
+    // The ceiling is PAGE_MAX + 1, not PAGE_MAX, and the difference is a bug
+    // that hid behind two clamps agreeing on the wrong number. The caller asks
+    // for one row MORE than the page it intends to return, using the extra row
+    // as evidence that a next page exists. Clamping here to PAGE_MAX made that
+    // probe unrepresentable at the largest page size — which is also the
+    // DEFAULT page size — so `rows.length > limit` was never true, the cursor
+    // was always null, and every row past the first page became unreachable.
+    // Silently skipping rows is precisely what the keyset design exists to
+    // prevent, so the probe row gets its own headroom rather than competing
+    // with the page for it.
     const limit = Math.min(
       Math.max(filters.limit ?? GATEWAY_EVENT_PAGE_MAX, 1),
-      GATEWAY_EVENT_PAGE_MAX,
+      GATEWAY_EVENT_PAGE_MAX + 1,
     );
 
     const rows = await db
@@ -181,23 +193,39 @@ export class GatewayEventsRepository {
     return rows as GatewayEventRow[];
   }
 
-  /** Distinct server names present in the window, for the history filter UI. */
-  async listServerNames(since: Date): Promise<string[]> {
+  /**
+   * Distinct server names present in the window, for the history filter UI.
+   *
+   * Bounded by BOTH ends of the window the rows came from, so the filter offers
+   * the servers that appear in what the operator is actually looking at rather
+   * than every server seen since `from`.
+   *
+   * ORDER BY inside the query, not only in JavaScript afterwards. The LIMIT is
+   * what makes it load-bearing: an unordered `SELECT DISTINCT ... LIMIT 200`
+   * returns an ARBITRARY 200 of however many distinct names exist, so past that
+   * count the filter would offer a different subset on each page load. Sorting
+   * in the database makes the truncation deterministic — always the first 200
+   * by name — and the JavaScript sort then only has to agree with it.
+   */
+  async listServerNames(since: Date, until?: Date | null): Promise<string[]> {
+    const conditions: SQL[] = [
+      gte(gatewayEventsTable.occurred_at, since),
+      sql`${gatewayEventsTable.server_name} IS NOT NULL`,
+    ];
+    if (until) {
+      conditions.push(lte(gatewayEventsTable.occurred_at, until));
+    }
+
     const rows = await db
       .selectDistinct({ server_name: gatewayEventsTable.server_name })
       .from(gatewayEventsTable)
-      .where(
-        and(
-          gte(gatewayEventsTable.occurred_at, since),
-          sql`${gatewayEventsTable.server_name} IS NOT NULL`,
-        ),
-      )
+      .where(and(...conditions))
+      .orderBy(gatewayEventsTable.server_name)
       .limit(GATEWAY_EVENT_PAGE_MAX);
 
     return rows
       .map((row) => row.server_name)
-      .filter((name): name is string => Boolean(name))
-      .sort((a, b) => a.localeCompare(b));
+      .filter((name): name is string => Boolean(name));
   }
 }
 
