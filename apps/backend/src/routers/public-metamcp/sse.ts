@@ -18,9 +18,12 @@ import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
+import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
 import {
   boundSessionMatches,
+  classifyBindingDenial,
   SessionBinding,
+  SessionBindingDenialReason,
   SessionLifetimeManager,
   SessionLifetimeManagerImpl,
 } from "../../lib/session-lifetime-manager";
@@ -48,10 +51,17 @@ function requestBinding(authReq: ApiKeyAuthenticatedRequest): SessionBinding {
  * consumer's stream.
  *
  * A missing session and a session owned by someone else both resolve to
- * `not_found` so the route's 404 never signals the id is live elsewhere;
- * `residentRefused` exists ONLY to drive the server-side warn log, never the
- * response shape. Takes the manager as a parameter so the guard is
- * unit-testable against a seeded manager (`sse.test.ts`).
+ * `not_found` so the route's 404 never signals the id is live elsewhere.
+ * `refusedReason` exists ONLY to drive the server-side warn log and audit row,
+ * never the response shape: it is non-null exactly when a session WAS resident
+ * and was refused, and null for a genuine miss. One field rather than a
+ * separate boolean plus a reason, so the fact of a refusal and its recorded
+ * cause cannot disagree.
+ *
+ * The resolver stays PURE — it emits nothing. The route below owns the audit
+ * row, because that is where the authenticated request lives; keeping the
+ * emission out of here is what lets `sse.test.ts` drive the guard against a
+ * seeded manager with no express harness and no postgres.
  */
 export function resolveSseMessageSession(
   manager: Pick<
@@ -62,15 +72,54 @@ export function resolveSseMessageSession(
   target: SessionBinding,
 ):
   | { outcome: "ok"; transport: Transport }
-  | { outcome: "not_found"; residentRefused: boolean } {
+  | { outcome: "not_found"; refusedReason: SessionBindingDenialReason | null } {
   const transport = manager.getSession(sessionId);
-  if (
-    !transport ||
-    !boundSessionMatches(manager.getSessionBinding(sessionId), target)
-  ) {
-    return { outcome: "not_found", residentRefused: transport !== undefined };
+  if (!transport) {
+    return { outcome: "not_found", refusedReason: null };
+  }
+  const binding = manager.getSessionBinding(sessionId);
+  if (!boundSessionMatches(binding, target)) {
+    return {
+      outcome: "not_found",
+      refusedReason: classifyBindingDenial(binding, target),
+    };
   }
   return { outcome: "ok", transport };
+}
+
+/**
+ * Record a refused `/message` — one durable audit row and one warn line, both
+ * under the SAME throttle decision. The streamable-http twin is
+ * `refuseBoundSession`.
+ *
+ * A stream-hijack attempt must leave something an operator can query, not just
+ * a log line: this fork treats `audit_log` as the stolen-key detector, and a
+ * refusal that only warns is invisible to it. The log is throttled alongside
+ * the row because this is output a REFUSED caller paces — one line per attempt
+ * turns an id sweep into a flood that buries the first line, the one worth
+ * reading.
+ *
+ * Exported as the route's test seam: the `/message` leg's session map is
+ * populated only by a real SSE stream-open, so driving the wiring end-to-end
+ * would need a live transport. This keeps the guard's emission testable
+ * without one, and keeps `resolveSseMessageSession` itself pure.
+ */
+export function refuseSseMessage(
+  authReq: ApiKeyAuthenticatedRequest,
+  sessionId: string,
+  reason: SessionBindingDenialReason,
+): void {
+  const { emitted, suppressed } = emitSessionBindingDenial(authReq, {
+    sessionId,
+    reason,
+  });
+  if (emitted) {
+    logger.warn(
+      `SSE message for session ${sessionId} on endpoint ${authReq.endpointName} ` +
+        `refused (${reason}). ` +
+        `${suppressed} similar refusal(s) suppressed since the last line.`,
+    );
+  }
 }
 
 const sseRouter = express.Router();
@@ -190,7 +239,6 @@ sseRouter.post(
   rateLimitMiddleware,
   async (req, res) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
-    const { endpointName } = authReq;
 
     try {
       const sessionId = req.query.sessionId as string;
@@ -202,11 +250,8 @@ sseRouter.post(
         requestBinding(authReq),
       );
       if (resolution.outcome === "not_found") {
-        if (resolution.residentRefused) {
-          logger.warn(
-            `SSE message for session ${sessionId} on endpoint ${endpointName} ` +
-              `rejected — session bound to a different endpoint or credential.`,
-          );
+        if (resolution.refusedReason) {
+          refuseSseMessage(authReq, sessionId, resolution.refusedReason);
         }
         res.status(404).end("Session not found");
         return;

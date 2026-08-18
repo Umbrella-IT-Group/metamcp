@@ -86,6 +86,38 @@ export function boundSessionMatches(
   );
 }
 
+/**
+ * Which half of the binding a refused lookup actually failed.
+ *
+ * The response never learns this — every refusal answers the same 404 — but
+ * the audit row does, and `detail.reason` is the field an operator queries to
+ * separate the classes. One hardcoded reason would report a credential
+ * mismatch for a plain cross-endpoint replay, i.e. record an event that did
+ * not happen, in a table migration 0028 makes append-only.
+ *
+ * Lives here, next to the predicate whose `false` it explains, so the two
+ * cannot drift: the ordering below mirrors `boundSessionMatches` exactly.
+ * PRECONDITION: only meaningful when `boundSessionMatches` already returned
+ * false for the same pair.
+ */
+export type SessionBindingDenialReason =
+  | "session_binding_absent"
+  | "session_endpoint_mismatch"
+  | "session_credential_mismatch";
+
+export function classifyBindingDenial(
+  binding: SessionBinding | undefined,
+  target: SessionBinding,
+): SessionBindingDenialReason {
+  // A resident session carrying no binding at all. Unreachable today — every
+  // `addSession` call site passes one — which is why it gets its own reason
+  // rather than being folded into the endpoint case it would otherwise
+  // misreport as.
+  if (binding === undefined) return "session_binding_absent";
+  if (!bindingMatches(binding, target)) return "session_endpoint_mismatch";
+  return "session_credential_mismatch";
+}
+
 export interface SessionLifetimeManager<T> {
   addSession(sessionId: string, session: T, binding?: SessionBinding): void;
   removeSession(sessionId: string): void;

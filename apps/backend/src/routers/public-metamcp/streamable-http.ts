@@ -12,11 +12,6 @@ import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
-import {
-  auditRequestContext,
-  credentialFingerprint,
-  emit,
-} from "../../lib/audit/audit-emitter";
 import { isAdminHealthRequest } from "../../lib/health-upstream";
 import { runWithM365UserContext } from "../../lib/m365/request-context";
 import {
@@ -39,12 +34,18 @@ import {
   resolveSessionIdentity,
 } from "../../lib/metamcp/session-auth";
 import {
+  emitSessionBindingDenial,
+  extractPresentedCredential,
+  type SessionDenialReason,
+} from "../../lib/metamcp/session-binding-denial";
+import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
 } from "../../lib/metamcp/transport-recovery-hydration";
 import {
   bindingMatches,
   boundSessionMatches,
+  classifyBindingDenial,
   SessionBinding,
   SessionLifetimeManagerImpl,
 } from "../../lib/session-lifetime-manager";
@@ -92,7 +93,14 @@ function requestBinding(authReq: ApiKeyAuthenticatedRequest): SessionBinding {
  *    (a client is told to fix its credential, not to start a new session) and
  *    tells the caller that the id it presented is real and belongs to someone
  *    else. The route funnels `refused` into the same 404 statement as a
- *    genuine miss, so the response cannot distinguish them.
+ *    genuine miss, so the response CONTENT cannot distinguish them.
+ *
+ * Content, not timing: `refused` returns from memory while a genuine miss
+ * spends a `mcpSessionsRepository.findById` round trip, so the two remain
+ * separable by latency. That is left open on purpose — closing it would mean
+ * burning a pointless query on every refusal, and the oracle it leaves is
+ * worth nothing against `randomUUID` session ids, which an attacker has to
+ * hold before the timing difference tells them anything.
  */
 export type BoundSessionResolution =
   | { outcome: "ok"; transport: StreamableHTTPServerTransport }
@@ -107,78 +115,47 @@ export function resolveBoundSession(
   if (!transport) {
     return { outcome: "absent" };
   }
-  if (
-    !boundSessionMatches(
-      sessionManager.getSessionBinding(sessionId),
-      requestBinding(authReq),
-    )
-  ) {
-    logger.warn(
-      `Session ${sessionId} presented on endpoint ${authReq.endpointName} ` +
-        `is bound to a different endpoint or credential — treating as not found.`,
+  const binding = sessionManager.getSessionBinding(sessionId);
+  const target = requestBinding(authReq);
+  if (!boundSessionMatches(binding, target)) {
+    refuseBoundSession(
+      sessionId,
+      authReq,
+      classifyBindingDenial(binding, target),
     );
-    emitSessionBindingDenial(sessionId, authReq);
     return { outcome: "refused" };
   }
   return { outcome: "ok", transport };
 }
 
 /**
- * Durable record of a refused session reuse.
+ * Record a refused session reuse — one durable audit row and one warn line,
+ * both under the SAME throttle decision.
  *
- * Reuses the existing `mcp.auth.denied` verb rather than inventing one: this
- * is a refused credential on the MCP data plane, which is exactly what that
- * action already covers in `api-key-oauth.middleware`, and `detail.reason` is
- * the field an operator queries to separate the classes. A new verb would need
- * every existing query to be widened before it could see this at all.
+ * The log line is throttled alongside the row rather than written per attempt
+ * for the reason the row is: this is output a REFUSED caller paces, and a warn
+ * per attempt turns an id-enumeration sweep into a log flood that buries the
+ * first line, which is the one worth reading. The suppressed count rides along
+ * so volume survives.
  *
- * `session_id` is recorded here even though this fork strips session ids from
- * logs, health payloads and client responses. Those are surfaces a consumer or
- * a passer-by can read; `audit_log` is not — `audit-log.repo` exposes `record()`
- * and nothing else, no tRPC procedure reads the table, and migration 0028 makes
- * it append-only. Without the id an operator can see that a session reuse was
- * refused but not which consumer's session was targeted, which is most of what
- * the row is for.
- *
- * Fire-and-forget through `emit`, which swallows every failure — a refusal must
- * be answered whether or not it can be recorded.
+ * Every refusal leg funnels through here so the reason recorded and the reason
+ * logged cannot disagree.
  */
-function emitSessionBindingDenial(
+function refuseBoundSession(
   sessionId: string,
   authReq: ApiKeyAuthenticatedRequest,
+  reason: SessionDenialReason,
 ): void {
-  try {
-    const requestContext = auditRequestContext(authReq);
-    const isOAuth = authReq.authMethod === "oauth";
-    emit({
-      actor_type: isOAuth
-        ? "user"
-        : authReq.apiKeyUuid
-          ? "api_key"
-          : "anonymous",
-      actor_id: (isOAuth ? authReq.oauthUserId : authReq.apiKeyUuid) ?? null,
-      actor_label: null,
-      actor_ip: requestContext.actor_ip,
-      actor_user_agent: requestContext.actor_user_agent,
-      action: "mcp.auth.denied",
-      target_type: "endpoint",
-      target_id: authReq.endpoint?.uuid ?? null,
-      outcome: "denied",
-      request_id: requestContext.request_id,
-      http_status: 404,
-      detail: {
-        reason: "session_credential_mismatch",
-        auth_method: authReq.authMethod ?? null,
-        endpoint_name: authReq.endpointName ?? null,
-        session_id: sessionId,
-        credential: credentialFingerprint(
-          extractRawTokenForPrincipal(authReq) ?? undefined,
-        ),
-      },
-    });
-  } catch {
-    // An audit failure must never change what this guard answers. Same
-    // contract as `emitMcpAuthDenial` in api-key-oauth.middleware.
+  const { emitted, suppressed } = emitSessionBindingDenial(authReq, {
+    sessionId,
+    reason,
+  });
+  if (emitted) {
+    logger.warn(
+      `Session ${sessionId} presented on endpoint ${authReq.endpointName} ` +
+        `refused (${reason}) — treating as not found. ` +
+        `${suppressed} similar refusal(s) suppressed since the last line.`,
+    );
   }
 }
 
@@ -203,6 +180,22 @@ function emitSessionBindingDenial(
  * state. Every non-deletable case collapses into the ONE `not_found` outcome,
  * so the route's single 404 response cannot reveal that the id is live and
  * owned by someone else.
+ *
+ * THE TWO BRANCHES DEFINE "SAME PRINCIPAL" DIFFERENTLY, and that asymmetry is
+ * accepted rather than accidental. In memory an OAuth session is bound to the
+ * USER id, so a connector that refreshed its 24h access token still owns its
+ * session. The persisted row cannot offer that: `mcp_sessions` stores only
+ * `auth_principal` (a one-way hash of the token) and `auth_method` — there is
+ * no user column to compare, and a user id is not recoverable from a SHA-256
+ * digest. So a rotated OAuth token cannot tear down its own session once the
+ * idle sweeper has reaped it: the DELETE answers 404 and the row survives to
+ * the `MCP_SESSION_TTL_DAYS` pruner. That is the same rule
+ * `recoverPersistedSession` has always applied — token rotation invalidates
+ * the recovery path, by design, so a revoked token cannot survive a restart —
+ * and the cost here is a lingering row plus a 404 on a teardown, never a live
+ * session left reachable by the wrong caller. Widening it would mean storing
+ * the user id alongside the hash, which is a schema change and a new thing to
+ * keep in sync, for a case whose worst outcome is one row aging out.
  */
 export async function resolveDeletableSession(
   sessionId: string,
@@ -211,12 +204,12 @@ export async function resolveDeletableSession(
   const target = requestBinding(authReq);
   const inMemoryTransport = sessionManager.getSession(sessionId);
   if (inMemoryTransport) {
-    if (
-      !boundSessionMatches(sessionManager.getSessionBinding(sessionId), target)
-    ) {
-      logger.warn(
-        `DELETE for session ${sessionId} on endpoint ${target.endpointName} ` +
-          `rejected — session bound to a different endpoint or credential.`,
+    const binding = sessionManager.getSessionBinding(sessionId);
+    if (!boundSessionMatches(binding, target)) {
+      refuseBoundSession(
+        sessionId,
+        authReq,
+        classifyBindingDenial(binding, target),
       );
       return { outcome: "not_found" };
     }
@@ -245,7 +238,7 @@ export async function resolveDeletableSession(
   ) {
     return { outcome: "not_found" };
   }
-  const rawToken = extractRawTokenForPrincipal(authReq);
+  const rawToken = extractPresentedCredential(authReq, authReq.endpoint);
   if (
     !rawToken ||
     stored.auth_method !== authMethodFromRequest(authReq) ||
@@ -254,9 +247,10 @@ export async function resolveDeletableSession(
       stored.auth_principal,
     )
   ) {
-    logger.warn(
-      `DELETE for session ${sessionId} on endpoint ${target.endpointName} ` +
-        `rejected — persisted session belongs to a different credential.`,
+    refuseBoundSession(
+      sessionId,
+      authReq,
+      "session_persisted_credential_mismatch",
     );
     return { outcome: "not_found" };
   }
@@ -415,35 +409,6 @@ function authMethodFromRequest(req: ApiKeyAuthenticatedRequest): AuthMethod {
   return req.authMethod === "oauth" ? "oauth" : "api_key";
 }
 
-/**
- * Extract the raw bearer token (or API key) the middleware authenticated
- * from. The middleware doesn't surface the matched token explicitly, so
- * we replay the same header lookup it used. Returns `null` when no
- * recognizable credential is present — the lazy-recovery path then
- * refuses recovery (a credential-less request can't reclaim a session).
- */
-function extractRawTokenForPrincipal(req: express.Request): string | null {
-  const apiKeyHeader = req.headers["x-api-key"];
-  if (typeof apiKeyHeader === "string" && apiKeyHeader.length > 0) {
-    return apiKeyHeader;
-  }
-  const authHeader = req.headers.authorization;
-  if (
-    typeof authHeader === "string" &&
-    authHeader.startsWith("Bearer ") &&
-    authHeader.length > 7
-  ) {
-    return authHeader.substring(7);
-  }
-  const queryToken =
-    (req.query.api_key as string | undefined) ||
-    (req.query.apikey as string | undefined);
-  if (queryToken) {
-    return queryToken;
-  }
-  return null;
-}
-
 // Fail-loud at boot if the SDK internals the recovery hydration depends
 // on changed shape across an upgrade. See transport-recovery-hydration.ts.
 assertRecoveryHydrationContract();
@@ -564,7 +529,7 @@ export async function recoverPersistedSession(
     return { status: "not_found" };
   }
 
-  const rawToken = extractRawTokenForPrincipal(authReq);
+  const rawToken = extractPresentedCredential(authReq, authReq.endpoint);
   if (!rawToken) {
     return { status: "auth_failed" };
   }
@@ -1140,7 +1105,7 @@ streamableHttpRouter.post(
         // recover this consumer's cached sessionId. Best-effort — a DB
         // outage during init shouldn't block the consumer; they'll just
         // lose the post-restart recovery path until the next init.
-        const rawToken = extractRawTokenForPrincipal(req);
+        const rawToken = extractPresentedCredential(req, authReq.endpoint);
         if (rawToken) {
           const authMethod = authMethodFromRequest(authReq);
           const principal = hashAuthPrincipal(rawToken, authMethod);

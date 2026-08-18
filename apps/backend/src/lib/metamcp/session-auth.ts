@@ -84,6 +84,20 @@ export interface SessionIdentity {
  *    binding to the token would force a re-initialize on every refresh for a
  *    caller who is plainly the same principal. The access-control question is
  *    "is this the same principal", and the user id answers exactly that.
+ *
+ * WHY A MISSING `authMethod` RESOLVES TO ANONYMOUS rather than to the
+ * never-matching identity `identityMatches` gives a null `credentialId` on an
+ * authenticated method. `anonymous` is not a fallback here, it is the answer
+ * for the one shape that legitimately has no method: an endpoint published
+ * through `ALLOW_UNAUTHENTICATED_ENDPOINTS`, where CONDITION 1 requires BOTH
+ * auth toggles off, so such an endpoint is either all-anonymous or
+ * all-credentialed and the two identities never meet on one endpoint. On a
+ * credentialed endpoint the case is unreachable: every success branch of
+ * `authenticateApiKey` stamps `authMethod` plus `apiKeyUuid` or `oauthUserId`
+ * before calling `next()`. That coupling is what makes this safe, so it is
+ * pinned directly rather than assumed — see
+ * `middleware/api-key-identity-stamp.test.ts`, which drives the real
+ * middleware and fails if a stamp is ever dropped.
  */
 export function resolveSessionIdentity(req: {
   authMethod?: AuthMethod;

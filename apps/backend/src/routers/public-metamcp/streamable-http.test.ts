@@ -146,6 +146,7 @@ import {
 } from "../../lib/metamcp/gateway-boot-id";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { hashAuthPrincipal } from "../../lib/metamcp/session-auth";
+import { __resetSessionDenialThrottleForTesting } from "../../lib/metamcp/session-binding-denial";
 import streamableHttpRouter, {
   buildSessionsHealthPayload,
   cleanupSession,
@@ -169,6 +170,11 @@ function fakeAuthReq(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The refusal throttle is module state shared by every test in this file.
+  // Without a reset, whether a given test sees its audit row depends on which
+  // (credential, endpoint) pairs earlier tests happened to refuse — the audit
+  // assertions below must pin the emitter, not the test ordering.
+  __resetSessionDenialThrottleForTesting();
   (mcpSessionsRepository.delete as ReturnType<typeof vi.fn>).mockResolvedValue(
     undefined,
   );
@@ -636,6 +642,80 @@ describe("resolveBoundSession — ownership guard on the in-memory lookup (cross
     expect(credential.last4).toBe("alue");
     expect(JSON.stringify(event)).not.toContain("the-other-key-value");
   });
+
+  it("audits a cross-endpoint replay as an ENDPOINT mismatch, not as a credential one", async () => {
+    // Sibling of the case above and the one the hardcoded reason got wrong:
+    // the SAME credential presenting the id on the WRONG endpoint. The
+    // response is byte-identical either way, so `detail.reason` is the only
+    // place these two classes are ever separable — and it is written to a
+    // table migration 0028 makes append-only.
+    const sessionId = "sess-endpoint-audited";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      resolveBoundSession(
+        sessionId,
+        fakeAuthReq({
+          namespaceUuid: "ns-B",
+          endpointName: "ep-B",
+          endpoint: { uuid: "ep-B-uuid" } as DatabaseEndpoint,
+          authMethod: "api_key",
+          apiKeyUuid: "key-A-uuid",
+          headers: { "x-api-key": "bound-key-value" },
+        }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].detail?.reason).toBe("session_endpoint_mismatch");
+    expect(events[0].detail?.session_id).toBe(sessionId);
+  });
+
+  it("collapses a burst of refusals from one credential into ONE row carrying the swallowed count", async () => {
+    // `audit_log` has no prune path (migration 0028), so an un-throttled row
+    // per attempt is permanent storage a REFUSED caller paces. Walking session
+    // ids is exactly the shape that would exploit it.
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      for (let i = 0; i < 30; i += 1) {
+        const sessionId = `sess-burst-${i}`;
+        await seedBoundSession(sessionId, "ns-A", "ep-A", {
+          apiKeyUuid: "key-A-uuid",
+        });
+        resolveBoundSession(
+          sessionId,
+          fakeAuthReq({
+            namespaceUuid: "ns-A",
+            endpointName: "ep-A",
+            endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+            authMethod: "api_key",
+            apiKeyUuid: "key-attacker-uuid",
+            headers: { "x-api-key": "attacker-key-value" },
+          }),
+        );
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].detail?.suppressed_since_last).toBe(0);
+  });
 });
 
 describe("resolveDeletableSession — ownership guard on the DELETE leg (round 2: guard was untested)", () => {
@@ -863,6 +943,91 @@ describe("resolveDeletableSession — ownership guard on the DELETE leg (round 2
     expect(cross).toEqual(absent);
     expect(foreign).toEqual(absent);
     expect(dbError).toEqual(absent);
+  });
+
+  it("audits the RESIDENT refusal — a sibling credential's teardown attempt leaves a queryable row", async () => {
+    const sessionId = "sess-del-audit-mem";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", owner);
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const resolution = await resolveDeletableSession(sessionId, {
+        ...siblingReq("ns-A", "ep-A"),
+        endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+      } as ApiKeyAuthenticatedRequest);
+      expect(resolution).toEqual({ outcome: "not_found" });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].action).toBe("mcp.auth.denied");
+    expect(events[0].http_status).toBe(404);
+    expect(events[0].detail?.reason).toBe("session_credential_mismatch");
+    expect(events[0].detail?.session_id).toBe(sessionId);
+    expect(events[0].actor_id).toBe("key-sibling-uuid");
+  });
+
+  it("audits the NOT-RESIDENT refusal — the reaped-session teardown attempt is not silent either", async () => {
+    // The sweeper preserves rows for reaped sessions by design, so this is a
+    // normal steady state, and `cleanupSession` would drop the row along with
+    // the session. A refusal here must be as visible as the resident one.
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const resolution = await resolveDeletableSession("sess-del-audit-row", {
+        ...siblingReq("ns-A", "ep-A"),
+        endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+      } as ApiKeyAuthenticatedRequest);
+      expect(resolution).toEqual({ outcome: "not_found" });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    // Distinct from the in-memory reasons: there is no binding to classify
+    // here, only the persisted principal hash.
+    expect(events[0].detail?.reason).toBe(
+      "session_persisted_credential_mismatch",
+    );
+    expect(events[0].detail?.session_id).toBe("sess-del-audit-row");
+  });
+
+  it("does NOT audit a genuine miss — only a refusal is worth a permanent row", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(null);
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const resolution = await resolveDeletableSession("sess-del-audit-miss", {
+        ...ownerReq("ns-A", "ep-A"),
+        endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+      } as ApiKeyAuthenticatedRequest);
+      expect(resolution).toEqual({ outcome: "not_found" });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(0);
   });
 });
 

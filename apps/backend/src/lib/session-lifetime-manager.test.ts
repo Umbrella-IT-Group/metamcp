@@ -24,6 +24,7 @@ import type { SessionIdentity } from "./metamcp/session-auth";
 import {
   bindingMatches,
   boundSessionMatches,
+  classifyBindingDenial,
   SessionLifetimeManagerImpl,
 } from "./session-lifetime-manager";
 
@@ -94,6 +95,70 @@ describe("boundSessionMatches — endpoint AND creating credential", () => {
     // It is still a distinct identity from any authenticated one.
     expect(boundSessionMatches({ ...anon }, target)).toBe(false);
     expect(boundSessionMatches({ ...target }, anon)).toBe(false);
+  });
+});
+
+describe("classifyBindingDenial — which half of the binding failed", () => {
+  const target = {
+    namespaceUuid: "ns-A",
+    endpointName: "ep-A",
+    identity: KEY_A,
+  };
+
+  it("names a cross-endpoint replay as an ENDPOINT mismatch, not a credential one", () => {
+    // The defect this classifier closes: a single hardcoded reason wrote
+    // `session_credential_mismatch` for a same-credential, wrong-endpoint
+    // replay — asserting an event that did not happen, in an append-only
+    // table, in the exact field an operator queries to tell them apart.
+    expect(
+      classifyBindingDenial({ ...target, endpointName: "ep-B" }, target),
+    ).toBe("session_endpoint_mismatch");
+    expect(
+      classifyBindingDenial({ ...target, namespaceUuid: "ns-B" }, target),
+    ).toBe("session_endpoint_mismatch");
+  });
+
+  it("names a same-endpoint foreign credential as a CREDENTIAL mismatch", () => {
+    expect(classifyBindingDenial({ ...target, identity: KEY_B }, target)).toBe(
+      "session_credential_mismatch",
+    );
+  });
+
+  it("names an anonymous caller on an authenticated session as a credential mismatch", () => {
+    const anon = { method: "anonymous" as const, credentialId: null };
+    expect(classifyBindingDenial({ ...target, identity: anon }, target)).toBe(
+      "session_credential_mismatch",
+    );
+  });
+
+  it("gives a resident session with NO binding its own reason", () => {
+    expect(classifyBindingDenial(undefined, target)).toBe(
+      "session_binding_absent",
+    );
+  });
+
+  it("classifies exactly the cases boundSessionMatches rejects, in the same order", () => {
+    // The classifier and the predicate must not drift: every input the
+    // predicate refuses gets a reason, and the endpoint half is decided
+    // first in both.
+    const refused = [
+      undefined,
+      { ...target, endpointName: "ep-B" },
+      { ...target, identity: KEY_B },
+      // Both halves wrong — the endpoint half is reported, matching the
+      // order boundSessionMatches evaluates them in.
+      { ...target, endpointName: "ep-B", identity: KEY_B },
+    ];
+    for (const binding of refused) {
+      expect(boundSessionMatches(binding, target)).toBe(false);
+      expect(classifyBindingDenial(binding, target)).toBeTruthy();
+    }
+    expect(
+      classifyBindingDenial(
+        { ...target, endpointName: "ep-B", identity: KEY_B },
+        target,
+      ),
+    ).toBe("session_endpoint_mismatch");
   });
 });
 

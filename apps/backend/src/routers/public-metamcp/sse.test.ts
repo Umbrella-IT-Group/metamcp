@@ -12,7 +12,7 @@
  * plus the express middlewares the router module pulls in at import time.
  */
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/logger", () => ({
   default: {
@@ -45,9 +45,14 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
   },
 }));
 
+import type { ApiKeyAuthenticatedRequest } from "@/middleware/api-key-oauth.middleware";
+
+import type { AuditEvent } from "../../lib/audit/audit-emitter";
+import { setAuditSinkForTesting } from "../../lib/audit/audit-emitter";
 import type { SessionIdentity } from "../../lib/metamcp/session-auth";
+import { __resetSessionDenialThrottleForTesting } from "../../lib/metamcp/session-binding-denial";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
-import { resolveSseMessageSession } from "./sse";
+import { refuseSseMessage, resolveSseMessageSession } from "./sse";
 
 const KEY_A: SessionIdentity = { method: "api_key", credentialId: "key-A" };
 const KEY_B: SessionIdentity = { method: "api_key", credentialId: "key-B" };
@@ -130,7 +135,7 @@ describe("resolveSseMessageSession — ownership guard on the /message leg", () 
     expect(resolution.outcome).toBe("not_found");
   });
 
-  it("shapes absent, cross-endpoint and foreign-credential identically for the response: same outcome, residentRefused drives ONLY the warn log", () => {
+  it("shapes absent, cross-endpoint and foreign-credential identically for the response: same outcome, refusedReason drives ONLY the warn log and audit row", () => {
     const { manager } = seededManager();
 
     const absent = resolveSseMessageSession(manager, "sess-never-seen", {
@@ -147,7 +152,7 @@ describe("resolveSseMessageSession — ownership guard on the /message leg", () 
     });
 
     // All three feed the route's single 404 branch — the response never
-    // learns WHICH not_found it was; only the log-only flag differs.
+    // learns WHICH not_found it was; only the log-only reason differs.
     expect(absent.outcome).toBe("not_found");
     expect(cross.outcome).toBe("not_found");
     expect(foreign.outcome).toBe("not_found");
@@ -156,9 +161,113 @@ describe("resolveSseMessageSession — ownership guard on the /message leg", () 
       cross.outcome === "not_found" &&
       foreign.outcome === "not_found"
     ) {
-      expect(absent.residentRefused).toBe(false);
-      expect(cross.residentRefused).toBe(true);
-      expect(foreign.residentRefused).toBe(true);
+      // Null means "genuine miss": nothing to record, nothing to warn about.
+      expect(absent.refusedReason).toBeNull();
+      // A cross-endpoint replay must NOT be recorded as a credential
+      // mismatch — the audit row is the operator's only way to separate the
+      // two classes after the fact.
+      expect(cross.refusedReason).toBe("session_endpoint_mismatch");
+      expect(foreign.refusedReason).toBe("session_credential_mismatch");
     }
+  });
+
+  it("reports a resident session with NO binding as its own reason, not as an endpoint mismatch", () => {
+    // Fail-closed and unreachable in production (every addSession call site
+    // passes a binding), but if it ever fires the row must say what actually
+    // happened rather than assert a mismatch that never occurred.
+    const manager = new SessionLifetimeManagerImpl<Transport>("SSE-test");
+    manager.addSession("sess-unbound", {
+      handlePostMessage: vi.fn(),
+    } as unknown as Transport);
+
+    const resolution = resolveSseMessageSession(manager, "sess-unbound", {
+      ...OWNER,
+    });
+    expect(resolution.outcome).toBe("not_found");
+    if (resolution.outcome === "not_found") {
+      expect(resolution.refusedReason).toBe("session_binding_absent");
+    }
+  });
+});
+
+describe("refuseSseMessage — the /message leg's durable record", () => {
+  const foreignReq = () =>
+    ({
+      headers: { "x-api-key": "sibling-key-value" },
+      query: {},
+      endpoint: { uuid: "ep-A-uuid" },
+      endpointName: "ep-A",
+      namespaceUuid: "ns-A",
+      authMethod: "api_key",
+      apiKeyUuid: "key-B-uuid",
+    }) as unknown as ApiKeyAuthenticatedRequest;
+
+  beforeEach(() => {
+    __resetSessionDenialThrottleForTesting();
+  });
+
+  it("writes an mcp.auth.denied row — an SSE hijack attempt is not log-only", async () => {
+    // Before this, the /message refusal emitted a warn and nothing else, so a
+    // cross-credential stream hijack attempt left nothing queryable in the one
+    // table this fork treats as the stolen-key detector.
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      refuseSseMessage(foreignReq(), "sess-1", "session_credential_mismatch");
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].action).toBe("mcp.auth.denied");
+    // Same 404 the response gives, so the row and the answer agree.
+    expect(events[0].http_status).toBe(404);
+    expect(events[0].detail?.reason).toBe("session_credential_mismatch");
+    expect(events[0].detail?.session_id).toBe("sess-1");
+    expect(events[0].actor_id).toBe("key-B-uuid");
+    expect(JSON.stringify(events[0])).not.toContain("sibling-key-value");
+  });
+
+  it("carries the endpoint-mismatch reason through unchanged", async () => {
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      refuseSseMessage(foreignReq(), "sess-1", "session_endpoint_mismatch");
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].detail?.reason).toBe("session_endpoint_mismatch");
+  });
+
+  it("collapses a burst from one credential into ONE row", async () => {
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      for (let i = 0; i < 20; i += 1) {
+        refuseSseMessage(
+          foreignReq(),
+          `sess-${i}`,
+          "session_credential_mismatch",
+        );
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
   });
 });
