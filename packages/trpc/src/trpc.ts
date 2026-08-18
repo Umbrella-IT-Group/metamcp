@@ -180,11 +180,16 @@ export function auditActor(ctx: BaseContext): AuditActor {
 //
 // errorFormatter strips `stack` from every error payload. @trpc/server only
 // attaches the stack when its `isDev` flag is on, and `isDev` defaults to
-// `process.env.NODE_ENV !== "production"` — which is always true in the
-// deployed gateway, because nothing in the container image or compose files
-// ever sets NODE_ENV. Every 4xx/5xx from a procedure built by this factory
-// therefore shipped an internal stack trace (absolute `/app/...` paths,
-// bundled dependency names and versions) to the caller.
+// `process.env.NODE_ENV !== "production"`, so whether a stack ships is a
+// property of the deployment rather than of this code. The image and the
+// compose files set no NODE_ENV themselves, but both compose files pass the
+// whole `.env` in through `env_file:` and `example.env` ships
+// `NODE_ENV=production` on its first line, so the flag is set on a quickstart
+// deployment derived from that file and unset on one that dropped the line.
+// On the second, every 4xx/5xx from a procedure built by this factory shipped
+// an internal stack trace (absolute `/app/...` paths, bundled dependency
+// names and versions) to the caller. Stripping it here is unconditional for
+// that reason: the payload does not depend on how the process was started.
 //
 // This mirrors the same formatter on the backend's own `initTRPC` instance
 // (apps/backend/src/trpc.ts). BOTH are needed: routers in this package are

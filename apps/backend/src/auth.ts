@@ -97,6 +97,50 @@ export const auth = betterAuth({
     },
   }),
   trustedOrigins,
+  // OFF EXPLICITLY, because it is currently off only by accident, and because
+  // turning it on in its default shape would be worse than leaving it off.
+  //
+  // better-auth defaults this to `enabled ?? isProduction`, so today the
+  // limiter is disabled purely because NODE_ENV is unset in the container. A
+  // deployment that picks up `NODE_ENV=production`, which `example.env` ships
+  // on its first line, would enable it as a side effect of an unrelated
+  // environment edit.
+  //
+  // WHY THAT WOULD BE A SELF-DoS. The key is `${ip}|${path}`, and better-auth
+  // resolves that ip from `x-forwarded-for` ONLY (its default
+  // `ipAddressHeaders`), never from `CF-Connecting-IP`. With no
+  // `trustedProxies` configured it accepts the header only when it carries
+  // exactly one entry, and behind this deployment's
+  // `client -> Cloudflare -> cloudflared -> Next.js rewrite -> express` chain
+  // it carries more, so the address resolves to null and the limiter falls
+  // back to the literal key `no-trusted-ip`: ONE shared bucket per path for
+  // every caller. It logs a warning once when that happens, so this is loud
+  // rather than silent, but the bucket is the problem either way. And the
+  // default rules are tighter than the headline 100-per-10s: better-auth
+  // applies a special rule of window 10s / max 3 to `/sign-in*`, `/sign-up*`,
+  // `/change-password*` and `/change-email*`. Three sign-in attempts per ten
+  // seconds, shared globally, means any single caller can lock everyone else
+  // out of signing in. An availability control an attacker can aim at other
+  // users is inverted, which is the same defect this fork's own failed-auth
+  // limiter had when it keyed on `req.ip`.
+  //
+  // WHAT THIS PIN DOES NOT DO, stated plainly because the honest gap matters
+  // more than the fix. It prevents that inversion; it does NOT add rate
+  // limiting to `/api/auth`. That surface is served by `routers/auth-relay.ts`
+  // calling `auth.handler` directly, and no limiter is mounted on it, so
+  // `/api/auth/sign-in` is unlimited today and stays unlimited after this
+  // line. The fork's own limiters cover other surfaces and not this one:
+  // `lib/auth-rate-limiter.ts` is wired into the lookup-endpoint, token and
+  // api-key-oauth paths, `routers/oauth/utils.ts` covers `/oauth/*`, and
+  // `middleware/trpc-rate-limit.middleware.ts` covers `/trpc`.
+  //
+  // The remedy is a per-caller-keyed limiter on the relay, keying on
+  // `CF-Connecting-IP` via `lib/client-ip` the way the other three already do,
+  // rather than enabling this one. Enabling this one instead would need
+  // `advanced.ipAddress.ipAddressHeaders` / `trustedProxies` set so the
+  // address resolves per caller; until that is done, on is strictly worse
+  // than off. Tracked as a follow-up.
+  rateLimit: { enabled: false },
   plugins: [
     // Add generic OAuth plugin for OIDC support
     ...(oidcProviders.length > 0
