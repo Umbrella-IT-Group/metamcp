@@ -37,6 +37,110 @@ export function hashAuthPrincipal(token: string, method: AuthMethod): string {
 }
 
 /**
+ * The identity a live in-memory session is bound to, alongside its endpoint.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM `hashAuthPrincipal`. The principal hash above
+ * guards the DB-backed recovery path, where the only thing the stored row can
+ * be compared against is the raw credential the caller just presented. The
+ * IN-MEMORY pool has a better source: `authenticateApiKey` has already resolved
+ * the credential to a row, so the session can be bound to WHO the caller is
+ * rather than to the exact secret they used.
+ *
+ * `anonymous` is a real member of the method set, not a hole. An endpoint
+ * published through `ALLOW_UNAUTHENTICATED_ENDPOINTS` has no credential on any
+ * request, so there is nothing to tell two callers apart and binding cannot
+ * invent it — every caller on such an endpoint shares one identity. That is the
+ * stated cost of the escape hatch, not a weakening of this check: it applies
+ * only where the operator has already declared the endpoint public.
+ */
+export type SessionIdentityMethod = AuthMethod | "anonymous";
+
+export interface SessionIdentity {
+  method: SessionIdentityMethod;
+  /**
+   * The api key's uuid, or the OAuth user's id. Null only for `anonymous` and
+   * for the defensive case where an authenticated method resolved no id at all.
+   */
+  credentialId: string | null;
+}
+
+/**
+ * Derive the session identity from an authenticated request.
+ *
+ * Structurally typed rather than taking `ApiKeyAuthenticatedRequest` so this
+ * module keeps its zero-dependency import graph (node:crypto only) — the
+ * express request shape satisfies it without this file knowing about express.
+ *
+ * GRANULARITY, which is a deliberate choice per auth method rather than an
+ * oversight:
+ *
+ *  - api_key -> the KEY uuid. Two keys owned by the same user are two
+ *    credentials, and one must not inherit the other's session. This is as
+ *    tight as the token hash in practice, since a key's secret is not
+ *    rotatable in place.
+ *
+ *  - oauth -> the USER id, deliberately NOT the token. An access token lives
+ *    24h and a connector refreshes it while holding the same `Mcp-Session-Id`;
+ *    binding to the token would force a re-initialize on every refresh for a
+ *    caller who is plainly the same principal. The access-control question is
+ *    "is this the same principal", and the user id answers exactly that.
+ *
+ * WHY A MISSING `authMethod` RESOLVES TO ANONYMOUS rather than to the
+ * never-matching identity `identityMatches` gives a null `credentialId` on an
+ * authenticated method. `anonymous` is not a fallback here, it is the answer
+ * for the one shape that legitimately has no method: an endpoint published
+ * through `ALLOW_UNAUTHENTICATED_ENDPOINTS`, where CONDITION 1 requires BOTH
+ * auth toggles off, so such an endpoint is either all-anonymous or
+ * all-credentialed and the two identities never meet on one endpoint. On a
+ * credentialed endpoint the case is unreachable: every success branch of
+ * `authenticateApiKey` stamps `authMethod` plus `apiKeyUuid` or `oauthUserId`
+ * before calling `next()`. That coupling is what makes this safe, so it is
+ * pinned directly rather than assumed — see
+ * `middleware/api-key-identity-stamp.test.ts`, which drives the real
+ * middleware and fails if a stamp is ever dropped.
+ */
+export function resolveSessionIdentity(req: {
+  authMethod?: AuthMethod;
+  apiKeyUuid?: string;
+  oauthUserId?: string;
+}): SessionIdentity {
+  if (req.authMethod === "api_key") {
+    return { method: "api_key", credentialId: req.apiKeyUuid ?? null };
+  }
+  if (req.authMethod === "oauth") {
+    return { method: "oauth", credentialId: req.oauthUserId ?? null };
+  }
+  return { method: "anonymous", credentialId: null };
+}
+
+/**
+ * True only when a presented identity is the one a session was created under.
+ *
+ * A missing stored identity never matches — a session with no recorded identity
+ * is treated as belonging to nobody rather than to everybody, the same
+ * fail-closed direction `bindingMatches` takes for a missing endpoint binding.
+ *
+ * A null `credentialId` on an AUTHENTICATED method never matches either, in
+ * both directions. That case means the middleware admitted a caller it could
+ * not name, which should be unreachable — every api-key branch stamps
+ * `apiKeyUuid` and every OAuth branch refuses a token with no user. Refusing it
+ * costs a re-initialize if it ever happens; matching it would make one
+ * unnameable session reusable by every other unnameable caller.
+ */
+export function identityMatches(
+  stored: SessionIdentity | undefined,
+  presented: SessionIdentity,
+): boolean {
+  if (!stored) return false;
+  if (stored.method !== presented.method) return false;
+  if (stored.method === "anonymous") return true;
+  return (
+    stored.credentialId !== null &&
+    stored.credentialId === presented.credentialId
+  );
+}
+
+/**
  * Constant-time compare of two hex-encoded principals. Returns true
  * only when both inputs are non-empty, hex-decodable, and byte-equal.
  *

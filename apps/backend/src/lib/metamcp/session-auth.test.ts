@@ -2,7 +2,12 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import { hashAuthPrincipal, principalMatches } from "./session-auth";
+import {
+  hashAuthPrincipal,
+  identityMatches,
+  principalMatches,
+  resolveSessionIdentity,
+} from "./session-auth";
 
 describe("hashAuthPrincipal", () => {
   it("returns a 64-char hex SHA-256 digest", () => {
@@ -72,5 +77,98 @@ describe("principalMatches", () => {
     // and "returns a boolean".
     const result = principalMatches(a, b);
     expect(typeof result).toBe("boolean");
+  });
+});
+
+describe("resolveSessionIdentity", () => {
+  it("resolves an api-key request to its KEY uuid, not its owner", () => {
+    expect(
+      resolveSessionIdentity({
+        authMethod: "api_key",
+        apiKeyUuid: "key-uuid-1",
+        oauthUserId: undefined,
+      }),
+    ).toEqual({ method: "api_key", credentialId: "key-uuid-1" });
+  });
+
+  it("resolves an OAuth request to its USER id, so a token refresh keeps the identity", () => {
+    expect(
+      resolveSessionIdentity({
+        authMethod: "oauth",
+        oauthUserId: "user-1",
+      }),
+    ).toEqual({ method: "oauth", credentialId: "user-1" });
+  });
+
+  it("resolves a request with no auth method to anonymous", () => {
+    expect(resolveSessionIdentity({})).toEqual({
+      method: "anonymous",
+      credentialId: null,
+    });
+  });
+
+  it("keeps the method but nulls the id when an authenticated request carries none", () => {
+    expect(resolveSessionIdentity({ authMethod: "api_key" })).toEqual({
+      method: "api_key",
+      credentialId: null,
+    });
+  });
+});
+
+describe("identityMatches", () => {
+  const keyA = { method: "api_key" as const, credentialId: "key-A" };
+
+  it("matches the same api key", () => {
+    expect(identityMatches(keyA, { ...keyA })).toBe(true);
+  });
+
+  it("rejects a different api key", () => {
+    expect(
+      identityMatches(keyA, { method: "api_key", credentialId: "key-B" }),
+    ).toBe(false);
+  });
+
+  it("rejects a different auth method even when the ids are equal", () => {
+    expect(
+      identityMatches(keyA, { method: "oauth", credentialId: "key-A" }),
+    ).toBe(false);
+  });
+
+  it("matches the same OAuth user across two different access tokens", () => {
+    // The identity is the user id precisely so a 24h token refresh does not
+    // force the connector to re-initialize its MCP session.
+    const stored = { method: "oauth" as const, credentialId: "user-1" };
+    expect(identityMatches(stored, { ...stored })).toBe(true);
+  });
+
+  it("rejects a different OAuth user", () => {
+    expect(
+      identityMatches(
+        { method: "oauth", credentialId: "user-1" },
+        { method: "oauth", credentialId: "user-2" },
+      ),
+    ).toBe(false);
+  });
+
+  it("treats a missing stored identity as belonging to nobody", () => {
+    expect(identityMatches(undefined, keyA)).toBe(false);
+  });
+
+  it("never matches an authenticated identity with no id, in either direction", () => {
+    const unnameable = { method: "api_key" as const, credentialId: null };
+    expect(identityMatches(unnameable, unnameable)).toBe(false);
+    expect(identityMatches(unnameable, keyA)).toBe(false);
+    expect(identityMatches(keyA, unnameable)).toBe(false);
+  });
+
+  it("matches anonymous to anonymous — an endpoint published without auth has no credential to bind to", () => {
+    const anon = { method: "anonymous" as const, credentialId: null };
+    expect(identityMatches(anon, anon)).toBe(true);
+  });
+
+  it("never matches anonymous against an authenticated identity", () => {
+    const anon = { method: "anonymous" as const, credentialId: null };
+    expect(identityMatches(anon, keyA)).toBe(false);
+    expect(identityMatches(keyA, anon)).toBe(false);
   });
 });

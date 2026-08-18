@@ -34,6 +34,7 @@ import type { Server } from "node:http";
 import { join } from "node:path";
 
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { DatabaseEndpoint } from "@repo/zod-types";
 // Value import, not `import type`: the /health/sessions gate tests below mount
 // the REAL router on a real socket, which needs express itself. The default
 // import still carries the `express.Request` / `express.Response` types the
@@ -133,6 +134,8 @@ import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 
+import type { AuditEvent } from "../../lib/audit/audit-emitter";
+import { setAuditSinkForTesting } from "../../lib/audit/audit-emitter";
 import type { M365UserContext } from "../../lib/m365/request-context";
 import { getM365UserContext } from "../../lib/m365/request-context";
 import type { CallerContext } from "../../lib/metamcp/caller-context-store";
@@ -143,14 +146,15 @@ import {
 } from "../../lib/metamcp/gateway-boot-id";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { hashAuthPrincipal } from "../../lib/metamcp/session-auth";
+import { __resetSessionDenialThrottleForTesting } from "../../lib/metamcp/session-binding-denial";
 import streamableHttpRouter, {
   buildSessionsHealthPayload,
   cleanupSession,
   dispatchTracked,
-  getBoundSession,
   publicSessionSweeper,
   reapIdleSession,
   recoverPersistedSession,
+  resolveBoundSession,
   resolveDeletableSession,
 } from "./streamable-http";
 
@@ -166,6 +170,11 @@ function fakeAuthReq(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The refusal throttle is module state shared by every test in this file.
+  // Without a reset, whether a given test sees its audit row depends on which
+  // (credential, endpoint) pairs earlier tests happened to refuse — the audit
+  // assertions below must pin the emitter, not the test ordering.
+  __resetSessionDenialThrottleForTesting();
   (mcpSessionsRepository.delete as ReturnType<typeof vi.fn>).mockResolvedValue(
     undefined,
   );
@@ -376,24 +385,38 @@ describe("dispatchTracked — in-flight guard around a long-lived dispatch (item
 });
 
 /**
- * Seed a session into the module's real `sessionManager` (bound to
- * ns/ep) by driving the recovery path — the same path production uses to
- * repopulate the in-memory map. Returns the seeded sessionId.
+ * Seed a session into the module's real `sessionManager` by driving the
+ * recovery path — the same path production uses to repopulate the in-memory
+ * map, and therefore the path that records the session's endpoint + identity
+ * binding. `creator` describes the credential the session is created UNDER;
+ * the persisted row is derived from it so recovery genuinely succeeds rather
+ * than being forced.
  */
 async function seedBoundSession(
   sessionId: string,
   namespaceUuid: string,
   endpointName: string,
+  creator: Partial<ApiKeyAuthenticatedRequest> = {},
 ): Promise<void> {
-  const rawToken = "bound-key-value";
+  const authMethod = creator.authMethod ?? "api_key";
+  const headers =
+    creator.headers ??
+    (authMethod === "oauth"
+      ? { authorization: "Bearer bound-token-value" }
+      : { "x-api-key": "bound-key-value" });
+  const apiKeyHeader = headers["x-api-key"];
+  const rawToken =
+    typeof apiKeyHeader === "string"
+      ? apiKeyHeader
+      : (headers.authorization as string).substring(7);
   (
     mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
   ).mockResolvedValueOnce({
     session_id: sessionId,
     namespace_uuid: namespaceUuid,
     endpoint_name: endpointName,
-    auth_principal: hashAuthPrincipal(rawToken, "api_key"),
-    auth_method: "api_key",
+    auth_principal: hashAuthPrincipal(rawToken, authMethod),
+    auth_method: authMethod,
     init_params: {},
     created_at: new Date(),
     last_seen_at: new Date(),
@@ -412,64 +435,321 @@ async function seedBoundSession(
     fakeAuthReq({
       namespaceUuid,
       endpointName,
-      authMethod: "api_key",
-      headers: { "x-api-key": rawToken },
+      ...creator,
+      authMethod,
+      headers,
     }),
   );
   expect(result.status).toBe("recovered");
 }
 
-describe("getBoundSession — endpoint-binding guard on the in-memory lookup (HIGH: cross-endpoint session replay)", () => {
-  it("returns the transport when the request targets the SAME endpoint the session is bound to", async () => {
+describe("resolveBoundSession — ownership guard on the in-memory lookup (cross-endpoint AND cross-credential session replay)", () => {
+  it("serves the transport when the request targets the SAME endpoint under the SAME credential", async () => {
     const sessionId = "sess-bound-match";
-    await seedBoundSession(sessionId, "ns-A", "ep-A");
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
 
-    const transport = getBoundSession(
+    const resolved = resolveBoundSession(
       sessionId,
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "api_key",
+        apiKeyUuid: "key-A-uuid",
+      }),
     );
-    expect(transport).toBeDefined();
+    expect(resolved.outcome).toBe("ok");
+    if (resolved.outcome === "ok") {
+      expect(resolved.transport).toBeDefined();
+    }
   });
 
-  it("returns undefined when a key for a DIFFERENT endpoint presents this session id (the replay attempt)", async () => {
+  it("refuses when a key for a DIFFERENT endpoint presents this session id (the cross-endpoint replay attempt)", async () => {
     const sessionId = "sess-bound-mismatch";
-    await seedBoundSession(sessionId, "ns-A", "ep-A");
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
 
     // Same live session id, but the caller is authenticated for endpoint B.
-    // The lookup must NOT hand them endpoint A's transport — it resolves to
-    // undefined so the route falls through to a 404, never signalling the id
-    // is live on ep-A.
-    const wrongEndpoint = getBoundSession(
+    // The lookup must NOT hand them endpoint A's transport.
+    const wrongEndpoint = resolveBoundSession(
       sessionId,
-      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+      fakeAuthReq({
+        namespaceUuid: "ns-B",
+        endpointName: "ep-B",
+        authMethod: "api_key",
+        apiKeyUuid: "key-A-uuid",
+      }),
     );
-    expect(wrongEndpoint).toBeUndefined();
+    expect(wrongEndpoint.outcome).toBe("refused");
 
     // A partial match (right namespace, wrong endpoint name) is still a miss.
-    const wrongName = getBoundSession(
+    const wrongName = resolveBoundSession(
       sessionId,
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-B" }),
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-B",
+        authMethod: "api_key",
+        apiKeyUuid: "key-A-uuid",
+      }),
     );
-    expect(wrongName).toBeUndefined();
+    expect(wrongName.outcome).toBe("refused");
   });
 
-  it("returns undefined for a session id that isn't resident in memory", () => {
-    const transport = getBoundSession(
+  it("reports `absent` for a session id that isn't resident in memory, so lazy recovery still runs", () => {
+    const resolved = resolveBoundSession(
       "sess-never-seen",
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "api_key",
+        apiKeyUuid: "key-A-uuid",
+      }),
     );
-    expect(transport).toBeUndefined();
+    expect(resolved.outcome).toBe("absent");
+  });
+
+  it("refuses a session created under api key A when key B presents its id on the SAME endpoint", async () => {
+    // The defect this guard closes: both keys authenticate for ep-A, so the
+    // endpoint half of the binding matched and the pooled transport was
+    // handed straight to B.
+    const sessionId = "sess-cred-replay";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
+
+    const foreign = resolveBoundSession(
+      sessionId,
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "api_key",
+        apiKeyUuid: "key-B-uuid",
+      }),
+    );
+    expect(foreign.outcome).toBe("refused");
+  });
+
+  it("refuses when an OAuth caller presents an api key's session id on the same endpoint", async () => {
+    const sessionId = "sess-cred-crossmethod";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
+
+    const foreign = resolveBoundSession(
+      sessionId,
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "oauth",
+        oauthUserId: "key-A-uuid",
+      }),
+    );
+    expect(foreign.outcome).toBe("refused");
+  });
+
+  it("keeps serving an OAuth caller whose access token was refreshed (identity is the user, not the token)", async () => {
+    // A connector refreshes its 24h access token while holding the same
+    // Mcp-Session-Id. Binding to the token would force a re-initialize on
+    // every refresh; binding to the user id does not.
+    const sessionId = "sess-oauth-refresh";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      authMethod: "oauth",
+      oauthUserId: "user-1",
+      headers: { authorization: "Bearer first-token" },
+    });
+
+    const afterRefresh = resolveBoundSession(
+      sessionId,
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "oauth",
+        oauthUserId: "user-1",
+        headers: { authorization: "Bearer second-token" },
+      }),
+    );
+    expect(afterRefresh.outcome).toBe("ok");
+  });
+
+  it("refuses when a DIFFERENT OAuth user presents the session id", async () => {
+    const sessionId = "sess-oauth-foreign-user";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      authMethod: "oauth",
+      oauthUserId: "user-1",
+      headers: { authorization: "Bearer first-token" },
+    });
+
+    const foreign = resolveBoundSession(
+      sessionId,
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "oauth",
+        oauthUserId: "user-2",
+        headers: { authorization: "Bearer other-users-token" },
+      }),
+    );
+    expect(foreign.outcome).toBe("refused");
+  });
+
+  it("writes an mcp.auth.denied audit row naming the presenting credential and the targeted session", async () => {
+    const sessionId = "sess-cred-audited";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      resolveBoundSession(
+        sessionId,
+        fakeAuthReq({
+          namespaceUuid: "ns-A",
+          endpointName: "ep-A",
+          endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+          authMethod: "api_key",
+          apiKeyUuid: "key-B-uuid",
+          headers: { "x-api-key": "the-other-key-value" },
+        }),
+      );
+      // emit() resolves its sink asynchronously; let the microtask queue drain.
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    const [event] = events;
+    expect(event.action).toBe("mcp.auth.denied");
+    expect(event.outcome).toBe("denied");
+    expect(event.http_status).toBe(404);
+    // The refusal names the caller who tried, not the session's owner.
+    expect(event.actor_type).toBe("api_key");
+    expect(event.actor_id).toBe("key-B-uuid");
+    expect(event.target_id).toBe("ep-A-uuid");
+    expect(event.detail?.reason).toBe("session_credential_mismatch");
+    expect(event.detail?.session_id).toBe(sessionId);
+    // The credential is fingerprinted, never stored.
+    const credential = event.detail?.credential as {
+      sha256: string | null;
+      last4: string | null;
+    };
+    expect(credential.last4).toBe("alue");
+    expect(JSON.stringify(event)).not.toContain("the-other-key-value");
+  });
+
+  it("audits a cross-endpoint replay as an ENDPOINT mismatch, not as a credential one", async () => {
+    // Sibling of the case above and the one the hardcoded reason got wrong:
+    // the SAME credential presenting the id on the WRONG endpoint. The
+    // response is byte-identical either way, so `detail.reason` is the only
+    // place these two classes are ever separable — and it is written to a
+    // table migration 0028 makes append-only.
+    const sessionId = "sess-endpoint-audited";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", {
+      apiKeyUuid: "key-A-uuid",
+    });
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      resolveBoundSession(
+        sessionId,
+        fakeAuthReq({
+          namespaceUuid: "ns-B",
+          endpointName: "ep-B",
+          endpoint: { uuid: "ep-B-uuid" } as DatabaseEndpoint,
+          authMethod: "api_key",
+          apiKeyUuid: "key-A-uuid",
+          headers: { "x-api-key": "bound-key-value" },
+        }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].detail?.reason).toBe("session_endpoint_mismatch");
+    expect(events[0].detail?.session_id).toBe(sessionId);
+  });
+
+  it("collapses a burst of refusals from one credential into ONE row carrying the swallowed count", async () => {
+    // `audit_log` has no prune path (migration 0028), so an un-throttled row
+    // per attempt is permanent storage a REFUSED caller paces. Walking session
+    // ids is exactly the shape that would exploit it.
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      for (let i = 0; i < 30; i += 1) {
+        const sessionId = `sess-burst-${i}`;
+        await seedBoundSession(sessionId, "ns-A", "ep-A", {
+          apiKeyUuid: "key-A-uuid",
+        });
+        resolveBoundSession(
+          sessionId,
+          fakeAuthReq({
+            namespaceUuid: "ns-A",
+            endpointName: "ep-A",
+            endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+            authMethod: "api_key",
+            apiKeyUuid: "key-attacker-uuid",
+            headers: { "x-api-key": "attacker-key-value" },
+          }),
+        );
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].detail?.suppressed_since_last).toBe(0);
   });
 });
 
-describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (round 2: guard was untested)", () => {
+describe("resolveDeletableSession — ownership guard on the DELETE leg (round 2: guard was untested)", () => {
+  /** The credential the sessions below are created under. */
+  const OWNER_TOKEN = "owner-key-value";
+  const ownerReq = (namespaceUuid: string, endpointName: string) =>
+    fakeAuthReq({
+      namespaceUuid,
+      endpointName,
+      authMethod: "api_key",
+      apiKeyUuid: "key-owner-uuid",
+      headers: { "x-api-key": OWNER_TOKEN },
+    });
+  /** A second credential that authenticates fine — for a different consumer. */
+  const siblingReq = (namespaceUuid: string, endpointName: string) =>
+    fakeAuthReq({
+      namespaceUuid,
+      endpointName,
+      authMethod: "api_key",
+      apiKeyUuid: "key-sibling-uuid",
+      headers: { "x-api-key": "sibling-key-value" },
+    });
+
   /** A persisted mcp_sessions row shaped like findById returns it. */
-  function storedRow(namespaceUuid: string, endpointName: string) {
+  function storedRow(
+    namespaceUuid: string,
+    endpointName: string,
+    rawToken = OWNER_TOKEN,
+  ) {
     return {
       session_id: "irrelevant",
       namespace_uuid: namespaceUuid,
       endpoint_name: endpointName,
-      auth_principal: "hash",
+      auth_principal: hashAuthPrincipal(rawToken, "api_key"),
       auth_method: "api_key",
       init_params: {},
       created_at: new Date(),
@@ -479,16 +759,21 @@ describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (
     };
   }
 
-  it("allows the delete when the IN-MEMORY session is bound to the requesting endpoint", async () => {
+  const owner: Partial<ApiKeyAuthenticatedRequest> = {
+    apiKeyUuid: "key-owner-uuid",
+    headers: { "x-api-key": OWNER_TOKEN },
+  };
+
+  it("allows the delete when the IN-MEMORY session belongs to the requesting endpoint AND credential", async () => {
     const sessionId = "sess-del-mem-match";
-    await seedBoundSession(sessionId, "ns-A", "ep-A");
+    await seedBoundSession(sessionId, "ns-A", "ep-A", owner);
     // Seeding itself goes through recoverPersistedSession -> findById;
     // reset call history so the assertion below sees ONLY the resolver.
     (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockClear();
 
     const resolution = await resolveDeletableSession(
       sessionId,
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+      ownerReq("ns-A", "ep-A"),
     );
     expect(resolution).toEqual({ outcome: "deletable" });
     // The in-memory branch never needs the DB.
@@ -497,23 +782,37 @@ describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (
 
   it("refuses (not_found) when the in-memory session is bound to a DIFFERENT endpoint — cross-endpoint teardown DoS", async () => {
     const sessionId = "sess-del-mem-cross";
-    await seedBoundSession(sessionId, "ns-A", "ep-A");
+    await seedBoundSession(sessionId, "ns-A", "ep-A", owner);
 
     const resolution = await resolveDeletableSession(
       sessionId,
-      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+      ownerReq("ns-B", "ep-B"),
     );
     expect(resolution).toEqual({ outcome: "not_found" });
   });
 
-  it("allows the delete when the session is NOT resident but the persisted row matches the endpoint (findById branch)", async () => {
+  it("refuses (not_found) when a SIBLING credential on the same endpoint tries to tear the session down", async () => {
+    // `cleanupSession` also drops the mcp_sessions row, so an unguarded
+    // DELETE lets any second key on the endpoint end another consumer's
+    // session AND its recovery path with nothing but the session id.
+    const sessionId = "sess-del-mem-sibling";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", owner);
+
+    const resolution = await resolveDeletableSession(
+      sessionId,
+      siblingReq("ns-A", "ep-A"),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("allows the delete when the session is NOT resident but the persisted row matches endpoint AND credential (findById branch)", async () => {
     (
       mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
     ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
 
     const resolution = await resolveDeletableSession(
       "sess-del-row-match",
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+      ownerReq("ns-A", "ep-A"),
     );
     expect(resolution).toEqual({ outcome: "deletable" });
   });
@@ -525,7 +824,58 @@ describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (
 
     const resolution = await resolveDeletableSession(
       "sess-del-row-cross",
-      fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" }),
+      ownerReq("ns-B", "ep-B"),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("refuses (not_found) when the persisted row belongs to another CREDENTIAL on the same endpoint", async () => {
+    // The sweeper preserves rows for reaped sessions by design, so the
+    // not-resident branch is a normal state rather than an edge case — and
+    // an endpoint check alone would leave exactly those sessions deletable
+    // by any sibling key.
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-row-sibling",
+      siblingReq("ns-A", "ep-A"),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("refuses (not_found) when the persisted row was created under a different auth METHOD", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-row-method",
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "oauth",
+        oauthUserId: "user-1",
+        headers: { authorization: `Bearer ${OWNER_TOKEN}` },
+      }),
+    );
+    expect(resolution).toEqual({ outcome: "not_found" });
+  });
+
+  it("refuses (not_found) when the request carries no recognizable credential at all", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const resolution = await resolveDeletableSession(
+      "sess-del-row-nocred",
+      fakeAuthReq({
+        namespaceUuid: "ns-A",
+        endpointName: "ep-A",
+        authMethod: "api_key",
+        apiKeyUuid: "key-owner-uuid",
+      }),
     );
     expect(resolution).toEqual({ outcome: "not_found" });
   });
@@ -537,7 +887,7 @@ describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (
 
     const resolution = await resolveDeletableSession(
       "sess-del-absent",
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+      ownerReq("ns-A", "ep-A"),
     );
     expect(resolution).toEqual({ outcome: "not_found" });
   });
@@ -549,35 +899,135 @@ describe("resolveDeletableSession — endpoint-binding guard on the DELETE leg (
 
     const resolution = await resolveDeletableSession(
       "sess-del-db-error",
-      fakeAuthReq({ namespaceUuid: "ns-A", endpointName: "ep-A" }),
+      ownerReq("ns-A", "ep-A"),
     );
     expect(resolution).toEqual({ outcome: "not_found" });
   });
 
-  it("404-shaping: absent, cross-endpoint, and lookup-failure produce IDENTICAL resolutions — the response cannot distinguish them", async () => {
-    const target = fakeAuthReq({ namespaceUuid: "ns-B", endpointName: "ep-B" });
+  it("404-shaping: absent, cross-endpoint, foreign-credential and lookup-failure produce IDENTICAL resolutions — the response cannot distinguish them", async () => {
+    const crossTarget = ownerReq("ns-B", "ep-B");
 
     (
       mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
     ).mockResolvedValueOnce(null);
-    const absent = await resolveDeletableSession("sess-shape-absent", target);
+    const absent = await resolveDeletableSession(
+      "sess-shape-absent",
+      crossTarget,
+    );
 
     (
       mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
     ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
-    const cross = await resolveDeletableSession("sess-shape-cross", target);
+    const cross = await resolveDeletableSession(
+      "sess-shape-cross",
+      crossTarget,
+    );
+
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+    const foreign = await resolveDeletableSession(
+      "sess-shape-foreign",
+      siblingReq("ns-A", "ep-A"),
+    );
 
     (
       mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
     ).mockRejectedValueOnce(new Error("boom"));
-    const dbError = await resolveDeletableSession("sess-shape-db", target);
+    const dbError = await resolveDeletableSession("sess-shape-db", crossTarget);
 
     // One outcome, zero variants — the route's single 404 site sees the
-    // same object shape for all three, so the id being live elsewhere is
-    // unobservable from the response.
+    // same object shape for all four, so the id being live and owned by
+    // someone else is unobservable from the response.
     expect(absent).toEqual({ outcome: "not_found" });
     expect(cross).toEqual(absent);
+    expect(foreign).toEqual(absent);
     expect(dbError).toEqual(absent);
+  });
+
+  it("audits the RESIDENT refusal — a sibling credential's teardown attempt leaves a queryable row", async () => {
+    const sessionId = "sess-del-audit-mem";
+    await seedBoundSession(sessionId, "ns-A", "ep-A", owner);
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const resolution = await resolveDeletableSession(sessionId, {
+        ...siblingReq("ns-A", "ep-A"),
+        endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+      } as ApiKeyAuthenticatedRequest);
+      expect(resolution).toEqual({ outcome: "not_found" });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].action).toBe("mcp.auth.denied");
+    expect(events[0].http_status).toBe(404);
+    expect(events[0].detail?.reason).toBe("session_credential_mismatch");
+    expect(events[0].detail?.session_id).toBe(sessionId);
+    expect(events[0].actor_id).toBe("key-sibling-uuid");
+  });
+
+  it("audits the NOT-RESIDENT refusal — the reaped-session teardown attempt is not silent either", async () => {
+    // The sweeper preserves rows for reaped sessions by design, so this is a
+    // normal steady state, and `cleanupSession` would drop the row along with
+    // the session. A refusal here must be as visible as the resident one.
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(storedRow("ns-A", "ep-A"));
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const resolution = await resolveDeletableSession("sess-del-audit-row", {
+        ...siblingReq("ns-A", "ep-A"),
+        endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+      } as ApiKeyAuthenticatedRequest);
+      expect(resolution).toEqual({ outcome: "not_found" });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(1);
+    // Distinct from the in-memory reasons: there is no binding to classify
+    // here, only the persisted principal hash.
+    expect(events[0].detail?.reason).toBe(
+      "session_persisted_credential_mismatch",
+    );
+    expect(events[0].detail?.session_id).toBe("sess-del-audit-row");
+  });
+
+  it("does NOT audit a genuine miss — only a refusal is worth a permanent row", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(null);
+
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const resolution = await resolveDeletableSession("sess-del-audit-miss", {
+        ...ownerReq("ns-A", "ep-A"),
+        endpoint: { uuid: "ep-A-uuid" } as DatabaseEndpoint,
+      } as ApiKeyAuthenticatedRequest);
+      expect(resolution).toEqual({ outcome: "not_found" });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+
+    expect(events).toHaveLength(0);
   });
 });
 
@@ -1237,8 +1687,12 @@ describe("caller binding — the POST route stamps the instance it serves", () =
   it("re-stamps the pooled instance on a subsequent POST rather than leaving the initialize request's values", async () => {
     // Seed a live in-memory session so the request takes the existing-session
     // branch rather than falling into lazy recovery (which has its own stamp).
+    // Seeded under the SAME api key the mocked auth chain stamps, or the
+    // ownership guard would answer 404 before any stamping happened.
     const sessionId = "sess-route-existing";
-    await seedBoundSession(sessionId, "ns-1", "ep-1");
+    await seedBoundSession(sessionId, "ns-1", "ep-1", {
+      apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000004",
+    });
 
     // The state the bug produces: values frozen at session creation.
     instance.handlerContext = {
@@ -1259,6 +1713,214 @@ describe("caller binding — the POST route stamps the instance it serves", () =
       callerIp: "203.0.113.7",
       requestId: "req-route",
     });
+    await cleanupSession(sessionId);
+  });
+});
+
+/**
+ * Route-level proof over a REAL socket that the ownership guard's ANSWER is
+ * the one the MCP Streamable HTTP session model calls for.
+ *
+ * The resolver unit tests above pin `refused`; these pin what the routes do
+ * with it, and that is the half a reader is most likely to get wrong. Letting
+ * a refused reuse fall through to lazy recovery — the shape the code had when
+ * the guard was endpoint-only — produces a 401 from the stored-principal
+ * check instead of a 404: it tells the caller their credential is wrong rather
+ * than that the session is gone, so a spec-conformant client never
+ * re-initializes, and it confirms to anyone probing session ids that the one
+ * they guessed is live and belongs to someone else.
+ */
+describe("POST/GET /:endpoint/mcp — a refused session reuse answers 404, not 401", () => {
+  let server: Server;
+  let baseUrl = "";
+
+  /** The credential the mocked auth chain stamps; mutated per test. */
+  let currentKeyUuid = "key-owner-uuid";
+
+  beforeAll(async () => {
+    vi.mocked(lookupEndpoint).mockImplementation(((
+      req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => {
+      Object.assign(req, {
+        namespaceUuid: "ns-guard",
+        endpointName: "ep-guard",
+        endpoint: { uuid: "ep-guard-uuid", name: "ep-guard" },
+        authMethod: "api_key",
+        apiKeyUuid: currentKeyUuid,
+        auditRequestId: "req-guard",
+        auditClientIp: "203.0.113.9",
+      });
+      next();
+    }) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+    vi.mocked(rateLimitMiddleware).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+
+    const app = express();
+    app.use("/metamcp", streamableHttpRouter);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (typeof address === "object" && address) {
+      baseUrl = `http://127.0.0.1:${address.port}`;
+    }
+  });
+
+  afterAll(async () => {
+    vi.mocked(lookupEndpoint).mockImplementation((() => undefined) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(
+      (() => undefined) as never,
+    );
+    vi.mocked(rateLimitMiddleware).mockImplementation(
+      (() => undefined) as never,
+    );
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  beforeEach(() => {
+    currentKeyUuid = "key-owner-uuid";
+  });
+
+  const post = (sessionId: string) =>
+    fetch(`${baseUrl}/metamcp/ep-guard/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+
+  it("answers 404 + the reinitialize header when a sibling key presents another consumer's session id", async () => {
+    const sessionId = "sess-route-foreign";
+    await seedBoundSession(sessionId, "ns-guard", "ep-guard", {
+      apiKeyUuid: "key-owner-uuid",
+    });
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockClear();
+    // Arm the persisted row the session really has. This is the production
+    // state — every credentialed session persists one — and it is what makes
+    // the assertions below bite: reaching recovery with this row present
+    // fails the stored-principal check and answers 401.
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
+      session_id: sessionId,
+      namespace_uuid: "ns-guard",
+      endpoint_name: "ep-guard",
+      auth_principal: hashAuthPrincipal("bound-key-value", "api_key"),
+      auth_method: "api_key",
+      init_params: {},
+      created_at: new Date(),
+      last_seen_at: new Date(),
+      gateway_boot_id: GATEWAY_BOOT_ID,
+      capability_hash: GATEWAY_CAPABILITY_HASH,
+    });
+
+    currentKeyUuid = "key-sibling-uuid";
+    const response = await post(sessionId);
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Mcp-Session-Reinitialize-Required")).toBe(
+      "true",
+    );
+    // Recovery is never attempted for a refused reuse — that is what would
+    // have turned this into a 401.
+    expect(mcpSessionsRepository.findById).not.toHaveBeenCalled();
+    // The refused caller never reaches the pooled instance either.
+    expect(metaMcpServerPool.getServerInstance).not.toHaveBeenCalled();
+
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockReset();
+    await cleanupSession(sessionId);
+  });
+
+  it("byte-identical to a genuine miss: the refused body carries no hint the id is live", async () => {
+    const sessionId = "sess-route-shape";
+    await seedBoundSession(sessionId, "ns-guard", "ep-guard", {
+      apiKeyUuid: "key-owner-uuid",
+    });
+
+    currentKeyUuid = "key-sibling-uuid";
+    const refused = await post(sessionId);
+    const refusedBody = await refused.text();
+
+    // A session id that never existed, same caller, same route.
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(null);
+    const missing = await post("sess-route-never-existed");
+    const missingBody = await missing.text();
+
+    expect(refused.status).toBe(missing.status);
+    // Only the timestamp differs between the two envelopes.
+    const strip = (body: string) =>
+      body.replace(/"timestamp":"[^"]*"/, '"timestamp":"<ts>"');
+    expect(strip(refusedBody)).toBe(strip(missingBody));
+    expect(refusedBody).not.toContain(sessionId);
+
+    await cleanupSession(sessionId);
+  });
+
+  it("still serves the OWNER of the session on the same route", async () => {
+    const sessionId = "sess-route-owner";
+    await seedBoundSession(sessionId, "ns-guard", "ep-guard", {
+      apiKeyUuid: "key-owner-uuid",
+    });
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockClear();
+    (
+      metaMcpServerPool.getServerInstance as ReturnType<typeof vi.fn>
+    ).mockReturnValueOnce({
+      server: { connect: vi.fn() },
+      cleanup: vi.fn(),
+      handlerContext: {} as Record<string, unknown>,
+    });
+
+    const response = await post(sessionId);
+
+    // The transport itself refuses the body (no MCP handshake was performed
+    // in this harness), so the status is the transport's business. What is
+    // under test is that the guard let the request THROUGH: the route only
+    // reaches the pooled instance after the guard passes, and it never
+    // answered the reinitialize 404.
+    expect(response.status).not.toBe(404);
+    expect(metaMcpServerPool.getServerInstance).toHaveBeenCalledWith(sessionId);
+    expect(mcpSessionsRepository.findById).not.toHaveBeenCalled();
+
+    await cleanupSession(sessionId);
+  });
+
+  it("GET (the standalone notification stream) refuses a foreign credential the same way", async () => {
+    const sessionId = "sess-route-get-foreign";
+    await seedBoundSession(sessionId, "ns-guard", "ep-guard", {
+      apiKeyUuid: "key-owner-uuid",
+    });
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockClear();
+
+    currentKeyUuid = "key-sibling-uuid";
+    const response = await fetch(`${baseUrl}/metamcp/ep-guard/mcp`, {
+      method: "GET",
+      headers: {
+        accept: "text/event-stream",
+        "mcp-session-id": sessionId,
+      },
+    });
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Mcp-Session-Reinitialize-Required")).toBe(
+      "true",
+    );
+    expect(mcpSessionsRepository.findById).not.toHaveBeenCalled();
+
     await cleanupSession(sessionId);
   });
 });

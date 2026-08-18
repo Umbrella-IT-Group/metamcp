@@ -17,23 +17,51 @@ import {
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
+import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
+import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
 import {
-  bindingMatches,
+  boundSessionMatches,
+  classifyBindingDenial,
   SessionBinding,
+  SessionBindingDenialReason,
   SessionLifetimeManager,
   SessionLifetimeManagerImpl,
 } from "../../lib/session-lifetime-manager";
 
 /**
- * Pure resolver for the `/message` leg's endpoint-binding guard — the SSE
- * twin of streamable-http's `getBoundSession`. The message must target the
- * SAME endpoint the SSE stream was opened on: resolving by sessionId alone
- * would let a caller authenticated for endpoint A post messages into
- * endpoint B's transport. A missing session and a cross-endpoint session
- * both resolve to `not_found` so the route's 404 never signals the id is
- * live elsewhere; `crossEndpoint` exists ONLY to drive the server-side
- * warn log, never the response shape. Takes the manager as a parameter so
- * the guard is unit-testable against a seeded manager (`sse.test.ts`).
+ * The full binding a request presents — endpoint plus the identity
+ * `authenticateApiKey` resolved for it. The SSE twin of streamable-http's
+ * `requestBinding`.
+ */
+function requestBinding(authReq: ApiKeyAuthenticatedRequest): SessionBinding {
+  return {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+    identity: resolveSessionIdentity(authReq),
+  };
+}
+
+/**
+ * Pure resolver for the `/message` leg's ownership guard — the SSE twin of
+ * streamable-http's `resolveBoundSession`. The message must target the SAME
+ * endpoint the SSE stream was opened on AND come from the credential that
+ * opened it: resolving by sessionId alone would let a caller authenticated for
+ * endpoint A post messages into endpoint B's transport, and — on any endpoint
+ * reachable by more than one credential — let one consumer post into another
+ * consumer's stream.
+ *
+ * A missing session and a session owned by someone else both resolve to
+ * `not_found` so the route's 404 never signals the id is live elsewhere.
+ * `refusedReason` exists ONLY to drive the server-side warn log and audit row,
+ * never the response shape: it is non-null exactly when a session WAS resident
+ * and was refused, and null for a genuine miss. One field rather than a
+ * separate boolean plus a reason, so the fact of a refusal and its recorded
+ * cause cannot disagree.
+ *
+ * The resolver stays PURE — it emits nothing. The route below owns the audit
+ * row, because that is where the authenticated request lives; keeping the
+ * emission out of here is what lets `sse.test.ts` drive the guard against a
+ * seeded manager with no express harness and no postgres.
  */
 export function resolveSseMessageSession(
   manager: Pick<
@@ -44,21 +72,86 @@ export function resolveSseMessageSession(
   target: SessionBinding,
 ):
   | { outcome: "ok"; transport: Transport }
-  | { outcome: "not_found"; crossEndpoint: boolean } {
+  | { outcome: "not_found"; refusedReason: SessionBindingDenialReason | null } {
   const transport = manager.getSession(sessionId);
-  if (
-    !transport ||
-    !bindingMatches(manager.getSessionBinding(sessionId), target)
-  ) {
-    return { outcome: "not_found", crossEndpoint: transport !== undefined };
+  if (!transport) {
+    return { outcome: "not_found", refusedReason: null };
+  }
+  const binding = manager.getSessionBinding(sessionId);
+  if (!boundSessionMatches(binding, target)) {
+    return {
+      outcome: "not_found",
+      refusedReason: classifyBindingDenial(binding, target),
+    };
   }
   return { outcome: "ok", transport };
+}
+
+/**
+ * Record a refused `/message` — one durable audit row and one warn line, both
+ * under the SAME throttle decision. The streamable-http twin is
+ * `refuseBoundSession`.
+ *
+ * A stream-hijack attempt must leave something an operator can query, not just
+ * a log line: this fork treats `audit_log` as the stolen-key detector, and a
+ * refusal that only warns is invisible to it. The log is throttled alongside
+ * the row because this is output a REFUSED caller paces — one line per attempt
+ * turns an id sweep into a flood that buries the first line, the one worth
+ * reading.
+ *
+ * Exported so the emission can be asserted directly, and so
+ * `resolveSseMessageSession` can stay pure. That alone does not pin the route:
+ * a test that only calls this function is still green once the route stops
+ * calling it, which is why `__seedSseSessionForTesting` below exists.
+ */
+export function refuseSseMessage(
+  authReq: ApiKeyAuthenticatedRequest,
+  sessionId: string,
+  reason: SessionBindingDenialReason,
+): void {
+  const { emitted, suppressed } = emitSessionBindingDenial(authReq, {
+    sessionId,
+    reason,
+  });
+  if (emitted) {
+    logger.warn(
+      `SSE message for session ${sessionId} on endpoint ${authReq.endpointName} ` +
+        `refused (${reason}). ` +
+        `${suppressed} similar refusal(s) suppressed since the last line.`,
+    );
+  }
 }
 
 const sseRouter = express.Router();
 
 // Session lifetime manager for SSE sessions
 const sessionManager = new SessionLifetimeManagerImpl<Transport>("SSE");
+
+/**
+ * Put a bound session into the module's REAL map — tests only. The
+ * streamable-http twin is `recoverPersistedSession`, which tests can drive
+ * because recovery is a production entry point; SSE has no equivalent, since
+ * the only production writer of this map is a live stream-open needing a real
+ * transport and a real pooled server.
+ *
+ * Without this seam the `/message` route is unreachable from a test: the guard
+ * always resolves "absent", which carries a null `refusedReason` and so skips
+ * the refusal branch entirely. That left the branch's wiring unpinned — the
+ * route's `refuseSseMessage` call could be deleted and the suite stayed green,
+ * meaning nothing would catch the SSE leg silently going back to log-only.
+ */
+export function __seedSseSessionForTesting(
+  sessionId: string,
+  transport: Transport,
+  binding?: SessionBinding,
+): void {
+  sessionManager.addSession(sessionId, transport, binding);
+}
+
+/** Companion seam: drop a seeded session without running cleanup side effects. */
+export function __removeSseSessionForTesting(sessionId: string): void {
+  sessionManager.removeSession(sessionId);
+}
 
 // Cleanup function for a specific session
 const cleanupSession = async (sessionId: string, transport?: Transport) => {
@@ -139,12 +232,15 @@ sseRouter.get(
         clientIdentity?.name,
       );
 
-      // Bind the session to the endpoint it was opened on so the message leg
-      // below can reject a sessionId replayed against a different endpoint.
-      sessionManager.addSession(sessionId, webAppTransport, {
-        namespaceUuid,
-        endpointName,
-      });
+      // Bind the session to the endpoint it was opened on AND to the
+      // credential that opened it, so the message leg below can reject a
+      // sessionId replayed against a different endpoint or presented by a
+      // different consumer.
+      sessionManager.addSession(
+        sessionId,
+        webAppTransport,
+        requestBinding(authReq),
+      );
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -169,22 +265,19 @@ sseRouter.post(
   rateLimitMiddleware,
   async (req, res) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
-    const { namespaceUuid, endpointName } = authReq;
 
     try {
       const sessionId = req.query.sessionId as string;
 
-      // Endpoint-binding guard — see resolveSseMessageSession's doc comment.
-      const resolution = resolveSseMessageSession(sessionManager, sessionId, {
-        namespaceUuid,
-        endpointName,
-      });
+      // Ownership guard — see resolveSseMessageSession's doc comment.
+      const resolution = resolveSseMessageSession(
+        sessionManager,
+        sessionId,
+        requestBinding(authReq),
+      );
       if (resolution.outcome === "not_found") {
-        if (resolution.crossEndpoint) {
-          logger.warn(
-            `SSE message for session ${sessionId} on endpoint ${endpointName} ` +
-              `rejected — session bound to a different endpoint.`,
-          );
+        if (resolution.refusedReason) {
+          refuseSseMessage(authReq, sessionId, resolution.refusedReason);
         }
         res.status(404).end("Session not found");
         return;
