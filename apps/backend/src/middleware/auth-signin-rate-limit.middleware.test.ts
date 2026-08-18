@@ -352,6 +352,79 @@ describe("sign-in rate limit — path matching", () => {
     );
   });
 
+  /**
+   * Every spelling here is one the RELAY resolves to the credential path, so
+   * matching it is not over-matching — it is the only way the limiter and
+   * `routers/auth-relay` answer the same question. The relay rebuilds the
+   * request with `new URL(req.url, ...)`, and that parser resolves dot
+   * segments (percent-encoded ones included) and reads a backslash as a
+   * slash, so each of these arrives at better-auth as
+   * `/api/auth/sign-in/email`. Before the normaliser resolved them the same
+   * way, each was an unbounded and unaudited sign-in path.
+   */
+  it("cannot be dodged by dot segments the relay resolves away", () => {
+    const dodges = [
+      "/api/auth/x/../sign-in/email",
+      "/api/auth/./sign-in/email",
+      "/api/auth/x/%2e%2e/sign-in/email",
+      "/api/auth/x/%2E%2E/sign-in/email",
+      "/api/auth/%2e/sign-in/email",
+      "/api/auth/x/.%2e/sign-in/email",
+      "/api/auth/x/y/../../sign-in/email",
+    ];
+    for (const path of dodges) {
+      expect(
+        new URL(path, "http://localhost").pathname,
+        `${path} is only worth matching because the relay resolves it`,
+      ).toBe(SIGN_IN);
+      expect(isCredentialSignInRequest("POST", path), path).toBe(true);
+    }
+  });
+
+  it("cannot be dodged by a backslash the relay reads as a slash", () => {
+    const dodges = [
+      "/api/auth\\sign-in/email",
+      "/api/auth/sign-in\\email",
+      "/api/auth/x/..\\sign-in/email",
+      "/api\\auth\\sign-in\\email",
+    ];
+    for (const path of dodges) {
+      expect(
+        new URL(path, "http://localhost").pathname,
+        `${path} is only worth matching because the relay resolves it`,
+      ).toBe(SIGN_IN);
+      expect(isCredentialSignInRequest("POST", path), path).toBe(true);
+    }
+  });
+
+  /**
+   * The normaliser resolves the path with the WHATWG URL parser, which THROWS
+   * on a protocol-relative input with an empty or malformed host. This runs
+   * ahead of the relay on every request, so a throw would be a 500 — and on
+   * `POST /\` a 500 in place of the 404 the route answers today. The rewrites
+   * that make a leading `//` unreachable are what prevent it; these are the
+   * shapes that would reach the authority state without them.
+   */
+  it("answers rather than throwing on a path that is not a URL", () => {
+    const hostile = [
+      "/\\",
+      "/\\evil",
+      "/\\?x",
+      "/\t/e]",
+      "/\t\\",
+      "//",
+      "///",
+      "/api/auth/sign-in/email%",
+      "/api/auth/sign-in/email%zz",
+      "/api/auth/sign-in/em ail",
+      "",
+      "/",
+    ];
+    for (const path of hostile) {
+      expect(() => isCredentialSignInRequest("POST", path), path).not.toThrow();
+    }
+  });
+
   it("refuses a respelled path through the middleware too", () => {
     const middleware = createAuthSigninRateLimitMiddleware({
       limiter: new AuthRateLimiter(1, 60_000),
@@ -364,6 +437,26 @@ describe("sign-in rate limit — path matching", () => {
     // budget.
     expect(
       call(middleware, request({ clientIp, path: `${SIGN_IN}/` })).statusCode,
+    ).toBe(429);
+  });
+
+  it("refuses a dot-segment dodge through the middleware too", () => {
+    const middleware = createAuthSigninRateLimitMiddleware({
+      limiter: new AuthRateLimiter(1, 60_000),
+    });
+    const clientIp = "203.0.113.7";
+
+    // Spend the budget on the canonical spelling...
+    call(middleware, request({ clientIp }));
+
+    // ...and the traversal spelling lands in the SAME bucket rather than
+    // buying a fresh one, which is what "the limiter and the relay agree"
+    // has to mean at the middleware boundary and not only in the matcher.
+    expect(
+      call(
+        middleware,
+        request({ clientIp, path: "/api/auth/x/../sign-in/email" }),
+      ).statusCode,
     ).toBe(429);
   });
 });

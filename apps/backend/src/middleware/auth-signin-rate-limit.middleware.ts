@@ -248,23 +248,64 @@ export const CREDENTIAL_SIGN_IN_PATHS: ReadonlySet<string> = new Set([
 /**
  * Compare a request path against that set.
  *
- * Repeated slashes are collapsed and a trailing one dropped, and the comparison
- * is case-insensitive. Over-matching is the safe direction here: a variant
- * spelling that this server would answer with a 404 costs a rate-limit bucket
- * entry and nothing else, whereas under-matching is a bypass, and neither
- * express nor better-auth promises the same normalisation this middleware would
- * otherwise have to assume.
+ * THIS HAS TO NORMALISE THE WAY THE RELAY DOES, and that is the whole design
+ * constraint. `routers/auth-relay` does not forward the raw path: it rebuilds
+ * the request with `new URL(req.url, ...)` and hands better-auth
+ * `url.pathname`. That is the WHATWG URL parser, which RESOLVES DOT SEGMENTS
+ * and TREATS A BACKSLASH AS A SLASH. So a comparison here against the
+ * unresolved `req.path` is a different question from the one the relay
+ * answers, and every spelling where the two disagree is a bypass:
+ * `POST /api/auth/x/../sign-in/email` and `POST /api/auth\sign-in/email` both
+ * reach better-auth as `/api/auth/sign-in/email` while an unresolved match
+ * sees a path that is not in the set and waves the attempt through — unbounded,
+ * and unaudited too, because `lib/audit/auth-relay-audit` keys off the same
+ * raw `req.path`. Resolving with the same parser the relay uses is what keeps
+ * the two in step; a hand-rolled segment walker would have to re-derive
+ * `%2e`, `.%2e` and backslash handling and would drift from it again.
+ *
+ * The three rewrites BEFORE that parse are ordered, and each is load-bearing:
+ *
+ *  - Tab, LF and CR are dropped because the URL parser drops them too, and it
+ *    does so BEFORE parsing — so leaving them in lets `/<tab>/host` reach the
+ *    parser as `//host`.
+ *  - Backslashes fold to slashes so the collapse below sees them.
+ *  - Runs of slashes collapse LAST, once nothing can turn into a slash again.
+ *
+ * Together they guarantee the string handed to the parser cannot begin with
+ * `//`, which is what makes this call TOTAL: a leading `//` is a
+ * protocol-relative URL, the parser reads what follows as a HOST, and an empty
+ * or malformed one THROWS. On this path a throw would be a 500 on the sign-in
+ * route, so the input is shaped such that the parser stays in path state,
+ * which has no failure mode, rather than being wrapped in a catch that would
+ * have to guess an answer.
+ *
+ * Over-matching is the safe direction for what remains: a variant spelling
+ * that this server would answer with a 404 costs a rate-limit bucket entry and
+ * nothing else, whereas under-matching is a bypass, and neither express nor
+ * better-auth promises the normalisation this middleware would otherwise have
+ * to assume. That is why the comparison is also case-insensitive and drops a
+ * trailing slash, neither of which the relay does.
  */
 export function isCredentialSignInRequest(
   method: string,
   path: string,
 ): boolean {
   if (method.toUpperCase() !== "POST") return false;
-  const collapsed = path.replace(/\/{2,}/g, "/").toLowerCase();
+  const collapsed = path
+    .replace(/[\t\n\r]/g, "")
+    .replace(/\\/g, "/")
+    .replace(/\/{2,}/g, "/");
+  // The origin is a throwaway: only `pathname` is read from it. It is here
+  // because a path on its own is a relative reference and needs some base to
+  // resolve against.
+  const resolved = new URL(
+    collapsed,
+    "http://localhost",
+  ).pathname.toLowerCase();
   const normalized =
-    collapsed.length > 1 && collapsed.endsWith("/")
-      ? collapsed.slice(0, -1)
-      : collapsed;
+    resolved.length > 1 && resolved.endsWith("/")
+      ? resolved.slice(0, -1)
+      : resolved;
   return CREDENTIAL_SIGN_IN_PATHS.has(normalized);
 }
 
