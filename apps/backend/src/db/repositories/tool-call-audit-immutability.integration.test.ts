@@ -192,6 +192,13 @@ let toolCallAuditRepository: (typeof import("./tool-call-audit.repo"))["toolCall
 describeIfDb("tool_call_audit against a REAL postgres", () => {
   const youngMarker = `itest-young-${Date.now()}`;
   const oldMarker = `itest-old-${Date.now()}`;
+  // Shared by the retention-floor pair below, which seeds in one test and
+  // asserts across both. Per-run values, because in-window rows from earlier
+  // runs CANNOT be cleaned up — that is the property under test — so any
+  // assertion counting rows has to be scoped to this run or it starts failing
+  // the second time the suite meets the same database.
+  const midWindowMarker = `itest-midwindow-${Date.now()}`;
+  const agedMarker = `itest-aged-${Date.now()}`;
 
   beforeAll(async () => {
     if (!TEST_DATABASE_URL) return;
@@ -376,8 +383,6 @@ describeIfDb("tool_call_audit against a REAL postgres", () => {
     // `pruneOlderThan(1)`; only the young one is refused. The aged one is the
     // assertion that matters, because it is the row that a "retention is just
     // shorter" reading would expect to disappear.
-    const midWindowMarker = `itest-midwindow-${Date.now()}`;
-    const agedMarker = `itest-aged-${Date.now()}`;
     await db.execute(
       `INSERT INTO tool_call_audit (called_at, server_name, tool_name, success) VALUES
          (now() - interval '10 days',  '${midWindowMarker}', 'in_window_tool', true),
@@ -422,12 +427,12 @@ describeIfDb("tool_call_audit against a REAL postgres", () => {
     ).resolves.toBeUndefined();
 
     const aged = await db.execute(
-      `SELECT uuid FROM tool_call_audit WHERE tool_name = 'aged_tool'` as never,
+      `SELECT uuid FROM tool_call_audit WHERE server_name = '${agedMarker}'` as never,
     );
     expect(aged.rows).toHaveLength(0);
 
     const inWindow = await db.execute(
-      `SELECT uuid FROM tool_call_audit WHERE tool_name = 'in_window_tool'` as never,
+      `SELECT uuid FROM tool_call_audit WHERE server_name = '${midWindowMarker}'` as never,
     );
     expect(inWindow.rows).toHaveLength(1);
   });
