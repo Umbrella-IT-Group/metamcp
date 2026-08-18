@@ -22,6 +22,10 @@ export const createAppRouter = (implementations: {
       apiKeys: frontendRouters.apiKeys,
       config: frontendRouters.config,
       logs: frontendRouters.logs,
+      // Access groups (migration 0033): which OAuth users may reach which
+      // endpoints. Listed here for the reason stated above — wiring the
+      // implementations into `createFrontendRouter` is NOT enough to mount it.
+      accessGroups: frontendRouters.accessGroups,
     }),
   });
 };

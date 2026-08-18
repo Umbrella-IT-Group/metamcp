@@ -107,6 +107,12 @@ export const EndpointSchema = z.object({
   clientMaxRateStrategyKey: z.string().optional(),
   enable_oauth: z.boolean(),
   use_query_param_auth: z.boolean(),
+  // Access-group gate for OAuth callers (migration 0033). Read-only on this
+  // schema: it is not settable through create/update, only through the
+  // dedicated `accessGroups.setEndpointRestricted` mutation, so that flipping a
+  // live endpoint's authorization posture is its own attributable act rather
+  // than a field that can ride along in an unrelated rename.
+  restricted: z.boolean(),
   created_at: z.string(),
   updated_at: z.string(),
   user_id: z.string().nullable(),
@@ -257,6 +263,13 @@ export const DatabaseEndpointSchema = z.object({
   client_max_rate_strategy_key: z.string().nullable().optional(),
   enable_oauth: z.boolean(),
   use_query_param_auth: z.boolean(),
+  // REQUIRED, not optional, and that is the point. `middleware/api-key-oauth`
+  // reads this off the endpoint row the lookup middleware stamped on the
+  // request, and every repository read projects columns explicitly — so an
+  // optional field here would let a projection that forgot `restricted` compile
+  // and then fail OPEN at runtime, admitting an OAuth caller to an endpoint an
+  // operator had switched on. Required makes that a type error at the read site.
+  restricted: z.boolean(),
   created_at: z.date(),
   updated_at: z.date(),
   user_id: z.string().nullable(),

@@ -11,6 +11,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 
+import { EndpointAccessSection } from "@/components/endpoint-access-section";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -655,6 +656,12 @@ export function EditEndpoint({
                 </div>
               )}
             </div>
+
+            {/* Access groups (migration 0033). Rendered only for an endpoint
+                that already exists, and only for an administrator — the section
+                writes through its own mutation rather than this form, so there
+                is nothing for it to do on a record that has no uuid yet. */}
+            {endpoint && <EndpointAccessSection endpointUuid={endpoint.uuid} />}
           </div>
 
           <DialogFooter>

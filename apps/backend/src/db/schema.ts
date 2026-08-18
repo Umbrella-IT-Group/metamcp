@@ -19,6 +19,7 @@ import {
   jsonb,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   unique,
@@ -313,6 +314,16 @@ export const endpointsTable = pgTable(
     require_scoped_api_key: boolean("require_scoped_api_key")
       .notNull()
       .default(false),
+    // Access-group gate for OAUTH callers (migration 0033). When true, an
+    // OAuth-authenticated user reaches this endpoint only if they are an
+    // administrator or belong to a group mapped to it — see
+    // `lib/endpoint-access-control`. API-key callers are deliberately
+    // unaffected: a key is admin-minted and already carries its own
+    // per-endpoint scoping (`require_scoped_api_key` above, migration 0023).
+    //
+    // Default false = today's behaviour, which is what lets this ship without
+    // locking any live connector out while the groups are still being drawn up.
+    restricted: boolean("restricted").notNull().default(false),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -903,5 +914,84 @@ export const gatewayEventsTable = pgTable(
       table.category,
       table.occurred_at.desc(),
     ),
+  ],
+);
+
+// Named access groups (migration 0033): which OAuth users may reach which
+// endpoints.
+//
+// Deliberately shaped like namespaces — a named, reusable set that users join
+// and endpoints are mapped to — rather than as a per-user allow-list on the
+// endpoint row. The operator's estate has more endpoints than it has distinct
+// audiences, so the set is the thing worth naming: adding a person to
+// "helpdesk" is one row, while an allow-list per endpoint would be one row per
+// endpoint per person and would drift the moment an endpoint is added.
+//
+// Enforcement lives in `lib/endpoint-access-control` and is applied on the
+// OAuth branches of `middleware/api-key-oauth.middleware`.
+export const accessGroupsTable = pgTable("access_groups", {
+  uuid: uuid("uuid").primaryKey().defaultRandom(),
+  // Globally unique: the name is how an operator refers to a group in the UI
+  // and in an audit row's `detail`, so two groups sharing one makes both the
+  // screen and the record ambiguous. No user scoping, unlike namespaces —
+  // groups are gateway-level authorization configuration, administered only by
+  // administrators, so there is no per-owner space for names to live in.
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  created_at: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const accessGroupMembersTable = pgTable(
+  "access_group_members",
+  {
+    group_uuid: uuid("group_uuid")
+      .notNull()
+      .references(() => accessGroupsTable.uuid, { onDelete: "cascade" }),
+    // `users.id` is text (better-auth owns the id format), not uuid.
+    user_id: text("user_id")
+      .notNull()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    created_at: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // The pair IS the row's identity — there is nothing else to record about a
+    // membership — so the composite PK is both the key and the uniqueness
+    // guarantee, and a repeated add conflicts instead of granting twice.
+    primaryKey({
+      name: "access_group_members_pkey",
+      columns: [table.group_uuid, table.user_id],
+    }),
+    // The PK covers group-first scans (the admin UI listing one group's
+    // members). The authorization path starts from the USER, whose leading
+    // column the PK cannot serve.
+    index("access_group_members_user_id_idx").on(table.user_id),
+  ],
+);
+
+export const accessGroupEndpointsTable = pgTable(
+  "access_group_endpoints",
+  {
+    group_uuid: uuid("group_uuid")
+      .notNull()
+      .references(() => accessGroupsTable.uuid, { onDelete: "cascade" }),
+    endpoint_uuid: uuid("endpoint_uuid")
+      .notNull()
+      .references(() => endpointsTable.uuid, { onDelete: "cascade" }),
+    created_at: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      name: "access_group_endpoints_pkey",
+      columns: [table.group_uuid, table.endpoint_uuid],
+    }),
+    // Same reasoning as the members index: the authorization path filters on
+    // endpoint_uuid, which is the PK's trailing column.
+    index("access_group_endpoints_endpoint_uuid_idx").on(table.endpoint_uuid),
   ],
 );
