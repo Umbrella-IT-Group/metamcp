@@ -1643,6 +1643,24 @@ describe("POST/GET /:endpoint/mcp — a refused session reuse answers 404, not 4
       apiKeyUuid: "key-owner-uuid",
     });
     (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockClear();
+    // Arm the persisted row the session really has. This is the production
+    // state — every credentialed session persists one — and it is what makes
+    // the assertions below bite: reaching recovery with this row present
+    // fails the stored-principal check and answers 401.
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
+      session_id: sessionId,
+      namespace_uuid: "ns-guard",
+      endpoint_name: "ep-guard",
+      auth_principal: hashAuthPrincipal("bound-key-value", "api_key"),
+      auth_method: "api_key",
+      init_params: {},
+      created_at: new Date(),
+      last_seen_at: new Date(),
+      gateway_boot_id: GATEWAY_BOOT_ID,
+      capability_hash: GATEWAY_CAPABILITY_HASH,
+    });
 
     currentKeyUuid = "key-sibling-uuid";
     const response = await post(sessionId);
@@ -1657,6 +1675,7 @@ describe("POST/GET /:endpoint/mcp — a refused session reuse answers 404, not 4
     // The refused caller never reaches the pooled instance either.
     expect(metaMcpServerPool.getServerInstance).not.toHaveBeenCalled();
 
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockReset();
     await cleanupSession(sessionId);
   });
 

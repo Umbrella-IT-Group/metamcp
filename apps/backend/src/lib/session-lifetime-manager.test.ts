@@ -80,6 +80,21 @@ describe("boundSessionMatches — endpoint AND creating credential", () => {
   it("rejects a missing binding entirely", () => {
     expect(boundSessionMatches(undefined, target)).toBe(false);
   });
+
+  it("still shares a session between anonymous callers on an endpoint published without auth", () => {
+    // ALLOW_UNAUTHENTICATED_ENDPOINTS puts every caller on the same identity
+    // because there is no credential to tell them apart. Refusing here would
+    // break that escape hatch outright rather than narrowing it.
+    const anon = {
+      namespaceUuid: "ns-A",
+      endpointName: "ep-A",
+      identity: { method: "anonymous" as const, credentialId: null },
+    };
+    expect(boundSessionMatches({ ...anon }, anon)).toBe(true);
+    // It is still a distinct identity from any authenticated one.
+    expect(boundSessionMatches({ ...anon }, target)).toBe(false);
+    expect(boundSessionMatches({ ...target }, anon)).toBe(false);
+  });
 });
 
 describe("SessionLifetimeManagerImpl — binding storage", () => {
