@@ -13,8 +13,9 @@ import logger from "@/utils/logger";
  * `packages/trpc/src/trpc.ts` or the backend's own) was on that path, and
  * nothing else was: the response was written by Express's built-in final
  * handler, which serialises `err.stack` whenever NODE_ENV is not
- * "production". This image and its compose files set no NODE_ENV of their
- * own, though both compose files pass the whole `.env` in through
+ * "production". The production `Dockerfile` and the two root compose files
+ * set no NODE_ENV of their own (`.devcontainer/Dockerfile` does, to
+ * `development`), though both compose files pass the whole `.env` in through
  * `env_file:` and `example.env` ships `NODE_ENV=production` on its first
  * line, so that branch is live on any deployment whose `.env` lacks the
  * line and dead on one that kept it. Where it was live, what an

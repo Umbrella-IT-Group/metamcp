@@ -111,19 +111,29 @@ describe("migration 0032 — the DDL that makes the window real", () => {
     expect((sql.match(/DROP TRIGGER IF EXISTS/g) ?? []).length).toBe(3);
   });
 
-  it("leaves the 90-day pruner room, so retention never trips the window", () => {
-    // The coupling this migration depends on, pinned in the direction that
-    // can break it. `pruneOlderThan` deletes rows STRICTLY OLDER than its
-    // cutoff, and the cutoff is TOOL_AUDIT_RETENTION_DAYS (default 90) back
-    // from now. Lower that default under the trigger's window and every prune
-    // starts raising instead of pruning.
+  it("leaves the pruner room, so retention can never trip the window", () => {
+    // The coupling this migration depends on, pinned in the direction that can
+    // break it. `pruneOlderThan` deletes rows STRICTLY OLDER than its cutoff,
+    // and the cutoff is TOOL_AUDIT_RETENTION_DAYS back from now. Let that
+    // value land inside the window and every prune raises and rolls back, so
+    // the floor is what keeps the two from ever meeting.
+    const retention = readFileSync(
+      path.resolve(__dirname, "../../lib/tool-audit-retention.ts"),
+      "utf8",
+    );
+    expect(retention).toContain("TOOL_AUDIT_RETENTION_FLOOR_DAYS = 30");
+    expect(retention).toContain("TOOL_AUDIT_RETENTION_DEFAULT_DAYS = 90");
+
+    // The router must consume the clamped constant rather than re-reading the
+    // raw variable, which is how the floor could be present and bypassed.
     const oauthRouter = readFileSync(
       path.resolve(__dirname, "../../routers/oauth/index.ts"),
       "utf8",
     );
     expect(oauthRouter).toContain(
-      'process.env.TOOL_AUDIT_RETENTION_DAYS || "90"',
+      'import { TOOL_AUDIT_RETENTION_DAYS } from "@/lib/tool-audit-retention"',
     );
+    expect(oauthRouter).not.toContain("process.env.TOOL_AUDIT_RETENTION_DAYS");
 
     const repo = readFileSync(
       path.resolve(__dirname, "./tool-call-audit.repo.ts"),
@@ -350,24 +360,75 @@ describeIfDb("tool_call_audit against a REAL postgres", () => {
    * retention silently winning over the window) is the outcome that loses the
    * record.
    */
-  it("RAISES rather than pruning when retention is configured below the window", async () => {
-    // The row has to sit BETWEEN the short retention and the window, or the
-    // test proves nothing: a BEFORE DELETE trigger fires per matched row, so a
-    // prune that matches no rows returns quietly no matter what the trigger
-    // says. Ten days old is selected by `pruneOlderThan(1)` and refused by the
-    // 30-day gate.
+  /**
+   * The failure the floor clamp in `lib/tool-audit-retention` exists to stop,
+   * demonstrated against a real database rather than argued.
+   *
+   * An unclamped retention between 1 and 29 does NOT merely shorten retention.
+   * The pruner issues one DELETE for everything older than its cutoff, that
+   * statement spans the immutability boundary, the trigger raises on the first
+   * in-window row, and the raise rolls the whole statement back. So the aged
+   * rows the sweep existed to reclaim survive too, and the table grows without
+   * bound behind an error logged every five minutes.
+   */
+  it("RAISES and prunes NOTHING when retention is configured below the window", async () => {
+    // Two rows, one either side of the boundary. Both are selected by
+    // `pruneOlderThan(1)`; only the young one is refused. The aged one is the
+    // assertion that matters, because it is the row that a "retention is just
+    // shorter" reading would expect to disappear.
     const midWindowMarker = `itest-midwindow-${Date.now()}`;
+    const agedMarker = `itest-aged-${Date.now()}`;
     await db.execute(
-      `INSERT INTO tool_call_audit (called_at, server_name, tool_name, success)
-       VALUES (now() - interval '10 days', '${midWindowMarker}', 'in_window_tool', true)` as never,
+      `INSERT INTO tool_call_audit (called_at, server_name, tool_name, success) VALUES
+         (now() - interval '10 days',  '${midWindowMarker}', 'in_window_tool', true),
+         (now() - interval '200 days', '${agedMarker}',      'aged_tool',      true)` as never,
     );
 
     await expect(toolCallAuditRepository.pruneOlderThan(1)).rejects.toThrow();
 
-    const survivor = await db.execute(
+    const inWindow = await db.execute(
       `SELECT tool_name FROM tool_call_audit WHERE server_name = '${midWindowMarker}'` as never,
     );
-    expect(survivor.rows).toHaveLength(1);
-    expect(survivor.rows[0]).toMatchObject({ tool_name: "in_window_tool" });
+    expect(inWindow.rows).toHaveLength(1);
+    expect(inWindow.rows[0]).toMatchObject({ tool_name: "in_window_tool" });
+
+    // The whole point: the aged row is collateral damage of the rollback.
+    const aged = await db.execute(
+      `SELECT tool_name FROM tool_call_audit WHERE server_name = '${agedMarker}'` as never,
+    );
+    expect(aged.rows).toHaveLength(1);
+    expect(aged.rows[0]).toMatchObject({ tool_name: "aged_tool" });
+  });
+
+  /**
+   * And the clamp's payoff: at the value the resolver would have substituted,
+   * the same sweep succeeds and the aged tail is reclaimed.
+   *
+   * This is the half that makes the clamp worth having rather than just safe.
+   * Running the previous case alone would leave "does anything still get
+   * pruned?" unanswered.
+   */
+  it("prunes the aged tail normally at the clamped floor value", async () => {
+    const { TOOL_AUDIT_RETENTION_FLOOR_DAYS } = await import(
+      "../../lib/tool-audit-retention"
+    );
+    expect(TOOL_AUDIT_RETENTION_FLOOR_DAYS).toBe(30);
+
+    // The two rows the previous test left behind are still present: one at 10
+    // days (inside the window) and one at 200 days (prunable). Pruning at the
+    // floor must remove the second and leave the first.
+    await expect(
+      toolCallAuditRepository.pruneOlderThan(TOOL_AUDIT_RETENTION_FLOOR_DAYS),
+    ).resolves.toBeUndefined();
+
+    const aged = await db.execute(
+      `SELECT uuid FROM tool_call_audit WHERE tool_name = 'aged_tool'` as never,
+    );
+    expect(aged.rows).toHaveLength(0);
+
+    const inWindow = await db.execute(
+      `SELECT uuid FROM tool_call_audit WHERE tool_name = 'in_window_tool'` as never,
+    );
+    expect(inWindow.rows).toHaveLength(1);
   });
 });

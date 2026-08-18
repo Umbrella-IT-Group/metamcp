@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 
 import { pruneGatewayEvents } from "@/lib/gateway-events/retention";
+import { TOOL_AUDIT_RETENTION_DAYS } from "@/lib/tool-audit-retention";
 import logger from "@/utils/logger";
 
 import {
@@ -23,15 +24,12 @@ import {
 
 const oauthRouter = express.Router();
 
-// Tool-call audit retention (days). The prune rides the same cleanup
-// interval below; <=0 disables pruning (retain forever).
-const TOOL_AUDIT_RETENTION_DAYS = (() => {
-  const raw = Number.parseInt(
-    process.env.TOOL_AUDIT_RETENTION_DAYS || "90",
-    10,
-  );
-  return Number.isFinite(raw) ? raw : 90;
-})();
+// Tool-call audit retention (days). The prune rides the same cleanup interval
+// below; <=0 disables pruning (retain forever), and anything between 1 and 29
+// is raised to 30 at import with a WARN. See `lib/tool-audit-retention` for
+// why the floor is not optional: a prune spanning migration 0032's
+// immutability window raises and rolls back whole, so an under-range setting
+// stops pruning entirely rather than shortening retention.
 
 // Cleanup expired entries every 5 minutes
 setInterval(

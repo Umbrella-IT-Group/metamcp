@@ -45,12 +45,19 @@
 -- not a skew, it is a broken host. Narrowing the gap is what would make the
 -- clock source matter.
 --
--- CONFIGURING TOOL_AUDIT_RETENTION_DAYS BELOW 30 now has a consequence, and it
--- is deliberately the loud one. The pruner would select rows this trigger
--- refuses, its DELETE would raise, and `routers/oauth/index.ts` logs that
--- error and continues. Pruning stops and the rows survive. The alternative
--- ordering, where a short retention setting silently wins over the window, is
--- the one that loses the record, so the two disagree in the correct direction.
+-- CONFIGURING TOOL_AUDIT_RETENTION_DAYS BELOW 30 is prevented in the
+-- application rather than merely surviving it, and the reason is that the
+-- failure mode is worse than "retention is shorter than the floor". The
+-- pruner issues ONE statement covering everything older than its cutoff. With
+-- retention between 1 and 29 that statement spans this boundary, the trigger
+-- raises on the first in-window row, and the raise rolls the WHOLE statement
+-- back, so the aged rows the sweep existed to reclaim are not deleted either.
+-- Pruning stops altogether behind an error logged every five minutes while the
+-- table grows without bound. `lib/tool-audit-retention` therefore clamps 1-29
+-- up to 30 at boot with a WARN, so the application never asks for a range the
+-- database will refuse. `<= 0` keeps its long-standing meaning of retain
+-- forever and is left alone: the floor exists to stop retention going BELOW 30,
+-- and forever is not below 30.
 --
 -- WHAT A TRIGGER BUYS THAT A GRANT DOES NOT. `scripts/ensure-runtime-role.sh`
 -- (migration-era change #124) already revokes UPDATE and TRUNCATE from the
