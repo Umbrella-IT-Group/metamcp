@@ -361,6 +361,12 @@ describe("sign-in rate limit — path matching", () => {
    * slash, so each of these arrives at better-auth as
    * `/api/auth/sign-in/email`. Before the normaliser resolved them the same
    * way, each was an unbounded and unaudited sign-in path.
+   *
+   * The EMPTY-SEGMENT spellings below are the ones a list of dot segments
+   * alone will not catch, and they are why this list is worth extending rather
+   * than trusting: `..` consumes an empty segment exactly as it consumes a
+   * named one, so any normaliser that squeezes `//` down to `/` before
+   * resolving has already thrown away the segment the relay is standing on.
    */
   it("cannot be dodged by dot segments the relay resolves away", () => {
     const dodges = [
@@ -371,6 +377,10 @@ describe("sign-in rate limit — path matching", () => {
       "/api/auth/%2e/sign-in/email",
       "/api/auth/x/.%2e/sign-in/email",
       "/api/auth/x/y/../../sign-in/email",
+      "/api/auth//../sign-in/email",
+      "/api/auth//%2e%2e/sign-in/email",
+      "/api/auth///../../sign-in/email",
+      "/api/auth/x//../../sign-in/email",
     ];
     for (const path of dodges) {
       expect(
@@ -387,6 +397,12 @@ describe("sign-in rate limit — path matching", () => {
       "/api/auth/sign-in\\email",
       "/api/auth/x/..\\sign-in/email",
       "/api\\auth\\sign-in\\email",
+      // Backslash AND an empty segment in one spelling. The backslash folds to
+      // a slash before the parse, so these carry the same empty segment the
+      // dot-segment list covers and are the members of this class that a
+      // collapse-before-parse normaliser waves through.
+      "/api/auth//..\\sign-in/email",
+      "/api/auth//%2e%2e\\sign-in/email",
     ];
     for (const path of dodges) {
       expect(
@@ -456,6 +472,16 @@ describe("sign-in rate limit — path matching", () => {
       call(
         middleware,
         request({ clientIp, path: "/api/auth/x/../sign-in/email" }),
+      ).statusCode,
+    ).toBe(429);
+
+    // The empty-segment spelling of the same dodge, through the middleware
+    // rather than the matcher, because this is the one the matcher answered
+    // wrongly while every assertion above it still passed.
+    expect(
+      call(
+        middleware,
+        request({ clientIp, path: "/api/auth//../sign-in/email" }),
       ).statusCode,
     ).toBe(429);
   });

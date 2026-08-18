@@ -67,6 +67,11 @@ const ATTEMPTED_EMAIL = "victim@example.invalid";
  * each case. Each assertion below proves that resolution rather than assuming
  * it, so a future better-auth or Node change that stopped resolving one of
  * these would fail loudly instead of leaving a test that guards nothing.
+ *
+ * The EMPTY-SEGMENT entries are here because `..` consumes an empty segment
+ * exactly as it consumes a named one. Any normaliser downstream of this that
+ * squeezes `//` to `/` before resolving loses that segment and stops agreeing
+ * with the relay, so the spelling has to be pinned on both sides.
  */
 const RESPELLINGS = [
   "/api/auth/x/../sign-in/email",
@@ -75,6 +80,8 @@ const RESPELLINGS = [
   "/api/auth/x/%2E%2E/sign-in/email",
   "/api/auth/x/y/../../sign-in/email",
   "/api/auth\\sign-in/email",
+  "/api/auth//../sign-in/email",
+  "/api/auth//%2e%2e/sign-in/email",
 ];
 
 type AuditRow = {

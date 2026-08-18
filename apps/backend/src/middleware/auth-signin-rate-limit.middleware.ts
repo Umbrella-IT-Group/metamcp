@@ -263,45 +263,66 @@ export const CREDENTIAL_SIGN_IN_PATHS: ReadonlySet<string> = new Set([
  * the two in step; a hand-rolled segment walker would have to re-derive
  * `%2e`, `.%2e` and backslash handling and would drift from it again.
  *
- * The three rewrites BEFORE that parse are ordered, and each is load-bearing:
+ * PARSE FIRST, COLLAPSE AFTER. That order is load-bearing, not stylistic. An
+ * empty segment is not noise to the parser: `..` CONSUMES one, exactly as it
+ * consumes a named segment. So collapsing runs of slashes BEFORE the parse
+ * deletes a segment the relay's own resolution would still have been standing
+ * on, and the two answers come apart — `/api/auth//../sign-in/email` reaches
+ * better-auth as `/api/auth/sign-in/email`, while collapsing first leaves
+ * `/api/auth/../sign-in/email`, which resolves to `/api/sign-in/email` and is
+ * not in the set, so the attempt is waved through unbounded. Empty segments
+ * paired with a dot segment are that whole class of spelling. Collapsing only
+ * what the parser hands BACK cannot reopen it, because by then the dot
+ * segments are already resolved away.
+ *
+ * What still has to run BEFORE the parse is only what makes the parse TOTAL:
  *
  *  - Tab, LF and CR are dropped because the URL parser drops them too, and it
  *    does so BEFORE parsing — so leaving them in lets `/<tab>/host` reach the
  *    parser as `//host`.
- *  - Backslashes fold to slashes so the collapse below sees them.
- *  - Runs of slashes collapse LAST, once nothing can turn into a slash again.
+ *  - Backslashes fold to slashes because the parser reads them as slashes, so
+ *    `/\` would otherwise reach it as `//`.
+ *  - The LEADING run of slashes, and only the leading run, flattens to
+ *    exactly one — prepended when the input carries none, so what reaches the
+ *    parser is always an absolute path and never a relative reference.
  *
- * Together they guarantee the string handed to the parser cannot begin with
- * `//`, which is what makes this call TOTAL: a leading `//` is a
- * protocol-relative URL, the parser reads what follows as a HOST, and an empty
- * or malformed one THROWS. On this path a throw would be a 500 on the sign-in
- * route, so the input is shaped such that the parser stays in path state,
- * which has no failure mode, rather than being wrapped in a catch that would
- * have to guess an answer.
+ * Together they guarantee the string handed to the parser begins with exactly
+ * one slash and so cannot begin with `//`, which is what makes this call
+ * TOTAL: a leading `//` is a protocol-relative URL, the parser reads what
+ * follows as a HOST, and an empty or malformed one THROWS. On this path a
+ * throw would be a 500 on the sign-in route, so the input is shaped such that
+ * the parser stays in path state, which has no failure mode, rather than being
+ * wrapped in a catch that would have to guess an answer. Flattening the
+ * leading run is the one collapse that cannot lose a bypass, because a leading
+ * empty segment has no `..` to its left that could have consumed it.
  *
- * Over-matching is the safe direction for what remains: a variant spelling
- * that this server would answer with a 404 costs a rate-limit bucket entry and
- * nothing else, whereas under-matching is a bypass, and neither express nor
- * better-auth promises the normalisation this middleware would otherwise have
- * to assume. That is why the comparison is also case-insensitive and drops a
- * trailing slash, neither of which the relay does.
+ * OVER-MATCHING IS WHAT REMAINS, and it is the direction to prefer. Collapsing
+ * after the parse means an interior `//` that the relay KEEPS — better-auth is
+ * routed on `/api/auth//sign-in/email`, which is not the credential path — is
+ * still counted here. That costs a rate-limit bucket entry and nothing else.
+ * Under-matching is the failure that matters, because it is an unbounded
+ * sign-in path and an unaudited one too: `lib/audit/auth-relay-audit` keys off
+ * the resolved path this has to agree with. The comparison is case-insensitive
+ * and drops a trailing slash for the same reason, neither of which the relay
+ * does.
  */
 export function isCredentialSignInRequest(
   method: string,
   path: string,
 ): boolean {
   if (method.toUpperCase() !== "POST") return false;
-  const collapsed = path
-    .replace(/[\t\n\r]/g, "")
-    .replace(/\\/g, "/")
-    .replace(/\/{2,}/g, "/");
+  const shaped =
+    "/" +
+    path
+      .replace(/[\t\n\r]/g, "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "");
   // The origin is a throwaway: only `pathname` is read from it. It is here
   // because a path on its own is a relative reference and needs some base to
   // resolve against.
-  const resolved = new URL(
-    collapsed,
-    "http://localhost",
-  ).pathname.toLowerCase();
+  const resolved = new URL(shaped, "http://localhost").pathname
+    .replace(/\/{2,}/g, "/")
+    .toLowerCase();
   const normalized =
     resolved.length > 1 && resolved.endsWith("/")
       ? resolved.slice(0, -1)
