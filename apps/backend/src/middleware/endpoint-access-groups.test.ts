@@ -11,7 +11,7 @@
  * Four properties, in the order they matter:
  *
  *   1. A restricted endpoint refuses a non-member OAuth user with 403 and the
- *      operator's exact sentence, compared byte for byte.
+ *      configured refusal message, compared byte for byte.
  *   2. A member passes, and an administrator passes without membership.
  *   3. An endpoint that has NOT opted in behaves exactly as it did before this
  *      feature existed — no query, no cache entry, no behaviour change. This is
@@ -238,7 +238,7 @@ afterEach(() => {
 });
 
 describe("restricted endpoint refuses a non-member OAuth user", () => {
-  it("403 with the operator's exact sentence, byte for byte", async () => {
+  it("403 with the exact refusal message, byte for byte", async () => {
     const { served, res } = await asOAuthUser(
       USER_ID,
       makeEndpoint({ restricted: true }),

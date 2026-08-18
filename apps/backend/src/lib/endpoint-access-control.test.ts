@@ -56,7 +56,7 @@ afterEach(() => {
 });
 
 describe("the refusal copy", () => {
-  it("is the operator's sentence, verbatim", () => {
+  it("is the configured sentence, verbatim", () => {
     // Pinned here as well as in the middleware suite. This constant is product
     // copy an operator wrote; a well-meant tidy-up of the wording is a change
     // to what every refused user reads, and should have to be deliberate.

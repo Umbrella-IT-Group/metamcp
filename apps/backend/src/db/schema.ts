@@ -922,7 +922,7 @@ export const gatewayEventsTable = pgTable(
 //
 // Deliberately shaped like namespaces — a named, reusable set that users join
 // and endpoints are mapped to — rather than as a per-user allow-list on the
-// endpoint row. The operator's estate has more endpoints than it has distinct
+// endpoint row. A deployment generally has more endpoints than it has distinct
 // audiences, so the set is the thing worth naming: adding a person to
 // "helpdesk" is one row, while an allow-list per endpoint would be one row per
 // endpoint per person and would drift the moment an endpoint is added.
