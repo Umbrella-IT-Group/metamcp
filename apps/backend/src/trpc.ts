@@ -122,15 +122,19 @@ export const createContext = async ({
 //
 // errorFormatter strips `stack` from every error payload. @trpc/server only
 // attaches the stack when its `isDev` flag is on, and `isDev` defaults to
-// `process.env.NODE_ENV !== "production"` — which is always true here,
-// because nothing in the container image or compose files ever sets
-// NODE_ENV. The result was that every 4xx/5xx from a tRPC procedure shipped
-// an internal stack trace (absolute `/app/...` paths, bundled dependency
-// names and versions) to the caller. Stripping it here rather than setting
-// NODE_ENV is deliberate: it holds regardless of how the process is started,
-// and it does not silently change any other NODE_ENV-conditional behaviour
-// in this codebase (redirect-URI validation in routers/oauth/utils.ts reads
-// the same variable).
+// `process.env.NODE_ENV !== "production"`, which makes stack disclosure a
+// property of how the deployment was assembled rather than of this code. The
+// image and the compose files set no NODE_ENV themselves, but both compose
+// files pass the whole `.env` in through `env_file:` and `example.env` ships
+// `NODE_ENV=production` on its first line: a quickstart deployment derived
+// from that file has the flag set, one that dropped or edited the line does
+// not. On the second, every 4xx/5xx from a tRPC procedure shipped an internal
+// stack trace (absolute `/app/...` paths, bundled dependency names and
+// versions) to the caller. Stripping it here UNCONDITIONALLY is the design
+// point: the payload is the same however the process was started, and it does
+// not silently change any other NODE_ENV-conditional behaviour in this
+// codebase (redirect-URI validation in routers/oauth/utils.ts reads the same
+// variable).
 //
 // `code`, `httpStatus`, and `path` stay — clients and the frontend error
 // handling need them, and none of them disclose internals.
