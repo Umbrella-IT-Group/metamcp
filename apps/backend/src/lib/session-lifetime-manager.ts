@@ -1,40 +1,88 @@
 import logger from "@/utils/logger";
 
 import { configService } from "./config.service";
+import { identityMatches, type SessionIdentity } from "./metamcp/session-auth";
 
 /**
- * Endpoint binding stored alongside a public-endpoint session so a
- * session-id-keyed transport lookup can be re-checked against the endpoint
- * the request is actually targeting. Without this, the in-memory session
- * map is keyed by `Mcp-Session-Id` ALONE — a caller authenticated for
- * endpoint A could drive endpoint B's pooled namespace by presenting B's
- * session id. Mirrors the cross-namespace replay predicate the DB-backed
- * `recoverPersistedSession` already enforces (namespace_uuid +
- * endpoint_name must both match). See `getBoundSession` in
- * `streamable-http.ts` and the message-leg guard in `sse.ts`.
+ * The endpoint half of a session's binding: which namespace + public endpoint
+ * a session-id-keyed transport lookup must be targeting. Without this, the
+ * in-memory session map is keyed by `Mcp-Session-Id` ALONE — a caller
+ * authenticated for endpoint A could drive endpoint B's pooled namespace by
+ * presenting B's session id. Mirrors the cross-namespace replay predicate the
+ * DB-backed `recoverPersistedSession` already enforces (namespace_uuid +
+ * endpoint_name must both match).
+ *
+ * Split out from `SessionBinding` below so the DB-backed guards can keep
+ * comparing a persisted `mcp_sessions` row — which carries the endpoint pair
+ * but not the in-memory identity — through the same predicate.
  */
-export interface SessionBinding {
+export interface EndpointBinding {
   namespaceUuid: string;
   endpointName: string;
 }
 
 /**
- * True only when a stored session binding matches the endpoint a request is
+ * What is stored alongside a live public-endpoint session: its endpoint AND
+ * the identity of the credential that created it.
+ *
+ * The endpoint half alone was not enough. Every endpoint that accepts more
+ * than one credential — a gateway-wide api key plus a scoped one, two keys for
+ * two consumers, any OAuth user with access — had a pool in which ANY of those
+ * credentials could present ANY live session id for that endpoint and be
+ * handed the transport, because the lookup never re-checked WHO created it.
+ * The DB-backed recovery path had guarded exactly this since it shipped
+ * (`auth_principal` + `auth_method`); the in-memory fast path, which serves
+ * every request after the first, had not. See `resolveBoundSession` in
+ * `streamable-http.ts` and the message-leg guard in `sse.ts`.
+ */
+export interface SessionBinding extends EndpointBinding {
+  identity: SessionIdentity;
+}
+
+/**
+ * True only when a stored binding matches the endpoint a request is
  * targeting — BOTH the namespace uuid and the endpoint name must agree. A
  * missing binding (`undefined`) never matches, so a session with no recorded
  * binding is treated as non-existent for the requesting endpoint rather than
- * blindly served. This is the single predicate both public-endpoint legs
- * (streamable-http `getBoundSession`, sse message route) and the DELETE guard
- * use, mirroring the cross-namespace replay check in `recoverPersistedSession`.
+ * blindly served.
+ *
+ * This is the ENDPOINT-ONLY predicate, used where the thing being compared is
+ * a persisted `mcp_sessions` row: `recoverPersistedSession` and the
+ * not-resident branch of `resolveDeletableSession`, both of which verify the
+ * credential separately against the row's `auth_principal` hash. In-memory
+ * lookups use `boundSessionMatches` below instead.
  */
 export function bindingMatches(
-  binding: SessionBinding | undefined,
-  target: SessionBinding,
+  binding: EndpointBinding | undefined,
+  target: EndpointBinding,
 ): boolean {
   return (
     binding !== undefined &&
     binding.namespaceUuid === target.namespaceUuid &&
     binding.endpointName === target.endpointName
+  );
+}
+
+/**
+ * The predicate every IN-MEMORY session lookup funnels through: the request
+ * must target the session's endpoint AND present the identity the session was
+ * created under. One function so the check cannot drift between the three
+ * legs that need it (streamable-http's request lookup and DELETE guard, sse's
+ * message leg), which is the same reason `bindingMatches` was extracted.
+ *
+ * Callers treat `false` as "no such session" rather than as a distinct
+ * refusal: per the MCP Streamable HTTP session model an unknown session id is
+ * answered 404 so a well-behaved client re-initializes, and collapsing the
+ * foreign-credential case into that one answer is also what stops the response
+ * from confirming that someone else's session id is live.
+ */
+export function boundSessionMatches(
+  binding: SessionBinding | undefined,
+  target: SessionBinding,
+): boolean {
+  return (
+    bindingMatches(binding, target) &&
+    identityMatches(binding?.identity, target.identity)
   );
 }
 
@@ -87,9 +135,10 @@ export class SessionLifetimeManagerImpl<T>
     return this.sessions.get(sessionId);
   }
 
-  // The endpoint this session was created against, if one was recorded.
+  // The endpoint AND creating credential this session was recorded against.
   // Used by the public-endpoint routers to reject a session id presented on
-  // an endpoint other than the one it belongs to (cross-endpoint replay).
+  // an endpoint other than the one it belongs to, or under a credential other
+  // than the one that opened it.
   getSessionBinding(sessionId: string): SessionBinding | undefined {
     return this.sessionBindings.get(sessionId);
   }

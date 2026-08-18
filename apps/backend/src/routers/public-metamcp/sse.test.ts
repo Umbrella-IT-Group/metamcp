@@ -1,9 +1,11 @@
 /**
- * Unit tests for the SSE `/message` endpoint-binding guard
+ * Unit tests for the SSE `/message` ownership guard
  * (`resolveSseMessageSession`) — PR #84 review round 2: the guard shipped
  * in round 1 with zero tests, leaving one of the two least-reviewed new
- * security branches unpinned. The resolver is pure over an injected
- * manager, so these run with no express harness and no postgres.
+ * security branches unpinned. It now checks the creating CREDENTIAL as well
+ * as the endpoint, so the same-endpoint cases below matter as much as the
+ * cross-endpoint ones. The resolver is pure over an injected manager, so
+ * these run with no express harness and no postgres.
  *
  * Mocking mirrors `streamable-http.test.ts`: DB-touching boundaries only
  * (`@/db` transitively via session-lifetime-manager -> config.service),
@@ -43,8 +45,19 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
   },
 }));
 
+import type { SessionIdentity } from "../../lib/metamcp/session-auth";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 import { resolveSseMessageSession } from "./sse";
+
+const KEY_A: SessionIdentity = { method: "api_key", credentialId: "key-A" };
+const KEY_B: SessionIdentity = { method: "api_key", credentialId: "key-B" };
+
+/** The binding the stream-open leg records for the seeded session. */
+const OWNER = {
+  namespaceUuid: "ns-A",
+  endpointName: "ep-A",
+  identity: KEY_A,
+};
 
 function seededManager(): {
   manager: SessionLifetimeManagerImpl<Transport>;
@@ -52,20 +65,16 @@ function seededManager(): {
 } {
   const manager = new SessionLifetimeManagerImpl<Transport>("SSE-test");
   const transport = { handlePostMessage: vi.fn() } as unknown as Transport;
-  manager.addSession("sess-1", transport, {
-    namespaceUuid: "ns-A",
-    endpointName: "ep-A",
-  });
+  manager.addSession("sess-1", transport, OWNER);
   return { manager, transport };
 }
 
-describe("resolveSseMessageSession — endpoint-binding guard on the /message leg", () => {
-  it("resolves the transport when the message targets the SAME endpoint the stream was opened on", () => {
+describe("resolveSseMessageSession — ownership guard on the /message leg", () => {
+  it("resolves the transport when the message targets the SAME endpoint under the SAME credential", () => {
     const { manager, transport } = seededManager();
 
     const resolution = resolveSseMessageSession(manager, "sess-1", {
-      namespaceUuid: "ns-A",
-      endpointName: "ep-A",
+      ...OWNER,
     });
 
     expect(resolution).toEqual({ outcome: "ok", transport });
@@ -77,6 +86,7 @@ describe("resolveSseMessageSession — endpoint-binding guard on the /message le
     const crossEndpoint = resolveSseMessageSession(manager, "sess-1", {
       namespaceUuid: "ns-B",
       endpointName: "ep-B",
+      identity: KEY_A,
     });
     expect(crossEndpoint.outcome).toBe("not_found");
 
@@ -84,16 +94,26 @@ describe("resolveSseMessageSession — endpoint-binding guard on the /message le
     const wrongName = resolveSseMessageSession(manager, "sess-1", {
       namespaceUuid: "ns-A",
       endpointName: "ep-B",
+      identity: KEY_A,
     });
     expect(wrongName.outcome).toBe("not_found");
+  });
+
+  it("resolves not_found when a DIFFERENT credential on the SAME endpoint presents the session id", () => {
+    const { manager } = seededManager();
+
+    const foreign = resolveSseMessageSession(manager, "sess-1", {
+      ...OWNER,
+      identity: KEY_B,
+    });
+    expect(foreign.outcome).toBe("not_found");
   });
 
   it("resolves not_found for a session id that does not exist", () => {
     const { manager } = seededManager();
 
     const resolution = resolveSseMessageSession(manager, "sess-never-seen", {
-      namespaceUuid: "ns-A",
-      endpointName: "ep-A",
+      ...OWNER,
     });
     expect(resolution.outcome).toBe("not_found");
   });
@@ -105,31 +125,40 @@ describe("resolveSseMessageSession — endpoint-binding guard on the /message le
     } as unknown as Transport);
 
     const resolution = resolveSseMessageSession(manager, "sess-unbound", {
-      namespaceUuid: "ns-A",
-      endpointName: "ep-A",
+      ...OWNER,
     });
     expect(resolution.outcome).toBe("not_found");
   });
 
-  it("shapes absent and cross-endpoint identically for the response: same outcome, crossEndpoint drives ONLY the warn log", () => {
+  it("shapes absent, cross-endpoint and foreign-credential identically for the response: same outcome, residentRefused drives ONLY the warn log", () => {
     const { manager } = seededManager();
 
     const absent = resolveSseMessageSession(manager, "sess-never-seen", {
-      namespaceUuid: "ns-A",
-      endpointName: "ep-A",
+      ...OWNER,
     });
     const cross = resolveSseMessageSession(manager, "sess-1", {
       namespaceUuid: "ns-B",
       endpointName: "ep-B",
+      identity: KEY_A,
+    });
+    const foreign = resolveSseMessageSession(manager, "sess-1", {
+      ...OWNER,
+      identity: KEY_B,
     });
 
-    // Both feed the route's single 404 branch — the response never learns
-    // WHICH not_found it was; only the log-only flag differs.
+    // All three feed the route's single 404 branch — the response never
+    // learns WHICH not_found it was; only the log-only flag differs.
     expect(absent.outcome).toBe("not_found");
     expect(cross.outcome).toBe("not_found");
-    if (absent.outcome === "not_found" && cross.outcome === "not_found") {
-      expect(absent.crossEndpoint).toBe(false);
-      expect(cross.crossEndpoint).toBe(true);
+    expect(foreign.outcome).toBe("not_found");
+    if (
+      absent.outcome === "not_found" &&
+      cross.outcome === "not_found" &&
+      foreign.outcome === "not_found"
+    ) {
+      expect(absent.residentRefused).toBe(false);
+      expect(cross.residentRefused).toBe(true);
+      expect(foreign.residentRefused).toBe(true);
     }
   });
 });
