@@ -245,58 +245,83 @@ describe("getAuthRateLimitIdentifier", () => {
  *
  * DRIVEN THROUGH THE PRODUCTION CALL PAIR, and that is the point of this block
  * rather than an incidental detail. Every call site — three of them, in
- * middleware/api-key-oauth.middleware — does `recordFailedAttempt(id)` and then
- * `isRateLimited(id)`, and `isRateLimited` counts the question it is asked (see
- * the `isCurrentlyLimited` docblock in the module under test, which exists
- * because of exactly that). Two counts land per failed request, so the
- * constructor argument of 20 buys about ten attempts a minute, not twenty. A
- * test that drove `recordFailedAttempt` alone would pin the counter's arithmetic
- * and quietly misreport the allowance the gateway actually enforces.
+ * middleware/api-key-oauth.middleware — checks with `isCurrentlyLimited(id)`
+ * and only then calls `recordFailedAttempt(id)`, so one failed request costs
+ * one count and the enforced allowance is the constructor's 20.
+ *
+ * It has not always been. The sites used to record and then ask
+ * `isRateLimited`, which counts the question it is asked (see the
+ * `isCurrentlyLimited` docblock in the module under test, which exists because
+ * of exactly that), so two counts landed per failure and refusal arrived on the
+ * eleventh. The exact-boundary cases below are what stop that shape coming
+ * back: a test that drove `recordFailedAttempt` alone would pin the counter's
+ * arithmetic and say nothing about the allowance the gateway enforces.
  */
 describe("the failed-auth budget as the middleware actually spends it", () => {
-  /** What the three call sites do per failed request, in order. */
+  /**
+   * What the three call sites do per failed request, in order. Returns whether
+   * the request was REFUSED, so `false` is "answered as a normal 401".
+   */
   const failOnce = (identifier: string): boolean => {
+    if (authRateLimiter.isCurrentlyLimited(identifier)) return true;
     authRateLimiter.recordFailedAttempt(identifier);
-    return authRateLimiter.isRateLimited(identifier);
+    return false;
   };
 
-  it("serves ten failed attempts and refuses the eleventh", () => {
+  it("serves twenty failed attempts and refuses the twenty-first", () => {
     // Unique per run: the limiter is module-scoped, so a fixed key would let
     // this test spend a budget another file's traffic is counting on.
     const identifier = `budget-pin:${randomUUID()}`;
 
-    for (let attempt = 1; attempt <= 10; attempt += 1) {
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
       expect(failOnce(identifier)).toBe(false);
     }
     expect(failOnce(identifier)).toBe(true);
   });
 
-  it("keeps refusing for the rest of the window once the budget is gone", () => {
+  it("does not refuse a caller one attempt early", () => {
+    // The off-by-one that the double-count produced was invisible to any
+    // assertion that only checked "refuses eventually". Nineteen failures must
+    // leave the caller still inside its budget.
     const identifier = `budget-pin:${randomUUID()}`;
 
-    for (let attempt = 1; attempt <= 11; attempt += 1) {
+    for (let attempt = 1; attempt <= 19; attempt += 1) {
       failOnce(identifier);
     }
 
-    // Not a formality: `isRateLimited` mutates, so a limiter that refused once
-    // and then let the next request through would still satisfy the test above.
+    expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(false);
+    expect(failOnce(identifier)).toBe(false);
+    expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(true);
+  });
+
+  it("keeps refusing for the rest of the window once the budget is gone", () => {
+    const identifier = `budget-pin:${randomUUID()}`;
+
+    for (let attempt = 1; attempt <= 21; attempt += 1) {
+      failOnce(identifier);
+    }
+
+    // Not a formality: a limiter that refused once and then let the next
+    // request through would still satisfy the test above.
     expect(failOnce(identifier)).toBe(true);
     expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(true);
   });
 
-  it("still allows the nominal twenty when only the counter is driven", () => {
-    // The other half of the discrepancy, pinned so the gap between the
-    // constructor argument and the enforced allowance stays visible: counting
-    // without asking reaches 20. If these two tests ever converge, the
-    // middleware's call pair changed and the docblocks above need rereading.
+  it("counts a refused request nowhere, the check being read-only", () => {
+    // The one behavioural difference beyond the allowance. A refused request
+    // never reached the credential check, so it must not move the counter —
+    // and because a record inside an open window does not extend the window
+    // either, a caller over budget stays refused for exactly the window it
+    // opened rather than for one a flood keeps pushing out.
     const identifier = `budget-pin:${randomUUID()}`;
+    const limiter = new AuthRateLimiter(2, 60 * 1000);
 
-    for (let attempt = 1; attempt <= 19; attempt += 1) {
-      authRateLimiter.recordFailedAttempt(identifier);
+    limiter.recordFailedAttempt(identifier);
+    limiter.recordFailedAttempt(identifier);
+    expect(limiter.isCurrentlyLimited(identifier)).toBe(true);
+
+    for (let attempt = 1; attempt <= 50; attempt += 1) {
+      expect(limiter.isCurrentlyLimited(identifier)).toBe(true);
     }
-    expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(false);
-
-    authRateLimiter.recordFailedAttempt(identifier);
-    expect(authRateLimiter.isCurrentlyLimited(identifier)).toBe(true);
   });
 });
