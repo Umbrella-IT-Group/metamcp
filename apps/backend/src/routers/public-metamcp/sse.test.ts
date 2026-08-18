@@ -1,18 +1,34 @@
 /**
- * Unit tests for the SSE `/message` ownership guard
- * (`resolveSseMessageSession`) — PR #84 review round 2: the guard shipped
- * in round 1 with zero tests, leaving one of the two least-reviewed new
- * security branches unpinned. It now checks the creating CREDENTIAL as well
- * as the endpoint, so the same-endpoint cases below matter as much as the
- * cross-endpoint ones. The resolver is pure over an injected manager, so
- * these run with no express harness and no postgres.
+ * Tests for the SSE `/message` ownership guard — PR #84 review round 2: the
+ * guard shipped in round 1 with zero tests, leaving one of the two
+ * least-reviewed new security branches unpinned. It now checks the creating
+ * CREDENTIAL as well as the endpoint, so the same-endpoint cases below matter
+ * as much as the cross-endpoint ones.
+ *
+ * Three layers, narrowest first: `resolveSseMessageSession` is pure over an
+ * injected manager and needs no harness; `refuseSseMessage` is driven straight
+ * against the audit sink; and the last block drives the REAL router over a real
+ * socket. That last layer is not redundant — the first two both stay green
+ * while the route's call joining them is deleted, which is exactly how this leg
+ * could revert to log-only unnoticed.
  *
  * Mocking mirrors `streamable-http.test.ts`: DB-touching boundaries only
  * (`@/db` transitively via session-lifetime-manager -> config.service),
  * plus the express middlewares the router module pulls in at import time.
  */
+import type { Server } from "node:http";
+
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import express from "express";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 vi.mock("@/utils/logger", () => ({
   default: {
@@ -46,13 +62,21 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
 }));
 
 import type { ApiKeyAuthenticatedRequest } from "@/middleware/api-key-oauth.middleware";
+import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
+import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
+import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 
 import type { AuditEvent } from "../../lib/audit/audit-emitter";
 import { setAuditSinkForTesting } from "../../lib/audit/audit-emitter";
 import type { SessionIdentity } from "../../lib/metamcp/session-auth";
 import { __resetSessionDenialThrottleForTesting } from "../../lib/metamcp/session-binding-denial";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
-import { refuseSseMessage, resolveSseMessageSession } from "./sse";
+import sseRouter, {
+  __removeSseSessionForTesting,
+  __seedSseSessionForTesting,
+  refuseSseMessage,
+  resolveSseMessageSession,
+} from "./sse";
 
 const KEY_A: SessionIdentity = { method: "api_key", credentialId: "key-A" };
 const KEY_B: SessionIdentity = { method: "api_key", credentialId: "key-B" };
@@ -269,5 +293,190 @@ describe("refuseSseMessage — the /message leg's durable record", () => {
     }
 
     expect(events).toHaveLength(1);
+  });
+});
+
+/**
+ * The two blocks above test the guard and the emitter in isolation, which
+ * leaves the thing that connects them — the route — unpinned: with only those,
+ * deleting the route's `refuseSseMessage` call keeps the suite green while the
+ * SSE leg silently reverts to log-only. These drive the real router over a real
+ * socket so that call is load-bearing.
+ */
+describe("POST /:endpoint_name/message — the route wires the guard to the record", () => {
+  const SEEDED_SESSION = "sess-route-1";
+  let server: Server;
+  let baseUrl = "";
+  let currentKeyUuid = "key-A";
+  let currentEndpointName = "ep-A";
+  let currentNamespaceUuid = "ns-A";
+
+  const transport = () =>
+    ({
+      // The real SSEServerTransport answers 202 and forwards the body onto the
+      // open stream. A stub that never responds would hang the request rather
+      // than fail it, so it answers too.
+      handlePostMessage: vi.fn(
+        async (_req: express.Request, res: express.Response) => {
+          res.status(202).end("Accepted");
+        },
+      ),
+    }) as unknown as Transport;
+  let seededTransport: Transport;
+
+  /** The stub's spy, past the `Transport` cast the seam takes. */
+  const postMessageSpy = () =>
+    (
+      seededTransport as unknown as {
+        handlePostMessage: ReturnType<typeof vi.fn>;
+      }
+    ).handlePostMessage;
+
+  beforeAll(async () => {
+    // The guard is what is under test, so the three middlewares in front of it
+    // become pass-throughs that stamp what `lookupEndpoint` /
+    // `authenticateApiKey` would have resolved. Same harness shape as the
+    // route-level block in `streamable-http.test.ts`.
+    vi.mocked(lookupEndpoint).mockImplementation(((
+      req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => {
+      const authReq = req as ApiKeyAuthenticatedRequest;
+      authReq.namespaceUuid = currentNamespaceUuid;
+      authReq.endpointName = currentEndpointName;
+      authReq.endpoint = {
+        uuid: "ep-A-uuid",
+        name: currentEndpointName,
+        enable_api_key_auth: true,
+        use_query_param_auth: false,
+      } as unknown as ApiKeyAuthenticatedRequest["endpoint"];
+      next();
+    }) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(((
+      req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => {
+      const authReq = req as ApiKeyAuthenticatedRequest;
+      authReq.authMethod = "api_key";
+      authReq.apiKeyUuid = currentKeyUuid;
+      next();
+    }) as never);
+    vi.mocked(rateLimitMiddleware).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+
+    const app = express();
+    app.use("/metamcp", sseRouter);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (typeof address === "object" && address) {
+      baseUrl = `http://127.0.0.1:${address.port}`;
+    }
+  });
+
+  afterAll(async () => {
+    __removeSseSessionForTesting(SEEDED_SESSION);
+    vi.mocked(lookupEndpoint).mockImplementation((() => undefined) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(
+      (() => undefined) as never,
+    );
+    vi.mocked(rateLimitMiddleware).mockImplementation(
+      (() => undefined) as never,
+    );
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  beforeEach(() => {
+    __resetSessionDenialThrottleForTesting();
+    __removeSseSessionForTesting(SEEDED_SESSION);
+    seededTransport = transport();
+    // The session the owning credential opened on ep-A.
+    __seedSseSessionForTesting(SEEDED_SESSION, seededTransport, {
+      namespaceUuid: "ns-A",
+      endpointName: "ep-A",
+      identity: KEY_A,
+    });
+    currentKeyUuid = "key-A";
+    currentEndpointName = "ep-A";
+    currentNamespaceUuid = "ns-A";
+  });
+
+  const post = async (
+    sessionId: string,
+  ): Promise<{ status: number; events: AuditEvent[] }> => {
+    const events: AuditEvent[] = [];
+    setAuditSinkForTesting(async (event) => {
+      events.push(event);
+    });
+    try {
+      const response = await fetch(
+        `${baseUrl}/metamcp/${currentEndpointName}/message?sessionId=${sessionId}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": "presented-key-value",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+        },
+      );
+      // `emit` is fire-and-forget through a promise chain; let it settle.
+      await Promise.resolve();
+      await Promise.resolve();
+      return { status: response.status, events };
+    } finally {
+      setAuditSinkForTesting(undefined);
+    }
+  };
+
+  it("writes the audit row when a FOREIGN credential presents a live session id", async () => {
+    currentKeyUuid = "key-B";
+
+    const { status, events } = await post(SEEDED_SESSION);
+
+    expect(status).toBe(404);
+    expect(events).toHaveLength(1);
+    expect(events[0].action).toBe("mcp.auth.denied");
+    expect(events[0].http_status).toBe(404);
+    expect(events[0].detail?.reason).toBe("session_credential_mismatch");
+    expect(events[0].detail?.session_id).toBe(SEEDED_SESSION);
+    expect(events[0].actor_id).toBe("key-B");
+    // The refused caller never reaches the owner's transport.
+    expect(postMessageSpy()).not.toHaveBeenCalled();
+  });
+
+  it("carries the endpoint-mismatch class through the route for a cross-endpoint replay", async () => {
+    // Same credential, replaying the id against a different endpoint. The row
+    // must not call this a credential mismatch.
+    currentEndpointName = "ep-B";
+    currentNamespaceUuid = "ns-B";
+
+    const { status, events } = await post(SEEDED_SESSION);
+
+    expect(status).toBe(404);
+    expect(events).toHaveLength(1);
+    expect(events[0].detail?.reason).toBe("session_endpoint_mismatch");
+  });
+
+  it("writes NOTHING for a genuine miss — an unknown id is not an incident", async () => {
+    const { status, events } = await post("sess-never-existed");
+
+    expect(status).toBe(404);
+    expect(events).toHaveLength(0);
+  });
+
+  it("serves the owner: same endpoint, same credential is not refused", async () => {
+    const { status, events } = await post(SEEDED_SESSION);
+
+    // No refusal row, and the guard handed the request to the bound transport.
+    expect(status).toBe(202);
+    expect(events).toHaveLength(0);
+    expect(postMessageSpy()).toHaveBeenCalled();
   });
 });

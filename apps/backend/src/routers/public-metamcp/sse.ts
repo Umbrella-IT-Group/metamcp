@@ -99,10 +99,10 @@ export function resolveSseMessageSession(
  * turns an id sweep into a flood that buries the first line, the one worth
  * reading.
  *
- * Exported as the route's test seam: the `/message` leg's session map is
- * populated only by a real SSE stream-open, so driving the wiring end-to-end
- * would need a live transport. This keeps the guard's emission testable
- * without one, and keeps `resolveSseMessageSession` itself pure.
+ * Exported so the emission can be asserted directly, and so
+ * `resolveSseMessageSession` can stay pure. That alone does not pin the route:
+ * a test that only calls this function is still green once the route stops
+ * calling it, which is why `__seedSseSessionForTesting` below exists.
  */
 export function refuseSseMessage(
   authReq: ApiKeyAuthenticatedRequest,
@@ -126,6 +126,32 @@ const sseRouter = express.Router();
 
 // Session lifetime manager for SSE sessions
 const sessionManager = new SessionLifetimeManagerImpl<Transport>("SSE");
+
+/**
+ * Put a bound session into the module's REAL map — tests only. The
+ * streamable-http twin is `recoverPersistedSession`, which tests can drive
+ * because recovery is a production entry point; SSE has no equivalent, since
+ * the only production writer of this map is a live stream-open needing a real
+ * transport and a real pooled server.
+ *
+ * Without this seam the `/message` route is unreachable from a test: the guard
+ * always resolves "absent", which carries a null `refusedReason` and so skips
+ * the refusal branch entirely. That left the branch's wiring unpinned — the
+ * route's `refuseSseMessage` call could be deleted and the suite stayed green,
+ * meaning nothing would catch the SSE leg silently going back to log-only.
+ */
+export function __seedSseSessionForTesting(
+  sessionId: string,
+  transport: Transport,
+  binding?: SessionBinding,
+): void {
+  sessionManager.addSession(sessionId, transport, binding);
+}
+
+/** Companion seam: drop a seeded session without running cleanup side effects. */
+export function __removeSseSessionForTesting(sessionId: string): void {
+  sessionManager.removeSession(sessionId);
+}
 
 // Cleanup function for a specific session
 const cleanupSession = async (sessionId: string, transport?: Transport) => {

@@ -155,16 +155,18 @@ describe("extractPresentedCredential — one gated definition of the presented c
 });
 
 describe("recordSessionBindingDenial — the write throttle", () => {
-  it("writes the first refusal for a pair and swallows the rest of the window", () => {
-    expect(recordSessionBindingDenial("key-A", "ep-1")).toEqual({
+  const MISMATCH = "session_credential_mismatch";
+
+  it("writes the first refusal for a key and swallows the rest of the window", () => {
+    expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH)).toEqual({
       emit: true,
       suppressed: 0,
     });
-    expect(recordSessionBindingDenial("key-A", "ep-1")).toEqual({
+    expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH)).toEqual({
       emit: false,
       suppressed: 1,
     });
-    expect(recordSessionBindingDenial("key-A", "ep-1")).toEqual({
+    expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH)).toEqual({
       emit: false,
       suppressed: 2,
     });
@@ -174,13 +176,14 @@ describe("recordSessionBindingDenial — the write throttle", () => {
     // Volume is the question a responder asks of this event — "denied once"
     // and "denied 4,000 times in a minute" must stay distinguishable even
     // though per-attempt timestamps do not survive.
-    recordSessionBindingDenial("key-A", "ep-1");
-    for (let i = 0; i < 40; i += 1) recordSessionBindingDenial("key-A", "ep-1");
+    recordSessionBindingDenial("key-A", "ep-1", MISMATCH);
+    for (let i = 0; i < 40; i += 1)
+      recordSessionBindingDenial("key-A", "ep-1", MISMATCH);
 
     vi.useFakeTimers();
     try {
       vi.setSystemTime(Date.now() + SESSION_DENIAL_REPORT_INTERVAL_MS + 1);
-      expect(recordSessionBindingDenial("key-A", "ep-1")).toEqual({
+      expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH)).toEqual({
         emit: true,
         suppressed: 40,
       });
@@ -189,13 +192,76 @@ describe("recordSessionBindingDenial — the write throttle", () => {
     }
   });
 
-  it("throttles PER (actor, endpoint) — one noisy caller never hides another's first refusal", () => {
-    expect(recordSessionBindingDenial("key-A", "ep-1").emit).toBe(true);
-    expect(recordSessionBindingDenial("key-A", "ep-1").emit).toBe(false);
+  it("throttles PER (actor, endpoint, reason) — one noisy caller never hides another's first refusal", () => {
+    expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH).emit).toBe(
+      true,
+    );
+    expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH).emit).toBe(
+      false,
+    );
     // Same caller, different endpoint.
-    expect(recordSessionBindingDenial("key-A", "ep-2").emit).toBe(true);
+    expect(recordSessionBindingDenial("key-A", "ep-2", MISMATCH).emit).toBe(
+      true,
+    );
     // Different caller, same endpoint.
-    expect(recordSessionBindingDenial("key-B", "ep-1").emit).toBe(true);
+    expect(recordSessionBindingDenial("key-B", "ep-1", MISMATCH).emit).toBe(
+      true,
+    );
+  });
+
+  it("keys on the REASON too — a second class from the same caller and endpoint is not swallowed", () => {
+    // The whole point of `detail.reason` is letting an operator separate a
+    // cross-endpoint replay from a stolen credential. Keying without it means
+    // whichever class arrives first in a window hides every other class behind
+    // a bare count, so the distinguishing field never reaches the table.
+    expect(
+      recordSessionBindingDenial("key-A", "ep-1", "session_endpoint_mismatch")
+        .emit,
+    ).toBe(true);
+    expect(
+      recordSessionBindingDenial("key-A", "ep-1", "session_endpoint_mismatch")
+        .emit,
+    ).toBe(false);
+
+    // Same credential, same endpoint, DIFFERENT class — its own first row.
+    expect(recordSessionBindingDenial("key-A", "ep-1", MISMATCH).emit).toBe(
+      true,
+    );
+    expect(
+      recordSessionBindingDenial("key-A", "ep-1", "session_binding_absent")
+        .emit,
+    ).toBe(true);
+    expect(
+      recordSessionBindingDenial(
+        "key-A",
+        "ep-1",
+        "session_persisted_credential_mismatch",
+      ).emit,
+    ).toBe(true);
+  });
+
+  it("stays bounded: the four reasons are the ceiling for one (actor, endpoint) window", () => {
+    // Per-reason keying must not become an amplifier. The reason is assigned by
+    // the server from a closed four-member union, so a caller cannot vary it to
+    // buy extra permanent rows — a burst of every class still writes 4, and
+    // everything after that is swallowed.
+    const reasons = [
+      "session_binding_absent",
+      "session_endpoint_mismatch",
+      "session_credential_mismatch",
+      "session_persisted_credential_mismatch",
+    ] as const;
+
+    let written = 0;
+    for (let i = 0; i < 200; i += 1) {
+      for (const reason of reasons) {
+        if (recordSessionBindingDenial("key-A", "ep-1", reason).emit) {
+          written += 1;
+        }
+      }
+    }
+
+    expect(written).toBe(reasons.length);
   });
 });
 
@@ -270,6 +336,33 @@ describe("emitSessionBindingDenial — the mcp.auth.denied envelope", () => {
     }
   });
 
+  it("writes a SECOND row when the same caller trips a different class in one window", () => {
+    // A cross-endpoint replay and a credential mismatch from the same key are
+    // different incidents. If the throttle collapsed them, the operator would
+    // see only the class that happened to arrive first and the other would
+    // survive as an unattributed number — exactly the read `detail.reason`
+    // exists to prevent.
+    emitSessionBindingDenial(authReq(), {
+      sessionId: "sess-1",
+      reason: "session_endpoint_mismatch",
+    });
+    emitSessionBindingDenial(authReq(), {
+      sessionId: "sess-2",
+      reason: "session_credential_mismatch",
+    });
+    // ...while a repeat of either class is still collapsed.
+    emitSessionBindingDenial(authReq(), {
+      sessionId: "sess-3",
+      reason: "session_endpoint_mismatch",
+    });
+
+    expect(emitMock).toHaveBeenCalledTimes(2);
+    expect(emitMock.mock.calls.map((call) => call[0].detail.reason)).toEqual([
+      "session_endpoint_mismatch",
+      "session_credential_mismatch",
+    ]);
+  });
+
   it("attributes an OAuth refusal to the user, not to an api key", () => {
     emitSessionBindingDenial(
       makeReq({
@@ -294,11 +387,16 @@ describe("emitSessionBindingDenial — the mcp.auth.denied envelope", () => {
       throw new Error("audit sink down");
     });
 
-    expect(() =>
-      emitSessionBindingDenial(authReq(), {
+    let result: ReturnType<typeof emitSessionBindingDenial> | undefined;
+    expect(() => {
+      result = emitSessionBindingDenial(authReq(), {
         sessionId: "sess-1",
         reason: "session_credential_mismatch",
-      }),
-    ).not.toThrow();
+      });
+    }).not.toThrow();
+
+    // Not just "did not throw": the caller shapes its warn log off this, so a
+    // failed sink must report the row as NOT written rather than claim one.
+    expect(result).toEqual({ emitted: false, suppressed: 0 });
   });
 });
