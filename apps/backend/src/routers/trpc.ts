@@ -8,6 +8,7 @@ import { trpcDenialSink } from "../lib/audit/trpc-denial-sink";
 import { credentialedCorsOrigin } from "../lib/cors-policy";
 import { trpcRateLimitMiddleware } from "../middleware/trpc-rate-limit.middleware";
 import { createContext } from "../trpc";
+import { accessGroupsImplementations } from "../trpc/access-groups.impl";
 import { apiKeysImplementations } from "../trpc/api-keys.impl";
 import { configImplementations } from "../trpc/config.impl";
 import { endpointsImplementations } from "../trpc/endpoints.impl";
@@ -43,6 +44,7 @@ const appRouter = createAppRouter({
     apiKeys: apiKeysImplementations,
     config: configImplementations,
     logs: logsImplementations,
+    accessGroups: accessGroupsImplementations,
   },
 });
 

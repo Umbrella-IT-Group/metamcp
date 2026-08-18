@@ -62,6 +62,17 @@ vi.mock("../db/repositories/oauth.repo", () => ({
   oauthRepository: { getAccessToken: getAccessTokenMock },
 }));
 
+// The access-group gate (migration 0033) reaches `access-groups.repo` from
+// `lib/endpoint-access-control`, which puts it on this middleware's module-load
+// import chain and therefore on db/index — same reason oauth.repo is mocked
+// above. Every endpoint in this file has `restricted: false`, so the gate
+// returns before it would ever call this.
+vi.mock("../db/repositories/access-groups.repo", () => ({
+  accessGroupsRepository: {
+    hasEndpointGrant: vi.fn().mockResolvedValue(false),
+  },
+}));
+
 vi.mock("../db/repositories/endpoints.repo", () => ({
   endpointsRepository: { findByName: findByNameMock },
 }));
@@ -95,6 +106,9 @@ const makeEndpoint = (
   client_max_rate_strategy_key: null,
   enable_oauth: false,
   use_query_param_auth: false,
+  // Access-group gate off (migration 0033 default), so these fixtures keep
+  // asserting pre-0033 behaviour exactly.
+  restricted: false,
   created_at: new Date("2026-07-01T00:00:00Z"),
   updated_at: new Date("2026-07-01T00:00:00Z"),
   user_id: null,
