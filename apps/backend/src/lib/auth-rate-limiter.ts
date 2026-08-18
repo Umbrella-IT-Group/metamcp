@@ -56,6 +56,12 @@ export class AuthRateLimiter {
    * check itself would become the thing that eventually refuses a legitimate
    * caller. This one only reads, so the count moves only when something
    * actually failed.
+   *
+   * It is also the right question wherever a call site RECORDS as well, which
+   * every failed-credential path here does: check with this, then record, and a
+   * failed request costs one count. Asking `isRateLimited` beside a
+   * `recordFailedAttempt` costs two, and the enforced allowance is half the
+   * constructor argument — see the budget note on getAuthRateLimitIdentifier.
    */
   isCurrentlyLimited(identifier: string): boolean {
     const record = this.attempts.get(identifier);
@@ -97,10 +103,9 @@ export class AuthRateLimiter {
 
 // Create rate limiter instance for failed authentication attempts.
 //
-// The ceiling reads 20 but the enforced allowance is about ten failures per
-// minute, because the middleware records a failure and then asks
-// `isRateLimited`, which counts the asking too. See the docblock on
-// `getAuthRateLimitIdentifier` below for the full account.
+// Twenty failures per minute per (caller, endpoint), and the number here is
+// now the number that is enforced. See the budget note on
+// `getAuthRateLimitIdentifier` below for what it used to be and why.
 export const authRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000);
 
 // Clean up rate limiter entries every 10 minutes.
@@ -134,19 +139,26 @@ setInterval(
  * eleven requests. A single consumer retrying a stale credential in a loop did
  * the same thing by accident.
  *
- * WHAT THE BUDGET ACTUALLY IS, since the constructor argument reads 20 and the
- * effective allowance is half that. Every call site pairs the two calls —
- * `recordFailedAttempt(id)` and then `isRateLimited(id)` (three of them, in
- * middleware/api-key-oauth.middleware) — and `isRateLimited` COUNTS the
- * question it is asked, which is precisely the hazard `isCurrentlyLimited`
- * exists to avoid and documents above. Two counts therefore land per failed
- * request, so refusal arrives on the ELEVENTH failure in a window, not the
- * twentieth: roughly ten failed attempts per minute per (caller, endpoint).
- * That is the number to reason about, and the test file pins it by driving the
- * production pair rather than the counter directly. It is written down rather
- * than corrected because changing which method the middleware calls would
- * change enforcement — a separate decision from re-keying, and not one this
- * change makes.
+ * WHAT THE BUDGET IS: twenty failed attempts per minute per (caller, endpoint),
+ * the twentieth answered as a normal 401 and the twenty-first refused with a
+ * 429. The constructor argument and the enforced allowance are the same number.
+ *
+ * THEY USED NOT TO BE, and the reason is worth keeping because it is easy to
+ * reintroduce. All three call sites in middleware/api-key-oauth.middleware
+ * paired `recordFailedAttempt(id)` with `isRateLimited(id)`, and
+ * `isRateLimited` COUNTS the question it is asked — precisely the hazard
+ * `isCurrentlyLimited` exists to avoid and documents above. Two counts landed
+ * per failed request, so refusal arrived on the eleventh failure rather than
+ * the twenty-first: a nominal twenty enforced as roughly ten. The sites now
+ * check with `isCurrentlyLimited` first and record afterwards, which costs one
+ * count per failure, and the test file pins the exact boundary by driving that
+ * production pair rather than the counter directly.
+ *
+ * The one behavioural difference beyond the allowance: a request refused with a
+ * 429 no longer adds to the count, because it never reached the credential
+ * check. Nothing depends on that count growing during a refusal — a record
+ * inside an open window does not extend the window either — so a caller over
+ * budget stays refused for exactly the rest of the window it opened.
  *
  * Cloudflare overwrites CF-Connecting-IP at the edge on every request, so it is
  * per-CALLER rather than per-container. The trust assumption is exactly the one
