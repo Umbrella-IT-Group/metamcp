@@ -1,6 +1,7 @@
 import cors from "cors";
 import express from "express";
 
+import { checkAuditStorage } from "@/lib/audit-storage/tripwire";
 import { pruneGatewayEvents } from "@/lib/gateway-events/retention";
 import { TOOL_AUDIT_RETENTION_DAYS } from "@/lib/tool-audit-retention";
 import logger from "@/utils/logger";
@@ -60,6 +61,18 @@ setInterval(
     // thing to reason about at shutdown. Errors are logged and swallowed here
     // deliberately — see sweepUnusedDcrClients, which never throws.
     await sweepUnusedDcrClients();
+    // Audit-table growth tripwire. LAST on the tick, and that ordering is the
+    // point: it reports what the estate looks like after the sweeps above have
+    // run, not what it looked like a moment before they shrank it.
+    //
+    // It gates itself to every AUDIT_STORAGE_CHECK_INTERVAL_SWEEPS-th tick
+    // (default 12, so hourly) rather than taking a timer of its own, so the
+    // cheap ticks cost one modulo. `gateway_events` and `tool_call_audit` are
+    // immutable for 30 days, which means no application path can reclaim
+    // in-window space and the prunes above cannot fix a growth problem once it
+    // exists, so knowing early is the whole defence. Never throws; see
+    // lib/audit-storage/tripwire.
+    await checkAuditStorage();
   },
   5 * 60 * 1000,
 );
