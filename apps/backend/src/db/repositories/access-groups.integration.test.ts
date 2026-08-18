@@ -339,6 +339,31 @@ describeIfDb("read shapes the admin UI depends on", () => {
     expect(row.endpoint_count).toBe(0);
   });
 
+  it("findDetailByUuid carries the auth toggles the badge reads", async () => {
+    // `restricted` alone cannot say whether a mapping does anything: the gate
+    // is OAuth-only, so it is inert with `enable_oauth` off and partial when
+    // API keys are also accepted. These two columns are what let the group
+    // screen distinguish those states instead of labelling all three
+    // "Enforcing".
+    await db.execute(
+      `UPDATE endpoints SET restricted = true, enable_oauth = false, enable_api_key_auth = true WHERE uuid = '${ENDPOINT_A}'` as never,
+    );
+    const group = await repo.create({ name: "helpdesk" });
+    await repo.addEndpoint(group.uuid, ENDPOINT_A);
+
+    const detail = await repo.findDetailByUuid(group.uuid);
+
+    expect(detail?.endpoints).toEqual([
+      {
+        endpoint_uuid: ENDPOINT_A,
+        name: "agroups-alpha",
+        restricted: true,
+        enable_oauth: false,
+        enable_api_key_auth: true,
+      },
+    ]);
+  });
+
   it("findGroupsForEndpoint returns the groups that gate one endpoint", async () => {
     const gating = await repo.create({ name: "gating" });
     const elsewhere = await repo.create({ name: "elsewhere" });

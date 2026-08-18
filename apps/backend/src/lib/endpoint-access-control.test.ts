@@ -165,6 +165,53 @@ describe("the decision cache", () => {
     );
   });
 
+  it("an invalidation landing MID-FLIGHT discards the result instead of caching it", async () => {
+    // The window this closes: a decision that began before a revocation and
+    // resolved after it. Stamping the generation at WRITE time would store the
+    // pre-revocation `true` under the new generation, where it looks current
+    // for the full TTL — invalidation defeated in exactly the case it exists
+    // for, and only visible to a request that raced an admin mutation.
+    let releaseGrant: (value: boolean) => void = () => {};
+    hasEndpointGrantMock.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        releaseGrant = resolve;
+      }),
+    );
+
+    const inFlight = isOAuthUserAllowedOnEndpoint(USER, ENDPOINT);
+
+    // The admin revokes while the queries are still outstanding.
+    invalidateEndpointAccessCache();
+    releaseGrant(true);
+
+    // The in-flight request keeps the answer it computed — it was authorized
+    // before the revocation landed and there is nothing to un-decide.
+    await expect(inFlight).resolves.toBe(true);
+
+    // But nothing was cached, so the NEXT request re-decides against the
+    // committed state rather than replaying the stale admission.
+    expect(__endpointAccessCacheSizeForTesting()).toBe(0);
+
+    hasEndpointGrantMock.mockResolvedValue(false);
+    await expect(isOAuthUserAllowedOnEndpoint(USER, ENDPOINT)).resolves.toBe(
+      false,
+    );
+    expect(hasEndpointGrantMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a decision that does NOT race an invalidation is still cached", async () => {
+    // The other half of the guard: it must discard only the racing write, not
+    // every write. Without this, "the cache never stores anything" would pass
+    // the test above.
+    hasEndpointGrantMock.mockResolvedValue(true);
+
+    await isOAuthUserAllowedOnEndpoint(USER, ENDPOINT);
+
+    expect(__endpointAccessCacheSizeForTesting()).toBe(1);
+    await isOAuthUserAllowedOnEndpoint(USER, ENDPOINT);
+    expect(hasEndpointGrantMock).toHaveBeenCalledTimes(1);
+  });
+
   it("keys on the pair — a shared user id does not leak across endpoints", async () => {
     hasEndpointGrantMock.mockResolvedValue(true);
     await isOAuthUserAllowedOnEndpoint(USER, ENDPOINT);

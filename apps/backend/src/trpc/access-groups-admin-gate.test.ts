@@ -59,7 +59,13 @@ const buildRouter = () =>
     listEndpoints: vi.fn().mockResolvedValue({ success: true, data: [] }),
     getEndpointAccess: vi.fn().mockResolvedValue({
       success: true,
-      data: { endpoint_uuid: ENDPOINT_UUID, restricted: false, groups: [] },
+      data: {
+        endpoint_uuid: ENDPOINT_UUID,
+        restricted: false,
+        enable_oauth: true,
+        enable_api_key_auth: false,
+        groups: [],
+      },
     }),
     create: vi.fn().mockResolvedValue({ success: true, data: GROUP }),
     update: vi.fn().mockResolvedValue({ success: true }),

@@ -502,6 +502,64 @@ describe("membership is cached, and revocation drops it", () => {
   });
 });
 
+describe("fails closed end to end when the decision cannot be made", () => {
+  /**
+   * The two halves of fail-closed only ever met in separate files: the lib
+   * suite proves the predicate REJECTS, and this suite proves what the caller
+   * gets. Neither on its own rules out a middleware catch that swallows the
+   * throw and calls next(), which would serve an unauthorized caller on exactly
+   * the endpoint an operator switched on. These two cases join them.
+   */
+  it("a failing grant query serves nobody and answers 500", async () => {
+    hasEndpointGrantMock.mockRejectedValue(
+      new Error("connection terminated unexpectedly"),
+    );
+
+    const { served, res } = await asOAuthUser(
+      USER_ID,
+      makeEndpoint({ restricted: true }),
+    );
+
+    expect(served).toBe(false);
+    expect(res.statusCode).toBe(500);
+    // Nothing was cached, so a recovered database is re-consulted rather than
+    // the failure being remembered as a decision.
+    expect(__endpointAccessCacheSizeForTesting()).toBe(0);
+  });
+
+  it("a failing role lookup serves nobody and answers 500", async () => {
+    findRoleByIdMock.mockRejectedValue(new Error("role lookup failed"));
+    // The grant query succeeding is the point: a caller must not be admitted
+    // just because the OTHER half of the decision happened to resolve.
+    hasEndpointGrantMock.mockResolvedValue(true);
+
+    const { served, res } = await asOAuthUser(
+      USER_ID,
+      makeEndpoint({ restricted: true }),
+    );
+
+    expect(served).toBe(false);
+    expect(res.statusCode).toBe(500);
+    expect(__endpointAccessCacheSizeForTesting()).toBe(0);
+  });
+
+  it("but an UNRESTRICTED endpoint is unaffected by a broken grant query", async () => {
+    // The gate returns before either query on an endpoint that has not opted
+    // in, so a database problem in this path cannot take unrestricted traffic
+    // down with it.
+    hasEndpointGrantMock.mockRejectedValue(new Error("connection terminated"));
+    findRoleByIdMock.mockRejectedValue(new Error("connection terminated"));
+
+    const { served, res } = await asOAuthUser(
+      USER_ID,
+      makeEndpoint({ restricted: false }),
+    );
+
+    expect(served).toBe(true);
+    expect(res.statusCode).toBe(200);
+  });
+});
+
 describe("the denial is recorded", () => {
   it("emits one endpoint.access.denied row naming the user and the endpoint", async () => {
     await asOAuthUser(USER_ID, makeEndpoint({ restricted: true }));

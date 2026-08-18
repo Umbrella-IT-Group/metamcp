@@ -68,6 +68,12 @@ export const AccessGroupEndpointSchema = z.object({
   // to say so — otherwise an operator reads a grant list as protection that is
   // not switched on.
   restricted: z.boolean(),
+  // `restricted` alone is not enough to answer that question. The gate governs
+  // OAuth callers only, so it is inert on an endpoint with `enable_oauth` off,
+  // and only partial on one that also accepts API keys. The badge needs all
+  // three to be honest.
+  enable_oauth: z.boolean(),
+  enable_api_key_auth: z.boolean(),
 });
 
 export const AccessGroupDetailSchema = AccessGroupSchema.extend({
@@ -115,10 +121,22 @@ export const GetEndpointAccessRequestSchema = z.object({
   endpoint_uuid: z.string().uuid(),
 });
 
-/** The endpoint-detail Access panel: the toggle's state plus who it admits. */
+/**
+ * The endpoint-detail Access panel: the toggle's state plus who it admits.
+ *
+ * `enable_oauth` and `enable_api_key_auth` ride along because the gate's REAL
+ * effect depends on them and the switch alone cannot express it. The gate
+ * applies to OAuth callers only, so on an endpoint with `enable_oauth` off it
+ * is inert no matter what `restricted` says, and on one that also accepts API
+ * keys it narrows the OAuth half while every key holder still passes. Without
+ * these two fields the UI can only say "restricted", which an operator
+ * reasonably reads as "locked down" in both of those cases.
+ */
 export const EndpointAccessSchema = z.object({
   endpoint_uuid: z.string(),
   restricted: z.boolean(),
+  enable_oauth: z.boolean(),
+  enable_api_key_auth: z.boolean(),
   groups: z.array(
     z.object({
       uuid: z.string(),

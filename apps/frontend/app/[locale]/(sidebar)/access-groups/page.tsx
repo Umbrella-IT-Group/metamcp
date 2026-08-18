@@ -60,6 +60,29 @@ import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 type CreateAccessGroupFormData = z.infer<typeof CreateAccessGroupRequestSchema>;
 
 /**
+ * What a group's mapping onto one endpoint actually does today.
+ *
+ * `restricted` alone cannot say, and reporting it alone is wrong in the
+ * reassuring direction. The gate governs OAUTH callers only, so:
+ *
+ *   off        the endpoint has not opted in; the mapping is legal and inert.
+ *   noOauth    it opted in, but accepts no OAuth callers, so nothing is gated.
+ *   oauthOnly  it gates OAuth callers, while every API-key holder still passes
+ *              (the designed scope boundary, not a gap).
+ *   enforcing  OAuth is the only way in and the gate governs all of it.
+ */
+function endpointGateState(endpoint: {
+  restricted: boolean;
+  enable_oauth: boolean;
+  enable_api_key_auth: boolean;
+}): "off" | "noOauth" | "oauthOnly" | "enforcing" {
+  if (!endpoint.restricted) return "off";
+  if (!endpoint.enable_oauth) return "noOauth";
+  if (endpoint.enable_api_key_auth) return "oauthOnly";
+  return "enforcing";
+}
+
+/**
  * Access groups: which OAuth users may reach which endpoints (migration 0033).
  *
  * DISTINCT FROM `/access`, which is the read-only inventory of every way into
@@ -599,19 +622,24 @@ export default function AccessGroupsPage() {
                               {endpoint.name}
                             </TableCell>
                             <TableCell>
-                              {/* A mapping onto an endpoint that has not opted
-                                  in is legal and INERT. Saying so here is the
-                                  difference between a grant list an operator
-                                  can trust and one they misread as protection
-                                  that is already switched on. */}
+                              {/* Four states, because `restricted` alone is not
+                                  the answer. The gate governs OAuth callers
+                                  only, so it is INERT on an endpoint with OAuth
+                                  off and PARTIAL on one that also accepts API
+                                  keys. Collapsing those into "Enforcing" is the
+                                  difference between a grant list an operator can
+                                  trust and one they misread as protection that
+                                  is already fully switched on. */}
                               <Badge
                                 variant={
-                                  endpoint.restricted ? "default" : "outline"
+                                  endpointGateState(endpoint) === "enforcing"
+                                    ? "default"
+                                    : "outline"
                                 }
                               >
-                                {endpoint.restricted
-                                  ? t("access:groups.enforcing")
-                                  : t("access:groups.notEnforcing")}
+                                {t(
+                                  `access:groups.gate.${endpointGateState(endpoint)}`,
+                                )}
                               </Badge>
                             </TableCell>
                             <TableCell className="w-[80px]">

@@ -87,6 +87,19 @@ export const CreateEndpointRequestSchema = z.object({
   user_id: z.string().nullable().optional(),
 });
 
+// DELIBERATELY WITHOUT `restricted` (migration 0033). This is the wire shape
+// for `endpoints.list` / `endpoints.get`, which are protectedProcedure and
+// therefore MEMBER-visible. Which endpoints are gated, and which are not, is
+// the authorization policy itself: the whole reason every procedure on the
+// access-groups router is adminProcedure is that a member has no business
+// reading that map, and shipping the same bit here through a member-visible
+// endpoint would hand it back one row at a time.
+//
+// The middleware does not read this schema. It reads `DatabaseEndpointSchema`
+// below, off the row the lookup middleware stamps on the request, which still
+// carries `restricted` as a REQUIRED field. Enforcement is unaffected.
+//
+// The admin surface reads it through `accessGroups.getEndpointAccess`.
 export const EndpointSchema = z.object({
   uuid: z.string(),
   name: z.string(),
@@ -107,12 +120,6 @@ export const EndpointSchema = z.object({
   clientMaxRateStrategyKey: z.string().optional(),
   enable_oauth: z.boolean(),
   use_query_param_auth: z.boolean(),
-  // Access-group gate for OAuth callers (migration 0033). Read-only on this
-  // schema: it is not settable through create/update, only through the
-  // dedicated `accessGroups.setEndpointRestricted` mutation, so that flipping a
-  // live endpoint's authorization posture is its own attributable act rather
-  // than a field that can ride along in an unrelated rename.
-  restricted: z.boolean(),
   created_at: z.string(),
   updated_at: z.string(),
   user_id: z.string().nullable(),

@@ -164,6 +164,11 @@ export class AccessGroupsRepository {
           endpoint_uuid: endpointsTable.uuid,
           name: endpointsTable.name,
           restricted: endpointsTable.restricted,
+          // The auth toggles decide whether `restricted` gates anybody: the
+          // gate is OAuth-only, so it is inert with `enable_oauth` off and
+          // partial when API keys are also accepted.
+          enable_oauth: endpointsTable.enable_oauth,
+          enable_api_key_auth: endpointsTable.enable_api_key_auth,
         })
         .from(accessGroupEndpointsTable)
         .innerJoin(

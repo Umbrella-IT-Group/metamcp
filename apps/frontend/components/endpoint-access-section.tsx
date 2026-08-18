@@ -66,10 +66,12 @@ export function EndpointAccessSection({
           utils.frontend.accessGroups.getEndpointAccess.invalidate({
             endpoint_uuid: endpointUuid,
           });
-          // The endpoint list carries `restricted` too, so a stale list would
-          // disagree with the toggle the operator just flipped.
-          utils.frontend.endpoints.list.invalidate();
+          // `endpoints.list` is deliberately NOT invalidated: it is
+          // member-visible and no longer carries `restricted` at all, so it
+          // cannot go stale on this flip. The two admin reads that do carry the
+          // bit are the ones refreshed here and above.
           utils.frontend.accessGroups.listEndpoints.invalidate();
+          utils.frontend.accessGroups.get.invalidate();
           toast.success(t("access:groups.restrictedUpdated"));
         } else {
           toast.error(
@@ -89,6 +91,27 @@ export function EndpointAccessSection({
   const access = accessResponse?.success ? accessResponse.data : undefined;
   const restricted = access?.restricted ?? false;
   const groups = access?.groups ?? [];
+
+  // What the switch ACTUALLY does on this endpoint, which `restricted` alone
+  // cannot say. The gate governs OAuth callers only:
+  //
+  //   enable_oauth off        -> the switch is inert; no caller reaches this
+  //                             endpoint through the gate at all.
+  //   + enable_api_key_auth   -> it narrows the OAuth half only; every API-key
+  //                             holder still passes, by design.
+  //
+  // Reporting "only administrators can reach it" in either case would be
+  // false, and false in the reassuring direction, which is the worst kind on a
+  // security panel.
+  const gateIsInert =
+    restricted && access !== undefined && !access.enable_oauth;
+  const apiKeysStillPass =
+    restricted && access !== undefined && access.enable_api_key_auth;
+  const gateFullyGoverns =
+    restricted &&
+    access !== undefined &&
+    access.enable_oauth &&
+    !access.enable_api_key_auth;
 
   return (
     <div className="space-y-4 border-t pt-4">
@@ -115,16 +138,37 @@ export function EndpointAccessSection({
         />
       </div>
 
-      {restricted && groups.length === 0 && (
-        // The lockout warning. A restricted endpoint with no group mapped
-        // admits administrators and nobody else, which is a legitimate state
-        // but almost never the intended one — and the person who set it is
-        // usually an administrator, so they will not notice by using it.
+      {gateIsInert && (
+        // The switch is on but this endpoint accepts no OAuth callers, so it
+        // gates nobody. Said outright, because a switch that reads as "on" and
+        // does nothing is the most misleading state this panel can render.
+        <div className="p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
+          <p className="text-sm text-yellow-800 dark:text-yellow-200">
+            {t("access:groups.noOauthWarning")}
+          </p>
+        </div>
+      )}
+
+      {gateFullyGoverns && groups.length === 0 && (
+        // The lockout warning, now correctly narrowed. It only holds when OAuth
+        // is the ONLY way in: a restricted endpoint with no group mapped then
+        // admits administrators and nobody else, which is legitimate but almost
+        // never intended, and the person who set it is usually an administrator
+        // so they will not notice by using it.
         <div className="p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
           <p className="text-sm text-yellow-800 dark:text-yellow-200">
             {t("access:groups.noGroupsWarning")}
           </p>
         </div>
+      )}
+
+      {apiKeysStillPass && access?.enable_oauth && (
+        // Not a warning: this is the designed scope boundary. But an operator
+        // reading "restricted" on an endpoint that also accepts API keys should
+        // not have to infer that every key holder still gets in.
+        <p className="text-xs text-muted-foreground">
+          {t("access:groups.apiKeysStillPass")}
+        </p>
       )}
 
       <div className="space-y-2">

@@ -144,6 +144,8 @@ const ENDPOINT_ROW = {
   uuid: ENDPOINT_UUID,
   name: "autotask",
   restricted: false,
+  enable_oauth: true,
+  enable_api_key_auth: false,
 };
 
 let rows: AuditRow[];
@@ -592,5 +594,24 @@ describe("read side", () => {
     expect(result.data?.groups).toEqual([
       { uuid: GROUP_UUID, name: "helpdesk", member_count: 3 },
     ]);
+  });
+
+  it("getEndpointAccess carries the auth toggles, so the panel can tell inert from enforcing", async () => {
+    // Without these the UI can only say "restricted", which on an endpoint that
+    // accepts no OAuth callers is a switch that reads as on and gates nobody.
+    endpointFindByUuidMock.mockResolvedValue({
+      ...ENDPOINT_ROW,
+      restricted: true,
+      enable_oauth: false,
+      enable_api_key_auth: true,
+    });
+    findGroupsForEndpointMock.mockResolvedValue([]);
+
+    const result = await accessGroupsImplementations.getEndpointAccess({
+      endpoint_uuid: ENDPOINT_UUID,
+    });
+
+    expect(result.data?.enable_oauth).toBe(false);
+    expect(result.data?.enable_api_key_auth).toBe(true);
   });
 });

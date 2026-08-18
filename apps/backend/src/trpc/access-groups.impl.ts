@@ -157,6 +157,10 @@ export const accessGroupsImplementations = {
         data: {
           endpoint_uuid: endpoint.uuid,
           restricted: endpoint.restricted,
+          // Carried so the panel can tell "restricted" from "restricted AND
+          // actually gating anyone" — see EndpointAccessSchema.
+          enable_oauth: endpoint.enable_oauth,
+          enable_api_key_auth: endpoint.enable_api_key_auth,
           groups,
         },
       };

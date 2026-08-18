@@ -168,14 +168,42 @@ function readCachedDecision(key: string): boolean | undefined {
   return entry.allowed;
 }
 
-function writeCachedDecision(key: string, allowed: boolean): void {
+/**
+ * Store a decision, unless an invalidation landed while it was being computed.
+ *
+ * `generation` is the value captured BEFORE the queries were issued, and
+ * comparing it here is the whole point of the parameter. Stamping
+ * `cacheGeneration` as read at write time instead would defeat invalidation in
+ * the one window where it matters most: a decision that began before a
+ * revocation, and resolved after it, would be written under the NEW generation
+ * and would therefore look current for the full TTL. The revoked user would
+ * keep being served for a minute by the very mechanism meant to cut them off,
+ * and only a request that raced an admin mutation would show it.
+ *
+ * Discarding the write is the correct remedy rather than a partial one: the
+ * next request for this pair misses the cache and re-decides against the
+ * committed state. The IN-FLIGHT request still returns the value it computed —
+ * it was authorized before the revocation landed and there is nothing to
+ * un-decide — which is the same bound any check-then-act authorization has.
+ *
+ * Same generation-capture guard the connection pools use for their idle
+ * sessions (`idleSessionGenerations` in `lib/metamcp/mcp-server-pool.ts`),
+ * where an invalidation mid-create means the created client is thrown away
+ * rather than stored.
+ */
+function writeCachedDecision(
+  key: string,
+  allowed: boolean,
+  generation: number,
+): void {
+  if (generation !== cacheGeneration) return;
   if (decisionCache.size >= ACCESS_DECISION_MAX_ENTRIES) {
     decisionCache.clear();
   }
   decisionCache.set(key, {
     allowed,
     expiresAt: Date.now() + ACCESS_DECISION_TTL_MS,
-    generation: cacheGeneration,
+    generation,
   });
 }
 
@@ -213,6 +241,11 @@ export async function isOAuthUserAllowedOnEndpoint(
   const cached = readCachedDecision(key);
   if (cached !== undefined) return cached;
 
+  // Captured BEFORE the queries are issued, never after: an invalidation that
+  // lands while they are in flight has to be able to discard the result. See
+  // writeCachedDecision.
+  const generation = cacheGeneration;
+
   // Concurrent rather than sequential: neither answer depends on the other, and
   // this runs on a request that is otherwise idle waiting on the database.
   const [role, hasGrant] = await Promise.all([
@@ -221,7 +254,7 @@ export async function isOAuthUserAllowedOnEndpoint(
   ]);
 
   const allowed = role === "admin" || hasGrant;
-  writeCachedDecision(key, allowed);
+  writeCachedDecision(key, allowed, generation);
   return allowed;
 }
 
