@@ -50,7 +50,12 @@ services:
       APP_URL: ${APP_URL:-http://localhost:12008}
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
       
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-your-super-secret-key-change-this-in-production}
+      # Required, no fallback — the session signing key, whose old default is
+      # published in this repository. The message names `.devcontainer/.env`
+      # for the same reason the POSTGRES_PASSWORD note above does: compose
+      # resolves `.env` for `${...}` interpolation from the project directory,
+      # which defaults to this compose file's own folder.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in the environment or .devcontainer/.env (see example.env)}
       
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
     extra_hosts:

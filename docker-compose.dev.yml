@@ -42,7 +42,10 @@ services:
       NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost:12008}
       
       # Auth configuration
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-your-super-secret-key-change-this-in-production}
+      # Required, no fallback — see the note in docker-compose.yml. This is
+      # the session signing key, and the default it used to carry is
+      # published in this repository.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env (see example.env)}
       
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}

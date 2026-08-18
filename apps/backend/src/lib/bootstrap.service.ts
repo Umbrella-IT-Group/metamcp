@@ -1447,6 +1447,14 @@ const SHIPPED_PLACEHOLDER_PASSWORDS = new Set([
 ]);
 
 /**
+ * Deliberately its own constant rather than a member of the set above: this
+ * value is a signing key, and `example.env` gives it a distinct placeholder so
+ * one find-and-replace cannot set the database password and the session
+ * signing key to the same string.
+ */
+const SHIPPED_PLACEHOLDER_AUTH_SECRET = "REPLACE_ME__generate_a_signing_key";
+
+/**
  * Warn, loudly, if a bootstrap account is being created with a password this
  * repository publishes. Returns whether it warned, so a test can assert the
  * warning rather than the predicate behind it.
@@ -1475,6 +1483,50 @@ export function warnOnPlaceholderBootstrapPassword(
   console.warn(
     "     Set BOOTSTRAP_USER_PASSWORD (or the password in BOOTSTRAP_USERS) to " +
       "a real secret and restart.",
+  );
+  console.warn(
+    "==============================================================",
+  );
+  return true;
+}
+
+/**
+ * The signing-key twin of the check above, and the reason it is a SEPARATE
+ * function rather than another entry in the set.
+ *
+ * `BETTER_AUTH_SECRET` is not a password: it signs session cookies and the
+ * OAuth consent requests. Someone who knows it does not need to guess a
+ * password at all, they can mint a valid session for any account, so the
+ * remedy sentence and the severity are different from a bootstrap password's
+ * and the message has to say so.
+ *
+ * A WARNING rather than a refusal, matching its sibling: `auth.ts` already
+ * throws when the variable is absent, and the case being addressed here is an
+ * operator who copied `example.env` and edited the lines they noticed. Refusing
+ * to boot would brick a throwaway local stack over a value that is fine there.
+ *
+ * Returns whether it warned so a test can assert the warning rather than the
+ * predicate behind it.
+ */
+export function warnOnPlaceholderAuthSecret(
+  secret: string | undefined,
+): boolean {
+  if (secret !== SHIPPED_PLACEHOLDER_AUTH_SECRET) return false;
+
+  console.warn(
+    "==============================================================",
+  );
+  console.warn(
+    "⚠️ INSECURE BETTER_AUTH_SECRET: the gateway is signing sessions with " +
+      "the placeholder published in example.env.",
+  );
+  console.warn(
+    "     Anyone who has read the repository can mint a session cookie for " +
+      "ANY account on this gateway without a password.",
+  );
+  console.warn(
+    "     Generate one with `openssl rand -hex 32`, set BETTER_AUTH_SECRET " +
+      "and restart. Existing sessions are invalidated by the change.",
   );
   console.warn(
     "==============================================================",
@@ -1514,6 +1566,11 @@ function validateConfig(config: EnvConfig): void {
     }
     warnOnPlaceholderBootstrapPassword(user.email, user.password);
   }
+
+  // Read here rather than taken from `config`, because this is not bootstrap
+  // configuration: it is the running gateway's signing key, and it matters
+  // even on a deployment that configures no bootstrap users at all.
+  warnOnPlaceholderAuthSecret(process.env.BETTER_AUTH_SECRET);
 
   if (config.recreateDefaultUser && !config.preserveApiKeysOnRecreate) {
     console.warn(
