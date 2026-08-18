@@ -88,8 +88,21 @@ export const authApiRelay = async (
     // been reached. Fire-and-forget and never throws — see
     // lib/audit/auth-relay-audit; a logging failure here must not turn a
     // successful sign-in into a 500 (the catch below would answer one).
+    //
+    // `url.pathname`, NOT `req.path`: the audit has to name the path
+    // better-auth actually routed on, and those two are different strings.
+    // `url` is the one handed to `auth.handler` above, and building it ran the
+    // WHATWG parser, which resolves dot segments and reads a backslash as a
+    // slash; express leaves both alone. So `POST /api/auth/x/../sign-in/email`
+    // and `POST /api/auth\sign-in/email` are credential attempts that
+    // better-auth answers as `/api/auth/sign-in/email` while `req.path` is a
+    // path the emitter does not recognise — which silently dropped the
+    // `auth.login.failure` row, the one event here with no database-hook
+    // equivalent and therefore the whole credential-stuffing signal. Reusing
+    // the relay's own `url` rather than re-normalising keeps the two from
+    // drifting apart again.
     emitAuthRelayEvent({
-      path: req.path,
+      path: url.pathname,
       status: response.status,
       requestBody: req.body,
       responseBody: body,

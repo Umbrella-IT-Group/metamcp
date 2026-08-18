@@ -39,15 +39,25 @@ import {
  * SIZE. That attempted address is attacker-controlled body text on a route
  * whose JSON limit is 50mb, so it is clamped to RFC 5321's 320-character
  * maximum address length before it reaches a column in a table with no
- * prune path. The row COUNT is bounded by better-auth's own sign-in limiter;
- * the row SIZE is bounded here, and both are needed.
+ * prune path. The row SIZE is bounded here; the row COUNT is bounded by
+ * `middleware/auth-signin-rate-limit.middleware`, and both are needed. It is
+ * NOT bounded by better-auth's own limiter — `auth.ts` pins that off, because
+ * its address resolution puts every caller in one shared bucket behind this
+ * deployment's proxy chain.
  */
 
 /** RFC 5321 §4.5.3.1.3: the longest legal email address. */
 const MAX_EMAIL_LENGTH = 320;
 
 const AUTH_PREFIX = "/api/auth";
-const SIGN_IN_EMAIL_PATH = `${AUTH_PREFIX}/sign-in/email`;
+
+/**
+ * Exported because the sign-in rate limiter needs the same answer to "which
+ * path is the one where the HTTP status IS the credential verdict", and that
+ * distinction — drawn in WHY ONLY `sign-in/email` above — should be drawn once
+ * rather than restated where it can drift.
+ */
+export const SIGN_IN_EMAIL_PATH = `${AUTH_PREFIX}/sign-in/email`;
 const SIGN_OUT_PATH = `${AUTH_PREFIX}/sign-out`;
 
 /** Pull a string property off an unknown object without ever throwing. */
@@ -85,7 +95,16 @@ function signedInUser(responseBody: string): {
 }
 
 export function emitAuthRelayEvent(params: {
-  /** `req.path`, i.e. including the `/api/auth` prefix. */
+  /**
+   * The path better-auth ROUTED ON, including the `/api/auth` prefix — i.e.
+   * the `pathname` of the URL the relay handed `auth.handler`, never express's
+   * `req.path`. The comparisons below are exact, and the two strings differ on
+   * exactly the inputs that matter: the WHATWG URL parser the relay builds its
+   * Request with resolves dot segments and reads a backslash as a slash, and
+   * express does neither. Passing the raw `req.path` therefore drops the row
+   * for any respelling of the credential path — an attempt better-auth still
+   * judged, with no record that it happened.
+   */
   path: string;
   status: number;
   /** `req.body` — read for the attempted email only. */
