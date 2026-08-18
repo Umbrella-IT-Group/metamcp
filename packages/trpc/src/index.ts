@@ -26,6 +26,7 @@ export { createMcpServersRouter } from "./routers/frontend";
 // same pattern the pre-existing createMcpServersRouter export enables,
 // rather than re-deriving each gate against a synthetic router.
 export {
+  createAccessGroupsRouter,
   createApiKeysRouter,
   createNamespacesRouter,
   createConfigRouter,

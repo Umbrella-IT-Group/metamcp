@@ -1,3 +1,4 @@
+export * from "./access-groups.zod";
 export * from "./api.zod";
 export * from "./mcp-servers.zod";
 export * from "./namespaces.zod";

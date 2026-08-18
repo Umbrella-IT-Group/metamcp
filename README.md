@@ -96,6 +96,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 ### Access control
 
 - **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry.
+- **Endpoint access groups** — named groups that decide which OAuth users may reach which endpoints, so publishing one connector per business system no longer means publishing all of them to everyone who can log in. See [Access groups](#access-groups).
 
 ### Observability
 
@@ -351,6 +352,32 @@ Notes: use the API key in an `Authorization: Bearer <API_KEY>` header (the `?api
 - **MCP OAuth** on exposed endpoints (MCP Spec 2025-06-18), with this fork's refresh-token grant and configurable TTLs.
 - **RBAC** — `admin` vs `member` roles; destructive and config mutations are admin-gated (see [What we added](#what-we-added-over-upstream)).
 - **OIDC / SSO** — Auth0, Keycloak, Azure AD, Google, Okta, etc., with PKCE and separate UI/SSO registration controls. See [`CONTRIBUTING.md`](CONTRIBUTING.md#openid-connect-oidc-provider-setup).
+
+### Access groups
+
+By default an OAuth-authenticated user reaches every public endpoint on the gateway: endpoint access is gated on ownership only, so a public endpoint admits anyone who has completed an authorization flow. On an estate that publishes one connector per business system, that means one login reaches all of them.
+
+Access groups narrow it. A group is a named, reusable set of people; endpoints are mapped to groups; and an individual endpoint opts in with a **Restrict to access groups** switch. Once an endpoint is restricted, an OAuth caller reaches it only if they are an administrator or belong to at least one group mapped to it. Anyone else gets `403` with a single fixed message that names no endpoint and no group.
+
+The switch governs OAuth callers and nothing else, so what it actually does depends on the endpoint's other auth toggles, and the admin UI labels all three cases rather than reporting a bare "restricted":
+
+| endpoint accepts | effect of the switch |
+| --- | --- |
+| OAuth only | the gate governs every caller |
+| OAuth and API keys | it narrows OAuth callers; every API-key holder still reaches the endpoint |
+| API keys only | no effect at all, since no caller arrives through the gate |
+
+Administered from **Access Groups** in the sidebar (administrators only), plus an **Access** panel on each endpoint's edit dialog showing the switch and the groups currently mapped to it. Group create/update/delete, membership changes, endpoint mappings and the restriction switch each write an `audit_log` row; so does a refused request.
+
+Three properties worth stating plainly, because each is a deliberate boundary rather than an omission:
+
+- **It ships inert.** No group exists and no endpoint is restricted until an administrator creates and switches them on, so upgrading changes nothing for any existing caller. On an unrestricted endpoint the gate costs one boolean read and no query.
+- **API keys are not affected.** A key is minted by an administrator, is held by a machine rather than a person, and already carries its own per-endpoint scoping (`endpoint_uuid` and the per-endpoint *require scoped API key* switch). Gating a server-to-server key on the group membership of whoever happens to own it would break integrations to solve a problem those keys do not have. Use key scoping for machine callers and access groups for people.
+- **Groups gate whole endpoints, not individual tools.** There is no per-tool grant, and adding one is not planned. The supported way to give an audience a narrower tool set is the one this platform already has: curate a second namespace containing only the tools they should see, publish a second endpoint over it, and map the group to that endpoint.
+
+Membership decisions are cached in-process for 60 seconds and dropped immediately when any group or endpoint mapping changes, so a revocation takes effect on the caller's next request. Across multiple backend replicas the cache is per-process, and 60 seconds is the worst-case convergence.
+
+One limit worth knowing: the gate runs per request, so restricting an endpoint does not disconnect a notification stream that is already open. No tool call can land through it, because every call is a fresh request that re-runs the gate, but `list_changed` and log notifications keep flowing on that connection until the client disconnects.
 
 For reverse-proxy (nginx) setups with SSE long connections, see [`nginx.conf.example`](nginx.conf.example). A 2–4GB instance is the practical minimum for a hosted deployment.
 
