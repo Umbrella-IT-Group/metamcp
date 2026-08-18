@@ -593,9 +593,13 @@ export const authenticateApiKey = async (
       } else {
         // API key invalid - check rate limiting
         const rateLimitId = getAuthRateLimitIdentifier(req, endpoint);
-        authRateLimiter.recordFailedAttempt(rateLimitId);
 
-        if (authRateLimiter.isRateLimited(rateLimitId)) {
+        // READ-ONLY check, and it runs BEFORE the record on purpose: one failed
+        // request must cost exactly one count. `isRateLimited` counts the
+        // question it is asked, so pairing it with `recordFailedAttempt` landed
+        // two counts per failure and refused on the eleventh attempt against a
+        // nominal twenty. See the budget note in lib/auth-rate-limiter.
+        if (authRateLimiter.isCurrentlyLimited(rateLimitId)) {
           emitMcpAuthDenial(req, endpoint, {
             httpStatus: 429,
             reason: "too_many_failed_attempts",
@@ -609,6 +613,11 @@ export const authenticateApiKey = async (
             timestamp: new Date().toISOString(),
           });
         }
+
+        // Recorded only once the caller is inside its budget: a request already
+        // refused above never reached the credential check, so counting it
+        // would be counting the limiter's own answer.
+        authRateLimiter.recordFailedAttempt(rateLimitId);
 
         emitMcpAuthDenial(req, endpoint, {
           httpStatus: 401,
@@ -775,9 +784,13 @@ export const authenticateApiKey = async (
       } else {
         // Both OAuth and API key failed - check rate limiting
         const rateLimitId = getAuthRateLimitIdentifier(req, endpoint);
-        authRateLimiter.recordFailedAttempt(rateLimitId);
 
-        if (authRateLimiter.isRateLimited(rateLimitId)) {
+        // READ-ONLY check, and it runs BEFORE the record on purpose: one failed
+        // request must cost exactly one count. `isRateLimited` counts the
+        // question it is asked, so pairing it with `recordFailedAttempt` landed
+        // two counts per failure and refused on the eleventh attempt against a
+        // nominal twenty. See the budget note in lib/auth-rate-limiter.
+        if (authRateLimiter.isCurrentlyLimited(rateLimitId)) {
           emitMcpAuthDenial(req, endpoint, {
             httpStatus: 429,
             reason: "too_many_failed_attempts",
@@ -790,6 +803,10 @@ export const authenticateApiKey = async (
             timestamp: new Date().toISOString(),
           });
         }
+
+        // Recorded only once the caller is inside its budget — see the note on
+        // the api-key branch above.
+        authRateLimiter.recordFailedAttempt(rateLimitId);
 
         emitMcpAuthDenial(req, endpoint, {
           httpStatus: 401,
@@ -886,9 +903,13 @@ export const authenticateApiKey = async (
       } else {
         // OAuth token invalid - check rate limiting
         const rateLimitId = getAuthRateLimitIdentifier(req, endpoint);
-        authRateLimiter.recordFailedAttempt(rateLimitId);
 
-        if (authRateLimiter.isRateLimited(rateLimitId)) {
+        // READ-ONLY check, and it runs BEFORE the record on purpose: one failed
+        // request must cost exactly one count. `isRateLimited` counts the
+        // question it is asked, so pairing it with `recordFailedAttempt` landed
+        // two counts per failure and refused on the eleventh attempt against a
+        // nominal twenty. See the budget note in lib/auth-rate-limiter.
+        if (authRateLimiter.isCurrentlyLimited(rateLimitId)) {
           emitMcpAuthDenial(req, endpoint, {
             httpStatus: 429,
             reason: "too_many_failed_attempts",
@@ -902,6 +923,10 @@ export const authenticateApiKey = async (
             timestamp: new Date().toISOString(),
           });
         }
+
+        // Recorded only once the caller is inside its budget — see the note on
+        // the api-key branch above.
+        authRateLimiter.recordFailedAttempt(rateLimitId);
 
         emitMcpAuthDenial(req, endpoint, {
           httpStatus: 401,
