@@ -95,7 +95,16 @@ function signedInUser(responseBody: string): {
 }
 
 export function emitAuthRelayEvent(params: {
-  /** `req.path`, i.e. including the `/api/auth` prefix. */
+  /**
+   * The path better-auth ROUTED ON, including the `/api/auth` prefix — i.e.
+   * the `pathname` of the URL the relay handed `auth.handler`, never express's
+   * `req.path`. The comparisons below are exact, and the two strings differ on
+   * exactly the inputs that matter: the WHATWG URL parser the relay builds its
+   * Request with resolves dot segments and reads a backslash as a slash, and
+   * express does neither. Passing the raw `req.path` therefore drops the row
+   * for any respelling of the credential path — an attempt better-auth still
+   * judged, with no record that it happened.
+   */
   path: string;
   status: number;
   /** `req.body` — read for the attempted email only. */
