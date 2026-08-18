@@ -194,13 +194,28 @@ describe("resolveAuditStorageWarnMb", () => {
     expect(loggerMock.warn).not.toHaveBeenCalled();
   });
 
-  it("honours any positive integer", async () => {
+  it("honours any positive integer up to the ceiling", async () => {
     const { tripwire } = await loadTripwire();
 
     expect(tripwire.resolveAuditStorageWarnMb("1")).toBe(1);
     expect(tripwire.resolveAuditStorageWarnMb(" 512 ")).toBe(512);
     expect(tripwire.resolveAuditStorageWarnMb("102400")).toBe(102400);
+    expect(tripwire.resolveAuditStorageWarnMb("1048576")).toBe(1048576);
     expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+
+  it("caps a threshold so large it would mute the escalation", async () => {
+    const { tripwire } = await loadTripwire();
+
+    // The interval knob refuses to be an off switch; a threshold nothing can
+    // reach is the same off switch by another route, and it mutes the layer
+    // that does not depend on how logging is configured.
+    expect(tripwire.resolveAuditStorageWarnMb("1048577")).toBe(1048576);
+    expect(tripwire.resolveAuditStorageWarnMb("999999999")).toBe(1048576);
+    expect(loggerMock.warn).toHaveBeenCalledTimes(2);
+    expect(String(loggerMock.warn.mock.calls[0][0])).toContain(
+      "would mute the escalation entirely",
+    );
   });
 
   it("falls back on a non-integer or unusable value, with a WARN", async () => {
@@ -576,8 +591,9 @@ describe("failure isolation: the check never reaches the sweep it rides", () => 
         ),
     );
 
-    // The pool it reads through gives up after a second by design, so this is
-    // the ordinary saturated-database path, not an exotic one.
+    // The pool it reads through gives up rather than waiting, at both the
+    // checkout (1s) and the statement (5s), so this is the ordinary
+    // saturated-or-locked database path rather than an exotic one.
     await expect(tripwire.checkAuditStorage()).resolves.toBeUndefined();
     expect(loggerMock.error).toHaveBeenCalledTimes(1);
     expect(String(loggerMock.error.mock.calls[0][0])).toContain(
@@ -592,6 +608,68 @@ describe("failure isolation: the check never reaches the sweep it rides", () => 
     await expect(tripwire.checkAuditStorage()).resolves.toBeUndefined();
     expect(loggerMock.error).not.toHaveBeenCalled();
     expect(loggerMock.info).not.toHaveBeenCalled();
+  });
+
+  it("SAYS SO when it disables itself, rather than going quiet", async () => {
+    const originalDatabaseUrl = process.env.DATABASE_URL;
+    // Deleted explicitly rather than assumed absent, so the case is the same
+    // whether or not the runner's environment happens to carry one.
+    delete process.env.DATABASE_URL;
+    try {
+      const { tripwire } = await loadTripwire();
+      // `undefined` forces a real resolve attempt, which fails at the db
+      // module's import-time DATABASE_URL check.
+      tripwire.setAuditStorageStatsReaderForTesting(undefined);
+
+      await expect(tripwire.checkAuditStorage()).resolves.toBeUndefined();
+
+      // The module argues at length that a monitor nobody hears is the failure
+      // it exists to prevent. A bare `catch {}` that switches it off for the
+      // process lifetime would have been exactly that, inside its own error
+      // handling.
+      const disabled = loggerMock.warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("storage checks are disabled"));
+      expect(disabled).toHaveLength(1);
+      // The caught error rides along, so the line says WHY rather than only
+      // that it happened.
+      expect(loggerMock.warn.mock.calls.at(-1)?.[1]).toBeInstanceOf(Error);
+    } finally {
+      if (originalDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = originalDatabaseUrl;
+      }
+    }
+  });
+
+  it("does not re-attempt the resolve on every later sweep", async () => {
+    const originalDatabaseUrl = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      const { tripwire } = await loadTripwire({
+        AUDIT_STORAGE_CHECK_INTERVAL_SWEEPS: "1",
+      });
+      tripwire.setAuditStorageStatsReaderForTesting(undefined);
+
+      for (let sweep = 0; sweep < 5; sweep += 1) {
+        await tripwire.checkAuditStorage();
+      }
+
+      // One line, not five: the null is cached, so warning once is the whole
+      // truth and repeating it would be the noise this module keeps arguing
+      // against.
+      const disabled = loggerMock.warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("storage checks are disabled"));
+      expect(disabled).toHaveLength(1);
+    } finally {
+      if (originalDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = originalDatabaseUrl;
+      }
+    }
   });
 
   it("still advances the sweep counter when the check fails", async () => {

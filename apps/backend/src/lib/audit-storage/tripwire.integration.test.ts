@@ -21,8 +21,11 @@
  *   TEST_DATABASE_URL=postgres://test:test@127.0.0.1:55521/metamcp_test \
  *     npx vitest run src/lib/audit-storage/tripwire.integration.test.ts
  *
- * The rows it writes are inside `gateway_events`' 30-day immutability window
- * and cannot be cleaned up afterwards. Point it at a disposable database.
+ * The rows it writes are inside `gateway_events`' 30-day immutability window,
+ * so nothing can clean them up afterwards, including this suite. It is written
+ * to be re-runnable anyway: every assertion is scoped to rows newer than this
+ * run's start (see `runStart`). Still prefer a disposable database, because the
+ * rows accumulate even though they no longer break the assertions.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -36,12 +39,34 @@ type Db = Awaited<typeof import("@/db/index")>["db"];
 let db: Db;
 let checkAuditStorage: (typeof import("./tripwire"))["checkAuditStorage"];
 
+/**
+ * Start of this run, as the DATABASE sees it. Every assertion below counts
+ * only rows newer than this.
+ *
+ * WITHOUT IT THIS SUITE IS SINGLE-SHOT, and single-shot in the worst way: the
+ * rows it writes are inside `gateway_events`' 30-day immutability window, so
+ * they cannot be cleaned up in `afterAll` even deliberately. A second run
+ * against the same TEST_DATABASE_URL would find its predecessor's row, count
+ * two, and fail, reporting a defect in the tripwire when the only thing that
+ * happened is that the suite ran twice. A monitor's own test suite going red
+ * on a re-run is how a real red gets dismissed.
+ *
+ * Taken from the database clock rather than `Date.now()` for the reason
+ * `gateway-events.repo.pruneOlderThan` gives about its cutoff: the row's
+ * `occurred_at` is a server default, so comparing it to an application clock
+ * running slightly ahead would filter out the very row just written. The one
+ * second of margin covers the same skew from the other direction, and is far
+ * shorter than the gap between any two runs.
+ */
+let runStart: string;
+
 /** Poll for the detached history write rather than the call that scheduled it. */
 async function tripwireMessages(): Promise<string[]> {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const result = await db.execute(
       `SELECT message FROM gateway_events
         WHERE category = 'system' AND server_name = 'audit-storage'
+          AND occurred_at >= '${runStart}'::timestamptz
         ORDER BY occurred_at` as never,
     );
     if (result.rows.length > 0) {
@@ -66,6 +91,13 @@ describeIfDb("the tripwire reports through the table it monitors", () => {
     process.env.AUDIT_STORAGE_WARN_MB = "1";
 
     ({ db } = await import("@/db/index"));
+
+    // Claimed BEFORE the first check runs, so it bounds this run's rows and
+    // excludes every earlier run's.
+    const started = await db.execute(
+      `SELECT (now() - interval '1 second')::text AS started` as never,
+    );
+    runStart = String(started.rows[0].started);
 
     // Past 1 MB of table, so the crossing is real growth rather than an
     // arithmetic fixture.

@@ -26,19 +26,30 @@ import logger from "@/utils/logger";
  *
  *   1. Every check logs an INFO line per table with the numbers, in a flat
  *      `key=value` shape that greps and parses. This is the layer that answers
- *      "was it already growing last week?" from shipped logs, and it fires
- *      whether or not anything is wrong, so a silent tripwire and a healthy
- *      estate are distinguishable.
+ *      "was it already growing last week?", and it fires whether or not
+ *      anything is wrong, so a silent tripwire and a healthy estate are
+ *      distinguishable.
  *   2. Crossing the threshold escalates to a WARN written through
- *      `metamcpLogStore.record()`, which mirrors to stdout (shipped to the log
- *      stack) AND persists a `system` row to `gateway_events`. Reporting
- *      through the surface it monitors is the point: the operator meets the
- *      tripwire in the same History view they already use, rather than in a
- *      log stack they have to remember to open.
+ *      `metamcpLogStore.record()`, which mirrors to the console AND persists a
+ *      `system` row to `gateway_events`. Reporting through the surface it
+ *      monitors is the point: the operator meets the tripwire in the same
+ *      History view they already use, rather than in a log stack they have to
+ *      remember to open.
  *
- * That second layer writes one row about the growth of a table it may itself
- * be reporting on. One row per table per day is not a contributor to the
- * problem, and a warning that only exists somewhere nobody looks is not a
+ * WHERE EACH LAYER ACTUALLY LANDS DEPENDS ON `LOG_LEVEL`, and the difference
+ * matters enough to state rather than imply. `utils/logger` mirrors to stdout
+ * only at or above the floor for the configured mode, and the floor when
+ * `LOG_LEVEL` is unset is WARN. So on a default-configured deployment the
+ * heartbeat reaches the in-container app log but NOT stdout, which means it
+ * does not reach anything shipping container logs; `LOG_LEVEL=info` (what this
+ * fork's own deployment sets) is what puts layer 1 in front of a log shipper.
+ * Layer 2 is a WARN, so it clears the floor at every mode except `none`.
+ *
+ * That asymmetry is the reason layer 2 does not rely on the log at all. Its
+ * database half is written by the same call and is level-independent, so the
+ * one signal an operator must not miss survives a logging configuration nobody
+ * revisited. One row per table per day is not a contributor to the problem it
+ * reports on, and a warning that only exists somewhere nobody looks is not a
  * warning. The hourly INFO line deliberately does NOT go through the log store
  * for the same reason inverted: a heartbeat has no escalation value in the
  * history and would add rows on every check forever.
@@ -61,6 +72,23 @@ export const AUDIT_STORAGE_CHECK_INTERVAL_SWEEPS_MAX = 288;
 
 /** Default warn threshold per table, in megabytes. */
 export const AUDIT_STORAGE_WARN_MB_DEFAULT = 2048;
+
+/**
+ * Ceiling on the configured threshold: 1 TiB per table.
+ *
+ * A ceiling here for the same reason the interval has one. Without it, an
+ * absurd value is an off switch for the escalation layer, and the escalation
+ * layer is the half that does not depend on how logging happens to be
+ * configured. Leaving the heartbeat as the only guard would not cover it: at
+ * the default `LOG_LEVEL` the heartbeat does not reach stdout at all (see the
+ * module header), so muting layer 2 on such a deployment mutes everything an
+ * external log stack could see.
+ *
+ * 1 TiB is far past any threshold a deployment would set on purpose and far
+ * past the point at which these tables are a problem worth a warning, so the
+ * cap refuses only values that were already meaningless.
+ */
+export const AUDIT_STORAGE_WARN_MB_MAX = 1024 * 1024;
 
 /** One reported crossing suppresses the next for this long, per table. */
 export const AUDIT_STORAGE_WARN_REPEAT_MS = 24 * 60 * 60 * 1000;
@@ -151,6 +179,13 @@ export function resolveAuditStorageWarnMb(raw: string | undefined): number {
     return AUDIT_STORAGE_WARN_MB_DEFAULT;
   }
 
+  if (parsed > AUDIT_STORAGE_WARN_MB_MAX) {
+    logger.warn(
+      `[audit-storage] AUDIT_STORAGE_WARN_MB=${parsed} would mute the escalation entirely and has been capped to ${AUDIT_STORAGE_WARN_MB_MAX} MB (1 TiB); there is deliberately no value that turns the warning off`,
+    );
+    return AUDIT_STORAGE_WARN_MB_MAX;
+  }
+
   return parsed;
 }
 
@@ -178,10 +213,20 @@ async function resolveStatsReader(): Promise<AuditStorageStatsReader | null> {
       "../../db/repositories/audit-storage.repo"
     );
     statsReader = () => auditStorageRepository.tableStats();
-  } catch {
-    // No database in this process (unit tests, tooling). Disabled for the
-    // process lifetime rather than re-attempting the import every hour, the
-    // same seam `lib/gateway-events/retention` uses for its pruner.
+  } catch (error) {
+    // Almost always "no database in this process" (unit tests, tooling), and
+    // disabling for the process lifetime is right for that case: re-attempting
+    // the import every hour would achieve nothing. But it is not the ONLY case
+    // that lands here, and the others are a real defect quietly turning the
+    // monitor off for as long as the process lives. Saying so once is what
+    // keeps the no-off-switch rule this module argues for from having an
+    // accidental exception inside its own error handling. Once rather than
+    // hourly because the result is cached; there is no second attempt to warn
+    // about.
+    logger.warn(
+      "[audit-storage] storage checks are disabled for this process: the stats repository could not be loaded",
+      error,
+    );
     statsReader = null;
   }
   return statsReader;

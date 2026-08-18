@@ -48,11 +48,18 @@ import * as schema from "./schema";
  * read precisely. What those three methods are barred for is DURATION: a
  * DELETE across millions of rows or a filtered page of history can hold a
  * connection for as long as the table is large. `audit-storage.repo.ts` reads
- * three catalog rows once an hour and gives up after the 1s checkout timeout
+ * three catalog rows once an hour and is bounded at both ends by the timeouts
  * below, so it cannot hold anything. It belongs here rather than on the main
  * pool for the opposite half of the same reasoning: the main pool sets no
  * checkout timeout, so a stats read there would queue indefinitely under
  * saturation and stall the cleanup sweep it rides.
+ *
+ * BOTH ENDS, because they are different exposures. `connectionTimeoutMillis`
+ * bounds waiting FOR a connection; `statement_timeout` bounds holding one. On
+ * a two-connection pool the second is the one that bites, and it is not a
+ * property of how fast the query is: any statement here can block behind an
+ * ACCESS EXCLUSIVE lock no matter how little work it does. See the comments on
+ * the two settings.
  */
 
 const { DATABASE_URL, POSTGRES_CA_CERT } = process.env;
@@ -69,6 +76,28 @@ export const gatewayEventsPool = new Pool({
   // detached, so this timeout costs nothing on the request path, and an
   // unbounded queue would just relocate the pressure into memory.
   connectionTimeoutMillis: 1000,
+  // The checkout timeout above bounds ACQUIRING a connection. It says nothing
+  // about how long a statement holds one once acquired, and on this pool that
+  // gap is the whole exposure: two connections is the entire budget, so a
+  // single statement stuck on a lock takes half of it for as long as the lock
+  // is held.
+  //
+  // Both consumers can stall that way, and neither is doing anything slow.
+  // `record()` INSERTs take a ROW EXCLUSIVE lock and the stats read in
+  // `audit-storage.repo` takes ACCESS SHARE; both conflict with ACCESS
+  // EXCLUSIVE, which is what a boot-time migration, a `VACUUM FULL`, or the
+  // README's own break-glass `ALTER TABLE ... DISABLE TRIGGER` holds. Measured:
+  // `pg_total_relation_size` behind a held ACCESS EXCLUSIVE blocks for as long
+  // as the lock lives, and the 1s checkout timeout never fires because the
+  // connection was already checked out.
+  //
+  // A server-side statement timeout is what actually bounds it, and it is set
+  // on the pool rather than around the one query because the writer needs the
+  // same protection for the same reason. Five seconds is far past anything
+  // either consumer legitimately does (a single-row INSERT, a three-row
+  // catalog read), so it only ever fires on a stall. Both callers already
+  // treat an error as a dropped row or a missed reading.
+  options: "-c statement_timeout=5000",
   ...(POSTGRES_CA_CERT && {
     ssl: {
       ca: POSTGRES_CA_CERT,

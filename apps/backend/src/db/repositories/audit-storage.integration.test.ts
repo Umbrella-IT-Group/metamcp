@@ -63,6 +63,27 @@ describeIfDb("audit storage stats against a REAL postgres", () => {
     await Promise.all([pool.end(), gatewayEventsPool.end()]);
   });
 
+  it("runs on a pool that bounds how long a statement can hold a connection", async () => {
+    // The pool is two connections wide, so a statement stuck on a lock takes
+    // half the writer's budget for as long as the lock lives. This query
+    // touches no table data, but `pg_total_relation_size` still takes ACCESS
+    // SHARE, which conflicts with the ACCESS EXCLUSIVE held by a migration, a
+    // VACUUM FULL, or the README's break-glass DISABLE TRIGGER. Measured
+    // against a held lock: the read blocks for the full duration of the lock
+    // and the pool's 1s CHECKOUT timeout never fires, because the connection
+    // was already checked out. Only a server-side statement timeout bounds it.
+    //
+    // Asserted as the effective server setting rather than by taking a lock
+    // here, so the case cannot wedge a shared test database if it fails
+    // partway.
+    const { gatewayEventsDb } = await import("../gateway-events-db");
+    const shown = await gatewayEventsDb.execute(
+      `SHOW statement_timeout` as never,
+    );
+
+    expect(String(shown.rows[0].statement_timeout)).toBe("5s");
+  });
+
   it("returns exactly one row per watched table, in a stable order", async () => {
     const rows = await auditStorageRepository.tableStats();
 

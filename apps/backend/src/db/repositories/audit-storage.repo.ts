@@ -25,14 +25,22 @@ import { gatewayEventsDb } from "../gateway-events-db";
  * one that mattered without saying so.
  *
  * WHICH POOL, AND WHY IT IS NOT THE MAIN ONE. This runs on `gatewayEventsDb`,
- * the bounded two-connection pool with a 1s checkout
- * timeout (`../gateway-events-db`). The main pool sets no
- * `connectionTimeoutMillis`, so a checkout there queues indefinitely; a stats
- * read awaited inside the cleanup interval could then hold the sweep open for
- * as long as the database stayed saturated, which turns a monitor into an
- * outage amplifier. Failing fast and logging is the correct behaviour for a
- * diagnostic: a missed hourly reading costs an hour of visibility, a stalled
- * sweep costs retention.
+ * the bounded two-connection pool with a 1s checkout timeout and a 5s
+ * server-side statement timeout (`../gateway-events-db`). The main pool sets
+ * neither, so a checkout there queues indefinitely; a stats read awaited inside
+ * the cleanup interval could then hold the sweep open for as long as the
+ * database stayed saturated, which turns a monitor into an outage amplifier.
+ * Failing fast and logging is the correct behaviour for a diagnostic: a missed
+ * hourly reading costs an hour of visibility, a stalled sweep costs retention.
+ *
+ * BOTH timeouts are load-bearing here and the second is the less obvious one.
+ * This query touches no table data, but `pg_total_relation_size` still takes
+ * ACCESS SHARE, which conflicts with the ACCESS EXCLUSIVE held by a migration,
+ * a `VACUUM FULL`, or the break-glass `DISABLE TRIGGER` in the README. Blocked
+ * on that lock the statement waits as long as the lock lives, holding a
+ * connection the writer needs, and the checkout timeout cannot help because
+ * the connection was already checked out. `statement_timeout` is what bounds
+ * it.
  *
  * NOT the audit pool, for the reason `../audit-db` spells out at length:
  * `audit_log` is the security record, it has no prune path, and a write that
@@ -44,9 +52,10 @@ import { gatewayEventsDb } from "../gateway-events-db";
  * duration scales with the table (a DELETE across millions of rows, a page of
  * history with a substring filter), and either could occupy a connection long
  * enough to matter to the writer that depends on it. This is a three-row
- * catalog lookup once an hour that gives up after a second. The rule that
- * pool's comment is really stating is "nothing that can hold a connection",
- * and this cannot.
+ * catalog lookup once an hour, and the pool's statement timeout caps what it
+ * can hold at five seconds even when it is blocked rather than working. The
+ * rule that pool's comment is really stating is "nothing that can hold a
+ * connection", and this is bounded so it cannot.
  */
 
 /** One table's storage figures. Both numbers are nullable, deliberately. */

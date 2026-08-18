@@ -56,3 +56,42 @@ describe("the storage check is wired into the cleanup sweep", () => {
     );
   });
 });
+
+/**
+ * The pool choice is the load-bearing isolation claim of this feature, and
+ * nothing else would notice it changing.
+ *
+ * Rewiring the stats query onto the main pool leaves every other suite green:
+ * the unit tests stub the reader entirely, and the integration tests would
+ * still pass because the query returns the same rows either way. What would
+ * change is only visible under load, which is where the difference matters and
+ * where a test cannot go. The main pool sets no checkout timeout and no
+ * statement timeout, so a stats read there can queue indefinitely and then
+ * block indefinitely, inside the cleanup sweep. Pinning the import is the
+ * cheapest guard that fails when that reasoning is undone.
+ */
+describe("the stats query stays on the bounded pool", () => {
+  const REPO = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../db/repositories/audit-storage.repo.ts",
+    ),
+    "utf8",
+  );
+
+  it("imports the bounded gateway-events pool and executes through it", () => {
+    expect(REPO).toContain(
+      'import { gatewayEventsDb } from "../gateway-events-db";',
+    );
+    expect(REPO).toContain("gatewayEventsDb.execute(");
+  });
+
+  it("does NOT reach for the main pool", () => {
+    // `../index` is the shared `max: 10` pool with neither timeout set. The
+    // assertion is on the import rather than on a usage, because an unused
+    // import is the state this file would be in halfway through the change
+    // that breaks the guarantee.
+    expect(REPO).not.toMatch(/from "\.\.\/index"/);
+    expect(REPO).not.toMatch(/\bdb\.execute\(/);
+  });
+});
