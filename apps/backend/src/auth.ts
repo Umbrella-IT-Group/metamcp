@@ -124,22 +124,23 @@ export const auth = betterAuth({
   // users is inverted, which is the same defect this fork's own failed-auth
   // limiter had when it keyed on `req.ip`.
   //
-  // WHAT THIS PIN DOES NOT DO, stated plainly because the honest gap matters
-  // more than the fix. It prevents that inversion; it does NOT add rate
-  // limiting to `/api/auth`. That surface is served by `routers/auth-relay.ts`
-  // calling `auth.handler` directly, and no limiter is mounted on it, so
-  // `/api/auth/sign-in` is unlimited today and stays unlimited after this
-  // line. The fork's own limiters cover other surfaces and not this one:
-  // `lib/auth-rate-limiter.ts` is wired into the lookup-endpoint, token and
-  // api-key-oauth paths, `routers/oauth/utils.ts` covers `/oauth/*`, and
-  // `middleware/trpc-rate-limit.middleware.ts` covers `/trpc`.
+  // WHAT THIS PIN DOES NOT DO. It prevents that inversion; it does not by
+  // itself put a limiter on `/api/auth`. That surface is served by
+  // `routers/auth-relay.ts` calling `auth.handler` directly, so a limiter has
+  // to be mounted ahead of the relay — which is what
+  // `middleware/auth-signin-rate-limit.middleware` now is, keyed per caller on
+  // `CF-Connecting-IP` via `lib/client-ip` the way the fork's other limiters
+  // already are (`lib/auth-rate-limiter` on the lookup-endpoint, token and
+  // api-key-oauth paths, `routers/oauth/utils` on `/oauth/*`,
+  // `middleware/trpc-rate-limit.middleware` on `/trpc`). It covers the
+  // credential sign-in POST and deliberately nothing else on this surface.
   //
-  // The remedy is a per-caller-keyed limiter on the relay, keying on
-  // `CF-Connecting-IP` via `lib/client-ip` the way the other three already do,
-  // rather than enabling this one. Enabling this one instead would need
-  // `advanced.ipAddress.ipAddressHeaders` / `trustedProxies` set so the
-  // address resolves per caller; until that is done, on is strictly worse
-  // than off. Tracked as a follow-up.
+  // That is the remedy rather than enabling this one, and the order matters:
+  // enabling better-auth's would first need
+  // `advanced.ipAddress.ipAddressHeaders` / `trustedProxies` set so the address
+  // resolves per caller, and until that is done, on is strictly worse than off.
+  // Two limiters on the same path with different keying would also make a
+  // refusal impossible to attribute.
   rateLimit: { enabled: false },
   plugins: [
     // Add generic OAuth plugin for OIDC support

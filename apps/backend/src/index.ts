@@ -11,6 +11,7 @@ import {
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
+import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
 import { errorHandler } from "./middleware/error-handler.middleware";
 import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
@@ -54,6 +55,16 @@ app.use(oauthRouter);
 // one turns a cookie-authenticated response into a cross-site read. The
 // allowlist and the reasoning live in ./lib/cors-policy.
 app.use(authApiCorsMiddleware);
+
+// Per-caller cap on password sign-in attempts. AFTER the CORS policy above, so
+// a 429 carries the headers a browser needs to surface it as a 429 rather than
+// as an opaque network failure, and BEFORE the relay, because a request refused
+// after `auth.handler` has run has already spent the password check and written
+// the append-only `auth.login.failure` row this limiter exists to bound. It
+// answers only `POST /api/auth/sign-in/email`; everything else on this surface
+// — SSO, callbacks, session reads, sign-out, dynamic client registration —
+// passes straight through. See ./middleware/auth-signin-rate-limit.middleware.
+app.use(authSigninRateLimitMiddleware);
 
 // Mount better-auth routes by calling auth API directly. The relay body lives
 // in ./routers/auth-relay so it can be imported by a test — this file cannot,

@@ -124,6 +124,10 @@ across the management and OAuth surfaces:
   across restarts; unauthenticated endpoints require an explicit opt-in.
 - **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of
   unused clients, and a dedicated rate-limit bucket.
+- **Per-caller rate limiting on password sign-in** — the credential sign-in endpoint is capped
+  per client IP, which also bounds how fast the append-only audit log can be filled with failed
+  logins. SSO, callbacks, session reads and sign-out are deliberately not capped. See
+  [Sign-in rate limiting](#sign-in-rate-limiting).
 - **Hardened OAuth surface** — allowlisted redirect URIs at authorize time, authenticated token
   introspection, and consent protection on the authorize flow.
 - **Tamper-evident audit logging** of authentication and administrative events.
@@ -263,6 +267,22 @@ Both fail closed: an unset variable, or an unparseable one, reads as `true`, so 
 Bootstrap is exempt from its own lock, and it has to be. It creates the configured accounts by signing them up through the same route `DISABLE_SIGNUP` closes, and it writes that flag to the `config` table on every run, so from the second boot onward the flag is already stored `true` when bootstrap starts. With `BOOTSTRAP_RECREATE_USER=true` the administrator (and its user-scoped API keys) is deleted before the re-signup, so a refusal there would leave an ordinary restart with no administrator, registration closed, and the keys unrecoverable. Bootstrap therefore opens a signup exemption around its user pass and closes it in a `finally` immediately after. The exemption is not reachable from outside the process: all of this runs before the HTTP server starts listening, so no request can arrive while it is open, and it covers only bootstrap's own accounts, never a request. The created account is still recorded in the audit log like any other.
 
 One limit worth knowing: these controls are only asserted when bootstrap runs at all. A `BOOTSTRAP_ENABLE=false` deploy writes no row, which upstream's readers treat as open, so such a deploy keeps upstream's behaviour and has to close registration by hand in the admin UI.
+
+### Sign-in rate limiting
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTH_SIGNIN_RATE_LIMIT_MAX` | `20` | Password sign-in attempts allowed per window, per client IP. Unparseable, zero and negative values fall back to the default with a boot warning rather than being honoured — a `0` would refuse every sign-in. Capped at `1000`, above which it is not a bound. |
+| `AUTH_SIGNIN_RATE_LIMIT_WINDOW_SECONDS` | `600` (10m) | Length of the fixed window. Same fallback rule: `0` would expire the window on every request and silently remove the limit. Capped at `86400` (24h), so a refused caller is never locked out for longer than a day. |
+| `AUTH_SIGNIN_RATE_LIMIT_DISABLED` | unset (limiter on) | Set to exactly `true` to turn the limiter off. Phrased negatively on purpose: unset, empty and misspelled all leave it on. |
+
+`POST /api/auth/sign-in/email` is the only path this covers, and the exclusions are deliberate. SSO entry (`sign-in/social`, `sign-in/oauth2`) and its callbacks carry no credential and are the flows a lockout would break; `get-session` is read on nearly every page render; `sign-out` must never be answered with "try again later"; and dynamic client registration (`/api/auth/register`) already has its own bucket and is what the loopback OAuth pairing depends on.
+
+The key is the edge-supplied client IP (`CF-Connecting-IP`), the same key the failed-auth, registration and `/trpc` limiters use — not `req.ip`, which is one shared in-container address for every caller behind the frontend rewrite and would make the limiter an organisation-wide lockout rather than a bound. **Requests arriving without that header are exempt rather than pooled into one bucket**, for the same reason: a shared bucket would be the lockout. The honest cost is that a caller reaching the origin directly, beside the tunnel, is not bounded by this.
+
+Better-auth's own rate limiter stays pinned off and should not be enabled instead. Its address resolution reads `x-forwarded-for` only and accepts it solely when it carries exactly one entry, so behind a proxy chain every caller collapses into the literal bucket `no-trusted-ip` — at 3 sign-ins per 10 seconds, shared globally.
+
+A refusal is a `429` with a `Retry-After` and writes no audit row (a row per refusal would amplify the writes being bounded); it is reported to the log instead, at most one line a minute, carrying a running total since startup.
 
 ### OAuth and session lifetimes
 
