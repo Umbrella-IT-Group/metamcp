@@ -258,6 +258,27 @@ async function handleAuthorizationCodeGrant(
 
   // Check if code has expired (10 minutes)
   if (Date.now() > codeData.expires_at.getTime()) {
+    // Emitted before the delete for the reason given on the refresh-expiry
+    // branch below: this is a rejection that destroys the row it just read, so
+    // the row here is the only surviving evidence the code ever existed. The
+    // client is UNAUTHENTICATED at this point — auth-method validation happens
+    // further down — but the branch is still bounded, because reaching it
+    // requires a real, currently-stored authorization code and consumes it.
+    emitTokenLifecycle(req, {
+      action: "oauth.token.issue",
+      clientId: codeData.client_id,
+      userId: codeData.user_id,
+      token: code,
+      outcome: "failure",
+      httpStatus: 400,
+      detail: {
+        reason: "authorization_code_expired",
+        token_type: "authorization_code",
+        grant_type: "authorization_code",
+        created_at: isoOrNull(codeData.created_at),
+        expires_at: isoOrNull(codeData.expires_at),
+      },
+    });
     await oauthRepository.deleteAuthCode(code);
     return res.status(400).json({
       error: "invalid_grant",
@@ -453,6 +474,37 @@ async function handleRefreshTokenGrant(
     tokenData.refresh_token_expires_at &&
     Date.now() > tokenData.refresh_token_expires_at.getTime()
   ) {
+    // Emitted BEFORE the delete, and never awaited — `emit` is fire-and-forget
+    // by contract (see lib/audit/audit-emitter). Ordering it first is what
+    // makes the record survive a delete that throws: the whole point of the
+    // row is that the credential it describes no longer exists to be looked
+    // up, so writing it after the destruction would lose it in exactly the
+    // case an operator is investigating.
+    const destroyed = credentialFingerprint(tokenData.access_token);
+    emitTokenLifecycle(req, {
+      action: "oauth.token.refresh",
+      clientId: tokenData.client_id,
+      userId: tokenData.user_id,
+      // The refresh token as PRESENTED — `token_sha256` in the row. It is a
+      // different string from the access token in the same row, which is
+      // fingerprinted separately below.
+      token: refresh_token,
+      outcome: "failure",
+      httpStatus: 400,
+      detail: {
+        reason: "refresh_token_expired",
+        token_type: "refresh_token",
+        // The destroyed row's ACCESS token, under the same keys
+        // `emitTokenIssued` writes — this is the join back to the
+        // `oauth.token.issue` / `oauth.token.refresh` row that minted the
+        // chain, which is the only place its age is now recorded.
+        access_token_sha256: destroyed.sha256,
+        access_token_last4: destroyed.last4,
+        created_at: isoOrNull(tokenData.created_at),
+        expires_at: isoOrNull(tokenData.expires_at),
+        refresh_token_expires_at: isoOrNull(tokenData.refresh_token_expires_at),
+      },
+    });
     await oauthRepository.deleteAccessToken(tokenData.access_token);
     return res.status(400).json({
       error: "invalid_grant",
@@ -536,13 +588,29 @@ async function handleRefreshTokenGrant(
 }
 
 /**
- * Record an introspection or revocation of a token that ACTUALLY EXISTS.
+ * Render a row timestamp for `detail`, tolerating a missing or null value.
  *
- * WHAT IS AND IS NOT EMITTED HERE, because both endpoints are unauthenticated
- * and `audit_log` has no prune path. Both now carry a FAILURE-only limiter
- * (see isPublicOAuthEndpointLimited below), which bounds unresolvable-token
- * spam but deliberately does NOT bound the success paths — so every "is this
- * branch replayable?" judgement below still stands unchanged:
+ * `refresh_token_expires_at` is genuinely nullable in the schema, and the
+ * remaining columns are only NOT NULL as far as the type system is concerned —
+ * an emitter that called `.toISOString()` straight would turn one unexpected
+ * null into a throw on a rejection path, i.e. a 500 on a request that was
+ * already being refused. A null in the column is also honest output: it says
+ * the row carried no such instant.
+ */
+function isoOrNull(value: Date | null | undefined): string | null {
+  return value instanceof Date ? value.toISOString() : null;
+}
+
+/**
+ * Record a lifecycle event for a credential that ACTUALLY EXISTS — issued,
+ * refreshed, introspected, revoked, or REJECTED AND DESTROYED.
+ *
+ * WHAT IS AND IS NOT EMITTED HERE, because /oauth/revoke is unauthenticated
+ * and `audit_log` has no prune path. The two public endpoints carry a
+ * FAILURE-only limiter (see isPublicOAuthEndpointLimited below), which bounds
+ * unresolvable-token spam but deliberately does NOT bound the success paths —
+ * so every "is this branch replayable?" judgement below still stands
+ * unchanged:
  *
  *  - UNKNOWN token, either endpoint: NOTHING. One anonymous request would
  *    equal one permanent INSERT recording a string the caller invented, and
@@ -571,14 +639,49 @@ async function handleRefreshTokenGrant(
  *    token, and it is rate-limited on top, so it is not replay amplification.
  *    A caller naming a different client than the token was issued to is not a
  *    confused client.
+ *  - A REJECTION THAT DESTROYS THE ROW IT JUST READ: emitted. Three branches
+ *    qualify — an EXPIRED AUTHORIZATION CODE and an EXPIRED REFRESH TOKEN on
+ *    /oauth/token, and an EXPIRED ACCESS TOKEN on /oauth/introspect. Each is
+ *    bounded by exactly the argument that admits revoke above: it cannot be
+ *    reached without presenting a REAL, currently-stored credential, and
+ *    reaching it DELETES that credential, so a replay of the same string finds
+ *    nothing and writes nothing. One row per credential destroyed. These were
+ *    the only deletes in this file that left no trace anywhere — not even a
+ *    `logger` line — so a stale credential simply vanished, and with it the
+ *    only evidence of when the chain behind it was minted. That is what the
+ *    `created_at` / `expires_at` / `refresh_token_expires_at` values in
+ *    `detail` are for: they date the chain that just ended, and the destroyed
+ *    row's `access_token_sha256` joins this row to the `oauth.token.issue` row
+ *    that minted it.
+ *  - Every OTHER refusal on the grant half of /oauth/token — missing or
+ *    mismatched client, bad client secret, PKCE failure, unknown code, unknown
+ *    refresh token, disabled account: still NOTHING here. None of them
+ *    destroys a row, so none is self-limiting; an invented code or refresh
+ *    token can be replayed forever. The two disabled-account refusals also
+ *    leave the row deliberately intact, because disable must stay reversible,
+ *    and they already carry a `logger.warn`.
  *
- * The token is recorded as a fingerprint only, matching `emitTokenIssued`, so
- * an operator can follow one credential from mint to revocation by hash.
+ * GET /oauth/userinfo has the same destroy-on-expiry branch and emits the same
+ * shape, but from ./userinfo.ts — this emitter is private to the token router.
+ *
+ * A FAILURE ROW REUSES THE VERB OF THE OPERATION IT REFUSED (`oauth.token.issue`
+ * for a dead authorization code, `oauth.token.refresh` for a dead refresh
+ * token) rather than inventing a `*.expired` verb, matching the revoke
+ * client-mismatch row above. `outcome` is what separates them, so any query
+ * counting successful grants must filter on `outcome = 'success'` and not on
+ * `action` alone.
+ *
+ * The credential is recorded as a fingerprint only, matching `emitTokenIssued`,
+ * so an operator can follow one credential from mint to destruction by hash.
  */
 function emitTokenLifecycle(
   req: express.Request,
   fields: {
-    action: "oauth.token.introspect" | "oauth.token.revoke";
+    action:
+      | "oauth.token.issue"
+      | "oauth.token.refresh"
+      | "oauth.token.introspect"
+      | "oauth.token.revoke";
     clientId: string;
     userId: string;
     token: string;
@@ -760,6 +863,31 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
       // and a caller replaying one indefinitely is the shape being bounded. A
       // real client hits this at most once, when its own token ages out.
       recordPublicOAuthEndpointFailure(req, "introspect");
+      // Emitted before the delete, same reasoning as the grant-half branches.
+      // No `httpStatus`: RFC 7662 answers an inactive token with 200 and
+      // `{active:false}`, which is the emitter's default.
+      //
+      // `refresh_token_expires_at` is in the row deliberately. This delete
+      // takes the WHOLE row, so a refresh token that had not itself expired
+      // dies with the access token — the record has to show what was
+      // destroyed, not just what was asked about.
+      emitTokenLifecycle(req, {
+        action: "oauth.token.introspect",
+        clientId: tokenData.client_id,
+        userId: tokenData.user_id,
+        token,
+        outcome: "failure",
+        detail: {
+          active: false,
+          reason: "access_token_expired",
+          token_type: "access_token",
+          created_at: isoOrNull(tokenData.created_at),
+          expires_at: isoOrNull(tokenData.expires_at),
+          refresh_token_expires_at: isoOrNull(
+            tokenData.refresh_token_expires_at,
+          ),
+        },
+      });
       await oauthRepository.deleteAccessToken(token);
       return res.json({
         active: false,

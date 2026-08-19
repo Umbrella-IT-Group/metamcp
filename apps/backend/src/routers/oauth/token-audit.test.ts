@@ -16,6 +16,14 @@
  *
  * Same harness as `token.test.ts`: the router driven as express middleware
  * against fake req/res, repositories mocked so `db/index.ts` never loads.
+ *
+ * `GET /oauth/userinfo` is exercised here too, even though it lives in its own
+ * router and has its own suite. The property under test is the one this file
+ * exists for — a rejection that DESTROYS a credential must leave a row, and
+ * that row must hold a fingerprint rather than the credential — and the audit
+ * sink seam plus the `serialized()` negative that enforce it live here.
+ * Duplicating the seam into `userinfo.test.ts` would fork the discipline
+ * across two files instead of pinning it in one.
  */
 
 import { createHash, randomBytes } from "crypto";
@@ -60,6 +68,7 @@ vi.mock("./introspection-auth", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+const { default: userinfoRouter } = await import("./userinfo");
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 
 const CLIENT_ID = "mcp_client_test";
@@ -162,6 +171,35 @@ async function post(
   return res;
 }
 
+async function getUserinfo(token: string): Promise<FakeRes> {
+  ipCounter += 1;
+  const req = {
+    method: "GET",
+    url: "/oauth/userinfo",
+    originalUrl: "/oauth/userinfo",
+    baseUrl: "",
+    // Same hand-stamped attribution as makeReq: the audit-context middleware
+    // is mounted on the app, not on this router.
+    auditRequestId: REQUEST_ID,
+    auditClientIp: CLIENT_IP,
+    headers: { authorization: `Bearer ${token}`, "user-agent": "Claude/1.0" },
+    ip: `10.3.0.${ipCounter}`,
+    socket: { remoteAddress: `10.3.0.${ipCounter}` },
+  } as unknown as express.Request;
+  const res = makeRes();
+
+  await new Promise<void>((resolve, reject) => {
+    (userinfoRouter as unknown as express.RequestHandler)(
+      req,
+      res as unknown as express.Response,
+      (err?: unknown) => (err ? reject(err) : resolve()),
+    );
+    res.settled.then(resolve);
+  });
+
+  return res;
+}
+
 function grantBody(res: FakeRes): Record<string, string> {
   if (!res.body) throw new Error("token endpoint settled without a JSON body");
   return res.body;
@@ -251,10 +289,17 @@ describe("oauth.token.issue — the authorization_code grant", () => {
     expect(serialized()).not.toContain(codeVerifier);
   });
 
-  it("writes NOTHING when the grant is refused", async () => {
+  it("claims NO issuance when a disabled account's code is refused", async () => {
     // A disabled account's code stays redeemable for its full TTL, so the
     // refusal is the outcome here. Lane A's detectors own denial rows; this
     // emitter must not claim a token was issued.
+    //
+    // Scoped to THIS refusal on purpose. It is not the general claim "a
+    // refused grant is never audited" — the expired-code and expired-refresh
+    // refusals below do emit, because they destroy the row they read and are
+    // therefore self-limiting. This one leaves the code intact so that Enable
+    // restores a working flow, which is exactly why it stays silent: an
+    // invented code could otherwise be replayed into the table forever.
     usersRepositoryMock.isDisabled.mockResolvedValue(true);
 
     const res = await exchange();
@@ -263,6 +308,57 @@ describe("oauth.token.issue — the authorization_code grant", () => {
     expect(res.statusCode).toBe(400);
     expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
     expect(rows).toEqual([]);
+  });
+
+  it("records an EXPIRED code as a failed issue, before consuming it", async () => {
+    // Same defect class as the expired-refresh branch: the handler deletes a
+    // real, currently-stored credential and used to answer 400 with nothing
+    // written anywhere. Bounded for the same reason revoke is — it needs a
+    // real code and it consumes it.
+    const issuedAt = new Date(Date.now() - 11 * 60 * 1000);
+    const expiredAt = new Date(Date.now() - 60 * 1000);
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: authCode,
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      scope: SCOPE,
+      user_id: USER_ID,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      created_at: issuedAt,
+      expires_at: expiredAt,
+    });
+
+    const res = await exchange();
+    await flush();
+
+    expect(res.statusCode).toBe(400);
+    // The code is still consumed — auditing must not change the outcome.
+    expect(oauthRepositoryMock.deleteAuthCode).toHaveBeenCalledWith(authCode);
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.issue",
+      outcome: "failure",
+      actor_type: "user",
+      actor_id: USER_ID,
+      actor_ip: CLIENT_IP,
+      request_id: REQUEST_ID,
+      target_type: "oauth_client",
+      target_id: CLIENT_ID,
+      http_status: 400,
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "authorization_code_expired",
+      token_type: "authorization_code",
+      token_sha256: sha256(authCode),
+      created_at: issuedAt.toISOString(),
+      expires_at: expiredAt.toISOString(),
+    });
+    // The code is a credential too — fingerprint only, same as every token.
+    expect(serialized()).not.toContain(authCode);
+    expect(serialized()).not.toContain(codeVerifier);
   });
 });
 
@@ -305,6 +401,114 @@ describe("oauth.token.refresh — rotation", () => {
     expect(serialized()).not.toContain(refreshToken);
     expect(serialized()).not.toContain(body.access_token);
     expect(serialized()).not.toContain(body.refresh_token);
+  });
+});
+
+describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly", () => {
+  // The branch this file was extended for. It reads a real token row, DELETES
+  // it, and answered 400 with nothing written anywhere — not even a logger
+  // line — so the credential and the record of when its chain was minted
+  // disappeared in the same request.
+  const refreshToken = "mcp_refresh_long_since_expired";
+  const priorAccessToken = "mcp_token_previous_value";
+  const issuedAt = new Date(Date.now() - 400 * 86400000);
+  const accessExpiredAt = new Date(Date.now() - 399 * 86400000);
+  const refreshExpiredAt = new Date(Date.now() - 86400000);
+
+  beforeEach(() => {
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue({
+      access_token: priorAccessToken,
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      created_at: issuedAt,
+      expires_at: accessExpiredAt,
+      refresh_token_expires_at: refreshExpiredAt,
+    });
+  });
+
+  const redeem = () =>
+    post({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+    });
+
+  it("writes exactly one failure row and still destroys the row", async () => {
+    const res = await redeem();
+    await flush();
+
+    expect(res.statusCode).toBe(400);
+    // The delete is the behaviour the audit row exists to describe; it must
+    // still happen, and it must still target the row's ACCESS token, which is
+    // the primary key.
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      priorAccessToken,
+    );
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.refresh",
+      outcome: "failure",
+      actor_type: "user",
+      actor_id: USER_ID,
+      actor_ip: CLIENT_IP,
+      request_id: REQUEST_ID,
+      target_type: "oauth_client",
+      target_id: CLIENT_ID,
+      http_status: 400,
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "refresh_token_expired",
+      token_type: "refresh_token",
+    });
+  });
+
+  it("dates the destroyed chain and joins it to the row that minted it", async () => {
+    // The forensic content. Once the row is deleted nothing else records when
+    // the chain began, and `access_token_sha256` is the join key back to the
+    // `oauth.token.issue` row under the key that emitter already writes.
+    await redeem();
+    await flush();
+
+    expect(rows[0].detail).toMatchObject({
+      token_sha256: sha256(refreshToken),
+      token_last4: refreshToken.slice(-4),
+      access_token_sha256: sha256(priorAccessToken),
+      access_token_last4: priorAccessToken.slice(-4),
+      created_at: issuedAt.toISOString(),
+      expires_at: accessExpiredAt.toISOString(),
+      refresh_token_expires_at: refreshExpiredAt.toISOString(),
+    });
+  });
+
+  it("records both credentials as fingerprints and neither as itself", async () => {
+    await redeem();
+    await flush();
+
+    expect(serialized()).not.toContain(refreshToken);
+    expect(serialized()).not.toContain(priorAccessToken);
+  });
+
+  it("still refuses and still deletes when the audit sink REJECTS", async () => {
+    // Mirror of "a broken audit sink cannot break a grant" for the rejection
+    // path. An audit write that fails must degrade the record, never the
+    // request — and it must not leave a destroyed-credential branch half
+    // executed.
+    setAuditSinkForTesting(async () => {
+      throw new Error("connection pool exhausted");
+    });
+
+    const res = await redeem();
+    await flush();
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ error: "invalid_grant" });
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      priorAccessToken,
+    );
   });
 });
 
@@ -525,6 +729,181 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
       token_sha256: sha256(liveToken),
     });
     expect(serialized()).not.toContain(liveToken);
+  });
+
+  it("DOES record an introspection that finds an EXPIRED token, which it deletes", async () => {
+    // The introspect twin of the expired-refresh branch: the handler destroys
+    // the row it just read. Bounded by that destruction, so it emits — unlike
+    // the ACTIVE branch above, which consumes nothing and is replayable.
+    const expiredToken = "mcp_token_aged_out_value";
+    const issuedAt = new Date(Date.now() - 2 * 86400000);
+    const accessExpiredAt = new Date(Date.now() - 86400000);
+    const refreshExpiresAt = new Date(Date.now() + 300 * 86400000);
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: expiredToken,
+      refresh_token: "mcp_refresh_still_alive",
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      created_at: issuedAt,
+      expires_at: accessExpiredAt,
+      refresh_token_expires_at: refreshExpiresAt,
+    });
+
+    const res = await post({ token: expiredToken }, "/oauth/introspect");
+    await flush();
+
+    expect(grantBody(res).active).toBe(false);
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      expiredToken,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.introspect",
+      outcome: "failure",
+      actor_id: USER_ID,
+      target_id: CLIENT_ID,
+      // RFC 7662 answers an inactive token with 200, so the row must say 200.
+      http_status: 200,
+    });
+    expect(rows[0].detail).toMatchObject({
+      active: false,
+      reason: "access_token_expired",
+      token_type: "access_token",
+      token_sha256: sha256(expiredToken),
+      created_at: issuedAt.toISOString(),
+      expires_at: accessExpiredAt.toISOString(),
+      // The delete takes the whole row, so a refresh token that had NOT
+      // expired dies with it. The record has to show that.
+      refresh_token_expires_at: refreshExpiresAt.toISOString(),
+    });
+    expect(serialized()).not.toContain(expiredToken);
+    expect(serialized()).not.toContain("mcp_refresh_still_alive");
+  });
+
+  it("still answers and still deletes on introspect when the sink REJECTS", async () => {
+    setAuditSinkForTesting(async () => {
+      throw new Error("connection pool exhausted");
+    });
+    const expiredToken = "mcp_token_aged_out_value";
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: expiredToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      created_at: new Date(Date.now() - 2 * 86400000),
+      expires_at: new Date(Date.now() - 86400000),
+      refresh_token_expires_at: null,
+    });
+
+    const res = await post({ token: expiredToken }, "/oauth/introspect");
+    await flush();
+
+    expect(grantBody(res).active).toBe(false);
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      expiredToken,
+    );
+  });
+});
+
+describe("oauth.token.userinfo — the third destroy-on-expiry branch", () => {
+  const expiredToken = "mcp_token_userinfo_aged_out";
+  const issuedAt = new Date(Date.now() - 2 * 86400000);
+  const accessExpiredAt = new Date(Date.now() - 86400000);
+  const refreshExpiresAt = new Date(Date.now() + 300 * 86400000);
+
+  beforeEach(() => {
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: expiredToken,
+      refresh_token: "mcp_refresh_still_alive",
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      created_at: issuedAt,
+      expires_at: accessExpiredAt,
+      refresh_token_expires_at: refreshExpiresAt,
+    });
+  });
+
+  it("records the destruction and still answers 401", async () => {
+    const res = await getUserinfo(expiredToken);
+    await flush();
+
+    expect(res.statusCode).toBe(401);
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      expiredToken,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.userinfo",
+      outcome: "failure",
+      actor_type: "user",
+      actor_id: USER_ID,
+      actor_ip: CLIENT_IP,
+      request_id: REQUEST_ID,
+      target_type: "oauth_client",
+      target_id: CLIENT_ID,
+      http_status: 401,
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "access_token_expired",
+      token_type: "access_token",
+      token_sha256: sha256(expiredToken),
+      token_last4: expiredToken.slice(-4),
+      created_at: issuedAt.toISOString(),
+      expires_at: accessExpiredAt.toISOString(),
+      refresh_token_expires_at: refreshExpiresAt.toISOString(),
+    });
+    expect(serialized()).not.toContain(expiredToken);
+    expect(serialized()).not.toContain("mcp_refresh_still_alive");
+  });
+
+  it("writes NOTHING when the token is simply unknown", async () => {
+    // The unbounded case: an invented bearer value costs an anonymous caller
+    // one request and would cost the append-only table one permanent row.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
+
+    const res = await getUserinfo("mcp_token_invented_by_the_caller");
+    await flush();
+
+    expect(res.statusCode).toBe(401);
+    expect(rows).toEqual([]);
+  });
+
+  it("writes NOTHING when the account is disabled — the row survives", async () => {
+    // Disable is a reversible lockout, so this branch destroys nothing and is
+    // therefore not self-limiting. It keeps its logger.warn and no row.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: expiredToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      created_at: issuedAt,
+      expires_at: new Date(Date.now() + 3600000),
+      refresh_token_expires_at: refreshExpiresAt,
+    });
+    usersRepositoryMock.isDisabled.mockResolvedValue(true);
+
+    const res = await getUserinfo(expiredToken);
+    await flush();
+
+    expect(res.statusCode).toBe(401);
+    expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+    expect(rows).toEqual([]);
+  });
+
+  it("still answers and still deletes when the sink REJECTS", async () => {
+    setAuditSinkForTesting(async () => {
+      throw new Error("connection pool exhausted");
+    });
+
+    const res = await getUserinfo(expiredToken);
+    await flush();
+
+    expect(res.statusCode).toBe(401);
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      expiredToken,
+    );
   });
 });
 
