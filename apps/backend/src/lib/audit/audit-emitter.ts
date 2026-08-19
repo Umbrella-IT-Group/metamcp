@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
-
 import type express from "express";
 
 import logger from "@/utils/logger";
+
+import { apiKeyLast4, hashApiKey } from "../api-key-hash";
 
 /**
  * Fire-and-forget writer for the control-plane security audit log
@@ -440,6 +440,15 @@ export interface CredentialFingerprint {
  * NEVER store the credential itself. sha256 is one-way, and 4 trailing
  * characters of a high-entropy token identify a key to a human who already
  * holds the key list without being usable by anyone who does not.
+ *
+ * Delegates to `hashApiKey`/`apiKeyLast4` rather than re-implementing the
+ * digest, because `api_keys.key_hash` stores that same encoding and the
+ * whole point of the match is the JOIN: an operator answers "which key was
+ * this denied request presenting" by comparing `detail.credential.sha256`
+ * against a stored `key_hash`. A second local implementation is a second
+ * thing to keep in step, and the failure mode of drift is silent — the join
+ * simply returns nothing, which is indistinguishable from "that key does not
+ * exist". One implementation makes drift impossible instead of tested-for.
  */
 export function credentialFingerprint(
   credential: string | undefined | null,
@@ -447,8 +456,8 @@ export function credentialFingerprint(
   if (!credential) return { sha256: null, last4: null };
   try {
     return {
-      sha256: createHash("sha256").update(credential).digest("hex"),
-      last4: credential.slice(-4),
+      sha256: hashApiKey(credential),
+      last4: apiKeyLast4(credential),
     };
   } catch {
     // Unhashable input is not a reason to lose the event — the row still

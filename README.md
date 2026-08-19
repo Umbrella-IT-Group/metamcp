@@ -125,7 +125,11 @@ across the management and OAuth surfaces:
   `psql` session) no longer yields working credentials. A key is shown exactly once, in the
   response that mints it; if it is not copied then it cannot be recovered from anywhere and
   must be re-minted. Existing keys keep working across the upgrade — the migration hashes what
-  is already stored rather than requiring a re-mint.
+  is already stored rather than requiring a re-mint. `BOOTSTRAP_API_KEYS` entries consequently
+  require a `key` value that the operator generates: with nothing readable stored, bootstrap
+  cannot invent a key and hand it back, so an entry without one is skipped with a warning
+  rather than silently creating a credential nobody can obtain. Re-declaring a different value
+  for an existing key name rotates that key.
 - **Fail-closed registration** — self-registration defaults to disabled and stays disabled
   across restarts; unauthenticated endpoints require an explicit opt-in.
 - **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of

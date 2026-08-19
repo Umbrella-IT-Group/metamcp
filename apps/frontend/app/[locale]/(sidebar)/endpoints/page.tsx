@@ -60,11 +60,23 @@ export default function EndpointsPage() {
     onSuccess: (data) => {
       // Check if the operation was actually successful
       if (data.success) {
-        toast.success(t("endpoints:endpointCreated"), {
-          description: t("endpoints:endpointCreatedDescription", {
-            name: form.getValues().name,
-          }),
-        });
+        // A `warning` means PARTIAL success: the endpoint exists but a
+        // companion step (the auto-generated MCP server) did not complete.
+        // Umbrella: shown instead of the success toast rather than alongside
+        // it — a green "created" toast covering a server that was silently
+        // not created is how the caller ends up hunting for a row that never
+        // existed. The text is the server's, since it names the actual cause.
+        if (data.warning) {
+          toast.warning(t("endpoints:endpointCreated"), {
+            description: data.warning,
+          });
+        } else {
+          toast.success(t("endpoints:endpointCreated"), {
+            description: t("endpoints:endpointCreatedDescription", {
+              name: form.getValues().name,
+            }),
+          });
+        }
         setCreateOpen(false);
         form.reset({
           name: "",

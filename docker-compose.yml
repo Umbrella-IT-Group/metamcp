@@ -130,26 +130,31 @@ services:
       #   ]
       
       # API Keys - Assign keys to specific users using user_email
+      #
+      # "key" is REQUIRED and is a value YOU generate (min 32 chars, high
+      # entropy - e.g. `openssl rand -hex 32`). The database stores only a
+      # SHA-256 of each key, so bootstrap cannot generate one and report it
+      # back to you afterwards: there is nowhere to read it from, and no
+      # rotate endpoint. An entry without "key" is skipped with a warning.
+      # Re-declaring a different value for an existing name rotates that key.
       # BOOTSTRAP_API_KEYS: |
       #   [
       #     {
       #       "name": "Admin Production Key",
       #       "is_public": false,
-      #       "user_email": "admin@company.com"
+      #       "user_email": "admin@company.com",
+      #       "key": "sk_mt_REPLACE_WITH_openssl_rand_hex_32"
       #     },
       #     {
       #       "name": "Developer Key",
       #       "is_public": false,
-      #       "user_email": "developer@company.com"
-      #     },
-      #     {
-      #       "name": "Analyst Key",
-      #       "is_public": false,
-      #       "user_email": "analyst@company.com"
+      #       "user_email": "developer@company.com",
+      #       "key": "sk_mt_REPLACE_WITH_ANOTHER_SECRET"
       #     },
       #     {
       #       "name": "Public API Key",
-      #       "is_public": true
+      #       "is_public": true,
+      #       "key": "sk_mt_REPLACE_WITH_A_THIRD_SECRET"
       #     }
       #   ]
       

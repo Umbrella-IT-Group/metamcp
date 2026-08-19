@@ -134,6 +134,14 @@ export const CreateEndpointResponseSchema = z.object({
   success: z.boolean(),
   data: EndpointSchema.optional(),
   message: z.string().optional(),
+  // PARTIAL success: the endpoint exists, but an optional companion step did
+  // not complete (today: the auto-generated MCP server, whose bearer key
+  // could not be minted). It is not a `success: false` — the endpoint really
+  // was created, and reporting failure would send the caller into a retry
+  // that hits "Endpoint name already exists". It is not folded into
+  // `message` either, because `message` is populated on the happy path too
+  // and callers would have to string-match to tell the two apart.
+  warning: z.string().optional(),
 });
 
 export const ListEndpointsResponseSchema = z.object({

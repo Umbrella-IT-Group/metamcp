@@ -192,6 +192,16 @@ type ApiKeyConfig = {
   is_public?: boolean;
   user_email?: string; // Email of user who owns this key (for private keys)
   owner?: string; // Alias for user_email
+  /**
+   * The key's VALUE, supplied by the operator. Required to create a key
+   * (see `bootstrapApiKeys`): since migration 0034 only a hash is stored, so
+   * a bootstrap-minted random value could never be read back by any surface
+   * and there is no rotate endpoint to recover from that. The operator holds
+   * this value already — it goes into whatever client config consumes the
+   * gateway — so provisioning it here keeps the credential out of the boot
+   * log entirely and makes repeated boots deterministic.
+   */
+  key?: string;
 };
 
 type NamespaceConfig = {
@@ -261,8 +271,54 @@ function nonEmpty(value: string | undefined): string | undefined {
   return v ? v : undefined;
 }
 
-function generateApiKey(): string {
-  return `sk_mt_${crypto.randomBytes(32).toString("hex")}`; // 64 hex chars
+/**
+ * Shortest operator-supplied `BOOTSTRAP_API_KEYS[].key` this will accept.
+ *
+ * The at-rest encoding is an UNSALTED sha256 (lib/api-key-hash.ts), which is
+ * safe only because the input is a high-entropy token rather than a
+ * human-chosen secret: with no salt, a short or guessable key is a rainbow
+ * table lookup away from recovery by anyone who reads `api_keys.key_hash` —
+ * the exact read access migration 0034 exists to render useless. 32
+ * characters is well under what the repository mint emits (`sk_mt_` + 64 hex
+ * = 70) and well over anything a person types by hand, so it rejects
+ * passphrases without rejecting real tokens.
+ */
+const MIN_CONFIGURED_API_KEY_LENGTH = 32;
+
+/**
+ * Validate an operator-supplied key value from `BOOTSTRAP_API_KEYS`.
+ *
+ * Returns the value when usable, or a human-readable reason when not. Every
+ * rejection is a SKIP rather than a fallback to a generated value: falling
+ * back would create a row holding a credential the operator neither chose
+ * nor can read, which is the failure this field exists to prevent.
+ *
+ * Surrounding whitespace is refused rather than trimmed. `hashApiKey` hashes
+ * its input exactly as given and the API-key middleware passes the presented
+ * header raw, so silently trimming here would store a digest for a value the
+ * operator did not write, and their padded copy would 401 with nothing in
+ * any log explaining why.
+ */
+function validateConfiguredApiKey(
+  value: string,
+): { ok: true; key: string } | { ok: false; reason: string } {
+  if (value.trim() !== value) {
+    return {
+      ok: false,
+      reason:
+        'its "key" has leading or trailing whitespace (the value is hashed exactly as written, so the padding would have to be presented too)',
+    };
+  }
+  if (!value) {
+    return { ok: false, reason: 'its "key" is empty' };
+  }
+  if (value.length < MIN_CONFIGURED_API_KEY_LENGTH) {
+    return {
+      ok: false,
+      reason: `its "key" is shorter than ${MIN_CONFIGURED_API_KEY_LENGTH} characters (the at-rest hash is unsalted, so a low-entropy key is recoverable from the database)`,
+    };
+  }
+  return { ok: true, key: value };
 }
 
 function maskKey(key: string): string {
@@ -1097,6 +1153,12 @@ function pendingRestoreKeyId(userId: string, name: string): string {
 /**
  * Bootstrap API keys from configuration array.
  *
+ * Each entry must carry its own `key` value. Migration 0034 stores only a
+ * hash, so bootstrap can no longer invent a key: the value would be
+ * unreadable from every surface the moment it was written. An entry without
+ * one is SKIPPED with a warning naming the remedy — see the create branch
+ * below for why refusing beats minting.
+ *
  * `pendingRestoreKeyIds` names the (user_id, name) pairs that
  * `restorePreservedApiKeys` will upsert LATER in the run (it runs after
  * `bootstrapEndpoints`; this runs before). A config-declared key that
@@ -1126,6 +1188,20 @@ async function bootstrapApiKeys(
       const name = apiKeyConfig.name;
       const isPublic = apiKeyConfig.is_public ?? false;
       const ownerEmail = getOwnerEmail(apiKeyConfig);
+
+      // Validated before any owner resolution or write: an unusable value
+      // must stop this entry outright, never fall back to a generated one.
+      let configuredKey: string | undefined;
+      if (apiKeyConfig.key !== undefined) {
+        const validated = validateConfiguredApiKey(apiKeyConfig.key);
+        if (!validated.ok) {
+          console.warn(
+            `⚠️ Skipping API key "${name}" because ${validated.reason}`,
+          );
+          continue;
+        }
+        configuredKey = validated.key;
+      }
 
       let userId: string | null = null;
 
@@ -1161,8 +1237,30 @@ async function bootstrapApiKeys(
         where: whereCondition,
       });
 
+      const ownerInfo = userId
+        ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
+        : "(public)";
+      const restorePending =
+        userId !== null &&
+        pendingRestoreKeyIds.has(pendingRestoreKeyId(userId, name));
+
       if (!existing) {
-        const key = generateApiKey();
+        if (!configuredKey) {
+          // Since migration 0034 only a hash is stored, and there is no
+          // rotate surface anywhere in the product (`apiKeysImplementations`
+          // exposes create/list/update/delete/validate — update carries name
+          // and is_active only). So a value generated here would be written
+          // to a row that NO surface can ever return: not the boot log, not
+          // the API, not the UI. Bootstrap would print "✓ Created" over a
+          // credential nobody can use and nobody can repair except by
+          // deleting the row. Refuse loudly and name the remedy instead —
+          // this is the one case where doing less is the honest outcome.
+          console.warn(
+            `⚠️ Skipping API key "${name}": BOOTSTRAP_API_KEYS entries must carry a "key" value. Only a hash of the key is stored, so a value generated here could never be shown to you and the key would be unusable. Add "key": "<a secret you generate, at least ${MIN_CONFIGURED_API_KEY_LENGTH} characters>" to this entry, or create the key in the UI, which displays it once.`,
+          );
+          continue;
+        }
+
         await db.insert(apiKeysTable).values({
           name,
           // Hashed through the SAME shared helper the repository mint and the
@@ -1170,34 +1268,52 @@ async function bootstrapApiKeys(
           // ApiKeysRepository.create(), so a local hash here would be the
           // classic two-encodings bug: the key prints fine at boot and then
           // never authenticates.
-          key_hash: hashApiKey(key),
-          last4: apiKeyLast4(key),
+          key_hash: hashApiKey(configuredKey),
+          last4: apiKeyLast4(configuredKey),
           user_id: userId,
           is_active: true,
         });
 
-        const ownerInfo = userId
-          ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
-          : "(public)";
-        const restorePending =
-          userId !== null &&
-          pendingRestoreKeyIds.has(pendingRestoreKeyId(userId, name));
         if (restorePending) {
-          // Log truth: the value minted here is NOT the one that survives
+          // Log truth: the value written here is NOT the one that survives
           // startup — the deferred restore overwrites it. Never print this
           // mask as if it were the live credential.
           console.log(
             `✓ Created ${isPublic ? "public" : "private"} API key "${name}" ${ownerInfo} (placeholder — a preserved-key restore for this name is pending and will overwrite it; the restored value is the live one)`,
           );
         } else {
+          // Masked, never whole: the operator supplied this value and already
+          // holds it, so printing it in full would put a live credential in
+          // the boot log for no gain.
           console.log(
-            `✓ Created ${isPublic ? "public" : "private"} API key "${name}" ${ownerInfo}: ${maskKey(key)}`,
+            `✓ Created ${isPublic ? "public" : "private"} API key "${name}" ${ownerInfo}: ${maskKey(configuredKey)}`,
           );
         }
+      } else if (
+        configuredKey &&
+        existing.key_hash !== hashApiKey(configuredKey)
+      ) {
+        // The configured value is authoritative, and re-asserting it is the
+        // ONLY way back from an unreadable key: rows minted before this field
+        // existed hold a value no surface can return and no endpoint can
+        // rotate, so ignoring the config here would leave the operator with a
+        // dead row and no repair short of deleting it. Re-declaring a key in
+        // BOOTSTRAP_API_KEYS is therefore also how a key is rotated.
+        await db
+          .update(apiKeysTable)
+          .set({
+            key_hash: hashApiKey(configuredKey),
+            last4: apiKeyLast4(configuredKey),
+          })
+          .where(eq(apiKeysTable.uuid, existing.uuid));
+        console.log(
+          `✓ ${isPublic ? "Public" : "Private"} API key "${name}" ${ownerInfo} updated to the value configured in BOOTSTRAP_API_KEYS: ${maskKey(configuredKey)}${
+            restorePending
+              ? " (a preserved-key restore for this name is pending and will overwrite it)"
+              : ""
+          }`,
+        );
       } else {
-        const ownerInfo = userId
-          ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
-          : "(public)";
         // The stored row holds no key to mask (migration 0034) — only the
         // display tail, rendered the same way the API's key_prefix is so the
         // boot log and the UI name the same key the same way.

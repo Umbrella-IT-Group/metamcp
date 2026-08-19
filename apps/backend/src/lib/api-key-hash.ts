@@ -10,17 +10,20 @@ import { createHash } from "crypto";
  * two encodings mean a key minted by one path can never authenticate
  * through the other, and the failure is a silent 401 rather than an error.
  *
- * The encoding is byte-identical to `credentialFingerprint()` in
- * lib/audit/audit-emitter.ts (utf8 input, unsalted sha256, lowercase hex),
- * and that is a deliberate property rather than a coincidence: the audit log
+ * `credentialFingerprint()` in lib/audit/audit-emitter.ts CALLS this function
+ * rather than repeating the digest, and that is deliberate: the audit log
  * records the fingerprint of every credential presented on a DENIED request,
  * so a stored `key_hash` joins directly against `detail.credential.sha256`.
  * An operator can answer "which key was this rejected request presenting"
- * without either table holding the secret. Changing the encoding here
- * silently breaks that join — change both, or neither. Unsalted is what
- * makes the join possible at all; it is acceptable here because the input is
- * a 256-bit-plus random token, not a human-chosen password, so there is no
- * dictionary to precompute against.
+ * without either table holding the secret. Two independent implementations
+ * could drift, and drift here is silent — the join returns nothing, which
+ * reads exactly like "no such key". Delegation makes that impossible instead
+ * of merely tested-for, so any change to the encoding moves both surfaces at
+ * once. Unsalted is what makes the join possible at all; it is acceptable
+ * here because the input is a 256-bit-plus random token, not a human-chosen
+ * password, so there is no dictionary to precompute against. That assumption
+ * is why `BOOTSTRAP_API_KEYS` refuses to accept a short operator-supplied
+ * key (see `MIN_CONFIGURED_API_KEY_LENGTH` in lib/bootstrap.service.ts).
  */
 export function hashApiKey(key: string): string {
   return createHash("sha256").update(key).digest("hex");

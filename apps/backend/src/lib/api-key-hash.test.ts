@@ -10,7 +10,10 @@
  *    `detail.credential.sha256` — an operator can answer "which key was that
  *    rejected request presenting" without either table holding the secret.
  *    A salt, a different digest, or uppercase hex breaks the join silently:
- *    nothing errors, the answers just stop matching.
+ *    nothing errors, the answers just stop matching. `credentialFingerprint`
+ *    now DELEGATES here rather than repeating the digest, so this case is no
+ *    longer guarding two implementations against drift — it guards that the
+ *    delegation stays wired, which is the thing a future edit could undo.
  *
  * 2. The hash must be computed over the input EXACTLY as given. The
  *    middleware passes the API-key header raw and the OAuth introspection

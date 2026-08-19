@@ -41,9 +41,22 @@
 -- startup sequence that has already deleted nothing and can only halt. The
 -- encoding (utf8 bytes in, lowercase hex out, unsalted) is byte-identical to
 -- the application's hashApiKey() in lib/api-key-hash.ts and to the audit
--- log's credentialFingerprint(): `key::bytea` on a `text` column is that
--- column's utf8 bytes, and `encode(..., 'hex')` is lowercase. All three must
--- agree or a key hashed by one is invisible to the others.
+-- log's credentialFingerprint(), and `encode(..., 'hex')` is lowercase. All
+-- three must agree or a key hashed by one is invisible to the others.
+--
+-- convert_to("key", 'UTF8') rather than `"key"::bytea` is the load-bearing
+-- half of that agreement. A `text`-to-`bytea` CAST is not a byte
+-- reinterpretation: it is an I/O conversion through byteain, which reads the
+-- text as bytea INPUT SYNTAX — so a backslash in a stored key is an escape
+-- introducer, not a byte. Measured on 16.14, `sk_mt_a\b` hashes to
+-- 97a132e4… through the cast and f0d3dd0e… through convert_to; the cast
+-- digest is one no application code path can ever reproduce, so that key
+-- would silently 401 forever, and a malformed escape sequence would abort
+-- the whole migration instead. Today both key generators emit [0-9A-Za-z]
+-- only (api-keys.repo.ts, bootstrap.service.ts) so nothing in the wild hits
+-- it, but an operator-supplied BOOTSTRAP_API_KEYS key is not so constrained.
+-- convert_to() returns the column's characters encoded as UTF-8 bytes, which
+-- is what Node's createHash().update(string) hashes.
 --
 -- Idempotent (ADD COLUMN IF NOT EXISTS / DO-block guards, and the backfill is
 -- restricted to rows still missing a hash) per fork convention — see
@@ -57,16 +70,23 @@ ALTER TABLE "api_keys" ADD COLUMN IF NOT EXISTS "last4" text;
 --> statement-breakpoint
 -- Backfill from the plaintext while it is still there. Guarded on the column
 -- still existing so a re-run after the DROP below is a no-op rather than an
--- error: a partially-applied migration must be resumable, not fatal.
+-- error: a partially-applied migration must be resumable, not fatal. The
+-- guard is schema-qualified to current_schema(): information_schema.columns
+-- spans every schema this role can see, so an unrelated same-named table
+-- elsewhere would make the guard true after the search-path table has
+-- already dropped "key" — turning the resumability guard into exactly the
+-- error it exists to prevent.
 DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'api_keys' AND column_name = 'key'
+    WHERE table_schema = current_schema()
+      AND table_name = 'api_keys'
+      AND column_name = 'key'
   ) THEN
     EXECUTE $backfill$
       UPDATE "api_keys"
-      SET "key_hash" = encode(sha256("key"::bytea), 'hex'),
+      SET "key_hash" = encode(sha256(convert_to("key", 'UTF8')), 'hex'),
           "last4" = right("key", 4)
       WHERE "key_hash" IS NULL OR "last4" IS NULL
     $backfill$;
