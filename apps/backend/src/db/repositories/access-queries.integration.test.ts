@@ -39,6 +39,7 @@ import {
 } from "@repo/zod-types";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { apiKeyLast4, hashApiKey } from "../../lib/api-key-hash";
 import { INTEGRATION_DB_LOCK_KEY } from "./integration-db-lock";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -257,16 +258,21 @@ async function seed() {
     throw new Error("seed failed: scoped endpoint was not inserted");
   }
 
+  // Seeded through the same hashApiKey the application writes with (migration
+  // 0034): the table stores no key, so a literal in the `key_hash` column
+  // would be a value the running gateway could never produce.
   await db.insert(schema.apiKeysTable).values([
     {
       name: "itest-key-member-active",
-      key: "sk_mt_itest_member_active",
+      key_hash: hashApiKey("sk_mt_itest_member_active"),
+      last4: apiKeyLast4("sk_mt_itest_member_active"),
       user_id: MEMBER_ID,
       is_active: true,
     },
     {
       name: "itest-key-member-inactive",
-      key: "sk_mt_itest_member_inactive",
+      key_hash: hashApiKey("sk_mt_itest_member_inactive"),
+      last4: apiKeyLast4("sk_mt_itest_member_inactive"),
       user_id: MEMBER_ID,
       is_active: false,
     },
@@ -275,7 +281,8 @@ async function seed() {
       // the key the first cut of revokeAccess left live, and that
       // active_api_key_count did not count.
       name: "itest-key-actsas-member",
-      key: "sk_mt_itest_actsas",
+      key_hash: hashApiKey("sk_mt_itest_actsas"),
+      last4: apiKeyLast4("sk_mt_itest_actsas"),
       user_id: ADMIN_ID,
       acts_as_user_id: MEMBER_ID,
       endpoint_uuid: scopedEndpoint.uuid,

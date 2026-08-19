@@ -23,28 +23,6 @@ import { emitAdminEvent } from "../lib/audit/admin-event";
 
 const apiKeysRepository = new ApiKeysRepository();
 
-/**
- * Pick an existing active key that is safe to embed as the auto-generated
- * MCP server's bearer token for `endpointUuid`. Since migration 0023 an
- * endpoint-scoped key only authenticates on the endpoint it is bound to, so
- * blindly reusing "any active key" (the pre-0023 behavior) can embed a key
- * scoped to a DIFFERENT endpoint — it then 403s on the MCP server's first
- * call. Reuse order:
- *   1. an active key already scoped to THIS endpoint (ideal), then
- *   2. an active unscoped (gateway-wide / NULL) key (works everywhere).
- * A key scoped elsewhere is never reused; the caller mints a fresh scoped
- * key instead.
- */
-export function pickReusableApiKey<
-  T extends { key: string; is_active: boolean; endpoint_uuid: string | null },
->(userApiKeys: T[], endpointUuid: string): T | undefined {
-  return (
-    userApiKeys.find(
-      (key) => key.is_active && key.endpoint_uuid === endpointUuid,
-    ) ?? userApiKeys.find((key) => key.is_active && key.endpoint_uuid === null)
-  );
-}
-
 export const endpointsImplementations = {
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
@@ -114,6 +92,14 @@ export const endpointsImplementations = {
         user_id: effectiveUserId,
       });
 
+      // Partial-success detail for the companion MCP server. The endpoint
+      // itself is already committed by the time this block runs, so a failure
+      // here must NOT be reported as a failed endpoint creation (the caller
+      // would retry into "Endpoint name already exists") — it is returned
+      // alongside the created endpoint instead, and the UI raises it as a
+      // warning rather than swallowing it under a success toast.
+      let mcpServerWarning: string | undefined;
+
       // Create MCP server if requested
       if (input.createMcpServer) {
         try {
@@ -123,57 +109,70 @@ export const endpointsImplementations = {
           const baseUrl = process.env.APP_URL;
           const endpointUrl = `${baseUrl}/metamcp/${input.name}/mcp`;
 
-          // Get or create API key for bearer token only if API key auth is enabled
+          // Get an API key for the bearer token only if API key auth is
+          // enabled. This ALWAYS mints a fresh key rather than reusing one of
+          // the user's existing keys, and that is forced rather than chosen:
+          // since migration 0034 the gateway stores only a hash, so no
+          // existing key's value can be read back to embed here. The mint is
+          // SCOPED to the endpoint being created — an internal convenience
+          // mint must not produce an unscoped (gateway-wide) key silently.
+          //
+          // The key's name carries the endpoint name because api_keys is
+          // UNIQUE on (user_id, name): a fixed literal would collide on the
+          // second endpoint the same user creates this way, and the collision
+          // would surface as an MCP server silently configured with an empty
+          // bearer token rather than as an error. Endpoint names are globally
+          // unique (checked at the top of this handler), so this is unique per
+          // user too, and the key is cascade-deleted with its endpoint, so
+          // recreating an endpoint under the same name does not collide with
+          // its own predecessor.
           let bearerToken = "";
           if (input.enableApiKeyAuth) {
             try {
-              const userApiKeys = await apiKeysRepository.findByUserId(userId);
-              // Only reuse a key that will actually authenticate on THIS
-              // endpoint (scoped to it, or unscoped) — a key scoped elsewhere
-              // would 403 the auto-generated MCP server on first use.
-              const reusableApiKey = pickReusableApiKey(
-                userApiKeys,
-                result.uuid,
-              );
-
-              if (reusableApiKey) {
-                bearerToken = reusableApiKey.key;
-              } else {
-                // No reusable key: mint one SCOPED to the endpoint it is
-                // being created for — an internal convenience mint must not
-                // produce an unscoped (gateway-wide) key silently.
-                const newApiKey = await apiKeysRepository.create({
-                  name: "Auto-generated for MCP Server",
-                  user_id: userId,
-                  endpoint_uuid: result.uuid,
-                  is_active: true,
-                });
-                bearerToken = newApiKey.key;
-              }
+              const newApiKey = await apiKeysRepository.create({
+                name: `Auto-generated for MCP Server (${input.name})`,
+                user_id: userId,
+                endpoint_uuid: result.uuid,
+                is_active: true,
+              });
+              bearerToken = newApiKey.key;
             } catch (apiKeyError) {
               logger.error(
                 "Error getting API key for MCP server:",
                 apiKeyError,
               );
-              // Continue without bearer token if API key operation fails
+              // Do NOT fall through and create the server anyway. The endpoint
+              // gates on an API key, so a server row carrying an empty bearer
+              // token is a connection that 401s on its first call — a broken
+              // artifact the caller never asked for and was never told about.
+              // Since migration 0034 this is also the ONLY mint path here (the
+              // branch that reused an existing key is gone, because no stored
+              // key can be read back), so nothing else can supply the token.
+              mcpServerWarning = `The endpoint was created, but its companion MCP server was not: minting its API key failed (${apiKeyError instanceof Error ? apiKeyError.message : "unknown error"}). Create the MCP server manually, or retry with an API key you mint yourself.`;
             }
           }
 
-          await mcpServersRepository.create({
-            name: mcpServerName,
-            description: mcpServerDescription,
-            type: "STREAMABLE_HTTP",
-            url: endpointUrl,
-            bearerToken: bearerToken,
-            command: "",
-            args: [],
-            env: {},
-            user_id: effectiveUserId,
-          });
+          if (!mcpServerWarning) {
+            await mcpServersRepository.create({
+              name: mcpServerName,
+              description: mcpServerDescription,
+              type: "STREAMABLE_HTTP",
+              url: endpointUrl,
+              bearerToken: bearerToken,
+              command: "",
+              args: [],
+              env: {},
+              user_id: effectiveUserId,
+            });
+          }
         } catch (mcpError) {
           logger.error("Error creating MCP server:", mcpError);
-          // Don't fail the endpoint creation if MCP server creation fails
-          // Just log the error and continue
+          // The endpoint stands — the companion server is a convenience, and
+          // rolling back the primary resource because a convenience failed
+          // would be the worse trade. But the caller is told, because a
+          // silently absent MCP server is indistinguishable from one they
+          // simply cannot find.
+          mcpServerWarning = `The endpoint was created, but its companion MCP server was not: ${mcpError instanceof Error ? mcpError.message : "unknown error"}.`;
         }
       }
 
@@ -200,6 +199,7 @@ export const endpointsImplementations = {
         success: true as const,
         data: EndpointsSerializer.serializeEndpoint(result),
         message: "Endpoint created successfully",
+        ...(mcpServerWarning ? { warning: mcpServerWarning } : {}),
       };
     } catch (error) {
       logger.error("Error creating endpoint:", error);

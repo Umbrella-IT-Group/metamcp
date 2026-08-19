@@ -427,7 +427,20 @@ export const apiKeysTable = pgTable(
   {
     uuid: uuid("uuid").primaryKey().defaultRandom(),
     name: text("name").notNull(),
-    key: text("key").notNull().unique(),
+    // At-rest form of the credential (migration 0034). The key itself is NOT
+    // stored: this is the unsalted lowercase-hex sha256 of it, written only
+    // through lib/api-key-hash.ts's hashApiKey() so the mint paths and the
+    // authentication lookup can never disagree about the encoding. Unique for
+    // the same reason the plaintext column was — two rows must not share a
+    // credential, or a lookup cannot say which scope and which acts-as
+    // identity authenticated the request. The unique constraint also builds
+    // the btree the auth lookup uses, so there is no separate index here.
+    key_hash: text("key_hash").notNull().unique(),
+    // The key's last 4 characters — the only part of the secret kept in
+    // readable form. Enough for a human holding the key to recognise its row
+    // in a list (the serializer renders it as the key_prefix), useless to
+    // anyone who is not.
+    last4: text("last4").notNull(),
     user_id: text("user_id").references(() => usersTable.id, {
       onDelete: "cascade",
     }),
@@ -469,7 +482,10 @@ export const apiKeysTable = pgTable(
   },
   (table) => [
     index("api_keys_user_id_idx").on(table.user_id),
-    index("api_keys_key_idx").on(table.key),
+    // No index on key_hash: the unique() above already builds one, and the
+    // dropped plaintext column carried a redundant pair (api_keys_key_unique
+    // plus api_keys_key_idx) that migration 0034 deliberately did not
+    // recreate.
     index("api_keys_is_active_idx").on(table.is_active),
     index("api_keys_endpoint_uuid_idx").on(table.endpoint_uuid),
     index("api_keys_acts_as_user_id_idx").on(table.acts_as_user_id),

@@ -58,7 +58,7 @@ vi.mock("../auth", () => ({ auth: { handler: authHandlerMock } }));
  * drizzle-orm table definitions, no connection).
  */
 type LoggedStatement = {
-  op: "insert" | "delete";
+  op: "insert" | "delete" | "update";
   table: unknown;
   values?: Record<string, unknown>;
 };
@@ -126,8 +126,16 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
 
   const dbMock = {
     insert: vi.fn(insertChain),
-    update: vi.fn(() => ({
-      set: () => ({ where: () => Promise.resolve(undefined) }),
+    // Logged like inserts and deletes: the config-supplied-key path REWRITES
+    // an existing row's hash rather than inserting, so without this the only
+    // observable of that branch would be its log line.
+    update: vi.fn((table: unknown) => ({
+      set: (values: Record<string, unknown>) => ({
+        where: () => {
+          statementLog.push({ op: "update", table, values });
+          return Promise.resolve(undefined);
+        },
+      }),
     })),
     delete: vi.fn((table: unknown) => ({
       where: () => {
@@ -214,6 +222,7 @@ import {
   endpointsTable,
   namespacesTable,
 } from "../db/schema";
+import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
 // NOT mocked, deliberately: this module is half the fix under test, and the
 // entrypoint's use of it is what these tests observe.
@@ -341,7 +350,8 @@ function arrangeRecreateScenario(options?: { apiKeysEnv?: string }) {
   readFixtures.preservedKeyRows = [
     {
       name: "consumer-scoped",
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
       is_active: true,
       user_id: "old-user-id",
       endpoint_uuid: "stale-ep-uuid",
@@ -394,7 +404,8 @@ describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residua
     // the stale preserved uuid.
     expect(apiKeyInserts[0].values).toMatchObject({
       name: "consumer-scoped",
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
     });
@@ -407,20 +418,30 @@ describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residua
   });
 });
 
+/**
+ * A well-formed operator-supplied key: 70 characters, the same shape the
+ * repository mint emits.
+ */
+const CONFIGURED_KEY = `sk_mt_${"c3D4".repeat(16)}`;
+
 describe("bootstrapApiKeys log truth — pending restore for the same (user_id, name)", () => {
   it("amends the 'Created ... API key' line instead of presenting the doomed fresh value as live", async () => {
     // The config declares a key with the SAME name as the preserved key
-    // ("consumer-scoped", owned by the recreated user): bootstrapApiKeys mints
-    // it fresh, then the deferred restore's onConflictDoUpdate overwrites
-    // it. The minted value never survives startup, so the log must not
-    // present its mask as the live credential.
+    // ("consumer-scoped", owned by the recreated user): bootstrapApiKeys
+    // writes the configured value, then the deferred restore's
+    // onConflictDoUpdate overwrites it. The configured value never survives
+    // startup, so the log must not present its mask as the live credential.
     arrangeRecreateScenario({
       apiKeysEnv: JSON.stringify([
-        { name: "consumer-scoped", user_email: "admin@example.com" },
+        {
+          name: "consumer-scoped",
+          user_email: "admin@example.com",
+          key: CONFIGURED_KEY,
+        },
       ]),
     });
     // bootstrapApiKeys' existence probe: the key is gone (the recreate
-    // deleted it), so the mint path runs.
+    // deleted it), so the create path runs.
     readFixtures.apiKeysFindFirstQueue = [undefined];
 
     await initializeEnvironmentConfiguration();
@@ -437,7 +458,7 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
     expect(createdLine).toContain("preserved-key restore");
     expect(createdLine).not.toMatch(/: sk_mt_/);
 
-    // Both writes still happened: the config mint AND the restore upsert —
+    // Both writes still happened: the config write AND the restore upsert —
     // net DB state is unchanged by the log fix.
     const apiKeyInserts = statementLog.filter(
       (s) => s.op === "insert" && s.table === apiKeysTable,
@@ -445,14 +466,19 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
     expect(apiKeyInserts).toHaveLength(2);
     // Last write wins and it is the restore (the preserved value).
     expect(apiKeyInserts[apiKeyInserts.length - 1].values).toMatchObject({
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
     });
   });
 
   it("a non-colliding config key keeps the normal masked-value log line", async () => {
     arrangeRecreateScenario({
       apiKeysEnv: JSON.stringify([
-        { name: "unrelated-key", user_email: "admin@example.com" },
+        {
+          name: "unrelated-key",
+          user_email: "admin@example.com",
+          key: CONFIGURED_KEY,
+        },
       ]),
     });
     readFixtures.apiKeysFindFirstQueue = [undefined];
@@ -468,6 +494,234 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
     expect(createdLine).toBeDefined();
     expect(createdLine).toMatch(/: sk_mt_/);
     expect(createdLine).not.toContain("preserved-key restore");
+    // Masked, never whole — the boot log must not carry a live credential.
+    expect(createdLine).not.toContain(CONFIGURED_KEY);
+  });
+});
+
+/**
+ * `BOOTSTRAP_API_KEYS[].key` — the operator-supplied value, and the refusal
+ * to invent one.
+ *
+ * Migration 0034 stores only a hash and the product has no rotate endpoint,
+ * so a key bootstrap generates for itself is written to a row that no
+ * surface can ever read back: the boot log would say "✓ Created" over a
+ * credential that is unusable and unrepairable. These cases pin that
+ * bootstrap refuses that outcome out loud, and that a supplied value reaches
+ * the database through the SHARED hash helper (a local encoding here would
+ * store a digest the authentication lookup never matches — a silent 401).
+ */
+describe("bootstrapApiKeys — operator-supplied key values", () => {
+  function warnLines(): string[] {
+    return (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+  }
+
+  function logLines(): string[] {
+    return (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+  }
+
+  /**
+   * A plain boot: the configured user already exists, nothing is recreated,
+   * no keys are preserved. Two `usersTable.findFirst` responses — the
+   * existing-user probe, then the re-read `ensureUser` issues on every path
+   * before it can return the id `userMap` is keyed on.
+   */
+  function arrangePlainBoot(apiKeysEnv: unknown[]) {
+    process.env.BOOTSTRAP_USER_EMAIL = "admin@example.com";
+    process.env.BOOTSTRAP_USER_PASSWORD = "hunter2hunter2";
+    process.env.BOOTSTRAP_API_KEYS = JSON.stringify(apiKeysEnv);
+    readFixtures.usersFindFirstQueue = [
+      { id: "user-1", email: "admin@example.com" },
+      { id: "user-1", email: "admin@example.com" },
+    ];
+  }
+
+  function apiKeyInserts() {
+    return statementLog.filter(
+      (s) => s.op === "insert" && s.table === apiKeysTable,
+    );
+  }
+
+  function apiKeyUpdates() {
+    return statementLog.filter(
+      (s) => s.op === "update" && s.table === apiKeysTable,
+    );
+  }
+
+  it("writes the SUPPLIED value's hash and last4 — never a value of its own", async () => {
+    arrangePlainBoot([
+      {
+        name: "connector",
+        user_email: "admin@example.com",
+        key: CONFIGURED_KEY,
+      },
+    ]);
+    readFixtures.apiKeysFindFirstQueue = [undefined];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(apiKeyInserts()).toHaveLength(1);
+    // Through the shared helper, so the row this writes is the row
+    // `validateApiKey` finds when the operator presents CONFIGURED_KEY.
+    expect(apiKeyInserts()[0].values).toMatchObject({
+      name: "connector",
+      key_hash: hashApiKey(CONFIGURED_KEY),
+      last4: apiKeyLast4(CONFIGURED_KEY),
+      user_id: "user-1",
+      is_active: true,
+    });
+  });
+
+  it("SKIPS an entry with no key, loudly and with the remedy, writing nothing", async () => {
+    // The regression: before this, bootstrap generated a value, stored its
+    // hash, logged "✓ Created ... : sk_mt_abcd…wxyz", and the operator was
+    // left holding a masked prefix of a credential no surface could return.
+    arrangePlainBoot([{ name: "connector", user_email: "admin@example.com" }]);
+    readFixtures.apiKeysFindFirstQueue = [undefined];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(apiKeyInserts()).toHaveLength(0);
+    const skipLine = warnLines().find((line) =>
+      line.includes('Skipping API key "connector"'),
+    );
+    expect(skipLine).toBeDefined();
+    expect(skipLine).toContain('must carry a "key" value');
+    // Names the way out, both of them — a warning that only says "no" costs
+    // the operator the same discovery this test exists to prevent.
+    expect(skipLine).toContain('Add "key"');
+    expect(skipLine).toContain("UI");
+    // And nothing claimed success for it.
+    expect(
+      logLines().find((line) => line.includes('API key "connector"')),
+    ).toBeUndefined();
+  });
+
+  it.each([
+    ["empty", "", 'its "key" is empty'],
+    ["too short", "sk_mt_tooshort", "shorter than 32 characters"],
+    [
+      "whitespace-padded",
+      ` ${CONFIGURED_KEY} `,
+      "leading or trailing whitespace",
+    ],
+  ])(
+    "SKIPS a %s key rather than falling back to a generated one",
+    async (_label, key, expectedReason) => {
+      arrangePlainBoot([
+        { name: "connector", user_email: "admin@example.com", key },
+      ]);
+      readFixtures.apiKeysFindFirstQueue = [undefined];
+
+      await initializeEnvironmentConfiguration();
+
+      // The fallback is the danger: a generated value would look like a
+      // success while being unreadable, and the operator would never learn
+      // their configured key was rejected.
+      expect(apiKeyInserts()).toHaveLength(0);
+      const skipLine = warnLines().find((line) =>
+        line.includes('Skipping API key "connector"'),
+      );
+      expect(skipLine).toBeDefined();
+      expect(skipLine).toContain(expectedReason);
+    },
+  );
+
+  it("rewrites an EXISTING row when the configured value disagrees with the stored hash", async () => {
+    // The only route back from a key nobody can read: rows minted before the
+    // field existed hold an unreadable value, and there is no rotate
+    // endpoint. Ignoring the config here would leave that row dead forever.
+    arrangePlainBoot([
+      {
+        name: "connector",
+        user_email: "admin@example.com",
+        key: CONFIGURED_KEY,
+      },
+    ]);
+    readFixtures.apiKeysFindFirstQueue = [
+      {
+        uuid: "key-uuid-1",
+        name: "connector",
+        key_hash: hashApiKey("sk_mt_some_older_unreadable_value"),
+        last4: "alue",
+        user_id: "user-1",
+      },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(apiKeyInserts()).toHaveLength(0);
+    expect(apiKeyUpdates()).toHaveLength(1);
+    expect(apiKeyUpdates()[0].values).toEqual({
+      key_hash: hashApiKey(CONFIGURED_KEY),
+      last4: apiKeyLast4(CONFIGURED_KEY),
+    });
+    const updatedLine = logLines().find((line) =>
+      line.includes('API key "connector"'),
+    );
+    expect(updatedLine).toContain("updated to the value configured");
+    expect(updatedLine).not.toContain(CONFIGURED_KEY); // masked, never whole
+  });
+
+  it("leaves an existing row alone when the configured value already matches", async () => {
+    // Every restart re-reads the same config; a write per boot would churn
+    // the row and make the audit trail lie about when the key last changed.
+    arrangePlainBoot([
+      {
+        name: "connector",
+        user_email: "admin@example.com",
+        key: CONFIGURED_KEY,
+      },
+    ]);
+    readFixtures.apiKeysFindFirstQueue = [
+      {
+        uuid: "key-uuid-1",
+        name: "connector",
+        key_hash: hashApiKey(CONFIGURED_KEY),
+        last4: apiKeyLast4(CONFIGURED_KEY),
+        user_id: "user-1",
+      },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(apiKeyInserts()).toHaveLength(0);
+    expect(apiKeyUpdates()).toHaveLength(0);
+    expect(
+      logLines().find((line) => line.includes('API key "connector"')),
+    ).toContain("already exists: sk_mt_…");
+  });
+
+  it("leaves an existing row alone when the entry declares no key at all", async () => {
+    // The no-key refusal is about CREATING an unreadable credential. A key
+    // that already exists is already working for whoever holds it, so an
+    // entry that merely names it must not be treated as a request to
+    // replace it.
+    arrangePlainBoot([{ name: "connector", user_email: "admin@example.com" }]);
+    readFixtures.apiKeysFindFirstQueue = [
+      {
+        uuid: "key-uuid-1",
+        name: "connector",
+        key_hash: hashApiKey(CONFIGURED_KEY),
+        last4: apiKeyLast4(CONFIGURED_KEY),
+        user_id: "user-1",
+      },
+    ];
+
+    await initializeEnvironmentConfiguration();
+
+    expect(apiKeyInserts()).toHaveLength(0);
+    expect(apiKeyUpdates()).toHaveLength(0);
+    expect(
+      warnLines().find((line) => line.includes('Skipping API key "connector"')),
+    ).toBeUndefined();
+    expect(
+      logLines().find((line) => line.includes('API key "connector"')),
+    ).toContain("already exists: sk_mt_…");
   });
 });
 
@@ -546,7 +800,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     readFixtures.preservedKeyRows = [
       {
         name: "alex-m365",
-        key: "sk_mt_bound_secret",
+        key_hash: hashApiKey("sk_mt_bound_secret"),
+        last4: apiKeyLast4("sk_mt_bound_secret"),
         is_active: true,
         user_id: "old-user-id",
         endpoint_uuid: "stale-ep-uuid",
@@ -566,7 +821,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     // EMAIL — each to its post-recreate value.
     expect(apiKeyInserts[0].values).toMatchObject({
       name: "alex-m365",
-      key: "sk_mt_bound_secret",
+      key_hash: hashApiKey("sk_mt_bound_secret"),
+      last4: apiKeyLast4("sk_mt_bound_secret"),
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
       acts_as_user_id: "new-user-id",
@@ -578,7 +834,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     readFixtures.preservedKeyRows = [
       {
         name: "bound-to-departed",
-        key: "sk_mt_departed_secret",
+        key_hash: hashApiKey("sk_mt_departed_secret"),
+        last4: apiKeyLast4("sk_mt_departed_secret"),
         is_active: true,
         user_id: "old-user-id",
         endpoint_uuid: "stale-ep-uuid",
@@ -615,7 +872,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     readFixtures.preservedKeyRows = [
       {
         name: "consumer-scoped",
-        key: "sk_mt_preserved_secret",
+        key_hash: hashApiKey("sk_mt_preserved_secret"),
+        last4: apiKeyLast4("sk_mt_preserved_secret"),
         is_active: true,
         user_id: "old-user-id",
         endpoint_uuid: "stale-ep-uuid",
@@ -625,7 +883,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
       },
       {
         name: "foreign-bound-key",
-        key: "sk_mt_foreign_secret",
+        key_hash: hashApiKey("sk_mt_foreign_secret"),
+        last4: apiKeyLast4("sk_mt_foreign_secret"),
         is_active: true,
         user_id: "some-other-user",
         endpoint_uuid: "stale-ep-uuid",
@@ -916,7 +1175,8 @@ describe("bootstrap signup exemption — the boot-2+ recreate lockout", () => {
     expect(apiKeyInserts).toHaveLength(1);
     expect(apiKeyInserts[0].values).toMatchObject({
       name: "consumer-scoped",
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
     });

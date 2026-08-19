@@ -60,7 +60,8 @@ vi.mock("../schema", () => ({
   apiKeysTable: {
     uuid: { name: "uuid" },
     name: { name: "name" },
-    key: { name: "key" },
+    key_hash: { name: "key_hash" },
+    last4: { name: "last4" },
     user_id: { name: "user_id" },
     endpoint_uuid: { name: "endpoint_uuid" },
     acts_as_user_id: { name: "acts_as_user_id" },
@@ -75,13 +76,22 @@ vi.mock("../schema", () => ({
 }));
 
 // Spy on the REAL drizzle-orm combinators (not stubbed out) so the assertion
-// is "isNull/or were never invoked", not "a mock returned some value".
+// is "isNull/or were never invoked", not "a mock returned some value". `eq` is
+// wrapped the same way so the authentication lookup's predicate can be
+// inspected — see the hashed-lookup suite at the bottom.
 vi.mock("drizzle-orm", async (importOriginal) => {
   const actual = await importOriginal<typeof import("drizzle-orm")>();
-  return { ...actual, or: vi.fn(actual.or), isNull: vi.fn(actual.isNull) };
+  return {
+    ...actual,
+    or: vi.fn(actual.or),
+    isNull: vi.fn(actual.isNull),
+    eq: vi.fn(actual.eq),
+  };
 });
 
-import { isNull, or } from "drizzle-orm";
+import { eq, isNull, or } from "drizzle-orm";
+
+import { hashApiKey } from "@/lib/api-key-hash";
 
 import { ApiKeysRepository } from "./api-keys.repo";
 
@@ -94,7 +104,7 @@ describe("ApiKeysRepository member-scoped update/delete — public key isolation
       {
         uuid: "k1",
         name: "x",
-        key: "sk_mt_x",
+        last4: "aaaa",
         created_at: new Date(),
         is_active: false,
       },
@@ -199,5 +209,59 @@ describe("ApiKeysRepository.validateApiKey — scope + acts-as projection", () =
     const result = await repo.validateApiKey("sk_mt_inactive");
 
     expect(result).toEqual({ valid: false });
+  });
+});
+
+// Migration 0034: the table stores sha256(key), not the key. If the lookup
+// ever compared the presented value against the stored digest directly — or
+// normalised the presented value on the way in — every key on the gateway
+// would stop authenticating at once, with a 401 rather than an error to say
+// why. These tests pin the predicate itself, not just the returned row, so
+// the failure surfaces here instead of in production auth.
+describe("ApiKeysRepository.validateApiKey — the lookup is by HASH, not by key", () => {
+  const repo = new ApiKeysRepository();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    selectChain.where.mockResolvedValue([]);
+  });
+
+  it("matches on the key_hash column using the sha256 of the presented value", async () => {
+    const presented = `sk_mt_${"d".repeat(64)}`;
+
+    await repo.validateApiKey(presented);
+
+    expect(eq).toHaveBeenCalledWith(
+      { name: "key_hash" },
+      hashApiKey(presented),
+    );
+  });
+
+  it("never puts the presented key itself into the predicate", async () => {
+    const presented = `sk_mt_${"e".repeat(64)}`;
+
+    await repo.validateApiKey(presented);
+
+    const eqArgs = (eq as unknown as ReturnType<typeof vi.fn>).mock.calls.flat();
+    expect(eqArgs).not.toContain(presented);
+    // …and no column other than key_hash is compared on this path, so a
+    // lingering plaintext column could not be reintroduced as the matcher.
+    expect(eqArgs).not.toContainEqual({ name: "key" });
+  });
+
+  it("hashes the presented value EXACTLY as received — no trimming, no case folding", async () => {
+    // The middleware passes the x-api-key header raw while the OAuth
+    // introspection route trims it. That asymmetry decides which
+    // whitespace-padded credentials authenticate, and it is the callers' to
+    // own: normalising here would silently change the answer for both.
+    const padded = "  sk_mt_padded  ";
+
+    await repo.validateApiKey(padded);
+
+    expect(eq).toHaveBeenCalledWith({ name: "key_hash" }, hashApiKey(padded));
+    expect(eq).not.toHaveBeenCalledWith(
+      { name: "key_hash" },
+      hashApiKey(padded.trim()),
+    );
   });
 });
