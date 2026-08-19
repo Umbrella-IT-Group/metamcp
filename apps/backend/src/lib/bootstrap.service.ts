@@ -1246,14 +1246,14 @@ async function bootstrapApiKeys(
 
       if (!existing) {
         if (!configuredKey) {
-          // Since migration 0034 only a hash is stored, and there is no
-          // rotate surface anywhere in the product (`apiKeysImplementations`
-          // exposes create/list/update/delete/validate — update carries name
-          // and is_active only). So a value generated here would be written
-          // to a row that NO surface can ever return: not the boot log, not
-          // the API, not the UI. Bootstrap would print "✓ Created" over a
-          // credential nobody can use and nobody can repair except by
-          // deleting the row. Refuse loudly and name the remedy instead —
+          // Since migration 0034 only a hash is stored, and the product has
+          // no rotate surface (`apiKeysImplementations` exposes
+          // create/list/update/delete/validate, and update carries name and
+          // is_active only). A value generated here would therefore land in
+          // a row that NO surface can ever return — not the boot log, not
+          // the API, not the UI — and bootstrap would print "✓ Created" over
+          // a credential nobody can use and nobody can repair except by
+          // deleting the row. Refuse loudly and name the remedy instead:
           // this is the one case where doing less is the honest outcome.
           console.warn(
             `⚠️ Skipping API key "${name}": BOOTSTRAP_API_KEYS entries must carry a "key" value. Only a hash of the key is stored, so a value generated here could never be shown to you and the key would be unusable. Add "key": "<a secret you generate, at least ${MIN_CONFIGURED_API_KEY_LENGTH} characters>" to this entry, or create the key in the UI, which displays it once.`,
