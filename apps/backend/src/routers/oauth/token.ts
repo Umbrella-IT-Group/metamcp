@@ -661,6 +661,23 @@ function isoOrNull(value: Date | null | undefined): string | null {
  *    leave the row deliberately intact, because disable must stay reversible,
  *    and they already carry a `logger.warn`.
  *
+ * THE RESIDUAL ON THAT BOUND, STATED PLAINLY RATHER THAN IMPLIED AWAY: it is
+ * one row per destroy ATTEMPT, not per credential. Read-then-delete is not
+ * atomic and neither delete reports whether it removed anything —
+ * `deleteAccessToken` and `deleteAuthCode` both return void — so N concurrent
+ * presentations of the SAME expired credential each read the row before the
+ * first delete commits, and each writes a row. /oauth/token is per-IP limited
+ * by `rateLimitToken` and /oauth/introspect sits behind the failure limiter
+ * plus the RFC 7662 credential gate; GET /oauth/userinfo carries no limiter at
+ * all, so it is the one a burst actually reaches. Emit-first is the half of
+ * that trade being kept ON PURPOSE: the record has to survive a delete that
+ * throws, which is the case an operator is investigating, and buying
+ * exactly-once instead would mean gating the emit on a delete that returns a
+ * row count — trading the forensic guarantee for a counting one. So the bound
+ * is one BURST per real credential, once, where the same burst wrote zero rows
+ * before these emitters existed. Bounding it further needs the prune path on
+ * `audit_log`, same as the introspect-active case above.
+ *
  * GET /oauth/userinfo has the same destroy-on-expiry branch and emits the same
  * shape, but from ./userinfo.ts — this emitter is private to the token router.
  *

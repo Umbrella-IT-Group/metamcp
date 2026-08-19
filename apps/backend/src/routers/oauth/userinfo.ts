@@ -41,6 +41,21 @@ function isoOrNull(value: Date | null | undefined): string | null {
  * and still holds — and reaching it deletes that token, so a replay finds
  * nothing and writes nothing. One row per credential destroyed.
  *
+ * THE RESIDUAL, STATED HERE BECAUSE THIS ENDPOINT CARRIES THE MOST OF IT: that
+ * is one row per destroy ATTEMPT. Read-then-delete is not atomic and
+ * `deleteAccessToken` returns void rather than a row count, so N concurrent
+ * presentations of the SAME expired token each read the row before the first
+ * delete commits and each write a row. /oauth/userinfo also has NO rate
+ * limiter — ./index.ts mounts it behind CORS, security headers and the body
+ * parsers only, while `rateLimitToken` guards /oauth/token and the failure
+ * limiter plus the RFC 7662 credential gate guard /oauth/introspect — so it is
+ * the branch a burst actually reaches. Kept anyway, because the alternative is
+ * to emit AFTER a delete that reports what it removed, which loses the record
+ * in precisely the failed-delete case this ordering exists for. One burst per
+ * real credential, once, against zero rows before this emitter existed.
+ * ./token.ts's `emitTokenLifecycle` header states the same trade for the other
+ * three branches.
+ *
  * `oauth.token.userinfo` rather than `oauth.userinfo`: the subject of the event
  * is the token, and this endpoint is the second half of the same token-metadata
  * plane as `oauth.token.introspect`. Keeping the prefix keeps one credential's

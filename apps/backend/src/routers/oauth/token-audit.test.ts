@@ -360,6 +360,44 @@ describe("oauth.token.issue — the authorization_code grant", () => {
     expect(serialized()).not.toContain(authCode);
     expect(serialized()).not.toContain(codeVerifier);
   });
+
+  it("keeps the row when the code DELETE throws — emit runs FIRST", async () => {
+    // The ordering itself, pinned. Emitting before the delete is the whole
+    // reason the record survives a destruction that fails halfway, and every
+    // other case here passes with the two statements swapped. A delete that
+    // throws is exactly the state an operator is investigating: the row may or
+    // may not still be in the table, and this event is the only thing that
+    // says the credential was reached at all.
+    const issuedAt = new Date(Date.now() - 11 * 60 * 1000);
+    const expiredAt = new Date(Date.now() - 60 * 1000);
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: authCode,
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      scope: SCOPE,
+      user_id: USER_ID,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      created_at: issuedAt,
+      expires_at: expiredAt,
+    });
+    oauthRepositoryMock.deleteAuthCode.mockRejectedValue(
+      new Error("connection pool exhausted"),
+    );
+
+    await expect(exchange()).rejects.toThrow("connection pool exhausted");
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.issue",
+      outcome: "failure",
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "authorization_code_expired",
+      token_sha256: sha256(authCode),
+    });
+  });
 });
 
 describe("oauth.token.refresh — rotation", () => {
@@ -488,6 +526,10 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
     await redeem();
     await flush();
 
+    // Asserted before the negatives on purpose: `not.toContain` over an empty
+    // table passes for the wrong reason, so without this line the case would
+    // stay green if the emit disappeared entirely.
+    expect(rows).toHaveLength(1);
     expect(serialized()).not.toContain(refreshToken);
     expect(serialized()).not.toContain(priorAccessToken);
   });
@@ -509,6 +551,27 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       priorAccessToken,
     );
+  });
+
+  it("keeps the row when the token DELETE throws — emit runs FIRST", async () => {
+    // Same ordering assertion as the expired-code branch, on the branch the
+    // commit body argues from. See the note there.
+    oauthRepositoryMock.deleteAccessToken.mockRejectedValue(
+      new Error("connection pool exhausted"),
+    );
+
+    await expect(redeem()).rejects.toThrow("connection pool exhausted");
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.refresh",
+      outcome: "failure",
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "refresh_token_expired",
+      access_token_sha256: sha256(priorAccessToken),
+    });
   });
 });
 
@@ -804,6 +867,40 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
       expiredToken,
     );
   });
+
+  it("keeps the row when the introspect DELETE throws — emit runs FIRST", async () => {
+    // Ordering, on the introspect branch. Here the failed delete is caught by
+    // the endpoint's own try/catch and answered 500, so the request outcome is
+    // observable — but the row is the point: it exists because the emit ran
+    // before the statement that threw.
+    const expiredToken = "mcp_token_aged_out_value";
+    oauthRepositoryMock.getAccessToken.mockResolvedValue({
+      access_token: expiredToken,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+      scope: SCOPE,
+      created_at: new Date(Date.now() - 2 * 86400000),
+      expires_at: new Date(Date.now() - 86400000),
+      refresh_token_expires_at: null,
+    });
+    oauthRepositoryMock.deleteAccessToken.mockRejectedValue(
+      new Error("connection pool exhausted"),
+    );
+
+    const res = await post({ token: expiredToken }, "/oauth/introspect");
+    await flush();
+
+    expect(res.statusCode).toBe(500);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.introspect",
+      outcome: "failure",
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "access_token_expired",
+      token_sha256: sha256(expiredToken),
+    });
+  });
 });
 
 describe("oauth.token.userinfo — the third destroy-on-expiry branch", () => {
@@ -904,6 +1001,29 @@ describe("oauth.token.userinfo — the third destroy-on-expiry branch", () => {
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       expiredToken,
     );
+  });
+
+  it("keeps the row when the userinfo DELETE throws — emit runs FIRST", async () => {
+    // Ordering, on the fourth branch. Same shape as the introspect case: the
+    // handler's try/catch turns the failed delete into a 500, and the row is
+    // there because the emit preceded it.
+    oauthRepositoryMock.deleteAccessToken.mockRejectedValue(
+      new Error("connection pool exhausted"),
+    );
+
+    const res = await getUserinfo(expiredToken);
+    await flush();
+
+    expect(res.statusCode).toBe(500);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.token.userinfo",
+      outcome: "failure",
+    });
+    expect(rows[0].detail).toMatchObject({
+      reason: "access_token_expired",
+      token_sha256: sha256(expiredToken),
+    });
   });
 });
 
