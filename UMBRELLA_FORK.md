@@ -85,8 +85,8 @@ These are Umbrella-specific deltas. Each one should eventually be either upstrea
 Two things the table is not, both worth knowing before you read a gap as a
 missing change. It does not log its own upkeep: a PR whose only change is
 this ledger gets no row, which is why `#10`, `#14`, `#31`, `#33`, `#51`,
-`#55`, `#59`, `#65`, `#66`, `#67`, `#75`, `#93`, `#128`, `#132` and `#135`
-are absent by design — a row for each would say nothing about the fork's behaviour. And it
+`#55`, `#59`, `#65`, `#66`, `#67`, `#75`, `#93`, `#128`, `#132`, `#135` and
+`#138` are absent by design — a row for each would say nothing about the fork's behaviour. And it
 is not yet a complete index of merged work: the rows dated 2026-08-14/15 that
 name a branch and read `(PR pending)` were written before those PRs existed
 and still need their numbers backfilled, while `#104` and `#108` have no row
