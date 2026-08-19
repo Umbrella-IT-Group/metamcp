@@ -48,15 +48,23 @@
 -- half of that agreement. A `text`-to-`bytea` CAST is not a byte
 -- reinterpretation: it is an I/O conversion through byteain, which reads the
 -- text as bytea INPUT SYNTAX — so a backslash in a stored key is an escape
--- introducer, not a byte. Measured on 16.14, `sk_mt_a\b` hashes to
--- 97a132e4… through the cast and f0d3dd0e… through convert_to; the cast
--- digest is one no application code path can ever reproduce, so that key
--- would silently 401 forever, and a malformed escape sequence would abort
--- the whole migration instead. Today both key generators emit [0-9A-Za-z]
--- only (api-keys.repo.ts, bootstrap.service.ts) so nothing in the wild hits
--- it, but an operator-supplied BOOTSTRAP_API_KEYS key is not so constrained.
--- convert_to() returns the column's characters encoded as UTF-8 bytes, which
--- is what Node's createHash().update(string) hashes.
+-- introducer, not a byte, and the cast then fails one of two ways depending
+-- on what follows it. Measured on 16.14: a key holding `sk_mt_a\b` has no
+-- valid escape after the backslash, so `"key"::bytea` raises `invalid input
+-- syntax for type bytea` and ABORTS this migration — a startup halted
+-- mid-schema-change, with no digest produced at all. A key holding
+-- `sk_mt_a\\b` does have a valid escape, which is the quieter failure:
+-- byteain collapses the pair to a single byte, so the cast digests 9 bytes
+-- to 97a132e4… while convert_to digests the 10 stored characters to
+-- f0d3dd0e…. The cast's digest is one no application code path can ever
+-- reproduce for that key, so it would silently 401 forever. convert_to() has
+-- neither failure mode: it returns the column's characters encoded as UTF-8
+-- bytes, which is what Node's createHash().update(string) hashes — Node
+-- digests `sk_mt_a\\b` to f0d3dd0e… too, so the hash written by the backfill
+-- and the hash computed at login agree. Today both key generators emit
+-- [0-9A-Za-z] only (api-keys.repo.ts, bootstrap.service.ts) so nothing in the
+-- wild hits it, but an operator-supplied BOOTSTRAP_API_KEYS key is not so
+-- constrained.
 --
 -- Idempotent (ADD COLUMN IF NOT EXISTS / DO-block guards, and the backfill is
 -- restricted to rows still missing a hash) per fork convention — see

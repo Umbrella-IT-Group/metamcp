@@ -120,12 +120,15 @@ across the management and OAuth surfaces:
   actions and diagnostics require an admin session, not merely an authenticated one.
 - **Secret redaction** in API responses — API-key values, per-server credentials, and OAuth
   tokens are never returned in list/get/update payloads.
-- **API keys hashed at rest** — the database stores a SHA-256 of each key plus its last four
-  characters, never the key itself, so read access to the database (a backup, a replica, a
-  `psql` session) no longer yields working credentials. A key is shown exactly once, in the
-  response that mints it; if it is not copied then it cannot be recovered from anywhere and
-  must be re-minted. Existing keys keep working across the upgrade — the migration hashes what
-  is already stored rather than requiring a re-mint. `BOOTSTRAP_API_KEYS` entries consequently
+- **API keys hashed at rest** — the `api_keys` table stores a SHA-256 of each key plus its
+  last four characters, never the key itself, so read access to that table (a backup, a
+  replica, a `psql` session) no longer yields working credentials. A key is shown exactly
+  once, in the response that mints it; it cannot be read back out of `api_keys` afterwards, so
+  an uncopied key must be re-minted. Bearer tokens configured on MCP-server rows are a separate
+  store and are still held as given — including the freshly minted key an auto-created endpoint
+  server is configured with — so `mcp_servers.bearer_token` remains in scope for database-read
+  exposure. Existing keys keep working across the upgrade — the migration hashes what is
+  already stored rather than requiring a re-mint. `BOOTSTRAP_API_KEYS` entries consequently
   require a `key` value that the operator generates: with nothing readable stored, bootstrap
   cannot invent a key and hand it back, so an entry without one is skipped with a warning
   rather than silently creating a credential nobody can obtain. Re-declaring a different value
