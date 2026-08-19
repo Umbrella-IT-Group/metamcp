@@ -620,11 +620,13 @@ describe("api-keys list — member view never returns a usable secret", () => {
   const PRIVATE_KEY = `sk_mt_${"b".repeat(64)}`;
   const EP = "11111111-1111-4111-8111-111111111111";
 
+  // The repository no longer selects a key column at all (migration 0034);
+  // `last4` is the stored display tail, and it is all the serializer gets.
   const accessibleRows = [
     {
       uuid: "pub-1",
       name: "gateway-wide shared",
-      key: PUBLIC_KEY,
+      last4: PUBLIC_KEY.slice(-4),
       created_at: new Date("2026-07-01T00:00:00Z"),
       is_active: true,
       user_id: null, // public / 'everyone' — the leaked class
@@ -634,7 +636,7 @@ describe("api-keys list — member view never returns a usable secret", () => {
     {
       uuid: "priv-1",
       name: "my own key",
-      key: PRIVATE_KEY,
+      last4: PRIVATE_KEY.slice(-4),
       created_at: new Date("2026-07-02T00:00:00Z"),
       is_active: true,
       user_id: "member-1",
@@ -652,8 +654,8 @@ describe("api-keys list — member view never returns a usable secret", () => {
     for (const row of result.apiKeys) {
       // The old field is gone entirely, not merely overwritten.
       expect((row as Record<string, unknown>).key).toBeUndefined();
-      // 10 characters of key, then the elision marker — nothing more.
-      expect(row.key_prefix).toMatch(/^sk_mt_[a-z0-9]{4}…$/);
+      // Scheme tag, elision marker, 4 stored characters — nothing more.
+      expect(row.key_prefix).toMatch(/^sk_mt_…[a-z0-9]{4}$/);
     }
   });
 
@@ -673,17 +675,18 @@ describe("api-keys list — member view never returns a usable secret", () => {
     expect(payload).not.toContain(PRIVATE_KEY);
   });
 
-  it("exposes only a strict, non-reversible prefix of each key", async () => {
+  it("exposes only a strict, non-reversible identifier for each key", async () => {
     repoMock.findAccessibleToUser.mockResolvedValue(accessibleRows);
 
     const result = await apiKeysImplementations.list("member-1");
 
-    expect(result.apiKeys[0].key_prefix).toBe("sk_mt_aaaa…");
-    expect(result.apiKeys[1].key_prefix).toBe("sk_mt_bbbb…");
-    // A prefix must be a genuine truncation of the original, not a rename.
-    expect(
-      PUBLIC_KEY.startsWith(result.apiKeys[0].key_prefix.slice(0, -1)),
-    ).toBe(true);
+    expect(result.apiKeys[0].key_prefix).toBe("sk_mt_…aaaa");
+    expect(result.apiKeys[1].key_prefix).toBe("sk_mt_…bbbb");
+    // The visible characters must be a genuine tail of the original, not a
+    // rename — and far shorter than the key itself.
+    expect(PUBLIC_KEY.endsWith(result.apiKeys[0].key_prefix.slice(-4))).toBe(
+      true,
+    );
     expect(result.apiKeys[0].key_prefix.length).toBeLessThan(PUBLIC_KEY.length);
   });
 
@@ -719,7 +722,7 @@ describe("api-keys list — member view never returns a usable secret", () => {
           uuid: "44444444-4444-4444-8444-444444444444",
           name: "regressed",
           key: PUBLIC_KEY,
-          key_prefix: "sk_mt_aaaa…",
+          key_prefix: "sk_mt_…aaaa",
           created_at: new Date(),
           is_active: true,
           user_id: null,
@@ -740,7 +743,7 @@ describe("api-keys listAll — admin cross-user view", () => {
       {
         uuid: "1",
         name: "alice-key",
-        key: "sk_mt_AAAAAAAAAAAAAAAA",
+        last4: "AAAA",
         created_at: new Date("2026-07-01T00:00:00Z"),
         last_used_at: null,
         is_active: true,
@@ -753,7 +756,7 @@ describe("api-keys listAll — admin cross-user view", () => {
       {
         uuid: "2",
         name: "public-key",
-        key: "sk_mt_BBBBBBBBBBBBBBBB",
+        last4: "BBBB",
         created_at: new Date("2026-07-02T00:00:00Z"),
         last_used_at: new Date("2026-07-10T00:00:00Z"),
         is_active: false,
@@ -784,9 +787,10 @@ describe("api-keys listAll — admin cross-user view", () => {
     // no caller id — the ownership filter is gone.
     expect(result.apiKeys[0].owner_email).toBe("alice@example.com");
     expect(result.apiKeys[1].owner_email).toBeNull(); // public key
-    // The full secret must NOT leak; only a non-reversible prefix is exposed.
+    // The full secret must NOT leak; only a non-reversible identifier built
+    // from the stored tail is exposed.
     expect((result.apiKeys[0] as Record<string, unknown>).key).toBeUndefined();
-    expect(result.apiKeys[0].key_prefix).toBe("sk_mt_AAAA…");
+    expect(result.apiKeys[0].key_prefix).toBe("sk_mt_…AAAA");
     expect(result.apiKeys[0].key_prefix.length).toBeLessThan(
       "sk_mt_AAAAAAAAAAAAAAAA".length,
     );
@@ -801,7 +805,7 @@ describe("api-keys update — admin ownership bypass", () => {
     repoMock.updateAsAdmin.mockResolvedValue({
       uuid: "k",
       name: "renamed",
-      key: "sk_mt_x",
+      last4: "keyx",
       created_at: new Date(),
       is_active: false,
     });
@@ -823,7 +827,7 @@ describe("api-keys update — admin ownership bypass", () => {
     repoMock.update.mockResolvedValue({
       uuid: "k",
       name: "renamed",
-      key: "sk_mt_x",
+      last4: "keyx",
       created_at: new Date(),
       is_active: false,
     });
@@ -852,10 +856,12 @@ describe("api-keys update — readback never returns a usable secret", () => {
   // Realistic shape: sk_mt_ + 64 chars, the generator's format.
   const RAW_KEY = `sk_mt_${"c".repeat(64)}`;
 
+  // The readback selects `last4`, not a key — there is no key column left to
+  // select (migration 0034).
   const updatedRow = {
     uuid: "k",
     name: "renamed",
-    key: RAW_KEY,
+    last4: RAW_KEY.slice(-4),
     created_at: new Date("2026-07-03T00:00:00Z"),
     is_active: false,
   };
@@ -871,7 +877,7 @@ describe("api-keys update — readback never returns a usable secret", () => {
 
     // The old field is gone entirely, not merely overwritten.
     expect((result as Record<string, unknown>).key).toBeUndefined();
-    expect(result.key_prefix).toBe("sk_mt_cccc…");
+    expect(result.key_prefix).toBe("sk_mt_…cccc");
   });
 
   it("member branch (update) returns a prefix instead of the raw value", async () => {
@@ -884,7 +890,7 @@ describe("api-keys update — readback never returns a usable secret", () => {
     );
 
     expect((result as Record<string, unknown>).key).toBeUndefined();
-    expect(result.key_prefix).toBe("sk_mt_cccc…");
+    expect(result.key_prefix).toBe("sk_mt_…cccc");
   });
 
   it("carries NO full-length sk_mt_ token anywhere in either branch's payload", async () => {
@@ -924,8 +930,9 @@ describe("api-keys update — readback never returns a usable secret", () => {
       created_at: new Date("2026-07-03T00:00:00Z"),
       is_active: false,
     });
-    // A prefix must be a genuine truncation of the original, not a rename.
-    expect(RAW_KEY.startsWith(result.key_prefix.slice(0, -1))).toBe(true);
+    // The visible characters must be a genuine tail of the original, not a
+    // rename.
+    expect(RAW_KEY.endsWith(result.key_prefix.slice(-4))).toBe(true);
     expect(result.key_prefix.length).toBeLessThan(RAW_KEY.length);
   });
 
@@ -937,7 +944,7 @@ describe("api-keys update — readback never returns a usable secret", () => {
       uuid: "44444444-4444-4444-8444-444444444444",
       name: "regressed",
       key: RAW_KEY,
-      key_prefix: "sk_mt_cccc…",
+      key_prefix: "sk_mt_…cccc",
       created_at: new Date(),
       is_active: true,
     });
@@ -1036,7 +1043,7 @@ describe("api-keys — public key isolation from members (BLOCKER fix)", () => {
     repoMock.updateAsAdmin.mockResolvedValue({
       uuid: "public-key",
       name: "shared",
-      key: "sk_mt_x",
+      last4: "keyx",
       created_at: new Date(),
       is_active: false,
     });

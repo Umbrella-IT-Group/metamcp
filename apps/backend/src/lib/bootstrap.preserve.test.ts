@@ -31,6 +31,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../auth", () => ({ auth: { handler: vi.fn() } }));
 vi.mock("../db", () => ({ db: {} }));
 
+import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import {
   planPreservedApiKeyRestores,
   PreservedApiKey,
@@ -40,7 +41,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
   it("re-resolves a scoped key to the endpoint's CURRENT uuid by name (uuid changed across recreate)", () => {
     const scoped: PreservedApiKey = {
       name: "consumer-autotask",
-      key: "sk_mt_scoped",
+      key_hash: hashApiKey("sk_mt_scoped"),
+      last4: apiKeyLast4("sk_mt_scoped"),
       is_active: true,
       // The uuid captured BEFORE the recreate — stale by restore time.
       endpoint_uuid: "old-uuid-cascaded-away",
@@ -60,7 +62,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
     expect(restores).toEqual([
       {
         name: "consumer-autotask",
-        key: "sk_mt_scoped",
+        key_hash: hashApiKey("sk_mt_scoped"),
+        last4: apiKeyLast4("sk_mt_scoped"),
         user_id: "user-1",
         is_active: true,
         endpoint_uuid: "fresh-uuid-after-recreate",
@@ -76,7 +79,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
   it("SKIPS a scoped key whose endpoint no longer exists — never widens it to gateway-wide", () => {
     const orphaned: PreservedApiKey = {
       name: "key-to-deleted-endpoint",
-      key: "sk_mt_orphan",
+      key_hash: hashApiKey("sk_mt_orphan"),
+      last4: apiKeyLast4("sk_mt_orphan"),
       is_active: true,
       endpoint_uuid: "old-uuid",
       endpoint_name: "endpoint-not-in-bootstrap-config",
@@ -107,7 +111,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
   it("SKIPS a scoped key whose endpoint name could not be captured (defensive: join miss)", () => {
     const nameless: PreservedApiKey = {
       name: "scoped-but-nameless",
-      key: "sk_mt_nameless",
+      key_hash: hashApiKey("sk_mt_nameless"),
+      last4: apiKeyLast4("sk_mt_nameless"),
       is_active: true,
       endpoint_uuid: "some-uuid",
       endpoint_name: null,
@@ -130,7 +135,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
   it("preserves NULL (grandfathered/unscoped) scope as NULL — no accidental binding, no skip", () => {
     const unscoped: PreservedApiKey = {
       name: "legacy-global",
-      key: "sk_mt_global",
+      key_hash: hashApiKey("sk_mt_global"),
+      last4: apiKeyLast4("sk_mt_global"),
       is_active: false,
       endpoint_uuid: null,
       endpoint_name: null,
@@ -156,7 +162,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
     const keys: PreservedApiKey[] = [
       {
         name: "survives-rename",
-        key: "k1",
+        key_hash: hashApiKey("k1"),
+        last4: apiKeyLast4("k1"),
         is_active: true,
         endpoint_uuid: "old-a",
         endpoint_name: "ep-a",
@@ -165,7 +172,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
       },
       {
         name: "endpoint-gone",
-        key: "k2",
+        key_hash: hashApiKey("k2"),
+        last4: apiKeyLast4("k2"),
         is_active: true,
         endpoint_uuid: "old-b",
         endpoint_name: "ep-b",
@@ -174,7 +182,8 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
       },
       {
         name: "gateway-wide",
-        key: "k3",
+        key_hash: hashApiKey("k3"),
+        last4: apiKeyLast4("k3"),
         is_active: true,
         endpoint_uuid: null,
         endpoint_name: null,
@@ -206,7 +215,8 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
   it("re-binds an identity-bound key to the acted-as user's CURRENT id by EMAIL (id changed across recreate)", () => {
     const bound: PreservedApiKey = {
       name: "alex-m365",
-      key: "sk_mt_bound",
+      key_hash: hashApiKey("sk_mt_bound"),
+      last4: apiKeyLast4("sk_mt_bound"),
       is_active: true,
       endpoint_uuid: "old-ep-uuid",
       endpoint_name: "m365",
@@ -227,7 +237,8 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
     expect(restores).toEqual([
       {
         name: "alex-m365",
-        key: "sk_mt_bound",
+        key_hash: hashApiKey("sk_mt_bound"),
+        last4: apiKeyLast4("sk_mt_bound"),
         user_id: "new-alex-id",
         is_active: true,
         endpoint_uuid: "fresh-ep-uuid",
@@ -242,7 +253,8 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
   it("SKIPS a bound key whose acted-as email resolves to no current user — never restored unbound", () => {
     const orphanedIdentity: PreservedApiKey = {
       name: "bound-to-departed-user",
-      key: "sk_mt_departed",
+      key_hash: hashApiKey("sk_mt_departed"),
+      last4: apiKeyLast4("sk_mt_departed"),
       is_active: true,
       endpoint_uuid: "old-ep-uuid",
       endpoint_name: "m365",
@@ -275,7 +287,8 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
   it("SKIPS a bound key whose acted-as email could not be captured (defensive: join miss)", () => {
     const emaillessBinding: PreservedApiKey = {
       name: "bound-but-emailless",
-      key: "sk_mt_emailless",
+      key_hash: hashApiKey("sk_mt_emailless"),
+      last4: apiKeyLast4("sk_mt_emailless"),
       is_active: true,
       endpoint_uuid: "old-ep-uuid",
       endpoint_name: "m365",
@@ -299,7 +312,8 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
   it("an unbound key restores with a NULL binding — no accidental identity", () => {
     const unbound: PreservedApiKey = {
       name: "plain-scoped",
-      key: "sk_mt_plain",
+      key_hash: hashApiKey("sk_mt_plain"),
+      last4: apiKeyLast4("sk_mt_plain"),
       is_active: true,
       endpoint_uuid: "old-ep-uuid",
       endpoint_name: "m365",
@@ -319,5 +333,67 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
     expect(skipped).toEqual([]);
     expect(restores).toHaveLength(1);
     expect(restores[0].acts_as_user_id).toBeNull();
+  });
+});
+
+// Migration 0034: preservation now copies the at-rest PAIR, because the
+// gateway no longer holds the key it could otherwise re-derive them from.
+// Carrying the hash back unchanged is exactly what makes a preserved key keep
+// authenticating after the recreate — the same secret still matches the same
+// digest. Losing either half is silent: a missing hash leaves a row nothing
+// can authenticate against, and a missing tail leaves a key nobody can
+// identify in the UI. Neither raises an error at restore time.
+describe("planPreservedApiKeyRestores — the at-rest hash/last4 pair survives intact", () => {
+  const SECRET = `sk_mt_${"h".repeat(64)}`;
+
+  it("carries key_hash AND last4 through unchanged", () => {
+    const preserved: PreservedApiKey = {
+      name: "consumer-key",
+      key_hash: hashApiKey(SECRET),
+      last4: apiKeyLast4(SECRET),
+      is_active: true,
+      endpoint_uuid: "old-ep-uuid",
+      endpoint_name: "ep-a",
+      acts_as_user_id: null,
+      acts_as_email: null,
+    };
+
+    const { restores } = planPreservedApiKeyRestores(
+      [preserved],
+      "new-user-id",
+      new Map([["ep-a", "fresh-ep-uuid"]]),
+      new Map(),
+    );
+
+    expect(restores).toHaveLength(1);
+    // The restored digest is still the digest OF THE ORIGINAL SECRET, so the
+    // key its holder already has keeps working.
+    expect(restores[0].key_hash).toBe(hashApiKey(SECRET));
+    expect(restores[0].last4).toBe("hhhh");
+  });
+
+  it("never re-derives the pair from anything — the plan carries no key value", () => {
+    const preserved: PreservedApiKey = {
+      name: "consumer-key",
+      key_hash: hashApiKey(SECRET),
+      last4: apiKeyLast4(SECRET),
+      is_active: true,
+      endpoint_uuid: null,
+      endpoint_name: null,
+      acts_as_user_id: null,
+      acts_as_email: null,
+    };
+
+    const { restores } = planPreservedApiKeyRestores(
+      [preserved],
+      "new-user-id",
+      new Map(),
+      new Map(),
+    );
+
+    // A plan that contained the secret would mean something upstream had
+    // recovered it, which after migration 0034 is impossible by construction.
+    expect(JSON.stringify(restores)).not.toContain(SECRET);
+    expect((restores[0] as Record<string, unknown>).key).toBeUndefined();
   });
 });

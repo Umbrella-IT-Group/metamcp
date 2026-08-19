@@ -120,6 +120,12 @@ across the management and OAuth surfaces:
   actions and diagnostics require an admin session, not merely an authenticated one.
 - **Secret redaction** in API responses — API-key values, per-server credentials, and OAuth
   tokens are never returned in list/get/update payloads.
+- **API keys hashed at rest** — the database stores a SHA-256 of each key plus its last four
+  characters, never the key itself, so read access to the database (a backup, a replica, a
+  `psql` session) no longer yields working credentials. A key is shown exactly once, in the
+  response that mints it; if it is not copied then it cannot be recovered from anywhere and
+  must be re-minted. Existing keys keep working across the upgrade — the migration hashes what
+  is already stored rather than requiring a re-mint.
 - **Fail-closed registration** — self-registration defaults to disabled and stays disabled
   across restarts; unauthenticated endpoints require an explicit opt-in.
 - **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of

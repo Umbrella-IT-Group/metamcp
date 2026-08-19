@@ -23,28 +23,6 @@ import { emitAdminEvent } from "../lib/audit/admin-event";
 
 const apiKeysRepository = new ApiKeysRepository();
 
-/**
- * Pick an existing active key that is safe to embed as the auto-generated
- * MCP server's bearer token for `endpointUuid`. Since migration 0023 an
- * endpoint-scoped key only authenticates on the endpoint it is bound to, so
- * blindly reusing "any active key" (the pre-0023 behavior) can embed a key
- * scoped to a DIFFERENT endpoint — it then 403s on the MCP server's first
- * call. Reuse order:
- *   1. an active key already scoped to THIS endpoint (ideal), then
- *   2. an active unscoped (gateway-wide / NULL) key (works everywhere).
- * A key scoped elsewhere is never reused; the caller mints a fresh scoped
- * key instead.
- */
-export function pickReusableApiKey<
-  T extends { key: string; is_active: boolean; endpoint_uuid: string | null },
->(userApiKeys: T[], endpointUuid: string): T | undefined {
-  return (
-    userApiKeys.find(
-      (key) => key.is_active && key.endpoint_uuid === endpointUuid,
-    ) ?? userApiKeys.find((key) => key.is_active && key.endpoint_uuid === null)
-  );
-}
-
 export const endpointsImplementations = {
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
@@ -123,33 +101,33 @@ export const endpointsImplementations = {
           const baseUrl = process.env.APP_URL;
           const endpointUrl = `${baseUrl}/metamcp/${input.name}/mcp`;
 
-          // Get or create API key for bearer token only if API key auth is enabled
+          // Get an API key for the bearer token only if API key auth is
+          // enabled. This ALWAYS mints a fresh key rather than reusing one of
+          // the user's existing keys, and that is forced rather than chosen:
+          // since migration 0034 the gateway stores only a hash, so no
+          // existing key's value can be read back to embed here. The mint is
+          // SCOPED to the endpoint being created — an internal convenience
+          // mint must not produce an unscoped (gateway-wide) key silently.
+          //
+          // The key's name carries the endpoint name because api_keys is
+          // UNIQUE on (user_id, name): a fixed literal would collide on the
+          // second endpoint the same user creates this way, and the collision
+          // would surface as an MCP server silently configured with an empty
+          // bearer token rather than as an error. Endpoint names are globally
+          // unique (checked at the top of this handler), so this is unique per
+          // user too, and the key is cascade-deleted with its endpoint, so
+          // recreating an endpoint under the same name does not collide with
+          // its own predecessor.
           let bearerToken = "";
           if (input.enableApiKeyAuth) {
             try {
-              const userApiKeys = await apiKeysRepository.findByUserId(userId);
-              // Only reuse a key that will actually authenticate on THIS
-              // endpoint (scoped to it, or unscoped) — a key scoped elsewhere
-              // would 403 the auto-generated MCP server on first use.
-              const reusableApiKey = pickReusableApiKey(
-                userApiKeys,
-                result.uuid,
-              );
-
-              if (reusableApiKey) {
-                bearerToken = reusableApiKey.key;
-              } else {
-                // No reusable key: mint one SCOPED to the endpoint it is
-                // being created for — an internal convenience mint must not
-                // produce an unscoped (gateway-wide) key silently.
-                const newApiKey = await apiKeysRepository.create({
-                  name: "Auto-generated for MCP Server",
-                  user_id: userId,
-                  endpoint_uuid: result.uuid,
-                  is_active: true,
-                });
-                bearerToken = newApiKey.key;
-              }
+              const newApiKey = await apiKeysRepository.create({
+                name: `Auto-generated for MCP Server (${input.name})`,
+                user_id: userId,
+                endpoint_uuid: result.uuid,
+                is_active: true,
+              });
+              bearerToken = newApiKey.key;
             } catch (apiKeyError) {
               logger.error(
                 "Error getting API key for MCP server:",

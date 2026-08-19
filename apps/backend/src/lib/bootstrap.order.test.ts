@@ -214,6 +214,7 @@ import {
   endpointsTable,
   namespacesTable,
 } from "../db/schema";
+import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
 // NOT mocked, deliberately: this module is half the fix under test, and the
 // entrypoint's use of it is what these tests observe.
@@ -341,7 +342,8 @@ function arrangeRecreateScenario(options?: { apiKeysEnv?: string }) {
   readFixtures.preservedKeyRows = [
     {
       name: "consumer-scoped",
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
       is_active: true,
       user_id: "old-user-id",
       endpoint_uuid: "stale-ep-uuid",
@@ -394,7 +396,8 @@ describe("bootstrap wiring — deferred api-key restore ordering (PR #84 residua
     // the stale preserved uuid.
     expect(apiKeyInserts[0].values).toMatchObject({
       name: "consumer-scoped",
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
     });
@@ -445,7 +448,8 @@ describe("bootstrapApiKeys log truth — pending restore for the same (user_id, 
     expect(apiKeyInserts).toHaveLength(2);
     // Last write wins and it is the restore (the preserved value).
     expect(apiKeyInserts[apiKeyInserts.length - 1].values).toMatchObject({
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
     });
   });
 
@@ -546,7 +550,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     readFixtures.preservedKeyRows = [
       {
         name: "alex-m365",
-        key: "sk_mt_bound_secret",
+        key_hash: hashApiKey("sk_mt_bound_secret"),
+        last4: apiKeyLast4("sk_mt_bound_secret"),
         is_active: true,
         user_id: "old-user-id",
         endpoint_uuid: "stale-ep-uuid",
@@ -566,7 +571,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     // EMAIL — each to its post-recreate value.
     expect(apiKeyInserts[0].values).toMatchObject({
       name: "alex-m365",
-      key: "sk_mt_bound_secret",
+      key_hash: hashApiKey("sk_mt_bound_secret"),
+      last4: apiKeyLast4("sk_mt_bound_secret"),
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
       acts_as_user_id: "new-user-id",
@@ -578,7 +584,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     readFixtures.preservedKeyRows = [
       {
         name: "bound-to-departed",
-        key: "sk_mt_departed_secret",
+        key_hash: hashApiKey("sk_mt_departed_secret"),
+        last4: apiKeyLast4("sk_mt_departed_secret"),
         is_active: true,
         user_id: "old-user-id",
         endpoint_uuid: "stale-ep-uuid",
@@ -615,7 +622,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
     readFixtures.preservedKeyRows = [
       {
         name: "consumer-scoped",
-        key: "sk_mt_preserved_secret",
+        key_hash: hashApiKey("sk_mt_preserved_secret"),
+        last4: apiKeyLast4("sk_mt_preserved_secret"),
         is_active: true,
         user_id: "old-user-id",
         endpoint_uuid: "stale-ep-uuid",
@@ -625,7 +633,8 @@ describe("bootstrap wiring — acts-as identity binding across the recreate (PR 
       },
       {
         name: "foreign-bound-key",
-        key: "sk_mt_foreign_secret",
+        key_hash: hashApiKey("sk_mt_foreign_secret"),
+        last4: apiKeyLast4("sk_mt_foreign_secret"),
         is_active: true,
         user_id: "some-other-user",
         endpoint_uuid: "stale-ep-uuid",
@@ -916,7 +925,8 @@ describe("bootstrap signup exemption — the boot-2+ recreate lockout", () => {
     expect(apiKeyInserts).toHaveLength(1);
     expect(apiKeyInserts[0].values).toMatchObject({
       name: "consumer-scoped",
-      key: "sk_mt_preserved_secret",
+      key_hash: hashApiKey("sk_mt_preserved_secret"),
+      last4: apiKeyLast4("sk_mt_preserved_secret"),
       user_id: "new-user-id",
       endpoint_uuid: "fresh-ep-uuid",
     });

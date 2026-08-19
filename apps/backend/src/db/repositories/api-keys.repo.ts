@@ -3,6 +3,7 @@ import { and, desc, eq, isNull, or } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { customAlphabet } from "nanoid";
 
+import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
 import logger from "@/utils/logger";
 
 import { db } from "../index";
@@ -40,7 +41,12 @@ export class ApiKeysRepository {
       .insert(apiKeysTable)
       .values({
         name: input.name,
-        key: key,
+        // Only the hash and the display tail are persisted (migration 0034);
+        // the plaintext lives in this local variable and is handed back once,
+        // below. There is no second chance to read it — if the caller loses
+        // it, the key must be re-minted.
+        key_hash: hashApiKey(key),
+        last4: apiKeyLast4(key),
         user_id: input.user_id,
         // NULL = unscoped (legacy gateway-wide). The tRPC create path makes
         // NULL an explicit admin choice (all_endpoints: true) — see
@@ -71,27 +77,11 @@ export class ApiKeysRepository {
     };
   }
 
-  async findByUserId(userId: string) {
-    return await db
-      .select({
-        uuid: apiKeysTable.uuid,
-        name: apiKeysTable.name,
-        key: apiKeysTable.key,
-        created_at: apiKeysTable.created_at,
-        is_active: apiKeysTable.is_active,
-        endpoint_uuid: apiKeysTable.endpoint_uuid,
-      })
-      .from(apiKeysTable)
-      .where(eq(apiKeysTable.user_id, userId))
-      .orderBy(desc(apiKeysTable.created_at));
-  }
-
   // Find all API keys (both public and user-owned). Admin-only surface. LEFT
   // JOIN users so the caller gets each key's owner email (NULL for a public /
   // 'everyone' key) without an N+1 lookup, plus last_used_at for the admin
-  // view. The full `key` is selected only so the serializer can derive a
-  // non-reversible prefix — the raw secret is dropped at the serializer
-  // boundary (serializeAdminApiKeyList) and never leaves the admin API.
+  // view. `last4` is the display tail the serializer renders as key_prefix;
+  // no column here can reconstruct a usable credential (migration 0034).
   async findAll() {
     // Second users join, aliased: acts_as_user_id → the acted-as user's
     // email, so the admin view can label an identity-bound key with WHO it
@@ -101,7 +91,7 @@ export class ApiKeysRepository {
       .select({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
-        key: apiKeysTable.key,
+        last4: apiKeysTable.last4,
         created_at: apiKeysTable.created_at,
         last_used_at: apiKeysTable.last_used_at,
         is_active: apiKeysTable.is_active,
@@ -117,30 +107,13 @@ export class ApiKeysRepository {
       .orderBy(desc(apiKeysTable.created_at));
   }
 
-  // Find public API keys (no user ownership)
-  async findPublicApiKeys() {
-    return await db
-      .select({
-        uuid: apiKeysTable.uuid,
-        name: apiKeysTable.name,
-        key: apiKeysTable.key,
-        created_at: apiKeysTable.created_at,
-        is_active: apiKeysTable.is_active,
-        user_id: apiKeysTable.user_id,
-        endpoint_uuid: apiKeysTable.endpoint_uuid,
-      })
-      .from(apiKeysTable)
-      .where(isNull(apiKeysTable.user_id))
-      .orderBy(desc(apiKeysTable.created_at));
-  }
-
   // Find API keys accessible to a specific user (public + user's own keys)
   async findAccessibleToUser(userId: string) {
     return await db
       .select({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
-        key: apiKeysTable.key,
+        last4: apiKeysTable.last4,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
         user_id: apiKeysTable.user_id,
@@ -155,53 +128,6 @@ export class ApiKeysRepository {
         ),
       )
       .orderBy(desc(apiKeysTable.created_at));
-  }
-
-  async findByUuid(uuid: string, userId: string) {
-    const [apiKey] = await db
-      .select({
-        uuid: apiKeysTable.uuid,
-        name: apiKeysTable.name,
-        key: apiKeysTable.key,
-        created_at: apiKeysTable.created_at,
-        is_active: apiKeysTable.is_active,
-        user_id: apiKeysTable.user_id,
-        endpoint_uuid: apiKeysTable.endpoint_uuid,
-      })
-      .from(apiKeysTable)
-      .where(
-        and(eq(apiKeysTable.uuid, uuid), eq(apiKeysTable.user_id, userId)),
-      );
-
-    return apiKey;
-  }
-
-  // Find API key by UUID with access control (user can access their own keys + public keys)
-  async findByUuidWithAccess(uuid: string, userId?: string) {
-    const [apiKey] = await db
-      .select({
-        uuid: apiKeysTable.uuid,
-        name: apiKeysTable.name,
-        key: apiKeysTable.key,
-        created_at: apiKeysTable.created_at,
-        is_active: apiKeysTable.is_active,
-        user_id: apiKeysTable.user_id,
-        endpoint_uuid: apiKeysTable.endpoint_uuid,
-      })
-      .from(apiKeysTable)
-      .where(
-        and(
-          eq(apiKeysTable.uuid, uuid),
-          userId
-            ? or(
-                isNull(apiKeysTable.user_id), // Public API keys
-                eq(apiKeysTable.user_id, userId), // User's own API keys
-              )
-            : isNull(apiKeysTable.user_id), // Only public if no user context
-        ),
-      );
-
-    return apiKey;
   }
 
   async validateApiKey(key: string): Promise<{
@@ -221,7 +147,16 @@ export class ApiKeysRepository {
         last_used_at: apiKeysTable.last_used_at,
       })
       .from(apiKeysTable)
-      .where(eq(apiKeysTable.key, key));
+      // Hash-for-hash comparison (migration 0034): the presented value is
+      // hashed here and matched against the stored digest, because the key
+      // itself is no longer in the table. The presented string is hashed
+      // EXACTLY as it arrived — no trimming, no case folding — so the set of
+      // credentials that authenticate is byte-for-byte the set the old
+      // `WHERE key = $1` accepted. Callers differ on whitespace handling
+      // (the middleware passes the header raw, the OAuth introspection route
+      // trims it) and that asymmetry is theirs to own; normalising it here
+      // would silently change which padded credentials are accepted.
+      .where(eq(apiKeysTable.key_hash, hashApiKey(key)));
 
     if (!apiKey) {
       return { valid: false };
@@ -293,14 +228,14 @@ export class ApiKeysRepository {
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
-        // Read back solely so ApiKeysSerializer.serializeApiKey can derive the
-        // non-reversible key_prefix from it; the raw value stops there and
-        // never reaches the response (UpdateApiKeyResponseSchema has no `key`
-        // field to carry it). Kept here rather than prefixed in SQL so the ONE
-        // masking rule stays in the serializer, where the list surfaces share
-        // it — a second copy in a `.returning()` is exactly the drift that
-        // rule exists to prevent.
-        key: apiKeysTable.key,
+        // Read back solely so ApiKeysSerializer.serializeApiKey can render the
+        // key_prefix from it. Since migration 0034 this is the stored display
+        // tail rather than a slice of the secret, so the readback carries no
+        // credential material at all. Kept here rather than formatted in SQL
+        // so the ONE display rule stays in the serializer, where the list
+        // surfaces share it — a second copy in a `.returning()` is exactly the
+        // drift that rule exists to prevent.
+        last4: apiKeysTable.last4,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
       });
@@ -348,9 +283,9 @@ export class ApiKeysRepository {
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
-        // Prefix source only, same reasoning as update() above — the raw value
-        // is consumed by the serializer and never reaches the response.
-        key: apiKeysTable.key,
+        // Display tail only, same reasoning as update() above — consumed by
+        // the serializer and never a credential in the first place.
+        last4: apiKeysTable.last4,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
       });

@@ -14,6 +14,7 @@ import {
   namespacesTable,
   usersTable,
 } from "../db/schema";
+import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { emitAdminEvent } from "./audit/admin-event";
 import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
 
@@ -48,7 +49,17 @@ import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
  */
 export interface PreservedApiKey {
   name: string;
-  key: string;
+  /**
+   * The key's AT-REST pair (migration 0034), carried together and never
+   * separated. The gateway no longer stores the credential, so preservation
+   * copies the stored hash and display tail verbatim — which is exactly what
+   * makes a preserved key keep authenticating after the recreate: the same
+   * digest goes back in, so the same secret still matches it. Dropping either
+   * half here would leave a row that cannot authenticate (missing hash) or
+   * cannot be identified in the UI (missing tail).
+   */
+  key_hash: string;
+  last4: string;
   is_active: boolean;
   endpoint_uuid: string | null;
   endpoint_name: string | null;
@@ -97,7 +108,8 @@ export function planPreservedApiKeyRestores(
 ): {
   restores: {
     name: string;
-    key: string;
+    key_hash: string;
+    last4: string;
     user_id: string;
     is_active: boolean;
     endpoint_uuid: string | null;
@@ -107,7 +119,8 @@ export function planPreservedApiKeyRestores(
 } {
   const restores: {
     name: string;
-    key: string;
+    key_hash: string;
+    last4: string;
     user_id: string;
     is_active: boolean;
     endpoint_uuid: string | null;
@@ -156,7 +169,8 @@ export function planPreservedApiKeyRestores(
 
     restores.push({
       name: k.name,
-      key: k.key,
+      key_hash: k.key_hash,
+      last4: k.last4,
       user_id: userId,
       is_active: k.is_active,
       endpoint_uuid: resolvedEndpointUuid,
@@ -707,7 +721,9 @@ async function ensureUser(
         const capturedRows = await db
           .select({
             name: apiKeysTable.name,
-            key: apiKeysTable.key,
+            // The at-rest pair, captured together — see PreservedApiKey.
+            key_hash: apiKeysTable.key_hash,
+            last4: apiKeysTable.last4,
             is_active: apiKeysTable.is_active,
             user_id: apiKeysTable.user_id,
             // Load-bearing pair: `endpoint_uuid` marks the key as scoped and
@@ -744,7 +760,8 @@ async function ensureUser(
           if (row.user_id === existing.id) {
             ownedKeys.push({
               name: row.name,
-              key: row.key,
+              key_hash: row.key_hash,
+              last4: row.last4,
               is_active: row.is_active,
               endpoint_uuid: row.endpoint_uuid ?? null,
               endpoint_name: row.endpoint_name ?? null,
@@ -999,7 +1016,12 @@ async function restorePreservedApiKeys(
           .onConflictDoUpdate({
             target: [apiKeysTable.user_id, apiKeysTable.name],
             set: {
-              key: values.key,
+              // The at-rest pair moves together: restoring the hash without
+              // its tail would leave the row unidentifiable in the UI, and
+              // restoring the tail without the hash would leave a key that
+              // authenticates nothing.
+              key_hash: values.key_hash,
+              last4: values.last4,
               is_active: values.is_active,
               // Restore the scope on conflict too, otherwise a pre-existing
               // row could keep a stale (or NULL) scope.
@@ -1143,7 +1165,13 @@ async function bootstrapApiKeys(
         const key = generateApiKey();
         await db.insert(apiKeysTable).values({
           name,
-          key,
+          // Hashed through the SAME shared helper the repository mint and the
+          // authentication lookup use. This insert bypasses
+          // ApiKeysRepository.create(), so a local hash here would be the
+          // classic two-encodings bug: the key prints fine at boot and then
+          // never authenticates.
+          key_hash: hashApiKey(key),
+          last4: apiKeyLast4(key),
           user_id: userId,
           is_active: true,
         });
@@ -1170,8 +1198,11 @@ async function bootstrapApiKeys(
         const ownerInfo = userId
           ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
           : "(public)";
+        // The stored row holds no key to mask (migration 0034) — only the
+        // display tail, rendered the same way the API's key_prefix is so the
+        // boot log and the UI name the same key the same way.
         console.log(
-          `✓ ${isPublic ? "Public" : "Private"} API key "${name}" ${ownerInfo} already exists: ${maskKey(existing.key)}`,
+          `✓ ${isPublic ? "Public" : "Private"} API key "${name}" ${ownerInfo} already exists: sk_mt_…${existing.last4}`,
         );
       }
     } catch (err) {

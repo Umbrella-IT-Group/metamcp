@@ -1,10 +1,16 @@
 export class ApiKeysSerializer {
-  // The one masking rule both list surfaces share, so the two can never
-  // drift apart into "one of them still leaks". 10 chars keeps the `sk_mt_`
-  // scheme tag plus 4 characters — enough for a human to tell two keys
-  // apart in a table, far too little to authenticate with.
-  private static keyPrefix(key: string) {
-    return `${key.slice(0, 10)}…`;
+  // The one display rule every key surface shares, so they can never drift
+  // apart into "one of them still leaks". Since migration 0034 the key is not
+  // stored at all — only its sha256 and its last 4 characters — so the
+  // rendered identifier is built from the scheme tag plus that stored tail:
+  // `sk_mt_…abcd`. Enough for a human holding the key to recognise its row,
+  // and nothing an attacker can extend into a credential. The elision marker
+  // sits in the MIDDLE now rather than at the end, because the visible
+  // characters are the key's tail, not its head — a trailing marker would
+  // read as "the key starts like this", which is no longer true and would
+  // send someone hunting for a prefix that does not exist.
+  private static keyPrefix(last4: string) {
+    return `sk_mt_…${last4}`;
   }
 
   // Update readback (rename / activate / revoke). Emits the same
@@ -23,22 +29,23 @@ export class ApiKeysSerializer {
   static serializeApiKey(dbApiKey: {
     uuid: string;
     name: string;
-    key: string;
+    last4: string;
     created_at: Date;
     is_active: boolean;
   }) {
     return {
       uuid: dbApiKey.uuid,
       name: dbApiKey.name,
-      key_prefix: ApiKeysSerializer.keyPrefix(dbApiKey.key),
+      key_prefix: ApiKeysSerializer.keyPrefix(dbApiKey.last4),
       created_at: dbApiKey.created_at,
       is_active: dbApiKey.is_active,
     };
   }
 
   // Member-facing list (the caller's own keys PLUS every public/'everyone'
-  // key). Drops the full `key` secret for all of them and emits only the
-  // non-reversible prefix, same as the admin view below.
+  // key). Emits only the non-reversible identifier for all of them, same as
+  // the admin view below — and since migration 0034 there is no stored key
+  // value it could emit instead even if this regressed.
   //
   // Security review finding: this used to return `key` raw. Any
   // self-registered member could read every public key — gateway-wide
@@ -55,7 +62,7 @@ export class ApiKeysSerializer {
     dbApiKeys: Array<{
       uuid: string;
       name: string;
-      key: string;
+      last4: string;
       created_at: Date;
       is_active: boolean;
       user_id: string | null;
@@ -66,7 +73,7 @@ export class ApiKeysSerializer {
     return dbApiKeys.map((apiKey) => ({
       uuid: apiKey.uuid,
       name: apiKey.name,
-      key_prefix: ApiKeysSerializer.keyPrefix(apiKey.key),
+      key_prefix: ApiKeysSerializer.keyPrefix(apiKey.last4),
       created_at: apiKey.created_at,
       is_active: apiKey.is_active,
       user_id: apiKey.user_id,
@@ -90,14 +97,14 @@ export class ApiKeysSerializer {
     };
   }
 
-  // Admin cross-user view. Drops the full `key` secret — an admin listing must
-  // never hand back every user's raw key — and emits only a non-reversible
-  // prefix (scheme tag + first few chars) for identification.
+  // Admin cross-user view. An admin listing must never hand back every user's
+  // raw key; since migration 0034 no key value exists to hand back, and this
+  // emits the same scheme-tag + stored-tail identifier as the surfaces above.
   static serializeAdminApiKeyList(
     dbApiKeys: Array<{
       uuid: string;
       name: string;
-      key: string;
+      last4: string;
       created_at: Date;
       last_used_at: Date | null;
       is_active: boolean;
@@ -111,7 +118,7 @@ export class ApiKeysSerializer {
     return dbApiKeys.map((apiKey) => ({
       uuid: apiKey.uuid,
       name: apiKey.name,
-      key_prefix: ApiKeysSerializer.keyPrefix(apiKey.key),
+      key_prefix: ApiKeysSerializer.keyPrefix(apiKey.last4),
       user_id: apiKey.user_id,
       owner_email: apiKey.owner_email,
       endpoint_uuid: apiKey.endpoint_uuid,

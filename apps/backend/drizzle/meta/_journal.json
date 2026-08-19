@@ -232,6 +232,13 @@
       "when": 1787270400000,
       "tag": "0033_endpoint_access_groups",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1787356800000,
+      "tag": "0034_api_key_hash_at_rest",
+      "breakpoints": true
     }
   ]
 }
