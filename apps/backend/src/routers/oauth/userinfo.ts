@@ -1,10 +1,110 @@
 import express from "express";
 
+import {
+  auditRequestContext,
+  credentialFingerprint,
+  emit,
+} from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
 
 const userinfoRouter = express.Router();
+
+/**
+ * Render a row timestamp for `detail`, tolerating a missing or null value.
+ *
+ * Local twin of the helper in ./token.ts, deliberately not shared: hoisting a
+ * one-line formatter into `lib/audit` would put a router detail in the audit
+ * library's API for no gain. `refresh_token_expires_at` is genuinely nullable,
+ * and an emitter that called `.toISOString()` straight would turn one
+ * unexpected null into a 500 on a request that was already being refused.
+ */
+function isoOrNull(value: Date | null | undefined): string | null {
+  return value instanceof Date ? value.toISOString() : null;
+}
+
+/**
+ * Record the destruction of an expired access token, before it is destroyed.
+ *
+ * The branch below DELETES a real, currently-stored token row and answers 401.
+ * Until this emitter existed it wrote nothing anywhere — no audit row, no log
+ * line — so the credential and every trace of when it had been minted vanished
+ * in the same request. This is the same defect, and the same fix, as the
+ * expired-code / expired-refresh / expired-introspect branches in ./token.ts,
+ * whose `emitTokenLifecycle` header carries the full emit/no-emit doctrine.
+ *
+ * IT IS EMITTED FOR THE SAME REASON THEY ARE, which is not severity but replay
+ * amplification: `audit_log` has no prune path, so a branch an anonymous caller
+ * can reach with an invented string must never write to it. This branch cannot
+ * be reached with an invented string — it requires a token this server issued
+ * and still holds — and reaching it deletes that token, so a replay finds
+ * nothing and writes nothing. One row per credential destroyed.
+ *
+ * THE RESIDUAL, STATED HERE BECAUSE THIS ENDPOINT CARRIES THE MOST OF IT: that
+ * is one row per destroy ATTEMPT. Read-then-delete is not atomic and
+ * `deleteAccessToken` returns void rather than a row count, so N concurrent
+ * presentations of the SAME expired token each read the row before the first
+ * delete commits and each write a row. /oauth/userinfo also has NO rate
+ * limiter — ./index.ts mounts it behind CORS, security headers and the body
+ * parsers only, while `rateLimitToken` guards /oauth/token and the failure
+ * limiter plus the RFC 7662 credential gate guard /oauth/introspect — so it is
+ * the branch a burst actually reaches. Kept anyway, because the alternative is
+ * to emit AFTER a delete that reports what it removed, which loses the record
+ * in precisely the failed-delete case this ordering exists for. One burst per
+ * real credential, once, against zero rows before this emitter existed.
+ * ./token.ts's `emitTokenLifecycle` header states the same trade for the other
+ * three branches.
+ *
+ * `oauth.token.userinfo` rather than `oauth.userinfo`: the subject of the event
+ * is the token, and this endpoint is the second half of the same token-metadata
+ * plane as `oauth.token.introspect`. Keeping the prefix keeps one credential's
+ * whole life queryable with `action LIKE 'oauth.token.%'`.
+ *
+ * The token is recorded ONLY as a sha256 + last-4 fingerprint, matching every
+ * other emitter on this plane, so it stays joinable to the `oauth.token.issue`
+ * row that minted it without the append-only table ever holding the credential.
+ */
+function emitExpiredTokenDestroyed(
+  req: express.Request,
+  tokenData: {
+    client_id: string;
+    user_id: string;
+    created_at?: Date | null;
+    expires_at?: Date | null;
+    refresh_token_expires_at?: Date | null;
+  },
+  token: string,
+): void {
+  const audit = auditRequestContext(req);
+  const fingerprint = credentialFingerprint(token);
+  emit({
+    actor_type: "user",
+    actor_id: tokenData.user_id,
+    actor_label: null,
+    actor_ip: audit.actor_ip,
+    actor_user_agent: audit.actor_user_agent,
+    action: "oauth.token.userinfo",
+    target_type: "oauth_client",
+    target_id: tokenData.client_id,
+    outcome: "failure",
+    request_id: audit.request_id,
+    http_status: 401,
+    detail: {
+      token_sha256: fingerprint.sha256,
+      token_last4: fingerprint.last4,
+      reason: "access_token_expired",
+      token_type: "access_token",
+      // The chain's age is the forensic content — it is what the deleted row
+      // was carrying and what nothing else records once the row is gone.
+      created_at: isoOrNull(tokenData.created_at),
+      expires_at: isoOrNull(tokenData.expires_at),
+      // In the row because this delete takes the WHOLE row: a refresh token
+      // that had not itself expired dies with the access token.
+      refresh_token_expires_at: isoOrNull(tokenData.refresh_token_expires_at),
+    },
+  });
+}
 
 /**
  * OAuth 2.0 UserInfo Endpoint
@@ -42,6 +142,12 @@ userinfoRouter.get("/oauth/userinfo", async (req, res) => {
 
     // Check if token has expired
     if (Date.now() > tokenData.expires_at.getTime()) {
+      // Before the delete, and never awaited: `emit` is fire-and-forget by
+      // contract, and ordering it first is what makes the record survive a
+      // delete that throws. The row describes a credential that will not
+      // exist to be looked up afterwards, so writing it second would lose it
+      // in exactly the case an operator is investigating.
+      emitExpiredTokenDestroyed(req, tokenData, token);
       await oauthRepository.deleteAccessToken(token);
       return res.status(401).json({
         error: "invalid_token",
