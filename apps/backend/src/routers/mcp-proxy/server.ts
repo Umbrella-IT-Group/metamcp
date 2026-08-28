@@ -28,11 +28,19 @@ import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
 import { assertPublicMcpUrl, createGuardedFetch } from "./url-guard";
 
-const SSE_HEADERS_PASSTHROUGH = ["authorization"];
+// `x-mcp-actor` is best-effort, client-asserted attribution: it names who an
+// action is on behalf of so backend MCPs (shell-broker, ninja, inventory) can
+// stamp the operator on their audit rows and the shell-broker approval page
+// instead of a generic default. It is NOT an authentication control — the
+// security identity stays the endpoint API-key auth, and for shell-broker the
+// CF-Access-verified approver — so forwarding a caller-set value is safe.
+// Lowercase because Node lowercases incoming header names.
+const SSE_HEADERS_PASSTHROUGH = ["authorization", "x-mcp-actor"];
 const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
   "authorization",
   "mcp-session-id",
   "last-event-id",
+  "x-mcp-actor",
 ];
 
 const defaultEnvironment = {

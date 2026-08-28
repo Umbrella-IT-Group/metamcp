@@ -247,6 +247,8 @@ async function drive(
   query: Record<string, string>,
   /** `null` means the request arrives with NO session user at all. */
   user: { id?: string; role?: string } | null = CALLER,
+  /** Request headers, lowercase-keyed as Express delivers them. */
+  headers: Record<string, string> = {},
 ): Promise<number> {
   const search = new URLSearchParams(query).toString();
   const req = {
@@ -255,7 +257,7 @@ async function drive(
     originalUrl: `/mcp-proxy/server${path}?${search}`,
     baseUrl: "",
     query: Object.fromEntries(new URLSearchParams(search)),
-    headers: {},
+    headers,
     user: user ?? undefined,
   } as unknown as express.Request;
 
@@ -278,11 +280,13 @@ async function drive(
 const getSse = (
   query: Record<string, string>,
   user: { id?: string; role?: string } | null = CALLER,
-) => drive("GET", "/sse", query, user);
+  headers: Record<string, string> = {},
+) => drive("GET", "/sse", query, user, headers);
 const postMcp = (
   query: Record<string, string>,
   user: { id?: string; role?: string } | null = CALLER,
-) => drive("POST", "/mcp", query, user);
+  headers: Record<string, string> = {},
+) => drive("POST", "/mcp", query, user, headers);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -571,5 +575,57 @@ describe("the SSE connect log", () => {
     expect(line).toBeDefined();
     // The escape sequence survives as TEXT rather than as a real break.
     expect(line).not.toMatch(/\n\n/);
+  });
+});
+
+/**
+ * X-MCP-Actor passthrough: best-effort, client-asserted attribution that lets
+ * a backend MCP stamp WHO an action is on behalf of onto its audit rows and the
+ * shell-broker approval page. It is NOT an auth control — that stays the
+ * endpoint API-key — so the only questions here are whether a caller-set value
+ * reaches the backend transport and whether the whitelist stays narrow enough
+ * that nothing else rides along with it.
+ */
+describe("X-MCP-Actor passthrough — best-effort audit attribution", () => {
+  const ACTOR = "operator@umbrellaitgroup.com";
+
+  it("forwards x-mcp-actor to an SSE backend when the caller sets it", async () => {
+    await getSse(
+      { transportType: "SSE", url: "https://mcp.example.com/sse" },
+      CALLER,
+      { "x-mcp-actor": ACTOR },
+    );
+
+    expect(sseHeaders()["x-mcp-actor"]).toBe(ACTOR);
+  });
+
+  it("forwards x-mcp-actor to a STREAMABLE_HTTP backend when the caller sets it", async () => {
+    await postMcp(
+      { transportType: "STREAMABLE_HTTP", url: "https://mcp.example.com/mcp" },
+      CALLER,
+      { "x-mcp-actor": ACTOR },
+    );
+
+    expect(
+      streamableClientConstructions[0].opts.requestInit.headers["x-mcp-actor"],
+    ).toBe(ACTOR);
+  });
+
+  it("omits x-mcp-actor when the caller does not send it", async () => {
+    await getSse({ transportType: "SSE", url: "https://mcp.example.com/sse" });
+
+    expect(sseHeaders()["x-mcp-actor"]).toBeUndefined();
+  });
+
+  it("does NOT forward a header outside the whitelist", async () => {
+    // Guard against over-widening: adding x-mcp-actor must not turn the
+    // passthrough into a general-purpose header conduit.
+    await getSse(
+      { transportType: "SSE", url: "https://mcp.example.com/sse" },
+      CALLER,
+      { "x-not-whitelisted": "must-not-travel" },
+    );
+
+    expect(sseHeaders()["x-not-whitelisted"]).toBeUndefined();
   });
 });
