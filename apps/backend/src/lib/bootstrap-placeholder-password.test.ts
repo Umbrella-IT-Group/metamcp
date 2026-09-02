@@ -209,3 +209,67 @@ describe("example.env ships no usable credential", () => {
     expect(exampleEnv).toContain("# ALLOW_UNAUTHENTICATED_ENDPOINTS=false");
   });
 });
+
+describe("compose files publish host ports on loopback only", () => {
+  // The security fix these two files carry is the 127.0.0.1 prefix on every
+  // published port. Without it a bare "12008:12008" binds every host
+  // interface, so on a box with a public IP the unauthenticated app port and
+  // the raw Postgres port are reachable from the network with only the edge in
+  // front of them. The prefix is a single token, so a rebase or an upstream
+  // cherry-pick can drop it with nothing failing; this pins the loopback
+  // default so a re-widening to 0.0.0.0 fails a test rather than shipping.
+  //
+  // Scope is the two quick-start files the fix locked down. docker-compose.dev
+  // and the devcontainer publish on all interfaces by design (a local dev loop
+  // reached from another host) and are deliberately not asserted here.
+
+  // Collects every short-syntax entry under a `ports:` key. The block runs
+  // from the `ports:` line to the next sibling key, skipping the comment and
+  // blank lines that sit between the key and its entries, so an entry written
+  // under a comment is still checked.
+  const publishedPorts = (compose: string): string[] => {
+    const entries: string[] = [];
+    let inPortsBlock = false;
+    for (const line of compose.split("\n")) {
+      if (/^\s*ports:\s*$/.test(line)) {
+        inPortsBlock = true;
+        continue;
+      }
+      if (!inPortsBlock) continue;
+      if (line.trim() === "" || /^\s*#/.test(line)) continue;
+      const item = /^\s*-\s+(.*)$/.exec(line);
+      if (item) {
+        entries.push(
+          item[1]
+            .replace(/\s+#.*$/, "")
+            .trim()
+            .replace(/^["']|["']$/g, ""),
+        );
+        continue;
+      }
+      // A non-comment, non-list line here is the next key: the block is over.
+      inPortsBlock = false;
+    }
+    return entries;
+  };
+
+  it.each(["docker-compose.yml", "docker-compose.test.yml"])(
+    "%s publishes every host port on 127.0.0.1",
+    (composeFile) => {
+      const compose = readFileSync(
+        path.resolve(
+          path.dirname(fileURLToPath(import.meta.url)),
+          "../../../..",
+          composeFile,
+        ),
+        "utf-8",
+      );
+      const ports = publishedPorts(compose);
+      // Guards the guard: an empty parse would let the loopback assertion pass
+      // vacuously, so prove the scan actually found the port publishes first.
+      expect(ports.length).toBeGreaterThan(0);
+      const wideBinds = ports.filter((p) => !p.startsWith("127.0.0.1:"));
+      expect(wideBinds).toEqual([]);
+    },
+  );
+});
