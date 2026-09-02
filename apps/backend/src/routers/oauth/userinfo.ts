@@ -5,11 +5,41 @@ import {
   credentialFingerprint,
   emit,
 } from "@/lib/audit/audit-emitter";
+import {
+  authRateLimiter,
+  getPublicOAuthRateLimitIdentifier,
+} from "@/lib/auth-rate-limiter";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
 
 const userinfoRouter = express.Router();
+
+/**
+ * Failure-only rate limiting for GET /oauth/userinfo, the same limiter shape
+ * /oauth/introspect and /oauth/revoke carry (see token.ts and
+ * getPublicOAuthRateLimitIdentifier). Failure-only is the requirement: with
+ * `trust proxy` off the bucket is per-edge-IP and a caller presenting a token
+ * this server issued must never score, so only tokens that resolve to nothing —
+ * missing, malformed, unknown, or expired — accumulate. A disabled account's
+ * real token is deliberately NOT counted, matching the introspect handler:
+ * counting it would let one locked-out account's still-running client spend the
+ * shared budget and refuse everyone on the same edge IP.
+ *
+ * `isCurrentlyLimited`, not `isRateLimited`, so the pre-work gate does not
+ * itself count; failures are recorded explicitly on the branches below.
+ */
+function isUserinfoRateLimited(req: express.Request): boolean {
+  return authRateLimiter.isCurrentlyLimited(
+    getPublicOAuthRateLimitIdentifier(req, "userinfo"),
+  );
+}
+
+function recordUserinfoFailure(req: express.Request): void {
+  authRateLimiter.recordFailedAttempt(
+    getPublicOAuthRateLimitIdentifier(req, "userinfo"),
+  );
+}
 
 /**
  * Render a row timestamp for `detail`, tolerating a missing or null value.
@@ -45,16 +75,15 @@ function isoOrNull(value: Date | null | undefined): string | null {
  * is one row per destroy ATTEMPT. Read-then-delete is not atomic and
  * `deleteAccessToken` returns void rather than a row count, so N concurrent
  * presentations of the SAME expired token each read the row before the first
- * delete commits and each write a row. /oauth/userinfo also has NO rate
- * limiter — ./index.ts mounts it behind CORS, security headers and the body
- * parsers only, while `rateLimitToken` guards /oauth/token and the failure
- * limiter plus the RFC 7662 credential gate guard /oauth/introspect — so it is
- * the branch a burst actually reaches. Kept anyway, because the alternative is
- * to emit AFTER a delete that reports what it removed, which loses the record
- * in precisely the failed-delete case this ordering exists for. One burst per
- * real credential, once, against zero rows before this emitter existed.
- * ./token.ts's `emitTokenLifecycle` header states the same trade for the other
- * three branches.
+ * delete commits and each write a row. /oauth/userinfo now carries the same
+ * failure-only limiter as /oauth/introspect and /oauth/revoke (the expired
+ * branch below records a failure), so a burst of the same expired token is
+ * bounded at roughly one window's budget per edge IP rather than unbounded —
+ * where before it had no limiter at all. Emit-first is kept anyway, because the
+ * alternative is to emit AFTER a delete that reports what it removed, which
+ * loses the record in precisely the failed-delete case this ordering exists
+ * for. ./token.ts's `emitTokenLifecycle` header states the same trade for the
+ * other three branches.
  *
  * `oauth.token.userinfo` rather than `oauth.userinfo`: the subject of the event
  * is the token, and this endpoint is the second half of the same token-metadata
@@ -112,9 +141,24 @@ function emitExpiredTokenDestroyed(
  */
 userinfoRouter.get("/oauth/userinfo", async (req, res) => {
   try {
+    // Runs before the token lookup, so an over-budget caller is refused for
+    // free. Only failures below record against the budget, so a caller with a
+    // real token is never throttled.
+    if (isUserinfoRateLimited(req)) {
+      logger.info(
+        "[RATE LIMIT] /oauth/userinfo rate limited after repeated unresolvable tokens",
+      );
+      return res.status(429).json({
+        error: "too_many_requests",
+        error_description:
+          "Too many failed token lookups. Please try again later.",
+      });
+    }
+
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      recordUserinfoFailure(req);
       return res.status(401).json({
         error: "invalid_token",
         error_description: "Missing or invalid authorization header",
@@ -125,6 +169,7 @@ userinfoRouter.get("/oauth/userinfo", async (req, res) => {
 
     // Validate MCP token format
     if (!token.startsWith("mcp_token_")) {
+      recordUserinfoFailure(req);
       return res.status(401).json({
         error: "invalid_token",
         error_description: "Invalid access token format",
@@ -134,6 +179,7 @@ userinfoRouter.get("/oauth/userinfo", async (req, res) => {
     // Look up token data (in production, this should validate signature and lookup in database)
     const tokenData = await oauthRepository.getAccessToken(token);
     if (!tokenData) {
+      recordUserinfoFailure(req);
       return res.status(401).json({
         error: "invalid_token",
         error_description: "Token not found or expired",
@@ -142,6 +188,10 @@ userinfoRouter.get("/oauth/userinfo", async (req, res) => {
 
     // Check if token has expired
     if (Date.now() > tokenData.expires_at.getTime()) {
+      // Counted: an expired token resolves to nothing, and a caller replaying
+      // one indefinitely is the shape being bounded. A real client hits this at
+      // most once, when its own token ages out.
+      recordUserinfoFailure(req);
       // Before the delete, and never awaited: `emit` is fire-and-forget by
       // contract, and ordering it first is what makes the record survive a
       // delete that throws. The row describes a credential that will not

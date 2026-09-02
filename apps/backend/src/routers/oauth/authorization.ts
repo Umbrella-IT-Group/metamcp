@@ -213,12 +213,16 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
       });
     }
 
-    // Validate PKCE method (OAuth 2.1 recommends S256)
-    if (code_challenge_method !== "S256" && code_challenge_method !== "plain") {
+    // Validate PKCE method. S256 only: the AS metadata advertises S256 as the
+    // sole supported method, and "plain" gives no protection against code
+    // interception (the challenge equals the verifier and rides in this query
+    // string), so accepting it here would contradict the metadata and let an
+    // anonymously registered client drive an unprotected flow. Rejected through
+    // the standard invalid_request error path.
+    if (code_challenge_method !== "S256") {
       return res.status(400).json({
         error: "invalid_request",
-        error_description:
-          "Unsupported code_challenge_method. Supported: S256, plain",
+        error_description: "Unsupported code_challenge_method. Supported: S256",
       });
     }
 
@@ -641,6 +645,13 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     clearConsentCookie(req, res, consentRequest.cid);
 
     const redirectUrl = new URL(consentRequest.redirect_uri);
+    // RFC 9207: every authorization response (the code below and the
+    // access_denied redirect) carries `iss`, the issuer identifier, so a client
+    // cannot be tricked into accepting a code minted by a different
+    // authorization server (mix-up defense). Set once here because it applies
+    // to both the grant and the denial that share this redirectUrl, and it is
+    // the same issuer string advertised in AS metadata (see getBaseUrl).
+    redirectUrl.searchParams.set("iss", getBaseUrl(req));
     if (consentRequest.state) {
       redirectUrl.searchParams.set("state", consentRequest.state);
     }

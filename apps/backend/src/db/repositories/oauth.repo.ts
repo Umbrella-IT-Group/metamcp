@@ -177,6 +177,23 @@ export class OAuthRepository {
       .where(eq(oauthAuthorizationCodesTable.code, code));
   }
 
+  // Atomic single-use consumption of an authorization code. DELETE ...
+  // RETURNING in one statement is the single-use gate: `code` is the primary
+  // key, so this matches at most one row, and under two concurrent redemptions
+  // of the same code postgres serializes the deletes — exactly one returns the
+  // row and the other returns none. The caller issues tokens only when this
+  // returned true, so a read-then-delete race can no longer mint two token
+  // pairs for one code. `deleteAuthCode` above stays for the cleanup deletes
+  // (expired codes) where no such gate is needed.
+  async consumeAuthCode(code: string): Promise<boolean> {
+    const deleted = await db
+      .delete(oauthAuthorizationCodesTable)
+      .where(eq(oauthAuthorizationCodesTable.code, code))
+      .returning({ code: oauthAuthorizationCodesTable.code });
+
+    return deleted.length === 1;
+  }
+
   // ===== Access Tokens =====
 
   async getAccessToken(token: string): Promise<OAuthAccessToken | null> {
@@ -191,8 +208,13 @@ export class OAuthRepository {
   async setAccessToken(
     token: string,
     data: OAuthAccessTokenCreateInput & {
-      refresh_token?: string;
-      refresh_token_expires_at?: number;
+      // The refresh token and its expiry travel together as one optional pair,
+      // not as two independent optionals. A token stored with a refresh token
+      // but a NULL expiry escapes every reaper predicate in cleanupExpired and
+      // is treated as valid forever by the refresh grant; bundling
+      // them makes that shape unrepresentable at this write path, and migration
+      // 0035's CHECK enforces the same invariant at the column level.
+      refresh?: { token: string; expires_at: number };
     },
   ): Promise<void> {
     await db.insert(oauthAccessTokensTable).values({
@@ -201,9 +223,9 @@ export class OAuthRepository {
       user_id: data.user_id,
       scope: data.scope,
       expires_at: new Date(data.expires_at),
-      refresh_token: data.refresh_token ?? null,
-      refresh_token_expires_at: data.refresh_token_expires_at
-        ? new Date(data.refresh_token_expires_at)
+      refresh_token: data.refresh?.token ?? null,
+      refresh_token_expires_at: data.refresh
+        ? new Date(data.refresh.expires_at)
         : null,
     });
   }

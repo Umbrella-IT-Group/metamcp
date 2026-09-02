@@ -552,6 +552,54 @@ describe("POST /oauth/authorize/decision — approval mints", () => {
     expect(res.clearedCookies).toHaveLength(1);
     expect(res.clearedCookies[0]?.name).toBe(csrfCookieName(cid));
   });
+
+  it("carries the RFC 9207 iss parameter on the granted redirect", async () => {
+    // The issuer identifier lets the client detect an authorization-server
+    // mix-up. It is the same string advertised as the metadata issuer.
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(redirectUrl(res).searchParams.get("iss")).toBe(APP_URL);
+  });
+
+  it("carries the iss parameter on the access_denied redirect too", async () => {
+    // RFC 9207 covers error responses, not just successful ones.
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "deny", csrfCookie: csrf });
+
+    const redirect = redirectUrl(res);
+    expect(redirect.searchParams.get("error")).toBe("access_denied");
+    expect(redirect.searchParams.get("iss")).toBe(APP_URL);
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /oauth/authorize — PKCE method must be S256", () => {
+  it("rejects code_challenge_method=plain with invalid_request", async () => {
+    // The AS metadata advertises S256 only, and a plain challenge equals the
+    // verifier in the query string, so it gives no interception protection.
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/authorize",
+      query: { ...AUTHORIZE_QUERY, code_challenge_method: "plain" },
+      cookie: SESSION_COOKIE,
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("invalid_request");
+    expect(String(res.body?.error_description)).toContain("S256");
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+
+  it("still accepts S256 (regression guard)", async () => {
+    // A check that refused every method would satisfy the assertion above.
+    const res = await authorize(SESSION_COOKIE);
+
+    expect(res.statusCode).toBe(200);
+    expect(redirectUrl(res).pathname).toBe("/consent");
+  });
 });
 
 describe("POST /oauth/authorize/decision — concurrent authorize flows", () => {

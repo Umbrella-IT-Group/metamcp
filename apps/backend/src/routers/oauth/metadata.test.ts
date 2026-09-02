@@ -190,6 +190,17 @@ describe("discovery IS served where OAuth is in use", () => {
     });
   });
 
+  it("advertises RFC 9207 iss support and S256-only PKCE", async () => {
+    // The authorization response now carries `iss`; the metadata must say so,
+    // and it must keep advertising S256 as the only PKCE method (plain is
+    // rejected at authorize and token).
+    const server = await dispatch(AUTHORIZATION_SERVER);
+    expect(server.body).toMatchObject({
+      authorization_response_iss_parameter_supported: true,
+      code_challenge_methods_supported: ["S256"],
+    });
+  });
+
   it("decodes a percent-encoded endpoint name before looking it up", async () => {
     // `req.path` is not decoded, but `lookupEndpoint` matches the DECODED
     // param — so an endpoint whose name needs escaping must resolve to the

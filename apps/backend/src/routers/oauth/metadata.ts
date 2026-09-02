@@ -261,6 +261,11 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
       // Code challenge methods - PKCE support (OAuth 2.1 compliant)
       code_challenge_methods_supported: ["S256"],
 
+      // RFC 9207: the authorization response carries the `iss` parameter, so a
+      // client can detect an authorization-server mix-up. See the redirect in
+      // authorization.ts, which sets `iss` on every authorization response.
+      authorization_response_iss_parameter_supported: true,
+
       // OAuth 2.1 compliance indicators
       require_pushed_authorization_requests: false,
       require_request_uri_registration: false,

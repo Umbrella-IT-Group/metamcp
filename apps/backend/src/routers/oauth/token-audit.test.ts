@@ -42,6 +42,7 @@ vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 const oauthRepositoryMock = {
   getAuthCode: vi.fn(),
   deleteAuthCode: vi.fn(),
+  consumeAuthCode: vi.fn(),
   getClient: vi.fn(),
   getByRefreshToken: vi.fn(),
   setAccessToken: vi.fn(),
@@ -216,6 +217,8 @@ beforeEach(() => {
   });
   oauthRepositoryMock.setAccessToken.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
+  // Default: the atomic single-use delete removed the row on redemption.
+  oauthRepositoryMock.consumeAuthCode.mockResolvedValue(true);
   oauthRepositoryMock.deleteAccessToken.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
 });

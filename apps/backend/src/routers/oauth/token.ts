@@ -17,6 +17,7 @@ import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
   rateLimitToken,
+  timingSafeEqualSecret,
 } from "./utils";
 
 const tokenRouter = express.Router();
@@ -177,8 +178,14 @@ async function issueTokenPair(clientId: string, userId: string, scope: string) {
     user_id: userId,
     scope,
     expires_at: Date.now() + ACCESS_TOKEN_EXPIRY * 1000,
-    refresh_token: refreshToken,
-    refresh_token_expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    // The refresh token and its expiry travel as one pair, so a token can never
+    // be stored with a refresh token but no expiry — the never-reaped,
+    // never-expiring shape migration 0035's CHECK also forbids at the column
+    // level.
+    refresh: {
+      token: refreshToken,
+      expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    },
   });
 
   return { accessToken, refreshToken };
@@ -326,9 +333,13 @@ async function handleAuthorizationCodeGrant(
     ).toString();
     const [authClientId, authClientSecret] = credentials.split(":");
 
+    // The client_id half is not a secret, so a plain compare is fine; the
+    // secret half is compared in constant time (see timingSafeEqualSecret) so
+    // the token endpoint is not a timing oracle for a confidential client's
+    // secret.
     if (
       authClientId !== client_id ||
-      authClientSecret !== clientData.client_secret
+      !timingSafeEqualSecret(authClientSecret, clientData.client_secret)
     ) {
       return res.status(401).json({
         error: "invalid_client",
@@ -337,7 +348,10 @@ async function handleAuthorizationCodeGrant(
     }
   } else if (clientData.token_endpoint_auth_method === "client_secret_post") {
     const { client_secret } = req.body;
-    if (!client_secret || client_secret !== clientData.client_secret) {
+    if (
+      !client_secret ||
+      !timingSafeEqualSecret(client_secret, clientData.client_secret)
+    ) {
       return res.status(401).json({
         error: "invalid_client",
         error_description: "Invalid client secret",
@@ -362,15 +376,19 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Verify code challenge
+  // Verify code challenge. Only S256 is honored — the "plain" method is
+  // rejected rather than verified. The AS metadata advertises S256 only, and a
+  // "plain" challenge equals the verifier and travels in the /oauth/authorize
+  // query string (logged, left in browser history), so it gives no protection
+  // against code interception. The authorize handler refuses to mint a "plain"
+  // code, so a stored one is not reachable through the normal flow; this branch
+  // is the defense-in-depth twin that refuses it here too.
   const crypto = await import("crypto");
   let challengeFromVerifier: string;
 
   if (codeData.code_challenge_method === "S256") {
     const hash = crypto.createHash("sha256").update(code_verifier).digest();
     challengeFromVerifier = hash.toString("base64url");
-  } else if (codeData.code_challenge_method === "plain") {
-    challengeFromVerifier = code_verifier;
   } else {
     return res.status(400).json({
       error: "invalid_grant",
@@ -405,8 +423,18 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Code is valid, delete it (authorization codes are single-use)
-  await oauthRepository.deleteAuthCode(code);
+  // Code is valid; consume it atomically. Single-use is enforced by the DELETE
+  // itself (consumeAuthCode is DELETE ... RETURNING), not by the earlier read:
+  // on two concurrent redemptions of the same code only one delete removes the
+  // row, so exactly one caller proceeds and the loser is refused invalid_grant
+  // rather than both minting a token pair for the same code.
+  const consumed = await oauthRepository.consumeAuthCode(code);
+  if (!consumed) {
+    return res.status(400).json({
+      error: "invalid_grant",
+      error_description: "Invalid or expired authorization code",
+    });
+  }
 
   // Issue access token + refresh token
   const { accessToken, refreshToken } = await issueTokenPair(
@@ -469,9 +497,14 @@ async function handleRefreshTokenGrant(
     });
   }
 
-  // Check refresh token expiry
+  // Check refresh token expiry. A NULL expiry is treated as expired, NOT as
+  // "valid forever": a row with a refresh token and no expiry is the
+  // never-reaped shape (see migration 0035), and honoring it would
+  // make it an immortal credential. Migration 0035's CHECK makes that shape
+  // unrepresentable going forward; this guard is the defense-in-depth twin that
+  // refuses a legacy row if one ever presents it.
   if (
-    tokenData.refresh_token_expires_at &&
+    !tokenData.refresh_token_expires_at ||
     Date.now() > tokenData.refresh_token_expires_at.getTime()
   ) {
     // Emitted BEFORE the delete, and never awaited — `emit` is fire-and-forget
@@ -666,10 +699,13 @@ function isoOrNull(value: Date | null | undefined): string | null {
  * atomic and neither delete reports whether it removed anything —
  * `deleteAccessToken` and `deleteAuthCode` both return void — so N concurrent
  * presentations of the SAME expired credential each read the row before the
- * first delete commits, and each writes a row. /oauth/token is per-IP limited
- * by `rateLimitToken` and /oauth/introspect sits behind the failure limiter
- * plus the RFC 7662 credential gate; GET /oauth/userinfo carries no limiter at
- * all, so it is the one a burst actually reaches. Emit-first is the half of
+ * first delete commits, and each writes a row. /oauth/token is per-edge-IP
+ * limited by `rateLimitToken`, /oauth/introspect sits behind the failure
+ * limiter plus the RFC 7662 credential gate, and GET /oauth/userinfo now
+ * carries the same failure-only limiter (see userinfo.ts) — but that limiter
+ * counts failures rather than successes, so a burst of the SAME expired token
+ * can still spend a window's worth of destroy-emits before the bucket fills.
+ * Emit-first is the half of
  * that trade being kept ON PURPOSE: the record has to survive a delete that
  * throws, which is the case an operator is investigating, and buying
  * exactly-once instead would mean gating the emit on a delete that returns a

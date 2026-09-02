@@ -646,6 +646,15 @@ export const oauthAccessTokensTable = pgTable(
     index("oauth_access_tokens_user_id_idx").on(table.user_id),
     index("oauth_access_tokens_expires_at_idx").on(table.expires_at),
     index("oauth_access_tokens_refresh_token_idx").on(table.refresh_token),
+    // Migration 0035. A refresh token and its expiry must be present together:
+    // a row with a refresh token but a NULL expiry is never-expiring and
+    // never-reaped (cleanupExpired misses it, the refresh grant treats a NULL
+    // expiry as valid), so the both-or-neither shape is enforced at the column
+    // level and not only in the app write path.
+    check(
+      "oauth_access_tokens_refresh_pairing",
+      sql`(${table.refresh_token} IS NULL) = (${table.refresh_token_expires_at} IS NULL)`,
+    ),
   ],
 );
 

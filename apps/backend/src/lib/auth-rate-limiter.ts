@@ -205,8 +205,8 @@ export function getAuthRateLimitIdentifier(
 }
 
 /**
- * Rate-limit identifier for the UNAUTHENTICATED OAuth token endpoints —
- * /oauth/introspect and /oauth/revoke.
+ * Rate-limit identifier for the UNAUTHENTICATED-in-effect public OAuth token
+ * endpoints — /oauth/introspect, /oauth/revoke and /oauth/userinfo.
  *
  * FAILURE-ONLY, and that is a hard requirement rather than a preference. This
  * fork deliberately does not set express `trust proxy` (see
@@ -229,7 +229,7 @@ export function getAuthRateLimitIdentifier(
  */
 export function getPublicOAuthRateLimitIdentifier(
   req: express.Request,
-  route: "introspect" | "revoke",
+  route: "introspect" | "revoke" | "userinfo",
 ): string {
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   return `oauth-public:${route}:${ip}`;
