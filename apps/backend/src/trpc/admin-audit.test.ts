@@ -472,6 +472,37 @@ describe("apikey.create — an admin mints a credential", () => {
     });
     expect(serialized()).not.toContain(RAW_API_KEY);
   });
+
+  // Reactivating (is_active: true) is the reverse of the kill above and must
+  // NOT be filed under apikey.revoke: reversing containment is a distinct
+  // event, the same rule user.enabled.set follows below. This pins the other
+  // side of the verb branch so a future refactor cannot collapse the two
+  // directions into one action and make a reactivation read as a revocation
+  // in the audit trail. The admin-UI deactivate/reactivate toggle exercises
+  // exactly this update path.
+  it("apikey.update is the verb when a key is reactivated (not revoke)", async () => {
+    apiKeysRepositoryMock.updateAsAdmin.mockResolvedValue({
+      uuid: API_KEY_UUID,
+      name: "grafana-probe",
+      key: RAW_API_KEY,
+      created_at: new Date("2026-08-14T00:00:00.000Z"),
+      is_active: true,
+    });
+
+    await apiKeysRouter().createCaller(adminCtx).update({
+      uuid: API_KEY_UUID,
+      is_active: true,
+    });
+    await flush();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "apikey.update",
+      target_id: API_KEY_UUID,
+      actor_id: "admin-1",
+    });
+    expect(serialized()).not.toContain(RAW_API_KEY);
+  });
 });
 
 // ---------------------------------------------------------------------------
