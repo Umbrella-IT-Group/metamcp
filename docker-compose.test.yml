@@ -8,7 +8,9 @@ services:
     env_file:
       - .env
     ports:
-      - "12008:12008"
+      # Loopback only. A throwaway stack is exactly the one left listening on a
+      # host port and forgotten; see docker-compose.yml for the rationale.
+      - "127.0.0.1:12008:12008"
     environment:
       # Postgres connection details
       #
@@ -59,7 +61,8 @@ services:
       # Required, no fallback — see the note in the app service above.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
     ports:
-      - "${POSTGRES_EXTERNAL_PORT:-9433}:5432"
+      # Loopback only. See the app service above.
+      - "127.0.0.1:${POSTGRES_EXTERNAL_PORT:-9433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
