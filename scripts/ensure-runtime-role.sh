@@ -278,6 +278,33 @@ BEGIN
         END IF;
     END IF;
 
+    -- gateway_events (migration 0031) carries the same trigger set as
+    -- tool_call_audit, so the runtime role's grant matrix on it must match:
+    -- INSERT + SELECT + DELETE held, UPDATE + TRUNCATE refused. Guarded by
+    -- to_regclass so a database that has not run 0031 yet converges rather than
+    -- erroring. The unconditional REVOKE above already re-runs every boot; this
+    -- block is what makes the SCRIPT fail loudly if that end state is ever not
+    -- reached (a hand-run GRANT on a boot where the REVOKE was edited away, a
+    -- REVOKE that silently no-oped), the way the two blocks above do for the
+    -- other audit tables.
+    IF to_regclass('public.gateway_events') IS NOT NULL THEN
+        IF has_table_privilege(v_role, 'public.gateway_events', 'UPDATE')
+            OR has_table_privilege(v_role, 'public.gateway_events', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'runtime role % can still rewrite gateway_events', v_role;
+        END IF;
+        -- DELETE is held on purpose: the in-app retention sweeper prunes the
+        -- aged tail, and migration 0031's age-gated DELETE trigger is what
+        -- bounds that grant to rows past the 30-day window. SELECT and INSERT
+        -- are the history read and the record() append. Asserted positively so
+        -- a REVOKE that reached too far fails the boot rather than silently
+        -- breaking the write path or the sweeper.
+        IF NOT has_table_privilege(v_role, 'public.gateway_events', 'INSERT')
+            OR NOT has_table_privilege(v_role, 'public.gateway_events', 'SELECT')
+            OR NOT has_table_privilege(v_role, 'public.gateway_events', 'DELETE') THEN
+            RAISE EXCEPTION 'runtime role % cannot append to or prune gateway_events', v_role;
+        END IF;
+    END IF;
+
     RAISE NOTICE 'runtime role % converged: NOSUPERUSER, LOGIN, audit_log append-only', v_role;
 END
 $verify$;

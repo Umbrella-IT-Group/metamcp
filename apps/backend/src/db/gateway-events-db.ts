@@ -3,6 +3,7 @@ import { Pool } from "pg";
 
 import logger from "@/utils/logger";
 
+import { resolveRuntimeConnection } from "./runtime-connection";
 import * as schema from "./schema";
 
 /**
@@ -34,8 +35,16 @@ import * as schema from "./schema";
  *
  * `max: 2` rather than 1 for the same reason `./audit-db` gives: a single
  * connection would serialise every write behind the slowest one. Same
- * DATABASE_URL and same TLS material as the other two pools — this is
- * isolation of CONNECTIONS, not of credentials or of the database.
+ * connection string and same TLS material as the other two pools: this is
+ * isolation of CONNECTIONS, not of the database. It becomes isolation of
+ * PRIVILEGE too once the optional NOSUPERUSER role split is configured, which
+ * is what `./runtime-connection` resolves: all three request-path pools then
+ * dial a role that holds INSERT, SELECT and DELETE on `gateway_events` and
+ * cannot UPDATE or TRUNCATE it, so migration 0031's append-only triggers stop
+ * being bypassable by the credential the gateway holds while serving. Before
+ * this it built from the raw DATABASE_URL (the bootstrap superuser), so this
+ * one request-path pool kept a trigger-bypassing credential the other two had
+ * already given up.
  *
  * NOTE the asymmetry inside `gateway-events.repo.ts`: only `record()` uses
  * this pool. `list()`, `listServerNames()` and `pruneOlderThan()` run on the
@@ -62,14 +71,17 @@ import * as schema from "./schema";
  * the two settings.
  */
 
-const { DATABASE_URL, POSTGRES_CA_CERT } = process.env;
+const { POSTGRES_CA_CERT } = process.env;
 
-if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL is not set");
-}
+// Resolved here rather than imported from `./index` for the same reason
+// `./audit-db` resolves its own: this module shares nothing with the main pool
+// it does not have to, and the resolution is a pure function of the
+// environment. `resolveRuntimeConnection` throws the same "DATABASE_URL is not
+// set" this file used to throw directly, so the missing-URL guard moves there.
+export const gatewayEventsRuntimeConnection = resolveRuntimeConnection();
 
 export const gatewayEventsPool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: gatewayEventsRuntimeConnection.connectionString,
   max: 2,
   // Fail fast instead of queueing forever. A write that cannot get a
   // connection within a second under load is better off dropped: the caller is

@@ -180,7 +180,7 @@ Cutover order:
 
 1. Set `METAMCP_RUNTIME_DB_PASSWORD` in `.env` to a strong value.
 2. `docker compose up -d` (a recreate, not a restart — the variable has to reach the entrypoint).
-3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool. The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential` — that means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
+3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool and the gateway-events pool (all three request-path pools are checked). The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential`, which means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
 
 The dev stack (`docker-compose.dev.yml`) runs the same step from its own entrypoint, so it honours the switch too. Both compose files read the same `.env`.
 
