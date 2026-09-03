@@ -91,7 +91,14 @@ class ToolStatusCache {
 const toolStatusCache = new ToolStatusCache();
 
 /**
- * Get tool status from database with caching
+ * Get tool status from database with caching.
+ *
+ * A `null` return means NO mapping row exists, which the callers read as "tool
+ * active by default". A DB error is deliberately NOT caught here: it must stay
+ * distinguishable from that legitimate `null`, so it propagates and each caller
+ * fails CLOSED (operator decision 2026-09-02). Swallowing it to `null` would
+ * silently re-enable a disabled tool the moment the database blips, the
+ * opposite of how the access-group gate behaves.
  */
 async function getToolStatus(
   namespaceUuid: string,
@@ -107,40 +114,32 @@ async function getToolStatus(
     }
   }
 
-  try {
-    // Query database for tool status
-    const [toolMapping] = await db
-      .select({
-        status: namespaceToolMappingsTable.status,
-      })
-      .from(namespaceToolMappingsTable)
-      .innerJoin(
-        toolsTable,
-        eq(toolsTable.uuid, namespaceToolMappingsTable.tool_uuid),
-      )
-      .where(
-        and(
-          eq(namespaceToolMappingsTable.namespace_uuid, namespaceUuid),
-          eq(toolsTable.name, toolName),
-          eq(namespaceToolMappingsTable.mcp_server_uuid, serverUuid),
-        ),
-      );
-
-    const status = toolMapping?.status || null;
-
-    // Cache the result if found and caching is enabled
-    if (status && useCache) {
-      toolStatusCache.set(namespaceUuid, toolName, serverUuid, status);
-    }
-
-    return status;
-  } catch (error) {
-    logger.error(
-      `Error fetching tool status for ${toolName} in namespace ${namespaceUuid}:`,
-      error,
+  // Query database for tool status
+  const [toolMapping] = await db
+    .select({
+      status: namespaceToolMappingsTable.status,
+    })
+    .from(namespaceToolMappingsTable)
+    .innerJoin(
+      toolsTable,
+      eq(toolsTable.uuid, namespaceToolMappingsTable.tool_uuid),
+    )
+    .where(
+      and(
+        eq(namespaceToolMappingsTable.namespace_uuid, namespaceUuid),
+        eq(toolsTable.name, toolName),
+        eq(namespaceToolMappingsTable.mcp_server_uuid, serverUuid),
+      ),
     );
-    return null;
+
+  const status = toolMapping?.status || null;
+
+  // Cache the result if found and caching is enabled
+  if (status && useCache) {
+    toolStatusCache.set(namespaceUuid, toolName, serverUuid, status);
   }
+
+  return status;
 }
 
 // parseToolName is now imported from shared utility
@@ -181,15 +180,18 @@ async function filterActiveTools(
       try {
         const parsed = parseToolName(tool.name);
         if (!parsed) {
-          // If tool name doesn't follow expected format, include it
+          // Not one of our prefixed tools, so tool-status curation does not
+          // apply: include it unchanged.
           activeTools.push(tool);
           return;
         }
 
         const serverUuid = await getServerUuidByName(parsed.serverName);
         if (!serverUuid) {
-          // If server not found, include the tool (fallback behavior)
-          activeTools.push(tool);
+          // FAIL CLOSED (operator decision 2026-09-02): an unresolved server
+          // means we cannot confirm the tool is enabled, so exclude it rather
+          // than serve a possibly-disabled tool. This matches the access-group
+          // gate's fail-closed direction; the two layers used to disagree.
           return;
         }
 
@@ -207,8 +209,9 @@ async function filterActiveTools(
         // If status is "INACTIVE", tool is filtered out
       } catch (error) {
         logger.error(`Error checking tool status for ${tool.name}:`, error);
-        // On error, include the tool (fail-safe behavior)
-        activeTools.push(tool);
+        // FAIL CLOSED (operator decision 2026-09-02): a DB error must not
+        // silently re-enable a disabled tool, so exclude it rather than
+        // include. Was fail-open (include on error).
       }
     }),
   );
@@ -254,8 +257,13 @@ async function isToolAllowed(
       `Error checking if tool ${toolName} is allowed in namespace ${namespaceUuid}:`,
       error,
     );
-    // On error, allow the tool (fail-safe behavior)
-    return { allowed: true };
+    // FAIL CLOSED (operator decision 2026-09-02): deny on error rather than
+    // allow, so a DB blip cannot let a call through to a tool that may be
+    // disabled. Matches the access-group gate; was fail-open (allow on error).
+    return {
+      allowed: false,
+      reason: "tool status could not be verified",
+    };
   }
 }
 
@@ -313,29 +321,31 @@ export function createFilterCallToolMiddleware(
       const parsed = parseToolName(toolName);
       if (parsed) {
         const serverUuid = await getServerUuidByName(parsed.serverName);
-        if (serverUuid) {
-          const { allowed, reason } = await isToolAllowed(
-            toolName,
-            context.namespaceUuid,
-            serverUuid,
-            useCache,
-          );
+        // FAIL CLOSED (operator decision 2026-09-02): a server-name miss (row
+        // absent, or a DB error surfacing as a null from getServerUuidByName)
+        // used to skip this check entirely and let the call through. Deny
+        // instead, so the call side agrees with the list side and the
+        // access-group gate on failure direction.
+        const { allowed, reason } = serverUuid
+          ? await isToolAllowed(
+              toolName,
+              context.namespaceUuid,
+              serverUuid,
+              useCache,
+            )
+          : { allowed: false, reason: "server could not be resolved" };
 
-          if (!allowed) {
-            // Return error response instead of calling the handler
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: customErrorMessage(
-                    toolName,
-                    reason || "Unknown reason",
-                  ),
-                },
-              ],
-              isError: true,
-            };
-          }
+        if (!allowed) {
+          // Return error response instead of calling the handler
+          return {
+            content: [
+              {
+                type: "text",
+                text: customErrorMessage(toolName, reason || "Unknown reason"),
+              },
+            ],
+            isError: true,
+          };
         }
       }
 
