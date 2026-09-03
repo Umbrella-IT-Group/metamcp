@@ -10,21 +10,44 @@ const nextConfig = {
     proxyTimeout: 1000 * 120,
   },
   async headers() {
+    // The value-less security headers, applied to EVERY response, documents
+    // and /_next static assets alike. The Content-Security-Policy is NOT here:
+    // it carries a per-request nonce and is emitted from middleware.ts, because
+    // a static config value cannot hold a nonce and the strict script policy
+    // (no 'unsafe-inline') needs one. See lib/security-headers.ts.
+    //
+    // This replaces the former /consent-only block. Every page, /consent
+    // included, now gets the full nonce'd CSP through middleware plus these
+    // headers. /consent's former Referrer-Policy of no-referrer becomes
+    // strict-origin-when-cross-origin, which still keeps the signed `areq`
+    // query string from leaking cross-origin (only the bare origin is sent),
+    // and the CSP now also bars /consent from loading any cross-origin
+    // subresource that a referrer could leak to.
+    const securityHeaders = [
+      { key: "X-Frame-Options", value: "DENY" },
+      { key: "X-Content-Type-Options", value: "nosniff" },
+      { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+      {
+        key: "Permissions-Policy",
+        value: "camera=(), microphone=(), geolocation=()",
+      },
+    ];
+
+    // HSTS only in production. The edge terminates TLS and owns the HSTS ramp;
+    // this is defense in depth for any direct-to-origin reach. Gated off in
+    // development so `next dev` over http://localhost is not force-upgraded to
+    // https.
+    if (process.env.NODE_ENV === "production") {
+      securityHeaders.push({
+        key: "Strict-Transport-Security",
+        value: "max-age=63072000; includeSubDomains",
+      });
+    }
+
     return [
       {
-        // The OAuth consent screen is the trust anchor of the authorization
-        // flow: it is where a human decides whether a client gets access to
-        // their account. Framing it would allow a clickjacked Approve, and a
-        // referrer leak would hand the signed `areq` token in the query string
-        // to whatever the page links or fetches. The backend's own /oauth/*
-        // routes get these from securityHeaders in the express router; this
-        // page is served by Next.js and had none.
-        source: "/:locale/consent",
-        headers: [
-          { key: "X-Frame-Options", value: "DENY" },
-          { key: "Content-Security-Policy", value: "frame-ancestors 'none'" },
-          { key: "Referrer-Policy", value: "no-referrer" },
-        ],
+        source: "/:path*",
+        headers: securityHeaders,
       },
     ];
   },

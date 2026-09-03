@@ -11,6 +11,11 @@ import { metaMcpServerPool } from "../../../lib/metamcp/metamcp-server-pool";
 import { lookupEndpoint } from "../../../middleware/lookup-endpoint-middleware";
 import { createMiddlewareEnabledHandlers } from "./handlers";
 import { generateOpenApiSchema } from "./schema-generator";
+import {
+  renderSwaggerUiHtml,
+  swaggerUiCsp,
+  swaggerUiNonce,
+} from "./swagger-ui";
 import { executeToolWithMiddleware } from "./tool-execution";
 import { ToolExecutionRequest } from "./types";
 
@@ -24,54 +29,16 @@ openApiRouter.get(
   async (req, res) => {
     const { endpointName } = req as ApiKeyAuthenticatedRequest;
 
-    // Return a simple HTML page with Swagger UI
-    const html = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>${endpointName} API Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui.css" />
-    <style>
-        html {
-            box-sizing: border-box;
-            overflow: -moz-scrollbars-vertical;
-            overflow-y: scroll;
-        }
-        *, *:before, *:after {
-            box-sizing: inherit;
-        }
-        body {
-            margin: 0;
-            background: #fafafa;
-        }
-    </style>
-</head>
-<body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui-bundle.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui-standalone-preset.js"></script>
-    <script>
-        window.onload = function() {
-            const ui = SwaggerUIBundle({
-                url: '/metamcp/${endpointName}/api/openapi.json',
-                dom_id: '#swagger-ui',
-                deepLinking: true,
-                presets: [
-                    SwaggerUIBundle.presets.apis,
-                    SwaggerUIStandalonePreset
-                ],
-                plugins: [
-                    SwaggerUIBundle.plugins.DownloadUrl
-                ],
-                layout: "StandaloneLayout"
-            });
-        }
-    </script>
-</body>
-</html>`;
-
+    // Build the Swagger UI page from the escaping/SRI/CSP-aware builder. The
+    // endpoint name comes from the request URL, so it is escaped there; the one
+    // inline script gets a per-response nonce that the CSP below authorises, and
+    // the CDN assets are integrity-pinned. See ./swagger-ui.
+    const nonce = swaggerUiNonce();
     res.setHeader("Content-Type", "text/html");
-    res.send(html);
+    res.setHeader("Content-Security-Policy", swaggerUiCsp(nonce));
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.send(renderSwaggerUiHtml(endpointName, nonce));
   },
 );
 
