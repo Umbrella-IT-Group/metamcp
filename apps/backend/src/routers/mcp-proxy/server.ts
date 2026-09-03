@@ -17,6 +17,10 @@ import express from "express";
 import { findActualExecutable } from "spawn-rx";
 import { z } from "zod";
 
+import {
+  assertPublicMcpUrl,
+  createGuardedFetch,
+} from "@/lib/metamcp/url-guard";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
@@ -28,7 +32,6 @@ import {
   resolveEnvVariables,
 } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
-import { assertPublicMcpUrl, createGuardedFetch } from "./url-guard";
 
 // `x-mcp-actor` is best-effort, client-asserted attribution: it names who an
 // action is on behalf of so backend MCPs (shell-broker, ninja, inventory) can
@@ -508,7 +511,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     const url = transformDockerUrl(query.url as string);
 
     // The destination is caller-supplied, so it is checked BEFORE anything is
-    // opened and before the database is asked about it — see ./url-guard. The
+    // opened and before the database is asked about it (see the url-guard module). The
     // check is by address range rather than by "is this row registered",
     // because pointing the Inspector at a not-yet-saved public server is a
     // flow that has to keep working.
@@ -590,7 +593,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
   } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
     const url = transformDockerUrl(query.url as string);
 
-    // Same destination check as the SSE branch above — see ./url-guard.
+    // Same destination check as the SSE branch above (see the url-guard module).
     const target = await assertPublicMcpUrl(url);
 
     // Same caller-scoped row lookup and same in-memory error-state read as the
