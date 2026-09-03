@@ -235,14 +235,38 @@ export const AUTH_SIGNIN_RATE_LIMIT_ENABLED = !signinRateLimitDisabled(
 );
 
 /**
- * The `/api/auth` paths that carry a password and where the HTTP status is the
- * credential verdict. A Set rather than a single constant because better-auth
+ * `/api/auth/sign-up/email` carries a password too, and it is bounded here for
+ * the same reason sign-in is. With self-registration disabled (this fork stores
+ * `DISABLE_SIGNUP=true`) every POST to it is refused inside the better-auth
+ * create hook, which writes a durable `audit_log` row via `emitSignupDenied`
+ * (auth.ts, lib/audit/auth-hook-audit) — and migration 0028 makes `audit_log`
+ * append-only with no prune path, so an unbounded sign-up POST is the same
+ * INSERT amplifier ledger #126 closed for sign-in but left open here. It is
+ * spelled out rather than imported from `lib/audit/auth-relay-audit` because
+ * that module matches only the paths the relay itself audits; sign-up denial is
+ * audited from the create hook, not the relay, so there is no relay answer to
+ * stay in lockstep with here.
+ */
+const SIGN_UP_EMAIL_PATH = "/api/auth/sign-up/email";
+
+/**
+ * The `/api/auth` paths that carry a password and where this limiter must bound
+ * the attempt rate. A Set rather than a single constant because better-auth
  * gains credential sub-paths over time (`sign-in/username` is one), and the
  * question "does this request try a password?" should have one answer here
  * rather than a growing chain of comparisons at the call site.
+ *
+ * `SIGN_IN_EMAIL_PATH` is the path where the HTTP status IS the credential
+ * verdict; `SIGN_UP_EMAIL_PATH` is the account-creation twin above. Both share
+ * one per-caller budget: a legitimate user drives one or the other, not both in
+ * a burst, and sign-up is disabled anyway, so the shared bucket only ever costs
+ * a determined caller and never a real one. The 429 copy stays sign-in framed
+ * because that is the dominant human-facing path; a rate-limited sign-up is a
+ * request that would have been refused regardless.
  */
 export const CREDENTIAL_SIGN_IN_PATHS: ReadonlySet<string> = new Set([
   SIGN_IN_EMAIL_PATH,
+  SIGN_UP_EMAIL_PATH,
 ]);
 
 /**
