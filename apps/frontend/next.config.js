@@ -1,6 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
+  // Drop the `X-Powered-By: Next.js` banner: it names the framework on
+  // every response for free reconnaissance and buys nothing. The backend's
+  // equivalent (`X-Powered-By: Express`) is turned off with
+  // `app.disable("x-powered-by")` in apps/backend/src/index.ts.
+  poweredByHeader: false,
   experimental: {
     proxyTimeout: 1000 * 120,
   },

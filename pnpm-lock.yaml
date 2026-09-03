@@ -80,6 +80,9 @@ importers:
       dotenv:
         specifier: ^16.5.0
         version: 16.5.0
+      drizzle-kit:
+        specifier: ^0.31.4
+        version: 0.31.10
       drizzle-orm:
         specifier: ^0.45.2
         version: 0.45.2(@types/pg@8.15.4)(kysely@0.29.3)(pg@8.16.0)
@@ -141,9 +144,6 @@ importers:
       dotenv-cli:
         specifier: ^8.0.0
         version: 8.0.0
-      drizzle-kit:
-        specifier: ^0.31.4
-        version: 0.31.10
       eslint:
         specifier: ^9.28.0
         version: 9.28.0(jiti@2.4.2)

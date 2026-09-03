@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
+import { toSafeInternalPath } from "@/lib/safe-redirect";
 import { vanillaTrpcClient } from "@/lib/trpc";
 
 function LoginForm() {
@@ -27,7 +28,10 @@ function LoginForm() {
 
   const router = useRouter();
   const searchParams = useSearchParams();
-  const callbackUrl = searchParams.get("callbackUrl") || "/";
+  // Sanitize once at the source: callbackUrl is attacker-controlled and flows
+  // into both router.push and better-auth's callbackURL below. Reduced to a
+  // safe same-origin path so neither leg can redirect off-site.
+  const callbackUrl = toSafeInternalPath(searchParams.get("callbackUrl"));
 
   // Check if signup is disabled
   useEffect(() => {

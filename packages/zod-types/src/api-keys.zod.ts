@@ -23,18 +23,6 @@ const actsAsShape = {
   acts_as_user_id: z.string().min(1).optional(),
 };
 
-// Base API Key schemas
-export const ApiKeySchema = z.object({
-  uuid: z.string().uuid(),
-  name: z.string(),
-  key: z.string(),
-  user_id: z.string().nullable(),
-  endpoint_uuid: z.string().uuid().nullable(),
-  acts_as_user_id: z.string().nullable(),
-  created_at: z.date(),
-  is_active: z.boolean(),
-});
-
 export const CreateApiKeyFormSchema = z
   .object({
     name: z
@@ -288,7 +276,6 @@ export const ApiKeyUpdateInputSchema = z.object({
 });
 
 // Type exports
-export type ApiKey = z.infer<typeof ApiKeySchema>;
 export type CreateApiKeyForm = z.infer<typeof CreateApiKeyFormSchema>;
 export type CreateApiKeyRequest = z.infer<typeof CreateApiKeyRequestSchema>;
 export type CreateApiKeyResponse = z.infer<typeof CreateApiKeyResponseSchema>;

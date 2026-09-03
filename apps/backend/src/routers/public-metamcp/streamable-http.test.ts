@@ -131,6 +131,12 @@ vi.mock("../../lib/metamcp/transport-recovery-hydration", () => ({
 import { mcpSessionsRepository } from "@/db/repositories/mcp-sessions.repo";
 import type { ApiKeyAuthenticatedRequest } from "@/middleware/api-key-oauth.middleware";
 import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
+// The REAL terminal handler, mounted after the router below exactly as index.ts
+// wires it, so the route's `next(error)` is answered the way production answers.
+import {
+  errorHandler,
+  INTERNAL_ERROR_BODY,
+} from "@/middleware/error-handler.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 
@@ -1922,5 +1928,99 @@ describe("POST/GET /:endpoint/mcp — a refused session reuse answers 404, not 4
     expect(mcpSessionsRepository.findById).not.toHaveBeenCalled();
 
     await cleanupSession(sessionId);
+  });
+});
+
+/**
+ * Response hygiene: a route-level 500 must answer the constant body the
+ * terminal error handler produces, never a serialized raw error (message, and
+ * on the POST branches the session id and endpoint name). The POST route now
+ * defers to `next(error)`; this drives the real router + terminal handler and
+ * forces a throw before any header is written.
+ */
+describe("POST /:endpoint/mcp -- a forced 500 answers the constant body, not the raw error", () => {
+  let server: Server;
+  let baseUrl = "";
+
+  beforeAll(async () => {
+    vi.mocked(lookupEndpoint).mockImplementation(((
+      req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => {
+      Object.assign(req, {
+        namespaceUuid: "ns-500",
+        endpointName: "ep-500-secret-name",
+        endpoint: { uuid: "ep-500-uuid", name: "ep-500-secret-name" },
+        authMethod: "api_key",
+        apiKeyUuid: "key-500",
+      });
+      next();
+    }) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+    vi.mocked(rateLimitMiddleware).mockImplementation(((
+      _req: express.Request,
+      _res: express.Response,
+      next: () => void,
+    ) => next()) as never);
+
+    const app = express();
+    app.use("/metamcp", streamableHttpRouter);
+    app.use(errorHandler);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (typeof address === "object" && address) {
+      baseUrl = `http://127.0.0.1:${address.port}`;
+    }
+  });
+
+  afterAll(async () => {
+    vi.mocked(lookupEndpoint).mockImplementation((() => undefined) as never);
+    vi.mocked(authenticateApiKey).mockImplementation(
+      (() => undefined) as never,
+    );
+    vi.mocked(rateLimitMiddleware).mockImplementation(
+      (() => undefined) as never,
+    );
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("returns the constant internal-error body with no error text, session id or endpoint name", async () => {
+    // New-session POST (no Mcp-Session-Id): pool acquisition returns nothing,
+    // so the route throws before writing a header and the terminal handler
+    // answers the constant body.
+    (
+      metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(undefined);
+
+    const response = await fetch(`${baseUrl}/metamcp/ep-500-secret-name/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {},
+      }),
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(body)).toEqual(INTERNAL_ERROR_BODY);
+    // None of the detail the old branches serialized to the caller leaks.
+    expect(body).not.toContain("ep-500-secret-name");
+    expect(body).not.toContain("Failed to get MetaMCP server instance");
+    // The old envelope's literal keys are gone too.
+    expect(body).not.toContain("Internal server error");
+    expect(body).not.toContain("timestamp");
   });
 });

@@ -689,8 +689,15 @@ export class MetaMcpServerPool {
 
       // Clean up expired sessions
       if (expiredSessionIds.length > 0) {
+        // Count at info, ids at debug only: a live session-id list in a
+        // request-path log undoes the fork's session-id log hygiene. Dormant
+        // in prod (sessionLifetime is null there), but this timer fires the
+        // moment an operator sets a finite lifetime.
         logger.info(
-          `Cleaning up ${expiredSessionIds.length} expired MetaMCP server pool sessions: ${expiredSessionIds.join(", ")}`,
+          `Cleaning up ${expiredSessionIds.length} expired MetaMCP server pool sessions`,
+        );
+        logger.debug(
+          `Expired MetaMCP server pool session ids: ${expiredSessionIds.join(", ")}`,
         );
 
         await Promise.allSettled(

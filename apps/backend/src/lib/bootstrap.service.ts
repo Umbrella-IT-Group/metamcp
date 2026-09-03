@@ -17,6 +17,11 @@ import {
 import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { emitAdminEvent } from "./audit/admin-event";
 import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
+import {
+  SHIPPED_PLACEHOLDER_AUTH_SECRET,
+  SHIPPED_PLACEHOLDER_PASSWORDS,
+  shouldRefuseBootstrapPasswordInProduction,
+} from "./shipped-placeholders";
 
 /**
  * Environment-based bootstrap for MetaMCP.
@@ -1572,39 +1577,15 @@ async function bootstrapEndpoints(
 }
 
 /**
- * Passwords that `example.env` has, at some point, shipped for the BOOTSTRAP
- * ADMINISTRATOR account.
- *
- * `changeme` was the shipped default for the whole life of the file, so it is
- * the first password anyone who has read this repository would try against a
- * MetaMCP deployment, and a deployment that copied `example.env` and edited
- * only the lines it noticed would still be running it. The replacement
- * placeholder is listed for exactly the same reason: it is public, so it is
- * guessable, and the point of a placeholder is that it must never survive to
- * a running install.
- *
- * WARN rather than refuse, deliberately. This account is created at boot, so a
- * hard failure would brick a deliberate throwaway local dev stack, and the
- * common case here is a first-run operator who needs to be TOLD, not stopped.
- * The warning is written to be impossible to skim past.
- */
-const SHIPPED_PLACEHOLDER_PASSWORDS = new Set([
-  "changeme",
-  "REPLACE_ME__generate_a_strong_password",
-]);
-
-/**
- * Deliberately its own constant rather than a member of the set above: this
- * value is a signing key, and `example.env` gives it a distinct placeholder so
- * one find-and-replace cannot set the database password and the session
- * signing key to the same string.
- */
-const SHIPPED_PLACEHOLDER_AUTH_SECRET = "REPLACE_ME__generate_a_signing_key";
-
-/**
  * Warn, loudly, if a bootstrap account is being created with a password this
  * repository publishes. Returns whether it warned, so a test can assert the
  * warning rather than the predicate behind it.
+ *
+ * The placeholder set and signing-key constant live in `./shipped-placeholders`
+ * so `auth.ts` can share them without an import cycle (that module imports this
+ * one). This is the dev-facing half: outside production a placeholder is a loud
+ * warning so a throwaway local stack still boots; production refuses instead
+ * (see `validateConfig` and `auth.ts`).
  *
  * Exported for that test only; `validateConfig` below is the sole production
  * caller and covers every configured user, so `BOOTSTRAP_USERS` entries are
@@ -1700,6 +1681,29 @@ function validateConfig(config: EnvConfig): void {
 
   // Validate users
   for (const user of config.users) {
+    // Production hard guard: this account is created as an
+    // administrator, so a placeholder or sub-8-character password in production
+    // would stand up an admin whose credential is published in the repository
+    // or trivially guessable. Refuse it rather than warn. Outside production
+    // the warn-only path below still runs, so a throwaway local stack boots.
+    // A throw here aborts the bootstrap pass, so the insecure account is never
+    // created; whether the process then exits is governed by BOOTSTRAP_FAIL_HARD
+    // (see lib/startup). The signing-key twin of this guard is fatal
+    // unconditionally at module load in auth.ts, because a placeholder there is
+    // a running-gateway total-bypass rather than a bootstrap-config problem.
+    if (
+      shouldRefuseBootstrapPasswordInProduction(
+        user.password,
+        process.env.NODE_ENV,
+      )
+    ) {
+      throw new Error(
+        `Refusing to create bootstrap user ${user.email ?? "(no email)"} in ` +
+          `production: the password is a placeholder published in example.env ` +
+          `or is fewer than 8 characters. Set a real BOOTSTRAP_USER_PASSWORD ` +
+          `(or the password in BOOTSTRAP_USERS) and restart.`,
+      );
+    }
     if (!user.email || user.email.trim() === "") {
       console.warn("⚠️ User configuration is missing 'email' field");
     }

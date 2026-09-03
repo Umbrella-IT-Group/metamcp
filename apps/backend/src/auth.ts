@@ -17,11 +17,34 @@ import {
 } from "./lib/audit/auth-hook-audit";
 import { isBootstrapSignupAllowed } from "./lib/bootstrap-signup-override";
 import { configService } from "./lib/config.service";
+import { shouldRefuseAuthSecretInProduction } from "./lib/shipped-placeholders";
 import logger from "./utils/logger";
 
 // Provide default values for development
 if (!process.env.BETTER_AUTH_SECRET) {
   throw new Error("BETTER_AUTH_SECRET environment variable is required");
+}
+// Refuse to boot in production on the signing key example.env ships.
+// This runs at module load, before app.listen and before any request can
+// arrive, and it is a hard throw rather than a warning because a gateway
+// signing sessions with the published key lets anyone who read the repository
+// mint a valid cookie for any account, admin included: authentication is
+// bypassed wholesale, not merely weakened. It stays fatal regardless of
+// BOOTSTRAP_FAIL_HARD (unlike the bootstrap-password guard in
+// lib/bootstrap.service, whose failure only skips creating one account). Kept
+// as a predicate in lib/shipped-placeholders so both guards read the published
+// value from one place and the decision is testable without booting this graph.
+if (
+  shouldRefuseAuthSecretInProduction(
+    process.env.BETTER_AUTH_SECRET,
+    process.env.NODE_ENV,
+  )
+) {
+  throw new Error(
+    "Refusing to boot: BETTER_AUTH_SECRET is the placeholder published in " +
+      "example.env and NODE_ENV=production. Generate one with " +
+      "`openssl rand -hex 32`, set BETTER_AUTH_SECRET and restart.",
+  );
 }
 if (!process.env.APP_URL) {
   throw new Error("APP_URL environment variable is required");
@@ -153,6 +176,15 @@ export const auth = betterAuth({
     requireEmailVerification: false, // Set to true if you want email verification
   },
   account: {
+    // Encrypt the provider tokens (access, refresh, id) better-auth stores in
+    // the `accounts` table for Entra SSO users. Without this they are written
+    // in plaintext at rest; with it better-auth applies symmetric
+    // encryption keyed on BETTER_AUTH_SECRET. Existing rows stay plaintext
+    // until the user re-authenticates and the row is rewritten. The scopes
+    // requested here are minimal (openid email profile, no offline_access), so
+    // a refresh token is generally not issued and the stored access token is
+    // short-lived and low-scope, but encrypting at rest is the correct default.
+    encryptOAuthTokens: true,
     accountLinking: {
       enabled: true,
       // Allow linking accounts with the same email address
@@ -205,8 +237,19 @@ export const auth = betterAuth({
     },
   },
   advanced: {
+    // Host-only session cookie. With crossSubDomainCookies enabled,
+    // better-auth 1.6.23 sets the cookie Domain to the APP_URL hostname, so the
+    // authenticated session cookie is sent to that host AND every subdomain of
+    // it. The frontend proxies the backend on localhost within one container
+    // (apps/frontend/next.config.js rewrites all of /api/auth, /trpc and
+    // /oauth to http://localhost:12009), so both planes are served from the
+    // single gateway host and nothing needs the cookie shared across
+    // subdomains. Disabled means better-auth omits the Domain attribute and the
+    // cookie stays host-only, so a future host published beneath the gateway
+    // name cannot receive the session. Pin an explicit narrow `domain` here
+    // only if a subdomain ever genuinely needs the session.
     crossSubDomainCookies: {
-      enabled: true,
+      enabled: false,
     },
   },
   logger: {

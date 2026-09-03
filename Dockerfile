@@ -104,11 +104,19 @@ COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 # package.json ranges (which can silently drift from the committed lockfile).
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-lock.yaml ./
 
-# Install production dependencies only
-RUN pnpm install --prod --frozen-lockfile
-
-# Install drizzle-kit locally in backend for migrations
-RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
+# Install production dependencies only. drizzle-kit is a prod dependency of
+# apps/backend (the entrypoint runs `drizzle-kit migrate` at start), so the
+# frozen install provides it from the lockfile-resolved graph. It used to be
+# fetched here with an ad-hoc `pnpm add` outside the lockfile, which pulled an
+# unpinned, ungoverned dependency tree into the production image on every build.
+#
+# CI=1 so pnpm runs non-interactively: the copied node_modules was built with
+# dev dependencies, so switching to --prod makes pnpm purge and reinstall the
+# modules tree, and without CI that confirmation prompt stalls in the non-TTY
+# build and leaves the per-workspace node_modules (and drizzle-kit's bin)
+# unlinked. The old ad-hoc `pnpm add` masked this by triggering its own full
+# reconcile; with that gone, the prod install has to complete on its own.
+RUN CI=1 pnpm install --prod --frozen-lockfile
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./

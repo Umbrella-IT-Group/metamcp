@@ -13,7 +13,13 @@ services:
     env_file:
       - .env
     ports:
-      - "12008:12008"
+      # Publish on loopback only. A bare "12008:12008" binds every host
+      # interface, so on a box with a public IP the unauthenticated app port is
+      # reachable from the network with only the edge in front of it. Reach it
+      # from another host through a reverse proxy or an SSH tunnel, not a
+      # wide-open host bind. The platform overlay that runs the real deployment
+      # already binds loopback; this default matches it.
+      - "127.0.0.1:12008:12008"
     environment:
       # Postgres connection details
       #
@@ -267,7 +273,9 @@ services:
       # Required, no fallback — see the note in the app service above.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see example.env)}
     ports:
-      - "${POSTGRES_EXTERNAL_PORT:-9433}:5432"
+      # Loopback only. A raw Postgres port must never bind all interfaces; see
+      # the app service above for the rationale.
+      - "127.0.0.1:${POSTGRES_EXTERNAL_PORT:-9433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
