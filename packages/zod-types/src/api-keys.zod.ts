@@ -23,6 +23,18 @@ const actsAsShape = {
   acts_as_user_id: z.string().min(1).optional(),
 };
 
+// Plane flag (migration 0038): true mints a CONTROL-plane (admin-plane / CI)
+// key that authenticates on /trpc as its owner, false/absent a DATA-plane key.
+// Admin-only, creation-only, and MUTUALLY EXCLUSIVE with every data-plane input
+// (endpoint scope + acts-as), a control-plane key has no endpoint to reach and
+// carries no delegated identity. The superRefines below reject that combination
+// and relax the mandatory-scope rule for admin-plane keys (they have no endpoint
+// to name); the admin-only and owner-must-be-admin policy lives in the impl,
+// the only layer that sees the caller's and the owner's role.
+const adminPlaneShape = {
+  admin_plane: z.boolean().optional(),
+};
+
 export const CreateApiKeyFormSchema = z
   .object({
     name: z
@@ -36,8 +48,32 @@ export const CreateApiKeyFormSchema = z
     user_id: z.string().nullable().optional(),
     ...scopeShape,
     ...actsAsShape,
+    ...adminPlaneShape,
   })
   .superRefine((val, ctx) => {
+    // Admin-plane (control-plane / CI) key: a separate population with NO
+    // data-plane scope. It authenticates a user on /trpc, never reaches an
+    // endpoint, and carries no acts-as identity, so the three data-plane inputs
+    // must be absent and the mandatory-scope rule below is skipped for it (it
+    // has no endpoint to name). Admin-only and owner-must-be-admin are enforced
+    // in the impl, the only layer that sees the caller's and owner's role.
+    if (val.admin_plane === true) {
+      if (val.endpoint_uuid !== undefined || val.all_endpoints !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noScope",
+        });
+      }
+      if (val.acts_as_user_id !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noActsAs",
+        });
+      }
+      return;
+    }
     if (val.endpoint_uuid && val.all_endpoints === true) {
       ctx.addIssue({
         code: "custom",
@@ -95,8 +131,32 @@ export const CreateApiKeyRequestSchema = z
     user_id: z.string().nullable().optional(),
     ...scopeShape,
     ...actsAsShape,
+    ...adminPlaneShape,
   })
   .superRefine((val, ctx) => {
+    // Admin-plane (control-plane / CI) key: a separate population with NO
+    // data-plane scope. It authenticates a user on /trpc, never reaches an
+    // endpoint, and carries no acts-as identity, so the three data-plane inputs
+    // must be absent and the mandatory-scope rule below is skipped for it (it
+    // has no endpoint to name). Admin-only and owner-must-be-admin are enforced
+    // in the impl, the only layer that sees the caller's and owner's role.
+    if (val.admin_plane === true) {
+      if (val.endpoint_uuid !== undefined || val.all_endpoints !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noScope",
+        });
+      }
+      if (val.acts_as_user_id !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["admin_plane"],
+          message: "validation:apiKeyAdminPlane.noActsAs",
+        });
+      }
+      return;
+    }
     if (val.endpoint_uuid && val.all_endpoints === true) {
       ctx.addIssue({
         code: "custom",
@@ -231,6 +291,10 @@ export const AdminApiKeyItemSchema = z.object({
   // so the admin view labels identity-bound keys loudly.
   acts_as_user_id: z.string().nullable(),
   acts_as_email: z.string().nullable(),
+  // Plane flag (migration 0038): true labels a control-plane (admin-plane / CI)
+  // key loudly in the admin view, the way acts-as is labelled. A boolean, not
+  // credential material, so it is safe in a list.
+  admin_plane: z.boolean(),
   created_at: z.date(),
   last_used_at: z.date().nullable(),
   is_active: z.boolean(),
@@ -267,6 +331,11 @@ export const ApiKeyCreateInputSchema = z.object({
   // tRPC create path enforces admin-only + requires-endpoint-scope; at the
   // repository layer the column is just nullable.
   acts_as_user_id: z.string().nullable().optional(),
+  // Plane flag (migration 0038). Optional (not defaulted) so it stays absent
+  // from the inferred input type and existing data-plane callers need not pass
+  // it; the repository persists `admin_plane ?? false`. The tRPC create path
+  // owns the admin-only + owner-must-be-admin + plane-exclusivity policy.
+  admin_plane: z.boolean().optional(),
   is_active: z.boolean().optional().default(true),
 });
 

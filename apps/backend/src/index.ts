@@ -2,6 +2,7 @@ import express from "express";
 import helmet from "helmet";
 
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
+import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
 import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
@@ -183,6 +184,11 @@ async function start(): Promise<void> {
   // near the other boot warnings so the gateway's posture is legible from the
   // boot log rather than something to prove by hand.
   warnIfGatewayBackendSecretUnset();
+
+  // One boot-time signal when the admin-plane (control-plane) bearer path has
+  // been switched off with ADMIN_PLANE_TOKEN_AUTH_DISABLED=true (migration
+  // 0038), so an emergency disable is legible in the boot log.
+  warnIfAdminPlaneTokenAuthDisabled();
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);

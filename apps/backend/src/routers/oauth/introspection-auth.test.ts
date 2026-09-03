@@ -210,6 +210,28 @@ describe("POST /oauth/introspect — anonymous callers are refused", () => {
     expect(validateApiKeyMock).toHaveBeenCalledWith("sk_mt_not_a_real_key");
   });
 
+  it("refuses an admin-plane (control-plane) key — the third data-plane surface", async () => {
+    // Plane separation (migration 0038) is enforced inside validateApiKey, so
+    // an admin-plane key reports { valid: false } here just like any credential
+    // that is not a usable data-plane key, and the introspection gate refuses
+    // it. This pins the third validateApiKey call site (alongside the two MCP
+    // branches) so the plane rule cannot be bypassed through introspection.
+    validateApiKeyMock.mockResolvedValueOnce({
+      valid: false,
+      admin_plane: true,
+      key_uuid: "admin-plane-key-uuid",
+    });
+
+    const res = await post(
+      "/oauth/introspect",
+      { token: LIVE_TOKEN },
+      { "x-api-key": "sk_mt_an_admin_plane_key" },
+    );
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body).not.toHaveProperty("active");
+  });
+
   it("does not accept an OAuth access token as its own credential", async () => {
     // Presenting the very token under inspection must not authorize the
     // inspection: that would leave the oracle open to anyone already holding

@@ -52,5 +52,9 @@
     "required": "此字段为必填项",
     "tooShort": "太短",
     "tooLong": "太长"
+  },
+  "apiKeyAdminPlane": {
+    "noScope": "管理平面（控制平面）密钥没有端点范围, 请清除端点和所有端点的选择",
+    "noActsAs": "管理平面（控制平面）密钥不携带代理身份, 请清除代理用户"
   }
 }

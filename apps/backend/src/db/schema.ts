@@ -497,6 +497,14 @@ export const apiKeysTable = pgTable(
     // key that has never authenticated reads NULL. Surfaced only in the
     // admin cross-user key view — the owner-scoped list does not expose it.
     last_used_at: timestamp("last_used_at", { withTimezone: true }),
+    // Plane flag (migration 0038). false (the default, and every existing key)
+    // is the DATA plane: authenticates on /metamcp and /mcp-proxy, refused as a
+    // tRPC bearer. true is the CONTROL plane: authenticates AS user_id on /trpc
+    // via Authorization: Bearer, refused on the data plane. The two planes are
+    // non-overlapping and the exclusion is the containment story, a leaked
+    // control-plane key cannot reach the data plane and vice versa. NOT NULL
+    // default false so the deploy is inert and no live key changes behaviour.
+    admin_plane: boolean("admin_plane").notNull().default(false),
   },
   (table) => [
     index("api_keys_user_id_idx").on(table.user_id),
@@ -516,6 +524,30 @@ export const apiKeysTable = pgTable(
     check(
       "api_keys_acts_as_requires_scope",
       sql`${table.acts_as_user_id} IS NULL OR ${table.endpoint_uuid} IS NOT NULL`,
+    ),
+    // Plane-separation invariants (migration 0038), mirrored from the SQL so a
+    // fresh `drizzle-kit generate` re-adds nothing. App-layer enforcement (zod
+    // superRefine + impl guard + the two authentication sites) cannot reach a
+    // row written outside the app, so plane separation is also a set of CHECKs.
+    // A control-plane key authenticates AS a user, so it must have one.
+    check(
+      "api_keys_admin_plane_requires_owner",
+      sql`${table.admin_plane} = false OR ${table.user_id} IS NOT NULL`,
+    ),
+    // A control-plane key is not bound to an endpoint (endpoint scope is a
+    // data-plane concept), so it stores endpoint_uuid NULL, which is why the
+    // data plane must refuse admin-plane keys explicitly (a NULL scope reads as
+    // legacy gateway-wide there).
+    check(
+      "api_keys_admin_plane_no_endpoint_scope",
+      sql`${table.admin_plane} = false OR ${table.endpoint_uuid} IS NULL`,
+    ),
+    // A control-plane key carries no acts-as m365 delegated identity. Implied by
+    // the no-endpoint-scope check plus api_keys_acts_as_requires_scope, but
+    // stated explicitly so it survives a change to the acts-as check.
+    check(
+      "api_keys_admin_plane_no_acts_as",
+      sql`${table.admin_plane} = false OR ${table.acts_as_user_id} IS NULL`,
     ),
   ],
 );

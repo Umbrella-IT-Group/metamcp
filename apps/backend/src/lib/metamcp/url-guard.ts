@@ -561,11 +561,19 @@ const readGatewayBackendSecret = (): {
   reason?: "unset" | "too_short";
 } => {
   const raw = process.env.GATEWAY_BACKEND_SECRET;
-  if (raw === undefined || raw.trim() === "") return { reason: "unset" };
-  if (Buffer.byteLength(raw, "utf8") < MIN_GATEWAY_BACKEND_SECRET_BYTES) {
+  if (raw === undefined) return { reason: "unset" };
+  // Trim BEFORE both the length check and the return: the length is measured on,
+  // and the header carries, the TRIMMED value. Returning `raw` while testing
+  // `raw.trim()` for emptiness let a trailing newline (a `.env` written by
+  // `echo`, a copy-paste) ride into X-Gateway-Auth, so the gateway would stamp
+  // a value a backend configured from the same secret without the newline would
+  // reject, the two ends must not differ.
+  const trimmed = raw.trim();
+  if (trimmed === "") return { reason: "unset" };
+  if (Buffer.byteLength(trimmed, "utf8") < MIN_GATEWAY_BACKEND_SECRET_BYTES) {
     return { reason: "too_short" };
   }
-  return { value: raw };
+  return { value: trimmed };
 };
 
 /** The usable gateway backend secret, or undefined when none is configured. */

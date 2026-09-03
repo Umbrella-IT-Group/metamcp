@@ -49,6 +49,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
       endpoint_name: "autotask",
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -68,6 +69,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
         is_active: true,
         endpoint_uuid: "fresh-uuid-after-recreate",
         acts_as_user_id: null,
+        admin_plane: false,
       },
     ]);
     // The stale uuid is NEVER inserted (it would violate the FK), and the
@@ -86,6 +88,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
       endpoint_name: "endpoint-not-in-bootstrap-config",
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -118,6 +121,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
       endpoint_name: null,
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -142,6 +146,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
       endpoint_name: null,
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -169,6 +174,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
         endpoint_name: "ep-a",
         acts_as_user_id: null,
         acts_as_email: null,
+        admin_plane: false,
       },
       {
         name: "endpoint-gone",
@@ -179,6 +185,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
         endpoint_name: "ep-b",
         acts_as_user_id: null,
         acts_as_email: null,
+        admin_plane: false,
       },
       {
         name: "gateway-wide",
@@ -189,6 +196,7 @@ describe("planPreservedApiKeyRestores — endpoint scope survives user recreate"
         endpoint_name: null,
         acts_as_user_id: null,
         acts_as_email: null,
+        admin_plane: false,
       },
     ];
 
@@ -224,6 +232,7 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
       // mints a FRESH id, so this one is stale by restore time.
       acts_as_user_id: "old-alex-id",
       acts_as_email: "alex@example.com",
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -243,6 +252,7 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
         is_active: true,
         endpoint_uuid: "fresh-ep-uuid",
         acts_as_user_id: "new-alex-id",
+        admin_plane: false,
       },
     ]);
     // The stale id is NEVER inserted, and the binding is NOT dropped.
@@ -260,6 +270,7 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
       endpoint_name: "m365",
       acts_as_user_id: "old-user-id",
       acts_as_email: "departed@example.com",
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -294,6 +305,7 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
       endpoint_name: "m365",
       acts_as_user_id: "some-user-id",
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -319,6 +331,7 @@ describe("planPreservedApiKeyRestores — acts-as identity binding survives user
       endpoint_name: "m365",
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores, skipped } = planPreservedApiKeyRestores(
@@ -356,6 +369,7 @@ describe("planPreservedApiKeyRestores — the at-rest hash/last4 pair survives i
       endpoint_name: "ep-a",
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores } = planPreservedApiKeyRestores(
@@ -382,6 +396,7 @@ describe("planPreservedApiKeyRestores — the at-rest hash/last4 pair survives i
       endpoint_name: null,
       acts_as_user_id: null,
       acts_as_email: null,
+      admin_plane: false,
     };
 
     const { restores } = planPreservedApiKeyRestores(
@@ -395,5 +410,62 @@ describe("planPreservedApiKeyRestores — the at-rest hash/last4 pair survives i
     // recovered it, which after migration 0034 is impossible by construction.
     expect(JSON.stringify(restores)).not.toContain(SECRET);
     expect((restores[0] as Record<string, unknown>).key).toBeUndefined();
+  });
+});
+
+describe("planPreservedApiKeyRestores — admin-plane survives user recreate (migration 0038)", () => {
+  it("restores a preserved admin-plane key as admin-plane, still owner-scoped", () => {
+    // A control-plane (CI) key carries no endpoint scope and no acts-as
+    // identity (the CHECK constraints forbid both), so it re-resolves nothing
+    // and restores as-is — but its plane MUST come back true, or a recreate
+    // silently demotes the CI key to a data-plane key that then fails on /trpc.
+    const controlPlane: PreservedApiKey = {
+      name: "ci-control-plane",
+      key_hash: hashApiKey("sk_mt_control_plane_key"),
+      last4: apiKeyLast4("sk_mt_control_plane_key"),
+      is_active: true,
+      endpoint_uuid: null,
+      endpoint_name: null,
+      acts_as_user_id: null,
+      acts_as_email: null,
+      admin_plane: true,
+    };
+
+    const { restores, skipped } = planPreservedApiKeyRestores(
+      [controlPlane],
+      "new-ci-user-id",
+      new Map(),
+      new Map(),
+    );
+
+    expect(skipped).toEqual([]);
+    expect(restores).toHaveLength(1);
+    expect(restores[0].admin_plane).toBe(true);
+    expect(restores[0].endpoint_uuid).toBeNull();
+    expect(restores[0].acts_as_user_id).toBeNull();
+    expect(restores[0].user_id).toBe("new-ci-user-id");
+  });
+
+  it("keeps a data-plane key admin_plane=false through the restore", () => {
+    const dataPlane: PreservedApiKey = {
+      name: "data-plane",
+      key_hash: hashApiKey("sk_mt_data_plane_key"),
+      last4: apiKeyLast4("sk_mt_data_plane_key"),
+      is_active: true,
+      endpoint_uuid: null,
+      endpoint_name: null,
+      acts_as_user_id: null,
+      acts_as_email: null,
+      admin_plane: false,
+    };
+
+    const { restores } = planPreservedApiKeyRestores(
+      [dataPlane],
+      "some-user",
+      new Map(),
+      new Map(),
+    );
+
+    expect(restores[0].admin_plane).toBe(false);
   });
 });

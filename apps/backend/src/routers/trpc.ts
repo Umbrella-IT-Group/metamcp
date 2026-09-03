@@ -6,6 +6,7 @@ import helmet from "helmet";
 
 import { trpcDenialSink } from "../lib/audit/trpc-denial-sink";
 import { credentialedCorsOrigin } from "../lib/cors-policy";
+import { trpcAdminKeyRateLimitMiddleware } from "../middleware/trpc-admin-key-rate-limit.middleware";
 import { trpcRateLimitMiddleware } from "../middleware/trpc-rate-limit.middleware";
 import { createContext } from "../trpc";
 import { accessGroupsImplementations } from "../trpc/access-groups.impl";
@@ -77,6 +78,14 @@ trpcRouter.use(
 // failure. See ../middleware/trpc-rate-limit.middleware for the keying
 // decision, which is the part that matters.
 trpcRouter.use(trpcRateLimitMiddleware);
+
+// Failure-only 429 gate for the admin-plane (control-plane) bearer path
+// (migration 0038). AFTER the request cap above so total volume is already
+// bounded and this refusal carries the CORS headers, and it CHECKS only,
+// lib/admin-plane-auth records a failed verification. It skips cookie-carrying
+// requests so a stale bearer on a cookie user is never refused (cookie
+// precedence). See ../middleware/trpc-admin-key-rate-limit.middleware.
+trpcRouter.use(trpcAdminKeyRateLimitMiddleware);
 
 // Better-auth integration now handled in tRPC context
 
