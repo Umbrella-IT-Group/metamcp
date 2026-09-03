@@ -6,14 +6,18 @@
  * tokens hit the database (and the destroy-emit path for expired ones) with no
  * bound. It now carries the SAME failure-only limiter as /oauth/introspect and
  * /oauth/revoke: only tokens that resolve to nothing accumulate, so a caller
- * presenting a token this server issued is never throttled. The whole-org
- * outage guard is the first assertion — the bucket is per-`req.ip` and `trust
- * proxy` is off, so a limiter that counted successes would throttle everyone on
- * the shared address.
+ * presenting a token this server issued is never throttled. It keys on the edge
+ * client IP (CF-Connecting-IP) with req.ip as the fallback, the same keying the
+ * authorize and token limiters use, so one source spraying failures fills only
+ * its own bucket rather than 429ing every caller behind the tunnel; that
+ * per-edge isolation is asserted directly below. `trust proxy` is off, so req.ip
+ * behind the tunnel is one shared container address, which is why the fallback
+ * path and the edge path are tested separately.
  *
- * Driven directly as express middleware against fake req/res — same harness as
- * token-public-endpoint.test.ts, with a FIXED ip per test since accumulating
- * within one bucket is what is under test.
+ * Driven directly as express middleware against fake req/res, the same harness
+ * as token-public-endpoint.test.ts, with a FIXED identity per test (a fixed
+ * req.ip, plus a fixed CF-Connecting-IP where the edge path is under test) since
+ * accumulating within one bucket is what is under test.
  */
 
 import express from "express";
@@ -91,13 +95,24 @@ function makeRes(): FakeRes {
   return res;
 }
 
-async function getUserinfo(token: string): Promise<FakeRes> {
+async function getUserinfo(
+  token: string,
+  cfConnectingIp?: string,
+): Promise<FakeRes> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${token}`,
+  };
+  // Cloudflare's per-caller header. When present the limiter keys on it; when
+  // absent it falls back to req.ip, so omitting it exercises the fallback path.
+  if (cfConnectingIp !== undefined) {
+    headers["cf-connecting-ip"] = cfConnectingIp;
+  }
   const req = {
     method: "GET",
     url: "/oauth/userinfo",
     originalUrl: "/oauth/userinfo",
     baseUrl: "",
-    headers: { authorization: `Bearer ${token}` },
+    headers,
     ip: currentIp,
     socket: { remoteAddress: currentIp },
   } as unknown as express.Request;
@@ -165,7 +180,7 @@ describe("GET /oauth/userinfo — a real token is never throttled", () => {
   it("does not count a DISABLED account's real token against the budget", async () => {
     // A real credential refused for a reason that is not the caller's doing.
     // Counting it would let one locked-out account's still-running client spend
-    // the shared bucket and refuse everyone on the same edge IP.
+    // that edge IP's bucket and refuse everyone sharing it.
     oauthRepositoryMock.getAccessToken.mockResolvedValue(liveTokenRow());
     usersRepositoryMock.isDisabled.mockResolvedValue(true);
 
@@ -202,5 +217,61 @@ describe("GET /oauth/userinfo — unresolvable tokens are bounded", () => {
 
     expect(res.statusCode).toBe(429);
     expect(oauthRepositoryMock.getAccessToken).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /oauth/userinfo: one edge IP cannot 429 another", () => {
+  // Fixed edge IPs, distinct from any other test's, since the limiter store is
+  // module-scoped and never reset between tests: a reused key would carry a
+  // previous test's failures.
+  it("keeps two edge IPs on independent buckets", async () => {
+    // Same container req.ip, different CF-Connecting-IP. Under the old
+    // per-req.ip keying these shared one bucket, so a noisy source's failures
+    // 429ed everyone; keyed on the edge IP they do not.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
+    const noisyEdge = "203.0.113.10";
+    const quietEdge = "203.0.113.11";
+
+    const noisy: number[] = [];
+    for (let i = 0; i < OVER_THE_LIMIT; i += 1) {
+      noisy.push(
+        (await getUserinfo(`mcp_token_bad_${i}`, noisyEdge)).statusCode,
+      );
+    }
+    expect(noisy).toContain(429);
+
+    // The quiet edge IP has spent nothing, so its first unresolvable token is
+    // answered 401, not pre-emptively 429ed by the noisy neighbour.
+    const quiet = await getUserinfo("mcp_token_bad_quiet", quietEdge);
+    expect(quiet.statusCode).toBe(401);
+  });
+
+  it("shares one bucket across requests from the same edge IP", async () => {
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
+    const edge = "203.0.113.20";
+
+    const statuses: number[] = [];
+    for (let i = 0; i < OVER_THE_LIMIT; i += 1) {
+      statuses.push((await getUserinfo(`mcp_token_bad_${i}`, edge)).statusCode);
+    }
+
+    expect(statuses[0]).toBe(401);
+    expect(statuses).toContain(429);
+  });
+
+  it("falls back to req.ip when no edge header is present", async () => {
+    // Direct-to-origin and local development send no CF-Connecting-IP, so the
+    // bucket keys on req.ip. freshIp() gave this test its own req.ip in
+    // beforeEach, so it starts empty and bounds the spray just as the edge path
+    // does.
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
+
+    const statuses: number[] = [];
+    for (let i = 0; i < OVER_THE_LIMIT; i += 1) {
+      statuses.push((await getUserinfo(`mcp_token_bad_${i}`)).statusCode);
+    }
+
+    expect(statuses[0]).toBe(401);
+    expect(statuses).toContain(429);
   });
 });

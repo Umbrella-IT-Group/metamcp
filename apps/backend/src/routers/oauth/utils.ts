@@ -447,6 +447,24 @@ export function getBaseUrl(req: express.Request): string {
 }
 
 /**
+ * The issuer identifier this authorization server publishes, normalised to a
+ * single trailing slash.
+ *
+ * ONE function so the value cannot drift between the two places that must agree
+ * byte for byte. RFC 8414 metadata advertises this as `issuer`, and RFC 9207
+ * requires every authorization response carry the same string as `iss`. A
+ * strict client compares the two by simple string comparison (RFC 9207 2.4) and
+ * aborts the flow on any difference, so a trailing-slash mismatch there is not
+ * cosmetic: it breaks the mix-up defence the `iss` parameter exists for. The
+ * slash matches the normalisation RFC 8414 / RFC 9728 discovery already applied
+ * to the issuer and resource identifiers.
+ */
+export function getIssuerIdentifier(req: express.Request): string {
+  const base = getBaseUrl(req);
+  return base.endsWith("/") ? base : base + "/";
+}
+
+/**
  * Path prefixes the OAuth router actually serves, matched whole-segment so
  * `/oauthsomething` is not mistaken for one of ours.
  *

@@ -80,7 +80,8 @@ const {
   verifyConsentRequest,
 } = await import("./consent-token");
 
-const { resetConsentDecisionRateLimitForTests } = await import("./utils");
+const { getIssuerIdentifier, resetConsentDecisionRateLimitForTests } =
+  await import("./utils");
 
 // APP_URL is https here, as on the real deployment, so the cookie this server
 // issues and reads carries the __Host- prefix. The name is per consent request:
@@ -90,6 +91,15 @@ function csrfCookieName(cid: string): string {
 }
 
 const APP_URL = "https://mcp.example.test";
+// The issuer identifier this server publishes: APP_URL normalised to a trailing
+// slash. RFC 9207 requires the `iss` on the authorization response be
+// byte-identical to the issuer the discovery metadata advertises, so this is
+// derived from the SAME production helper metadata uses (getIssuerIdentifier)
+// rather than a second hardcoded literal that could drift from it. See
+// metadata.test.ts, which pins the advertised issuer to this same value.
+const ISSUER = getIssuerIdentifier({
+  headers: {},
+} as unknown as express.Request);
 const CLIENT_ID = "mcp_client_test";
 const CLIENT_NAME = "Claude";
 const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
@@ -555,12 +565,17 @@ describe("POST /oauth/authorize/decision — approval mints", () => {
 
   it("carries the RFC 9207 iss parameter on the granted redirect", async () => {
     // The issuer identifier lets the client detect an authorization-server
-    // mix-up. It is the same string advertised as the metadata issuer.
+    // mix-up, and RFC 9207 2.4 has the client compare it against the discovery
+    // issuer by simple string comparison. ISSUER is that advertised issuer
+    // (trailing slash included); a strict client aborts if the two differ.
     const { areq, csrf } = makeAreq();
 
     const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
 
-    expect(redirectUrl(res).searchParams.get("iss")).toBe(APP_URL);
+    expect(redirectUrl(res).searchParams.get("iss")).toBe(ISSUER);
+    // Guard against a regression to getBaseUrl (no trailing slash), which would
+    // no longer match the discovery issuer.
+    expect(ISSUER).toBe(`${APP_URL}/`);
   });
 
   it("carries the iss parameter on the access_denied redirect too", async () => {
@@ -571,7 +586,7 @@ describe("POST /oauth/authorize/decision — approval mints", () => {
 
     const redirect = redirectUrl(res);
     expect(redirect.searchParams.get("error")).toBe("access_denied");
-    expect(redirect.searchParams.get("iss")).toBe(APP_URL);
+    expect(redirect.searchParams.get("iss")).toBe(ISSUER);
     expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
   });
 });

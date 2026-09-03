@@ -46,6 +46,7 @@ vi.mock("../../db/repositories", () => ({
 process.env.APP_URL = "https://mcp.example.test";
 
 const { default: metadataRouter } = await import("./metadata");
+const { getIssuerIdentifier } = await import("./utils");
 
 const PROTECTED_RESOURCE = "/.well-known/oauth-protected-resource";
 const AUTHORIZATION_SERVER = "/.well-known/oauth-authorization-server";
@@ -188,6 +189,14 @@ describe("discovery IS served where OAuth is in use", () => {
       authorization_endpoint: "https://mcp.example.test/oauth/authorize",
       registration_endpoint: "https://mcp.example.test/oauth/register",
     });
+
+    // The advertised issuer must be byte-identical to the RFC 9207 `iss` the
+    // authorization response carries (see authorization.test.ts). Both derive
+    // from getIssuerIdentifier, so pinning the metadata side to that same helper
+    // here closes the trailing-slash drift the two tests used to allow.
+    expect((server.body as { issuer: string }).issuer).toBe(
+      getIssuerIdentifier({ headers: {} } as unknown as express.Request),
+    );
   });
 
   it("advertises RFC 9207 iss support and S256-only PKCE", async () => {

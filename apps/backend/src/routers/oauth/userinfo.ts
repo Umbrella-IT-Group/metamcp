@@ -5,10 +5,8 @@ import {
   credentialFingerprint,
   emit,
 } from "@/lib/audit/audit-emitter";
-import {
-  authRateLimiter,
-  getPublicOAuthRateLimitIdentifier,
-} from "@/lib/auth-rate-limiter";
+import { authRateLimiter } from "@/lib/auth-rate-limiter";
+import { resolveClientIp } from "@/lib/client-ip";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
@@ -16,29 +14,57 @@ import { oauthRepository, usersRepository } from "../../db/repositories";
 const userinfoRouter = express.Router();
 
 /**
- * Failure-only rate limiting for GET /oauth/userinfo, the same limiter shape
- * /oauth/introspect and /oauth/revoke carry (see token.ts and
- * getPublicOAuthRateLimitIdentifier). Failure-only is the requirement: with
- * `trust proxy` off the bucket is per-edge-IP and a caller presenting a token
- * this server issued must never score, so only tokens that resolve to nothing —
- * missing, malformed, unknown, or expired — accumulate. A disabled account's
- * real token is deliberately NOT counted, matching the introspect handler:
- * counting it would let one locked-out account's still-running client spend the
- * shared budget and refuse everyone on the same edge IP.
+ * The failure-only rate-limit key for GET /oauth/userinfo, keyed on the edge
+ * client IP.
+ *
+ * Keyed on resolveClientIp (Cloudflare's per-caller CF-Connecting-IP) with
+ * req.ip as the fallback, the same keying rateLimitAuth and rateLimitToken use.
+ * `trust proxy` is deliberately off (see audit-context.middleware), so req.ip
+ * behind the tunnel is one container-local address shared by every caller.
+ * Keying on it alone would make this a single global bucket, and because the
+ * gate below runs before the token is even looked up, one source spraying
+ * failed lookups would then 429 userinfo for every caller behind the tunnel,
+ * including one holding a real token. This endpoint had no limiter at all
+ * before, so that would be a brand-new whole-deployment outage caused by the
+ * control meant to prevent one. Per-edge-IP keying bounds the failing source
+ * instead; the req.ip fallback degrades to the old shared bucket only for
+ * direct-to-origin and local development.
+ *
+ * The /oauth/introspect and /oauth/revoke siblings still share
+ * getPublicOAuthRateLimitIdentifier's per-container bucket; unifying all three
+ * on this keying is a follow-up, kept out of this change because those two are
+ * not otherwise touched here.
+ *
+ * Namespaced `oauth-public:userinfo:` so spam here cannot spend the endpoint
+ * data plane's budget, and per route so it cannot spend introspect's or
+ * revoke's either.
+ */
+function userinfoRateLimitIdentifier(req: express.Request): string {
+  const ip =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
+  return `oauth-public:userinfo:${ip}`;
+}
+
+/**
+ * Failure-only, matching the introspect and revoke handlers: a caller
+ * presenting a token this server issued must never score, so only tokens that
+ * resolve to nothing (missing, malformed, unknown, or expired) accumulate. A
+ * disabled account's real token is deliberately NOT counted, for the same
+ * reason: counting it would let one locked-out account's still-running client
+ * spend the bucket and refuse everyone sharing its edge IP.
  *
  * `isCurrentlyLimited`, not `isRateLimited`, so the pre-work gate does not
  * itself count; failures are recorded explicitly on the branches below.
  */
 function isUserinfoRateLimited(req: express.Request): boolean {
-  return authRateLimiter.isCurrentlyLimited(
-    getPublicOAuthRateLimitIdentifier(req, "userinfo"),
-  );
+  return authRateLimiter.isCurrentlyLimited(userinfoRateLimitIdentifier(req));
 }
 
 function recordUserinfoFailure(req: express.Request): void {
-  authRateLimiter.recordFailedAttempt(
-    getPublicOAuthRateLimitIdentifier(req, "userinfo"),
-  );
+  authRateLimiter.recordFailedAttempt(userinfoRateLimitIdentifier(req));
 }
 
 /**

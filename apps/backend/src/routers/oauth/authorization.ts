@@ -17,6 +17,7 @@ import {
 import {
   generateSecureAuthCode,
   getBaseUrl,
+  getIssuerIdentifier,
   GRANTED_OAUTH_SCOPE,
   isAllowedRedirectUri,
   isConsentDecisionRateLimited,
@@ -649,9 +650,12 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     // access_denied redirect) carries `iss`, the issuer identifier, so a client
     // cannot be tricked into accepting a code minted by a different
     // authorization server (mix-up defense). Set once here because it applies
-    // to both the grant and the denial that share this redirectUrl, and it is
-    // the same issuer string advertised in AS metadata (see getBaseUrl).
-    redirectUrl.searchParams.set("iss", getBaseUrl(req));
+    // to both the grant and the denial that share this redirectUrl. It goes
+    // through getIssuerIdentifier, the SAME helper the AS metadata `issuer`
+    // uses, because RFC 9207 2.4 has the client compare the two by simple string
+    // comparison: getBaseUrl alone omits the trailing slash the metadata issuer
+    // carries, so a strict client would abort every response.
+    redirectUrl.searchParams.set("iss", getIssuerIdentifier(req));
     if (consentRequest.state) {
       redirectUrl.searchParams.set("state", consentRequest.state);
     }
