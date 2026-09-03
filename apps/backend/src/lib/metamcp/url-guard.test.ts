@@ -22,6 +22,8 @@ const {
   createGuardedFetch,
   createPinnedAgent,
   isBlockedSsrfAddress,
+  isInternalTarget,
+  GATEWAY_BACKEND_AUTH_HEADER,
   CROSS_ORIGIN_REDIRECT_REFUSED,
   NOT_A_PERMITTED_TARGET,
   RESPONSE_TOO_LARGE,
@@ -871,5 +873,265 @@ describe("createGuardedFetch: the response body is bounded", () => {
 
     const response = await guarded("https://mcp.example.com/mcp");
     expect(await response.text()).toBe("ok");
+  });
+});
+
+describe("isInternalTarget", () => {
+  const target = (addresses: string[]) => ({
+    url: new URL("http://backend.example/mcp"),
+    addresses,
+  });
+
+  it("classifies an allowlisted (empty-address, trusted-by-name) target as internal", () => {
+    expect(isInternalTarget(target([]))).toBe(true);
+  });
+
+  it("classifies an all-internal-service address set as internal", () => {
+    expect(isInternalTarget(target(["10.0.0.5", "127.0.0.1"]))).toBe(true);
+  });
+
+  it("classifies a public address as external", () => {
+    expect(isInternalTarget(target([PUBLIC_V4]))).toBe(false);
+  });
+
+  it("classifies the cloud metadata address as external (never a trust-header target)", () => {
+    // Blocked under both postures, so it is neither an internal service nor
+    // public: the trust header must never reach it.
+    expect(isInternalTarget(target(["169.254.169.254"]))).toBe(false);
+  });
+
+  it("classifies a mixed internal + public set as external", () => {
+    // One public answer in a rebinding-style set means the header must not go.
+    expect(isInternalTarget(target(["10.0.0.5", PUBLIC_V4]))).toBe(false);
+  });
+});
+
+describe("createGuardedFetch: the gateway backend trust header", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+  const SECRET = "g".repeat(32);
+  const ORIGINAL_SECRET = process.env.GATEWAY_BACKEND_SECRET;
+
+  afterEach(() => {
+    if (ORIGINAL_SECRET === undefined) {
+      delete process.env.GATEWAY_BACKEND_SECRET;
+    } else {
+      process.env.GATEWAY_BACKEND_SECRET = ORIGINAL_SECRET;
+    }
+  });
+
+  // The exact posture createPoolGuardedFetch hands to BOTH the SSE and the
+  // Streamable-HTTP transport, so a header decision proven here holds for both.
+  const poolGuard = (
+    baseFetch: (url: string | URL, init?: RequestInit) => Promise<Response>,
+    lookup: (hostname: string) => Promise<string[]>,
+  ) =>
+    createGuardedFetch({
+      baseFetch,
+      lookup,
+      allowPrivateAddresses: true,
+      refuseCrossOriginRedirect: true,
+    });
+
+  const sentHeaders = (baseFetch: { mock: { calls: unknown[][] } }, call = 0) =>
+    (baseFetch.mock.calls[call][1] as { headers: Headers }).headers;
+
+  it("stamps the header on an internal destination when the secret is set", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp", {
+      headers: { authorization: "Bearer row-token" },
+    });
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+    // The row's own credential is left untouched beside it.
+    expect(sentHeaders(baseFetch).get("authorization")).toBe(
+      "Bearer row-token",
+    );
+  });
+
+  it("does NOT stamp the header on a public (non-internal) destination", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo(PUBLIC_V4));
+
+    await guarded("https://mcp.example.com/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("sends nothing when the secret is unset, even to an internal destination", async () => {
+    delete process.env.GATEWAY_BACKEND_SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("treats a secret shorter than 32 bytes as unset (fail closed)", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = "short";
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("strips a forged inbound trust header before reaching a public destination", async () => {
+    // A server row's stored headers must never smuggle the header to an
+    // external server, whether or not a real secret is configured.
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo(PUBLIC_V4));
+
+    await guarded("https://mcp.example.com/mcp", {
+      headers: { [GATEWAY_BACKEND_AUTH_HEADER]: "attacker-supplied" },
+    });
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBeNull();
+  });
+
+  it("overwrites a forged inbound value with the real secret on an internal destination", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp", {
+      headers: { [GATEWAY_BACKEND_AUTH_HEADER]: "attacker-supplied" },
+    });
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+  });
+
+  it("stamps the header for an allowlisted, trusted-by-name internal host (Inspector path)", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi.fn(async () => ok());
+    // Inspector posture: strict range check, host trusted by the allowlist so
+    // it is never resolved (addresses = []), which classifies it internal.
+    const guarded = createGuardedFetch({
+      baseFetch,
+      allowedHosts: ["host.docker.internal"],
+      allowlistOrigin: "http://host.docker.internal",
+    });
+
+    await guarded("http://host.docker.internal/mcp");
+
+    expect(sentHeaders(baseFetch).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+  });
+
+  it("does not carry the header from an internal hop 0 onto a public redirect hop", async () => {
+    // Inspector posture follows a cross-origin redirect with credentials
+    // dropped; the internal hop-0 stamp must not ride along to the public hop.
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://mcp.example.com/next"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      allowedHosts: ["host.docker.internal"],
+      allowlistOrigin: "http://host.docker.internal",
+      lookup: resolvesTo(PUBLIC_V4),
+    });
+
+    await guarded("http://host.docker.internal/mcp");
+
+    expect(sentHeaders(baseFetch, 0).get(GATEWAY_BACKEND_AUTH_HEADER)).toBe(
+      SECRET,
+    );
+    expect(
+      sentHeaders(baseFetch, 1).get(GATEWAY_BACKEND_AUTH_HEADER),
+    ).toBeNull();
+  });
+
+  it("never logs the secret value", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = SECRET;
+    const logger = (await import("@/utils/logger")).default as unknown as {
+      info: ReturnType<typeof vi.fn>;
+      warn: ReturnType<typeof vi.fn>;
+      error: ReturnType<typeof vi.fn>;
+      debug: ReturnType<typeof vi.fn>;
+    };
+    const baseFetch = vi.fn(async () => ok());
+    const guarded = poolGuard(baseFetch, resolvesTo("10.0.0.5"));
+
+    await guarded("http://backend.internal/mcp", {
+      headers: { authorization: "Bearer row-token" },
+    });
+
+    const everyLoggedArg = [
+      ...logger.info.mock.calls,
+      ...logger.warn.mock.calls,
+      ...logger.error.mock.calls,
+      ...logger.debug.mock.calls,
+    ]
+      .flat()
+      .map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg)))
+      .join(" ");
+    expect(everyLoggedArg).not.toContain(SECRET);
+  });
+});
+
+describe("warnIfGatewayBackendSecretUnset", () => {
+  const ORIGINAL_SECRET = process.env.GATEWAY_BACKEND_SECRET;
+
+  afterEach(() => {
+    if (ORIGINAL_SECRET === undefined) {
+      delete process.env.GATEWAY_BACKEND_SECRET;
+    } else {
+      process.env.GATEWAY_BACKEND_SECRET = ORIGINAL_SECRET;
+    }
+    vi.resetModules();
+  });
+
+  // A fresh module per case so the one-shot boot latch starts down. The mocked
+  // logger is a singleton that survives resetModules (mock registrations do),
+  // so its call count is cleared explicitly rather than relying on the reset.
+  const freshBootWarn = async () => {
+    vi.resetModules();
+    const mod = await import("./url-guard");
+    const logger = (await import("@/utils/logger")).default as unknown as {
+      warn: ReturnType<typeof vi.fn>;
+    };
+    logger.warn.mockClear();
+    return { warn: mod.warnIfGatewayBackendSecretUnset, logger };
+  };
+
+  it("warns exactly once when the secret is unset", async () => {
+    delete process.env.GATEWAY_BACKEND_SECRET;
+    const { warn, logger } = await freshBootWarn();
+    warn();
+    warn();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toContain(
+      "GATEWAY_BACKEND_SECRET is not set",
+    );
+  });
+
+  it("warns that a too-short secret is ignored", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = "too-short";
+    const { warn, logger } = await freshBootWarn();
+    warn();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toContain("shorter than 32 bytes");
+  });
+
+  it("stays silent when a valid secret is set", async () => {
+    process.env.GATEWAY_BACKEND_SECRET = "g".repeat(32);
+    const { warn, logger } = await freshBootWarn();
+    warn();
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 });

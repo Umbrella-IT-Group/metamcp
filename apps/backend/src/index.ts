@@ -12,6 +12,7 @@ import {
 } from "./lib/health-upstream";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
+import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
@@ -176,6 +177,12 @@ async function start(): Promise<void> {
   // see ./lib/endpoint-pairing-check for why these rows are warned about rather
   // than auto-migrated.
   await warnOnUnpairedRestrictedEndpoints();
+
+  // One boot-time signal for the staged rollout of the gateway backend trust
+  // header: absent secret means backends receive no X-Gateway-Auth yet. Kept
+  // near the other boot warnings so the gateway's posture is legible from the
+  // boot log rather than something to prove by hand.
+  warnIfGatewayBackendSecretUnset();
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);
