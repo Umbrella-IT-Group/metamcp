@@ -85,7 +85,10 @@
   // developer's (and each rotation of) the runtime password would miss the
   // whole shared cache. Nothing turbo builds depends on the value; only the
   // running container does.
-  "globalPassThroughEnv": ["METAMCP_RUNTIME_DB_PASSWORD"],
+  "globalPassThroughEnv": [
+    "METAMCP_RUNTIME_DB_PASSWORD",
+    "GATEWAY_BACKEND_SECRET"
+  ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

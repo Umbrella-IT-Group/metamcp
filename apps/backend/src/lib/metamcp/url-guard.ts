@@ -529,6 +529,125 @@ export interface ValidatedMcpTarget {
 }
 
 /**
+ * The header the gateway stamps on an upstream request to prove the request
+ * came from the gateway itself, not from something that merely reached a
+ * backend's port. A backend that enforces it can refuse everything without it.
+ * Header names are case-insensitive on the wire and `Headers` stores them
+ * lowercased, which is why the constant is lowercase and the tests read it back
+ * that way; it is the `X-Gateway-Auth` header.
+ */
+export const GATEWAY_BACKEND_AUTH_HEADER = "x-gateway-auth";
+
+/**
+ * Minimum accepted length of `GATEWAY_BACKEND_SECRET`. A shared secret this
+ * header carries to a backend has to resist guessing; below this it is treated
+ * as unset (see `readGatewayBackendSecret`), because a weak secret sent to a
+ * backend is worse than none.
+ */
+const MIN_GATEWAY_BACKEND_SECRET_BYTES = 32;
+
+/**
+ * The gateway backend secret from `GATEWAY_BACKEND_SECRET`, or the reason it is
+ * not usable.
+ *
+ * Read per call rather than captured at import, matching every other env read
+ * in this module, so a value can be corrected without a rebuild and varied by a
+ * test. A value shorter than the minimum FAILS CLOSED to `too_short` rather
+ * than shipping a guessable credential: the staged-rollout default is to send
+ * nothing, and a truncated secret must not silently opt into sending a weak one.
+ */
+const readGatewayBackendSecret = (): {
+  value?: string;
+  reason?: "unset" | "too_short";
+} => {
+  const raw = process.env.GATEWAY_BACKEND_SECRET;
+  if (raw === undefined || raw.trim() === "") return { reason: "unset" };
+  if (Buffer.byteLength(raw, "utf8") < MIN_GATEWAY_BACKEND_SECRET_BYTES) {
+    return { reason: "too_short" };
+  }
+  return { value: raw };
+};
+
+/** The usable gateway backend secret, or undefined when none is configured. */
+const gatewayBackendSecret = (): string | undefined =>
+  readGatewayBackendSecret().value;
+
+/**
+ * Log ONE warning at boot when the gateway backend secret is not usable, so a
+ * staged rollout (backends deployed permissive, gateway not yet stamping) is
+ * visible in the boot log rather than silent.
+ *
+ * Never logs the value; there is none worth logging in either branch, and the
+ * `unset` and `too_short` cases are distinguished so a truncated secret is not
+ * mistaken for a deliberate opt-out. The module-level latch keeps a second
+ * caller from repeating it, so "one warn at boot" holds even if the boot path
+ * calls it more than once.
+ */
+let gatewayBackendSecretWarned = false;
+export const warnIfGatewayBackendSecretUnset = (): void => {
+  if (gatewayBackendSecretWarned) return;
+  gatewayBackendSecretWarned = true;
+  const { reason } = readGatewayBackendSecret();
+  if (reason === "unset") {
+    logger.warn(
+      "GATEWAY_BACKEND_SECRET is not set: upstream requests to internal backends carry no gateway trust header (staged rollout). Set it once the backends enforce it.",
+    );
+  } else if (reason === "too_short") {
+    logger.warn(
+      `GATEWAY_BACKEND_SECRET is shorter than ${MIN_GATEWAY_BACKEND_SECRET_BYTES} bytes and is being ignored: no gateway trust header will be sent. Set a value of at least ${MIN_GATEWAY_BACKEND_SECRET_BYTES} bytes.`,
+    );
+  }
+};
+
+/**
+ * Whether the guard classifies a validated target as an INTERNAL destination,
+ * i.e. one that may receive the gateway trust header.
+ *
+ * Empty addresses mean the host matched the operator's allowlist and is trusted
+ * by NAME (the `MCP_PROXY_URL_ALLOWED_HOSTS` escape hatch exists only for a
+ * backend fronted on a private address), so it is internal by operator
+ * designation. Otherwise a target is internal exactly when EVERY resolved
+ * address is an internal-service range: blocked under the strict posture yet
+ * permitted under `allowPrivate`. Deriving that from the one range table rather
+ * than a second copy of it means metadata / CGNAT / multicast / reserved
+ * (blocked under both postures) and public addresses (allowed under both) are
+ * both correctly external, and this classification cannot drift from the SSRF
+ * check it rides on.
+ */
+export const isInternalTarget = (target: ValidatedMcpTarget): boolean => {
+  if (target.addresses.length === 0) return true;
+  return target.addresses.every(
+    (address) =>
+      isBlockedSsrfAddress(address, false) !== null &&
+      isBlockedSsrfAddress(address, true) === null,
+  );
+};
+
+/**
+ * Set or strip the gateway trust header on an outgoing request for the target
+ * it is about to reach.
+ *
+ * The header is set BY the gateway, so any inbound value is stripped FIRST: a
+ * server row's stored `headers`, or a redirect, must never smuggle or forge
+ * one. The real secret is then set only when it is configured AND the
+ * destination is internal, so an external server a user configured never
+ * receives it. Re-run per hop, because a cross-origin redirect drops it with
+ * the other non-forwardable headers and the next hop may be internal again.
+ * This lives in the guard because the internal/external decision needs the
+ * validated, resolved addresses, which exist nowhere else on the path.
+ */
+const applyGatewayTrustHeader = (
+  headers: Headers,
+  target: ValidatedMcpTarget,
+): void => {
+  headers.delete(GATEWAY_BACKEND_AUTH_HEADER);
+  const secret = gatewayBackendSecret();
+  if (secret && isInternalTarget(target)) {
+    headers.set(GATEWAY_BACKEND_AUTH_HEADER, secret);
+  }
+};
+
+/**
  * Build the single refusal Error and log the real reason beside it.
  *
  * CALLER CONTRACT: `reason` is interpolated raw, so anything caller-supplied
@@ -916,6 +1035,10 @@ export const createGuardedFetch = (
     let method = init?.method ?? "GET";
     let body = init?.body ?? undefined;
     let headers = new Headers(init?.headers);
+    // Stamp (or strip) the gateway trust header for hop 0's destination before
+    // it is dialled; re-evaluated per hop below because a redirect can change
+    // the destination's internal/external status.
+    applyGatewayTrustHeader(headers, target);
 
     for (let hop = 0; ; hop += 1) {
       const response = await baseFetch(
@@ -1009,6 +1132,10 @@ export const createGuardedFetch = (
         );
       }
 
+      // Re-stamp for the next hop: a same-origin redirect keeps the header
+      // (idempotent), and a cross-origin redirect just dropped it above, so it
+      // is re-added only if the new destination is itself internal.
+      applyGatewayTrustHeader(headers, next);
       target = next;
     }
   };
