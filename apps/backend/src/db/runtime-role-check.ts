@@ -4,6 +4,7 @@ import { emit } from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
 import { auditPool } from "./audit-db";
+import { gatewayEventsPool } from "./gateway-events-db";
 import { pool } from "./index";
 import type { RuntimeConnection } from "./runtime-connection";
 import { resolveRuntimeConnection } from "./runtime-connection";
@@ -19,10 +20,14 @@ import { resolveRuntimeConnection } from "./runtime-connection";
  * server, over the same pools the request path uses, rather than re-reading
  * the environment and believing it.
  *
- * Both pools are checked. They resolve the connection independently (see
- * ./audit-db), and the audit pool is the one whose privilege the whole feature
- * is about — a check that covered only the main pool would miss exactly the
- * regression that matters.
+ * All three request-path pools are checked: the main pool, the audit pool and
+ * the gateway-events pool. They resolve the connection independently (see
+ * ./audit-db and ./gateway-events-db), so a regression that repointed one and
+ * not the others would otherwise pass here. The audit and gateway-events pools
+ * are the ones whose privilege the whole feature is about: both front an
+ * append-only table whose immutability depends on the credential being
+ * NOSUPERUSER, so a check that covered only the main pool would miss exactly
+ * the regression that matters.
  */
 
 interface RoleFacts {
@@ -143,13 +148,15 @@ export async function verifyRuntimeDatabaseRole(): Promise<void> {
   }
 
   // `allSettled`, not `all`. Under `all` the first rejection discards the
-  // other pool's result, and the pool most likely to fail its query is the
-  // audit pool (`max: 2`, 1s checkout timeout) — so a transient timeout there
-  // would suppress the main pool's answer too and the boot log would carry one
-  // generic error instead of the privilege facts it exists to report.
+  // other pools' results, and the pools most likely to fail their query are
+  // the audit and gateway-events pools (`max: 2`, 1s checkout timeout), so a
+  // transient timeout on one would suppress the others' answers too and the
+  // boot log would carry one generic error instead of the privilege facts it
+  // exists to report.
   const checks: [string, Pool][] = [
     ["main pool", pool],
     ["audit pool", auditPool],
+    ["gateway-events pool", gatewayEventsPool],
   ];
   const results = await Promise.allSettled(
     checks.map(([label, target]) => checkPool(label, target, connection)),
