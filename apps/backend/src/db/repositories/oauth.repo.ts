@@ -16,6 +16,7 @@ import {
   oauthAccessTokensTable,
   oauthAuthorizationCodesTable,
   oauthClientsTable,
+  oauthRotatedRefreshTokensTable,
   usersTable,
 } from "../schema";
 
@@ -236,6 +237,11 @@ export class OAuthRepository {
   async setAccessToken(
     token: string,
     data: OAuthAccessTokenCreateInput & {
+      // The refresh-token family this pair belongs to (migration 0037). The
+      // caller passes a fresh id for an authorization_code grant and the
+      // rotated row's id for a refresh grant, so a whole chain shares one
+      // family and reuse of any rotated member can revoke it.
+      family_id: string;
       // The refresh token and its expiry travel together as one optional pair,
       // not as two independent optionals. A token stored with a refresh token
       // but a NULL expiry escapes every reaper predicate in cleanupExpired and
@@ -255,6 +261,7 @@ export class OAuthRepository {
       user_id: data.user_id,
       scope: data.scope,
       expires_at: new Date(data.expires_at),
+      family_id: data.family_id,
       // The refresh token is hashed the same way; its expiry travels with it
       // as one pair (see migration 0035).
       refresh_token: data.refresh ? hashApiKey(data.refresh.token) : null,
@@ -354,6 +361,79 @@ export class OAuthRepository {
     return result[0] || null;
   }
 
+  // ===== Refresh-token family reuse detection (migration 0037) =====
+
+  // Record a refresh token that has just been rotated OUT, so a later
+  // presentation of it is detectable as reuse. Takes the STORED hash directly
+  // (the caller holds the row from getByRefreshToken, whose refresh_token is
+  // already the digest), not the plaintext — re-hashing a hash would key the
+  // marker on a value no lookup can reproduce. onConflictDoNothing so a second
+  // rotation of the same token (a concurrent refresh) is a no-op rather than a
+  // primary-key crash. expires_at is the rotated token's own expiry, so
+  // cleanupExpired reaps the marker with the family.
+  async recordRotatedRefreshToken(data: {
+    refreshTokenHash: string;
+    familyId: string;
+    clientId: string;
+    userId: string;
+    expiresAt: Date;
+  }): Promise<void> {
+    await db
+      .insert(oauthRotatedRefreshTokensTable)
+      .values({
+        refresh_token_hash: data.refreshTokenHash,
+        family_id: data.familyId,
+        client_id: data.clientId,
+        user_id: data.userId,
+        expires_at: data.expiresAt,
+      })
+      .onConflictDoNothing();
+  }
+
+  // Look up a rotated-out refresh token by the PLAINTEXT presented value
+  // (hashes it to match the stored digest, mirroring getByRefreshToken). A hit
+  // means the presented token is not a live token but WAS rotated out of this
+  // family — i.e. reuse. Returns the owning family/client/user so the refresh
+  // grant can revoke and attribute it; null when the token was never issued.
+  async getRotatedRefreshToken(refreshToken: string) {
+    const result = await db
+      .select({
+        family_id: oauthRotatedRefreshTokensTable.family_id,
+        client_id: oauthRotatedRefreshTokensTable.client_id,
+        user_id: oauthRotatedRefreshTokensTable.user_id,
+      })
+      .from(oauthRotatedRefreshTokensTable)
+      .where(
+        eq(
+          oauthRotatedRefreshTokensTable.refresh_token_hash,
+          hashApiKey(refreshToken),
+        ),
+      )
+      .limit(1);
+    return result[0] || null;
+  }
+
+  // Revoke an entire refresh-token family on reuse detection. Deletes the
+  // family's LIVE access-token rows (the revocation the operator needs — every
+  // token in the chain stops working) and its rotated-token markers (so a
+  // replay of the stolen token after revocation takes the plain unknown-token
+  // path and re-emits nothing: one reuse audit row per family compromise). The
+  // live delete runs first and returns a count, so the caller can log how many
+  // tokens the compromise cost. Deleting the markers is not gated on the live
+  // delete because a family can be reused after its live rows already lapsed.
+  async revokeFamily(familyId: string): Promise<number> {
+    const revoked = await db
+      .delete(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.family_id, familyId))
+      .returning({ access_token: oauthAccessTokensTable.access_token });
+
+    await db
+      .delete(oauthRotatedRefreshTokensTable)
+      .where(eq(oauthRotatedRefreshTokensTable.family_id, familyId));
+
+    return revoked.length;
+  }
+
   // ===== Cleanup =====
 
   async cleanupExpired(): Promise<void> {
@@ -380,6 +460,13 @@ export class OAuthRepository {
             isNull(oauthAccessTokensTable.refresh_token),
           ),
         ),
+      // Rotated-out refresh-token markers (migration 0037) expire WITH the
+      // family: expires_at is the rotated token's own expiry, so a marker for a
+      // family that was never reused dissolves here on its own. A family that IS
+      // reused is collapsed at detection time by revokeFamily instead.
+      db
+        .delete(oauthRotatedRefreshTokensTable)
+        .where(lt(oauthRotatedRefreshTokensTable.expires_at, now)),
     ]);
   }
 }

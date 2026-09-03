@@ -210,6 +210,7 @@ async function seed() {
     expires_at: past(2 * DAY),
     refresh_token: "retention-itest-refresh",
     refresh_token_expires_at: future(300 * DAY),
+    family_id: "bbbbbbbb-0000-0000-0000-000000000001",
     created_at: past(30 * DAY),
   });
 

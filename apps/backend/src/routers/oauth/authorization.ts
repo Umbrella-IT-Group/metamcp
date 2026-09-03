@@ -786,6 +786,14 @@ authorizationRouter.get("/oauth/callback", async (req, res) => {
 
       // Code exists and is valid, redirect back to the original redirect_uri
       const redirectUrl = new URL(codeData.redirect_uri);
+      // RFC 9207: the metadata advertises
+      // authorization_response_iss_parameter_supported, so EVERY
+      // code-bearing authorization response must carry the issuer, this
+      // legacy forwarder included, or a client that validates iss rejects
+      // the code it just received. Through getIssuerIdentifier, the same
+      // helper the AS metadata `issuer` and the consent-decision redirect
+      // use, so the three can never disagree.
+      redirectUrl.searchParams.set("iss", getIssuerIdentifier(req));
       redirectUrl.searchParams.set("code", code as string);
       if (state) {
         redirectUrl.searchParams.set("state", state as string);
