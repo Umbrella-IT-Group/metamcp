@@ -108,14 +108,14 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # Login, tag metadata, and attestation only make sense on the push
       # path — a PR build never touches the registry, so there's nothing
       # to authenticate, tag, or attest.
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         if: github.event_name == 'push'
         with:
           registry: ${{ env.REGISTRY }}
@@ -124,7 +124,7 @@ jobs:
 
       - id: meta
         if: github.event_name == 'push'
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -132,7 +132,7 @@ jobs:
             type=sha,prefix=,format=long
 
       - id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           # The deploy host is amd64-only; arm64 cross-build doubles CI time
@@ -149,7 +149,7 @@ jobs:
           cache-from: type=gha,scope=metamcp-umbrella
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=metamcp-umbrella' || '' }}
 
-      - uses: actions/attest-build-provenance@v1
+      - uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
         if: github.event_name == 'push'
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
