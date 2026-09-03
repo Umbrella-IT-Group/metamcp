@@ -3,6 +3,7 @@ import helmet from "helmet";
 
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
@@ -153,6 +154,13 @@ async function start(): Promise<void> {
     // doesn't crash the gateway on boot.
     logger.error("Auto-nuke: unexpected error (ignored):", err);
   }
+
+  // Surface any pre-existing endpoint left in the unpaired state
+  // (restricted=true, require_scoped_api_key=false) so an operator can close
+  // the still-open API-key path deliberately. Non-fatal and self-swallowing;
+  // see ./lib/endpoint-pairing-check for why these rows are warned about rather
+  // than auto-migrated.
+  await warnOnUnpairedRestrictedEndpoints();
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);

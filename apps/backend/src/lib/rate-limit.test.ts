@@ -313,62 +313,78 @@ describe("SlidingWindowRateLimiting.cleanup -- eviction sweep", () => {
 });
 
 /**
- * The token-bucket path treated an absent limiter as rate-limited and
- * answered a spurious 503. A namespace with no created limiter must pass
- * through; a created, over-budget limiter must still refuse.
+ * The token-bucket path is the per-credential tool-call ceiling. It must
+ * enforce whether or not a background idle session exists (the old code only
+ * enforced while some existed, so the ceiling was silently off in the common
+ * no-idle-session steady state), key its bucket per credential rather than per
+ * namespace (so one busy credential cannot drain another's budget on a shared
+ * endpoint), and treat a non-positive budget as inert rather than refusing
+ * every request.
  */
 describe("RateLimiting.onRequest -- token bucket", () => {
-  const idleSessions = (status: string, hasUser: boolean) => {
-    const perNamespace = {
-      get: (k: string) => (k === "status" ? status : undefined),
-      has: () => hasUser,
-      set: vi.fn(),
-    };
-    const map = new Map<string, any>([[NAMESPACE_UUID, perNamespace]]);
+  // Empty idle-session map on every case: the ceiling must still bite.
+  beforeEach(() => {
     (
       mcpServerPool.getBackgroundIdleSessionsByNamespace as unknown as ReturnType<
         typeof vi.fn
       >
-    ).mockReturnValue(map);
-  };
+    ).mockReturnValue(new Map());
+  });
 
-  const tokenBucketContext = () => ({
+  const ctx = (
+    endpointOverrides: Record<string, unknown> = {},
+    apiKeyUuid = "key-A",
+  ) => ({
     req: {
+      authMethod: "api_key",
+      apiKeyUuid,
       endpoint: {
         namespace_uuid: NAMESPACE_UUID,
-        user_id: "user-1",
-        max_rate: 0,
-        max_rate_seconds: 1,
+        max_rate: 2,
+        max_rate_seconds: 0, // no refill inside the test window
+        ...endpointOverrides,
       },
     },
   });
 
-  it("passes through when no limiter was created for the namespace", async () => {
-    // Idle sessions exist (size > 0) but this namespace is not "created", so no
-    // limiter is ever built. Before the fix this threw a spurious RateLimitError.
-    idleSessions("not-created", false);
-
+  it("passes through when max_rate is not positive (limiter inert)", async () => {
     const rl = new RateLimiting();
     const callNext = vi.fn().mockResolvedValue("ok");
 
     await expect(
-      rl.onRequest(tokenBucketContext() as any, callNext),
+      rl.onRequest(ctx({ max_rate: 0 }) as any, callNext),
     ).resolves.toBe("ok");
     expect(callNext).toHaveBeenCalledTimes(1);
   });
 
-  it("still refuses when a created limiter is over budget", async () => {
-    // status "created" + user not yet initialized -> a limiter is created; a
-    // zero-capacity bucket refuses the first consume, proving enforcement is
-    // intact after the missing-limiter guard.
-    idleSessions("created", false);
-
+  it("enforces the ceiling with no background idle sessions present", async () => {
     const rl = new RateLimiting();
     const callNext = vi.fn().mockResolvedValue("ok");
 
+    // Capacity 2: two pass, the third is refused -- and no idle session was
+    // ever mocked, proving enforcement no longer depends on the idle gate.
+    await rl.onRequest(ctx() as any, callNext);
+    await rl.onRequest(ctx() as any, callNext);
+    await expect(rl.onRequest(ctx() as any, callNext)).rejects.toThrow(
+      RateLimitError,
+    );
+    expect(callNext).toHaveBeenCalledTimes(2);
+  });
+
+  it("keys the bucket per credential: one credential's burst does not spend another's", async () => {
+    const rl = new RateLimiting();
+    const callNext = vi.fn().mockResolvedValue("ok");
+
+    // key-A exhausts its own capacity-2 bucket.
+    await rl.onRequest(ctx({}, "key-A") as any, callNext);
+    await rl.onRequest(ctx({}, "key-A") as any, callNext);
     await expect(
-      rl.onRequest(tokenBucketContext() as any, callNext),
+      rl.onRequest(ctx({}, "key-A") as any, callNext),
     ).rejects.toThrow(RateLimitError);
-    expect(callNext).not.toHaveBeenCalled();
+
+    // key-B, on the same namespace, still has a full bucket.
+    await expect(rl.onRequest(ctx({}, "key-B") as any, callNext)).resolves.toBe(
+      "ok",
+    );
   });
 });

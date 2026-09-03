@@ -23,6 +23,17 @@ import { emitAdminEvent } from "../lib/audit/admin-event";
 
 const apiKeysRepository = new ApiKeysRepository();
 
+// Conservative default per-credential tool-call budget applied when a new
+// endpoint enables rate limiting without specifying numbers. In the token-bucket
+// limiter (lib/rate-limit.ts) `max_rate` is the bucket CAPACITY (burst) and
+// `max_rate_seconds` is the REFILL rate in tokens per second, one token per
+// data-plane request, so this is a 600-request burst refilling at ~60/sec
+// (~3600/min) PER CREDENTIAL PER NAMESPACE. That is far above real
+// interactive/agent usage (single-digit requests/sec); it exists to bound a
+// runaway loop, not to shape normal traffic, and operators tune it per endpoint.
+const DEFAULT_ENDPOINT_MAX_RATE = 600;
+const DEFAULT_ENDPOINT_MAX_RATE_SECONDS = 60;
+
 export const endpointsImplementations = {
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
@@ -39,9 +50,15 @@ export const endpointsImplementations = {
         };
       }
 
-      // Determine user ownership based on input.user_id or default to current user
+      // Ownership defaults to PRIVATE (the creating admin) unless the caller
+      // opts in to public. `undefined` (the caller said nothing) resolves to
+      // the creator's id; an explicit `null` is the deliberate
+      // publish-to-everyone flag. A new endpoint reachable by every
+      // authenticated user the instant it is created is the open-by-default
+      // exposure this closes; making public an explicit choice means an
+      // operator has to ASK for it rather than get it by omission.
       const effectiveUserId =
-        input.user_id !== undefined ? input.user_id : null;
+        input.user_id !== undefined ? input.user_id : userId;
       const isPublicEndpoint = effectiveUserId === null;
 
       // Validate namespace accessibility and relationship rules
@@ -71,6 +88,30 @@ export const endpointsImplementations = {
         };
       }
 
+      // Enforce the restricted => require_scoped_api_key pairing at the source.
+      // `restricted` gates OAuth callers only; `require_scoped_api_key` gates
+      // API-key callers. A restricted endpoint that still admits unscoped
+      // (gateway-wide) keys is confined on one plane and wide open on the
+      // other, so the two only actually restrict an endpoint when set together.
+      // We force the scoped-key requirement on rather than rejecting, so asking
+      // for restriction can never silently leave the API-key path open.
+      const restricted = input.restricted ?? false;
+      const requireScopedApiKey = restricted
+        ? true
+        : (input.requireScopedApiKey ?? false);
+
+      // A new endpoint gets a per-credential tool-call ceiling by default. When
+      // the flag is on but no budget was supplied, fall back to a conservative
+      // default so "enabled" always means an actually-enforcing limiter: the
+      // token bucket is inert at max_rate 0.
+      const enableMaxRate = input.enableMaxRate ?? true;
+      const maxRate = enableMaxRate
+        ? (input.maxRate ?? DEFAULT_ENDPOINT_MAX_RATE)
+        : input.maxRate;
+      const maxRateSeconds = enableMaxRate
+        ? (input.maxRateSeconds ?? DEFAULT_ENDPOINT_MAX_RATE_SECONDS)
+        : input.maxRateSeconds;
+
       logger.info(input);
 
       const result = await endpointsRepository.create({
@@ -78,11 +119,12 @@ export const endpointsImplementations = {
         description: input.description,
         namespace_uuid: input.namespaceUuid,
         enable_api_key_auth: input.enableApiKeyAuth ?? true,
-        require_scoped_api_key: input.requireScopedApiKey ?? false,
-        enable_max_rate: input.enableMaxRate ?? false,
+        require_scoped_api_key: requireScopedApiKey,
+        restricted,
+        enable_max_rate: enableMaxRate,
         enable_client_max_rate: input.enableClientMaxRate ?? false,
-        max_rate: input.maxRate,
-        max_rate_seconds: input.maxRateSeconds,
+        max_rate: maxRate,
+        max_rate_seconds: maxRateSeconds,
         client_max_rate: input.clientMaxRate,
         client_max_rate_seconds: input.clientMaxRateSeconds,
         client_max_rate_strategy: input.clientMaxRateStrategy,
@@ -190,7 +232,12 @@ export const endpointsImplementations = {
           namespace_uuid: input.namespaceUuid,
           owner_user_id: effectiveUserId,
           enable_api_key_auth: input.enableApiKeyAuth,
-          require_scoped_api_key: input.requireScopedApiKey,
+          // The enforced values, not the raw input: restriction forces the
+          // scoped-key requirement on, and the audit row records what actually
+          // took effect so a later "was this ever open" query is answered by
+          // the truth, not by what the caller asked for.
+          require_scoped_api_key: requireScopedApiKey,
+          restricted,
           enable_oauth: input.enableOauth,
         },
       });
@@ -401,13 +448,23 @@ export const endpointsImplementations = {
         };
       }
 
+      // A restricted endpoint must keep rejecting unscoped API keys, the same
+      // pairing enforced on create and at the restricted toggle. `restricted`
+      // is not editable through this form (it has its own tRPC procedure and
+      // audit event), so the endpoint's stored value is authoritative: an edit
+      // that tries to turn require_scoped_api_key off while the endpoint is
+      // restricted would re-open the API-key path the restriction exists to
+      // close, so it is forced back on here rather than obeyed.
+      const requireScopedApiKey =
+        existingEndpoint.restricted === true ? true : input.requireScopedApiKey;
+
       const result = await endpointsRepository.update({
         uuid: input.uuid,
         name: input.name,
         description: input.description,
         namespace_uuid: input.namespaceUuid,
         enable_api_key_auth: input.enableApiKeyAuth,
-        require_scoped_api_key: input.requireScopedApiKey,
+        require_scoped_api_key: requireScopedApiKey,
         enable_max_rate: input.enableMaxRate ?? false,
         enable_client_max_rate: input.enableClientMaxRate ?? false,
         max_rate: input.maxRate,
@@ -431,7 +488,10 @@ export const endpointsImplementations = {
           name: result.name,
           namespace_uuid: input.namespaceUuid,
           enable_api_key_auth: input.enableApiKeyAuth,
-          require_scoped_api_key: input.requireScopedApiKey,
+          // The enforced value, not the raw input: an attempt to unset this on
+          // a restricted endpoint is coerced back on above, and the audit row
+          // records what actually took effect.
+          require_scoped_api_key: requireScopedApiKey,
           enable_oauth: input.enableOauth,
         },
       });

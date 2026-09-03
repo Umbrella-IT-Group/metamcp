@@ -152,5 +152,7 @@
     "noResults": "No results."
   },
   "requireScopedApiKey": "Require Endpoint-Scoped API Keys",
-  "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys. Applies to API-key auth only — OAuth access is unaffected."
+  "requireScopedApiKeyDescription": "Only accept API keys scoped to this endpoint; reject gateway-wide (unscoped) keys. Applies to API-key auth only — OAuth access is unaffected.",
+  "restrictedLabel": "Restrict to access groups",
+  "restrictedDescription": "When on, only administrators and members of a mapped access group reach this endpoint over OAuth. Turning it on also requires endpoint-scoped API keys, so unscoped gateway-wide keys are rejected too."
 }

@@ -4,6 +4,7 @@
 import logger from "../utils/logger";
 import { CLIENT_IP_HEADER, resolveClientIp } from "./client-ip";
 import { mcpServerPool } from "./metamcp/mcp-server-pool";
+import { resolveSessionIdentity } from "./metamcp/session-auth";
 
 type Context = Record<string, any>;
 type CallNext = (context: Context) => Promise<any>;
@@ -113,54 +114,62 @@ export class SlidingWindowRateLimiter {
 }
 
 /**
- * Rate limiting (token bucket).
+ * Rate limiting (token bucket): the per-credential tool-call ceiling on the
+ * data plane.
+ *
+ * `max_rate` is the bucket CAPACITY (burst) and `max_rate_seconds` is the
+ * REFILL rate in tokens per second, one token per data-plane request. The
+ * middleware only invokes this when the endpoint has `enable_max_rate` set; a
+ * non-positive `max_rate` then makes it inert (nothing to enforce) rather than
+ * refusing every request.
+ *
+ * TWO deliberate departures from the earlier shape:
+ *
+ *  - It enforces INDEPENDENTLY of the background-idle-session gate. The old
+ *    code only built and consumed a limiter while `getBackgroundIdleSessions`
+ *    was non-empty, so on a gateway with no warmed idle sessions (the common
+ *    steady state), the ceiling silently did nothing and authenticated tool
+ *    calls were unbounded.
+ *
+ *  - The bucket is keyed PER CREDENTIAL within the namespace, not per
+ *    namespace. A shared per-namespace bucket lets one busy credential drain
+ *    the budget for every other consumer of the same endpoint, the
+ *    noisy-neighbour availability class this quota exists to bound. The map is
+ *    keyed on the api-key uuid or OAuth user id (bounded, admin-controlled
+ *    values, so the map cannot be grown per-request by a caller); an anonymous
+ *    endpoint has no per-caller identity, so all its callers share one bucket.
  */
 export class RateLimiting {
-  private maxRateSeconds: number;
-  private maxRate: number;
   private limiters: Map<string, TokenBucketRateLimiter>;
 
   constructor() {
-    this.maxRateSeconds = 0;
-    this.maxRate = 0;
     this.limiters = new Map();
   }
 
   async onRequest(context: Context, callNext: CallNext): Promise<any> {
     const { endpoint } = context.req;
-    const { user_id, namespace_uuid } = endpoint;
-    const backgroundIdleSessions =
-      mcpServerPool.getBackgroundIdleSessionsByNamespace();
-    let limiter = this.limiters.get(namespace_uuid);
+    const { namespace_uuid } = endpoint;
 
-    this.maxRateSeconds = endpoint.max_rate_seconds ?? 0;
-    this.maxRate = endpoint.max_rate ?? 0;
+    const maxRate = endpoint.max_rate ?? 0;
+    const refillPerSecond = endpoint.max_rate_seconds ?? 0;
 
-    if (backgroundIdleSessions.size > 0) {
-      if (
-        backgroundIdleSessions.get(namespace_uuid)?.get("status") === "created"
-      ) {
-        if (!backgroundIdleSessions.get(namespace_uuid)?.has(user_id)) {
-          backgroundIdleSessions
-            .get(namespace_uuid)
-            ?.set(user_id, "initialized");
-          if (!limiter) {
-            this.limiters.set(
-              namespace_uuid,
-              new TokenBucketRateLimiter(this.maxRate, this.maxRateSeconds),
-            );
-            limiter = this.limiters.get(namespace_uuid);
-          }
-        }
+    // A non-positive budget is a no-op: there is nothing to enforce, so pass
+    // rather than refuse. (A zero-capacity bucket that refuses every request is
+    // the spurious-503 failure mode the data plane already fought elsewhere.)
+    if (maxRate > 0) {
+      const identity = resolveSessionIdentity(context.req);
+      const credentialKey =
+        identity.credentialId !== null
+          ? `${identity.method}:${identity.credentialId}`
+          : "anonymous";
+      const key = `${namespace_uuid}::${credentialKey}`;
+
+      let limiter = this.limiters.get(key);
+      if (!limiter) {
+        limiter = new TokenBucketRateLimiter(maxRate, refillPerSecond);
+        this.limiters.set(key, limiter);
       }
-
-      // A missing limiter is a PASS, not a refusal. A limiter is created only
-      // in the narrow branch above (namespace status "created", first call for
-      // this user), so a namespace that never entered it has none -- and
-      // `await undefined?.consume()` is `undefined`, which the old `!allowed`
-      // read as rate-limited and answered with a spurious 503. Guard on the
-      // limiter existing so only a real over-budget consume refuses.
-      if (limiter && !(await limiter.consume())) {
+      if (!(await limiter.consume())) {
         throw new RateLimitError(`Rate limit exceeded`);
       }
     }

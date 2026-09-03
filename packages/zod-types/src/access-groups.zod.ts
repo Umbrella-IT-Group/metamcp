@@ -71,9 +71,15 @@ export const AccessGroupEndpointSchema = z.object({
   // `restricted` alone is not enough to answer that question. The gate governs
   // OAuth callers only, so it is inert on an endpoint with `enable_oauth` off,
   // and only partial on one that also accepts API keys. The badge needs all
-  // three to be honest.
+  // four to be honest.
   enable_oauth: z.boolean(),
   enable_api_key_auth: z.boolean(),
+  // Whether the API-key plane is closed to unscoped gateway-wide keys. A
+  // restricted endpoint forces this on (see the endpoint create/update pairing),
+  // so a restricted endpoint that also accepts API keys is scoped-only, not
+  // wide open: the badge reads that as enforcing rather than as a bypass. Only
+  // a legacy row from before the pairing can be restricted with this still off.
+  require_scoped_api_key: z.boolean(),
 });
 
 export const AccessGroupDetailSchema = AccessGroupSchema.extend({
@@ -137,6 +143,10 @@ export const EndpointAccessSchema = z.object({
   restricted: z.boolean(),
   enable_oauth: z.boolean(),
   enable_api_key_auth: z.boolean(),
+  // Carried so the panel can stop claiming "every API-key holder still passes"
+  // once the pairing has closed the unscoped path: a restricted endpoint forces
+  // this on, so the note only fires on a legacy row where it is still off.
+  require_scoped_api_key: z.boolean(),
   groups: z.array(
     z.object({
       uuid: z.string(),
