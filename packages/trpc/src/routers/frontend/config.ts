@@ -235,7 +235,15 @@ export const createConfigRouter = (implementations: {
         return await implementations.setSessionLifetime(input, auditActor(ctx));
       }),
 
-    getAllConfigs: protectedProcedure.query(async () => {
+    // Admin only. Unlike the individually-gated getters above, this returns
+    // the ENTIRE config table in one unfiltered read, and every paired write
+    // in this router is `adminProcedure`. A call-site sweep of `apps/frontend`
+    // found no consumer at all — the settings page reads each value through
+    // its named getter, never this — so gating it removes a member-level
+    // whole-table read with no UI impact. Left on `protectedProcedure`, a
+    // future sensitive config key would leak to every member automatically
+    // the moment it was added.
+    getAllConfigs: adminProcedure.query(async () => {
       return await implementations.getAllConfigs();
     }),
 

@@ -81,7 +81,11 @@ export const executeToolWithMiddleware = async (
     // Return the result directly (simplified format)
     res.json(result);
   } catch (error) {
-    logger.error(`Error executing tool ${toolName}:`, error);
+    // JSON.stringify the caller-controlled tool name before it enters a log
+    // line: `tool_name` is a URL-decoded path segment, so an embedded CR/LF
+    // would forge whole log lines. Same discipline as the mcp-proxy
+    // connection log.
+    logger.error(`Error executing tool ${JSON.stringify(toolName)}:`, error);
 
     // Handle different types of errors
     if (error instanceof Error) {

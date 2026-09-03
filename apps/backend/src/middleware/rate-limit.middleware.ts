@@ -11,6 +11,18 @@ import {
 const slidingWindowRateLimit = new SlidingWindowRateLimiting();
 const tokenBucketRateLimit = new RateLimiting();
 
+// Sweep the per-client sliding-window map every 10 minutes so it cannot grow
+// unbounded for the life of the process. `unref` for the same reason as the
+// auth limiter's sweep: this is housekeeping and must never keep the event
+// loop (or a test that merely imports this module) alive. Mirrors
+// lib/auth-rate-limiter's timer.
+setInterval(
+  () => {
+    slidingWindowRateLimit.cleanup();
+  },
+  10 * 60 * 1000,
+).unref();
+
 interface RateLimitOptions extends express.Request {
   endpoint: DatabaseEndpoint;
 }

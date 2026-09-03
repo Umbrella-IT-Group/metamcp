@@ -190,7 +190,7 @@ sseRouter.get(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
 
@@ -253,7 +253,10 @@ sseRouter.get(
       await mcpServerInstance.server.connect(webAppTransport);
     } catch (error) {
       logger.error("Error in public endpoint /sse route:", error);
-      res.status(500).json(error);
+      // Constant body via the terminal error handler (middleware/error-handler)
+      // instead of serializing the raw error object to the client; it also
+      // destroys an already streaming SSE socket correctly.
+      return next(error);
     }
   },
 );
@@ -263,7 +266,7 @@ sseRouter.post(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
 
     try {
@@ -300,7 +303,9 @@ sseRouter.post(
       );
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);
-      res.status(500).json(error);
+      // Constant body via the terminal error handler instead of serializing
+      // the raw error object to the client.
+      return next(error);
     }
   },
 );

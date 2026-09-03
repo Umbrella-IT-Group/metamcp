@@ -3,7 +3,6 @@ import {
   OAuthClientInformation,
   OAuthClientInformationSchema,
   OAuthClientMetadata,
-  OAuthMetadata,
   OAuthTokens,
   OAuthTokensSchema,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
@@ -227,52 +226,10 @@ class DbOAuthClientProvider implements OAuthClientProvider {
   }
 }
 
-// Debug version that overrides redirect URL and allows saving server OAuth metadata
-export class DebugDbOAuthClientProvider extends DbOAuthClientProvider {
-  get redirectUrl(): string {
-    return getAppUrl() + "/fe-oauth/callback/debug";
-  }
-
-  saveServerMetadata(metadata: OAuthMetadata) {
-    const key = getServerSpecificKey(
-      SESSION_KEYS.SERVER_METADATA,
-      this.serverUrl,
-    );
-    sessionStorage.setItem(key, JSON.stringify(metadata));
-  }
-
-  getServerMetadata(): OAuthMetadata | null {
-    const key = getServerSpecificKey(
-      SESSION_KEYS.SERVER_METADATA,
-      this.serverUrl,
-    );
-    const metadata = sessionStorage.getItem(key);
-    if (!metadata) {
-      return null;
-    }
-    return JSON.parse(metadata);
-  }
-
-  clear() {
-    super.clear();
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.SERVER_METADATA, this.serverUrl),
-    );
-  }
-}
-
 // Factory function to create an OAuth provider for a specific MCP server
 export function createAuthProvider(
   mcpServerUuid: string,
   serverUrl: string,
 ): DbOAuthClientProvider {
   return new DbOAuthClientProvider(mcpServerUuid, serverUrl);
-}
-
-// Factory function to create a debug OAuth provider for a specific MCP server
-export function createDebugAuthProvider(
-  mcpServerUuid: string,
-  serverUrl: string,
-): DebugDbOAuthClientProvider {
-  return new DebugDbOAuthClientProvider(mcpServerUuid, serverUrl);
 }

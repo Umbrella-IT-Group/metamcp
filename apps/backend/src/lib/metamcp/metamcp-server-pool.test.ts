@@ -54,6 +54,9 @@ vi.mock("@/utils/logger", () => ({
   },
 }));
 
+import logger from "@/utils/logger";
+
+import { configService } from "../config.service";
 import { MetaMcpServerPool } from "./metamcp-server-pool";
 
 // The constructor is private (singleton); a fresh instance per test so
@@ -216,5 +219,50 @@ describe("MetaMcpServerPool.cleanupSession — maps drop even when cleanup throw
   it("no-ops on an unknown sessionId", async () => {
     await pool.cleanupSession("missing");
     expect(backendCleanupSessionMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("MetaMcpServerPool.cleanupExpiredSessions -- session ids stay out of the info log", () => {
+  let pool: MetaMcpServerPool;
+  let internals: PoolInternals;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    backendCleanupSessionMock.mockResolvedValue(undefined);
+    pool = new PoolConstructor();
+    internals = pool as never;
+  });
+
+  it("logs a COUNT at info and the ids only at debug", async () => {
+    // Age-based cleanup used to join every expired session id into the info
+    // line, re-leaking the exact ids the round-1 payload sweep stripped. The
+    // count belongs at info; the ids drop to debug.
+    vi.mocked(configService.getSessionLifetime).mockResolvedValue(1000);
+    internals.sessionTimestamps["sess-secret-aaa"] = Date.now() - 60_000;
+    internals.sessionTimestamps["sess-secret-bbb"] = Date.now() - 60_000;
+
+    await (
+      pool as unknown as { cleanupExpiredSessions: () => Promise<void> }
+    ).cleanupExpiredSessions();
+
+    const infoLines = vi
+      .mocked(logger.info)
+      .mock.calls.map((c) => String(c[0]));
+    const cleanupLine = infoLines.find((l) =>
+      l.includes("expired MetaMCP server pool sessions"),
+    );
+    expect(cleanupLine).toBeDefined();
+    expect(cleanupLine).toContain("2 expired");
+    expect(cleanupLine).not.toContain("sess-secret");
+
+    const debugLines = vi
+      .mocked(logger.debug)
+      .mock.calls.map((c) => String(c[0]));
+    const idLine = debugLines.find((l) =>
+      l.includes("Expired MetaMCP server pool session ids"),
+    );
+    expect(idLine).toBeDefined();
+    expect(idLine).toContain("sess-secret-aaa");
+    expect(idLine).toContain("sess-secret-bbb");
   });
 });
