@@ -235,11 +235,13 @@ describe("computeReconnectBackoffMs — exponential backoff schedule", () => {
 });
 
 describe("createMetaMcpClient — STREAMABLE_HTTP transport option wiring", () => {
-  // The M365 injected-fetch wiring restructured this branch; these
-  // cases pin the four header/injection combinations so non-injected
-  // servers provably keep their pre-change transport shape. Reading
-  // SDK privates (_requestInit/_fetch) follows the precedent set by
-  // transport-recovery-hydration.ts.
+  // The pool now routes EVERY remote backend through the guarded, pinned
+  // fetch, so unlike before, a custom `fetch` and a `requestInit` are always
+  // installed regardless of headers or M365 injection. These cases pin that
+  // new shape: the guarded fetch is always present, headers are carried in
+  // requestInit, and an injected server still gets its injecting wrapper (over
+  // the guarded fetch). Reading SDK privates (_requestInit/_fetch) follows the
+  // precedent set by transport-recovery-hydration.ts.
   const baseParams = {
     uuid: "srv-uuid",
     name: "some-server",
@@ -267,14 +269,16 @@ describe("createMetaMcpClient — STREAMABLE_HTTP transport option wiring", () =
     return internals;
   }
 
-  it("no headers, non-injected server: no requestInit, no custom fetch", () => {
+  it("no headers, non-injected server: guarded fetch installed", () => {
     vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
     const internals = transportInternals({ name: "autotask" });
-    expect(internals._requestInit).toBeUndefined();
-    expect(internals._fetch).toBeUndefined();
+    // requestInit is always set now (headers may be empty), and the guarded
+    // fetch is always installed so the pool no longer dials with raw fetch.
+    expect(internals._requestInit).toBeDefined();
+    expect(typeof internals._fetch).toBe("function");
   });
 
-  it("bearer/header server, non-injected: requestInit carries auth, no custom fetch", () => {
+  it("bearer/header server, non-injected: requestInit carries auth, guarded fetch installed", () => {
     vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
     const internals = transportInternals({
       name: "autotask",
@@ -284,13 +288,13 @@ describe("createMetaMcpClient — STREAMABLE_HTTP transport option wiring", () =
     const headers = internals._requestInit?.headers as Record<string, string>;
     expect(headers.Authorization).toBe("Bearer static-token");
     expect(headers["X-Custom"]).toBe("yes");
-    expect(internals._fetch).toBeUndefined();
+    expect(typeof internals._fetch).toBe("function");
   });
 
   it("injected server: custom fetch installed even with no headers", () => {
     vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
     const internals = transportInternals({ name: "m365" });
-    expect(internals._requestInit).toBeUndefined();
+    expect(internals._requestInit).toBeDefined();
     expect(typeof internals._fetch).toBe("function");
   });
 

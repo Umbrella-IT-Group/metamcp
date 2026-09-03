@@ -1,4 +1,5 @@
 import express from "express";
+import helmet from "helmet";
 
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
@@ -50,6 +51,19 @@ app.use(auditContextMiddleware);
 // real ones were deleted. See that module's header for what each lane does and
 // why the OAuth skip is what makes the 256kb router limit bind at all.
 app.use(globalBodyParser);
+
+// App-wide security response headers, ahead of every router. helmet was only
+// mounted per-router on /trpc and /mcp-proxy, so the /api/auth relay (which
+// answers with the session cookie), /health, /metamcp and the OAuth surface
+// each carried whatever the framework left behind: no nosniff, no frame
+// denial, no default CSP. Mounting it here gives them all the same baseline in
+// one place. It sits BEFORE the routers on purpose: the OAuth router's own
+// securityHeaders and the per-router helmet still run afterwards and override
+// the specific headers they set (X-Frame-Options DENY, the OAuth CSP), so this
+// only fills the gaps and never weakens their tighter values. It does not touch
+// the request body or CORS, so the deliberate /api/auth CORS policy mounted
+// below is unaffected.
+app.use(helmet());
 
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);

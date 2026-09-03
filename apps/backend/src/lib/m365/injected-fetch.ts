@@ -73,11 +73,20 @@ const injectedFetchSingleton: FetchLike = makeM365InjectedFetch();
  * The `client.ts` wiring hook: returns the injected fetch when (and
  * only when) `serverName` is configured for M365 delegated injection.
  * Env is read per call — cheap, and keeps tests deterministic.
+ *
+ * `baseFetch` composes the injection over another fetch (the pool's guarded,
+ * pinned fetch): injection sets the per-user Authorization, then delegates the
+ * actual connection to `baseFetch`. Omitted, the singleton over the global
+ * fetch is returned, preserving the previous behaviour.
  */
 export function getInjectedFetchForServer(
   serverName: string,
+  baseFetch?: FetchLike,
 ): FetchLike | undefined {
-  return getInjectedServerNames().has(serverName)
-    ? injectedFetchSingleton
-    : undefined;
+  if (!getInjectedServerNames().has(serverName)) {
+    return undefined;
+  }
+  return baseFetch
+    ? makeM365InjectedFetch(m365MintService, baseFetch)
+    : injectedFetchSingleton;
 }

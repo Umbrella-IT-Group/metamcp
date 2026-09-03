@@ -2,7 +2,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  FetchLike,
+  Transport,
+} from "@modelcontextprotocol/sdk/shared/transport.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ServerParameters } from "@repo/zod-types";
 
@@ -19,6 +22,7 @@ import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed
 import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
+import { createGuardedFetch } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
 
 const sleep = (time: number) =>
@@ -230,6 +234,32 @@ export const transformDockerUrl = (url: string): string => {
   return url;
 };
 
+/**
+ * The guarded outbound fetch for the pooled data plane (SSE and
+ * Streamable-HTTP remote backends).
+ *
+ * Before this, the pool dialed remote backends with the raw global fetch: no
+ * address-range refusal, no redirect re-validation, no DNS pinning, no
+ * response-size or time cap, while the admin Inspector path already went
+ * through the shared url-guard. This closes that asymmetry for the pool.
+ *
+ * The pool's targets are DB-configured internal services, not caller-supplied
+ * URLs like the Inspector's, so `allowPrivateAddresses` permits the
+ * RFC-1918/loopback ranges where they live (the socket is still pinned to the
+ * resolved address and the cloud metadata address is still refused), and
+ * `refuseCrossOriginRedirect` rejects any redirect to another origin outright:
+ * a trusted backend never redirects the gateway elsewhere, and following one
+ * would carry the row's stored bearer to the redirect target, which is the
+ * SSRF vector this closes. The response byte ceiling and idle timeout come
+ * from the guard defaults (MCP_PROXY_MAX_RESPONSE_BYTES,
+ * MCP_PROXY_REQUEST_TIMEOUT_MS).
+ */
+const createPoolGuardedFetch = (): FetchLike =>
+  createGuardedFetch({
+    allowPrivateAddresses: true,
+    refuseCrossOriginRedirect: true,
+  });
+
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
 ): { client: Client | undefined; transport: Transport | undefined } => {
@@ -288,20 +318,22 @@ export const createMetaMcpClient = (
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
-    const hasHeaders = Object.keys(headers).length > 0;
-
-    if (!hasHeaders) {
-      transport = new SSEClientTransport(new URL(transformedUrl));
-    } else {
-      transport = new SSEClientTransport(new URL(transformedUrl), {
-        requestInit: {
-          headers,
-        },
-        eventSourceInit: {
-          fetch: (url, init) => fetch(url, { ...init, headers }),
-        },
-      });
-    }
+    // Every request this transport makes goes through the guarded, pinned
+    // fetch, not just the initial GET: the SSE POST back-channel targets the
+    // endpoint the REMOTE server advertises in its `endpoint` event, which is
+    // remote-controlled input the pool never sees otherwise. eventSourceInit
+    // .fetch takes precedence over the `fetch` option inside the SDK, so both
+    // are set for the stream GET and the back-channel POSTs to be covered.
+    const guardedFetch = createPoolGuardedFetch();
+    transport = new SSEClientTransport(new URL(transformedUrl), {
+      eventSourceInit: {
+        fetch: (url, init) => guardedFetch(url, { ...init, headers }),
+      },
+      requestInit: {
+        headers,
+      },
+      fetch: guardedFetch,
+    });
   } else if (serverParams.type === "STREAMABLE_HTTP" && serverParams.url) {
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
     const transformedUrl = transformDockerUrl(serverParams.url);
@@ -318,24 +350,30 @@ export const createMetaMcpClient = (
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
-    const hasHeaders = Object.keys(headers).length > 0;
+    // Guarded, pinned outbound fetch (see createPoolGuardedFetch), covering
+    // the transport's own reconnects and every redirect hop the one-shot
+    // connect check cannot reach.
+    const guardedFetch = createPoolGuardedFetch();
 
-    // M365 delegated broker: servers configured for per-user Graph
-    // token injection get a custom fetch that stamps a freshly minted
-    // per-user Authorization onto EVERY outgoing request (and strips
-    // any connection-level credential). Request-scoped — survives pool
-    // idle-handoff/cap-reuse without cross-user token leakage. See
+    // M365 delegated broker: servers configured for per-user Graph token
+    // injection get a fetch that stamps a freshly minted per-user
+    // Authorization onto EVERY outgoing request (and strips any
+    // connection-level credential), request-scoped so it survives pool
+    // idle-handoff/cap-reuse without cross-user token leakage. It wraps the
+    // guarded fetch: injection sets the header, then the guarded fetch
+    // validates + pins + caps the actual connection. See
     // `lib/m365/injected-fetch.ts` for the invariant.
-    const injectedFetch = getInjectedFetchForServer(serverParams.name);
+    const injectedFetch = getInjectedFetchForServer(
+      serverParams.name,
+      guardedFetch,
+    );
 
-    if (!hasHeaders && !injectedFetch) {
-      transport = new StreamableHTTPClientTransport(new URL(transformedUrl));
-    } else {
-      transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
-        ...(hasHeaders ? { requestInit: { headers } } : {}),
-        ...(injectedFetch ? { fetch: injectedFetch } : {}),
-      });
-    }
+    transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
+      requestInit: {
+        headers,
+      },
+      fetch: injectedFetch ?? guardedFetch,
+    });
   } else {
     metamcpLogStore.addLog(
       serverParams.name,
