@@ -163,8 +163,8 @@ export const apiKeysImplementations = {
     // single DB read.
     const apiKeyUserId = input.user_id !== undefined ? input.user_id : userId;
 
-    // Owner-must-be-admin at mint for an admin-plane key (foreman ruling). This
-    // is defense in depth, not the enforcement of record: the owner's role is
+    // Owner-must-be-admin at mint for an admin-plane key. This is
+    // defense in depth, not the enforcement of record: the owner's role is
     // re-read fresh per request at authentication, so a later demotion still
     // fails closed. Rejecting here keeps a useless-and-dangerous artifact, a
     // member-owned (or public) control-plane key, from being created at all. A

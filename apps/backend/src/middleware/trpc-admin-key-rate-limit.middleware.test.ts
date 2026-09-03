@@ -4,7 +4,7 @@
  *
  * It could fail to refuse a flood of failed admin-key verifications. It could
  * refuse the wrong caller — specifically a cookie-authenticated human carrying a
- * stale bearer, whom the foreman ruling says must NEVER draw a 429 (cookie
+ * stale bearer, who must NEVER draw a 429 (cookie
  * precedence). Or it could quietly COUNT valid traffic: this middleware only
  * CHECKS; the record happens in admin-plane-auth on a failed verification, so a
  * request passing through here must not move the counter. Each is pinned below.

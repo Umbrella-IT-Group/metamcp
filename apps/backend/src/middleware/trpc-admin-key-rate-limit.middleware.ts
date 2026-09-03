@@ -17,7 +17,7 @@ import {
  * record so a request costs exactly one count, the pattern lib/auth-rate-limiter
  * documents at length.
  *
- * COOKIE PRECEDENCE (foreman ruling): a request carrying a session cookie is
+ * COOKIE PRECEDENCE: a request carrying a session cookie is
  * skipped entirely, so a stale Authorization header on a cookie-authenticated
  * user can never draw a 429. createContext resolves the cookie first and never
  * reaches the bearer path for such a request, so it also never RECORDS a failure

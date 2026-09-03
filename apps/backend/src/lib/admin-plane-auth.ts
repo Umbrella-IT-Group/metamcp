@@ -38,7 +38,7 @@ import {
 const apiKeysRepository = new ApiKeysRepository();
 
 /**
- * Kill switch (foreman ruling): ADMIN_PLANE_TOKEN_AUTH_DISABLED disables the
+ * Kill switch: ADMIN_PLANE_TOKEN_AUTH_DISABLED disables the
  * bearer path process-wide for emergencies. Strict `"true"` only, unset, empty,
  * `1`, `yes` and `TRUE` are all OFF, matching ALLOW_UNAUTHENTICATED_ENDPOINTS
  * and the other security-gate env reads in this codebase, so a near-miss

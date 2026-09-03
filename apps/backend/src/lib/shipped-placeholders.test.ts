@@ -80,7 +80,7 @@ describe("isPlaceholderOrShortBootstrapPassword", () => {
     expect(isPlaceholderOrShortBootstrapPassword(undefined)).toBe(false);
   });
 
-  // Interim credential-hardening step for the CI-login rework: the bootstrap
+  // Interim credential-hardening step: the bootstrap
   // password floor was raised from 8 to 14. Pinned as a literal (not the
   // symbol) so a regression that lowers it fails here rather than silently
   // tracking the change.

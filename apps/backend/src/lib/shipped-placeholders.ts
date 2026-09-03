@@ -45,12 +45,11 @@ export const SHIPPED_PLACEHOLDER_AUTH_SECRET =
 
 /**
  * The floor a bootstrap administrator password must clear. Raised from 8 to 14
- * as the interim credential-hardening step for the CI-login rework (W2-3): while
- * CI still signs in with a password, that password is the bootstrap
- * administrator's, so the bootstrap floor is where a real length can be
- * required. Production REFUSES below it (not merely warns) via
- * `shouldRefuseBootstrapPasswordInProduction`; outside production it stays
- * warn-only so a throwaway local stack still boots.
+ * as an interim credential-hardening step: while a caller can still reach the
+ * gateway with the bootstrap administrator's password, the bootstrap floor is
+ * where a real length can be required. Production REFUSES below it (not merely
+ * warns) via `shouldRefuseBootstrapPasswordInProduction`; outside production it
+ * stays warn-only so a throwaway local stack still boots.
  */
 export const MIN_BOOTSTRAP_PASSWORD_LENGTH = 14;
 
