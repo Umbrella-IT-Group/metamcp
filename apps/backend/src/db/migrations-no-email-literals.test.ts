@@ -12,8 +12,7 @@
  * would change nothing an attacker has not already read while breaking every
  * deployed migration checksum. The guard is therefore forward-looking -- it
  * fences off every migration written after the current head so a NEW one
- * cannot reintroduce the disclosure, which review alone has already let through
- * twice.
+ * cannot reintroduce the disclosure.
  *
  * This is a static assertion over the migration files, so it runs with no
  * database, the same way the immutability suites' layer 1 does.
