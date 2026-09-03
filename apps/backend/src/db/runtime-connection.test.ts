@@ -310,6 +310,35 @@ describe("scripts/ensure-runtime-role.sh — the audit-table revoke list", () =>
     );
   });
 
+  it("self-checks the end state for every audit table it revokes on", () => {
+    // The REVOKE re-runs on every boot, so drift is bounded to one restart,
+    // but only the self-check turns a wrong end state into a NON-ZERO EXIT the
+    // entrypoint treats as fatal. A table left out of the self-check can be
+    // hand-granted UPDATE on a boot where the REVOKE was edited away and
+    // nothing fails. gateway_events used to be that table; assert its block is
+    // present and mirrors the other two (rewrite refused, prune kept).
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'UPDATE'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'TRUNCATE'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'INSERT'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'SELECT'\)/,
+    );
+    expect(script).toMatch(
+      /has_table_privilege\(v_role, 'public\.gateway_events', 'DELETE'\)/,
+    );
+    // Guarded so a database that has not run migration 0031 converges rather
+    // than erroring, the same way the tool_call_audit block is guarded.
+    expect(script).toMatch(
+      /to_regclass\('public\.gateway_events'\) IS NOT NULL/,
+    );
+  });
+
   it("names every table that a migration protects with an immutability trigger", () => {
     // The rule this enforces: if a migration installs a row- or
     // statement-level trigger that guards a table against mutation, that table
