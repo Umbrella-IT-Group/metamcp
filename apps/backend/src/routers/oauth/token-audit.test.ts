@@ -52,6 +52,12 @@ const oauthRepositoryMock = {
   // re-hashing a plaintext.
   deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
+  // Refresh-token family reuse detection (migration 0037): rotation records the
+  // outgoing token, and a presented token that is not live is checked against
+  // the rotated markers before it is rejected.
+  recordRotatedRefreshToken: vi.fn(),
+  getRotatedRefreshToken: vi.fn(),
+  revokeFamily: vi.fn(),
 };
 
 const usersRepositoryMock = { isDisabled: vi.fn() };

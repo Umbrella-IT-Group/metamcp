@@ -44,6 +44,12 @@ const oauthRepositoryMock = {
   // 0036), since they already hold the row read by refresh token.
   deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
+  // Refresh-token family reuse detection (migration 0037): rotation records the
+  // outgoing token, and a presented token that is not live is checked against
+  // the rotated markers before it is rejected.
+  recordRotatedRefreshToken: vi.fn(),
+  getRotatedRefreshToken: vi.fn(),
+  revokeFamily: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -304,6 +310,8 @@ describe("POST /oauth/token — refresh_token success logging", () => {
       scope: SCOPE,
       expires_at: new Date(Date.now() + 60 * 1000),
       refresh_token_expires_at: new Date(Date.now() + 365 * 24 * 3600 * 1000),
+      // The rotated row's family (migration 0037); the new pair inherits it.
+      family_id: "11111111-1111-1111-1111-111111111111",
     });
   });
 

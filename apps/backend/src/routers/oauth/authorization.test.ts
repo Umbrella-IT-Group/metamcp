@@ -1072,6 +1072,35 @@ describe("GET /oauth/callback — the params blob no longer mints", () => {
     expect(`${redirect.origin}${redirect.pathname}`).toBe(REDIRECT_URI);
     expect(redirect.searchParams.get("code")).toBe(existingCode);
   });
+
+  it("carries the RFC 9207 iss parameter on the forwarded code", async () => {
+    // The metadata advertises authorization_response_iss_parameter_supported,
+    // so EVERY code-bearing authorization response must carry the issuer, this
+    // legacy forwarder included, or a client that validates iss rejects the
+    // code it just received. ISSUER is the SAME advertised value the discovery
+    // metadata and the consent-decision redirect use, derived from
+    // getIssuerIdentifier — the three must be byte-identical.
+    const existingCode = "mcp_code_forwardediss";
+    oauthRepositoryMock.getAuthCode.mockResolvedValue({
+      code: existingCode,
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      scope: "mcp",
+      user_id: USER_ID,
+      expires_at: new Date(Date.now() + 5 * 60 * 1000),
+    });
+
+    const res = await dispatch({
+      method: "GET",
+      path: "/oauth/callback",
+      query: { code: existingCode, state: STATE },
+    });
+
+    expect(redirectUrl(res).searchParams.get("iss")).toBe(ISSUER);
+    // Guard against a regression to getBaseUrl (no trailing slash), which would
+    // no longer match the discovery issuer.
+    expect(ISSUER).toBe(`${APP_URL}/`);
+  });
 });
 
 // ---------------------------------------------------------------------------

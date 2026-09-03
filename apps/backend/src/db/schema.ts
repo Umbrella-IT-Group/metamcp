@@ -689,6 +689,15 @@ export const oauthAccessTokensTable = pgTable(
     refresh_token_expires_at: timestamp("refresh_token_expires_at", {
       withTimezone: true,
     }),
+    // Refresh-token family (migration 0037). Every token pair in one refresh
+    // chain shares this id: the authorization_code grant starts a new family,
+    // each refresh rotation inherits it. Reuse of a rotated-out refresh token
+    // is detected via oauthRotatedRefreshTokensTable and revokes the whole
+    // family with a single delete keyed on this column. A random uuid, so it is
+    // never a value a caller can present or predict. The DB default exists
+    // only so an image predating 0037 (which inserts without this column)
+    // keeps working if rolled back; the app always supplies the value.
+    family_id: uuid("family_id").notNull().defaultRandom(),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -698,6 +707,8 @@ export const oauthAccessTokensTable = pgTable(
     index("oauth_access_tokens_user_id_idx").on(table.user_id),
     index("oauth_access_tokens_expires_at_idx").on(table.expires_at),
     index("oauth_access_tokens_refresh_token_idx").on(table.refresh_token),
+    // Revocation on reuse is a DELETE keyed on family_id (migration 0037).
+    index("oauth_access_tokens_family_id_idx").on(table.family_id),
     // Migration 0035. A refresh token and its expiry must be present together:
     // a row with a refresh token but a NULL expiry is never-expiring and
     // never-reaped (cleanupExpired misses it, the refresh grant treats a NULL
@@ -707,6 +718,45 @@ export const oauthAccessTokensTable = pgTable(
       "oauth_access_tokens_refresh_pairing",
       sql`(${table.refresh_token} IS NULL) = (${table.refresh_token_expires_at} IS NULL)`,
     ),
+  ],
+);
+
+// Rotated-out refresh tokens (migration 0037): the reuse-detection surface for
+// OAuth refresh-token families.
+//
+// The refresh grant rotates on every use — it issues a new pair and DELETES the
+// old row — so a presented refresh token that is not a live token normally just
+// gets invalid_grant, which hides the case that matters: an attacker who stole a
+// refresh token, rotated it, and left the legitimate client holding a copy that
+// no longer resolves. Recording every rotated-out token here turns that silent
+// miss into a detected reuse: a presented token found in this table (and not in
+// the live table) revokes the whole `family_id` and returns invalid_grant.
+//
+// refresh_token_hash is the SAME sha256 the live table stores (migration 0036),
+// so detection hashes the presented token and matches the digest, never the
+// plaintext. client_id / user_id are carried so the reuse audit event can name
+// the compromised client and user even after the family's live rows are gone,
+// and both cascade with their parent — the same posture oauth_access_tokens
+// takes — so deleting a client or user leaves no orphan markers. expires_at is
+// the rotated token's own expiry, so `cleanupExpired` reaps a marker with the
+// family; a family that is reused is collapsed at detection time instead.
+export const oauthRotatedRefreshTokensTable = pgTable(
+  "oauth_rotated_refresh_tokens",
+  {
+    refresh_token_hash: text("refresh_token_hash").primaryKey(),
+    family_id: uuid("family_id").notNull(),
+    client_id: text("client_id")
+      .notNull()
+      .references(() => oauthClientsTable.client_id, { onDelete: "cascade" }),
+    user_id: text("user_id")
+      .notNull()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    // Revocation deletes every marker for a family; the reaper sweeps on expiry.
+    index("oauth_rotated_refresh_tokens_family_id_idx").on(table.family_id),
+    index("oauth_rotated_refresh_tokens_expires_at_idx").on(table.expires_at),
   ],
 );
 

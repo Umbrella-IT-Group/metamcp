@@ -91,6 +91,10 @@ export const OAuthAccessTokenSchema = z.object({
   expires_at: z.date(),
   refresh_token: z.string().nullable(),
   refresh_token_expires_at: z.date().nullable(),
+  // Refresh-token family (migration 0037): every pair in one refresh chain
+  // shares this id, so reuse of a rotated-out token can revoke the whole
+  // lineage. A uuid rendered as a string.
+  family_id: z.string(),
   created_at: z.date(),
 });
 

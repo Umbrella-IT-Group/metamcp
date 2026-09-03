@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "crypto";
 import express from "express";
 
-import { resolveClientIp } from "@/middleware/audit-context.middleware";
+import { resolveClientIp } from "@/lib/client-ip";
 import logger from "@/utils/logger";
 
 // OAuth 2.0 Authorization Parameters interface

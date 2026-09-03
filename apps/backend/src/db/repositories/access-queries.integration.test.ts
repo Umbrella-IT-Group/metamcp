@@ -194,6 +194,7 @@ async function seed() {
       expires_at: future(12 * HOUR),
       refresh_token: "itest-refresh-live",
       refresh_token_expires_at: future(30 * 24 * HOUR),
+      family_id: "aaaaaaaa-0000-0000-0000-000000000001",
       created_at: past(HOUR),
     },
     {
@@ -205,6 +206,7 @@ async function seed() {
       expires_at: future(6 * HOUR),
       refresh_token: null,
       refresh_token_expires_at: null,
+      family_id: "aaaaaaaa-0000-0000-0000-000000000002",
       created_at: past(2 * HOUR),
     },
     {
@@ -216,6 +218,7 @@ async function seed() {
       scope: "mcp",
       expires_at: past(HOUR),
       refresh_token: null,
+      family_id: "aaaaaaaa-0000-0000-0000-000000000003",
       created_at: past(48 * HOUR),
     },
   ]);
