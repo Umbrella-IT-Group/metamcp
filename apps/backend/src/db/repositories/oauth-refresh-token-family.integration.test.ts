@@ -327,11 +327,29 @@ describeIfDb("family reuse detection against a REAL postgres", () => {
     ).not.toBeNull();
   });
 
-  it("rejects an access-token row with no family_id (NOT NULL holds at the column)", async () => {
+  it("rejects an explicit NULL family_id (NOT NULL holds at the column)", async () => {
     await expect(
       db.execute(
-        `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at") VALUES ('${marker}-nofamily', 'nofa', '${client}', '${user}', now() + interval '1 hour')` as never,
+        `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at", "family_id") VALUES ('${marker}-nullfamily', 'nulf', '${client}', '${user}', now() + interval '1 hour', NULL)` as never,
       ),
     ).rejects.toThrow();
+  });
+
+  it("fills family_id for an insert that omits it (rollback insurance for the previous image)", async () => {
+    // The image deployed before this migration inserts without family_id. The
+    // column default turns that into a family of one instead of a NOT NULL
+    // failure, so rolling that image back after 0037 has run keeps token
+    // issuance working. The application itself always supplies the value.
+    await db.execute(
+      `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at") VALUES ('${marker}-nofamily', 'nofa', '${client}', '${user}', now() + interval '1 hour')` as never,
+    );
+    const rows = await db.execute(
+      `SELECT "family_id"::text AS family_id FROM "oauth_access_tokens" WHERE "access_token" = '${marker}-nofamily'` as never,
+    );
+    const familyId = (rows.rows?.[0] as { family_id?: string } | undefined)
+      ?.family_id;
+    expect(familyId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
   });
 });
