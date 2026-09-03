@@ -146,6 +146,45 @@ describe("sign-in rate limit — refusing a guessing run", () => {
     expect(refused.body).toMatchObject({ error: "too_many_requests" });
   });
 
+  it("also caps the password-carrying sign-up POST", () => {
+    // sign-up carries a password and, with signup disabled, each POST writes an
+    // append-only audit_log row — the INSERT amplifier this bounds. Before it
+    // joined the credential-path set, sign-up POSTs passed through uncapped.
+    const middleware = createAuthSigninRateLimitMiddleware({
+      limiter: new AuthRateLimiter(2, 60_000),
+    });
+    const signUp = () =>
+      request({ clientIp: "203.0.113.9", path: "/api/auth/sign-up/email" });
+
+    expect(call(middleware, signUp()).passed).toBe(true);
+    expect(call(middleware, signUp()).passed).toBe(true);
+    const refused = call(middleware, signUp());
+    expect(refused.passed).toBe(false);
+    expect(refused.statusCode).toBe(429);
+  });
+
+  it("shares one per-caller budget across sign-in and sign-up", () => {
+    // One AuthRateLimiter instance keyed on the caller IP, so the two
+    // password-carrying paths draw down the same bucket rather than two.
+    const middleware = createAuthSigninRateLimitMiddleware({
+      limiter: new AuthRateLimiter(2, 60_000),
+    });
+    const ip = "203.0.113.11";
+
+    expect(
+      call(middleware, request({ clientIp: ip, path: SIGN_IN })).passed,
+    ).toBe(true);
+    expect(
+      call(
+        middleware,
+        request({ clientIp: ip, path: "/api/auth/sign-up/email" }),
+      ).passed,
+    ).toBe(true);
+    const refused = call(middleware, request({ clientIp: ip, path: SIGN_IN }));
+    expect(refused.passed).toBe(false);
+    expect(refused.statusCode).toBe(429);
+  });
+
   it("says something the login form can actually display", () => {
     // The better-auth client surfaces `message` to the page. Without it a
     // refused administrator sees the generic "sign in failed" copy and keeps
@@ -299,7 +338,7 @@ describe("sign-in rate limit — the paths it must not touch", () => {
     ["session read", "GET", "/api/auth/get-session"],
     ["sign-out", "POST", "/api/auth/sign-out"],
     ["dynamic client registration", "POST", "/api/auth/register"],
-    ["sign-up", "POST", "/api/auth/sign-up/email"],
+    ["a GET on the sign-up path", "GET", "/api/auth/sign-up/email"],
     ["a GET on the sign-in path itself", "GET", SIGN_IN],
     ["a neighbouring router", "POST", "/oauth/token"],
   ] as const;
@@ -339,6 +378,25 @@ describe("sign-in rate limit — path matching", () => {
       isCredentialSignInRequest("POST", "/api/auth/sign-in/email/extra"),
     ).toBe(false);
     expect(isCredentialSignInRequest("POST", "/sign-in/email")).toBe(false);
+  });
+
+  it("matches the password-carrying sign-up POST as well", () => {
+    // sign-up/email is now a credential path too; a GET (no password) and the
+    // adjacent spellings are not, on the same over/under-match rules as sign-in.
+    expect(isCredentialSignInRequest("POST", "/api/auth/sign-up/email")).toBe(
+      true,
+    );
+    expect(isCredentialSignInRequest("GET", "/api/auth/sign-up/email")).toBe(
+      false,
+    );
+    expect(isCredentialSignInRequest("POST", "/api/auth/sign-up")).toBe(false);
+    // Dodged by neither a respelling nor a backslash the relay resolves.
+    expect(
+      isCredentialSignInRequest("POST", "/api/auth/x/../sign-up/email"),
+    ).toBe(true);
+    expect(isCredentialSignInRequest("POST", "/api/auth\\sign-up/email")).toBe(
+      true,
+    );
   });
 
   it("cannot be dodged by respelling the path", () => {

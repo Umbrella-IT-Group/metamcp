@@ -305,4 +305,32 @@ describe("GET /mcp-proxy/server/stdio — what reaches the transport", () => {
 
     expect(spawnCalls).toEqual([]);
   });
+
+  it("does NOT leak the gateway's own process.env secrets into the child env", async () => {
+    // The Inspector used to spread the whole gateway process.env into the
+    // spawned child, so an npx MCP an admin registers inherited DATABASE_URL,
+    // BETTER_AUTH_SECRET and every vendor secret. The child env is now the
+    // curated getDefaultEnvironment (which allowlists operational vars, NOT
+    // arbitrary secrets) plus the row's own env. A gateway secret no server env
+    // references must not reach the child; the row's FILESYSTEM_TOKEN still
+    // must, proving the curated path is not simply empty. Real declared gateway
+    // vars are used (saved/restored) so this asserts against the actual secrets.
+    const priorAuth = process.env.BETTER_AUTH_SECRET;
+    const priorDb = process.env.DATABASE_URL;
+    process.env.BETTER_AUTH_SECRET = "auth-secret-must-not-leak";
+    process.env.DATABASE_URL = "postgres://must-not-leak";
+    try {
+      await getStdio({ transportType: "STDIO", mcpServerUuid: SERVER_UUID });
+    } finally {
+      if (priorAuth === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = priorAuth;
+      if (priorDb === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = priorDb;
+    }
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].env.BETTER_AUTH_SECRET).toBeUndefined();
+    expect(spawnCalls[0].env.DATABASE_URL).toBeUndefined();
+    expect(spawnCalls[0].env.FILESYSTEM_TOKEN).toBe("s3cret");
+  });
 });

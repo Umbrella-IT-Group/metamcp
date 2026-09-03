@@ -120,9 +120,12 @@ async function startApp(skipOAuthInGlobalParser: boolean): Promise<{
 
   app.use(oauthRouter);
 
-  // Stands in for every non-OAuth route: it must keep the generous app-level
-  // limit, so the scoping is shown to be scoping rather than a global squeeze.
-  app.post("/trpc/anything", (req, res) => {
+  // Stands in for a route on the generous 50mb default lane, so the OAuth
+  // scoping is shown to be scoping rather than a global squeeze. Deliberately
+  // NOT `/trpc` or `/api/auth`: globalBodyParser now gives those their own
+  // smaller ceilings (see lib/global-body-parser lanes), so they no longer
+  // model the generous default this check is about.
+  app.post("/other/anything", (req, res) => {
     res.status(200).json({ received: typeof req.body === "object" });
   });
 
@@ -227,7 +230,7 @@ describe("/oauth/* body limit", () => {
   });
 
   it("leaves non-OAuth routes on the generous app-level limit", async () => {
-    const response = await postJson(fixed.baseUrl, "/trpc/anything", {
+    const response = await postJson(fixed.baseUrl, "/other/anything", {
       blob: "x".repeat(OVERSIZED_BYTES),
     });
 
@@ -267,8 +270,9 @@ describe("globalBodyParser lanes", () => {
   it("binds the 50mb global limit on a non-OAuth path", async () => {
     // The same 300kb body, one path over. If the OAuth limit had been applied
     // globally rather than scoped, this would 413 too — which is the failure
-    // this half exists to rule out.
-    const response = await postJson(fixed.baseUrl, "/trpc/anything", {
+    // this half exists to rule out. `/other` is on the 50mb default lane (not
+    // `/trpc` or `/api/auth`, which now carry their own smaller limits).
+    const response = await postJson(fixed.baseUrl, "/other/anything", {
       blob: "x".repeat(OVERSIZED_BYTES),
     });
 

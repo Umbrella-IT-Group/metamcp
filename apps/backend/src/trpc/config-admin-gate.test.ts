@@ -4,7 +4,9 @@
  * lifetime, MCP timeouts/attempts, raw setConfig) was on `protectedProcedure`
  * — any authenticated member could flip auth-posture toggles for the whole
  * gateway. Moved to `adminProcedure`; reads keep their existing access level
- * (mostly public, `getAllConfigs` stays protected).
+ * (mostly public). `getAllConfigs` is the exception: it returns the entire
+ * config table in one unfiltered read and no frontend page consumes it, so it
+ * is now `adminProcedure` too rather than staying member-readable.
  *
  * One representative setter (`setSignupDisabled`) is exercised through the
  * real `createConfigRouter` wiring via a real tRPC caller — the same
@@ -75,6 +77,18 @@ describe("config write surface — admin gate", () => {
       router
         .createCaller(memberCtx)
         .setConfig({ key: "DISABLE_SIGNUP", value: "true" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("getAllConfigs (whole-table read): admin allowed, member FORBIDDEN", async () => {
+    const router = buildRouter();
+
+    await expect(
+      router.createCaller(adminCtx).getAllConfigs(),
+    ).resolves.toEqual([]);
+
+    await expect(
+      router.createCaller(memberCtx).getAllConfigs(),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
