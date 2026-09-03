@@ -3,7 +3,7 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../../db/repositories";
-import { getBaseUrl, GRANTED_OAUTH_SCOPE } from "./utils";
+import { getBaseUrl, getIssuerIdentifier, GRANTED_OAUTH_SCOPE } from "./utils";
 
 const metadataRouter = express.Router();
 
@@ -225,9 +225,10 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
 
     const baseUrl = getBaseUrl(req);
 
-    // Ensure the issuer URL has a trailing slash for OAuth validation
-    // This is required by RFC 8414 and RFC 9728 for exact matching
-    const issuerUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+    // The issuer identifier, trailing-slash-normalised. Shared with the RFC
+    // 9207 `iss` on the authorization response through getIssuerIdentifier so
+    // the two cannot drift; a strict client rejects the flow if they differ.
+    const issuerUrl = getIssuerIdentifier(req);
 
     const metadata = {
       // Issuer identifier (required by RFC 8414)
@@ -260,6 +261,11 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
 
       // Code challenge methods - PKCE support (OAuth 2.1 compliant)
       code_challenge_methods_supported: ["S256"],
+
+      // RFC 9207: the authorization response carries the `iss` parameter, so a
+      // client can detect an authorization-server mix-up. See the redirect in
+      // authorization.ts, which sets `iss` on every authorization response.
+      authorization_response_iss_parameter_supported: true,
 
       // OAuth 2.1 compliance indicators
       require_pushed_authorization_requests: false,

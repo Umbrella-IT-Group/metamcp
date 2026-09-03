@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "crypto";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
 import express from "express";
 
 import { resolveClientIp } from "@/middleware/audit-context.middleware";
@@ -374,6 +374,35 @@ export function verifyClientSecret(
 }
 
 /**
+ * Constant-time equality for two secrets held in plaintext.
+ *
+ * WHY THE SHA-256 STEP. `timingSafeEqual` throws on buffers of unequal length,
+ * so comparing the raw secrets directly would both leak the secret's length
+ * through the thrown-vs-returned path and crash on a length mismatch. Hashing
+ * each side first makes every comparison a fixed 32-byte-vs-32-byte check: the
+ * lengths always match, and the time taken no longer depends on how many
+ * leading characters two values share. This is the compare half of the OAuth
+ * client-secret hardening; storing the secret hashed at rest is a later change,
+ * so this deliberately hashes at compare time rather than reading a stored
+ * hash.
+ *
+ * Returns false for any non-string input rather than throwing, so a caller that
+ * split a malformed `client:secret` and got `undefined` for the secret fails
+ * closed on the same path as a wrong secret.
+ */
+export function timingSafeEqualSecret(
+  presented: string | undefined | null,
+  stored: string | undefined | null,
+): boolean {
+  if (typeof presented !== "string" || typeof stored !== "string") {
+    return false;
+  }
+  const presentedHash = createHash("sha256").update(presented).digest();
+  const storedHash = createHash("sha256").update(stored).digest();
+  return timingSafeEqual(presentedHash, storedHash);
+}
+
+/**
  * The single scope this authorization server ever grants.
  *
  * RFC 7591 §3.2.1 and RFC 6749 §3.3 both put the scope decision on the
@@ -415,6 +444,24 @@ export function getBaseUrl(req: express.Request): string {
 
   // Fallback to request host
   return `${req.protocol}://${req.get("host")}`;
+}
+
+/**
+ * The issuer identifier this authorization server publishes, normalised to a
+ * single trailing slash.
+ *
+ * ONE function so the value cannot drift between the two places that must agree
+ * byte for byte. RFC 8414 metadata advertises this as `issuer`, and RFC 9207
+ * requires every authorization response carry the same string as `iss`. A
+ * strict client compares the two by simple string comparison (RFC 9207 2.4) and
+ * aborts the flow on any difference, so a trailing-slash mismatch there is not
+ * cosmetic: it breaks the mix-up defence the `iss` parameter exists for. The
+ * slash matches the normalisation RFC 8414 / RFC 9728 discovery already applied
+ * to the issuer and resource identifiers.
+ */
+export function getIssuerIdentifier(req: express.Request): string {
+  const base = getBaseUrl(req);
+  return base.endsWith("/") ? base : base + "/";
 }
 
 /**
@@ -559,7 +606,7 @@ class RateLimiter {
 
 // Create rate limiter instances
 const authEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
-const tokenEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 10 attempts per 1 minute
+const tokenEndpointLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 attempts per 1 minute
 const consentDecisionLimiter = new RateLimiter(20, 1 * 60 * 1000); // 20 decisions per user per 1 minute
 const registrationEndpointLimiter = new RateLimiter(30, 1 * 60 * 1000); // 30 registrations per caller IP per 1 minute
 
@@ -577,13 +624,14 @@ setInterval(
 /**
  * Rate limit the OAuth consent decision by USER, not by IP.
  *
- * The other two limiters key on `req.ip`, which works only as well as the
- * deployment lets it: express has no `trust proxy` set here and the backend is
- * reached through the frontend's rewrite inside the same container, so `req.ip`
- * is the same container-local address for every human. An IP key on this
- * endpoint would therefore be one bucket shared by the whole organisation —
- * and unlike the others, a 429 here strands a user who has ALREADY clicked
- * Approve, with no way forward but to restart the whole flow.
+ * The other two IP limiters (rateLimitAuth, rateLimitToken) key on
+ * `resolveClientIp` — the edge CF-Connecting-IP — with `req.ip` only as the
+ * fallback for direct-to-origin and local development. This endpoint keys on
+ * the user instead, and for a reason those two do not share: a 429 here strands
+ * a user who has ALREADY clicked Approve, with no way forward but to restart
+ * the whole flow, so keying it on any IP would let one busy source refuse a
+ * human mid-approval. Keying on the user bounds each account's own decision
+ * rate and nobody else's.
  *
  * The user id comes from the verified areq token, so it is this server's own
  * signed value, not anything the caller asserted.
@@ -603,14 +651,27 @@ export function resetConsentDecisionRateLimitForTests(): void {
 }
 
 /**
- * Rate limiting middleware for OAuth authorization endpoint
+ * Rate limiting middleware for OAuth authorization endpoint.
+ *
+ * Keyed on `resolveClientIp` (the edge CF-Connecting-IP) with `req.ip` as the
+ * fallback, exactly as rateLimitRegistration does. `trust proxy` is
+ * deliberately off (see audit-context.middleware), so `req.ip` behind the
+ * tunnel is one container-local address shared by every caller: keying on it
+ * made this a single global bucket, so 20 requests a minute from any one source
+ * held OAuth authorization exhausted for the whole organisation. CF-Connecting-IP
+ * is per-caller, so each edge IP now gets its own bucket. The fallback degrades
+ * to the old shared bucket only for direct-to-origin and local development.
  */
 export function rateLimitAuth(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ) {
-  const identifier = req.ip || req.socket?.remoteAddress || "unknown";
+  const identifier =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
 
   if (authEndpointLimiter.isRateLimited(identifier)) {
     logger.info(
@@ -627,14 +688,26 @@ export function rateLimitAuth(
 }
 
 /**
- * Rate limiting middleware for OAuth token endpoint
+ * Rate limiting middleware for OAuth token endpoint.
+ *
+ * Keyed on `resolveClientIp` with a `req.ip` fallback, for the reason spelled
+ * out on rateLimitAuth above: with `trust proxy` off, keying on `req.ip` made
+ * this one global bucket behind the tunnel, so a single caller sending 20
+ * requests a minute could hold token exchange 429ed org-wide — and this is the
+ * endpoint claude.ai connectors call to exchange codes and refresh tokens, so
+ * that is a live availability gap on the exposed plane. Per-edge-IP keying gives
+ * each caller its own bucket.
  */
 export function rateLimitToken(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ) {
-  const identifier = req.ip || req.socket?.remoteAddress || "unknown";
+  const identifier =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
 
   if (tokenEndpointLimiter.isRateLimited(identifier)) {
     logger.info(
@@ -652,22 +725,22 @@ export function rateLimitToken(
 /**
  * Rate limiting middleware for the RFC 7591 dynamic-registration endpoint.
  *
- * WHY /oauth/register CANNOT SHARE /oauth/token's BUCKET. It did, and that was
- * a denial-of-service against pairing rather than a control on it: both routes
- * carried `rateLimitToken`, which keys on `req.ip`, and `trust proxy` is
- * deliberately off (see audit-context.middleware), so every caller through the
- * tunnel lands in ONE bucket. 20 anonymous registrations in a minute therefore
- * spent the budget that legitimate claude.ai token exchanges needed, and the
- * connector's exchange came back 429. The endpoint an attacker can reach for
- * free must not be able to close the endpoint a paired client depends on.
+ * WHY /oauth/register HAS ITS OWN LIMITER INSTANCE, separate from
+ * /oauth/token's. It once shared `rateLimitToken`, and that was a
+ * denial-of-service against pairing rather than a control on it: 20 anonymous
+ * registrations in a minute spent the same bucket that legitimate claude.ai
+ * token exchanges needed, so the connector's exchange came back 429. The
+ * endpoint an attacker can reach for free must not be able to close the
+ * endpoint a paired client depends on. A separate limiter instance keeps the
+ * two budgets independent even now that all three key the same way.
  *
- * KEYED ON CF-Connecting-IP, not `req.ip`. Cloudflare overwrites that header at
- * the edge on every request, so it is per-CALLER instead of per-container, and
- * this limiter finally bounds what it is named for. The trust assumption is
- * exactly the one audit-context.middleware documents at length: it holds only
- * while the Cloudflare Tunnel is the sole ingress. `req.ip` remains the
- * fallback for direct-to-origin and local development, where it degrades to
- * the single shared bucket this endpoint had before.
+ * KEYED ON CF-Connecting-IP, with `req.ip` as the fallback — the same keying
+ * rateLimitAuth and rateLimitToken now use. Cloudflare overwrites that header
+ * at the edge on every request, so it is per-CALLER instead of per-container.
+ * The trust assumption is exactly the one audit-context.middleware documents at
+ * length: it holds only while the Cloudflare Tunnel is the sole ingress.
+ * `req.ip` remains the fallback for direct-to-origin and local development,
+ * where it degrades to a single shared bucket.
  *
  * THE RESIDUAL, PLAINLY: per-IP keying means the ceiling is per source
  * address, not global, so a distributed caller is not bounded by this at all.
@@ -733,10 +806,17 @@ export function securityHeaders(
   // Referrer policy
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
 
-  // Content Security Policy for OAuth pages
+  // Content Security Policy for OAuth pages.
+  //
+  // `form-action 'self'` is set alongside `frame-ancestors 'none'`: any HTML
+  // that ever appears on an /oauth backend route must not be able to POST a
+  // form to an attacker's host. The former HTML sinks on these routes are now
+  // JSON errors, so this is defense in depth — it means a future HTML
+  // regression cannot become a way to submit a form off-origin and around the
+  // consent screen this plane depends on.
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self';",
   );
 
   // Cache control for sensitive endpoints

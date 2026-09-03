@@ -34,6 +34,7 @@ vi.mock("../../db/repositories", () => ({
 }));
 
 const {
+  rateLimitAuth,
   rateLimitRegistration,
   rateLimitToken,
   resetRegistrationRateLimitForTests,
@@ -148,6 +149,62 @@ describe("rateLimitRegistration", () => {
     });
     expect(tokenExchange.passed).toBe(true);
     expect(tokenExchange.status).toBe(200);
+  });
+});
+
+/**
+ * The authorization and token endpoints key on the caller, not the container.
+ *
+ * `rateLimitAuth` and `rateLimitToken` used to key on `req.ip`, which behind the
+ * tunnel is one container-local address shared by every caller (`trust proxy`
+ * is off), so a single source spending a bucket's worth of requests held OAuth
+ * authorization and token exchange 429ed for the whole organisation. They now
+ * key on CF-Connecting-IP with a `req.ip` fallback, the same shape
+ * `rateLimitRegistration` uses. `/oauth/token` is the endpoint claude.ai
+ * connectors call to exchange codes and refresh tokens, so this is the live
+ * availability half.
+ *
+ * Distinct edge IPs per test because these two limiters live at module scope
+ * with no reset hook — the same reason the token exchanges above pick fresh
+ * addresses.
+ */
+const TOKEN_AUTH_BUDGET = 20;
+
+describe.each([
+  ["rateLimitToken", rateLimitToken, 10] as const,
+  ["rateLimitAuth", rateLimitAuth, 20] as const,
+])("%s keys per edge IP, not per container", (_label, middleware, base) => {
+  it("allows a full budget from one edge IP then 429s the next request", () => {
+    const ip = `192.0.2.${base}`;
+    for (let i = 0; i < TOKEN_AUTH_BUDGET; i += 1) {
+      expect(run(middleware, { clientIp: ip }).passed).toBe(true);
+    }
+
+    const overBudget = run(middleware, { clientIp: ip });
+    expect(overBudget.passed).toBe(false);
+    expect(overBudget.status).toBe(429);
+  });
+
+  it("gives a second edge IP its own budget though both share one req.ip", () => {
+    const a = `192.0.2.${base + 1}`;
+    const b = `192.0.2.${base + 2}`;
+    for (let i = 0; i < TOKEN_AUTH_BUDGET; i += 1) {
+      run(middleware, { clientIp: a });
+    }
+    expect(run(middleware, { clientIp: a }).passed).toBe(false);
+
+    // b arrives on the same container-local req.ip as a — the condition that
+    // made the old bucket global — and must still have a full budget.
+    expect(run(middleware, { clientIp: b }).passed).toBe(true);
+  });
+
+  it("falls back to req.ip when the Cloudflare header is absent", () => {
+    const reqIp = `192.0.2.${base + 3}`;
+    for (let i = 0; i < TOKEN_AUTH_BUDGET; i += 1) {
+      expect(run(middleware, { reqIp }).passed).toBe(true);
+    }
+
+    expect(run(middleware, { reqIp }).passed).toBe(false);
   });
 });
 
