@@ -37,10 +37,14 @@ export const CLIENT_IP_HEADER = "cf-connecting-ip";
  *
  * WHAT THE CLAMP DOES AND DOES NOT BUY THE LIMITERS THAT KEY ON THIS. It
  * bounds per-key SIZE, not key COUNT. A caller rotating the header still mints
- * one map entry per distinct value — measured at 200k entries for 200k values
- * — and those are reclaimed only by the ten-minute sweep in
- * `lib/auth-rate-limiter`. What bounds the count is the edge overwriting the
- * header, plus that sweep; it is not this line.
+ * one map entry per distinct value -- measured at 200k entries for 200k values.
+ * Each limiter reclaims its own entries on a ten-minute sweep: the auth
+ * limiters through the timer in `lib/auth-rate-limiter` (which iterates
+ * AuthRateLimiter instances ONLY, so it does not touch any other map), and the
+ * data-plane sliding-window map through `SlidingWindowRateLimiting.cleanup`,
+ * wired to its own timer in `middleware/rate-limit.middleware`. What bounds the
+ * count is the edge overwriting the header, plus the relevant sweep; it is not
+ * this line.
  */
 export function resolveClientIp(
   headers: express.Request["headers"],

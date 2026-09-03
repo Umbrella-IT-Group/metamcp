@@ -221,8 +221,15 @@ export class SessionLifetimeManagerImpl<T>
 
       // Clean up expired sessions
       if (expiredSessions.length > 0) {
+        // Count at info, ids at debug only: a live session-id list in a
+        // request-path log undoes the fork's session-id log hygiene. Dormant
+        // in prod (sessionLifetime is null there), but this timer fires the
+        // moment an operator sets a finite lifetime.
         logger.info(
-          `Cleaning up ${expiredSessions.length} expired ${this.name} sessions: ${expiredSessions.map((s) => s.sessionId).join(", ")}`,
+          `Cleaning up ${expiredSessions.length} expired ${this.name} sessions`,
+        );
+        logger.debug(
+          `Expired ${this.name} session ids: ${expiredSessions.map((s) => s.sessionId).join(", ")}`,
         );
 
         await Promise.allSettled(

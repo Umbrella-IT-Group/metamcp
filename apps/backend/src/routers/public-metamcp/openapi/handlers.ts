@@ -174,12 +174,16 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
   const toolToServerUuid: Record<string, string> = {};
 
   return async (request, context) => {
+    // `name` is the caller-controlled tool name (a URL-decoded path segment on
+    // the OpenAPI path). Every log line and thrown message below runs it
+    // through JSON.stringify so an embedded CR/LF cannot forge log lines, the
+    // same discipline as the mcp-proxy connection log.
     const { name, arguments: args } = request.params;
 
     // Extract the original tool name by removing the server prefix
     const firstDoubleUnderscoreIndex = name.indexOf("__");
     if (firstDoubleUnderscoreIndex === -1) {
-      throw new Error(`Invalid tool name format: ${name}`);
+      throw new Error(`Invalid tool name format: ${JSON.stringify(name)}`);
     }
 
     const serverPrefix = name.substring(0, firstDoubleUnderscoreIndex);
@@ -269,7 +273,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     }
 
     if (!targetSession) {
-      throw new Error(`Unknown tool: ${name}`);
+      throw new Error(`Unknown tool: ${JSON.stringify(name)}`);
     }
 
     const targetServerUuid = toolToServerUuid[name];
@@ -320,7 +324,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       // Streamable-HTTP one when investigating.
       if (!isRecoverableBackendError(error)) {
         logger.error(
-          `Error calling tool "${name}" through ${
+          `Error calling tool ${JSON.stringify(name)} through ${
             targetSession.client.getServerVersion()?.name || "unknown"
           }:`,
           error,
@@ -329,7 +333,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       }
 
       logger.warn(
-        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool ${JSON.stringify(name)}; invalidating pool and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
@@ -368,7 +372,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         return (await callOnce(freshSession)) as CallToolResult;
       } catch (retryError) {
         logger.error(
-          `OpenAPI bridge: error calling tool "${name}" through ${
+          `OpenAPI bridge: error calling tool ${JSON.stringify(name)} through ${
             freshSession.client.getServerVersion()?.name || "unknown"
           } after session re-initialize:`,
           retryError,
