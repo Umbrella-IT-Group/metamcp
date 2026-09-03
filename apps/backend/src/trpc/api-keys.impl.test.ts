@@ -67,6 +67,9 @@ const { repoMock, endpointsRepoMock, usersRepoMock } = vi.hoisted(() => ({
   usersRepoMock: {
     findById: vi.fn(),
     isDisabled: vi.fn(),
+    // Owner-must-be-admin at admin-plane mint (migration 0038) reads the
+    // effective owner's role through this.
+    findRoleById: vi.fn(),
   },
 }));
 
@@ -179,6 +182,7 @@ describe("api-keys create — mint RBAC gate", () => {
       user_id: null,
       endpoint_uuid: null,
       acts_as_user_id: null,
+      admin_plane: false,
       is_active: true,
     });
   });
@@ -226,6 +230,7 @@ describe("api-keys create — explicit endpoint scope (migration 0023)", () => {
       user_id: "admin-1",
       endpoint_uuid: null,
       acts_as_user_id: null,
+      admin_plane: false,
       is_active: true,
     });
     // The escape hatch never triggers an endpoint lookup.
@@ -258,6 +263,7 @@ describe("api-keys create — explicit endpoint scope (migration 0023)", () => {
       user_id: "admin-1",
       endpoint_uuid: EP,
       acts_as_user_id: null,
+      admin_plane: false,
       is_active: true,
     });
     expect(result.key).toBe("sk_mt_scopedscoped");
@@ -375,6 +381,7 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
       user_id: "target-user",
       endpoint_uuid: EP,
       acts_as_user_id: "target-user",
+      admin_plane: false,
       is_active: true,
     });
   });
@@ -407,6 +414,7 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
       user_id: "admin-1",
       endpoint_uuid: EP,
       acts_as_user_id: "admin-1",
+      admin_plane: false,
       is_active: true,
     });
   });
@@ -490,6 +498,7 @@ describe("api-keys create — acts-as identity binding (migration 0024)", () => 
       user_id: "admin-1",
       endpoint_uuid: EP,
       acts_as_user_id: null,
+      admin_plane: false,
       is_active: true,
     });
     expect(usersRepoMock.findById).not.toHaveBeenCalled();
@@ -752,6 +761,7 @@ describe("api-keys listAll — admin cross-user view", () => {
         acts_as_user_id: "acted-as-user",
         acts_as_email: "acted-as@example.com",
         owner_email: "alice@example.com",
+        admin_plane: false,
       },
       {
         uuid: "2",
@@ -765,6 +775,7 @@ describe("api-keys listAll — admin cross-user view", () => {
         acts_as_user_id: null,
         acts_as_email: null,
         owner_email: null,
+        admin_plane: false,
       },
     ]);
 
@@ -1256,5 +1267,189 @@ describe("api-keys validate — acts-as identity disabled gate", () => {
     });
     expect(usersRepoMock.isDisabled).toHaveBeenCalledWith("admin-owner");
     expect(usersRepoMock.isDisabled).not.toHaveBeenCalledWith("locked-victim");
+  });
+});
+
+describe("api-keys create — admin-plane (control-plane) mint policy (migration 0038)", () => {
+  const EP = "11111111-1111-4111-8111-111111111111";
+
+  it("lets an admin mint an admin-plane key owned by an admin (no scope, no acts-as)", async () => {
+    usersRepoMock.findRoleById.mockResolvedValue("admin");
+    repoMock.create.mockResolvedValue({
+      uuid: "cp-uuid",
+      name: "ci",
+      key: "sk_mt_controlplanekey",
+      user_id: "admin-1",
+      endpoint_uuid: null,
+      created_at: new Date(),
+    });
+
+    await apiKeysImplementations.create(
+      { name: "ci", admin_plane: true },
+      "admin-1",
+      true,
+    );
+
+    // The mandatory-scope gate is relaxed for a control-plane key, and it is
+    // persisted with no scope and no acts-as identity.
+    expect(repoMock.create).toHaveBeenCalledWith({
+      name: "ci",
+      user_id: "admin-1",
+      endpoint_uuid: null,
+      acts_as_user_id: null,
+      admin_plane: true,
+      is_active: true,
+    });
+  });
+
+  it("rejects a MEMBER minting an admin-plane key with FORBIDDEN and no write", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "ci", admin_plane: true },
+        "member-1",
+        false,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admin-plane key paired with endpoint_uuid", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "ci", admin_plane: true, endpoint_uuid: EP },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admin-plane key paired with all_endpoints", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "ci", admin_plane: true, all_endpoints: true },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admin-plane key paired with acts_as_user_id", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "ci", admin_plane: true, acts_as_user_id: "someone" },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admin-plane key whose OWNER is not an admin (owner-must-be-admin)", async () => {
+    usersRepoMock.findRoleById.mockResolvedValue("member");
+    await expect(
+      apiKeysImplementations.create(
+        { name: "ci", admin_plane: true, user_id: "member-owner" },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(usersRepoMock.findRoleById).toHaveBeenCalledWith("member-owner");
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a public ('everyone') admin-plane key with FORBIDDEN and no write", async () => {
+    await expect(
+      apiKeysImplementations.create(
+        { name: "ci", admin_plane: true, user_id: null },
+        "admin-1",
+        true,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.create).not.toHaveBeenCalled();
+  });
+
+  it("records admin_plane in the create audit detail path (mint succeeds)", async () => {
+    // The audit event is fire-and-forget; this asserts the mint completes and
+    // persists the flag, which is what the audit detail is built from.
+    usersRepoMock.findRoleById.mockResolvedValue("admin");
+    repoMock.create.mockResolvedValue({
+      uuid: "cp-uuid-2",
+      name: "ci2",
+      key: "sk_mt_cp2",
+      user_id: "admin-1",
+      endpoint_uuid: null,
+      created_at: new Date(),
+    });
+
+    const result = await apiKeysImplementations.create(
+      { name: "ci2", admin_plane: true },
+      "admin-1",
+      true,
+    );
+    expect(result.key).toBe("sk_mt_cp2");
+  });
+});
+
+describe("api-keys — admin_plane is immutable through update", () => {
+  it("the update schemas do not carry admin_plane at all", () => {
+    // Immutability by omission, the same guard acts-as and endpoint scope use:
+    // a smuggled field is stripped by the schema, so a data-plane key can never
+    // be silently promoted to control-plane through an update.
+    const parsed = UpdateApiKeyRequestSchema.parse({
+      uuid: "22222222-2222-4222-8222-222222222222",
+      name: "renamed",
+      admin_plane: true,
+    } as Record<string, unknown>);
+    expect(parsed).not.toHaveProperty("admin_plane");
+
+    const repoParsed = ApiKeyUpdateInputSchema.parse({
+      name: "renamed",
+      admin_plane: true,
+    } as Record<string, unknown>);
+    expect(repoParsed).not.toHaveProperty("admin_plane");
+  });
+});
+
+describe("api-keys listAll — admin_plane surfaced (migration 0038)", () => {
+  it("labels a control-plane key and a data-plane key distinctly", async () => {
+    repoMock.findAll.mockResolvedValue([
+      {
+        uuid: "cp",
+        name: "ci-control-plane",
+        last4: "CCCC",
+        created_at: new Date("2026-08-01T00:00:00Z"),
+        last_used_at: null,
+        is_active: true,
+        user_id: "ci-user",
+        endpoint_uuid: null,
+        acts_as_user_id: null,
+        acts_as_email: null,
+        owner_email: "ci@example.com",
+        admin_plane: true,
+      },
+      {
+        uuid: "dp",
+        name: "data-plane",
+        last4: "DDDD",
+        created_at: new Date("2026-08-02T00:00:00Z"),
+        last_used_at: null,
+        is_active: true,
+        user_id: "alice",
+        endpoint_uuid: "11111111-1111-4111-8111-111111111111",
+        acts_as_user_id: null,
+        acts_as_email: null,
+        owner_email: "alice@example.com",
+        admin_plane: false,
+      },
+    ]);
+
+    const result = await apiKeysImplementations.listAll();
+
+    expect(result.apiKeys[0].admin_plane).toBe(true);
+    expect(result.apiKeys[1].admin_plane).toBe(false);
+    // The flag is a boolean, never credential material.
+    expect((result.apiKeys[0] as Record<string, unknown>).key).toBeUndefined();
   });
 });

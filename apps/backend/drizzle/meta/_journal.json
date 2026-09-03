@@ -260,6 +260,13 @@
       "when": 1787616000000,
       "tag": "0037_oauth_refresh_token_family",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1787702400000,
+      "tag": "0038_api_key_admin_plane",
+      "breakpoints": true
     }
   ]
 }

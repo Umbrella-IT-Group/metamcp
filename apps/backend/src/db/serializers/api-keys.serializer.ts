@@ -113,6 +113,7 @@ export class ApiKeysSerializer {
       acts_as_user_id: string | null;
       acts_as_email: string | null;
       owner_email: string | null;
+      admin_plane: boolean;
     }>,
   ) {
     return dbApiKeys.map((apiKey) => ({
@@ -124,6 +125,9 @@ export class ApiKeysSerializer {
       endpoint_uuid: apiKey.endpoint_uuid,
       acts_as_user_id: apiKey.acts_as_user_id,
       acts_as_email: apiKey.acts_as_email,
+      // Plane flag (migration 0038): a boolean, never credential material, so
+      // it is safe in a list. Labels a control-plane key in the admin view.
+      admin_plane: apiKey.admin_plane,
       created_at: apiKey.created_at,
       last_used_at: apiKey.last_used_at,
       is_active: apiKey.is_active,

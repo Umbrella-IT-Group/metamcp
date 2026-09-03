@@ -107,6 +107,24 @@ describe("gateway backend trust header on the pooled transports", () => {
     expect(headerReachingUndici()).toBe(SECRET);
   });
 
+  it("STREAMABLE_HTTP: stamps the TRIMMED secret when the env value has trailing whitespace", async () => {
+    // readGatewayBackendSecret trims before it measures length and before it
+    // returns, so a secret written with a trailing newline (echo, copy-paste)
+    // cannot differ between the header the gateway stamps and the value a
+    // backend was configured with. Without the trim the stamped header would
+    // carry the newline and no backend comparing against the clean secret would
+    // match.
+    process.env.GATEWAY_BACKEND_SECRET = `${SECRET}\n`;
+    const { transport } = createMetaMcpClient(
+      asParams({ name: "s1b", type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+    );
+    await installedFetch(transport)(new URL(INTERNAL_URL), {
+      headers: { authorization: "Bearer row" },
+    });
+    expect(undiciFetch).toHaveBeenCalledTimes(1);
+    expect(headerReachingUndici()).toBe(SECRET);
+  });
+
   it("SSE: the installed fetch stamps the header for an internal backend", async () => {
     const { transport } = createMetaMcpClient(
       asParams({ name: "s2", type: "SSE", url: "http://10.0.0.5:3000/sse" }),

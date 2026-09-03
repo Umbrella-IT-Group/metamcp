@@ -108,6 +108,19 @@ export class AuthRateLimiter {
 // `getAuthRateLimitIdentifier` below for what it used to be and why.
 export const authRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000);
 
+// Failed admin-plane bearer verifications on `/trpc` (migration 0038), its own
+// instance with its own Map. FAILURE-ONLY and keyed per client IP with the
+// no-header class BUCKETED (see getAdminKeyRateLimitIdentifier), a limiter that
+// counts only FAILED admin-key verifications can only ever inconvenience callers
+// already failing to authenticate, so a shared no-header bucket is the cheap
+// failure and a valid admin-plane request never scores. Separate from the
+// sign-in limiter (which keys on `/api/auth` sign-in attempts and caps
+// successes too) and from authRateLimiter (endpoint data plane): sharing a
+// bucket would conflate three different questions. The 600/min/IP trpc request
+// limiter still sits in front and bounds total volume. Same 20/min/IP
+// failed-auth default as authRateLimiter.
+export const trpcAdminKeyRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000);
+
 // Clean up rate limiter entries every 10 minutes.
 //
 // `unref` because this sweep is housekeeping and must never own the process's
@@ -116,10 +129,12 @@ export const authRateLimiter = new AuthRateLimiter(20, 1 * 60 * 1000);
 // `AuthRateLimiter` or the identifier helpers below) registers a 10-minute
 // timer that keeps the event loop alive until something force-exits, which is
 // a hang with no visible cause. Same treatment as the sibling sweep in
-// `middleware/trpc-rate-limit.middleware`.
+// `middleware/trpc-rate-limit.middleware`. Both AuthRateLimiter instances in
+// this module are swept by the one timer.
 setInterval(
   () => {
     authRateLimiter.cleanup();
+    trpcAdminKeyRateLimiter.cleanup();
   },
   10 * 60 * 1000,
 ).unref();
@@ -235,4 +250,30 @@ export function getPublicOAuthRateLimitIdentifier(
 ): string {
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   return `oauth-public:${route}:${ip}`;
+}
+
+/**
+ * Rate-limit identifier for FAILED admin-plane bearer verifications on `/trpc`
+ * (migration 0038), keyed per client IP.
+ *
+ * Keyed on CF-Connecting-IP like getAuthRateLimitIdentifier, for the same
+ * reason: `req.ip` is the same in-container address for every caller behind the
+ * Next.js rewrite (`trust proxy` is off), so it would be one shared bucket.
+ *
+ * THE NO-HEADER CLASS IS BUCKETED, not exempted, the opposite of
+ * trpcRateLimitMiddleware's decision for the same class, and deliberate: this
+ * counts FAILED CREDENTIALS, so exempting a class would hand anyone able to omit
+ * the header an unbounded stream of admin-key guesses. Collapsing in-container
+ * and local-development callers into one `no-trusted-ip` bucket is the cheap
+ * failure: it can only inconvenience callers already failing to authenticate,
+ * and a valid admin-plane request never scores. Namespaced so it can never
+ * spend the endpoint data plane's or the public OAuth routes' budgets.
+ */
+export function getAdminKeyRateLimitIdentifier(req: express.Request): string {
+  const ip =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "no-trusted-ip";
+  return `trpc-admin-key:${ip}`;
 }

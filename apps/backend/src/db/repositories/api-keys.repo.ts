@@ -56,6 +56,11 @@ export class ApiKeysRepository {
         // create path enforces the admin-only + requires-endpoint-scope
         // policy; the repository just persists what it's given.
         acts_as_user_id: input.acts_as_user_id ?? null,
+        // Plane flag (migration 0038). The tRPC create path enforces the
+        // admin-only + owner-must-be-admin + plane-exclusivity policy; the
+        // repository just persists what it is given (default false = data
+        // plane). The CHECK constraints refuse a straddling row regardless.
+        admin_plane: input.admin_plane ?? false,
         is_active: input.is_active ?? true,
       })
       .returning({
@@ -100,6 +105,9 @@ export class ApiKeysRepository {
         acts_as_user_id: apiKeysTable.acts_as_user_id,
         acts_as_email: actsAsUsers.email,
         owner_email: usersTable.email,
+        // Plane flag (migration 0038): so the admin view can label a
+        // control-plane key loudly, the way acts-as is labelled.
+        admin_plane: apiKeysTable.admin_plane,
       })
       .from(apiKeysTable)
       .leftJoin(usersTable, eq(apiKeysTable.user_id, usersTable.id))
@@ -136,6 +144,10 @@ export class ApiKeysRepository {
     key_uuid?: string;
     endpoint_uuid?: string | null;
     acts_as_user_id?: string | null;
+    // Set true ONLY on the wrong-plane rejection below, so the data-plane call
+    // sites can name the refusal precisely. A valid data-plane key never
+    // carries it.
+    admin_plane?: boolean;
   }> {
     const [apiKey] = await db
       .select({
@@ -144,6 +156,9 @@ export class ApiKeysRepository {
         endpoint_uuid: apiKeysTable.endpoint_uuid,
         acts_as_user_id: apiKeysTable.acts_as_user_id,
         is_active: apiKeysTable.is_active,
+        // Plane flag (migration 0038). Read on the ONE hot data-plane auth
+        // read so the refusal below costs no second query.
+        admin_plane: apiKeysTable.admin_plane,
         last_used_at: apiKeysTable.last_used_at,
       })
       .from(apiKeysTable)
@@ -165,6 +180,20 @@ export class ApiKeysRepository {
     // Check if key is active
     if (!apiKey.is_active) {
       return { valid: false };
+    }
+
+    // PLANE SEPARATION (migration 0038), enforced HERE so it holds for every
+    // data-plane surface that resolves a key through this ONE validator,
+    // present and future, rather than at each call site (the MCP bearer and
+    // X-API-Key branches AND the /oauth/introspect credential gate all funnel
+    // through validateApiKey; patching them one by one would miss the next one
+    // added). A control-plane key is not a data-plane credential: reject it as
+    // not-valid so every caller's existing `if (result.valid)` refuses it, and
+    // return `admin_plane: true` + the key_uuid so the two MCP branches can
+    // emit the distinct `admin_plane_key_on_data_plane` denial. Deliberately
+    // BEFORE the last_used stamp: a rejected path must not touch last_used_at.
+    if (apiKey.admin_plane) {
+      return { valid: false, admin_plane: true, key_uuid: apiKey.uuid };
     }
 
     // Throttled, fire-and-forget last-used stamp. This is the hot auth path
@@ -207,6 +236,96 @@ export class ApiKeysRepository {
         error,
       );
     }
+  }
+
+  /**
+   * Resolve a CONTROL-plane (admin-plane, migration 0038) key to its owning
+   * user, for the tRPC bearer path (lib/admin-plane-auth.ts).
+   *
+   * Deliberately a SEPARATE resolver from validateApiKey rather than an
+   * overload of it: the control plane needs the owner's fresh RBAC role and
+   * disabled flag, which the data-plane hot path must never pay a users join
+   * for. One atomic api_keys INNER JOIN users read gives a consistent snapshot
+   * of is_active, admin_plane, role and disabled, so the plane check, the role
+   * and the disabled gate cannot race each other.
+   *
+   * Returns valid ONLY when the key exists, is active, and is admin_plane; the
+   * caller fails closed on `disabled` (the account lock, migration 0027). The
+   * INNER JOIN also means a key whose owner row is gone resolves to nothing,
+   * fail-closed by construction, and consistent with the requires-owner CHECK.
+   * Hashes the presented key through hashApiKey exactly as validateApiKey does
+   * (never a second encoding, per the api-key-hash.ts contract).
+   */
+  async validateAdminPlaneApiKey(key: string): Promise<
+    | {
+        valid: true;
+        key_uuid: string;
+        disabled: boolean;
+        user: {
+          id: string;
+          email: string;
+          name: string;
+          emailVerified: boolean;
+          image: string | null;
+          role: string;
+          createdAt: Date;
+          updatedAt: Date;
+        };
+      }
+    | { valid: false; reason: "unknown_key" | "inactive" | "not_admin_plane" }
+  > {
+    const [row] = await db
+      .select({
+        key_uuid: apiKeysTable.uuid,
+        is_active: apiKeysTable.is_active,
+        admin_plane: apiKeysTable.admin_plane,
+        last_used_at: apiKeysTable.last_used_at,
+        user_id: usersTable.id,
+        email: usersTable.email,
+        name: usersTable.name,
+        emailVerified: usersTable.emailVerified,
+        image: usersTable.image,
+        role: usersTable.role,
+        disabled: usersTable.disabled,
+        createdAt: usersTable.createdAt,
+        updatedAt: usersTable.updatedAt,
+      })
+      .from(apiKeysTable)
+      // INNER JOIN: a control-plane key with no owner cannot exist (the
+      // requires-owner CHECK), and an owner row torn out mid-cascade must
+      // resolve to nothing rather than a partial identity.
+      .innerJoin(usersTable, eq(apiKeysTable.user_id, usersTable.id))
+      .where(eq(apiKeysTable.key_hash, hashApiKey(key)));
+
+    if (!row) return { valid: false, reason: "unknown_key" };
+    if (!row.is_active) return { valid: false, reason: "inactive" };
+    // A data-plane key presented on /trpc is not a usable control-plane
+    // credential. Not-valid, so createContext leaves the request
+    // unauthenticated and protectedProcedure returns its normal UNAUTHORIZED.
+    if (!row.admin_plane) return { valid: false, reason: "not_admin_plane" };
+
+    // Throttled fire-and-forget last-used stamp for an ACCEPTED admin-plane
+    // request (owner not disabled), same discipline as validateApiKey. A
+    // disabled owner's request is rejected downstream, so it does not stamp.
+    if (!row.disabled && shouldTouchLastUsed(row.last_used_at, Date.now())) {
+      void this.touchLastUsedAt(row.key_uuid);
+    }
+
+    return {
+      valid: true,
+      key_uuid: row.key_uuid,
+      disabled: row.disabled,
+      user: {
+        id: row.user_id,
+        email: row.email,
+        name: row.name,
+        emailVerified: row.emailVerified,
+        image: row.image,
+        role: row.role,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      },
+    };
   }
 
   // Member-scoped update: uuid AND owned-by-this-user ONLY. Deliberately does

@@ -46,12 +46,14 @@ describe("ApiKeysSerializer — key_prefix is rendered from the stored last4", (
       last_used_at: null,
       acts_as_email: null,
       owner_email: "member@example.com",
+      admin_plane: false,
     };
 
-    const fromMemberList =
-      ApiKeysSerializer.serializeApiKeyList([memberRow])[0].key_prefix;
-    const fromAdminList =
-      ApiKeysSerializer.serializeAdminApiKeyList([adminRow])[0].key_prefix;
+    const fromMemberList = ApiKeysSerializer.serializeApiKeyList([memberRow])[0]
+      .key_prefix;
+    const fromAdminList = ApiKeysSerializer.serializeAdminApiKeyList([
+      adminRow,
+    ])[0].key_prefix;
 
     expect(fromMemberList).toBe("sk_mt_…abcd");
     // Same rule on both surfaces — the drift the shared helper exists to stop.

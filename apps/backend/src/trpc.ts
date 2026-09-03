@@ -25,6 +25,20 @@ async function isSessionUserDisabled(userId: string): Promise<boolean> {
   return usersRepository.isDisabled(userId);
 }
 
+/**
+ * The admin-plane (control-plane) bearer resolver (migration 0038), reached
+ * through the SAME lazy import as `isSessionUserDisabled` and for the same
+ * reason: it touches the repositories and thus `db/index`, so importing it at
+ * the top of this file would make the tRPC instance un-loadable without a
+ * database. error-formatter.test.ts imports this module with `../auth` mocked
+ * precisely because the instance is independent of all that; deferring keeps it
+ * so. Costs one resolution on the first bearer request and nothing after.
+ */
+async function resolveAdminPlaneBearer(token: string, req: Request) {
+  const { resolveAdminPlaneSession } = await import("./lib/admin-plane-auth");
+  return resolveAdminPlaneSession(token, req);
+}
+
 // Extend the base context with Express request/response and auth data
 export interface Context extends BaseContext {
   req: Request;
@@ -96,6 +110,30 @@ export const createContext = async ({
             user = sessionData.user;
             session = sessionData.session;
           }
+        }
+      }
+    }
+
+    // Admin-plane (control-plane) bearer path (migration 0038), reached ONLY
+    // when the cookie block above resolved nothing. COOKIE PRECEDENCE is the
+    // point: if a cookie authenticated, this never runs, so the cookie path
+    // stays byte-identical (the "cookie path unchanged" test) and a browser
+    // carrying a stray Authorization header never changes behaviour. A
+    // control-plane API key presented here authenticates AS its owning user;
+    // resolveAdminPlaneSession fails closed (returns null) for an unknown key,
+    // an inactive key, a data-plane key, a disabled owner, a malformed header,
+    // or the kill switch, and the request then stays unauthenticated exactly as
+    // the disabled-account branch above leaves it. The resolver is DB-backed, so
+    // it is a lazy import (see resolveAdminPlaneBearer) to keep this module
+    // loadable without a database.
+    if (!user && !session) {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.substring(7);
+        const resolved = await resolveAdminPlaneBearer(token, req);
+        if (resolved) {
+          user = resolved.user;
+          session = resolved.session;
         }
       }
     }

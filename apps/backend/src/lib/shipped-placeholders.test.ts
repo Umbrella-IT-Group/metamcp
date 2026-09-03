@@ -79,6 +79,18 @@ describe("isPlaceholderOrShortBootstrapPassword", () => {
     expect(isPlaceholderOrShortBootstrapPassword(REAL_PASSWORD)).toBe(false);
     expect(isPlaceholderOrShortBootstrapPassword(undefined)).toBe(false);
   });
+
+  // Interim credential-hardening step for the CI-login rework: the bootstrap
+  // password floor was raised from 8 to 14. Pinned as a literal (not the
+  // symbol) so a regression that lowers it fails here rather than silently
+  // tracking the change.
+  it("enforces a floor of 14 characters", () => {
+    expect(MIN_BOOTSTRAP_PASSWORD_LENGTH).toBe(14);
+    expect(isPlaceholderOrShortBootstrapPassword("x".repeat(13))).toBe(true);
+    expect(isPlaceholderOrShortBootstrapPassword("x".repeat(14))).toBe(false);
+    // A password that cleared the OLD 8-char floor but not the new one.
+    expect(isPlaceholderOrShortBootstrapPassword("abcdefghijk")).toBe(true);
+  });
 });
 
 describe("shouldRefuseBootstrapPasswordInProduction", () => {

@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -191,6 +192,10 @@ export default function ApiKeysPage() {
       // Acts-as identity (migration 0024) is OPTIONAL and defaults to none:
       // an unbound key stays fail-closed for m365 delegated injection.
       acts_as_user_id: undefined,
+      // Plane flag (migration 0038): defaults to a data-plane key. The checkbox
+      // below flips it and clears the data-plane inputs, which are mutually
+      // exclusive with a control-plane key.
+      admin_plane: undefined,
     },
   });
 
@@ -252,6 +257,20 @@ export default function ApiKeysPage() {
         {`${t("api-keys:actsAsBadge")} ${label}`}
       </Badge>
     );
+
+  // Plane badge (migration 0038): a control-plane (admin-plane / CI) key
+  // authenticates on /trpc as its owner and is refused on the data plane.
+  // Surfaced loudly in the admin list so it can never be mistaken for a
+  // data-plane key.
+  const renderAdminPlaneBadge = (adminPlane: boolean) =>
+    adminPlane ? (
+      <Badge
+        variant="outline"
+        className="bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
+      >
+        {t("api-keys:adminPlaneBadge")}
+      </Badge>
+    ) : null;
 
   // Better-auth ids are opaque ~32-char strings — shorten for badge display.
   // Emails are shown in full (admin list only).
@@ -378,11 +397,50 @@ export default function ApiKeysPage() {
                       </p>
                     )}
                   </div>
+                  {/* Admin-plane (control-plane / CI) key (migration 0038).
+                      This whole dialog is admin-only, and the backend
+                      re-enforces admin-only + owner-must-be-admin regardless.
+                      Checking it clears the data-plane inputs it is mutually
+                      exclusive with (endpoint scope + acts-as), pins ownership
+                      to an admin (self, never 'everyone'), and disables those
+                      controls while it is checked. */}
+                  <div className="flex items-start gap-2">
+                    <Checkbox
+                      id="admin-plane"
+                      checked={form.watch("admin_plane") === true}
+                      onCheckedChange={(checked) => {
+                        const on = checked === true;
+                        form.setValue("admin_plane", on ? true : undefined);
+                        if (on) {
+                          form.setValue("endpoint_uuid", undefined);
+                          form.setValue("all_endpoints", undefined);
+                          form.setValue("acts_as_user_id", undefined);
+                          form.setValue("user_id", undefined);
+                          form.clearErrors([
+                            "endpoint_uuid",
+                            "acts_as_user_id",
+                          ]);
+                        }
+                      }}
+                    />
+                    <div>
+                      <Label
+                        htmlFor="admin-plane"
+                        className="text-sm font-medium"
+                      >
+                        {t("api-keys:adminPlane")}
+                      </Label>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {t("api-keys:adminPlaneDescription")}
+                      </p>
+                    </div>
+                  </div>
                   <div>
                     <Label htmlFor="ownership" className="text-sm font-medium">
                       {t("api-keys:ownership")}
                     </Label>
                     <Select
+                      disabled={form.watch("admin_plane") === true}
                       value={
                         form.watch("user_id") === null ? "public" : "private"
                       }
@@ -429,6 +487,7 @@ export default function ApiKeysPage() {
                       {t("api-keys:scope")}
                     </Label>
                     <Select
+                      disabled={form.watch("admin_plane") === true}
                       value={
                         form.watch("all_endpoints") === true
                           ? "__all__"
@@ -516,7 +575,8 @@ export default function ApiKeysPage() {
                       placeholder={t("api-keys:actsAsUserPlaceholder")}
                       disabled={
                         !form.watch("endpoint_uuid") ||
-                        form.watch("user_id") === null
+                        form.watch("user_id") === null ||
+                        form.watch("admin_plane") === true
                       }
                     />
                     {form.formState.errors.acts_as_user_id && (
@@ -764,6 +824,7 @@ export default function ApiKeysPage() {
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1 flex-wrap">
+                          {renderAdminPlaneBadge(apiKey.admin_plane)}
                           {renderScopeBadge(apiKey.endpoint_uuid)}
                           {renderIdentityBadge(
                             apiKey.acts_as_email ??

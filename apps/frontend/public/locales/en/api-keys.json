@@ -49,5 +49,8 @@
   "actsAsUserDescription": "Optional, administrators only. Requests authenticated by this key run delegated M365 calls as this user. Requires a specific endpoint scope, and the key must be owned by this same user — never available on public ('everyone') keys. Without a binding the key stays fail-closed (no delegated identity).",
   "actsAsBadge": "Acts as",
   "roleLoadError": "Couldn't determine your permissions.",
-  "retryRoleLoad": "Retry"
+  "retryRoleLoad": "Retry",
+  "adminPlane": "Admin-plane (control-plane / CI) key",
+  "adminPlaneDescription": "Administrators only. Authenticates on the control plane (/trpc) as its owner, for CI and automation. Refused on the data plane. Mutually exclusive with endpoint scope and acts-as identity, and it must be owned by an administrator.",
+  "adminPlaneBadge": "Control plane"
 }

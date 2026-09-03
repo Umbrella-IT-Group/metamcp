@@ -34,6 +34,41 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> => {
+    // Admin-plane (control-plane) mint policy (migration 0038), enforced here
+    // and mirrored in the zod superRefine for schema-bypassing callers.
+    // ADMIN-ONLY: only an admin session may mint a control-plane key. PLANE
+    // EXCLUSIVITY: a control-plane key has no endpoint to reach and carries no
+    // acts-as identity, so those data-plane inputs must be absent (and the
+    // mandatory-scope gate below is skipped for it). Owner-must-be-admin is
+    // enforced once the effective owner is resolved. Kept FORBIDDEN/BAD_REQUEST
+    // -before-write, the same shape as the acts-as guards below.
+    if (input.admin_plane === true) {
+      if (!isAdmin) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "Only administrators can create admin-plane (control-plane) API keys.",
+        });
+      }
+      if (
+        input.endpoint_uuid !== undefined ||
+        input.all_endpoints !== undefined
+      ) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "An admin-plane key has no endpoint scope, do not pass endpoint_uuid or all_endpoints.",
+        });
+      }
+      if (input.acts_as_user_id !== undefined) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "An admin-plane key carries no acts-as identity, do not pass acts_as_user_id.",
+        });
+      }
+    }
+
     // RBAC on the mint path. `input.user_id === null` is the public
     // ('everyone') selection; `undefined` means "private to me". A member may
     // only mint keys owned by themselves — they cannot create a public key,
@@ -85,19 +120,25 @@ export const apiKeysImplementations = {
     // either name the ONE endpoint it may reach, or deliberately opt into
     // gateway-wide reach with all_endpoints: true (stored as NULL scope).
     // Silently defaulting to global is impossible.
-    if (input.endpoint_uuid && input.all_endpoints === true) {
-      throw new TRPCError({
-        code: "BAD_REQUEST",
-        message:
-          "Pass either endpoint_uuid or all_endpoints: true, not both — a key is scoped to one endpoint or explicitly global.",
-      });
-    }
-    if (!input.endpoint_uuid && input.all_endpoints !== true) {
-      throw new TRPCError({
-        code: "BAD_REQUEST",
-        message:
-          "An API key must be scoped to an endpoint (endpoint_uuid). To mint a gateway-wide key, pass all_endpoints: true explicitly.",
-      });
+    // Data-plane scope gate. Skipped for an admin-plane key: it is the ONE
+    // place the mandatory-scope rule is relaxed, and only for control-plane
+    // keys, which have no endpoint to name (the guard above already rejected a
+    // scope on them).
+    if (input.admin_plane !== true) {
+      if (input.endpoint_uuid && input.all_endpoints === true) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "Pass either endpoint_uuid or all_endpoints: true, not both, a key is scoped to one endpoint or explicitly global.",
+        });
+      }
+      if (!input.endpoint_uuid && input.all_endpoints !== true) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "An API key must be scoped to an endpoint (endpoint_uuid). To mint a gateway-wide key, pass all_endpoints: true explicitly.",
+        });
+      }
     }
 
     // Identity-requires-scope invariant (mirrors the zod superRefine so it
@@ -121,6 +162,31 @@ export const apiKeysImplementations = {
     // existence lookups below so the ownership invariant rejects without a
     // single DB read.
     const apiKeyUserId = input.user_id !== undefined ? input.user_id : userId;
+
+    // Owner-must-be-admin at mint for an admin-plane key (foreman ruling). This
+    // is defense in depth, not the enforcement of record: the owner's role is
+    // re-read fresh per request at authentication, so a later demotion still
+    // fails closed. Rejecting here keeps a useless-and-dangerous artifact, a
+    // member-owned (or public) control-plane key, from being created at all. A
+    // public ('everyone') owner has no user and no role to become; the
+    // requires-owner CHECK forbids it too, but a precise message beats a
+    // constraint error.
+    if (input.admin_plane === true) {
+      if (apiKeyUserId === null) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "An admin-plane key cannot be public ('everyone'), it must be owned by an administrator.",
+        });
+      }
+      const ownerRole = await usersRepository.findRoleById(apiKeyUserId);
+      if (ownerRole !== "admin") {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "An admin-plane key's owner must be an administrator.",
+        });
+      }
+    }
 
     // Ownership invariant (mirrored in both zod superRefines): an
     // identity-bound key must be OWNED by the identity it exercises. This
@@ -174,6 +240,10 @@ export const apiKeysImplementations = {
         // Validated acts-as identity (admin-only, requires the endpoint
         // scope above). NULL = no identity, m365 injection fail-closes.
         acts_as_user_id: input.acts_as_user_id ?? null,
+        // Plane flag (migration 0038). true only after the admin-only +
+        // owner-must-be-admin + plane-exclusivity gates above; the CHECK
+        // constraints refuse a straddling row regardless.
+        admin_plane: input.admin_plane === true,
         is_active: true,
       });
 
@@ -192,6 +262,9 @@ export const apiKeysImplementations = {
           endpoint_uuid: input.endpoint_uuid ?? null,
           all_endpoints: input.all_endpoints === true,
           acts_as_user_id: input.acts_as_user_id ?? null,
+          // Greppable "a control-plane key was minted" (migration 0038). Never
+          // the key itself, detail already carries no credential material.
+          admin_plane: input.admin_plane === true,
         },
       });
 

@@ -72,5 +72,9 @@
     "required": "Max rate is required",
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"
+  },
+  "apiKeyAdminPlane": {
+    "noScope": "An admin-plane (control-plane) key has no endpoint scope, clear the endpoint and all-endpoints selection",
+    "noActsAs": "An admin-plane (control-plane) key carries no acts-as identity, clear the acts-as user"
   }
 }

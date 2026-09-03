@@ -591,6 +591,31 @@ export const authenticateApiKey = async (
 
         return next();
       } else {
+        // CONTROL-plane (admin-plane) key on the DATA plane (migration 0038).
+        // validateApiKey refuses it as not-valid so it lands here; refuse it
+        // BEFORE the invalid-credential path so it answers the same 403
+        // access-denied a scope denial answers (not a 401) and is NOT counted
+        // as a failed credential, it is a valid credential on the wrong plane,
+        // not a guess, and counting it would let a misrouted CI key spend the
+        // data-plane budget. The distinct reason makes the misuse greppable.
+        // The plane rule itself lives in validateApiKey so every data-plane
+        // surface refuses; this branch only names the refusal precisely.
+        if (apiKeyResult?.admin_plane) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "admin_plane_key_on_data_plane",
+            presentedToken: token,
+            authMethod: "api_key",
+            actorType: "api_key",
+            actorId: apiKeyResult.key_uuid,
+          });
+          return res.status(403).json({
+            error: "Access denied",
+            message: "This credential is not permitted on the data plane.",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
         // API key invalid - check rate limiting
         const rateLimitId = getAuthRateLimitIdentifier(req, endpoint);
 
@@ -782,6 +807,28 @@ export const authenticateApiKey = async (
 
         return next();
       } else {
+        // CONTROL-plane (admin-plane) key on the DATA plane (migration 0038),
+        // same refusal as the api-key-only branch above, placed before the
+        // invalid-credential path for the same reasons (403 access-denied, not
+        // counted, distinct reason). This branch is reached when an admin-plane
+        // key arrives as an Authorization bearer on an OAuth-enabled endpoint;
+        // it is not an mcp_token_ so OAuth validation already declined it.
+        if (apiKeyResult?.admin_plane) {
+          emitMcpAuthDenial(req, endpoint, {
+            httpStatus: 403,
+            reason: "admin_plane_key_on_data_plane",
+            presentedToken: token,
+            authMethod: "api_key",
+            actorType: "api_key",
+            actorId: apiKeyResult.key_uuid,
+          });
+          return res.status(403).json({
+            error: "Access denied",
+            message: "This credential is not permitted on the data plane.",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
         // Both OAuth and API key failed - check rate limiting
         const rateLimitId = getAuthRateLimitIdentifier(req, endpoint);
 

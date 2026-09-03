@@ -210,6 +210,33 @@ describe("ApiKeysRepository.validateApiKey — scope + acts-as projection", () =
 
     expect(result).toEqual({ valid: false });
   });
+
+  it("refuses an ADMIN-PLANE key as not-valid, flagging the wrong plane (migration 0038)", async () => {
+    // The plane rule lives HERE so every data-plane surface that resolves a key
+    // through validateApiKey refuses a control-plane key. It reports the wrong
+    // plane distinctly (admin_plane: true + key_uuid) so the MCP branches can
+    // name the refusal. `last_used_at` is a fresh stamp, so the fire-and-forget
+    // touch would be inert anyway; the returned shape is what proves the reject.
+    selectChain.where.mockResolvedValueOnce([
+      {
+        uuid: "key-uuid-cp",
+        user_id: "ci-user",
+        endpoint_uuid: null,
+        acts_as_user_id: null,
+        is_active: true,
+        admin_plane: true,
+        last_used_at: new Date(),
+      },
+    ]);
+
+    const result = await repo.validateApiKey("sk_mt_admin_plane");
+
+    expect(result).toEqual({
+      valid: false,
+      admin_plane: true,
+      key_uuid: "key-uuid-cp",
+    });
+  });
 });
 
 // Migration 0034: the table stores sha256(key), not the key. If the lookup
@@ -242,7 +269,9 @@ describe("ApiKeysRepository.validateApiKey — the lookup is by HASH, not by key
 
     await repo.validateApiKey(presented);
 
-    const eqArgs = (eq as unknown as ReturnType<typeof vi.fn>).mock.calls.flat();
+    const eqArgs = (
+      eq as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.flat();
     expect(eqArgs).not.toContain(presented);
     // …and no column other than key_hash is compared on this path, so a
     // lingering plaintext column could not be reintroduced as the matcher.

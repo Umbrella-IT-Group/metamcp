@@ -44,11 +44,15 @@ export const SHIPPED_PLACEHOLDER_AUTH_SECRET =
   "REPLACE_ME__generate_a_signing_key";
 
 /**
- * The floor a bootstrap administrator password must clear. Eight matches the
- * length the config validation has always warned below; production now refuses
- * rather than warns (see `shouldRefuseBootstrapPasswordInProduction`).
+ * The floor a bootstrap administrator password must clear. Raised from 8 to 14
+ * as the interim credential-hardening step for the CI-login rework (W2-3): while
+ * CI still signs in with a password, that password is the bootstrap
+ * administrator's, so the bootstrap floor is where a real length can be
+ * required. Production REFUSES below it (not merely warns) via
+ * `shouldRefuseBootstrapPasswordInProduction`; outside production it stays
+ * warn-only so a throwaway local stack still boots.
  */
-export const MIN_BOOTSTRAP_PASSWORD_LENGTH = 8;
+export const MIN_BOOTSTRAP_PASSWORD_LENGTH = 14;
 
 /**
  * Whether a bootstrap password is one this repository publishes or is too
