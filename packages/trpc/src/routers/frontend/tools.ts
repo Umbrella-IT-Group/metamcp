@@ -13,7 +13,12 @@ import {
 
 export const createToolsRouter = <
   TImplementations extends {
-    getByMcpServerUuid: (input: any) => Promise<any>;
+    // `userId` is threaded from `ctx.user.id` so the impl can scope the tool
+    // catalog to servers the caller owns or public servers, the same
+    // own-plus-public contract as `mcpServers.get`. Without it any member who
+    // learns a private server's UUID could read that server's full tool
+    // catalog.
+    getByMcpServerUuid: (input: any, userId: string) => Promise<any>;
     create: (input: any, actor: AuditActor) => Promise<any>;
     sync: (input: any, actor: AuditActor) => Promise<any>;
   },
@@ -21,11 +26,11 @@ export const createToolsRouter = <
   implementations: TImplementations,
 ) => {
   return router({
-    // Protected: Get tools by MCP server UUID
+    // Protected: Get tools by MCP server UUID, scoped to the caller in the impl.
     getByMcpServerUuid: protectedProcedure
       .input(GetToolsByMcpServerUuidRequestSchema)
-      .query(async ({ input }) => {
-        return implementations.getByMcpServerUuid(input);
+      .query(async ({ input, ctx }) => {
+        return implementations.getByMcpServerUuid(input, ctx.user.id);
       }),
 
     // Admin only: Save tools to database (upsert only, no cleanup). Curation

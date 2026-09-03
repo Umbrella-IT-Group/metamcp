@@ -2,7 +2,16 @@
 
 import { CreateApiKeyFormSchema } from "@repo/zod-types";
 import { format } from "date-fns";
-import { Copy, Key, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import {
+  Ban,
+  Copy,
+  Key,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
@@ -148,6 +157,27 @@ export default function ApiKeysPage() {
     },
   });
 
+  // Deactivate / reactivate is the doctrine-compliant kill: it expires the key
+  // through the existing update path (is_active toggle) while PRESERVING the
+  // ownership and last-used audit row, unlike DELETE which destroys the only
+  // record of who held the credential. The backend audits is_active=false
+  // under its own apikey.revoke verb, so an incident review can answer "which
+  // keys were killed, by whom, when" from the action column.
+  const updateMutation = trpc.frontend.apiKeys.update.useMutation({
+    onSuccess: (data) => {
+      refetch();
+      if (isAdmin) refetchAll();
+      toast.success(
+        data.is_active
+          ? t("api-keys:apiKeyReactivated")
+          : t("api-keys:apiKeyDeactivated"),
+      );
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    },
+  });
+
   const form = useForm<CreateApiKeyFormData>({
     resolver: createTranslatedZodResolver(CreateApiKeyFormSchema, t),
     defaultValues: {
@@ -181,6 +211,13 @@ export default function ApiKeysPage() {
   const handleDeleteClick = (apiKey: { uuid: string; name: string }) => {
     setApiKeyToDelete(apiKey);
     setDeleteDialogOpen(true);
+  };
+
+  // Toggle sends the OPPOSITE of the current state so one button serves both
+  // directions. No confirm dialog: deactivate is reversible (reactivate is
+  // the same control), unlike the destructive DELETE which stays confirm-gated.
+  const handleToggleActive = (apiKey: { uuid: string; is_active: boolean }) => {
+    updateMutation.mutate({ uuid: apiKey.uuid, is_active: !apiKey.is_active });
   };
 
   // Scope cell: NULL endpoint_uuid = legacy/gateway-wide key ("All
@@ -611,19 +648,48 @@ export default function ApiKeysPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() =>
-                        handleDeleteClick({
-                          uuid: apiKey.uuid,
-                          name: apiKey.name,
-                        })
-                      }
-                      disabled={deleteMutation.isPending}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          handleToggleActive({
+                            uuid: apiKey.uuid,
+                            is_active: apiKey.is_active,
+                          })
+                        }
+                        disabled={updateMutation.isPending}
+                        title={
+                          apiKey.is_active
+                            ? t("api-keys:deactivate")
+                            : t("api-keys:reactivate")
+                        }
+                      >
+                        {apiKey.is_active ? (
+                          <Ban className="h-4 w-4" />
+                        ) : (
+                          <RotateCcw className="h-4 w-4" />
+                        )}
+                      </Button>
+                      {/* Delete stays confirm-gated (AlertDialog below) and is
+                          visually demoted with destructive color: deactivate is
+                          the preferred, reversible, record-preserving kill. */}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          handleDeleteClick({
+                            uuid: apiKey.uuid,
+                            name: apiKey.name,
+                          })
+                        }
+                        disabled={deleteMutation.isPending}
+                        title={t("api-keys:delete")}
+                        className="text-destructive hover:text-destructive"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))
@@ -733,20 +799,49 @@ export default function ApiKeysPage() {
                         </Badge>
                       </TableCell>
                       <TableCell>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() =>
-                            handleDeleteClick({
-                              uuid: apiKey.uuid,
-                              name: apiKey.name,
-                            })
-                          }
-                          disabled={deleteMutation.isPending}
-                          title={t("api-keys:delete")}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              handleToggleActive({
+                                uuid: apiKey.uuid,
+                                is_active: apiKey.is_active,
+                              })
+                            }
+                            disabled={updateMutation.isPending}
+                            title={
+                              apiKey.is_active
+                                ? t("api-keys:deactivate")
+                                : t("api-keys:reactivate")
+                            }
+                          >
+                            {apiKey.is_active ? (
+                              <Ban className="h-4 w-4" />
+                            ) : (
+                              <RotateCcw className="h-4 w-4" />
+                            )}
+                          </Button>
+                          {/* Delete stays confirm-gated (AlertDialog below) and
+                              is visually demoted with destructive color:
+                              deactivate is the preferred, reversible,
+                              record-preserving kill. */}
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              handleDeleteClick({
+                                uuid: apiKey.uuid,
+                                name: apiKey.name,
+                              })
+                            }
+                            disabled={deleteMutation.isPending}
+                            title={t("api-keys:delete")}
+                            className="text-destructive hover:text-destructive"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))

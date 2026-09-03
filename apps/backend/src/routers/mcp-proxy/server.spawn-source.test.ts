@@ -390,17 +390,33 @@ describe("resolveStdioSpawnParams — the Inspector still connects", () => {
     expect(params.errorStatus).toBe("ERROR");
   });
 
-  it("passes the backend environment through, so a server keeps its own", async () => {
-    // Read generically rather than by name: the spawned process inherits the
-    // whole backend environment, and naming one variable here would both pin
-    // an assumption about the host and add it to turbo's declared env set.
-    findAccessibleMock.mockResolvedValue([registeredServer()]);
+  it("gives the child the curated default env plus the row's own env, not the whole gateway environment", async () => {
+    // The Inspector used to spread the entire backend
+    // process.env into the child, so an admin-registered npx MCP inherited
+    // DATABASE_URL, BETTER_AUTH_SECRET and every vendor secret. The child env
+    // is now the curated getDefaultEnvironment allowlist (operational vars only)
+    // plus the row's resolved env, matching the pool path. A real declared
+    // gateway secret is used (saved/restored) for the negative assertion.
+    const prior = process.env.BETTER_AUTH_SECRET;
+    process.env.BETTER_AUTH_SECRET = "must-not-leak";
+    try {
+      findAccessibleMock.mockResolvedValue([registeredServer()]);
 
-    const params = await resolveStdioSpawnParams(
-      makeReq({ transportType: "STDIO", mcpServerUuid: SERVER_UUID }),
-    );
+      const params = await resolveStdioSpawnParams(
+        makeReq({ transportType: "STDIO", mcpServerUuid: SERVER_UUID }),
+      );
 
-    const [inheritedKey, inheritedValue] = Object.entries(process.env)[0];
-    expect(params.env[inheritedKey]).toBe(inheritedValue);
+      // The row's own env still reaches the child.
+      expect(params.env.FILESYSTEM_TOKEN).toBe("s3cret");
+      // The curated allowlist contributed operational vars beyond the single
+      // row key, so the fix did not over-restrict into an empty env (an
+      // Inspector-spawned server can still find its interpreter).
+      expect(Object.keys(params.env).length).toBeGreaterThan(1);
+      // A gateway secret no server env references does NOT reach the child.
+      expect(params.env.BETTER_AUTH_SECRET).toBeUndefined();
+    } finally {
+      if (prior === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = prior;
+    }
   });
 });

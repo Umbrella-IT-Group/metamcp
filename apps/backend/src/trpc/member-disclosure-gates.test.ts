@@ -31,6 +31,7 @@ import {
   createLogsRouter,
   createMcpServersRouter,
   createNamespacesRouter,
+  createToolsRouter,
 } from "@repo/trpc";
 import { describe, expect, it, vi } from "vitest";
 
@@ -81,6 +82,15 @@ const buildMcpServersRouter = () => {
     reconnect: okImpl({ success: true } as never),
   };
   return { router: createMcpServersRouter(impls), impls };
+};
+
+const buildToolsRouter = () => {
+  const impls = {
+    getByMcpServerUuid: okImpl({ success: true, data: [] } as never),
+    create: okImpl({ success: true, count: 0 } as never),
+    sync: okImpl({ success: true, count: 0 } as never),
+  };
+  return { router: createToolsRouter(impls), impls };
 };
 
 const buildNamespacesRouter = () => {
@@ -198,6 +208,35 @@ describe("mcpServers.reconnect — isAdmin reaches the implementation", () => {
 
     await expect(
       router.createCaller(memberCtx).reconnect({ uuid: SERVER_UUID }),
+    ).resolves.toMatchObject({ success: true });
+  });
+});
+
+describe("tools.getByMcpServerUuid — the caller id reaches the implementation", () => {
+  // The ownership decision lives in the impl (tools.impl.get.test.ts); this
+  // pins the wiring that feeds it. Drop `ctx.user.id` at the router and the
+  // impl scopes against `undefined`, which never equals any owner — every
+  // private catalog would refuse and the check would silently stop meaning
+  // anything. A positional argument no type error would catch.
+  it("passes the caller id, not the whole context", async () => {
+    const { router, impls } = buildToolsRouter();
+
+    await router
+      .createCaller(memberCtx)
+      .getByMcpServerUuid({ mcpServerUuid: SERVER_UUID });
+    expect(impls.getByMcpServerUuid).toHaveBeenCalledWith(
+      { mcpServerUuid: SERVER_UUID },
+      "member-1",
+    );
+  });
+
+  it("stays reachable by members — this is per-user scoping, not an admin gate", async () => {
+    const { router } = buildToolsRouter();
+
+    await expect(
+      router
+        .createCaller(memberCtx)
+        .getByMcpServerUuid({ mcpServerUuid: SERVER_UUID }),
     ).resolves.toMatchObject({ success: true });
   });
 });
