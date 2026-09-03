@@ -161,6 +161,11 @@ describeIfDb("ensure-runtime-role.sh against a REAL postgres", () => {
   it.each([
     ["audit_log", ["SELECT", "INSERT"], ["UPDATE", "DELETE", "TRUNCATE"]],
     ["tool_call_audit", ["SELECT", "INSERT", "DELETE"], ["UPDATE", "TRUNCATE"]],
+    // gateway_events carries the same trigger set as tool_call_audit, so its
+    // grant matrix matches: append and read, prune the aged tail, never
+    // rewrite. This is the end state the gateway-events pool depends on the
+    // moment it dials the runtime role.
+    ["gateway_events", ["SELECT", "INSERT", "DELETE"], ["UPDATE", "TRUNCATE"]],
   ])("%s: keeps %j, refuses %j", async (table, allowed, denied) => {
     for (const privilege of allowed as string[]) {
       const { rows } = await owner.query<{ ok: boolean }>(

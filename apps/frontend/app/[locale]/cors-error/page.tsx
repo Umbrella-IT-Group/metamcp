@@ -9,6 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useTranslations } from "@/hooks/useTranslations";
 import { getAppUrl } from "@/lib/env";
+import { toSafeInternalPath } from "@/lib/safe-redirect";
 
 function CorsErrorContent() {
   const { t } = useTranslations();
@@ -31,12 +32,23 @@ function CorsErrorContent() {
     }
   }, []);
 
-  const attemptedPath = searchParams.get("callbackUrl") || "/";
+  // callbackUrl is attacker-controlled; reduce it to a safe same-origin path
+  // before it is ever concatenated onto an origin and navigated to.
+  const attemptedPath = toSafeInternalPath(searchParams.get("callbackUrl"));
 
   const handleRedirectToCorrectDomain = () => {
-    if (correctDomain) {
-      const redirectUrl = `${correctDomain}${attemptedPath}`;
-      window.location.href = redirectUrl;
+    if (!correctDomain) return;
+    try {
+      // Belt to the sanitized path above: resolve against the authorized
+      // origin and navigate only when the result is still that same origin,
+      // so a value that slipped past the path check cannot send the user off
+      // to another host.
+      const target = new URL(attemptedPath, correctDomain);
+      if (target.origin === new URL(correctDomain).origin) {
+        window.location.href = target.href;
+      }
+    } catch (error) {
+      console.error("Invalid redirect target:", error);
     }
   };
 
