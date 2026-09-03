@@ -14,6 +14,13 @@ Please report security issues privately — do not open a public issue or PR:
 
 We aim to acknowledge within 3 business days and to agree a coordinated disclosure timeline with you.
 
+## Threat model
+
+We maintain a threat model for our deployment of this fork privately; it is not published in
+this repository. Vulnerability reports should go to the contact published in the deployment's
+`/.well-known/security.txt` (currently `mailto:support@umbrellaitgroup.com`), or through the
+private advisory process above.
+
 ## Scope
 
 In scope: the `umbrella` branch of this repository — the gateway, its management API, OAuth
