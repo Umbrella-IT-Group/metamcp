@@ -16,6 +16,10 @@ import {
 } from "../../lib/metamcp/caller-context";
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
+import {
+  checkConcurrentSessionCeiling,
+  registerSessionCounter,
+} from "../../lib/metamcp/credential-session-quota";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
 import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
@@ -127,6 +131,11 @@ const sseRouter = express.Router();
 // Session lifetime manager for SSE sessions
 const sessionManager = new SessionLifetimeManagerImpl<Transport>("SSE");
 
+// Register as a source of live-session counts for the per-credential
+// concurrent-session ceiling, so a credential's budget spans SSE and
+// StreamableHTTP together rather than being counted separately per transport.
+registerSessionCounter(sessionManager);
+
 /**
  * Put a bound session into the module's REAL map — tests only. The
  * streamable-http twin is `recoverPersistedSession`, which tests can drive
@@ -195,6 +204,20 @@ sseRouter.get(
     const { namespaceUuid, endpointName } = authReq;
 
     try {
+      // Per-credential concurrent-session ceiling, enforced at creation: the
+      // same budget the StreamableHTTP path enforces, shared across both
+      // transports. Refuse before opening the stream so an over-budget
+      // credential cannot keep accreting sessions that starve the backend pool.
+      const ceiling = checkConcurrentSessionCeiling(
+        resolveSessionIdentity(authReq),
+      );
+      if (!ceiling.allowed) {
+        res.status(429).json({
+          error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
+        });
+        return;
+      }
+
       logger.info(
         `New public endpoint SSE connection request for ${endpointName} -> namespace ${namespaceUuid}`,
       );

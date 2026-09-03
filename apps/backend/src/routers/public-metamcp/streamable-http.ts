@@ -21,6 +21,10 @@ import {
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
+  checkConcurrentSessionCeiling,
+  registerSessionCounter,
+} from "../../lib/metamcp/credential-session-quota";
+import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
   shouldRefuseRecovery,
@@ -264,6 +268,12 @@ const sessionManager =
   new SessionLifetimeManagerImpl<StreamableHTTPServerTransport>(
     "StreamableHTTP",
   );
+
+// Register as a source of live-session counts for the per-credential
+// concurrent-session ceiling. The ceiling sums across every registered manager
+// (this one plus the SSE manager), so a credential's session budget spans both
+// transports rather than being per-transport.
+registerSessionCounter(sessionManager);
 
 // Idle-TTL sweeper for public-endpoint sessions. This reaps on a DIFFERENT
 // axis than the age-based `sessionManager.startCleanupTimer` below: last
@@ -1001,6 +1011,20 @@ streamableHttpRouter.post(
 
     if (!sessionId) {
       try {
+        // Per-credential concurrent-session ceiling, enforced at creation. A
+        // credential already holding the maximum is refused here rather than
+        // being allowed to mint another session that, once the shared backend
+        // pool saturates, would evict other consumers' live connections.
+        const ceiling = checkConcurrentSessionCeiling(
+          resolveSessionIdentity(authReq),
+        );
+        if (!ceiling.allowed) {
+          res.status(429).json({
+            error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
+          });
+          return;
+        }
+
         logger.info(
           `New public endpoint StreamableHttp connection request for ${endpointName} -> namespace ${namespaceUuid}`,
         );

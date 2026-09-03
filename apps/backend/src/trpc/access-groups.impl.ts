@@ -161,6 +161,9 @@ export const accessGroupsImplementations = {
           // actually gating anyone" — see EndpointAccessSchema.
           enable_oauth: endpoint.enable_oauth,
           enable_api_key_auth: endpoint.enable_api_key_auth,
+          // Carried so the panel stops reporting that unscoped API keys still
+          // reach a restricted endpoint once the pairing has closed that path.
+          require_scoped_api_key: endpoint.require_scoped_api_key,
           groups,
         },
       };
@@ -542,6 +545,10 @@ export const accessGroupsImplementations = {
           // only answers the first.
           previous: existing.restricted,
           restricted: updated.restricted,
+          // Records the paired side effect: restricting an endpoint forces the
+          // scoped-key requirement on, so the audit shows the API-key plane was
+          // closed at the same moment, not left open.
+          require_scoped_api_key: updated.require_scoped_api_key,
         },
       });
 

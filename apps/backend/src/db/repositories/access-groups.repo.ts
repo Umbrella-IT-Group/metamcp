@@ -166,9 +166,13 @@ export class AccessGroupsRepository {
           restricted: endpointsTable.restricted,
           // The auth toggles decide whether `restricted` gates anybody: the
           // gate is OAuth-only, so it is inert with `enable_oauth` off and
-          // partial when API keys are also accepted.
+          // partial when API keys are also accepted AND unscoped keys still
+          // pass. `require_scoped_api_key` closes that API-key bypass (the
+          // pairing forces it on with `restricted`), so the badge needs it to
+          // tell a scoped-only endpoint from a wide-open one.
           enable_oauth: endpointsTable.enable_oauth,
           enable_api_key_auth: endpointsTable.enable_api_key_auth,
+          require_scoped_api_key: endpointsTable.require_scoped_api_key,
         })
         .from(accessGroupEndpointsTable)
         .innerJoin(
@@ -325,16 +329,30 @@ export class AccessGroupsRepository {
    *
    * Returns the new row so the caller can emit the change and report the miss
    * when no endpoint matched.
+   *
+   * Turning restriction ON also forces `require_scoped_api_key` ON in the same
+   * statement, pairing the API-key plane with the OAuth gate: a restricted
+   * endpoint must not keep admitting unscoped gateway-wide keys, or it is
+   * confined on one plane and open on the other. This is the primary path an
+   * operator uses to restrict a live endpoint, so the pairing has to hold here
+   * and not only on create/update. Turning restriction OFF leaves
+   * require_scoped_api_key as it was: keeping the more restrictive setting is
+   * safe, and the operator clears it deliberately if they want to.
    */
   async setEndpointRestricted(endpointUuid: string, restricted: boolean) {
     const [updated] = await db
       .update(endpointsTable)
-      .set({ restricted, updated_at: new Date() })
+      .set(
+        restricted
+          ? { restricted, require_scoped_api_key: true, updated_at: new Date() }
+          : { restricted, updated_at: new Date() },
+      )
       .where(eq(endpointsTable.uuid, endpointUuid))
       .returning({
         uuid: endpointsTable.uuid,
         name: endpointsTable.name,
         restricted: endpointsTable.restricted,
+        require_scoped_api_key: endpointsTable.require_scoped_api_key,
       });
 
     return updated;

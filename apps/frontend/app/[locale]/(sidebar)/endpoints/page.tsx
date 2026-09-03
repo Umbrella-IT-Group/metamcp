@@ -84,7 +84,8 @@ export default function EndpointsPage() {
           namespaceUuid: "",
           enableApiKeyAuth: true,
           requireScopedApiKey: false,
-          enableMaxRate: false,
+          restricted: false,
+          enableMaxRate: true,
           enableClientMaxRate: false,
           maxRate: undefined,
           maxRateSeconds: undefined,
@@ -95,7 +96,7 @@ export default function EndpointsPage() {
           enableOauth: true,
           useQueryParamAuth: false,
           createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
-          user_id: null, // Default to public (Everyone)
+          user_id: undefined, // default PRIVATE (owned by the creating admin); the ownership selector below opts in to public (Everyone)
         });
         setSelectedNamespaceUuid("");
         setSelectedNamespaceName("");
@@ -128,7 +129,7 @@ export default function EndpointsPage() {
       name: "",
       description: "",
       namespaceUuid: "",
-      enableMaxRate: false,
+      enableMaxRate: true,
       enableClientMaxRate: false,
       maxRate: undefined,
       maxRateSeconds: undefined,
@@ -138,10 +139,11 @@ export default function EndpointsPage() {
       clientMaxRateStrategyKey: "",
       enableApiKeyAuth: true,
       requireScopedApiKey: false,
+      restricted: false,
       enableOauth: true,
       useQueryParamAuth: false,
       createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
-      user_id: null, // Default to public (Everyone)
+      user_id: undefined, // default PRIVATE (owned by the creating admin); the ownership selector below opts in to public (Everyone)
     },
   });
 
@@ -155,6 +157,7 @@ export default function EndpointsPage() {
         namespaceUuid: data.namespaceUuid,
         enableApiKeyAuth: data.enableApiKeyAuth,
         requireScopedApiKey: data.requireScopedApiKey,
+        restricted: data.restricted,
         enableMaxRate: data.enableMaxRate,
         enableClientMaxRate: data.enableClientMaxRate,
         maxRate: data.maxRate,
@@ -201,7 +204,8 @@ export default function EndpointsPage() {
       namespaceUuid: "",
       enableApiKeyAuth: true,
       requireScopedApiKey: false,
-      enableMaxRate: false,
+      restricted: false,
+      enableMaxRate: true,
       enableClientMaxRate: false,
       maxRate: undefined,
       maxRateSeconds: undefined,
@@ -212,7 +216,7 @@ export default function EndpointsPage() {
       enableOauth: true,
       useQueryParamAuth: false,
       createMcpServer: false, // Umbrella: default OFF - the loopback <endpoint>-endpoint server row is noise for our expose-to-external-clients pattern
-      user_id: null, // Default to public (Everyone)
+      user_id: undefined, // default PRIVATE (owned by the creating admin); the ownership selector below opts in to public (Everyone)
     });
     setSelectedNamespaceUuid("");
     setSelectedNamespaceName("");
@@ -649,11 +653,18 @@ export default function EndpointsPage() {
                         </p>
                       </div>
                       <Switch
-                        checked={form.watch("requireScopedApiKey")}
+                        checked={
+                          form.watch("requireScopedApiKey") ||
+                          form.watch("restricted")
+                        }
                         onCheckedChange={(checked) =>
                           form.setValue("requireScopedApiKey", checked)
                         }
-                        disabled={isSubmitting}
+                        // Locked on while the endpoint is restricted: a
+                        // restricted endpoint must reject unscoped keys, so the
+                        // server pairs the two and the form shows it forced
+                        // rather than a value the operator can silently clear.
+                        disabled={isSubmitting || form.watch("restricted")}
                       />
                     </div>
                   )}
@@ -704,6 +715,34 @@ export default function EndpointsPage() {
                       disabled={isSubmitting}
                     />
                   </div>
+
+                  {/* Restrict to access groups (OAuth plane). Shown only when
+                      OAuth is on, since the gate governs OAuth callers. Turning
+                      it on also forces endpoint-scoped API keys on: the two
+                      controls only confine an endpoint together, so the form
+                      pairs them exactly as the server does on create. */}
+                  {form.watch("enableOauth") && (
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-0.5">
+                        <label className="text-sm font-medium">
+                          {t("endpoints:restrictedLabel")}
+                        </label>
+                        <p className="text-xs text-muted-foreground">
+                          {t("endpoints:restrictedDescription")}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={form.watch("restricted")}
+                        onCheckedChange={(checked) => {
+                          form.setValue("restricted", checked);
+                          if (checked) {
+                            form.setValue("requireScopedApiKey", true);
+                          }
+                        }}
+                        disabled={isSubmitting}
+                      />
+                    </div>
+                  )}
 
                   {/* OAuth HTTPS Warning */}
                   {form.watch("enableOauth") && (

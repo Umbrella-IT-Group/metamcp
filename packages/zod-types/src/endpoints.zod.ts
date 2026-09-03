@@ -12,6 +12,13 @@ export const createEndpointFormSchema = z.object({
   namespaceUuid: z.string().uuid("Please select a valid namespace"),
   enableApiKeyAuth: z.boolean(),
   requireScopedApiKey: z.boolean(),
+  // Access-group gate (OAuth callers). Exposed on create so an endpoint can be
+  // stood up already confined instead of being created open and locked down in
+  // a second step. When on, the server forces requireScopedApiKey on too (the
+  // two only compose when both are set: a restricted endpoint that still
+  // admits unscoped keys leaves the API-key path fully open), which is why the
+  // create dialog binds the two toggles together.
+  restricted: z.boolean(),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
@@ -70,8 +77,18 @@ export const CreateEndpointRequestSchema = z.object({
   // scoping the consumer's key before flipping enable_api_key_auth on a
   // sensitive endpoint.
   requireScopedApiKey: z.boolean().default(false),
+  // Access-group gate for OAuth callers, settable at create time. The
+  // implementation forces `requireScopedApiKey` true whenever this is true, so
+  // a restricted endpoint never ships with the API-key path left open (the two
+  // controls only confine an endpoint when both are set). Default false keeps
+  // an unspecified create as today's behaviour.
+  restricted: z.boolean().default(false),
   enableClientMaxRate: z.boolean(),
-  enableMaxRate: z.boolean(),
+  // Default ON: a new endpoint gets a per-credential tool-call ceiling out of
+  // the box (the token-bucket data-plane limiter), rather than being unbounded
+  // until an operator remembers to enable it per endpoint. The impl supplies a
+  // conservative default budget when the numbers are omitted.
+  enableMaxRate: z.boolean().default(true),
   maxRateSeconds: z.number().min(1, "validation:maxRateSeconds").optional(),
   maxRate: z.number().min(1, "validation:maxRate").optional(),
   clientMaxRate: z.number().min(1, "validation:clientMaxRate").optional(),
@@ -84,6 +101,10 @@ export const CreateEndpointRequestSchema = z.object({
   enableOauth: z.boolean().default(true),
   useQueryParamAuth: z.boolean().default(false),
   createMcpServer: z.boolean().default(true),
+  // Ownership / visibility. `undefined` (the default when the caller says
+  // nothing) means PRIVATE to the creating admin; the impl fills user_id with
+  // the creator. An explicit `null` is the deliberate publish-to-everyone
+  // opt-in (public endpoint). A user id assigns ownership to that user.
   user_id: z.string().nullable().optional(),
 });
 
@@ -224,6 +245,10 @@ export const EndpointCreateInputSchema = z.object({
   namespace_uuid: z.string(),
   enable_api_key_auth: z.boolean().optional().default(true),
   require_scoped_api_key: z.boolean().optional().default(false),
+  // Access-group gate persisted at create time. Default false matches the
+  // column default; the create handler is what enforces the restricted =>
+  // require_scoped_api_key pairing before this reaches the row.
+  restricted: z.boolean().optional().default(false),
   enable_max_rate: z.boolean(),
   enable_client_max_rate: z.boolean(),
   max_rate_seconds: z.number().nullable().optional(),
