@@ -8,6 +8,9 @@ import {
 } from "@repo/zod-types";
 import { and, desc, eq, gt, isNull, lt, notExists, sql } from "drizzle-orm";
 
+import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
+import { hashClientSecret } from "@/routers/oauth/utils";
+
 import { db } from "../index";
 import {
   oauthAccessTokensTable,
@@ -29,9 +32,23 @@ export class OAuthRepository {
   }
 
   async upsertClient(clientData: OAuthClientCreateInput): Promise<void> {
+    // Salted-hash the client secret at rest (migration 0036). This is the
+    // single write choke for both mint paths (the anonymous DCR endpoint and
+    // the admin create dialog), so hashing here covers both without either
+    // caller changing, the plaintext they return to the client once is a
+    // separate variable captured before this call, never this stored value. A
+    // public/PKCE client has no secret (null), which stays null. The salt goes
+    // in its own column so verifyClientSecret can recompute the digest.
+    const hashed = clientData.client_secret
+      ? hashClientSecret(clientData.client_secret)
+      : null;
     await db
       .insert(oauthClientsTable)
-      .values(clientData)
+      .values({
+        ...clientData,
+        client_secret: hashed ? hashed.hash : clientData.client_secret,
+        client_secret_salt: hashed ? hashed.salt : null,
+      })
       .onConflictDoUpdate({
         target: oauthClientsTable.client_id,
         set: {
@@ -146,11 +163,16 @@ export class OAuthRepository {
 
   // ===== Authorization Codes =====
 
+  // Codes are hashed at rest (migration 0036): the caller passes the plaintext
+  // code it received, this hashes it and matches the stored digest, exactly as
+  // the old exact-value lookup matched. The returned row's `code` is the hash;
+  // callers that re-address the row (consume/delete) pass the plaintext again
+  // and it re-hashes, so no caller ever handles the stored digest directly.
   async getAuthCode(code: string): Promise<OAuthAuthorizationCode | null> {
     const result = await db
       .select()
       .from(oauthAuthorizationCodesTable)
-      .where(eq(oauthAuthorizationCodesTable.code, code))
+      .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)))
       .limit(1);
     return result[0] || null;
   }
@@ -160,7 +182,7 @@ export class OAuthRepository {
     data: OAuthAuthorizationCodeCreateInput,
   ): Promise<void> {
     await db.insert(oauthAuthorizationCodesTable).values({
-      code,
+      code: hashApiKey(code),
       client_id: data.client_id,
       redirect_uri: data.redirect_uri,
       scope: data.scope,
@@ -174,7 +196,7 @@ export class OAuthRepository {
   async deleteAuthCode(code: string): Promise<void> {
     await db
       .delete(oauthAuthorizationCodesTable)
-      .where(eq(oauthAuthorizationCodesTable.code, code));
+      .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)));
   }
 
   // Atomic single-use consumption of an authorization code. DELETE ...
@@ -188,7 +210,7 @@ export class OAuthRepository {
   async consumeAuthCode(code: string): Promise<boolean> {
     const deleted = await db
       .delete(oauthAuthorizationCodesTable)
-      .where(eq(oauthAuthorizationCodesTable.code, code))
+      .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)))
       .returning({ code: oauthAuthorizationCodesTable.code });
 
     return deleted.length === 1;
@@ -196,11 +218,17 @@ export class OAuthRepository {
 
   // ===== Access Tokens =====
 
+  // Access tokens are hashed at rest (migration 0036): the caller passes the
+  // plaintext bearer it received, this hashes it and matches the stored digest,
+  // exactly as the old exact-value lookup matched. The returned row's
+  // `access_token` is the hash; a caller holding the row (rotation) deletes it
+  // through deleteAccessTokenByHash, while a caller holding the plaintext
+  // (introspection, userinfo) deletes through deleteAccessToken.
   async getAccessToken(token: string): Promise<OAuthAccessToken | null> {
     const result = await db
       .select()
       .from(oauthAccessTokensTable)
-      .where(eq(oauthAccessTokensTable.access_token, token))
+      .where(eq(oauthAccessTokensTable.access_token, hashApiKey(token)))
       .limit(1);
     return result[0] || null;
   }
@@ -218,22 +246,40 @@ export class OAuthRepository {
     },
   ): Promise<void> {
     await db.insert(oauthAccessTokensTable).values({
-      access_token: token,
+      // Hashed at rest (migration 0036); the plaintext is returned to the
+      // client by the caller and never stored. last4 keeps the readable tail
+      // for the admin view.
+      access_token: hashApiKey(token),
+      access_token_last4: apiKeyLast4(token),
       client_id: data.client_id,
       user_id: data.user_id,
       scope: data.scope,
       expires_at: new Date(data.expires_at),
-      refresh_token: data.refresh?.token ?? null,
+      // The refresh token is hashed the same way; its expiry travels with it
+      // as one pair (see migration 0035).
+      refresh_token: data.refresh ? hashApiKey(data.refresh.token) : null,
       refresh_token_expires_at: data.refresh
         ? new Date(data.refresh.expires_at)
         : null,
     });
   }
 
+  // Delete by the PLAINTEXT token (introspection revoke, userinfo expiry
+  // cleanup): hashes to match the stored digest, mirroring getAccessToken.
   async deleteAccessToken(token: string): Promise<void> {
     await db
       .delete(oauthAccessTokensTable)
-      .where(eq(oauthAccessTokensTable.access_token, token));
+      .where(eq(oauthAccessTokensTable.access_token, hashApiKey(token)));
+  }
+
+  // Delete by the STORED hash, for callers that already hold the row (refresh
+  // rotation reads the row by refresh token, then deletes the old access-token
+  // row). Passing the row's `access_token` (already the digest) to
+  // deleteAccessToken would hash it a second time and match nothing.
+  async deleteAccessTokenByHash(accessTokenHash: string): Promise<void> {
+    await db
+      .delete(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.access_token, accessTokenHash));
   }
 
   // Admin listing of LIVE access tokens — "who is connected over OAuth right
@@ -257,6 +303,10 @@ export class OAuthRepository {
     return await db
       .select({
         user_id: oauthAccessTokensTable.user_id,
+        // The token's readable tail (migration 0036), safe to show, unlike the
+        // access_token digest and refresh_token, which stay out of the
+        // projection entirely.
+        access_token_last4: oauthAccessTokensTable.access_token_last4,
         user_email: usersTable.email,
         client_id: oauthAccessTokensTable.client_id,
         client_name: oauthClientsTable.client_name,
@@ -292,11 +342,14 @@ export class OAuthRepository {
 
   // ===== Refresh Tokens =====
 
+  // Hashed lookup (migration 0036): the presented refresh token is hashed and
+  // matched against the stored digest. The returned row's access_token is the
+  // hash, so the refresh rotation deletes it via deleteAccessTokenByHash.
   async getByRefreshToken(refreshToken: string) {
     const result = await db
       .select()
       .from(oauthAccessTokensTable)
-      .where(eq(oauthAccessTokensTable.refresh_token, refreshToken))
+      .where(eq(oauthAccessTokensTable.refresh_token, hashApiKey(refreshToken)))
       .limit(1);
     return result[0] || null;
   }

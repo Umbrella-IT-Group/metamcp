@@ -64,6 +64,15 @@ export const mcpServersTable = pgTable(
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    // Upstream credential the gateway presents when it connects to this server
+    // (auto-minted for UI-created endpoints; operator-supplied for manual
+    // servers). Stored ENCRYPTED at rest as an `enc:v1:` AES-256-GCM envelope
+    // reusing the M365 token KEK (see lib/metamcp/server-bearer-crypto.ts): the
+    // value must stay recoverable (client.ts reads it back to build the
+    // upstream Authorization header), so it is encrypted rather than hashed.
+    // Ciphertext lives in this same text column, no schema change, and a
+    // boot-time converge encrypts any legacy plaintext row once. Serializers
+    // never return this value to any client.
     bearerToken: text("bearer_token"),
     headers: jsonb("headers")
       .$type<{ [key: string]: string }>()
@@ -520,7 +529,17 @@ export const oauthClientsTable = pgTable(
   "oauth_clients",
   {
     client_id: text("client_id").primaryKey(),
+    // At-rest form of the client secret (migration 0036). Because a client
+    // secret is a user-visible secret handed to a confidential client, it is
+    // SALTED (sha256 of secret||salt via hashClientSecret) rather than the
+    // unsalted digest the random tokens use; the token endpoint verifies with
+    // verifyClientSecret in constant time. NULL for a PKCE/public client
+    // ("none" auth method), which is issued no secret.
     client_secret: text("client_secret"),
+    // The per-secret salt for client_secret above (migration 0036). NULL when
+    // client_secret is NULL. Not itself a secret, it exists only so the salted
+    // hash can be recomputed at verify time.
+    client_secret_salt: text("client_secret_salt"),
     client_name: text("client_name").notNull(),
     redirect_uris: text("redirect_uris")
       .array()
@@ -595,6 +614,12 @@ export const oauthClientsTable = pgTable(
 export const oauthAuthorizationCodesTable = pgTable(
   "oauth_authorization_codes",
   {
+    // At-rest form of the authorization code (migration 0036): the unsalted
+    // lowercase-hex sha256, not the code, hashed through hashApiKey(). It stays
+    // the primary key (single-use consumption is a DELETE by this key) and is
+    // looked up by hashing the presented code. Codes are 256-bit random and
+    // expire in ten minutes, so an unsalted digest is correct and no last4 is
+    // kept, a code is never displayed.
     code: text("code").primaryKey(),
     client_id: text("client_id")
       .notNull()
@@ -623,7 +648,21 @@ export const oauthAuthorizationCodesTable = pgTable(
 export const oauthAccessTokensTable = pgTable(
   "oauth_access_tokens",
   {
+    // At-rest form of the access token (migration 0036). The token itself is
+    // NOT stored: this column holds the unsalted lowercase-hex sha256 of it,
+    // written and looked up only through lib/api-key-hash.ts's hashApiKey() so
+    // the mint path and the authentication lookup can never disagree about the
+    // encoding. It stays the primary key, distinct 256-bit tokens have
+    // distinct digests, and nothing references it by foreign key, so the
+    // 0036 backfill could rewrite it in place. Equal to the audit log's
+    // credentialFingerprint of the same token, which is what lets a denied
+    // request join back to the row that issued it.
     access_token: text("access_token").primaryKey(),
+    // The token's last 4 characters, the only part kept in readable form
+    // (migration 0036), the same tail the audit log records. Enough for the
+    // Access dashboard to show a token's tail and for an operator to correlate
+    // a listed token with an audit row; useless as a credential.
+    access_token_last4: text("access_token_last4").notNull(),
     client_id: text("client_id")
       .notNull()
       .references(() => oauthClientsTable.client_id, { onDelete: "cascade" }),
@@ -633,6 +672,10 @@ export const oauthAccessTokensTable = pgTable(
     // "mcp", not "admin" — see oauthClientsTable.scope above.
     scope: text("scope").notNull().default("mcp"),
     expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
+    // At-rest form of the refresh token (migration 0036): the unsalted
+    // lowercase-hex sha256, not the token, hashed through the same hashApiKey()
+    // as access_token. NULL when the grant issued no refresh token. Looked up
+    // by hashing the presented refresh token and matching digests.
     refresh_token: text("refresh_token"),
     refresh_token_expires_at: timestamp("refresh_token_expires_at", {
       withTimezone: true,

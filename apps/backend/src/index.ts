@@ -8,6 +8,7 @@ import {
   buildUpstreamHealthErrorBody,
   isAdminHealthRequest,
 } from "./lib/health-upstream";
+import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
@@ -106,6 +107,20 @@ async function start(): Promise<void> {
 
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
+
+  // Encrypt any legacy plaintext mcp_servers.bearer_token once, then arm the
+  // read path's fail-closed rule. Sequenced AFTER
+  // the 0036 migration (applied before start()) and BEFORE the idle pool warms
+  // in initializeIdleServers() below, so every serverParams the pool builds
+  // reads a converged column. The helper never throws (it logs and, when it
+  // cannot encrypt for lack of a KEK, leaves legacy rows honoured and retries
+  // next boot); this outer guard is defence-in-depth so the gateway still
+  // starts if a future refactor throws out of it.
+  try {
+    await convergeServerBearerTokens();
+  } catch (err) {
+    logger.error("Bearer-token converge: unexpected error (ignored):", err);
+  }
 
   // Auto-nuke pre-deploy `mcp_sessions` rows ONLY when the advertised
   // MCP server-capability set has changed since the last boot.

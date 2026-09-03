@@ -37,7 +37,13 @@ export class McpServersSerializer {
       url: includeSecrets ? dbServer.url : null,
       error_status: dbServer.error_status,
       created_at: dbServer.created_at.toISOString(),
-      bearerToken: includeSecrets ? dbServer.bearerToken : null,
+      // NEVER returned, on either side of the RBAC line.
+      // The value at rest is now an `enc:v1:` ciphertext, useless to a client,
+      // and even the plaintext was a gateway credential that no response needs
+      // to echo, it is only ever read server-side to build the upstream
+      // header. Same posture as api_keys and the OAuth token views: presence is
+      // not exposed here, the value is simply gone.
+      bearerToken: null,
       headers: includeSecrets ? dbServer.headers : {},
       user_id: dbServer.user_id,
     };

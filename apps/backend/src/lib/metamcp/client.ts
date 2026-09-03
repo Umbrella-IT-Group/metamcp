@@ -18,6 +18,7 @@ import { recordConnectBrokerFailure } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
+import { resolveServerBearerToken } from "./server-bearer-crypto";
 import { serverErrorTracker } from "./server-error-tracker";
 import { resolveEnvVariables } from "./utils";
 
@@ -281,9 +282,15 @@ export const createMetaMcpClient = (
       ...(serverParams.headers || {}),
     };
 
-    // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
+    // Check for authentication - prioritize OAuth tokens, fallback to
+    // bearerToken. The stored bearer is an `enc:v1:` envelope at rest
+    //, so it is decrypted here at the point of use; the
+    // plaintext exists only transiently while the header is built. A row that
+    // cannot be resolved yields no header (fail-closed) rather than a broken
+    // credential.
     const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+      serverParams.oauth_tokens?.access_token ||
+      resolveServerBearerToken(serverParams.bearerToken);
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
@@ -311,9 +318,15 @@ export const createMetaMcpClient = (
       ...(serverParams.headers || {}),
     };
 
-    // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
+    // Check for authentication - prioritize OAuth tokens, fallback to
+    // bearerToken. The stored bearer is an `enc:v1:` envelope at rest
+    //, so it is decrypted here at the point of use; the
+    // plaintext exists only transiently while the header is built. A row that
+    // cannot be resolved yields no header (fail-closed) rather than a broken
+    // credential.
     const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+      serverParams.oauth_tokens?.access_token ||
+      resolveServerBearerToken(serverParams.bearerToken);
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }

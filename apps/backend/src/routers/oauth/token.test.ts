@@ -40,6 +40,9 @@ const oauthRepositoryMock = {
   getByRefreshToken: vi.fn(),
   setAccessToken: vi.fn(),
   deleteAccessToken: vi.fn(),
+  // Rotation and refresh-expiry paths delete by the stored hash (migration
+  // 0036), since they already hold the row read by refresh token.
+  deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
 };
 
@@ -64,6 +67,10 @@ vi.mock("./introspection-auth", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+// Dynamic import for the same reason the router is imported this way: a static
+// import of ./utils pulls @/utils/logger into the module graph during the
+// import phase, before the hoisted vi.mock factory's loggerMock is initialized.
+const { hashClientSecret } = await import("./utils");
 
 const CLIENT_ID = "mcp_client_test";
 const USER_ID = "user-abc123";
@@ -186,6 +193,7 @@ beforeEach(() => {
   // race). Tests that exercise the loser set their own answer.
   oauthRepositoryMock.consumeAuthCode.mockResolvedValue(true);
   oauthRepositoryMock.deleteAccessToken.mockResolvedValue(undefined);
+  oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   // Default: the account is live. Tests that care set their own answer, so a
   // disabled-enforcement test that forgot to arm the mock fails OPEN and its
   // own assertion catches it.
@@ -622,11 +630,16 @@ describe("POST /oauth/token — client secret compared in constant time", () => 
     expires_at: new Date(Date.now() + 10 * 60 * 1000),
   });
 
+  // getClient returns the salted hash at rest (migration 0036), not the
+  // plaintext, so the row carries the digest of RIGHT_SECRET and its salt,
+  // exactly what verifyClientSecret recomputes the presented secret against.
+  const rightHashed = hashClientSecret(RIGHT_SECRET);
   const clientRow = (method: string) => ({
     client_id: CLIENT_ID,
     client_name: "Confidential Client",
     token_endpoint_auth_method: method,
-    client_secret: RIGHT_SECRET,
+    client_secret: rightHashed.hash,
+    client_secret_salt: rightHashed.salt,
   });
 
   function postWithAuth(

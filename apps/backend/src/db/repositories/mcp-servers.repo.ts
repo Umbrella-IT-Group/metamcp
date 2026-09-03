@@ -4,14 +4,59 @@ import {
   McpServerErrorStatusEnum,
   McpServerUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, like, not, or } from "drizzle-orm";
 import { DatabaseError } from "pg";
 import { z } from "zod";
 
+import {
+  BEARER_ENVELOPE_PREFIX,
+  encryptServerBearerToken,
+} from "@/lib/metamcp/server-bearer-crypto";
 import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { mcpServersTable } from "../schema";
+
+// Encrypt a bearer token at the CREATE boundary. A
+// non-empty value is stored as an `enc:v1:` envelope; empty/undefined is left
+// as-is (STDIO servers and credential-less HTTP servers carry no bearer). This
+// is the single write choke for both the endpoint auto-mint and the admin
+// create paths, so neither caller changes. Throws (fail-closed) when no KEK is
+// configured, see encryptServerBearerToken.
+function withEncryptedBearerToken<T extends { bearerToken?: string | null }>(
+  input: T,
+): T {
+  if (input.bearerToken) {
+    return {
+      ...input,
+      bearerToken: encryptServerBearerToken(input.bearerToken),
+    };
+  }
+  return input;
+}
+
+// The UPDATE variant of the choke above, and it differs on one point that is a
+// live-outage bug if it is wrong. The serializer redacts bearer_token to null
+// on every response, so the edit form cannot see the
+// stored value and re-submits an EMPTY bearerToken field on every save that did
+// not re-type the secret. Writing that empty value would blank the row's
+// credential and break the upstream connection. So a falsy bearerToken here
+// means "leave the stored value unchanged": the key is dropped from the SET so
+// drizzle never touches the column. A non-empty value replaces it, encrypted at
+// rest. This removes no capability the admin had, the value was never
+// round-tripped in cleartext for them to deliberately clear by blanking.
+function withUpdatedBearerToken<T extends { bearerToken?: string | null }>(
+  input: T,
+): Omit<T, "bearerToken"> | T {
+  if (input.bearerToken) {
+    return {
+      ...input,
+      bearerToken: encryptServerBearerToken(input.bearerToken),
+    };
+  }
+  const { bearerToken: _omitted, ...rest } = input;
+  return rest;
+}
 
 // Helper function to handle PostgreSQL errors
 function handleDatabaseError(
@@ -69,7 +114,7 @@ export class McpServersRepository {
     try {
       const [createdServer] = await db
         .insert(mcpServersTable)
-        .values(input)
+        .values(withEncryptedBearerToken(input))
         .returning();
 
       return createdServer;
@@ -175,7 +220,7 @@ export class McpServersRepository {
     try {
       const [updatedServer] = await db
         .update(mcpServersTable)
-        .set(updateData)
+        .set(withUpdatedBearerToken(updateData))
         .where(eq(mcpServersTable.uuid, uuid))
         .returning();
 
@@ -189,7 +234,10 @@ export class McpServersRepository {
     servers: McpServerCreateInput[],
   ): Promise<DatabaseMcpServer[]> {
     try {
-      return await db.insert(mcpServersTable).values(servers).returning();
+      return await db
+        .insert(mcpServersTable)
+        .values(servers.map(withEncryptedBearerToken))
+        .returning();
     } catch (error: unknown) {
       // For bulk operations, we don't have a specific server name to report
       // Extract the actual PostgreSQL error from Drizzle's error structure
@@ -263,6 +311,47 @@ export class McpServersRepository {
       .returning();
 
     return updated.length;
+  }
+
+  // ===== Bearer-token converge =====
+
+  // Rows whose bearer_token is present but NOT yet an `enc:v1:` envelope, i.e.
+  // legacy plaintext the boot converge must encrypt once. Selects only the uuid
+  // and the value, and only the rows that need work, so a converged database
+  // (the normal steady state) reads nothing.
+  async findServersWithPlaintextBearerToken(): Promise<
+    { uuid: string; bearerToken: string }[]
+  > {
+    const rows = await db
+      .select({
+        uuid: mcpServersTable.uuid,
+        bearerToken: mcpServersTable.bearerToken,
+      })
+      .from(mcpServersTable)
+      .where(
+        and(
+          isNotNull(mcpServersTable.bearerToken),
+          not(like(mcpServersTable.bearerToken, `${BEARER_ENVELOPE_PREFIX}%`)),
+        ),
+      );
+    // bearerToken is non-null by the filter; narrow the type for the caller.
+    return rows.filter(
+      (r): r is { uuid: string; bearerToken: string } => r.bearerToken !== null,
+    );
+  }
+
+  // Write an already-computed ciphertext for one row. Distinct from update():
+  // update() ENCRYPTS its input, so it cannot be used to store a value that is
+  // already an envelope without double-wrapping it. The converge computes the
+  // envelope and persists it verbatim here.
+  async writeBearerTokenCiphertext(
+    uuid: string,
+    ciphertext: string,
+  ): Promise<void> {
+    await db
+      .update(mcpServersTable)
+      .set({ bearerToken: ciphertext })
+      .where(eq(mcpServersTable.uuid, uuid));
   }
 }
 

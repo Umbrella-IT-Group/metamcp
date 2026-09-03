@@ -7,8 +7,10 @@
  * their dashboard, so the fix could not be an RBAC gate without blanking the
  * member UI. Instead the two serializers redact by role, and these tests pin
  * both halves of that contract: a member sees names and metadata but no way
- * to reach or authenticate to anything, and an admin's response is byte-for-
- * byte what it always was.
+ * to reach or authenticate to anything, and an admin sees everything the
+ * response ever carried EXCEPT bearerToken, which is redacted to null on every
+ * response now because it is encrypted at rest and read
+ * only server-side.
  *
  * Both serializers are covered because they are two independent copies of
  * the same embed — redacting only the mcpServers path would have left the
@@ -139,7 +141,12 @@ describe("McpServersSerializer — admin", () => {
     expect(server.command).toBe(SECRET_COMMAND);
     expect(server.args).toEqual(SECRET_ARGS);
     expect(server.env).toEqual(SECRET_ENV);
-    expect(server.bearerToken).toBe(SECRET_TOKEN);
+    // bearerToken is the one field an admin no longer gets back: it is redacted
+    // to null on EVERY response now, because the value
+    // at rest is an encrypted envelope read only server-side to build the
+    // upstream header, and echoing it served no client. Every other field is
+    // still admin-visible.
+    expect(server.bearerToken).toBeNull();
     expect(server.headers).toEqual(SECRET_HEADERS);
   });
 
@@ -152,7 +159,8 @@ describe("McpServersSerializer — admin", () => {
     expect(servers).toHaveLength(2);
     for (const server of servers) {
       expect(server.url).toBe(SECRET_URL);
-      expect(server.bearerToken).toBe(SECRET_TOKEN);
+      // Never returned, even to an admin.
+      expect(server.bearerToken).toBeNull();
     }
   });
 });
@@ -203,7 +211,9 @@ describe("NamespacesSerializer — embedded servers follow the same rule", () =>
     const [server] = namespace.servers;
 
     expect(server.url).toBe(SECRET_URL);
-    expect(server.bearerToken).toBe(SECRET_TOKEN);
+    // Never returned, even to an admin, through the namespace route either
+    // same posture as the mcpServers route above.
+    expect(server.bearerToken).toBeNull();
     expect(server.env).toEqual(SECRET_ENV);
     expect(server.command).toBe(SECRET_COMMAND);
     expect(server.args).toEqual(SECRET_ARGS);
