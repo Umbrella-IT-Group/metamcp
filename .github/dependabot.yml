@@ -39,3 +39,18 @@ updates:
         applies-to: security-updates
         patterns:
           - "*"
+
+  # Watches the root Dockerfile's digest-pinned base image. Dependabot's
+  # docker ecosystem bumps the FROM @sha256 digest via a reviewable PR when
+  # the pinned tag moves upstream; the github-actions entry above does the
+  # same for the SHA-pinned `uses:` in .github/workflows. (Neither tracks
+  # apt package versions inside RUN layers, e.g. the pinned nodejs.)
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"

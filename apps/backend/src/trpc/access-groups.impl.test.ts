@@ -146,6 +146,7 @@ const ENDPOINT_ROW = {
   restricted: false,
   enable_oauth: true,
   enable_api_key_auth: false,
+  require_scoped_api_key: false,
 };
 
 let rows: AuditRow[];
@@ -604,6 +605,7 @@ describe("read side", () => {
       restricted: true,
       enable_oauth: false,
       enable_api_key_auth: true,
+      require_scoped_api_key: true,
     });
     findGroupsForEndpointMock.mockResolvedValue([]);
 
@@ -613,5 +615,8 @@ describe("read side", () => {
 
     expect(result.data?.enable_oauth).toBe(false);
     expect(result.data?.enable_api_key_auth).toBe(true);
+    // Carried so the panel can tell a scoped-only endpoint (pairing closed the
+    // unscoped path) from one where unscoped keys still reach it.
+    expect(result.data?.require_scoped_api_key).toBe(true);
   });
 });

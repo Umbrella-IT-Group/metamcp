@@ -126,5 +126,7 @@
     "noResults": "无结果。"
   },
   "requireScopedApiKey": "要求端点范围 API 密钥",
-  "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥。仅适用于 API 密钥认证，不影响 OAuth 访问。"
+  "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥。仅适用于 API 密钥认证，不影响 OAuth 访问。",
+  "restrictedLabel": "限制为访问组",
+  "restrictedDescription": "开启后，只有管理员和已映射访问组的成员才能通过 OAuth 访问此端点。开启同时会要求使用端点范围 API 密钥，因此网关级（无范围）密钥也会被拒绝。"
 }

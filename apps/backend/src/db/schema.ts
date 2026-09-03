@@ -326,9 +326,18 @@ export const endpointsTable = pgTable(
     // Access-group gate for OAUTH callers (migration 0033). When true, an
     // OAuth-authenticated user reaches this endpoint only if they are an
     // administrator or belong to a group mapped to it — see
-    // `lib/endpoint-access-control`. API-key callers are deliberately
-    // unaffected: a key is admin-minted and already carries its own
-    // per-endpoint scoping (`require_scoped_api_key` above, migration 0023).
+    // `lib/endpoint-access-control`. This column governs the OAuth plane ONLY.
+    //
+    // The API-key plane is governed by `require_scoped_api_key` above, and the
+    // two are PAIRED by the application layer: every writer that can set
+    // `restricted` true (endpoint create, endpoint update, and the
+    // `setEndpointRestricted` toggle) also forces `require_scoped_api_key` on,
+    // because a restricted endpoint that still admitted unscoped gateway-wide
+    // keys would be confined on the OAuth plane and wide open on the API-key
+    // plane. The pairing is enforced in code rather than as a CHECK constraint
+    // so that pre-existing rows violating it are not rejected at migrate time;
+    // a boot-time warning (see `endpoint-pairing-check`) lists any such rows for
+    // an operator to fix deliberately.
     //
     // Default false = today's behaviour, which is what lets this ship without
     // locking any live connector out while the groups are still being drawn up.

@@ -97,16 +97,25 @@ export function EndpointAccessSection({
   //
   //   enable_oauth off        -> the switch is inert; no caller reaches this
   //                             endpoint through the gate at all.
-  //   + enable_api_key_auth   -> it narrows the OAuth half only; every API-key
-  //                             holder still passes, by design.
+  //   + enable_api_key_auth   -> it narrows the OAuth half only; UNSCOPED
+  //                             API-key holders still pass UNLESS the endpoint
+  //                             also requires endpoint-scoped keys.
   //
   // Reporting "only administrators can reach it" in either case would be
   // false, and false in the reassuring direction, which is the worst kind on a
   // security panel.
   const gateIsInert =
     restricted && access !== undefined && !access.enable_oauth;
+  // Only fires when unscoped keys really do still reach the endpoint. The
+  // create/update pairing forces require_scoped_api_key on with restricted, so
+  // for a paired endpoint this is false and the note (which claims every key
+  // holder passes) correctly disappears; it can still fire on a legacy row the
+  // boot-time pairing check flags.
   const apiKeysStillPass =
-    restricted && access !== undefined && access.enable_api_key_auth;
+    restricted &&
+    access !== undefined &&
+    access.enable_api_key_auth &&
+    !access.require_scoped_api_key;
   const gateFullyGoverns =
     restricted &&
     access !== undefined &&

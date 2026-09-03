@@ -1,7 +1,9 @@
 import express from "express";
+import helmet from "helmet";
 
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
@@ -50,6 +52,19 @@ app.use(auditContextMiddleware);
 // real ones were deleted. See that module's header for what each lane does and
 // why the OAuth skip is what makes the 256kb router limit bind at all.
 app.use(globalBodyParser);
+
+// App-wide security response headers, ahead of every router. helmet was only
+// mounted per-router on /trpc and /mcp-proxy, so the /api/auth relay (which
+// answers with the session cookie), /health, /metamcp and the OAuth surface
+// each carried whatever the framework left behind: no nosniff, no frame
+// denial, no default CSP. Mounting it here gives them all the same baseline in
+// one place. It sits BEFORE the routers on purpose: the OAuth router's own
+// securityHeaders and the per-router helmet still run afterwards and override
+// the specific headers they set (X-Frame-Options DENY, the OAuth CSP), so this
+// only fills the gaps and never weakens their tighter values. It does not touch
+// the request body or CORS, so the deliberate /api/auth CORS policy mounted
+// below is unaffected.
+app.use(helmet());
 
 // Mount OAuth metadata endpoints at root level for .well-known discovery
 app.use(oauthRouter);
@@ -154,6 +169,13 @@ async function start(): Promise<void> {
     // doesn't crash the gateway on boot.
     logger.error("Auto-nuke: unexpected error (ignored):", err);
   }
+
+  // Surface any pre-existing endpoint left in the unpaired state
+  // (restricted=true, require_scoped_api_key=false) so an operator can close
+  // the still-open API-key path deliberately. Non-fatal and self-swallowing;
+  // see ./lib/endpoint-pairing-check for why these rows are warned about rather
+  // than auto-migrated.
+  await warnOnUnpairedRestrictedEndpoints();
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);

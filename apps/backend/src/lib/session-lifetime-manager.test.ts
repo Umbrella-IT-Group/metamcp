@@ -187,3 +187,33 @@ describe("SessionLifetimeManagerImpl — binding storage", () => {
     expect(mgr.getSessionBinding("s2")).toBeUndefined();
   });
 });
+
+describe("countSessionsForIdentity feeds the per-credential ceiling", () => {
+  const ep = { namespaceUuid: "ns-A", endpointName: "ep-A" };
+
+  it("counts only the live sessions bound to the given identity", () => {
+    const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
+    mgr.addSession("a1", { id: "a1" }, { ...ep, identity: KEY_A });
+    mgr.addSession("a2", { id: "a2" }, { ...ep, identity: KEY_A });
+    mgr.addSession("b1", { id: "b1" }, { ...ep, identity: KEY_B });
+
+    expect(mgr.countSessionsForIdentity(KEY_A)).toBe(2);
+    expect(mgr.countSessionsForIdentity(KEY_B)).toBe(1);
+  });
+
+  it("falls as sessions are removed, so the count is self-healing", () => {
+    const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
+    mgr.addSession("a1", { id: "a1" }, { ...ep, identity: KEY_A });
+    mgr.addSession("a2", { id: "a2" }, { ...ep, identity: KEY_A });
+    expect(mgr.countSessionsForIdentity(KEY_A)).toBe(2);
+
+    mgr.removeSession("a1");
+    expect(mgr.countSessionsForIdentity(KEY_A)).toBe(1);
+  });
+
+  it("does not count a session added without a binding", () => {
+    const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
+    mgr.addSession("nobind", { id: "nobind" });
+    expect(mgr.countSessionsForIdentity(KEY_A)).toBe(0);
+  });
+});

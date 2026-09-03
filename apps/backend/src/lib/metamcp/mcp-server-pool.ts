@@ -67,6 +67,13 @@ export class McpServerPool {
   // Mapping: sessionId -> Set<serverUuid> for cleanup tracking
   private sessionToServers: Record<string, Set<string>> = {};
 
+  // Mapping: sessionId -> namespaceUuid. Populated when a session is first
+  // created (the namespace is known there) and dropped on cleanup. Used only by
+  // capacity eviction to protect each namespace's floor of connections, so a
+  // session opened without a namespace (none is passed) simply is not counted
+  // toward any namespace's floor and stays freely evictable.
+  private sessionToNamespace: Record<string, string> = {};
+
   // Session creation timestamps: sessionId -> timestamp
   private sessionTimestamps: Record<string, number> = {};
 
@@ -181,6 +188,16 @@ export class McpServerPool {
   // Maximum connections per individual server UUID (prevents per-server process explosion)
   private readonly maxConnectionsPerServer: number;
 
+  // Floor of active connections capacity eviction will not take from a
+  // namespace. Guards against one namespace's burst filling the pool and then
+  // evicting every other namespace's connections down to zero (the global-LRU
+  // problem): eviction prefers a victim from a namespace that is ABOVE this
+  // floor, and only falls back to an at-floor victim when no over-floor one
+  // exists (so the floor never deadlocks the pool, which is the reason eviction
+  // exists at all). Modest by design; with the production cap of 400 and a
+  // handful of namespaces it costs a negligible reserved slice.
+  private readonly minConnectionsPerNamespace: number;
+
   private constructor(
     defaultIdleCount: number = 1,
     maxTotalConnections: number = parseInt(
@@ -191,10 +208,15 @@ export class McpServerPool {
       process.env.MAX_CONNECTIONS_PER_SERVER || "5",
       10,
     ),
+    minConnectionsPerNamespace: number = parseInt(
+      process.env.MCP_POOL_MIN_CONNECTIONS_PER_NAMESPACE || "2",
+      10,
+    ),
   ) {
     this.defaultIdleCount = defaultIdleCount;
     this.maxTotalConnections = maxTotalConnections;
     this.maxConnectionsPerServer = maxConnectionsPerServer;
+    this.minConnectionsPerNamespace = Math.max(0, minConnectionsPerNamespace);
     this.recoveryResetThresholdMs = parseInt(
       process.env.MCP_RECOVERY_RESET_THRESHOLD_MS || "300000",
       10,
@@ -236,12 +258,14 @@ export class McpServerPool {
     defaultIdleCount?: number,
     maxTotalConnections?: number,
     maxConnectionsPerServer?: number,
+    minConnectionsPerNamespace?: number,
   ): McpServerPool {
     if (!McpServerPool.instance) {
       McpServerPool.instance = new McpServerPool(
         defaultIdleCount,
         maxTotalConnections,
         maxConnectionsPerServer,
+        minConnectionsPerNamespace,
       );
     }
     return McpServerPool.instance;
@@ -356,6 +380,12 @@ export class McpServerPool {
       this.activeSessions[sessionId] = {};
       this.sessionToServers[sessionId] = new Set();
       this.sessionTimestamps[sessionId] = Date.now();
+      // Record the namespace so capacity eviction can honor each namespace's
+      // floor. Only stored when known; a session created without a namespace is
+      // simply not counted toward any floor.
+      if (namespaceUuid) {
+        this.sessionToNamespace[sessionId] = namespaceUuid;
+      }
     }
 
     // Check if we have an idle session for this server that we can convert
@@ -769,6 +799,9 @@ export class McpServerPool {
     // Clean up session to servers mapping
     delete this.sessionToServers[sessionId];
 
+    // Clean up session to namespace mapping (capacity-eviction floor bookkeeping)
+    delete this.sessionToNamespace[sessionId];
+
     logger.info(
       `Cleaned up session ${sessionId} (recycled: ${recycled}, destroyed: ${destroyed})`,
     );
@@ -959,14 +992,86 @@ export class McpServerPool {
 
     // 2. No idle slots — every slot is an in-use active connection. Destroy
     //    the oldest-touched active connection for some OTHER server (LRU by
-    //    session timestamp). Disruptive, but bounded to one slot, and the
-    //    evicted session re-establishes on its next request.
+    //    session timestamp), but PREFER a victim from a namespace that is above
+    //    its floor so a bursting namespace cannot evict another namespace down
+    //    to zero. Fall back to an at-floor victim only when no over-floor one
+    //    exists, so the floor never turns a full pool into a hard refusal (the
+    //    deadlock this eviction exists to prevent).
+    const perNamespace = this.activeConnectionsPerNamespace();
+    const victim =
+      this.findOldestActiveVictim(forServerUuid, true, perNamespace) ??
+      this.findOldestActiveVictim(forServerUuid, false, perNamespace);
+    if (victim) {
+      const client = this.activeSessions[victim.sid]?.[victim.uuid];
+      if (client) {
+        delete this.activeSessions[victim.sid][victim.uuid];
+        this.sessionToServers[victim.sid]?.delete(victim.uuid);
+        logger.warn(
+          `Pool at cap (${this.maxTotalConnections}) with no idle slots; ` +
+            `destroying oldest active connection ${victim.sid}/${victim.uuid} to admit ${forServerUuid}`,
+        );
+        try {
+          await client.cleanup();
+        } catch (error) {
+          logger.error(
+            `Error destroying active connection ${victim.sid}/${victim.uuid} during capacity eviction:`,
+            error,
+          );
+        }
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Count active backend connections per namespace, for capacity-eviction floor
+   * decisions. Every connection under a session belongs to that session's
+   * namespace; a session with no recorded namespace contributes to no
+   * namespace's count (and so is never floor-protected).
+   */
+  private activeConnectionsPerNamespace(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const [sid, servers] of Object.entries(this.activeSessions)) {
+      const ns = this.sessionToNamespace[sid];
+      if (!ns) continue;
+      counts[ns] = (counts[ns] ?? 0) + Object.keys(servers).length;
+    }
+    return counts;
+  }
+
+  /**
+   * Oldest-touched active connection eligible for eviction (LRU by session
+   * timestamp), for a server other than the one being admitted.
+   *
+   * When `respectFloor` is true, a connection whose namespace is at or below
+   * `minConnectionsPerNamespace` is skipped, so a bursting namespace cannot
+   * evict another namespace below its guaranteed floor. The caller retries with
+   * `respectFloor` false when the floor pass finds nothing, so once every
+   * namespace is already at its floor availability wins over the floor rather
+   * than deadlocking the pool.
+   */
+  private findOldestActiveVictim(
+    forServerUuid: string,
+    respectFloor: boolean,
+    perNamespace: Record<string, number>,
+  ): { sid: string; uuid: string } | undefined {
     let oldestSid: string | undefined;
     let oldestUuid: string | undefined;
     let oldestTs = Infinity;
     for (const [sid, servers] of Object.entries(this.activeSessions)) {
       const ts = this.sessionTimestamps[sid] ?? Infinity;
       if (ts >= oldestTs) continue;
+      if (respectFloor) {
+        const ns = this.sessionToNamespace[sid];
+        if (
+          ns !== undefined &&
+          (perNamespace[ns] ?? 0) <= this.minConnectionsPerNamespace
+        ) {
+          continue;
+        }
+      }
       for (const uuid of Object.keys(servers)) {
         if (uuid === forServerUuid) continue;
         oldestTs = ts;
@@ -976,27 +1081,9 @@ export class McpServerPool {
       }
     }
     if (oldestSid && oldestUuid) {
-      const client = this.activeSessions[oldestSid]?.[oldestUuid];
-      if (client) {
-        delete this.activeSessions[oldestSid][oldestUuid];
-        this.sessionToServers[oldestSid]?.delete(oldestUuid);
-        logger.warn(
-          `Pool at cap (${this.maxTotalConnections}) with no idle slots; ` +
-            `destroying oldest active connection ${oldestSid}/${oldestUuid} to admit ${forServerUuid}`,
-        );
-        try {
-          await client.cleanup();
-        } catch (error) {
-          logger.error(
-            `Error destroying active connection ${oldestSid}/${oldestUuid} during capacity eviction:`,
-            error,
-          );
-        }
-        return true;
-      }
+      return { sid: oldestSid, uuid: oldestUuid };
     }
-
-    return false;
+    return undefined;
   }
 
   /**

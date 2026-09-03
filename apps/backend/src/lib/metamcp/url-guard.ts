@@ -62,11 +62,61 @@ export const TOO_MANY_REDIRECTS =
 export const UNREPLAYABLE_REDIRECT_BODY =
   "The MCP server URL redirected a request whose body cannot be resent.";
 
+/** A response body that exceeded the byte ceiling and was aborted. */
+export const RESPONSE_TOO_LARGE =
+  "The MCP server response exceeded the maximum allowed size.";
+
+/**
+ * A redirect to a different origin, refused rather than followed.
+ *
+ * Used only under `refuseCrossOriginRedirect` (the pooled data plane): a
+ * trusted internal backend does not redirect the gateway to another origin,
+ * so one that tries is answering a request with a hostile hop.
+ */
+export const CROSS_ORIGIN_REDIRECT_REFUSED =
+  "The MCP server URL redirected across origins, which is not permitted here.";
+
+/**
+ * Default response-byte ceiling and dispatcher idle timeout, both env-tunable.
+ *
+ * The byte ceiling (100 MiB) is a memory-exhaustion backstop, not an
+ * operational limit; a single JSON-RPC response never approaches it. The
+ * timeout (300000 ms) matches undici's own default, made explicit and tunable;
+ * it is the headers/body IDLE timeout, so it bounds a stalled upstream without
+ * capping a long-lived active stream. Read per call rather than captured at
+ * import so a value can be corrected without a rebuild and varied by a test,
+ * matching `allowedHostsFromEnv`.
+ */
+const DEFAULT_MAX_RESPONSE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
+
+const envPositiveInt = (name: string, fallback: number): number => {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const maxResponseBytesFromEnv = (): number =>
+  envPositiveInt("MCP_PROXY_MAX_RESPONSE_BYTES", DEFAULT_MAX_RESPONSE_BYTES);
+
+const requestTimeoutMsFromEnv = (): number =>
+  envPositiveInt("MCP_PROXY_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS);
+
 interface Ipv4Range {
   readonly base: string;
   readonly prefix: number;
   /** Why this range is not a legitimate destination for a remote MCP server. */
   readonly why: string;
+  /**
+   * True for the private ranges where a trusted, operator-configured backend
+   * legitimately lives (RFC 1918 and loopback). The `allowPrivate` posture
+   * (used by the pooled data plane, whose targets are DB-configured internal
+   * services, not caller-supplied) permits these while still refusing the
+   * ranges that are never a real backend: the cloud metadata address, CGNAT,
+   * multicast and the reserved blocks stay blocked in both postures.
+   */
+  readonly internalService?: boolean;
 }
 
 /**
@@ -82,15 +132,25 @@ interface Ipv4Range {
  */
 const BLOCKED_IPV4_RANGES: readonly Ipv4Range[] = [
   { base: "0.0.0.0", prefix: 8, why: "this-network / unspecified" },
-  { base: "10.0.0.0", prefix: 8, why: "private (RFC 1918)" },
+  {
+    base: "10.0.0.0",
+    prefix: 8,
+    why: "private (RFC 1918)",
+    internalService: true,
+  },
   { base: "100.64.0.0", prefix: 10, why: "carrier-grade NAT (RFC 6598)" },
-  { base: "127.0.0.0", prefix: 8, why: "loopback" },
+  { base: "127.0.0.0", prefix: 8, why: "loopback", internalService: true },
   {
     base: "169.254.0.0",
     prefix: 16,
     why: "link-local, including the cloud instance-metadata address",
   },
-  { base: "172.16.0.0", prefix: 12, why: "private (RFC 1918)" },
+  {
+    base: "172.16.0.0",
+    prefix: 12,
+    why: "private (RFC 1918)",
+    internalService: true,
+  },
   {
     base: "192.0.0.0",
     prefix: 24,
@@ -101,7 +161,12 @@ const BLOCKED_IPV4_RANGES: readonly Ipv4Range[] = [
     prefix: 24,
     why: "6to4 relay anycast (RFC 7526) — reaches a relay, not a server",
   },
-  { base: "192.168.0.0", prefix: 16, why: "private (RFC 1918)" },
+  {
+    base: "192.168.0.0",
+    prefix: 16,
+    why: "private (RFC 1918)",
+    internalService: true,
+  },
   {
     base: "198.18.0.0",
     prefix: 15,
@@ -201,10 +266,13 @@ const ipv6ToBytes = (address: string): Uint8Array | null => {
  * the plain v4 literal would. Judging the text form instead of the address it
  * denotes is how these checks get bypassed.
  */
-const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
+const blockedIpv6Reason = (
+  bytes: Uint8Array,
+  allowPrivate: boolean,
+): string | null => {
   // ::ffff:0:0/96 — IPv4-mapped. `http://[::ffff:127.0.0.1]` is loopback.
   if (allZero(bytes, 0, 10) && bytes[10] === 0xff && bytes[11] === 0xff) {
-    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12));
+    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12), allowPrivate);
     return inner ? `IPv4-mapped ::ffff:0:0/96 -> ${inner}` : null;
   }
 
@@ -217,7 +285,7 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
     bytes[9] === 0xff &&
     allZero(bytes, 10, 12)
   ) {
-    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12));
+    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12), allowPrivate);
     return inner ? `IPv4-translated ::ffff:0:0:0/96 -> ${inner}` : null;
   }
 
@@ -225,9 +293,13 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
   // prefix but are the unspecified and loopback addresses, not v4 wrappers.
   if (allZero(bytes, 0, 12)) {
     if (allZero(bytes, 12, 15) && bytes[15] <= 1) {
-      return bytes[15] === 0 ? "::/128 unspecified" : "::1/128 loopback";
+      // `::` (unspecified) is never a real backend and stays blocked in both
+      // postures; `::1` (loopback) is where an internal backend can live, so
+      // the allowPrivate posture permits it.
+      if (bytes[15] === 0) return "::/128 unspecified";
+      return allowPrivate ? null : "::1/128 loopback";
     }
-    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12));
+    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12), allowPrivate);
     return inner ? `IPv4-compatible ::/96 -> ${inner}` : null;
   }
 
@@ -256,13 +328,13 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
     bytes[3] === 0x9b &&
     allZero(bytes, 4, 12)
   ) {
-    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12));
+    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 12), allowPrivate);
     return inner ? `NAT64 64:ff9b::/96 -> ${inner}` : null;
   }
 
   // 2002::/16 — 6to4 carries the v4 site address in the next four bytes.
   if (bytes[0] === 0x20 && bytes[1] === 0x02) {
-    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 2));
+    const inner = isBlockedSsrfAddress(embeddedIpv4(bytes, 2), allowPrivate);
     return inner ? `6to4 2002::/16 -> ${inner}` : null;
   }
 
@@ -273,7 +345,11 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
   if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0xc0) {
     return "fec0::/10 site-local (deprecated)";
   }
-  if ((bytes[0] & 0xfe) === 0xfc) return "fc00::/7 unique local";
+  // fc00::/7 unique local is the IPv6 analogue of RFC 1918: an internal
+  // backend can live here, so the allowPrivate posture permits it.
+  if ((bytes[0] & 0xfe) === 0xfc) {
+    return allowPrivate ? null : "fc00::/7 unique local";
+  }
 
   return null;
 };
@@ -286,8 +362,17 @@ const blockedIpv6Reason = (bytes: Uint8Array): string | null => {
  * accepted or a string a resolver returned, so an unrecognisable value means
  * an assumption broke — and the safe reading of a broken assumption on this
  * path is "block".
+ *
+ * `allowPrivate` (default false) permits the private ranges where a trusted,
+ * operator-configured backend legitimately lives (RFC 1918, loopback, and
+ * their IPv6 unique-local/loopback/mapped forms). It NEVER relaxes the ranges
+ * that are never a real backend: the cloud metadata address, CGNAT, multicast,
+ * the unspecified address and the reserved blocks stay blocked either way.
  */
-export const isBlockedSsrfAddress = (address: string): string | null => {
+export const isBlockedSsrfAddress = (
+  address: string,
+  allowPrivate: boolean = false,
+): string | null => {
   const family = isIP(address);
 
   if (family === 4) {
@@ -297,6 +382,7 @@ export const isBlockedSsrfAddress = (address: string): string | null => {
     for (const range of BLOCKED_IPV4_RANGES) {
       const base = ipv4ToInt(range.base);
       if (base !== null && inIpv4Range(value, base, range.prefix)) {
+        if (allowPrivate && range.internalService) return null;
         return `${range.base}/${range.prefix} ${range.why}`;
       }
     }
@@ -306,7 +392,7 @@ export const isBlockedSsrfAddress = (address: string): string | null => {
   if (family === 6) {
     const bytes = ipv6ToBytes(address);
     if (!bytes) return "unparsable IPv6 address";
-    return blockedIpv6Reason(bytes);
+    return blockedIpv6Reason(bytes, allowPrivate);
   }
 
   return "not a recognisable IP address";
@@ -382,6 +468,45 @@ export interface McpUrlGuardOptions {
    * unblocks the attacker's redirect into it instead.
    */
   allowlistOrigin?: string;
+  /**
+   * Permit the private ranges where a trusted, operator-configured backend
+   * legitimately lives (RFC 1918, loopback, IPv6 unique-local) while still
+   * pinning the socket and still refusing the never-a-backend ranges (cloud
+   * metadata, CGNAT, multicast, reserved). The pooled data plane sets this:
+   * its targets are DB-configured internal services, not caller-supplied URLs
+   * like the Inspector's, so blocking every internal address (the default
+   * posture) would refuse every legitimate backend. Off by default so the
+   * Inspector path keeps its strict block-internal / allow-public posture.
+   */
+  allowPrivateAddresses?: boolean;
+  /**
+   * Refuse a redirect to a different origin outright instead of following it
+   * with credentials stripped. The pooled data plane sets this: a
+   * compromised backend answering `302` toward the metadata address or any
+   * other host is the exact vector this closes, and legitimate internal
+   * backends do not cross-origin-redirect. Same-origin redirects are still
+   * followed and re-validated. Off by default so the Inspector keeps
+   * following cross-origin redirects (for example an http->https upgrade
+   * mid-session) with credentials dropped.
+   */
+  refuseCrossOriginRedirect?: boolean;
+  /**
+   * Hard ceiling on the bytes read from a single response body before the
+   * request is aborted, guarding the gateway against a hostile or misbehaving
+   * upstream that streams an unbounded response. Defaults to
+   * `MCP_PROXY_MAX_RESPONSE_BYTES` (100 MiB). For a long-lived SSE stream the
+   * count is cumulative over the connection, so the default is a generous
+   * memory-exhaustion backstop, not an operational limit.
+   */
+  maxResponseBytes?: number;
+  /**
+   * Undici headers-and-body idle timeout (ms) applied to the pinned
+   * dispatcher, defaulting to `MCP_PROXY_REQUEST_TIMEOUT_MS` (300000). It is
+   * an idle timeout, reset on every received chunk, NOT a total-duration cap:
+   * a total cap would kill a legitimately long-lived SSE stream, whereas this
+   * bounds a hung or stalled upstream without that regression.
+   */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -469,11 +594,13 @@ export const assertPublicMcpUrl = async (
     throw refuse(`${JSON.stringify(hostname)} resolved to nothing`);
   }
 
-  // EVERY answer has to be public. A host that returns one public and one
-  // internal address is a rebinding attempt that got greedy, and connecting is
-  // a coin flip over which record the client picks.
+  // EVERY answer has to be public (or, under allowPrivate, an internal-service
+  // range). A host that returns one allowed and one refused address is a
+  // rebinding attempt that got greedy, and connecting is a coin flip over
+  // which record the client picks.
+  const allowPrivate = options.allowPrivateAddresses ?? false;
   for (const address of addresses) {
-    const blockedBy = isBlockedSsrfAddress(address);
+    const blockedBy = isBlockedSsrfAddress(address, allowPrivate);
     if (blockedBy) {
       throw refuse(`${JSON.stringify(hostname)} resolves into ${blockedBy}`);
     }
@@ -512,14 +639,37 @@ const pinnedLookup =
     callback(null, entries[0].address, entries[0].family);
   };
 
+/** Undici dispatcher timeouts, applied to the pinned Agent. */
+interface DispatcherTimeouts {
+  /** Max ms to receive the response headers. */
+  readonly headersTimeout?: number;
+  /** Max ms of inactivity between body chunks (idle, reset per chunk). */
+  readonly bodyTimeout?: number;
+}
+
 /**
  * An undici dispatcher whose connections can only land on `addresses`.
  *
  * Exported for the test that proves the pin at socket level: given a hostname
  * that cannot resolve at all, a request through this agent still connects.
+ *
+ * `timeouts` bounds a hung or stalled upstream. `bodyTimeout` is undici's idle
+ * timeout (reset on every received chunk), not a total-duration cap, so it
+ * does not sever a legitimately long-lived-but-active SSE stream.
  */
-export const createPinnedAgent = (addresses: string[]): Agent =>
-  new Agent({ connect: { lookup: pinnedLookup(addresses) } });
+export const createPinnedAgent = (
+  addresses: string[],
+  timeouts: DispatcherTimeouts = {},
+): Agent =>
+  new Agent({
+    connect: { lookup: pinnedLookup(addresses) },
+    ...(timeouts.headersTimeout !== undefined
+      ? { headersTimeout: timeouts.headersTimeout }
+      : {}),
+    ...(timeouts.bodyTimeout !== undefined
+      ? { bodyTimeout: timeouts.bodyTimeout }
+      : {}),
+  });
 
 /**
  * What `createGuardedFetch` calls, and the reason it is undici's `fetch` rather
@@ -634,18 +784,99 @@ const FORWARDABLE_ON_ORIGIN_CHANGE = new Set([
  * back-channel endpoint the remote server chooses — is judged with an empty
  * allowlist. Otherwise the entry that unblocks the operator's own internal
  * host also unblocks an attacker's `302` into it.
+ *
+ * THE POOLED DATA PLANE uses a different posture, set through options: its
+ * targets are DB-configured internal services, so `allowPrivateAddresses`
+ * permits the RFC-1918/loopback ranges where they live (the socket is still
+ * pinned and the metadata address is still refused), and
+ * `refuseCrossOriginRedirect` rejects any redirect to another origin outright
+ * rather than following it, because a trusted backend never redirects the
+ * gateway elsewhere and one that tries is answering with a hostile hop.
+ *
+ * EVERY RESPONSE IS BOUNDED. The final body is capped at `maxResponseBytes`
+ * (aborting the request when exceeded) so a hostile or misbehaving upstream
+ * cannot exhaust gateway memory, and the pinned dispatcher carries a
+ * headers/body idle timeout (`requestTimeoutMs`) so a hung upstream cannot
+ * stall a pool slot forever.
  */
+/**
+ * Wrap a response so reading its body aborts the request once `maxBytes` is
+ * exceeded.
+ *
+ * The count is cumulative over the stream, so on a long-lived SSE connection
+ * this is a memory-exhaustion backstop rather than a per-message limit.
+ * `onExceed` tears down the underlying connection (via the request's
+ * AbortController) so undici stops pulling bytes, then the stream errors so the
+ * consumer sees the refusal rather than a silently-truncated body. A body-less
+ * response (204/304 and friends) is returned untouched.
+ */
+const capResponseBody = (
+  response: Response,
+  maxBytes: number,
+  onExceed: () => void,
+): Response => {
+  if (!response.body) return response;
+  const source = response.body.getReader();
+  let seen = 0;
+  const capped = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await source.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        seen += value.byteLength;
+        if (seen > maxBytes) {
+          onExceed();
+          await source.cancel().catch(() => {});
+          logger.warn(
+            "MCP proxy remote URL refused: response exceeded the byte ceiling",
+          );
+          controller.error(new Error(RESPONSE_TOO_LARGE));
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      void source.cancel(reason).catch(() => {});
+    },
+  });
+  const wrapped = new Response(capped, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  // A constructed Response reports an empty url and redirected=false; restore
+  // both because `eventsource` resolves a relative SSE endpoint against `url`.
+  Object.defineProperty(wrapped, "url", { value: response.url });
+  Object.defineProperty(wrapped, "redirected", {
+    value: response.redirected,
+  });
+  return wrapped;
+};
+
 export const createGuardedFetch = (
   options: McpUrlGuardOptions = {},
 ): FetchLike => {
   const baseFetch = options.baseFetch ?? pinnedFetch;
+  const maxBytes = options.maxResponseBytes ?? maxResponseBytesFromEnv();
+  const timeoutMs = options.requestTimeoutMs ?? requestTimeoutMsFromEnv();
+  const timeouts: DispatcherTimeouts = {
+    headersTimeout: timeoutMs,
+    bodyTimeout: timeoutMs,
+  };
 
   /**
    * One dispatcher per validated address set, for the life of this transport.
    * Rebuilding an Agent per request would throw away connection reuse, which
    * on the streamable-HTTP transport is a TLS handshake for every JSON-RPC
    * message. Keyed by the addresses, so a host that legitimately moves gets a
-   * new pool rather than a stale one.
+   * new pool rather than a stale one. An allowlisted host (no addresses) is
+   * trusted by name and not pinned, so it rides the runtime default dispatcher.
    */
   const agents = new Map<string, Agent>();
   const agentFor = (addresses: string[]): Agent | undefined => {
@@ -653,13 +884,22 @@ export const createGuardedFetch = (
     const key = [...addresses].sort().join(",");
     let agent = agents.get(key);
     if (!agent) {
-      agent = createPinnedAgent(addresses);
+      agent = createPinnedAgent(addresses, timeouts);
       agents.set(key, agent);
     }
     return agent;
   };
 
   return async (input, init) => {
+    // Byte-ceiling teardown: an oversized final body aborts THIS request so
+    // undici stops pulling bytes. Chained with any caller-supplied signal so
+    // request cancellation still propagates through the guard.
+    const controller = new AbortController();
+    const signal =
+      init?.signal != null
+        ? AbortSignal.any([init.signal, controller.signal])
+        : controller.signal;
+
     // Hop 0 is the only destination an allowlist entry can speak for, and only
     // when it is the origin the route already validated.
     const firstHopOptions =
@@ -686,6 +926,7 @@ export const createGuardedFetch = (
           body,
           headers,
           redirect: "manual",
+          signal,
         },
         agentFor(target.addresses),
       );
@@ -693,7 +934,11 @@ export const createGuardedFetch = (
       const location = REDIRECT_STATUSES.has(response.status)
         ? response.headers.get("location")
         : null;
-      if (!location) return response;
+      // Only the final (non-redirect) body is capped; redirect bodies are
+      // drained below.
+      if (!location) {
+        return capResponseBody(response, maxBytes, () => controller.abort());
+      }
 
       // Drain the redirect body so the connection is released rather than held
       // open for the life of the chain.
@@ -710,6 +955,21 @@ export const createGuardedFetch = (
       } catch {
         throw refuse("redirect target is not a parsable URL");
       }
+
+      // Pooled posture: a redirect to another origin is refused outright, not
+      // followed with credentials stripped. A trusted internal backend never
+      // redirects the gateway elsewhere, so one that tries is the SSRF hop this
+      // closes; same-origin redirects still fall through and are re-validated.
+      if (
+        options.refuseCrossOriginRedirect &&
+        nextUrl.origin !== target.url.origin
+      ) {
+        logger.warn(
+          "MCP proxy remote URL refused: cross-origin redirect on the pooled path",
+        );
+        throw new Error(CROSS_ORIGIN_REDIRECT_REFUSED);
+      }
+
       const next = await assertPublicMcpUrl(nextUrl, laterHopOptions);
 
       if (

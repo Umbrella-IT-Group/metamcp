@@ -64,6 +64,7 @@ const buildRouter = () =>
         restricted: false,
         enable_oauth: true,
         enable_api_key_auth: false,
+        require_scoped_api_key: false,
         groups: [],
       },
     }),
