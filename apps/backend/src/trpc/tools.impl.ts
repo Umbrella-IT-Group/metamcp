@@ -9,7 +9,7 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { toolsRepository } from "../db/repositories";
+import { mcpServersRepository, toolsRepository } from "../db/repositories";
 import { ToolsSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { toolsSyncCache } from "../lib/metamcp/tools-sync-cache";
@@ -27,8 +27,27 @@ import { toolsSyncCache } from "../lib/metamcp/tools-sync-cache";
 export const toolsImplementations = {
   getByMcpServerUuid: async (
     input: z.infer<typeof GetToolsByMcpServerUuidRequestSchema>,
+    userId: string,
   ): Promise<z.infer<typeof GetToolsByMcpServerUuidResponseSchema>> => {
     try {
+      // Scope the catalog the same way `mcpServers.get` scopes the server
+      // itself: a private server (user_id set) is readable only by its owner,
+      // public servers (no user_id) stay readable to any member. The tool
+      // catalog (names, descriptions, input schemas) is the same per-user
+      // disclosure surface, so it must gate on ownership before returning —
+      // otherwise a member who obtains a private server's UUID can read
+      // another user's tools. Admins are not exempted here, matching
+      // mcpServers.get.
+      const server = await mcpServersRepository.findByUuid(input.mcpServerUuid);
+      if (server && server.user_id && server.user_id !== userId) {
+        return {
+          success: false as const,
+          data: [],
+          message:
+            "Access denied: You can only view tools for servers you own or public servers",
+        };
+      }
+
       const tools = await toolsRepository.findByMcpServerUuid(
         input.mcpServerUuid,
       );
