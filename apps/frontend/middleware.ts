@@ -1,6 +1,11 @@
 import { betterFetch } from "@better-fetch/fetch";
 import { NextRequest, NextResponse } from "next/server";
 
+import {
+  buildContentSecurityPolicy,
+  NONCE_HEADER,
+} from "./lib/security-headers";
+
 const locales = ["en", "zh", "ko"];
 const defaultLocale = "en";
 
@@ -87,6 +92,31 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
+  // Per-request CSP nonce. The policy bans inline script except by nonce, and a
+  // nonce cannot be a static next.config value, so it is minted here, the only
+  // layer that runs before the document is rendered. It is stamped on the
+  // request's CSP header (Next reads it there to nonce the framework hydration
+  // scripts) and on `x-nonce` (the root layout reads it there to nonce the
+  // third-party inline scripts Next does not own: the runtime-env script and
+  // the theme anti-flash script). See ./lib/security-headers.
+  const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
+  const csp = buildContentSecurityPolicy(nonce);
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set(NONCE_HEADER, nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
+
+  // A document render: carry the nonce forward to the renderer via the request
+  // headers, and the policy back to the browser on the response. Only the
+  // page-rendering branches below use this; the redirect branches return a
+  // bodyless 307 whose destination gets its own pass through this middleware.
+  const renderDocument = () => {
+    const response = NextResponse.next({
+      request: { headers: requestHeaders },
+    });
+    response.headers.set("Content-Security-Policy", csp);
+    return response;
+  };
+
   // Handle i18n routing first
   const pathnameHasLocale = locales.some(
     (locale) => pathname.startsWith(`/${locale}/`) || pathname === `/${locale}`,
@@ -110,7 +140,7 @@ export async function middleware(request: NextRequest) {
   // Now handle authentication for the pathname without locale
   const publicRoutes = ["/login", "/register", "/", "/cors-error"];
   if (publicRoutes.includes(pathnameWithoutLocale)) {
-    return NextResponse.next();
+    return renderDocument();
   }
 
   try {
@@ -142,7 +172,7 @@ export async function middleware(request: NextRequest) {
       );
     }
 
-    return NextResponse.next();
+    return renderDocument();
   } catch (error) {
     console.error("Auth middleware error:", error);
     // On error, redirect to login (with locale)

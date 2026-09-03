@@ -1,8 +1,8 @@
 /**
  * What the REMOTE-URL branches of the mcp-proxy actually connect to.
  *
- * `url-guard.test.ts` next door pins the validator — given a URL, is it a
- * public destination. That is necessary and NOT sufficient, and the gap is why
+ * The `url-guard.test.ts` suite pins the validator (given a URL, is it a
+ * public destination). That is necessary and NOT sufficient, and the gap is why
  * this file exists: a validator can be flawless while the route never calls
  * it, or calls it and connects anyway. Every assertion in that suite keeps
  * passing if the guard is deleted from `createTransport`.
@@ -146,7 +146,7 @@ vi.mock("../../db/index", () => ({ db: {}, pool: {} }));
 vi.mock("node:dns/promises", () => ({ lookup: lookupMock }));
 
 const { default: serverRouter } = await import("./server");
-const { NOT_A_PERMITTED_TARGET } = await import("./url-guard");
+const { NOT_A_PERMITTED_TARGET } = await import("@/lib/metamcp/url-guard");
 
 const PUBLIC_V4 = "93.184.216.34";
 

@@ -7,7 +7,7 @@
  * on. The hostnames below are all `example.com` subdomains for the same
  * reason — they must never resolve to anything real.
  *
- * `server.remote-url.test.ts` next door proves the route actually calls this;
+ * The `server.remote-url.test.ts` suite proves the route actually calls this;
  * a validator can be perfectly correct and still be wired to nothing.
  */
 
@@ -22,7 +22,9 @@ const {
   createGuardedFetch,
   createPinnedAgent,
   isBlockedSsrfAddress,
+  CROSS_ORIGIN_REDIRECT_REFUSED,
   NOT_A_PERMITTED_TARGET,
+  RESPONSE_TOO_LARGE,
   TOO_MANY_REDIRECTS,
   UNREPLAYABLE_REDIRECT_BODY,
 } = await import("./url-guard");
@@ -709,5 +711,165 @@ describe("createGuardedFetch — every hop is re-validated, not just the first",
     );
     // Two connections happened; the third was refused before it was opened.
     expect(baseFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The pooled data plane's posture: internal backends are trusted (their DB
+ * rows are operator-configured), so private ranges are permitted while the
+ * cloud metadata address and the other never-a-backend ranges stay refused.
+ */
+describe("isBlockedSsrfAddress: allowPrivate relaxation", () => {
+  it.each([
+    ["10.1.2.3", "RFC 1918 ten-dot"],
+    ["172.16.0.1", "RFC 1918 one-seven-two"],
+    ["192.168.1.1", "RFC 1918 one-nine-two"],
+    ["127.0.0.1", "loopback"],
+    ["::1", "IPv6 loopback"],
+    ["fd12:3456::1", "IPv6 unique local"],
+    ["::ffff:10.0.0.1", "IPv4-mapped RFC 1918"],
+  ])("permits internal-service %s (%s) under allowPrivate", (address) => {
+    expect(isBlockedSsrfAddress(address, true)).toBeNull();
+  });
+
+  it.each([
+    ["169.254.169.254", "cloud metadata"],
+    ["100.64.0.1", "carrier-grade NAT"],
+    ["224.0.0.1", "multicast"],
+    ["0.0.0.0", "unspecified"],
+    ["::", "IPv6 unspecified"],
+    ["fe80::1", "IPv6 link-local"],
+    ["::ffff:169.254.169.254", "IPv4-mapped metadata"],
+  ])("still blocks %s (%s) under allowPrivate", (address) => {
+    expect(isBlockedSsrfAddress(address, true)).not.toBeNull();
+  });
+});
+
+describe("assertPublicMcpUrl: allowPrivateAddresses (pooled posture)", () => {
+  it("permits an internal RFC-1918 backend and still pins it", async () => {
+    const { url, addresses } = await assertPublicMcpUrl(
+      "http://backend.internal/mcp",
+      { lookup: resolvesTo("10.0.0.5"), allowPrivateAddresses: true },
+    );
+    expect(url.href).toBe("http://backend.internal/mcp");
+    // Non-empty addresses = the socket is pinned to the validated answer.
+    expect(addresses).toEqual(["10.0.0.5"]);
+  });
+
+  it("permits a loopback backend literal under allowPrivate", async () => {
+    const { addresses } = await assertPublicMcpUrl(
+      "http://127.0.0.1:3001/mcp",
+      {
+        allowPrivateAddresses: true,
+      },
+    );
+    expect(addresses).toEqual(["127.0.0.1"]);
+  });
+
+  it("still refuses the cloud metadata address under allowPrivate", async () => {
+    await expect(
+      assertPublicMcpUrl("http://backend.internal/mcp", {
+        lookup: resolvesTo("169.254.169.254"),
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+  });
+
+  it("still refuses CGNAT under allowPrivate", async () => {
+    await expect(
+      assertPublicMcpUrl("http://backend.internal/mcp", {
+        lookup: resolvesTo("100.64.0.1"),
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+  });
+});
+
+describe("createGuardedFetch: refuseCrossOriginRedirect (pooled posture)", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+
+  it("refuses a cross-origin redirect outright rather than following it", async () => {
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://elsewhere.example.com/x"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      refuseCrossOriginRedirect: true,
+    });
+
+    await expect(guarded("https://mcp.example.com/mcp")).rejects.toThrow(
+      CROSS_ORIGIN_REDIRECT_REFUSED,
+    );
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("still follows a same-origin redirect", async () => {
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirect(302, "https://mcp.example.com/mcp/"))
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      refuseCrossOriginRedirect: true,
+    });
+
+    const response = await guarded("https://mcp.example.com/mcp");
+    expect(response.status).toBe(200);
+    expect(baseFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("permits an internal backend but refuses its redirect to the metadata address", async () => {
+    // Together: allowPrivate lets hop 0 (an internal 10.x host) connect, and
+    // the cross-origin refusal stops the compromised-backend 302 to metadata.
+    // Without allowPrivate the first hop is refused and baseFetch is never
+    // called, so the single call also proves allowPrivate did its job.
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        redirect(302, "http://169.254.169.254/latest/meta-data/"),
+      )
+      .mockResolvedValueOnce(ok());
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo("10.0.0.5"),
+      allowPrivateAddresses: true,
+      refuseCrossOriginRedirect: true,
+    });
+
+    await expect(guarded("http://backend.internal/mcp")).rejects.toThrow(
+      CROSS_ORIGIN_REDIRECT_REFUSED,
+    );
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createGuardedFetch: the response body is bounded", () => {
+  it("aborts a response body that exceeds the byte ceiling", async () => {
+    const baseFetch = vi.fn(async () => new Response("abcdefgh")); // 8 bytes
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      maxResponseBytes: 4,
+    });
+
+    const response = await guarded("https://mcp.example.com/mcp");
+    await expect(response.text()).rejects.toThrow(RESPONSE_TOO_LARGE);
+  });
+
+  it("passes a response under the byte ceiling untouched", async () => {
+    const baseFetch = vi.fn(async () => new Response("ok"));
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo(PUBLIC_V4),
+      maxResponseBytes: 1024,
+    });
+
+    const response = await guarded("https://mcp.example.com/mcp");
+    expect(await response.text()).toBe("ok");
   });
 });
