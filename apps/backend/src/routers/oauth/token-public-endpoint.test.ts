@@ -39,6 +39,9 @@ const oauthRepositoryMock = {
   getByRefreshToken: vi.fn(),
   setAccessToken: vi.fn(),
   deleteAccessToken: vi.fn(),
+  // Revoke-by-refresh-token holds the row from getByRefreshToken, so it deletes
+  // by the row's stored access-token hash (migration 0036).
+  deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
 };
 
@@ -405,7 +408,10 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
     );
 
     expect(res.statusCode).toBe(200);
-    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+    // The row is in hand from getByRefreshToken, so the delete goes through the
+    // by-hash path against the row's stored access-token digest (migration
+    // 0036), not the plaintext-hashing deleteAccessToken.
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
       LIVE_TOKEN,
     );
   });

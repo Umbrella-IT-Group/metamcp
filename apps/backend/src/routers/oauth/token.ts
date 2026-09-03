@@ -17,7 +17,7 @@ import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
   rateLimitToken,
-  timingSafeEqualSecret,
+  verifyClientSecret,
 } from "./utils";
 
 const tokenRouter = express.Router();
@@ -334,12 +334,16 @@ async function handleAuthorizationCodeGrant(
     const [authClientId, authClientSecret] = credentials.split(":");
 
     // The client_id half is not a secret, so a plain compare is fine; the
-    // secret half is compared in constant time (see timingSafeEqualSecret) so
-    // the token endpoint is not a timing oracle for a confidential client's
-    // secret.
+    // secret half is verified against the salted hash at rest (migration 0036)
+    // in constant time (verifyClientSecret -> timingSafeEqualSecret) so the
+    // token endpoint is not a timing oracle for a confidential client's secret.
     if (
       authClientId !== client_id ||
-      !timingSafeEqualSecret(authClientSecret, clientData.client_secret)
+      !verifyClientSecret(
+        authClientSecret,
+        clientData.client_secret,
+        clientData.client_secret_salt,
+      )
     ) {
       return res.status(401).json({
         error: "invalid_client",
@@ -350,7 +354,11 @@ async function handleAuthorizationCodeGrant(
     const { client_secret } = req.body;
     if (
       !client_secret ||
-      !timingSafeEqualSecret(client_secret, clientData.client_secret)
+      !verifyClientSecret(
+        client_secret,
+        clientData.client_secret,
+        clientData.client_secret_salt,
+      )
     ) {
       return res.status(401).json({
         error: "invalid_client",
@@ -513,14 +521,13 @@ async function handleRefreshTokenGrant(
     // row is that the credential it describes no longer exists to be looked
     // up, so writing it after the destruction would lose it in exactly the
     // case an operator is investigating.
-    const destroyed = credentialFingerprint(tokenData.access_token);
     emitTokenLifecycle(req, {
       action: "oauth.token.refresh",
       clientId: tokenData.client_id,
       userId: tokenData.user_id,
       // The refresh token as PRESENTED — `token_sha256` in the row. It is a
       // different string from the access token in the same row, which is
-      // fingerprinted separately below.
+      // recorded separately below.
       token: refresh_token,
       outcome: "failure",
       httpStatus: 400,
@@ -530,15 +537,19 @@ async function handleRefreshTokenGrant(
         // The destroyed row's ACCESS token, under the same keys
         // `emitTokenIssued` writes — this is the join back to the
         // `oauth.token.issue` / `oauth.token.refresh` row that minted the
-        // chain, which is the only place its age is now recorded.
-        access_token_sha256: destroyed.sha256,
-        access_token_last4: destroyed.last4,
+        // chain, which is the only place its age is now recorded. Since
+        // migration 0036 the stored `access_token` IS the sha256 the audit log
+        // records, and `access_token_last4` its tail, so they are used directly
+        // passing the stored hash through credentialFingerprint would hash it
+        // a second time and break the join.
+        access_token_sha256: tokenData.access_token,
+        access_token_last4: tokenData.access_token_last4,
         created_at: isoOrNull(tokenData.created_at),
         expires_at: isoOrNull(tokenData.expires_at),
         refresh_token_expires_at: isoOrNull(tokenData.refresh_token_expires_at),
       },
     });
-    await oauthRepository.deleteAccessToken(tokenData.access_token);
+    await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Refresh token has expired",
@@ -581,8 +592,10 @@ async function handleRefreshTokenGrant(
     });
   }
 
-  // Delete old token row (rotation: old refresh token is single-use)
-  await oauthRepository.deleteAccessToken(tokenData.access_token);
+  // Delete old token row (rotation: old refresh token is single-use). The row
+  // is in hand from getByRefreshToken, so delete by its stored hash rather than
+  // re-hashing it through deleteAccessToken.
+  await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
 
   // Issue new access token + refresh token
   const { accessToken, refreshToken } = await issueTokenPair(
@@ -1159,7 +1172,9 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
         if (clientMismatch(tokenData.client_id)) {
           return refuseClientMismatch(tokenData, "refresh_token");
         }
-        await oauthRepository.deleteAccessToken(tokenData.access_token);
+        // The row is in hand from getByRefreshToken, so delete by its stored
+        // hash rather than re-hashing it through deleteAccessToken.
+        await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
         emitTokenLifecycle(req, {
           action: "oauth.token.revoke",
           clientId: tokenData.client_id,

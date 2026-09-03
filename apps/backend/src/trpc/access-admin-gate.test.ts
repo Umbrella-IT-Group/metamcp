@@ -252,6 +252,9 @@ describe("Access routers — .output() is a second redaction layer", () => {
             expires_at: new Date("2026-09-13T12:00:00.000Z"),
             has_refresh_token: true,
             refresh_token_expires_at: null,
+            // The readable tail the contract now names (migration 0036); the
+            // full token values below are the extras .output() must strip.
+            access_token_last4: "0abc",
             access_token: "sk_mt_leaked_access_token",
             refresh_token: "sk_mt_leaked_refresh_token",
           },

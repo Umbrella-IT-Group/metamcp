@@ -78,6 +78,9 @@ const dbToken = {
   expires_at: EXPIRES_AT,
   has_refresh_token: true,
   refresh_token_expires_at: EXPIRES_AT,
+  // The readable tail the query DOES select now (migration 0036): safe to
+  // surface, and enough to correlate a listed token with an audit row.
+  access_token_last4: "9tok",
   // The repository query never selects these. Injected anyway — the
   // serializer is the layer that must hold if the query is ever widened.
   access_token: SECRET_ACCESS_TOKEN,
@@ -226,6 +229,7 @@ describe("OAuthTokensSerializer.serializeActiveTokenList", () => {
     for (const serialized of serializedList) {
       expect(Object.keys(serialized).sort()).toEqual(
         [
+          "access_token_last4",
           "client_id",
           "client_name",
           "created_at",

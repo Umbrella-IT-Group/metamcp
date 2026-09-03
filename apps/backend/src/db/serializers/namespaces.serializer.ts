@@ -60,7 +60,11 @@ export class NamespacesSerializer {
         args: includeSecrets ? server.args || [] : [],
         url: includeSecrets ? server.url : null,
         env: includeSecrets ? server.env || {} : {},
-        bearerToken: includeSecrets ? server.bearerToken : null,
+        // NEVER returned: the stored value is an
+        // `enc:v1:` ciphertext read only server-side to build the upstream
+        // header, so no response echoes it, same posture as
+        // McpServersSerializer.
+        bearerToken: null,
         headers: includeSecrets ? server.headers || {} : {},
         error_status: server.error_status,
         created_at: server.created_at.toISOString(),

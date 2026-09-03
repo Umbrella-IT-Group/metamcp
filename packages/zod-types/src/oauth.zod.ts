@@ -37,7 +37,13 @@ export const OAuthClientRegistrationSourceEnum = z.enum(["dcr", "admin"]);
 // OAuth Client schema for registered clients
 export const OAuthClientSchema = z.object({
   client_id: z.string(),
+  // Salted-hash at rest (migration 0036): client_secret holds the sha256 of
+  // secret||salt, not the secret. Nullable for a PKCE/public client that has
+  // no secret. Never leaves the server, the list view exposes presence only.
   client_secret: z.string().nullable(),
+  // The salt for client_secret above (migration 0036). NULL when there is no
+  // secret. Read by verifyClientSecret at the token endpoint.
+  client_secret_salt: z.string().nullable().optional(),
   client_name: z.string(),
   redirect_uris: z.array(z.string()),
   grant_types: z.array(z.string()),
@@ -75,7 +81,10 @@ export const OAuthAuthorizationCodeSchema = z.object({
 
 // OAuth Access Token schema
 export const OAuthAccessTokenSchema = z.object({
+  // Hash at rest (migration 0036): the sha256 of the token, not the token.
   access_token: z.string(),
+  // Last 4 characters of the token, kept for the admin view (migration 0036).
+  access_token_last4: z.string(),
   client_id: z.string(),
   user_id: z.string(),
   scope: z.string(),
@@ -377,9 +386,13 @@ export type DeleteOAuthClientResponse = z.infer<
 // this schema, not masked — `access_token` is the table's primary key and a
 // bearer credential for the whole gateway. Same rule as
 // OAuthClientListItemSchema and AdminApiKeyItemSchema: presence only, via
-// `has_refresh_token`.
+// `has_refresh_token`. The one readable fragment is `access_token_last4`, the
+// four-character tail the table now stores (migration 0036) and the audit log
+// already records, safe to show, and enough to correlate a listed token with
+// an audit row.
 export const ActiveOAuthTokenItemSchema = z.object({
   user_id: z.string(),
+  access_token_last4: z.string(),
   // LEFT JOINed: nullable so a token whose user row vanished mid-cascade
   // still appears in the listing instead of dropping out of it. An orphaned
   // live token is exactly the thing an administrator must be able to see.

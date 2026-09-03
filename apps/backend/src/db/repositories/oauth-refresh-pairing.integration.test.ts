@@ -182,21 +182,23 @@ describeIfDb("migration 0035 against a REAL postgres", () => {
       `INSERT INTO "oauth_clients" ("client_id", "client_name") VALUES ('${client}', 'itest 0035')` as never,
     );
 
+    // access_token_last4 is NOT NULL since migration 0036, so every raw insert
+    // supplies it; its value is irrelevant to the 0035 pairing this test pins.
     // Two violating rows.
     await db.execute(
-      `INSERT INTO "oauth_access_tokens" ("access_token", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${immortal}', '${client}', '${user}', now() + interval '1 hour', 'rt-${immortal}', NULL)` as never,
+      `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${immortal}', 'immo', '${client}', '${user}', now() + interval '1 hour', 'rt-${immortal}', NULL)` as never,
     );
     await db.execute(
-      `INSERT INTO "oauth_access_tokens" ("access_token", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${orphan}', '${client}', '${user}', now() + interval '1 hour', NULL, now() + interval '30 days')` as never,
+      `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${orphan}', 'orph', '${client}', '${user}', now() + interval '1 hour', NULL, now() + interval '30 days')` as never,
     );
     // Two legitimate rows that must not be altered. The refreshable row's
     // refresh expiry is far enough out that a spurious repair to now() would be
     // detectable.
     await db.execute(
-      `INSERT INTO "oauth_access_tokens" ("access_token", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${refreshable}', '${client}', '${user}', now() + interval '1 hour', 'rt-${refreshable}', now() + interval '30 days')` as never,
+      `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${refreshable}', 'refr', '${client}', '${user}', now() + interval '1 hour', 'rt-${refreshable}', now() + interval '30 days')` as never,
     );
     await db.execute(
-      `INSERT INTO "oauth_access_tokens" ("access_token", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${noRefresh}', '${client}', '${user}', now() + interval '1 hour', NULL, NULL)` as never,
+      `INSERT INTO "oauth_access_tokens" ("access_token", "access_token_last4", "client_id", "user_id", "expires_at", "refresh_token", "refresh_token_expires_at") VALUES ('${noRefresh}', 'nore', '${client}', '${user}', now() + interval '1 hour', NULL, NULL)` as never,
     );
 
     // Apply the migration exactly as it ships.

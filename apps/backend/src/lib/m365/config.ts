@@ -128,6 +128,33 @@ export function getM365BrokerConfig(): M365BrokerConfig {
   };
 }
 
+/**
+ * The token KEK on its own, decoupled from the full delegated-token broker.
+ *
+ * `getM365BrokerConfig()` throws unless the tenant/client/secret trio is also
+ * present, because the broker cannot mint Graph tokens without them. At-rest
+ * encryption of `mcp_servers.bearer_token` reuses this
+ * SAME KEK env and the same AES-256-GCM envelope, but has nothing to do with
+ * the Entra app registration, so it needs the key alone. Returns null when
+ * `M365_TOKEN_KEK` is unset (the caller decides whether that is fatal, the
+ * bearer-token write path fails closed, the converge logs and skips); throws
+ * only when the key is present but malformed, matching getM365BrokerConfig's
+ * validation exactly so there is one definition of "a valid KEK".
+ */
+export function getTokenKek(): { kek: Buffer; kekId: string } | null {
+  const kekB64 = process.env.M365_TOKEN_KEK || undefined;
+  if (!kekB64) {
+    return null;
+  }
+  const kek = Buffer.from(kekB64, "base64");
+  if (kek.length !== 32) {
+    throw new Error(
+      `M365_TOKEN_KEK must be base64 for exactly 32 bytes (AES-256); got ${kek.length} bytes`,
+    );
+  }
+  return { kek, kekId: process.env.M365_KEK_ID || "k1" };
+}
+
 /** Entra v2 endpoints for the configured tenant. */
 export function entraAuthorizeUrl(tenantId: string): string {
   return `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize`;

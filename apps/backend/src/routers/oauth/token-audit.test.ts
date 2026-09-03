@@ -47,6 +47,10 @@ const oauthRepositoryMock = {
   getByRefreshToken: vi.fn(),
   setAccessToken: vi.fn(),
   deleteAccessToken: vi.fn(),
+  // Rotation and refresh-expiry paths hold the row read by refresh token, so
+  // they delete by its stored access-token hash (migration 0036) rather than
+  // re-hashing a plaintext.
+  deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
 };
 
@@ -220,6 +224,7 @@ beforeEach(() => {
   // Default: the atomic single-use delete removed the row on redemption.
   oauthRepositoryMock.consumeAuthCode.mockResolvedValue(true);
   oauthRepositoryMock.deleteAccessToken.mockResolvedValue(undefined);
+  oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
 });
 
@@ -457,9 +462,15 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
   const refreshExpiredAt = new Date(Date.now() - 86400000);
 
   beforeEach(() => {
+    // The row read back holds the HASHES at rest (migration 0036), not the
+    // plaintext: access_token is the stored digest and access_token_last4 the
+    // readable tail. The audit row records the stored digest directly as
+    // access_token_sha256 (it is already the sha256 of the plaintext), and the
+    // reaper deletes by that digest via deleteAccessTokenByHash.
     oauthRepositoryMock.getByRefreshToken.mockResolvedValue({
-      access_token: priorAccessToken,
-      refresh_token: refreshToken,
+      access_token: sha256(priorAccessToken),
+      access_token_last4: priorAccessToken.slice(-4),
+      refresh_token: sha256(refreshToken),
       client_id: CLIENT_ID,
       user_id: USER_ID,
       scope: SCOPE,
@@ -484,8 +495,8 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
     // The delete is the behaviour the audit row exists to describe; it must
     // still happen, and it must still target the row's ACCESS token, which is
     // the primary key.
-    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
-      priorAccessToken,
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
+      sha256(priorAccessToken),
     );
     expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
 
@@ -551,15 +562,15 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
 
     expect(res.statusCode).toBe(400);
     expect(res.body).toMatchObject({ error: "invalid_grant" });
-    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
-      priorAccessToken,
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
+      sha256(priorAccessToken),
     );
   });
 
   it("keeps the row when the token DELETE throws — emit runs FIRST", async () => {
     // Same ordering assertion as the expired-code branch, on the branch the
     // commit body argues from. See the note there.
-    oauthRepositoryMock.deleteAccessToken.mockRejectedValue(
+    oauthRepositoryMock.deleteAccessTokenByHash.mockRejectedValue(
       new Error("connection pool exhausted"),
     );
 

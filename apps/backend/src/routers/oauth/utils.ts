@@ -347,8 +347,14 @@ export function isAllowedRedirectUri(
 }
 
 /**
- * Hash client secret for secure storage
- * Uses SHA-256 with salt
+ * Hash a client secret for storage at rest (migration 0036).
+ *
+ * SALTED, unlike the random tokens this server hashes unsalted: a client
+ * secret is handed to a confidential client and is a user-visible secret, so it
+ * gets a per-secret salt (16 random bytes, hex) even though the generator emits
+ * a 256-bit random value. `secret + salt` (secret first) is the exact order the
+ * migration's SQL backfill concatenates, so a secret hashed here verifies
+ * against a row the migration backfilled and vice versa.
  */
 export function hashClientSecret(
   secret: string,
@@ -362,15 +368,27 @@ export function hashClientSecret(
 }
 
 /**
- * Verify client secret against stored hash
+ * Verify a presented client secret against the stored salted hash in constant
+ * time.
+ *
+ * The comparison goes through `timingSafeEqualSecret` rather than `===` so the
+ * token endpoint is not a timing oracle for a confidential client's secret:
+ * the recomputed digest and the stored digest are both fixed-length hex, and
+ * `timingSafeEqualSecret` compares them without leaking how many leading
+ * characters agree. Returns false (fail-closed) if no stored hash or salt is
+ * present, a client configured for secret auth with no stored secret must not
+ * authenticate.
  */
 export function verifyClientSecret(
   secret: string,
-  storedHash: string,
-  salt: string,
+  storedHash: string | null | undefined,
+  salt: string | null | undefined,
 ): boolean {
+  if (!storedHash || !salt) {
+    return false;
+  }
   const { hash } = hashClientSecret(secret, salt);
-  return hash === storedHash;
+  return timingSafeEqualSecret(hash, storedHash);
 }
 
 /**
@@ -381,10 +399,13 @@ export function verifyClientSecret(
  * through the thrown-vs-returned path and crash on a length mismatch. Hashing
  * each side first makes every comparison a fixed 32-byte-vs-32-byte check: the
  * lengths always match, and the time taken no longer depends on how many
- * leading characters two values share. This is the compare half of the OAuth
- * client-secret hardening; storing the secret hashed at rest is a later change,
- * so this deliberately hashes at compare time rather than reading a stored
- * hash.
+ * leading characters two values share. This is the constant-time primitive
+ * behind the OAuth client-secret compare: `verifyClientSecret` (migration 0036)
+ * now recomputes the salted digest from the stored salt and calls this to
+ * compare it against the stored hash, so the client-secret path reads a hash at
+ * rest and no longer holds a plaintext secret. The extra sha256 this applies to
+ * two already-hex digests is harmless: equal digests stay equal, unequal stay
+ * unequal, and the compare stays fixed-length.
  *
  * Returns false for any non-string input rather than throwing, so a caller that
  * split a malformed `client:secret` and got `undefined` for the secret fails

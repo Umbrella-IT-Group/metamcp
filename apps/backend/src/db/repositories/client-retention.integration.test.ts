@@ -199,6 +199,7 @@ async function seed() {
 
   await db.insert(schema.oauthAccessTokensTable).values({
     access_token: "retention-itest-access",
+    access_token_last4: "cess",
     client_id: DCR_WITH_TOKEN,
     user_id: USER_ID,
     scope: "mcp",

@@ -15,6 +15,7 @@ export class OAuthTokensSerializer {
   static serializeActiveTokenList(
     dbTokens: Array<{
       user_id: string;
+      access_token_last4: string;
       user_email: string | null;
       client_id: string;
       client_name: string | null;
@@ -27,6 +28,10 @@ export class OAuthTokensSerializer {
   ) {
     return dbTokens.map((token) => ({
       user_id: token.user_id,
+      // The token's four-character tail (migration 0036). Safe to display and
+      // already recorded in the audit log; the full access_token digest and the
+      // refresh token stay out of both the query and this allow-list.
+      access_token_last4: token.access_token_last4,
       user_email: token.user_email,
       client_id: token.client_id,
       client_name: token.client_name,
