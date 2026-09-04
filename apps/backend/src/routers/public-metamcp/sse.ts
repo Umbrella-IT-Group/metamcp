@@ -23,6 +23,7 @@ import {
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
 import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
+import { recordSessionCeilingEvent } from "../../lib/metamcp/session-ceiling-events";
 import {
   boundSessionMatches,
   classifyBindingDenial,
@@ -208,9 +209,23 @@ sseRouter.get(
       // same budget the StreamableHTTP path enforces, shared across both
       // transports. Refuse before opening the stream so an over-budget
       // credential cannot keep accreting sessions that starve the backend pool.
-      const ceiling = checkConcurrentSessionCeiling(
-        resolveSessionIdentity(authReq),
-      );
+      //
+      // The consumer's display name is resolved HERE, ahead of the ceiling
+      // check, so the WARN and the throttled gateway event can name WHICH
+      // credential is at the ceiling instead of emitting a nameless event. It
+      // is a read-only lookup and is reused for the caller stamp below, so
+      // moving it up costs nothing.
+      const clientIdentity = await resolveClientIdentity(authReq);
+      const identity = resolveSessionIdentity(authReq);
+      const ceiling = checkConcurrentSessionCeiling(identity, {
+        label: clientIdentity?.name,
+      });
+      recordSessionCeilingEvent({
+        identity,
+        endpointName,
+        label: clientIdentity?.name,
+        decision: ceiling,
+      });
       if (!ceiling.allowed) {
         res.status(429).json({
           error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
@@ -248,7 +263,7 @@ sseRouter.get(
       // only — the authoritative per-request binding is entered on that leg
       // itself; this covers the window before the first message and any call
       // that reaches the auditing middleware outside a request scope.
-      const clientIdentity = await resolveClientIdentity(authReq);
+      // `clientIdentity` was resolved above for the ceiling check; reused here.
       stampCallerContext(
         mcpServerInstance.handlerContext,
         authReq,

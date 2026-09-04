@@ -88,6 +88,12 @@ export interface CeilingDecision {
   allowed: boolean;
   current: number;
   ceiling: number;
+  // True once a credential is at or above the 80% WARN threshold, whether or
+  // not it was refused (a refused credential is by definition past 80%). The
+  // threshold is derived here so the observability helper keys its
+  // "approaching" event off this flag rather than recomputing 0.8*ceiling and
+  // letting the two definitions drift.
+  approaching: boolean;
 }
 
 /**
@@ -101,9 +107,18 @@ export interface CeilingDecision {
  *
  * WARNs at 80% of the ceiling so an operator sees a credential approaching the
  * limit before it is ever refused.
+ *
+ * `options.label` is a DISPLAY NAME for the credential (an api-key name or the
+ * OAuth user's email), resolved by the caller and threaded through only so the
+ * WARN lines name WHICH credential is at the ceiling instead of just its
+ * method. It is NEVER a token, key value, hash, or Authorization header: a
+ * pinned credential's WARN reaches the same logs a broad audience can read, so
+ * only the operator-facing name belongs here. When absent the text is
+ * identical to the label-less form.
  */
 export function checkConcurrentSessionCeiling(
   identity: SessionIdentity,
+  options?: { label?: string },
 ): CeilingDecision {
   const ceiling = resolveSessionCeiling();
   if (
@@ -111,25 +126,31 @@ export function checkConcurrentSessionCeiling(
     identity.method === "anonymous" ||
     identity.credentialId === null
   ) {
-    return { allowed: true, current: 0, ceiling };
+    return { allowed: true, current: 0, ceiling, approaching: false };
   }
 
   const current = countLiveSessionsForIdentity(identity);
   const allowed = current < ceiling;
+  const approaching = current >= Math.floor(ceiling * 0.8);
+
+  // Rendered as ` "<name>"` when present so the WARN reads
+  // `... for api_key credential "<name>": 101/100 ...`, and collapses to the
+  // original `... for api_key credential: 101/100 ...` when it is not.
+  const labelSuffix = options?.label ? ` "${options.label}"` : "";
 
   if (!allowed) {
     logger.warn(
-      `Concurrent-session ceiling reached for ${identity.method} credential: ` +
+      `Concurrent-session ceiling reached for ${identity.method} credential${labelSuffix}: ` +
         `${current}/${ceiling} live sessions; refusing a new session. Raise ` +
         `MCP_MAX_SESSIONS_PER_CREDENTIAL if this is a legitimate consumer.`,
     );
-  } else if (current >= Math.floor(ceiling * 0.8)) {
+  } else if (approaching) {
     logger.warn(
-      `Concurrent-session usage high for ${identity.method} credential: ` +
+      `Concurrent-session usage high for ${identity.method} credential${labelSuffix}: ` +
         `${current}/${ceiling} live sessions (>=80%). Approaching the ceiling; ` +
         `raise MCP_MAX_SESSIONS_PER_CREDENTIAL before it refuses new sessions.`,
     );
   }
 
-  return { allowed, current, ceiling };
+  return { allowed, current, ceiling, approaching };
 }
