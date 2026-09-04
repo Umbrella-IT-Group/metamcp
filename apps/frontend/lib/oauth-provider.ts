@@ -19,8 +19,17 @@ class DbOAuthClientProvider implements OAuthClientProvider {
   constructor(mcpServerUuid: string, serverUrl: string) {
     this.mcpServerUuid = mcpServerUuid;
     this.serverUrl = serverUrl;
-    // Save the server URL to session storage for consistency
-    sessionStorage.setItem(SESSION_KEYS.SERVER_URL, serverUrl);
+    // useConnection() instantiates this provider at render time, and that
+    // render includes the server render of every page that hosts an MCP
+    // connection. sessionStorage is browser-only, so writing it unconditionally
+    // throws "sessionStorage is not defined" during SSR and turns the whole
+    // route into a 500 before the client can hydrate. The write only keeps the
+    // server URL in sync for the client-side OAuth flow (SERVER_URL is read back
+    // exclusively in the browser), so it is skipped when web storage is absent;
+    // the client re-runs the constructor on hydration and performs it then.
+    if (typeof window !== "undefined") {
+      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, serverUrl);
+    }
   }
 
   get redirectUrl() {
