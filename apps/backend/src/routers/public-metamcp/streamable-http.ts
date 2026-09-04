@@ -42,6 +42,7 @@ import {
   extractPresentedCredential,
   type SessionDenialReason,
 } from "../../lib/metamcp/session-binding-denial";
+import { recordSessionCeilingEvent } from "../../lib/metamcp/session-ceiling-events";
 import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
@@ -1014,10 +1015,20 @@ streamableHttpRouter.post(
         // Per-credential concurrent-session ceiling, enforced at creation. A
         // credential already holding the maximum is refused here rather than
         // being allowed to mint another session that, once the shared backend
-        // pool saturates, would evict other consumers' live connections.
-        const ceiling = checkConcurrentSessionCeiling(
-          resolveSessionIdentity(authReq),
-        );
+        // pool saturates, would evict other consumers' live connections. The
+        // consumer's display name is threaded into the WARN and the throttled
+        // gateway event so a leaking credential is nameable from the logs and
+        // the History view, never from a database prompt.
+        const identity = resolveSessionIdentity(authReq);
+        const ceiling = checkConcurrentSessionCeiling(identity, {
+          label: clientIdentity?.name,
+        });
+        recordSessionCeilingEvent({
+          identity,
+          endpointName,
+          label: clientIdentity?.name,
+          decision: ceiling,
+        });
         if (!ceiling.allowed) {
           res.status(429).json({
             error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,

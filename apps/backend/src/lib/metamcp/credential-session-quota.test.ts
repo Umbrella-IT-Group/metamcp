@@ -136,3 +136,71 @@ describe("checkConcurrentSessionCeiling", () => {
     expect(decision.allowed).toBe(true);
   });
 });
+
+describe("checkConcurrentSessionCeiling — credential label in the WARN text", () => {
+  // The label names WHICH credential is at the ceiling so a leak is
+  // identifiable from the logs. It is a display name (api-key name or user
+  // email), never a token or key value.
+  it("names the credential in the refusal WARN when a label is given", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "3";
+    registerSessionCounter(counterReturning(3));
+
+    checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "Autotask connector",
+    });
+
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(loggerMock.warn.mock.calls[0][0]).toContain(
+      'api_key credential "Autotask connector":',
+    );
+  });
+
+  it("omits the label cleanly in the refusal WARN when none is given", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "3";
+    registerSessionCounter(counterReturning(3));
+
+    checkConcurrentSessionCeiling(API_KEY_IDENTITY);
+
+    const message = loggerMock.warn.mock.calls[0][0];
+    expect(message).toContain("api_key credential:");
+    expect(message).not.toContain('"');
+  });
+
+  it("names the credential in the 80% WARN when a label is given", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "10";
+    registerSessionCounter(counterReturning(8));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "user@example.test",
+    });
+
+    expect(decision.approaching).toBe(true);
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(loggerMock.warn.mock.calls[0][0]).toContain(
+      'api_key credential "user@example.test":',
+    );
+  });
+
+  it("omits the label cleanly in the 80% WARN when none is given", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "10";
+    registerSessionCounter(counterReturning(8));
+
+    checkConcurrentSessionCeiling(API_KEY_IDENTITY);
+
+    const message = loggerMock.warn.mock.calls[0][0];
+    expect(message).toContain("api_key credential:");
+    expect(message).not.toContain('"');
+  });
+
+  it("reports approaching=false and does not WARN below the 80% threshold", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "10";
+    registerSessionCounter(counterReturning(3));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "Autotask connector",
+    });
+
+    expect(decision.approaching).toBe(false);
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+});
