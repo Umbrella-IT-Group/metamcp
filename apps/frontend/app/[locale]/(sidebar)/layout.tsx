@@ -165,7 +165,12 @@ function LiveLogsMenuItem() {
 
 function UserInfoFooter() {
   const { t } = useTranslations();
-  const [user, setUser] = useState<any>(null);
+  // Only the display name and email are read below; type it to just those so
+  // the footer does not lean on `any`.
+  const [user, setUser] = useState<{
+    name?: string | null;
+    email?: string | null;
+  } | null>(null);
 
   // Get user info
   useEffect(() => {
@@ -286,7 +291,12 @@ export default function SidebarLayout({
             <Separator orientation="vertical" className="mr-2 h-4" />
           </div>
         </header>
-        <div className="flex flex-1 flex-col gap-4 p-4 pt-0">{children}</div>
+        {/* min-w-0 so a wide page (e.g. a data table) shrinks to the inset
+            width and scrolls inside its own wrapper rather than widening the
+            whole column past the viewport. */}
+        <div className="flex min-w-0 flex-1 flex-col gap-4 p-4 pt-0">
+          {children}
+        </div>
       </SidebarInset>
     </SidebarProvider>
   );

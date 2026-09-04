@@ -1,6 +1,7 @@
 import express from "express";
 import helmet from "helmet";
 
+import { logBasicAuthEnforcementState } from "./auth";
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
 import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
@@ -189,6 +190,12 @@ async function start(): Promise<void> {
   // been switched off with ADMIN_PLANE_TOKEN_AUTH_DISABLED=true (migration
   // 0038), so an emergency disable is legible in the boot log.
   warnIfAdminPlaneTokenAuthDisabled();
+
+  // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
+  // boot log records whether password login is on. Reads the DB-backed setting,
+  // so it runs here after initializeOnStartup(); the live per-request hook in
+  // auth.ts is the enforcement point either way.
+  await logBasicAuthEnforcementState();
 
   app.listen(12009, async () => {
     console.log(`Server is running on port 12009`);

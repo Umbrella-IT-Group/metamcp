@@ -8,6 +8,7 @@ import { GatewayEventHistory } from "@/components/gateway-event-history";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { pageHeaderRow } from "@/components/ui/page-header";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
 import { CATEGORIES, categoryMeta, messageColor } from "@/lib/log-categories";
@@ -129,8 +130,8 @@ export default function LiveLogsPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    <div className="space-y-6 min-w-0">
+      <div className={pageHeaderRow}>
         <div className="flex items-center gap-3">
           <FileTerminal className="h-6 w-6 text-muted-foreground" />
           <div>

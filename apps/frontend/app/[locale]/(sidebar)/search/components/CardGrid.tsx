@@ -541,7 +541,11 @@ export default function CardGrid({ items }: { items: SearchIndex }) {
     <>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {Object.entries(items).map(([key, item]) => (
-          <Card key={key} className="flex flex-col">
+          // h-full so the card fills its grid cell and every card in a row
+          // matches the tallest one; the footer stays pinned to the bottom
+          // via the flex-grow content below, instead of ragged bottoms when
+          // env-var lists differ in length.
+          <Card key={key} className="flex h-full flex-col">
             <CardHeader>
               <CardTitle>
                 <span>{item.name}</span>
