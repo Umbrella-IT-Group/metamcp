@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { PageHeader } from "@/components/ui/page-header";
 import {
   Table,
   TableBody,
@@ -39,6 +40,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
 import { getLocalizedPath } from "@/lib/i18n";
+import { pluralize } from "@/lib/pluralize";
 import { trpc } from "@/lib/trpc";
 
 /**
@@ -225,28 +227,26 @@ export default function AccessPage() {
   });
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <ShieldCheck className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("access:title")}
-            </h1>
-            <p className="text-muted-foreground">{t("access:description")}</p>
-          </div>
-        </div>
-
-        {!roleLoaded && roleError && (
-          <div className="flex flex-col items-end gap-1">
-            <Button variant="outline" onClick={loadRole}>
-              <RefreshCw className="h-4 w-4 mr-2" />
-              {t("common:refresh")}
-            </Button>
-            <p className="text-xs text-destructive">{t("access:loadError")}</p>
-          </div>
-        )}
-      </div>
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<ShieldCheck className="h-8 w-8 text-primary" />}
+        title={t("access:title")}
+        description={t("access:description")}
+        actions={
+          !roleLoaded &&
+          roleError && (
+            <div className="flex flex-col items-end gap-1">
+              <Button variant="outline" onClick={loadRole}>
+                <RefreshCw className="h-4 w-4 mr-2" />
+                {t("common:refresh")}
+              </Button>
+              <p className="text-xs text-destructive">
+                {t("access:loadError")}
+              </p>
+            </div>
+          )
+        }
+      />
 
       {roleLoaded && !isAdmin ? (
         <p className="text-sm text-muted-foreground">{t("access:adminOnly")}</p>
@@ -345,12 +345,21 @@ export default function AccessPage() {
                                 sessions can still be reaching MCP through a
                                 token or a key. */}
                             {user.active_session_count}{" "}
-                            {t("access:sessionsLabel")}
+                            {pluralize(
+                              user.active_session_count,
+                              t("access:sessionLabel"),
+                              t("access:sessionsLabel"),
+                            )}
                             {" · "}
                             {user.active_oauth_token_count}{" "}
                             {t("access:tokensLabel")}
                             {" · "}
-                            {user.active_api_key_count} {t("access:keysLabel")}
+                            {user.active_api_key_count}{" "}
+                            {pluralize(
+                              user.active_api_key_count,
+                              t("access:keyLabel"),
+                              t("access:keysLabel"),
+                            )}
                           </TableCell>
                           <TableCell
                             className="whitespace-nowrap"

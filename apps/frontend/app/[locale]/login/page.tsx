@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
@@ -7,10 +8,12 @@ import { Suspense, useEffect, useState } from "react";
 import { DomainWarningBanner } from "@/components/domain-warning-banner";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
+import { getBranding } from "@/lib/branding";
 import { toSafeInternalPath } from "@/lib/safe-redirect";
 import { vanillaTrpcClient } from "@/lib/trpc";
 
@@ -128,9 +131,21 @@ function LoginForm() {
         <h1 className="text-2xl font-semibold tracking-tight">
           {t("auth:signInToAccount")}
         </h1>
-        <p className="text-sm text-muted-foreground">
-          {t("auth:enterCredentials")}
-        </p>
+        {/* The subtitle must match what the form actually offers. When basic
+            auth is disabled the email/password fields do not render, so the
+            "enter your email and password" copy contradicted the UI; show the
+            single-sign-on line instead. When basic auth is off AND OIDC is not
+            enabled, the disabled-auth notice below carries the explanation, so
+            no subtitle is shown here. */}
+        {!isBasicAuthDisabled ? (
+          <p className="text-sm text-muted-foreground">
+            {t("auth:enterCredentials")}
+          </p>
+        ) : isOidcEnabled ? (
+          <p className="text-sm text-muted-foreground">
+            {t("auth:oidcOnlySubtitle")}
+          </p>
+        ) : null}
       </div>
 
       {error && (
@@ -222,6 +237,11 @@ function LoginForm() {
 }
 
 export default function LoginPage() {
+  // Brand the sign-in surface like the rest of the app (logo + org name over a
+  // card), instead of the bare centered text it used to be. getBranding() is
+  // isomorphic and defaults to the Umbrella marks when no branding vars are set.
+  const { orgName, logoPath } = getBranding();
+
   return (
     <div className="relative min-h-screen flex items-center justify-center px-4">
       <div className="absolute top-4 right-4 flex items-center gap-2">
@@ -230,9 +250,24 @@ export default function LoginPage() {
       </div>
       <div className="w-full max-w-sm mx-auto flex flex-col justify-center space-y-6">
         <DomainWarningBanner />
-        <Suspense fallback={<div>Loading...</div>}>
-          <LoginForm />
-        </Suspense>
+        <div className="flex flex-col items-center gap-3">
+          <Image
+            src={logoPath}
+            alt={orgName}
+            width={256}
+            height={256}
+            priority
+            className="h-12 w-auto"
+          />
+          <span className="text-lg font-semibold">{orgName}</span>
+        </div>
+        <Card>
+          <CardContent>
+            <Suspense fallback={<div>Loading...</div>}>
+              <LoginForm />
+            </Suspense>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

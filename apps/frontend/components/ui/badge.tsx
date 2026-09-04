@@ -24,6 +24,15 @@ const badgeVariants = cva(
           "border-transparent bg-yellow-100 text-yellow-800 ring-1 ring-inset ring-yellow-600/20 dark:bg-yellow-900/20 dark:text-yellow-400 dark:ring-yellow-400/30",
         neutral:
           "border-transparent bg-gray-100 text-gray-800 ring-1 ring-inset ring-gray-600/20 dark:bg-gray-900/20 dark:text-gray-400 dark:ring-gray-400/30",
+        // Soft red for a negative status (an inactive/revoked key), distinct
+        // from the solid `destructive` used on delete actions.
+        danger:
+          "border-transparent bg-red-100 text-red-800 ring-1 ring-inset ring-red-600/20 dark:bg-red-900/20 dark:text-red-400 dark:ring-red-400/30",
+        // Purple marks an identity-bound ("acts as") key, the one status
+        // colour the palette was missing, so it was set ad hoc at the call
+        // site before this.
+        purple:
+          "border-transparent bg-purple-100 text-purple-800 ring-1 ring-inset ring-purple-600/20 dark:bg-purple-900/20 dark:text-purple-400 dark:ring-purple-400/30",
       },
     },
     defaultVariants: {

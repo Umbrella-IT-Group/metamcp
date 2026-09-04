@@ -137,8 +137,13 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(newUrl);
   }
 
-  // Now handle authentication for the pathname without locale
-  const publicRoutes = ["/login", "/register", "/", "/cors-error"];
+  // Now handle authentication for the pathname without locale.
+  // "/" is deliberately NOT public: an unauthenticated visitor to the root
+  // should be redirected to /login rather than served the dashboard shell,
+  // which then fires a 401 on every data query. Leaving it out routes the root
+  // through the session check below like any other protected page, so an
+  // authenticated user still gets the dashboard and everyone else gets login.
+  const publicRoutes = ["/login", "/register", "/cors-error"];
   if (publicRoutes.includes(pathnameWithoutLocale)) {
     return renderDocument();
   }

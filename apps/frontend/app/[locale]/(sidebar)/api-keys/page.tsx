@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PageHeader } from "@/components/ui/page-header";
 import {
   Select,
   SelectContent,
@@ -230,12 +231,7 @@ export default function ApiKeysPage() {
   // name (uuid prefix fallback if the endpoint isn't visible to the caller).
   const renderScopeBadge = (endpointUuid: string | null) =>
     endpointUuid === null ? (
-      <Badge
-        variant="outline"
-        className="bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
-      >
-        {t("api-keys:allEndpointsBadge")}
-      </Badge>
+      <Badge variant="warning">{t("api-keys:allEndpointsBadge")}</Badge>
     ) : (
       <Badge variant="outline">
         {endpointNameByUuid.get(endpointUuid) ?? endpointUuid.slice(0, 8)}
@@ -250,12 +246,7 @@ export default function ApiKeysPage() {
   // shortened (member list, via shortUserId); null renders nothing.
   const renderIdentityBadge = (label: string | null) =>
     label === null ? null : (
-      <Badge
-        variant="outline"
-        className="bg-purple-50 dark:bg-purple-950/20 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800"
-      >
-        {`${t("api-keys:actsAsBadge")} ${label}`}
-      </Badge>
+      <Badge variant="purple">{`${t("api-keys:actsAsBadge")} ${label}`}</Badge>
     );
 
   // Plane badge (migration 0038): a control-plane (admin-plane / CI) key
@@ -264,12 +255,7 @@ export default function ApiKeysPage() {
   // data-plane key.
   const renderAdminPlaneBadge = (adminPlane: boolean) =>
     adminPlane ? (
-      <Badge
-        variant="outline"
-        className="bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
-      >
-        {t("api-keys:adminPlaneBadge")}
-      </Badge>
+      <Badge variant="warning">{t("api-keys:adminPlaneBadge")}</Badge>
     ) : null;
 
   // Better-auth ids are opaque ~32-char strings — shorten for badge display.
@@ -289,257 +275,266 @@ export default function ApiKeysPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Key className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("api-keys:title")}
-            </h1>
-            <p className="text-muted-foreground">{t("api-keys:description")}</p>
-          </div>
-        </div>
-        {/* Minting is admin-only since the migration 0023 scope rules: every
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<Key className="h-8 w-8 text-primary" />}
+        title={t("api-keys:title")}
+        description={t("api-keys:description")}
+        actions={
+          <>
+            {/* Minting is admin-only since the migration 0023 scope rules: every
             new key must carry an (admin-gated) endpoint scope, so a member
             create always fails server-side. Rather than show a dialog that
             can only error, non-admins get a disabled button + an explanatory
             line. The backend enforces this regardless of the UI. While the
             role is still resolving, the button is neutrally disabled with
             NO admin-only claim (see the roleLoaded comment above). */}
-        {!roleLoaded ? (
-          roleError ? (
-            <div className="flex flex-col items-end gap-1">
-              <Button variant="outline" onClick={loadRole}>
-                <RefreshCw className="h-4 w-4 mr-2" />
-                {t("api-keys:retryRoleLoad")}
-              </Button>
-              <p className="text-xs text-destructive">
-                {t("api-keys:roleLoadError")}
-              </p>
-            </div>
-          ) : (
-            <Button disabled aria-busy="true">
-              <Plus className="h-4 w-4 mr-2" />
-              {t("api-keys:createApiKey")}
-            </Button>
-          )
-        ) : !isAdmin ? (
-          <div className="flex flex-col items-end gap-1">
-            <Button disabled title={t("api-keys:createAdminOnly")}>
-              <Plus className="h-4 w-4 mr-2" />
-              {t("api-keys:createApiKey")}
-            </Button>
-            <p className="text-xs text-muted-foreground">
-              {t("api-keys:createAdminOnly")}
-            </p>
-          </div>
-        ) : (
-          <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-            <DialogTrigger asChild>
-              <Button>
-                <Plus className="h-4 w-4 mr-2" />
-                {t("api-keys:createApiKey")}
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>{t("api-keys:createApiKey")}</DialogTitle>
-                <DialogDescription>
-                  {t("api-keys:createApiKeyDescription")}
-                </DialogDescription>
-              </DialogHeader>
-              {newApiKey ? (
-                <div className="space-y-4">
-                  <div className="p-4 bg-muted rounded-lg">
-                    <p className="text-sm font-medium mb-2">
-                      {t("api-keys:newApiKey")}
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
-                        {newApiKey}
-                      </code>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => copyToClipboard(newApiKey)}
-                      >
-                        <Copy className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                  <Button
-                    onClick={() => {
-                      setNewApiKey(null);
-                      handleCreateSuccess();
-                    }}
-                    className="w-full"
-                  >
-                    {t("api-keys:done")}
+            {!roleLoaded ? (
+              roleError ? (
+                <div className="flex flex-col items-end gap-1">
+                  <Button variant="outline" onClick={loadRole}>
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    {t("api-keys:retryRoleLoad")}
                   </Button>
+                  <p className="text-xs text-destructive">
+                    {t("api-keys:roleLoadError")}
+                  </p>
                 </div>
               ) : (
-                <form
-                  onSubmit={form.handleSubmit(onSubmit)}
-                  className="space-y-4"
-                >
-                  <div>
-                    <label className="text-sm font-medium">
-                      {t("api-keys:name")}
-                    </label>
-                    <Input
-                      {...form.register("name")}
-                      placeholder={t("api-keys:namePlaceholder")}
-                    />
-                    {form.formState.errors.name && (
-                      <p className="text-sm text-destructive mt-1">
-                        {form.formState.errors.name.message}
-                      </p>
-                    )}
-                  </div>
-                  {/* Admin-plane (control-plane / CI) key (migration 0038).
+                <Button disabled aria-busy="true">
+                  <Plus className="h-4 w-4 mr-2" />
+                  {t("api-keys:createApiKey")}
+                </Button>
+              )
+            ) : !isAdmin ? (
+              <div className="flex flex-col items-end gap-1">
+                <Button disabled title={t("api-keys:createAdminOnly")}>
+                  <Plus className="h-4 w-4 mr-2" />
+                  {t("api-keys:createApiKey")}
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  {t("api-keys:createAdminOnly")}
+                </p>
+              </div>
+            ) : (
+              <Dialog
+                open={createDialogOpen}
+                onOpenChange={setCreateDialogOpen}
+              >
+                <DialogTrigger asChild>
+                  <Button>
+                    <Plus className="h-4 w-4 mr-2" />
+                    {t("api-keys:createApiKey")}
+                  </Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>{t("api-keys:createApiKey")}</DialogTitle>
+                    <DialogDescription>
+                      {t("api-keys:createApiKeyDescription")}
+                    </DialogDescription>
+                  </DialogHeader>
+                  {newApiKey ? (
+                    <div className="space-y-4">
+                      <div className="p-4 bg-muted rounded-lg">
+                        <p className="text-sm font-medium mb-2">
+                          {t("api-keys:newApiKey")}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
+                            {newApiKey}
+                          </code>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => copyToClipboard(newApiKey)}
+                          >
+                            <Copy className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+                      <Button
+                        onClick={() => {
+                          setNewApiKey(null);
+                          handleCreateSuccess();
+                        }}
+                        className="w-full"
+                      >
+                        {t("api-keys:done")}
+                      </Button>
+                    </div>
+                  ) : (
+                    <form
+                      onSubmit={form.handleSubmit(onSubmit)}
+                      className="space-y-4"
+                    >
+                      <div>
+                        <label className="text-sm font-medium">
+                          {t("api-keys:name")}
+                        </label>
+                        <Input
+                          {...form.register("name")}
+                          placeholder={t("api-keys:namePlaceholder")}
+                        />
+                        {form.formState.errors.name && (
+                          <p className="text-sm text-destructive mt-1">
+                            {form.formState.errors.name.message}
+                          </p>
+                        )}
+                      </div>
+                      {/* Admin-plane (control-plane / CI) key (migration 0038).
                       This whole dialog is admin-only, and the backend
                       re-enforces admin-only + owner-must-be-admin regardless.
                       Checking it clears the data-plane inputs it is mutually
                       exclusive with (endpoint scope + acts-as), pins ownership
                       to an admin (self, never 'everyone'), and disables those
                       controls while it is checked. */}
-                  <div className="flex items-start gap-2">
-                    <Checkbox
-                      id="admin-plane"
-                      checked={form.watch("admin_plane") === true}
-                      onCheckedChange={(checked) => {
-                        const on = checked === true;
-                        form.setValue("admin_plane", on ? true : undefined);
-                        if (on) {
-                          form.setValue("endpoint_uuid", undefined);
-                          form.setValue("all_endpoints", undefined);
-                          form.setValue("acts_as_user_id", undefined);
-                          form.setValue("user_id", undefined);
-                          form.clearErrors([
-                            "endpoint_uuid",
-                            "acts_as_user_id",
-                          ]);
-                        }
-                      }}
-                    />
-                    <div>
-                      <Label
-                        htmlFor="admin-plane"
-                        className="text-sm font-medium"
-                      >
-                        {t("api-keys:adminPlane")}
-                      </Label>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        {t("api-keys:adminPlaneDescription")}
-                      </p>
-                    </div>
-                  </div>
-                  <div>
-                    <Label htmlFor="ownership" className="text-sm font-medium">
-                      {t("api-keys:ownership")}
-                    </Label>
-                    <Select
-                      disabled={form.watch("admin_plane") === true}
-                      value={
-                        form.watch("user_id") === null ? "public" : "private"
-                      }
-                      onValueChange={(value) => {
-                        form.setValue(
-                          "user_id",
-                          value === "public" ? null : undefined,
-                        );
-                        if (value === "public") {
-                          // An identity binding requires the key to be OWNED
-                          // by the acted-as user — a public ('everyone') key
-                          // has no owner, so switching to it clears the
-                          // acts-as field (same pattern as the all-endpoints
-                          // switch in the scope select below) and the input
-                          // is disabled while 'everyone' is selected.
-                          form.setValue("acts_as_user_id", undefined);
-                          form.clearErrors("acts_as_user_id");
-                        }
-                      }}
-                    >
-                      <SelectTrigger>
-                        <SelectValue placeholder={t("api-keys:ownership")} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="private">
-                          {t("api-keys:forMyself")}
-                        </SelectItem>
-                        {/* Minting a public ('everyone') key is admin-only —
+                      <div className="flex items-start gap-2">
+                        <Checkbox
+                          id="admin-plane"
+                          checked={form.watch("admin_plane") === true}
+                          onCheckedChange={(checked) => {
+                            const on = checked === true;
+                            form.setValue("admin_plane", on ? true : undefined);
+                            if (on) {
+                              form.setValue("endpoint_uuid", undefined);
+                              form.setValue("all_endpoints", undefined);
+                              form.setValue("acts_as_user_id", undefined);
+                              form.setValue("user_id", undefined);
+                              form.clearErrors([
+                                "endpoint_uuid",
+                                "acts_as_user_id",
+                              ]);
+                            }
+                          }}
+                        />
+                        <div>
+                          <Label
+                            htmlFor="admin-plane"
+                            className="text-sm font-medium"
+                          >
+                            {t("api-keys:adminPlane")}
+                          </Label>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {t("api-keys:adminPlaneDescription")}
+                          </p>
+                        </div>
+                      </div>
+                      <div>
+                        <Label
+                          htmlFor="ownership"
+                          className="text-sm font-medium"
+                        >
+                          {t("api-keys:ownership")}
+                        </Label>
+                        <Select
+                          disabled={form.watch("admin_plane") === true}
+                          value={
+                            form.watch("user_id") === null
+                              ? "public"
+                              : "private"
+                          }
+                          onValueChange={(value) => {
+                            form.setValue(
+                              "user_id",
+                              value === "public" ? null : undefined,
+                            );
+                            if (value === "public") {
+                              // An identity binding requires the key to be OWNED
+                              // by the acted-as user, a public ('everyone') key
+                              // has no owner, so switching to it clears the
+                              // acts-as field (same pattern as the all-endpoints
+                              // switch in the scope select below) and the input
+                              // is disabled while 'everyone' is selected.
+                              form.setValue("acts_as_user_id", undefined);
+                              form.clearErrors("acts_as_user_id");
+                            }
+                          }}
+                        >
+                          <SelectTrigger>
+                            <SelectValue
+                              placeholder={t("api-keys:ownership")}
+                            />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="private">
+                              {t("api-keys:forMyself")}
+                            </SelectItem>
+                            {/* Minting a public ('everyone') key is admin-only,
                           the backend rejects it for members regardless, so
                           the option is simply hidden for non-admins. */}
-                        {isAdmin && (
-                          <SelectItem value="public">
-                            {t("api-keys:everyone")}
-                          </SelectItem>
-                        )}
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t("api-keys:ownershipDescription")}
-                    </p>
-                  </div>
-                  <div>
-                    <Label htmlFor="scope" className="text-sm font-medium">
-                      {t("api-keys:scope")}
-                    </Label>
-                    <Select
-                      disabled={form.watch("admin_plane") === true}
-                      value={
-                        form.watch("all_endpoints") === true
-                          ? "__all__"
-                          : (form.watch("endpoint_uuid") ?? "")
-                      }
-                      onValueChange={(value) => {
-                        if (value === "__all__") {
-                          form.setValue("all_endpoints", true);
-                          form.setValue("endpoint_uuid", undefined);
-                          // An identity binding requires a single-endpoint
-                          // scope — switching to gateway-wide clears it so
-                          // the form can never submit the rejected pairing.
-                          form.setValue("acts_as_user_id", undefined);
-                          form.clearErrors("acts_as_user_id");
-                        } else {
-                          form.setValue("endpoint_uuid", value);
-                          form.setValue("all_endpoints", undefined);
-                        }
-                        form.clearErrors("endpoint_uuid");
-                      }}
-                    >
-                      <SelectTrigger>
-                        <SelectValue
-                          placeholder={t("api-keys:selectEndpoint")}
-                        />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {availableEndpoints.map((endpoint) => (
-                          <SelectItem key={endpoint.uuid} value={endpoint.uuid}>
-                            {endpoint.name}
-                          </SelectItem>
-                        ))}
-                        {/* Gateway-wide keys are the explicit escape hatch and
+                            {isAdmin && (
+                              <SelectItem value="public">
+                                {t("api-keys:everyone")}
+                              </SelectItem>
+                            )}
+                          </SelectContent>
+                        </Select>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {t("api-keys:ownershipDescription")}
+                        </p>
+                      </div>
+                      <div>
+                        <Label htmlFor="scope" className="text-sm font-medium">
+                          {t("api-keys:scope")}
+                        </Label>
+                        <Select
+                          disabled={form.watch("admin_plane") === true}
+                          value={
+                            form.watch("all_endpoints") === true
+                              ? "__all__"
+                              : (form.watch("endpoint_uuid") ?? "")
+                          }
+                          onValueChange={(value) => {
+                            if (value === "__all__") {
+                              form.setValue("all_endpoints", true);
+                              form.setValue("endpoint_uuid", undefined);
+                              // An identity binding requires a single-endpoint
+                              // scope, switching to gateway-wide clears it so
+                              // the form can never submit the rejected pairing.
+                              form.setValue("acts_as_user_id", undefined);
+                              form.clearErrors("acts_as_user_id");
+                            } else {
+                              form.setValue("endpoint_uuid", value);
+                              form.setValue("all_endpoints", undefined);
+                            }
+                            form.clearErrors("endpoint_uuid");
+                          }}
+                        >
+                          <SelectTrigger>
+                            <SelectValue
+                              placeholder={t("api-keys:selectEndpoint")}
+                            />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {availableEndpoints.map((endpoint) => (
+                              <SelectItem
+                                key={endpoint.uuid}
+                                value={endpoint.uuid}
+                              >
+                                {endpoint.name}
+                              </SelectItem>
+                            ))}
+                            {/* Gateway-wide keys are the explicit escape hatch and
                           admin-only — the backend rejects the flag for
                           members regardless, so the option is hidden. */}
-                        {isAdmin && (
-                          <SelectItem value="__all__">
-                            {t("api-keys:allEndpoints")}
-                          </SelectItem>
+                            {isAdmin && (
+                              <SelectItem value="__all__">
+                                {t("api-keys:allEndpoints")}
+                              </SelectItem>
+                            )}
+                          </SelectContent>
+                        </Select>
+                        {form.formState.errors.endpoint_uuid && (
+                          <p className="text-sm text-destructive mt-1">
+                            {form.formState.errors.endpoint_uuid.message}
+                          </p>
                         )}
-                      </SelectContent>
-                    </Select>
-                    {form.formState.errors.endpoint_uuid && (
-                      <p className="text-sm text-destructive mt-1">
-                        {form.formState.errors.endpoint_uuid.message}
-                      </p>
-                    )}
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t("api-keys:scopeDescription")}
-                    </p>
-                  </div>
-                  {/* Acts-as identity binding (migration 0024) — this whole
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {t("api-keys:scopeDescription")}
+                        </p>
+                      </div>
+                      {/* Acts-as identity binding (migration 0024), this whole
                       dialog is admin-only (see the create-button gate above),
                       and the backend re-enforces admin-only regardless. Free
                       text for the better-auth user id: the ownership select
@@ -555,64 +550,66 @@ export default function ApiKeysPage() {
                       all-endpoints escape hatch or 'everyone' ownership. The
                       backend rejects any owner ≠ acted-as divergence
                       (FORBIDDEN + zod ownerMismatch) regardless of the UI. */}
-                  <div>
-                    <Label
-                      htmlFor="acts-as-user"
-                      className="text-sm font-medium"
-                    >
-                      {t("api-keys:actsAsUser")}
-                    </Label>
-                    <Input
-                      id="acts-as-user"
-                      {...form.register("acts_as_user_id", {
-                        // Empty / whitespace input means "no binding" — the
-                        // schema field is optional, never an empty string.
-                        setValueAs: (value: unknown) =>
-                          typeof value === "string" && value.trim() !== ""
-                            ? value.trim()
-                            : undefined,
-                      })}
-                      placeholder={t("api-keys:actsAsUserPlaceholder")}
-                      disabled={
-                        !form.watch("endpoint_uuid") ||
-                        form.watch("user_id") === null ||
-                        form.watch("admin_plane") === true
-                      }
-                    />
-                    {form.formState.errors.acts_as_user_id && (
-                      <p className="text-sm text-destructive mt-1">
-                        {form.formState.errors.acts_as_user_id.message}
-                      </p>
-                    )}
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t("api-keys:actsAsUserDescription")}
-                    </p>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => setCreateDialogOpen(false)}
-                      className="flex-1"
-                    >
-                      {t("api-keys:cancel")}
-                    </Button>
-                    <Button
-                      type="submit"
-                      disabled={createMutation.isPending}
-                      className="flex-1"
-                    >
-                      {createMutation.isPending
-                        ? t("common:creating")
-                        : t("common:create")}
-                    </Button>
-                  </div>
-                </form>
-              )}
-            </DialogContent>
-          </Dialog>
-        )}
-      </div>
+                      <div>
+                        <Label
+                          htmlFor="acts-as-user"
+                          className="text-sm font-medium"
+                        >
+                          {t("api-keys:actsAsUser")}
+                        </Label>
+                        <Input
+                          id="acts-as-user"
+                          {...form.register("acts_as_user_id", {
+                            // Empty / whitespace input means "no binding", the
+                            // schema field is optional, never an empty string.
+                            setValueAs: (value: unknown) =>
+                              typeof value === "string" && value.trim() !== ""
+                                ? value.trim()
+                                : undefined,
+                          })}
+                          placeholder={t("api-keys:actsAsUserPlaceholder")}
+                          disabled={
+                            !form.watch("endpoint_uuid") ||
+                            form.watch("user_id") === null ||
+                            form.watch("admin_plane") === true
+                          }
+                        />
+                        {form.formState.errors.acts_as_user_id && (
+                          <p className="text-sm text-destructive mt-1">
+                            {form.formState.errors.acts_as_user_id.message}
+                          </p>
+                        )}
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {t("api-keys:actsAsUserDescription")}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => setCreateDialogOpen(false)}
+                          className="flex-1"
+                        >
+                          {t("api-keys:cancel")}
+                        </Button>
+                        <Button
+                          type="submit"
+                          disabled={createMutation.isPending}
+                          className="flex-1"
+                        >
+                          {createMutation.isPending
+                            ? t("common:creating")
+                            : t("common:create")}
+                        </Button>
+                      </div>
+                    </form>
+                  )}
+                </DialogContent>
+              </Dialog>
+            )}
+          </>
+        }
+      />
 
       <Separator />
 
@@ -674,14 +671,7 @@ export default function ApiKeysPage() {
                     {format(new Date(apiKey.created_at), "MMM d, yyyy")}
                   </TableCell>
                   <TableCell>
-                    <Badge
-                      variant={apiKey.is_active ? "default" : "secondary"}
-                      className={
-                        apiKey.is_active
-                          ? "bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-200 border-green-200 dark:border-green-800"
-                          : "bg-red-100 dark:bg-red-900/20 text-red-800 dark:text-red-200 border-red-200 dark:border-red-800"
-                      }
-                    >
+                    <Badge variant={apiKey.is_active ? "success" : "danger"}>
                       {apiKey.is_active
                         ? t("common:active")
                         : t("common:inactive")}
@@ -689,12 +679,7 @@ export default function ApiKeysPage() {
                   </TableCell>
                   <TableCell>
                     <Badge
-                      variant="outline"
-                      className={
-                        apiKey.user_id === null
-                          ? "bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-300 border-green-200 dark:border-green-800"
-                          : "bg-gray-50 dark:bg-gray-950/20 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-800"
-                      }
+                      variant={apiKey.user_id === null ? "success" : "neutral"}
                     >
                       {apiKey.user_id === null
                         ? t("api-keys:public")
@@ -814,10 +799,7 @@ export default function ApiKeysPage() {
                       </TableCell>
                       <TableCell>
                         {apiKey.owner_email ?? (
-                          <Badge
-                            variant="outline"
-                            className="bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-300 border-green-200 dark:border-green-800"
-                          >
+                          <Badge variant="success">
                             {t("api-keys:public")}
                           </Badge>
                         )}
@@ -847,12 +829,7 @@ export default function ApiKeysPage() {
                       </TableCell>
                       <TableCell>
                         <Badge
-                          variant={apiKey.is_active ? "default" : "secondary"}
-                          className={
-                            apiKey.is_active
-                              ? "bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-200 border-green-200 dark:border-green-800"
-                              : "bg-red-100 dark:bg-red-900/20 text-red-800 dark:text-red-200 border-red-200 dark:border-red-800"
-                          }
+                          variant={apiKey.is_active ? "success" : "danger"}
                         >
                           {apiKey.is_active
                             ? t("common:active")

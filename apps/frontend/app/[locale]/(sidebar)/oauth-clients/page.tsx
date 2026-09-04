@@ -38,6 +38,7 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import {
   Select,
   SelectContent,
@@ -219,267 +220,273 @@ export default function OAuthClientsPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <KeyRound className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("oauth-clients:title")}
-            </h1>
-            <p className="text-muted-foreground">
-              {t("oauth-clients:description")}
-            </p>
-          </div>
-        </div>
-
-        {!roleLoaded ? (
-          roleError ? (
-            <div className="flex flex-col items-end gap-1">
-              <Button variant="outline" onClick={loadRole}>
-                <RefreshCw className="h-4 w-4 mr-2" />
-                {t("common:refresh")}
-              </Button>
-              <p className="text-xs text-destructive">
-                {t("oauth-clients:loadError")}
-              </p>
-            </div>
-          ) : (
-            <Button disabled aria-busy="true">
-              <Plus className="h-4 w-4 mr-2" />
-              {t("oauth-clients:createClient")}
-            </Button>
-          )
-        ) : !isAdmin ? (
-          <div className="flex flex-col items-end gap-1">
-            <Button disabled title={t("oauth-clients:adminOnly")}>
-              <Plus className="h-4 w-4 mr-2" />
-              {t("oauth-clients:createClient")}
-            </Button>
-            <p className="text-xs text-muted-foreground">
-              {t("oauth-clients:adminOnly")}
-            </p>
-          </div>
-        ) : (
-          <Dialog
-            open={createDialogOpen}
-            onOpenChange={(open) => {
-              // Reuse the same teardown as the Done button so dismissing the
-              // dialog can never leave a stale secret in state.
-              if (!open) closeCreateDialog();
-              else setCreateDialogOpen(true);
-            }}
-          >
-            <DialogTrigger asChild>
-              <Button>
-                <Plus className="h-4 w-4 mr-2" />
-                {t("oauth-clients:createClient")}
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>{t("oauth-clients:createClient")}</DialogTitle>
-                <DialogDescription>
-                  {t("oauth-clients:createClientDescription")}
-                </DialogDescription>
-              </DialogHeader>
-
-              {newClient ? (
-                <div className="space-y-4">
-                  <div className="p-4 bg-muted rounded-lg space-y-3">
-                    <p className="text-sm font-medium">
-                      {t("oauth-clients:credentialsTitle")}
-                    </p>
-
-                    <div className="space-y-1">
-                      <p className="text-xs text-muted-foreground">
-                        {t("oauth-clients:clientId")}
-                      </p>
-                      <div className="flex items-center gap-2">
-                        <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
-                          {newClient.client_id}
-                        </code>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => copyToClipboard(newClient.client_id)}
-                        >
-                          <Copy className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-
-                    {newClient.client_secret ? (
-                      <div className="space-y-1">
-                        <p className="text-xs text-muted-foreground">
-                          {t("oauth-clients:clientSecret")}
-                        </p>
-                        <div className="flex items-center gap-2">
-                          <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
-                            {newClient.client_secret}
-                          </code>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() =>
-                              copyToClipboard(newClient.client_secret!)
-                            }
-                          >
-                            <Copy className="h-4 w-4" />
-                          </Button>
-                        </div>
-                        <p className="text-xs text-destructive font-medium">
-                          {t("oauth-clients:secretWarning")}
-                        </p>
-                      </div>
-                    ) : (
-                      // A PKCE public client genuinely has no secret. Say that
-                      // outright — an empty space where a secret should be
-                      // reads as a bug or a lost credential.
-                      <p className="text-xs text-muted-foreground">
-                        {t("oauth-clients:publicClientNote")}
-                      </p>
-                    )}
-                  </div>
-
-                  <Button onClick={closeCreateDialog} className="w-full">
-                    {t("oauth-clients:done")}
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<KeyRound className="h-8 w-8 text-primary" />}
+        title={t("oauth-clients:title")}
+        description={t("oauth-clients:description")}
+        actions={
+          <>
+            {!roleLoaded ? (
+              roleError ? (
+                <div className="flex flex-col items-end gap-1">
+                  <Button variant="outline" onClick={loadRole}>
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    {t("common:refresh")}
                   </Button>
+                  <p className="text-xs text-destructive">
+                    {t("oauth-clients:loadError")}
+                  </p>
                 </div>
               ) : (
-                <Form {...form}>
-                  <form
-                    onSubmit={form.handleSubmit(onSubmit)}
-                    className="space-y-4"
-                  >
-                    <FormField
-                      control={form.control}
-                      name="client_name"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{t("oauth-clients:clientName")}</FormLabel>
-                          <FormControl>
-                            <Input
-                              {...field}
-                              placeholder={t(
-                                "oauth-clients:clientNamePlaceholder",
-                              )}
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
+                <Button disabled aria-busy="true">
+                  <Plus className="h-4 w-4 mr-2" />
+                  {t("oauth-clients:createClient")}
+                </Button>
+              )
+            ) : !isAdmin ? (
+              <div className="flex flex-col items-end gap-1">
+                <Button disabled title={t("oauth-clients:adminOnly")}>
+                  <Plus className="h-4 w-4 mr-2" />
+                  {t("oauth-clients:createClient")}
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  {t("oauth-clients:adminOnly")}
+                </p>
+              </div>
+            ) : (
+              <Dialog
+                open={createDialogOpen}
+                onOpenChange={(open) => {
+                  // Reuse the same teardown as the Done button so dismissing the
+                  // dialog can never leave a stale secret in state.
+                  if (!open) closeCreateDialog();
+                  else setCreateDialogOpen(true);
+                }}
+              >
+                <DialogTrigger asChild>
+                  <Button>
+                    <Plus className="h-4 w-4 mr-2" />
+                    {t("oauth-clients:createClient")}
+                  </Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>{t("oauth-clients:createClient")}</DialogTitle>
+                    <DialogDescription>
+                      {t("oauth-clients:createClientDescription")}
+                    </DialogDescription>
+                  </DialogHeader>
 
-                    <FormField
-                      control={form.control}
-                      name="redirect_uris"
-                      render={({ field }) => (
-                        <FormItem>
-                          <div className="flex items-center justify-between">
-                            <FormLabel>
-                              {t("oauth-clients:redirectUris")}
-                            </FormLabel>
+                  {newClient ? (
+                    <div className="space-y-4">
+                      <div className="p-4 bg-muted rounded-lg space-y-3">
+                        <p className="text-sm font-medium">
+                          {t("oauth-clients:credentialsTitle")}
+                        </p>
+
+                        <div className="space-y-1">
+                          <p className="text-xs text-muted-foreground">
+                            {t("oauth-clients:clientId")}
+                          </p>
+                          <div className="flex items-center gap-2">
+                            <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
+                              {newClient.client_id}
+                            </code>
                             <Button
-                              type="button"
                               size="sm"
                               variant="outline"
-                              onClick={applyClaudePreset}
+                              onClick={() =>
+                                copyToClipboard(newClient.client_id)
+                              }
                             >
-                              {t("oauth-clients:useClaudePreset")}
+                              <Copy className="h-4 w-4" />
                             </Button>
                           </div>
-                          <FormControl>
-                            <Textarea
-                              {...field}
-                              rows={3}
-                              placeholder={t(
-                                "oauth-clients:redirectUrisPlaceholder",
-                              )}
-                              className="whitespace-pre-wrap break-all overflow-x-hidden font-mono text-sm"
-                            />
-                          </FormControl>
-                          <FormDescription>
-                            {t("oauth-clients:redirectUrisHelp")}
-                          </FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
+                        </div>
 
-                    <FormField
-                      control={form.control}
-                      name="token_endpoint_auth_method"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{t("oauth-clients:authMethod")}</FormLabel>
-                          <Select
-                            value={field.value}
-                            onValueChange={field.onChange}
-                          >
-                            <FormControl>
-                              <SelectTrigger>
-                                <SelectValue />
-                              </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                              <SelectItem value="none">
-                                {t("oauth-clients:authMethodNone")}
-                              </SelectItem>
-                              <SelectItem value="client_secret_post">
-                                {t("oauth-clients:authMethodPost")}
-                              </SelectItem>
-                              <SelectItem value="client_secret_basic">
-                                {t("oauth-clients:authMethodBasic")}
-                              </SelectItem>
-                            </SelectContent>
-                          </Select>
-                          <FormDescription>
-                            {t("oauth-clients:authMethodHelp")}
-                          </FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
+                        {newClient.client_secret ? (
+                          <div className="space-y-1">
+                            <p className="text-xs text-muted-foreground">
+                              {t("oauth-clients:clientSecret")}
+                            </p>
+                            <div className="flex items-center gap-2">
+                              <code className="flex-1 p-2 bg-background rounded border text-sm font-mono break-all">
+                                {newClient.client_secret}
+                              </code>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() =>
+                                  copyToClipboard(newClient.client_secret!)
+                                }
+                              >
+                                <Copy className="h-4 w-4" />
+                              </Button>
+                            </div>
+                            <p className="text-xs text-destructive font-medium">
+                              {t("oauth-clients:secretWarning")}
+                            </p>
+                          </div>
+                        ) : (
+                          // A PKCE public client genuinely has no secret. Say that
+                          // outright, an empty space where a secret should be
+                          // reads as a bug or a lost credential.
+                          <p className="text-xs text-muted-foreground">
+                            {t("oauth-clients:publicClientNote")}
+                          </p>
+                        )}
+                      </div>
 
-                    <FormField
-                      control={form.control}
-                      name="scope"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{t("oauth-clients:scope")}</FormLabel>
-                          <FormControl>
-                            <Input
-                              {...field}
-                              placeholder={t("oauth-clients:scopePlaceholder")}
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-
-                    <div className="flex justify-end gap-2">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={closeCreateDialog}
-                      >
-                        {t("oauth-clients:cancel")}
-                      </Button>
-                      <Button type="submit" disabled={createMutation.isPending}>
-                        {createMutation.isPending
-                          ? t("oauth-clients:creating")
-                          : t("oauth-clients:create")}
+                      <Button onClick={closeCreateDialog} className="w-full">
+                        {t("oauth-clients:done")}
                       </Button>
                     </div>
-                  </form>
-                </Form>
-              )}
-            </DialogContent>
-          </Dialog>
-        )}
-      </div>
+                  ) : (
+                    <Form {...form}>
+                      <form
+                        onSubmit={form.handleSubmit(onSubmit)}
+                        className="space-y-4"
+                      >
+                        <FormField
+                          control={form.control}
+                          name="client_name"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t("oauth-clients:clientName")}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder={t(
+                                    "oauth-clients:clientNamePlaceholder",
+                                  )}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="redirect_uris"
+                          render={({ field }) => (
+                            <FormItem>
+                              <div className="flex items-center justify-between">
+                                <FormLabel>
+                                  {t("oauth-clients:redirectUris")}
+                                </FormLabel>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={applyClaudePreset}
+                                >
+                                  {t("oauth-clients:useClaudePreset")}
+                                </Button>
+                              </div>
+                              <FormControl>
+                                <Textarea
+                                  {...field}
+                                  rows={3}
+                                  placeholder={t(
+                                    "oauth-clients:redirectUrisPlaceholder",
+                                  )}
+                                  className="whitespace-pre-wrap break-all overflow-x-hidden font-mono text-sm"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t("oauth-clients:redirectUrisHelp")}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="token_endpoint_auth_method"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t("oauth-clients:authMethod")}
+                              </FormLabel>
+                              <Select
+                                value={field.value}
+                                onValueChange={field.onChange}
+                              >
+                                <FormControl>
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  <SelectItem value="none">
+                                    {t("oauth-clients:authMethodNone")}
+                                  </SelectItem>
+                                  <SelectItem value="client_secret_post">
+                                    {t("oauth-clients:authMethodPost")}
+                                  </SelectItem>
+                                  <SelectItem value="client_secret_basic">
+                                    {t("oauth-clients:authMethodBasic")}
+                                  </SelectItem>
+                                </SelectContent>
+                              </Select>
+                              <FormDescription>
+                                {t("oauth-clients:authMethodHelp")}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="scope"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t("oauth-clients:scope")}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder={t(
+                                    "oauth-clients:scopePlaceholder",
+                                  )}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={closeCreateDialog}
+                          >
+                            {t("oauth-clients:cancel")}
+                          </Button>
+                          <Button
+                            type="submit"
+                            disabled={createMutation.isPending}
+                          >
+                            {createMutation.isPending
+                              ? t("oauth-clients:creating")
+                              : t("oauth-clients:create")}
+                          </Button>
+                        </div>
+                      </form>
+                    </Form>
+                  )}
+                </DialogContent>
+              </Dialog>
+            )}
+          </>
+        }
+      />
 
       {roleLoaded && !isAdmin ? (
         <p className="text-sm text-muted-foreground">
