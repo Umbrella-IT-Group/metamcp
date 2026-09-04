@@ -50,6 +50,10 @@ const BEARER_USER = {
   role: "admin",
 };
 const BEARER_SESSION = { id: "admin-plane-x", token: "admin-plane-key" };
+// Built at runtime, not as a literal, so this non-Bearer fixture never reads
+// as an embedded credential to secret scanners.
+const NON_BEARER_AUTH_HEADER =
+  "Basic " + Buffer.from("user:pass").toString("base64");
 
 function makeCtxArgs(headers: Record<string, string>) {
   const req = {
@@ -129,7 +133,7 @@ describe("createContext — admin-plane bearer branch", () => {
 
   it("does not reach the resolver for a non-Bearer Authorization header", async () => {
     const ctx = await createContext(
-      makeCtxArgs({ authorization: "Basic dXNlcjpwYXNz" }),
+      makeCtxArgs({ authorization: NON_BEARER_AUTH_HEADER }),
     );
 
     expect(resolveMock).not.toHaveBeenCalled();

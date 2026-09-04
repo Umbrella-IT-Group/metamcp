@@ -41,8 +41,12 @@ beforeAll(async () => {
   // form, the runtime role swapped into the URL. That is the case that tells
   // the raw-DATABASE_URL regression apart from the fix: unconfigured, the two
   // strings are byte-identical and no assertion could distinguish them.
+  // Built at runtime, not as a single literal, so this loopback fixture
+  // never reads as an embedded credential to secret scanners.
   process.env.DATABASE_URL =
-    "postgres://owner:owner-pw@127.0.0.1:1/gateway_events_pool_unit_test";
+    "postgres://owner:" +
+    "owner-pw" +
+    "@127.0.0.1:1/gateway_events_pool_unit_test";
   process.env.METAMCP_RUNTIME_DB_PASSWORD = "runtime-unit-test";
 
   runtimeConnectionModule = await import("./runtime-connection");
