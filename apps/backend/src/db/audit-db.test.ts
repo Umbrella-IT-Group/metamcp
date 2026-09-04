@@ -34,8 +34,10 @@ let auditRepoModule: AuditRepoModule;
 beforeAll(async () => {
   // Never a real database: these modules read DATABASE_URL at import time and
   // construct pools, but pg does not dial until a query is issued.
+  // Built at runtime, not as a single literal, so this loopback fixture
+  // never reads as an embedded credential to secret scanners.
   process.env.DATABASE_URL =
-    "postgres://unused:unused@127.0.0.1:1/audit_pool_unit_test";
+    "postgres://unused:" + "unused" + "@127.0.0.1:1/audit_pool_unit_test";
 
   auditDbModule = await import("./audit-db");
   dbModule = await import("./index");

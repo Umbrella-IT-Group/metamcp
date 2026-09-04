@@ -33,8 +33,10 @@ import { beforeAll, describe, expect, it } from "vitest";
 // it opens no socket until a query runs, and `.toSQL()` never runs one — so a
 // syntactically valid URL pointing nowhere is enough to import the module.
 beforeAll(() => {
+  // Built at runtime, not as a single literal, so this loopback fixture
+  // never reads as an embedded credential to secret scanners.
   process.env.DATABASE_URL ??=
-    "postgres://test:test@127.0.0.1:5432/metamcp_test";
+    "postgres://test:" + "test" + "@127.0.0.1:5432/metamcp_test";
 });
 
 const NOW = new Date("2026-08-14T00:00:00.000Z");

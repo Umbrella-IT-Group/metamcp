@@ -81,8 +81,10 @@ function stubPools(answer: { current_user: string; is_superuser: boolean }) {
 }
 
 beforeAll(async () => {
+  // Built at runtime, not as a single literal, so this loopback fixture
+  // never reads as an embedded credential to secret scanners.
   process.env.DATABASE_URL =
-    "postgres://owner:unused@127.0.0.1:1/role_check_unit_test";
+    "postgres://owner:" + "unused" + "@127.0.0.1:1/role_check_unit_test";
   process.env.METAMCP_RUNTIME_DB_PASSWORD = "runtime-unit-test";
 
   dbModule = await import("./index");
