@@ -1,6 +1,6 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { APIError } from "better-auth/api";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { genericOAuth, GenericOAuthConfig } from "better-auth/plugins";
 
 import { db } from "./db/index";
@@ -53,18 +53,73 @@ if (!process.env.APP_URL) {
 const BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET;
 const BETTER_AUTH_URL = process.env.APP_URL;
 
-// Helper function to create basic auth middleware
-const createBasicAuthCheckMiddleware = () => {
-  return async (request: unknown) => {
-    const isBasicAuthDisabled = await configService.isBasicAuthDisabled();
-    if (isBasicAuthDisabled) {
-      throw new Error(
-        "Basic email/password authentication is currently disabled. Please use SSO/OIDC authentication instead.",
+// The credential paths better-auth 1.6.23 registers for email/password auth,
+// as they appear in `ctx.path` (the endpoint path with the `/api/auth` base
+// already stripped). `/reset-password` is matched by prefix so the
+// `/reset-password/:token` callback endpoint is covered by the same rule.
+//
+// Verified against the installed better-auth routes (sign-in.mjs, sign-up.mjs,
+// password.mjs): `/request-password-reset` is this version's name for
+// forgot-password, and `/forget-password` is not a registered server endpoint
+// here. SSO stays reachable ON PURPOSE. `/sign-in/social`, the OIDC callbacks
+// (`/oauth2/callback/:id`, `/callback/:id`), `/oauth/*`, `/sign-out` and the
+// session reads are all absent from this set, so disabling password login
+// never strands an SSO user or breaks an in-flight OAuth authorize.
+const isBasicAuthCredentialPath = (path: string): boolean =>
+  path === "/sign-in/email" ||
+  path === "/sign-up/email" ||
+  path === "/request-password-reset" ||
+  path === "/reset-password" ||
+  path.startsWith("/reset-password/");
+
+// Enforce the DISABLE_BASIC_AUTH setting on the credential paths.
+//
+// WHY A HOOK, NOT A `middleware` OPTION. better-auth 1.6.23's options type has
+// no top-level `middleware` field: an array passed there is silently dropped,
+// so the previous wiring never ran and a stored DISABLE_BASIC_AUTH=true still
+// let password sign-in through. `hooks.before` is the request middleware this
+// version documents and actually consumes: its dispatcher reads
+// `options.hooks.before` and registers it with `matcher: () => true`, so it
+// runs ahead of every endpoint and the path match belongs here in the handler.
+//
+// The flag is read LIVE per request: it is DB-backed and toggled from Settings
+// at runtime, so a flip must take effect on the next request with no restart.
+// Throwing an APIError('FORBIDDEN') yields an honest 403 the login page can
+// show, and no session is created because the endpoint handler never runs.
+const basicAuthEnforcementHook = createAuthMiddleware(async (ctx) => {
+  if (!isBasicAuthCredentialPath(ctx.path)) return;
+  if (await configService.isBasicAuthDisabled()) {
+    throw new APIError("FORBIDDEN", {
+      message:
+        "Basic email/password authentication is disabled. Sign in with SSO/OIDC instead.",
+    });
+  }
+});
+
+// One boot-time signal for the effective DISABLE_BASIC_AUTH state, called from
+// index.ts after the DB is reachable (the setting is DB-backed). Logs the
+// posture only, never a secret, so the boot log answers "is password login on?"
+// without an operator querying the config table. Self-swallowing: a config read
+// that fails must not turn a posture question into a failed boot, and the live
+// per-request hook remains the enforcement point regardless.
+export async function logBasicAuthEnforcementState(): Promise<void> {
+  try {
+    if (await configService.isBasicAuthDisabled()) {
+      logger.info(
+        "DISABLE_BASIC_AUTH=true: password sign-in, sign-up and password-reset are refused (403); SSO/OIDC only.",
+      );
+    } else {
+      logger.info(
+        "DISABLE_BASIC_AUTH=false: email/password sign-in is enabled.",
       );
     }
-    return { request };
-  };
-};
+  } catch (err) {
+    logger.warn(
+      "Could not read DISABLE_BASIC_AUTH at boot; password-login posture unknown until first request:",
+      err,
+    );
+  }
+}
 
 // OIDC Provider configuration - optional, only if environment variables are provided
 const oidcProviders: GenericOAuthConfig[] = [];
@@ -396,25 +451,12 @@ export const auth = betterAuth({
       },
     },
   },
-  // Add middleware to check basic auth setting
-  middleware: [
-    {
-      path: "/sign-in/email",
-      middleware: createBasicAuthCheckMiddleware(),
-    },
-    {
-      path: "/sign-up/email",
-      middleware: createBasicAuthCheckMiddleware(),
-    },
-    {
-      path: "/forgot-password",
-      middleware: createBasicAuthCheckMiddleware(),
-    },
-    {
-      path: "/reset-password",
-      middleware: createBasicAuthCheckMiddleware(),
-    },
-  ],
+  // Enforce DISABLE_BASIC_AUTH on the credential paths. `hooks.before` is the
+  // request middleware better-auth 1.6.23 actually runs; the removed top-level
+  // `middleware` array was never a supported option and did nothing.
+  hooks: {
+    before: basicAuthEnforcementHook,
+  },
 });
 
 console.log("✓ Better Auth instance created successfully");
