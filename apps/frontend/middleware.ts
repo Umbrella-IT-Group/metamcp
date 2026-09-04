@@ -1,6 +1,7 @@
 import { betterFetch } from "@better-fetch/fetch";
 import { NextRequest, NextResponse } from "next/server";
 
+import { shouldBypassMiddleware } from "./lib/middleware-bypass";
 import {
   buildContentSecurityPolicy,
   NONCE_HEADER,
@@ -69,26 +70,11 @@ function loginRedirect(
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
-  // Skip middleware for static files and API routes
-  if (
-    pathname.startsWith("/_next") ||
-    pathname.startsWith("/api/") ||
-    pathname.startsWith("/trpc") ||
-    pathname.startsWith("/mcp-proxy") ||
-    pathname.startsWith("/metamcp") ||
-    pathname.startsWith("/oauth") ||
-    pathname.startsWith("/.well-known") ||
-    pathname.startsWith("/service") ||
-    pathname.startsWith("/health") ||
-    pathname.startsWith("/fe-oauth") ||
-    // Umbrella fork: M365 broker routes live on the backend behind a
-    // next.config.js rewrite; without this skip the i18n branch 307s
-    // /m365/* to /en/m365/* before the rewrite runs (Entra redirects
-    // to the EXACT registered callback URI, so that redirect breaks
-    // enrollment).
-    pathname.startsWith("/m365") ||
-    pathname.includes(".")
-  ) {
+  // Skip middleware for static files and the backend/framework routes. The
+  // bypass set and its segment-boundary matching live in ./lib/middleware-bypass
+  // so the config.matcher below stays in lockstep with it (see that module for
+  // why bare-prefix matching swallowed the same-prefix /oauth-clients page).
+  if (shouldBypassMiddleware(pathname)) {
     return NextResponse.next();
   }
 
@@ -189,7 +175,12 @@ export async function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    // Skip all internal paths (_next, etc.)
-    "/((?!_next|api/|trpc|mcp-proxy|metamcp|oauth|fe-oauth|\\.well-known|service|health|m365|.*\\..*).*)",
+    // Skip all internal paths (_next, etc.). Each prefix is matched on a segment
+    // boundary ((?:/|$)) so a page whose route merely shares a prefix (e.g.
+    // /oauth-clients vs the bypassed /oauth) is NOT skipped. Keep this in
+    // lockstep with shouldBypassMiddleware in ./lib/middleware-bypass. Next
+    // requires config.matcher to be a statically-analyzable literal, so it
+    // cannot import that list; middleware-bypass.test.ts cross-checks the two.
+    "/((?!_next(?:/|$)|api/|trpc(?:/|$)|mcp-proxy(?:/|$)|metamcp(?:/|$)|oauth(?:/|$)|fe-oauth(?:/|$)|\\.well-known(?:/|$)|service(?:/|$)|health(?:/|$)|m365(?:/|$)|.*\\..*).*)",
   ],
 };
