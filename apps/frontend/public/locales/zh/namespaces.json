@@ -173,6 +173,7 @@
   },
   "toolManagement": {
     "toolsOverview": "工具概览：",
+    "server": "服务器",
     "servers": "服务器",
     "active": "活跃",
     "fromMetaMCP": "来自 MetaMCP",

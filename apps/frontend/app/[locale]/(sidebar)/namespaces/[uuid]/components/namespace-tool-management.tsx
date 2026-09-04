@@ -13,6 +13,7 @@ import { z } from "zod";
 import { ToolManagementSkeleton } from "@/components/skeletons/tool-management-skeleton";
 import { Button } from "@/components/ui/button";
 import { useTranslations } from "@/hooks/useTranslations";
+import { pluralize } from "@/lib/pluralize";
 import { trpc } from "@/lib/trpc";
 
 import { EnhancedNamespaceToolsTable } from "./enhanced-namespace-tools-table";
@@ -267,7 +268,12 @@ export function NamespaceToolManagement({
               {t("namespaces:toolManagement.toolsOverview")}
             </span>
             <span className="text-sm text-muted-foreground">
-              {serverCount} {t("namespaces:toolManagement.servers")}
+              {serverCount}{" "}
+              {pluralize(
+                serverCount,
+                t("namespaces:toolManagement.server"),
+                t("namespaces:toolManagement.servers"),
+              )}
             </span>
             <span className="text-muted-foreground">•</span>
             <span className="text-sm text-muted-foreground">
@@ -330,7 +336,12 @@ export function NamespaceToolManagement({
             {t("namespaces:toolManagement.toolsOverview")}
           </span>
           <span className="text-sm text-muted-foreground">
-            {serverCount} {t("namespaces:toolManagement.servers")}
+            {serverCount}{" "}
+            {pluralize(
+              serverCount,
+              t("namespaces:toolManagement.server"),
+              t("namespaces:toolManagement.servers"),
+            )}
           </span>
           <span className="text-muted-foreground">•</span>
           <span className="text-sm text-muted-foreground">

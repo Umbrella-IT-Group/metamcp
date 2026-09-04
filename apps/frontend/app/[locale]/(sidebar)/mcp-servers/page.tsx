@@ -35,6 +35,7 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
 import { trpc } from "@/lib/trpc";
@@ -142,325 +143,319 @@ export default function McpServersPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Server className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("mcp-servers:title")}
-            </h1>
-            <p className="text-muted-foreground">
-              {t("mcp-servers:description")}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <ExportImportButtons />
-          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-            <DialogTrigger asChild>
-              <Button>
-                <Plus className="mr-2 h-4 w-4" />
-                {t("mcp-servers:addServer")}
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="sm:max-w-[500px]">
-              <DialogHeader>
-                <DialogTitle>{t("mcp-servers:addServer")}</DialogTitle>
-                <DialogDescription>
-                  {t("mcp-servers:addServerDescription")}
-                </DialogDescription>
-              </DialogHeader>
-              <Form {...form}>
-                <form
-                  onSubmit={form.handleSubmit(onSubmit)}
-                  className="space-y-4"
-                >
-                  <FormField
-                    control={form.control}
-                    name="name"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t("mcp-servers:name")}</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            placeholder={t("mcp-servers:namePlaceholder")}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<Server className="h-8 w-8 text-primary" />}
+        title={t("mcp-servers:title")}
+        description={t("mcp-servers:description")}
+        actions={
+          <>
+            <ExportImportButtons />
+            <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+              <DialogTrigger asChild>
+                <Button>
+                  <Plus className="mr-2 h-4 w-4" />
+                  {t("mcp-servers:addServer")}
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="sm:max-w-[500px]">
+                <DialogHeader>
+                  <DialogTitle>{t("mcp-servers:addServer")}</DialogTitle>
+                  <DialogDescription>
+                    {t("mcp-servers:addServerDescription")}
+                  </DialogDescription>
+                </DialogHeader>
+                <Form {...form}>
+                  <form
+                    onSubmit={form.handleSubmit(onSubmit)}
+                    className="space-y-4"
+                  >
+                    <FormField
+                      control={form.control}
+                      name="name"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t("mcp-servers:name")}</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              placeholder={t("mcp-servers:namePlaceholder")}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="description"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t("mcp-servers:descriptionLabel")}
+                          </FormLabel>
+                          <FormControl>
+                            <Textarea
+                              {...field}
+                              placeholder={t(
+                                "mcp-servers:descriptionPlaceholder",
+                              )}
+                              rows={3}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="type"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t("mcp-servers:type")}</FormLabel>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                variant="outline"
+                                className="w-full justify-between"
+                              >
+                                {field.value === McpServerTypeEnum.enum.STDIO
+                                  ? t("mcp-servers:stdio")
+                                  : field.value === McpServerTypeEnum.enum.SSE
+                                    ? t("mcp-servers:sse")
+                                    : field.value ===
+                                        McpServerTypeEnum.enum.STREAMABLE_HTTP
+                                      ? "Streamable HTTP"
+                                      : t("mcp-servers:selectType")}
+                                <ChevronDown className="ml-2 h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent
+                              className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]"
+                              align="start"
+                            >
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  field.onChange(McpServerTypeEnum.enum.STDIO)
+                                }
+                              >
+                                {t("mcp-servers:stdio")}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  field.onChange(McpServerTypeEnum.enum.SSE)
+                                }
+                              >
+                                {t("mcp-servers:sse")}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  field.onChange(
+                                    McpServerTypeEnum.enum.STREAMABLE_HTTP,
+                                  )
+                                }
+                              >
+                                Streamable HTTP
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="user_id"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t("mcp-servers:ownership")}</FormLabel>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                variant="outline"
+                                className="w-full justify-between"
+                              >
+                                {field.value === null
+                                  ? t("mcp-servers:public")
+                                  : t("mcp-servers:private")}
+                                <ChevronDown className="ml-2 h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent
+                              className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]"
+                              align="start"
+                            >
+                              <DropdownMenuItem
+                                onClick={() => field.onChange(undefined)}
+                              >
+                                {t("mcp-servers:private")}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() => field.onChange(null)}
+                              >
+                                {t("mcp-servers:public")}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {t("mcp-servers:ownershipHelp")}
+                          </p>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    {/* STDIO specific fields */}
+                    {form.watch("type") === McpServerTypeEnum.enum.STDIO && (
+                      <>
+                        <FormField
+                          control={form.control}
+                          name="command"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t("mcp-servers:command")}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder={t(
+                                    "mcp-servers:commandPlaceholder",
+                                  )}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="args"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t("mcp-servers:args")}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder={t("mcp-servers:argsPlaceholder")}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="env"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t("mcp-servers:env")}</FormLabel>
+                              <FormControl>
+                                <Textarea
+                                  {...field}
+                                  placeholder={t("mcp-servers:envPlaceholder")}
+                                  rows={3}
+                                  className="whitespace-pre-wrap break-all overflow-x-hidden"
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </>
                     )}
-                  />
 
-                  <FormField
-                    control={form.control}
-                    name="description"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>
-                          {t("mcp-servers:descriptionLabel")}
-                        </FormLabel>
-                        <FormControl>
-                          <Textarea
-                            {...field}
-                            placeholder={t(
-                              "mcp-servers:descriptionPlaceholder",
-                            )}
-                            rows={3}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
+                    {/* SSE and STREAMABLE_HTTP specific fields */}
+                    {(form.watch("type") === McpServerTypeEnum.enum.SSE ||
+                      form.watch("type") ===
+                        McpServerTypeEnum.enum.STREAMABLE_HTTP) && (
+                      <>
+                        <FormField
+                          control={form.control}
+                          name="url"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t("mcp-servers:url")}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder={t("mcp-servers:urlPlaceholder")}
+                                  type="url"
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="bearerToken"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t("mcp-servers:bearerToken")}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder={t(
+                                    "mcp-servers:bearerTokenPlaceholder",
+                                  )}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="headers"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t("mcp-servers:headers")}</FormLabel>
+                              <FormControl>
+                                <Textarea
+                                  {...field}
+                                  placeholder={t(
+                                    "mcp-servers:headersPlaceholder",
+                                  )}
+                                  rows={3}
+                                  className="whitespace-pre-wrap break-all overflow-x-hidden"
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </>
                     )}
-                  />
 
-                  <FormField
-                    control={form.control}
-                    name="type"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t("mcp-servers:type")}</FormLabel>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="outline"
-                              className="w-full justify-between"
-                            >
-                              {field.value === McpServerTypeEnum.enum.STDIO
-                                ? t("mcp-servers:stdio")
-                                : field.value === McpServerTypeEnum.enum.SSE
-                                  ? t("mcp-servers:sse")
-                                  : field.value ===
-                                      McpServerTypeEnum.enum.STREAMABLE_HTTP
-                                    ? "Streamable HTTP"
-                                    : t("mcp-servers:selectType")}
-                              <ChevronDown className="ml-2 h-4 w-4" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent
-                            className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]"
-                            align="start"
-                          >
-                            <DropdownMenuItem
-                              onClick={() =>
-                                field.onChange(McpServerTypeEnum.enum.STDIO)
-                              }
-                            >
-                              {t("mcp-servers:stdio")}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() =>
-                                field.onChange(McpServerTypeEnum.enum.SSE)
-                              }
-                            >
-                              {t("mcp-servers:sse")}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() =>
-                                field.onChange(
-                                  McpServerTypeEnum.enum.STREAMABLE_HTTP,
-                                )
-                              }
-                            >
-                              Streamable HTTP
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="user_id"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t("mcp-servers:ownership")}</FormLabel>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="outline"
-                              className="w-full justify-between"
-                            >
-                              {field.value === null
-                                ? t("mcp-servers:public")
-                                : t("mcp-servers:private")}
-                              <ChevronDown className="ml-2 h-4 w-4" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent
-                            className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]"
-                            align="start"
-                          >
-                            <DropdownMenuItem
-                              onClick={() => field.onChange(undefined)}
-                            >
-                              {t("mcp-servers:private")}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() => field.onChange(null)}
-                            >
-                              {t("mcp-servers:public")}
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {t("mcp-servers:ownershipHelp")}
-                        </p>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  {/* STDIO specific fields */}
-                  {form.watch("type") === McpServerTypeEnum.enum.STDIO && (
-                    <>
-                      <FormField
-                        control={form.control}
-                        name="command"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>{t("mcp-servers:command")}</FormLabel>
-                            <FormControl>
-                              <Input
-                                {...field}
-                                placeholder={t(
-                                  "mcp-servers:commandPlaceholder",
-                                )}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="args"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>{t("mcp-servers:args")}</FormLabel>
-                            <FormControl>
-                              <Input
-                                {...field}
-                                placeholder={t("mcp-servers:argsPlaceholder")}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="env"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>{t("mcp-servers:env")}</FormLabel>
-                            <FormControl>
-                              <Textarea
-                                {...field}
-                                placeholder={t("mcp-servers:envPlaceholder")}
-                                rows={3}
-                                className="whitespace-pre-wrap break-all overflow-x-hidden"
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </>
-                  )}
-
-                  {/* SSE and STREAMABLE_HTTP specific fields */}
-                  {(form.watch("type") === McpServerTypeEnum.enum.SSE ||
-                    form.watch("type") ===
-                      McpServerTypeEnum.enum.STREAMABLE_HTTP) && (
-                    <>
-                      <FormField
-                        control={form.control}
-                        name="url"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>{t("mcp-servers:url")}</FormLabel>
-                            <FormControl>
-                              <Input
-                                {...field}
-                                placeholder={t("mcp-servers:urlPlaceholder")}
-                                type="url"
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="bearerToken"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>
-                              {t("mcp-servers:bearerToken")}
-                            </FormLabel>
-                            <FormControl>
-                              <Input
-                                {...field}
-                                placeholder={t(
-                                  "mcp-servers:bearerTokenPlaceholder",
-                                )}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="headers"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>{t("mcp-servers:headers")}</FormLabel>
-                            <FormControl>
-                              <Textarea
-                                {...field}
-                                placeholder={t(
-                                  "mcp-servers:headersPlaceholder",
-                                )}
-                                rows={3}
-                                className="whitespace-pre-wrap break-all overflow-x-hidden"
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </>
-                  )}
-
-                  <div className="flex justify-end space-x-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => setIsDialogOpen(false)}
-                    >
-                      {t("common:cancel")}
-                    </Button>
-                    <Button type="submit" disabled={createMutation.isPending}>
-                      {createMutation.isPending
-                        ? t("common:creating")
-                        : t("common:create")}
-                    </Button>
-                  </div>
-                </form>
-              </Form>
-            </DialogContent>
-          </Dialog>
-        </div>
-      </div>
+                    <div className="flex justify-end space-x-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => setIsDialogOpen(false)}
+                      >
+                        {t("common:cancel")}
+                      </Button>
+                      <Button type="submit" disabled={createMutation.isPending}>
+                        {createMutation.isPending
+                          ? t("common:creating")
+                          : t("common:create")}
+                      </Button>
+                    </div>
+                  </form>
+                </Form>
+              </DialogContent>
+            </Dialog>
+          </>
+        }
+      />
 
       <McpServersList />
     </div>

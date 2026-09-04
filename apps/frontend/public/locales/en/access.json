@@ -30,8 +30,10 @@
   "unverified": "Unverified",
   "disabledBadge": "Disabled",
   "never": "Never",
+  "sessionLabel": "session",
   "sessionsLabel": "sessions",
   "tokensLabel": "OAuth",
+  "keyLabel": "key",
   "keysLabel": "keys",
   "you": "You",
 

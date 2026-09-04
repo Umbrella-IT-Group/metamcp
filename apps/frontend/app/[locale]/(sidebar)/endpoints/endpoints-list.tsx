@@ -230,7 +230,13 @@ export function EndpointsList({ onRefresh }: EndpointsListProps) {
         return (
           <div className="px-3 pl-0 py-2">
             {description ? (
-              <p className="text-sm">{description}</p>
+              // Cap the width and truncate: descriptions run long and the cell
+              // is whitespace-nowrap, so an untruncated one used to push the
+              // table (and the page) wider than the viewport. The full text
+              // stays available on hover via the title attribute.
+              <p className="max-w-md truncate text-sm" title={description}>
+                {description}
+              </p>
             ) : (
               <span className="text-sm text-muted-foreground italic">
                 {t("endpoints:list.noDescription")}

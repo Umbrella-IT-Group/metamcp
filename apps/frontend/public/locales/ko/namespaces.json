@@ -182,6 +182,7 @@
   },
   "toolManagement": {
     "toolsOverview": "Tool 개요:",
+    "server": "server",
     "servers": "servers",
     "active": "활성",
     "fromMetaMCP": "MetaMCP에서",

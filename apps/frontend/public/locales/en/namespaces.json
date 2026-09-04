@@ -182,6 +182,7 @@
   },
   "toolManagement": {
     "toolsOverview": "Tools Overview:",
+    "server": "server",
     "servers": "servers",
     "active": "active",
     "fromMetaMCP": "from MetaMCP",

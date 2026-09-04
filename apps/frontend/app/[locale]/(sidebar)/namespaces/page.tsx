@@ -26,6 +26,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
 import { trpc } from "@/lib/trpc";
@@ -140,20 +141,12 @@ export default function NamespacesPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Package className="h-8 w-8 text-primary" />
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">
-              {t("namespaces:title")}
-            </h1>
-            <p className="text-muted-foreground">
-              {t("namespaces:description")}
-            </p>
-          </div>
-        </div>
-        <div className="flex gap-2">
+    <div className="space-y-6 min-w-0">
+      <PageHeader
+        icon={<Package className="h-8 w-8 text-primary" />}
+        title={t("namespaces:title")}
+        description={t("namespaces:description")}
+        actions={
           <Dialog open={createOpen} onOpenChange={setCreateOpen}>
             <DialogTrigger asChild>
               <Button>
@@ -326,8 +319,8 @@ export default function NamespacesPage() {
               </form>
             </DialogContent>
           </Dialog>
-        </div>
-      </div>
+        }
+      />
 
       <NamespacesList />
     </div>
