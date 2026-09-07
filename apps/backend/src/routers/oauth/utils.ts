@@ -221,6 +221,34 @@ const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set([
   "::1",
 ]);
 
+/**
+ * True when a redirect_uri names the loopback interface — the shape RFC 8252
+ * §7.3 gives an installed client (`http://127.0.0.1:<ephemeral>/callback`,
+ * `http://localhost:<port>/…`, or the IPv6 `http://[::1]:<port>/…`). The
+ * consent success branch renders a copy-the-code page for these instead of the
+ * bare 302, because on a headless gateway the browser that approved consent is
+ * a DIFFERENT machine from the one running the listener, so the 302 lands on a
+ * dead localhost port. Non-loopback redirects (claude.ai, Claude Desktop) are
+ * false here and keep the 302 untouched.
+ *
+ * Host membership is EXACT and bracket-stripped, matched the same way the two
+ * validators above do it so the three agree: `localhost.evil.com` and
+ * `127.0.0.1.evil.com` carry a loopback label yet are not the loopback host.
+ * Scheme and port are intentionally NOT constrained — a caller only reaches
+ * this after the uri has cleared `isAllowedRedirectUri`, so the only remaining
+ * question is "is the host loopback", nothing else.
+ */
+export function isLoopbackRedirectUri(uri: string): boolean {
+  try {
+    const hostname = new URL(uri).hostname
+      .replace(/^\[|\]$/g, "")
+      .toLowerCase();
+    return LOOPBACK_HOSTNAMES.has(hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** Why a redirect_uri was refused. Machine-readable so tests can pin the rule. */
 export type RedirectUriRejectionReason =
   | "not_a_string"

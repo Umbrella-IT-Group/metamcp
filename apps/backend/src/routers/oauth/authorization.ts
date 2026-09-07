@@ -6,6 +6,7 @@ import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import { sendLoopbackConsentSuccess } from "./consent-success-page";
 import {
   CONSENT_REQUEST_TTL_MS,
   consentCsrfCookieName,
@@ -21,6 +22,7 @@ import {
   GRANTED_OAUTH_SCOPE,
   isAllowedRedirectUri,
   isConsentDecisionRateLimited,
+  isLoopbackRedirectUri,
   type OAuthParams,
   rateLimitAuth,
   validateRedirectUri,
@@ -699,13 +701,28 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
 
     // AFTER setAuthCode: the code exists in the database by this line, so the
     // row cannot claim a grant that then failed to persist.
+    //
+    // A loopback redirect_uri (RFC 8252 §7.3) means an installed client is
+    // waiting for the code on loopback. On a headless gateway the browser that
+    // approved consent is a different machine from the one running that
+    // listener, so the bare 302 below lands on a dead localhost port. For that
+    // case render a success page that both attempts the completion and shows
+    // the code to copy; non-loopback redirects (claude.ai, Claude Desktop) are
+    // untouched and keep the 302. httpStatus on the audit row reflects the real
+    // response so the two branches stay distinguishable after the fact.
+    const loopback = isLoopbackRedirectUri(consentRequest.redirect_uri);
+
     emitConsentDecision(req, {
       granted: true,
       userId,
       clientId: consentRequest.client_id,
       redirectUri: consentRequest.redirect_uri,
-      httpStatus: 302,
+      httpStatus: loopback ? 200 : 302,
     });
+
+    if (loopback) {
+      return sendLoopbackConsentSuccess(res, redirectUrl);
+    }
 
     res.redirect(redirectUrl.toString());
   } catch (error) {
