@@ -27,6 +27,10 @@
 import express from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// No env is read at import time, so this static import is safe ahead of the
+// APP_URL / BETTER_AUTH_SECRET setup below. It ties the page assertions to the
+// SAME escaper the router uses rather than re-implementing it here.
+import { escapeHtml } from "./consent-success-page";
 // Type-only, so it is erased at compile time and does not pull the module in
 // before the environment below is set.
 import type { ConsentRequestPayload } from "./consent-token";
@@ -103,6 +107,9 @@ const ISSUER = getIssuerIdentifier({
 const CLIENT_ID = "mcp_client_test";
 const CLIENT_NAME = "Claude";
 const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
+// An installed client's loopback callback (RFC 8252 §7.3): plain http on a port
+// the OS handed out. This is the redirect that takes the success-page branch.
+const LOOPBACK_REDIRECT_URI = "http://127.0.0.1:49213/callback";
 const USER_ID = "user-abc123";
 const OTHER_USER_ID = "user-attacker999";
 const STATE = "opaque-client-state";
@@ -126,6 +133,7 @@ interface FakeRes {
   sentBody: string | undefined;
   cookies: CookieWrite[];
   clearedCookies: CookieWrite[];
+  headers: Record<string, string>;
   settled: Promise<void>;
   status(code: number): FakeRes;
   json(payload: Record<string, unknown>): FakeRes;
@@ -137,6 +145,7 @@ interface FakeRes {
     options: Record<string, unknown>,
   ): FakeRes;
   clearCookie(name: string, options: Record<string, unknown>): FakeRes;
+  setHeader(name: string, value: string): FakeRes;
 }
 
 // Unique per request so the authorization endpoint's in-memory rate limiter
@@ -184,6 +193,7 @@ function makeRes(): FakeRes {
     sentBody: undefined,
     cookies: [],
     clearedCookies: [],
+    headers: {},
     settled,
     status(code) {
       res.statusCode = code;
@@ -210,6 +220,10 @@ function makeRes(): FakeRes {
     },
     clearCookie(name, options) {
       res.clearedCookies.push({ name, value: "", options });
+      return res;
+    },
+    setHeader(name, value) {
+      res.headers[name] = value;
       return res;
     },
   };
@@ -588,6 +602,129 @@ describe("POST /oauth/authorize/decision — approval mints", () => {
     expect(redirect.searchParams.get("error")).toBe("access_denied");
     expect(redirect.searchParams.get("iss")).toBe(ISSUER);
     expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. A loopback redirect gets the success page, not the dead-port 302
+// ---------------------------------------------------------------------------
+
+describe("POST /oauth/authorize/decision — loopback consent success page", () => {
+  // A grant whose redirect_uri is loopback. The client must have that exact
+  // URI registered, the same membership check every grant clears.
+  async function approveLoopback() {
+    oauthRepositoryMock.getClient.mockResolvedValue(
+      registeredClient([LOOPBACK_REDIRECT_URI]),
+    );
+    const { areq, csrf } = makeAreq({ redirect_uri: LOOPBACK_REDIRECT_URI });
+    return decide({ areq, decision: "approve", csrfCookie: csrf });
+  }
+
+  it("renders a 200 page carrying the code and full callback URL, not a 302", async () => {
+    const res = await approveLoopback();
+
+    expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
+    const { code } = mintedAuthCode();
+
+    // The whole point: no bare redirect to a port the browser cannot reach.
+    expect(res.redirectedTo).toBeUndefined();
+    expect(res.statusCode).toBe(200);
+
+    const html = res.sentBody ?? "";
+    // The floor the design promises: the code is on the page even if the
+    // auto-complete script never runs. base64url has no HTML-significant
+    // characters, so the escaped form equals the raw code.
+    expect(html).toContain(code);
+
+    // The full callback URL (iss, state, code) is offered for the headless
+    // case, HTML-escaped exactly as the router escapes it.
+    const expected = new URL(LOOPBACK_REDIRECT_URI);
+    expected.searchParams.set("iss", ISSUER);
+    expected.searchParams.set("state", STATE);
+    expected.searchParams.set("code", code);
+    expect(html).toContain(escapeHtml(expected.toString()));
+  });
+
+  it("gates the inline script with a per-request CSP nonce and locks the rest", async () => {
+    const res = await approveLoopback();
+
+    const csp = res.headers["Content-Security-Policy"] ?? "";
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("style-src 'unsafe-inline'");
+    // Scripts run only by nonce, never unsafe-inline.
+    expect(csp).not.toContain("script-src 'unsafe-inline'");
+
+    const nonceMatch = /script-src 'nonce-([^']+)'/.exec(csp);
+    if (!nonceMatch) throw new Error("CSP carried no script-src nonce");
+    const nonce = nonceMatch[1];
+    if (!nonce) throw new Error("CSP script-src nonce was empty");
+    // A guessable nonce would defeat the control; randomBytes(16) is 24 b64 chars.
+    expect(nonce.length).toBeGreaterThanOrEqual(16);
+    // The one inline script carries exactly that nonce.
+    expect(res.sentBody ?? "").toContain(`<script nonce="${nonce}">`);
+  });
+
+  it("mints a fresh nonce per request", async () => {
+    const first = await approveLoopback();
+    resetConsentDecisionRateLimitForTests();
+    const second = await approveLoopback();
+
+    const nonceOf = (res: FakeRes) =>
+      /script-src 'nonce-([^']+)'/.exec(
+        res.headers["Content-Security-Policy"] ?? "",
+      )?.[1];
+
+    const a = nonceOf(first);
+    const b = nonceOf(second);
+    expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
+    expect(a).not.toBe(b);
+  });
+
+  it("sets Cache-Control no-store and the hardening headers", async () => {
+    const res = await approveLoopback();
+
+    // The body carries a code; no cache may retain it.
+    expect(res.headers["Cache-Control"]).toBe("no-store");
+    expect(res.headers["Referrer-Policy"]).toBe("no-referrer");
+    expect(res.headers["X-Content-Type-Options"]).toBe("nosniff");
+  });
+
+  it("never writes the authorization code to any log", async () => {
+    await approveLoopback();
+    const { code } = mintedAuthCode();
+
+    const logged = [
+      ...loggerMock.debug.mock.calls,
+      ...loggerMock.info.mock.calls,
+      ...loggerMock.warn.mock.calls,
+      ...loggerMock.error.mock.calls,
+    ]
+      .flat()
+      .map((arg) => String(arg))
+      .join("\n");
+
+    expect(logged).not.toContain(code);
+  });
+
+  it("leaves a non-loopback redirect on the untouched 302 path (regression)", async () => {
+    // Default REDIRECT_URI is claude.ai. The success-page branch must not fire.
+    const { areq, csrf } = makeAreq();
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    const { code } = mintedAuthCode();
+
+    // Redirected, no page rendered.
+    expect(res.sentBody).toBeUndefined();
+    const redirect = redirectUrl(res);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(REDIRECT_URI);
+    expect(redirect.searchParams.get("code")).toBe(code);
+    expect(redirect.searchParams.get("state")).toBe(STATE);
+    expect(redirect.searchParams.get("iss")).toBe(ISSUER);
+
+    // None of the success-page headers were set on the 302 path.
+    expect(res.headers["Content-Security-Policy"]).toBeUndefined();
+    expect(res.headers["Cache-Control"]).toBeUndefined();
   });
 });
 
