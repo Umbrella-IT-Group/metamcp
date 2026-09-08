@@ -62,6 +62,23 @@ describe("buildContentSecurityPolicy (production)", () => {
     expect(csp).toContain("connect-src 'self'");
   });
 
+  it("pins form-action to exactly 'self' when no extra source is given", () => {
+    expect(directive(csp, "form-action")).toBe("form-action 'self'");
+  });
+
+  it("widens form-action to the given sources and touches nothing else", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const widened = buildContentSecurityPolicy("TESTNONCE==", {
+      formActionSources: ["https://claude.ai"],
+    });
+    expect(directive(widened, "form-action")).toBe(
+      "form-action 'self' https://claude.ai",
+    );
+    // Same policy otherwise: the widening must not leak into any other directive.
+    const strip = (v: string) => v.replace(/form-action[^;]*/, "form-action X");
+    expect(strip(widened)).toBe(strip(csp));
+  });
+
   it("allows unsafe-inline for styles only, not scripts", () => {
     const styleSrc = directive(csp, "style-src");
     // Radix/toast/theme set inline style ATTRIBUTES a nonce cannot cover, so

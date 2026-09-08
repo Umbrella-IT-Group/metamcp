@@ -46,8 +46,17 @@ export const NONCE_HEADER = "x-nonce";
  * connect-src is `'self'`: every fetch, tRPC call and MCP inspector transport
  * goes to this same origin (the MCP proxy is reached at the app's own URL, not
  * the backend host directly). frame-ancestors and frame-src are `'none'`: the
- * app frames nothing and must not be framed. form-action and base-uri are
- * `'self'`, object-src is `'none'`.
+ * app frames nothing and must not be framed. base-uri is `'self'`, object-src
+ * is `'none'`.
+ *
+ * form-action is `'self'` plus whatever `options.formActionSources` adds, and
+ * the ONE caller that adds anything is the middleware on the OAuth consent
+ * document (lib/consent-form-action.ts). Chromium enforces form-action against
+ * the redirect chain of a form submission, and the consent Approve's success
+ * response is a 302 to the client's registered redirect_uri, so a bare `'self'`
+ * made Chrome and Edge cancel that redirect after the code was already minted
+ * (fork #150 regression, 2026-09-03 to 2026-09-08). The widening is exactly the
+ * redirect target named in the request's own signed `areq`, nothing broader.
  *
  * script-src gains `'unsafe-eval'` OUTSIDE production only. `next dev`
  * (Turbopack, React Fast Refresh) evaluates modules with eval and cannot run
@@ -56,15 +65,28 @@ export const NONCE_HEADER = "x-nonce";
  * execution to `'self'` plus the per-request nonce with no eval escape. The
  * gate is read at call time so a test can pin either environment.
  */
-export function buildContentSecurityPolicy(nonce: string): string {
+export interface ContentSecurityPolicyOptions {
+  /**
+   * Extra `form-action` host-sources beyond `'self'`. Only the consent document
+   * passes any (its redirect_uri origin, see lib/consent-form-action.ts); every
+   * other document keeps `form-action 'self'`.
+   */
+  formActionSources?: readonly string[];
+}
+
+export function buildContentSecurityPolicy(
+  nonce: string,
+  options: ContentSecurityPolicyOptions = {},
+): string {
   const devEval = process.env.NODE_ENV === "production" ? "" : " 'unsafe-eval'";
+  const formAction = ["'self'", ...(options.formActionSources ?? [])].join(" ");
   return [
     "default-src 'self'",
     "base-uri 'self'",
     "object-src 'none'",
     "frame-ancestors 'none'",
     "frame-src 'none'",
-    "form-action 'self'",
+    `form-action ${formAction}`,
     `script-src 'self' 'nonce-${nonce}'${devEval}`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
