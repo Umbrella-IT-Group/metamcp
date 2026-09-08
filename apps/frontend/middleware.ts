@@ -1,6 +1,7 @@
 import { betterFetch } from "@better-fetch/fetch";
 import { NextRequest, NextResponse } from "next/server";
 
+import { consentFormActionSources } from "./lib/consent-form-action";
 import { shouldBypassMiddleware } from "./lib/middleware-bypass";
 import {
   buildContentSecurityPolicy,
@@ -86,7 +87,17 @@ export async function middleware(request: NextRequest) {
   // third-party inline scripts Next does not own: the runtime-env script and
   // the theme anti-flash script). See ./lib/security-headers.
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
-  const csp = buildContentSecurityPolicy(nonce);
+  // The consent document alone widens form-action to its redirect_uri origin:
+  // its Approve is a form POST whose success response is a 302 to the client,
+  // and Chromium enforces form-action on that redirect (see
+  // ./lib/consent-form-action for the failure this closes). Every other page
+  // keeps `form-action 'self'`.
+  const csp = buildContentSecurityPolicy(nonce, {
+    formActionSources: consentFormActionSources(
+      pathname,
+      request.nextUrl.searchParams.get("areq"),
+    ),
+  });
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set(NONCE_HEADER, nonce);
   requestHeaders.set("Content-Security-Policy", csp);
