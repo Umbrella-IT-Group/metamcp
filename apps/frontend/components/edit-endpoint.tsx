@@ -344,9 +344,14 @@ export function EditEndpoint({
                 </div>
                 <Switch
                   checked={editForm.watch("enableMaxRate")}
-                  onCheckedChange={(checked) =>
-                    editForm.setValue("enableMaxRate", checked)
-                  }
+                  onCheckedChange={(checked) => {
+                    editForm.setValue("enableMaxRate", checked);
+                    if (!checked) {
+                      editForm.setValue("maxRate", undefined);
+                      editForm.setValue("maxRateSeconds", undefined);
+                      editForm.clearErrors(["maxRate", "maxRateSeconds"]);
+                    }
+                  }}
                   disabled={isUpdating}
                 />
               </div>
@@ -408,9 +413,17 @@ export function EditEndpoint({
                 </div>
                 <Switch
                   checked={editForm.watch("enableClientMaxRate")}
-                  onCheckedChange={(checked) =>
-                    editForm.setValue("enableClientMaxRate", checked)
-                  }
+                  onCheckedChange={(checked) => {
+                    editForm.setValue("enableClientMaxRate", checked);
+                    if (!checked) {
+                      editForm.setValue("clientMaxRate", undefined);
+                      editForm.setValue("clientMaxRateSeconds", undefined);
+                      editForm.clearErrors([
+                        "clientMaxRate",
+                        "clientMaxRateSeconds",
+                      ]);
+                    }
+                  }}
                   disabled={isUpdating}
                 />
               </div>
