@@ -36,6 +36,7 @@ export const DEFAULT_M365_SCOPES = [
   "Chat.ReadWrite",
   "Notes.ReadWrite.All",
   "People.Read",
+  "Presence.ReadWrite",
 ].join(" ");
 
 export interface M365BrokerConfig {
