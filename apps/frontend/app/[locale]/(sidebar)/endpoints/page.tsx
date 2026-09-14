@@ -397,9 +397,14 @@ export default function EndpointsPage() {
                     </div>
                     <Switch
                       checked={form.watch("enableMaxRate")}
-                      onCheckedChange={(checked) =>
-                        form.setValue("enableMaxRate", checked)
-                      }
+                      onCheckedChange={(checked) => {
+                        form.setValue("enableMaxRate", checked);
+                        if (!checked) {
+                          form.setValue("maxRate", undefined);
+                          form.setValue("maxRateSeconds", undefined);
+                          form.clearErrors(["maxRate", "maxRateSeconds"]);
+                        }
+                      }}
                       disabled={isSubmitting}
                     />
                   </div>
@@ -464,9 +469,17 @@ export default function EndpointsPage() {
                     </div>
                     <Switch
                       checked={form.watch("enableClientMaxRate")}
-                      onCheckedChange={(checked) =>
-                        form.setValue("enableClientMaxRate", checked)
-                      }
+                      onCheckedChange={(checked) => {
+                        form.setValue("enableClientMaxRate", checked);
+                        if (!checked) {
+                          form.setValue("clientMaxRate", undefined);
+                          form.setValue("clientMaxRateSeconds", undefined);
+                          form.clearErrors([
+                            "clientMaxRate",
+                            "clientMaxRateSeconds",
+                          ]);
+                        }
+                      }}
                       disabled={isSubmitting}
                     />
                   </div>
