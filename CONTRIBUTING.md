@@ -121,10 +121,11 @@ Enable debug logging by setting the auth logger level in `apps/backend/src/auth.
    pnpm --filter @repo/trpc build
    pnpm -C apps/backend test
    pnpm -C apps/frontend test
+   pnpm check-types
    ```
-   `pnpm check-types` and `pnpm lint` from the repo root are worth running too.
+   `pnpm lint` is not part of CI. Both apps run it with `--max-warnings 0` and the frontend currently fails on existing warnings, so treat it as advisory for now.
 4. Open a pull request against `umbrella`. Say what changed, why, and how you verified it. We squash-merge, so the PR title becomes the commit subject.
-5. Add a row to the "Our own patches" table in [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) describing the change, or ask in the PR and we will add it.
+5. Add a row for the change at the bottom of the patch table in [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) (the newest rows are last), or ask in the PR and we will add it.
 
 ## Pull request guidelines
 

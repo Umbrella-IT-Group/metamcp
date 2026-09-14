@@ -236,7 +236,7 @@ Upstream community resources (Discord, docs, DeepWiki) live at [`metatool-ai/met
 docker pull ghcr.io/umbrella-it-group/metamcp:latest
 ```
 
-Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64, public (no registry login needed), and published on every push to `umbrella`. If the pull is denied, the package visibility has regressed; please [open an issue](https://github.com/Umbrella-IT-Group/metamcp/issues).
+Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64, public (no registry login needed), and published when a push to `umbrella` changes a path watched by [the build workflow](.github/workflows/umbrella-build.yml). If the pull is denied, please [open an issue](https://github.com/Umbrella-IT-Group/metamcp/issues) with the exact error text, with secrets and internal hostnames redacted.
 
 ### Build from source with Docker Compose
 
