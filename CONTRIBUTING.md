@@ -1,12 +1,21 @@
-# Contributing to MetaMCP
+# Contributing to the Umbrella IT Group fork of MetaMCP
 
-We welcome contributions to MetaMCP! This guide will help you get started.
+This is a maintained downstream fork of [metatool-ai/metamcp](https://github.com/metatool-ai/metamcp). The `umbrella` branch is the default and deployable line; `main` mirrors upstream and never carries our changes. [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) explains the branch model and records every patch we carry.
 
-## Development Setup
+## Where to send things
 
-1. Clone the repository:
+- **Bugs and feature requests:** open a [GitHub Issue](https://github.com/Umbrella-IT-Group/metamcp/issues). Templates for both are provided.
+- **Questions and ideas:** use [GitHub Discussions](https://github.com/Umbrella-IT-Group/metamcp/discussions).
+- **Security vulnerabilities:** do not open a public issue. Follow [`SECURITY.md`](SECURITY.md) (private advisory or email).
+- **Problems in upstream MetaMCP that are not specific to this fork:** report them to [metatool-ai/metamcp](https://github.com/metatool-ai/metamcp/issues). If you are not sure which side a problem belongs to, open it here and we will route it.
+
+When reporting a bug, include how you are running the fork (prebuilt image tag or commit, the repo's compose file or your own), the exact error text, and what you expected. Redact secrets and internal hostnames.
+
+## Development setup
+
+1. Clone the repository. `umbrella` is the default branch, so a plain clone lands on the deployable line:
    ```bash
-   git clone https://github.com/metatool-ai/metamcp.git
+   git clone https://github.com/Umbrella-IT-Group/metamcp.git
    cd metamcp
    ```
 
@@ -15,7 +24,7 @@ We welcome contributions to MetaMCP! This guide will help you get started.
    pnpm install
    ```
 
-3. Set up environment:
+3. Set up the environment. Read the comments in `example.env` first: `POSTGRES_PASSWORD`, `BETTER_AUTH_SECRET`, and the bootstrap account have placeholders, not usable defaults.
    ```bash
    cp example.env .env
    ```
@@ -24,9 +33,10 @@ We welcome contributions to MetaMCP! This guide will help you get started.
    ```bash
    pnpm dev
    ```
-### **🐳 Docker Development with Hot Reload**
 
-For development with Docker that includes hot reloading for both frontend and backend:
+### Docker development with hot reload
+
+For development in Docker with hot reloading for both frontend and backend:
 
 ```bash
 # Start development environment with hot reload
@@ -39,17 +49,17 @@ pnpm run dev:docker:down
 pnpm run dev:docker:clean
 ```
 
-**Features:**
-- 🔄 **Hot Reload**: Both frontend (Next.js) and backend (Express) automatically reload on code changes
-- 🐳 **Containerized**: Full development environment in Docker with PostgreSQL
-- 📊 **Ports**: Frontend on 12008, Backend on 12009, PostgreSQL on 9433
-- 🛠️ **Development Tools**: Includes all necessary development dependencies and tools
+What you get:
+- Hot reload for the frontend (Next.js) and the backend (Express) on code changes
+- A full containerized environment with PostgreSQL
+- Ports: frontend on 12008, backend on 12009, PostgreSQL on 9433
+- All development dependencies and tools inside the container
 
-**Requirements:**
+Requirements:
 - Docker and Docker Compose installed
-- `.env` file configured (copy from `example.env`)
+- A `.env` file (copy from `example.env`)
 
-**Note:** The first run may take longer as it builds the development image. Subsequent runs will be faster.
+The first run builds the development image and takes longer. Later runs are faster.
 
 ## OpenID Connect (OIDC) Provider Setup
 
@@ -100,27 +110,29 @@ Once configured, users will see a "Login with OIDC" button on the login page. Th
 
 Enable debug logging by setting the auth logger level in `apps/backend/src/auth.ts` to see detailed OIDC flow information.
 
-## How to Contribute
+## How to contribute
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature-name`
-3. Make your changes
-4. Test your changes
-5. Commit your changes: `git commit -m "Description of changes"`
-6. Push to your fork: `git push origin feature/your-feature-name`
-7. Open a Pull Request
+1. Fork the repository and branch off `umbrella`.
+2. Make the change. Tests and documentation land in the same change as the code.
+3. Run what CI runs before you push:
+   ```bash
+   pnpm install --frozen-lockfile
+   pnpm --filter @repo/zod-types build
+   pnpm --filter @repo/trpc build
+   pnpm -C apps/backend test
+   pnpm -C apps/frontend test
+   ```
+   `pnpm check-types` and `pnpm lint` from the repo root are worth running too.
+4. Open a pull request against `umbrella`. Say what changed, why, and how you verified it. We squash-merge, so the PR title becomes the commit subject.
+5. Add a row to the "Our own patches" table in [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) describing the change, or ask in the PR and we will add it.
 
-## Pull Request Guidelines
+## Pull request guidelines
 
-- Provide a clear description of the changes
-- Explain how to test (human test is fine)
-
-## Issues
-
-- Use GitHub Issues to report bugs or request features
-- Search existing issues before creating new ones
-- Provide detailed information and reproduction steps for bugs
+- One concern per pull request.
+- No secrets, internal hostnames, or credentials in code, comments, tests, or commit messages.
+- Fixes that are not specific to this fork are candidates for upstream. We carry them here in the meantime and are glad to help you file them against metatool-ai/metamcp.
+- Every workflow `uses:` is pinned to a commit SHA and the Dockerfile base image to a digest; a test guards this. Keep new pins in the same form.
 
 ## License
 
-By contributing to MetaMCP, you agree that your contributions will be licensed under the MIT License. 
+By contributing, you agree that your contributions are licensed under the MIT License, the same license as upstream MetaMCP.

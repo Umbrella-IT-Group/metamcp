@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in the fork does not work as documented
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two routing notes before you start: security weaknesses do not belong here (use the private advisory linked from SECURITY.md), and problems in upstream MetaMCP that are not specific to this fork can go to metatool-ai/metamcp. If you are not sure which side a problem is on, file it here and we will route it.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Image tag or digest, or the commit you built from
+      placeholder: ghcr.io/umbrella-it-group/metamcp:latest, or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: how-running
+    attributes:
+      label: How are you running it?
+      options:
+        - Prebuilt image with the repo's docker-compose.yml
+        - Prebuilt image with my own compose file or orchestrator
+        - Built from source
+        - Local development (pnpm dev)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: The exact error text, with secrets and internal hostnames redacted
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Container logs or browser console output. This field is rendered as code automatically.
+      render: shell

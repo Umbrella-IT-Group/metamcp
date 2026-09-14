@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/Umbrella-IT-Group/metamcp/security/advisories/new
+    about: Do not file security weaknesses as public issues. Open a private advisory; SECURITY.md has the details.
+  - name: Questions and ideas
+    url: https://github.com/Umbrella-IT-Group/metamcp/discussions
+    about: Anything that is not a bug report or a concrete feature request.
+  - name: Upstream MetaMCP issues
+    url: https://github.com/metatool-ai/metamcp/issues
+    about: Problems in upstream MetaMCP that are not specific to this fork. Not sure? File here and we will route it.

@@ -196,8 +196,8 @@ table created by a future migration starts out fully writable by the runtime rol
 append-only table must be added to the revoke list in `scripts/ensure-runtime-role.sh`; a test
 asserts that every table a migration protects with an immutability trigger appears there.
 
-See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record, and [`SECURITY.md`](SECURITY.md)
-to report an issue. Several of these items apply to upstream unchanged; we coordinate them privately
+See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record. Report a security weakness through
+[`SECURITY.md`](SECURITY.md), and anything else through [GitHub Issues](https://github.com/Umbrella-IT-Group/metamcp/issues). Several of these items apply to upstream unchanged; we coordinate them privately
 with the upstream maintainers before any public detail.
 
 ## Where we diverged from upstream
@@ -236,7 +236,7 @@ Upstream community resources (Discord, docs, DeepWiki) live at [`metatool-ai/met
 docker pull ghcr.io/umbrella-it-group/metamcp:latest
 ```
 
-Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64 and published on every push to `umbrella`.
+Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64, public (no registry login needed), and published on every push to `umbrella`. If the pull is denied, the package visibility has regressed; please [open an issue](https://github.com/Umbrella-IT-Group/metamcp/issues).
 
 ### Build from source with Docker Compose
 
@@ -459,7 +459,7 @@ sequenceDiagram
 
 ## Contributing and upstreaming
 
-Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). PRs target `umbrella`, squash-merged after review and gates.
+Contributions welcome. Bugs and feature requests go to [GitHub Issues](https://github.com/Umbrella-IT-Group/metamcp/issues), questions to [Discussions](https://github.com/Umbrella-IT-Group/metamcp/discussions), and security reports through [`SECURITY.md`](SECURITY.md). [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup and the pull request flow: PRs target `umbrella` and are squash-merged after review and gates.
 
 When a patch is generic (a bug fix or config option that isn't Umbrella-specific), branch off `main`, open it against `metatool-ai/metamcp`, and once merged upstream we drop our private carry. [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) tracks the full cherry-pick log, which of our patches converged upstream, and the upstreaming backlog.
 

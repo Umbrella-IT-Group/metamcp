@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a change or addition to the fork
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This fork has a deliberate single-tenant posture and a documented list of upstream features it declines (README, "Where we diverged from upstream"). Requests that fit that posture are welcome. Requests that fit upstream better are welcome too; we will say so and point you there.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I checked whether this belongs upstream (metatool-ai/metamcp) rather than in this fork
