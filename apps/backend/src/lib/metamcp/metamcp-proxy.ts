@@ -139,6 +139,11 @@ export const createServer = async (
     return false;
   };
 
+  // Namespace description surfaces as MCP `instructions` so clients show
+  // a human-readable summary of what this namespace offers. Null-safe:
+  // field omitted when no description set. (Ported from ai-dev 2c696db.)
+  const namespace = await namespacesRepository.findByUuid(namespaceUuid);
+
   const server = new Server(
     {
       name: `metamcp-unified-${namespaceUuid}`,
@@ -152,6 +157,7 @@ export const createServer = async (
       // the advertised set actually changed across a restart. Mutate
       // the constant, not this declaration.
       capabilities: GATEWAY_CAPABILITIES,
+      instructions: namespace?.description ?? undefined,
     },
   );
 
