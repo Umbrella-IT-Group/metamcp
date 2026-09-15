@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { notFound, useRouter } from "next/navigation";
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { EditMcpServer } from "@/components/edit-mcp-server";
@@ -160,8 +160,13 @@ export default function McpServerDetailPage({
     ),
   });
 
-  // Auto-connect when hook is enabled and not already connected
+  // Auto-connect when hook is enabled and not already connected.
+  // Guarded against React Strict Mode double-invocation: without the ref,
+  // both fires race two concurrent OAuth registrations and the browser/DB
+  // disagree on client_id. (ai-dev 89592bb.)
+  const didAutoConnect = useRef(false);
   useEffect(() => {
+    if (didAutoConnect.current) return;
     if (
       connection &&
       server &&
@@ -169,6 +174,7 @@ export default function McpServerDetailPage({
       server.error_status !== McpServerErrorStatusEnum.enum.ERROR &&
       connection.connectionStatus === "disconnected"
     ) {
+      didAutoConnect.current = true;
       connection.connect();
     }
   }, [server, connection, isLoading]);

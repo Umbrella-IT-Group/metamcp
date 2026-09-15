@@ -282,6 +282,8 @@ export function NamespacesList() {
             <Input
               placeholder={t("namespaces.searchPlaceholder")}
               className="pl-8"
+              value=""
+              readOnly
               disabled
             />
           </div>
@@ -305,6 +307,8 @@ export function NamespacesList() {
             <Input
               placeholder={t("namespaces.searchPlaceholder")}
               className="pl-8"
+              value=""
+              readOnly
               disabled
             />
           </div>

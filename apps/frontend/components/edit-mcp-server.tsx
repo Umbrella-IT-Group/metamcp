@@ -287,7 +287,7 @@ export function EditMcpServer({
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-[500px]">
+      <DialogContent className="sm:max-w-[500px] max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{t("mcp-servers:editServer")}</DialogTitle>
           <DialogDescription>

@@ -9,6 +9,25 @@ import { getServerSpecificKey, SESSION_KEYS } from "../lib/constants";
 import { createAuthProvider } from "../lib/oauth-provider";
 import { vanillaTrpcClient } from "../lib/trpc";
 
+// Drop every sessionStorage entry the SDK used during the pre-redirect
+// half of the flow. Called from both the success and the error paths so a
+// failed exchange leaves no stale state to confuse a retry. (ai-dev 3f8e88b.)
+function clearOAuthSessionKeys(serverUrl: string | null): void {
+  if (serverUrl) {
+    sessionStorage.removeItem(
+      getServerSpecificKey(SESSION_KEYS.CLIENT_INFORMATION, serverUrl),
+    );
+    sessionStorage.removeItem(
+      getServerSpecificKey(SESSION_KEYS.TOKENS, serverUrl),
+    );
+    sessionStorage.removeItem(
+      getServerSpecificKey(SESSION_KEYS.CODE_VERIFIER, serverUrl),
+    );
+  }
+  sessionStorage.removeItem(SESSION_KEYS.SERVER_URL);
+  sessionStorage.removeItem(SESSION_KEYS.MCP_SERVER_UUID);
+}
+
 const OAuthCallback = () => {
   const { t } = useTranslations();
   const hasProcessedRef = useRef(false);
@@ -30,6 +49,7 @@ const OAuthCallback = () => {
 
       if (!code || !serverUrl || !mcpServerUuid) {
         console.error("Missing required OAuth parameters");
+        clearOAuthSessionKeys(serverUrl);
         window.location.href = "/mcp-servers";
         return;
       }
@@ -76,16 +96,13 @@ const OAuthCallback = () => {
         });
 
         // Clean up session storage
-        sessionStorage.removeItem(clientInformationKey);
-        sessionStorage.removeItem(tokensKey);
-        sessionStorage.removeItem(codeVerifierKey);
-        sessionStorage.removeItem(SESSION_KEYS.SERVER_URL);
-        sessionStorage.removeItem(SESSION_KEYS.MCP_SERVER_UUID);
+        clearOAuthSessionKeys(serverUrl);
 
         // Redirect back to the MCP server detail page
         window.location.href = `/mcp-servers/${mcpServerUuid}`;
       } catch (error) {
         console.error("OAuth callback error:", error);
+        clearOAuthSessionKeys(serverUrl);
         window.location.href = "/mcp-servers";
       }
     };
