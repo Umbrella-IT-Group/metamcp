@@ -8,7 +8,7 @@ import {
   NONCE_HEADER,
 } from "./lib/security-headers";
 
-const locales = ["en", "zh", "ko"];
+const locales = ["en", "zh", "ko", "pt", "es"];
 const defaultLocale = "en";
 
 // Get the preferred locale from the request
@@ -40,6 +40,16 @@ function getLocale(request: NextRequest): string {
     // Look for ko in accept-language
     if (acceptLanguage.includes("ko")) {
       return "ko";
+    }
+
+    // Look for pt in accept-language (ai-dev c870b83)
+    if (acceptLanguage.includes("pt")) {
+      return "pt";
+    }
+
+    // Look for es in accept-language (ai-dev c870b83)
+    if (acceptLanguage.includes("es")) {
+      return "es";
     }
   }
 
