@@ -23,6 +23,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // doesn't need a postgres or a real upstream MCP.
 vi.mock("./client", () => ({
   connectMetaMcpClient: vi.fn(),
+  // Live Set mirroring the real module's oauthAwaitingAuth latch so
+  // park/unpark paths behave truthfully under test.
+  oauthAwaitingAuth: new Set(),
 }));
 vi.mock("../config.service", () => ({
   configService: {

@@ -260,6 +260,26 @@ const createPoolGuardedFetch = (): FetchLike =>
     allowPrivateAddresses: true,
     refuseCrossOriginRedirect: true,
   });
+// STDIO subprocesses awaiting browser OAuth consent (mcp-remote prints
+// authorize instructions, sits on localhost callback). Parked uuids are
+// alive waiting on the user, not dead: pool must not kill/respawn (fresh
+// process mints new PKCE, invalidates open consent page). Cleared on
+// success or explicit reconnect.
+export const oauthAwaitingAuth = new Set<string>();
+
+// Bounded per-server stderr tail feeding the OAuth-wait classifier.
+const oauthStderrTail = new Map<string, string>();
+const STDERR_TAIL_MAX = 4096;
+
+// Browser-consent wait markers printed by mcp-remote and compatible
+// OAuth shims. Narrow on purpose: generic ECONNREFUSED/exit failure
+// keeps the normal retry path.
+const OAUTH_WAIT_PATTERNS = [
+  /authorize this client/i,
+  /paste the .*url.*into your browser/i,
+  /waiting for authorization/i,
+  /oauth.*callback.*listening on/i,
+];
 
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
@@ -287,11 +307,13 @@ export const createMetaMcpClient = (
       const stderrStream = (transport as ProcessManagedStdioTransport).stderr;
 
       stderrStream?.on("data", (chunk: Buffer) => {
-        metamcpLogStore.addLog(
-          serverParams.name,
-          "error",
-          chunk.toString().trim(),
+        const text = chunk.toString();
+        const prev = oauthStderrTail.get(serverParams.uuid) ?? "";
+        oauthStderrTail.set(
+          serverParams.uuid,
+          (prev + text).slice(-STDERR_TAIL_MAX),
         );
+        metamcpLogStore.addLog(serverParams.name, "error", text.trim());
       });
 
       stderrStream?.on("error", (error: Error) => {
@@ -782,6 +804,24 @@ export const connectMetaMcpClient = async (
           message: `Connect attempt ${count + 1}/${maxAttempts} failed — ${describeConnectError(error)}`,
           error,
         });
+      }
+
+      // OAuth-wait park: STDIO subprocess printing browser-consent
+      // instructions is waiting on the user, not a failed backend.
+      // Leave process alive, latch uuid so pool stops recreating it,
+      // return without counting a retry.
+      const isStdioServerType =
+        !serverParams.type || serverParams.type === "STDIO";
+      if (isStdioServerType) {
+        const tail = oauthStderrTail.get(serverParams.uuid) ?? "";
+        if (tail && OAUTH_WAIT_PATTERNS.some((re) => re.test(tail))) {
+          oauthAwaitingAuth.add(serverParams.uuid);
+          logger.info(
+            `[oauth] ${serverParams.name} (${serverParams.uuid}) awaiting browser consent - parking connect loop, leaving subprocess alive`,
+          );
+          return undefined;
+        }
+        oauthStderrTail.delete(serverParams.uuid);
       }
 
       // CRITICAL FIX: Clean up transport/process on connection failure

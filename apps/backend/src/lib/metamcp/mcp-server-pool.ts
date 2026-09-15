@@ -13,7 +13,11 @@ import logger from "@/utils/logger";
 // fully mocked in that test, so this is the only live db import the pool has.
 import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
-import { ConnectedClient, connectMetaMcpClient } from "./client";
+import {
+  ConnectedClient,
+  connectMetaMcpClient,
+  oauthAwaitingAuth,
+} from "./client";
 import { serverErrorTracker } from "./server-error-tracker";
 import { toolsSyncCache } from "./tools-sync-cache";
 
@@ -547,6 +551,8 @@ export class McpServerPool {
     // success cycle lands within the threshold, we'll clear the
     // circuit breaker accumulation.
     this.markServerSuccess(params.uuid);
+    // Consent completed (or a fresh process connected): unpark.
+    oauthAwaitingAuth.delete(params.uuid);
 
     return connectedClient;
   }
@@ -621,6 +627,14 @@ export class McpServerPool {
       return;
     }
 
+    // Don't recreate a subprocess parked awaiting interactive browser OAuth
+    // consent (client.ts oauthAwaitingAuth): it is alive and waiting on the
+    // user, not dead. Recreating rotates the PKCE challenge and invalidates
+    // the consent page. Cleared on success or explicit reconnect.
+    if (oauthAwaitingAuth.has(serverUuid)) {
+      return;
+    }
+
     // Don't create if at per-server cap (#260) — happens before the
     // generation-tracking guard from #273 to short-circuit cap-blocked
     // calls without entering the concurrency-protected critical section.
@@ -677,6 +691,11 @@ export class McpServerPool {
       this.idleSessions[serverUuid] ||
       this.creatingIdleSessions.has(serverUuid)
     ) {
+      return;
+    }
+
+    // Same OAuth-wait park as the blocking variant above.
+    if (oauthAwaitingAuth.has(serverUuid)) {
       return;
     }
 
@@ -1156,6 +1175,9 @@ export class McpServerPool {
     this.idleSessionGenerations[serverUuid] =
       (this.idleSessionGenerations[serverUuid] ?? 0) + 1;
     this.creatingIdleSessions.delete(serverUuid);
+    // Explicit operator-initiated reconnect: unpark even an OAuth-waiting
+    // server so the fresh parameters take effect immediately.
+    oauthAwaitingAuth.delete(serverUuid);
 
     // Create a new idle session with updated parameters
     await this.createIdleSession(serverUuid, params, namespaceUuid);
@@ -1493,6 +1515,8 @@ export class McpServerPool {
   async resetServerErrorState(serverUuid: string): Promise<void> {
     // Reset crash attempts and error status
     await serverErrorTracker.resetServerErrorState(serverUuid);
+    // Admin error-reset is an explicit reconnect signal: unpark.
+    oauthAwaitingAuth.delete(serverUuid);
 
     logger.info(`Reset error state for server ${serverUuid}`);
   }
