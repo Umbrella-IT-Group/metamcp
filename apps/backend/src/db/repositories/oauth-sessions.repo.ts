@@ -57,22 +57,40 @@ export class OAuthSessionsRepository {
   }
 
   async upsert(input: OAuthSessionUpdateInput): Promise<DatabaseOAuthSession> {
-    // Check if session exists
-    const existingSession = await this.findByMcpServerUuid(
-      input.mcp_server_uuid,
-    );
+    // Single-statement atomic upsert. Concurrent callers for the same
+    // mcp_server_uuid resolve via ON CONFLICT instead of racing a
+    // SELECT-then-INSERT, which previously crashed the loser with a
+    // unique-constraint violation. Only fields present on `input` are written
+    // so a partial update (e.g. tokens only) does not clear unrelated columns
+    // such as code_verifier.
+    const [row] = await db
+      .insert(oauthSessionsTable)
+      .values({
+        mcp_server_uuid: input.mcp_server_uuid,
+        ...(input.client_information && {
+          client_information: input.client_information,
+        }),
+        ...(input.tokens && { tokens: input.tokens }),
+        ...(input.code_verifier && { code_verifier: input.code_verifier }),
+      })
+      .onConflictDoUpdate({
+        target: oauthSessionsTable.mcp_server_uuid,
+        set: {
+          ...(input.client_information && {
+            client_information: input.client_information,
+          }),
+          ...(input.tokens && { tokens: input.tokens }),
+          ...(input.code_verifier && { code_verifier: input.code_verifier }),
+          updated_at: sql`NOW()`,
+        },
+      })
+      .returning();
 
-    if (existingSession) {
-      // Update existing session
-      const updatedSession = await this.update(input);
-      if (!updatedSession) {
-        throw new Error("Failed to update OAuth session");
-      }
-      return updatedSession;
-    } else {
-      // Create new session
-      return await this.create(input);
+    if (!row) {
+      throw new Error("Failed to upsert OAuth session");
     }
+
+    return row;
   }
 
   async deleteByMcpServerUuid(

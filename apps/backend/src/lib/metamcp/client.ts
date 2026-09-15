@@ -18,6 +18,8 @@ import {
 } from "../m365/errors";
 import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { recordConnectBrokerFailure } from "../m365/request-context";
+import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
+import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
@@ -804,6 +806,65 @@ export const connectMetaMcpClient = async (
           await client.close();
         } catch {
           // Client may not be fully initialized, ignore.
+        }
+      }
+
+      // Refresh-on-401: if the upstream MCP server returned an
+      // unauthorized response and we have a refresh_token on file, try a
+      // server-to-server refresh once before counting this as a retry. On
+      // success the next loop iteration rebuilds the transport using the
+      // freshly-rotated access_token; on failure we fall through to the
+      // normal retry/back-off below. MUST run before `count++`/`retry`
+      // decrement -- an expired access_token surfaces as a 401 during
+      // `initialize`, and skipping this just retries with the same dead
+      // token until `maxAttempts` exhausts.
+      //
+      // ponytail: the post-auth-race recovery helper (10s-window retry
+      // right after a fresh token exchange, `oauth-upstream/retry-post-auth`)
+      // is not wired in here -- it needs `attemptConnect` extracted into a
+      // reusable callback, which this function doesn't have. Add it if the
+      // "empty body/ECONNREFUSED immediately after OAuth callback" symptom
+      // is actually observed against this pool.
+      const isHttpServerType =
+        serverParams.type === "SSE" || serverParams.type === "STREAMABLE_HTTP";
+      if (
+        isHttpServerType &&
+        serverParams.oauth_tokens?.refresh_token &&
+        isUpstreamUnauthorizedError(error)
+      ) {
+        try {
+          const refresh = await tryRefreshUpstreamTokens(serverParams);
+          if (refresh.status === "refreshed" && refresh.tokens) {
+            serverParams.oauth_tokens = {
+              access_token: refresh.tokens.access_token,
+              token_type: refresh.tokens.token_type,
+              expires_in: refresh.tokens.expires_in,
+              scope:
+                typeof refresh.tokens.scope === "string"
+                  ? refresh.tokens.scope
+                  : undefined,
+              refresh_token:
+                typeof refresh.tokens.refresh_token === "string"
+                  ? refresh.tokens.refresh_token
+                  : undefined,
+            };
+            logger.info(
+              `[oauth] upstream 401 refreshed for ${serverParams.name} (${serverParams.uuid}); retrying connect`,
+            );
+            // Refresh is the recovery, not a backoff-worthy failure.
+            continue;
+          }
+          logger.warn(
+            `[oauth] upstream 401 refresh did not recover ${serverParams.name} ` +
+              `(${serverParams.uuid}): ${refresh.status}${
+                refresh.error ? ` (${refresh.error})` : ""
+              }`,
+          );
+        } catch (refreshError) {
+          logger.error(
+            `[oauth] upstream 401 refresh threw for ${serverParams.name} (${serverParams.uuid}):`,
+            refreshError,
+          );
         }
       }
 
