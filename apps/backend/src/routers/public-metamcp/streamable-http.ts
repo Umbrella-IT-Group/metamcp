@@ -393,12 +393,41 @@ export async function dispatchTracked(
  * DESIGN (pinned by test); do not add an acts-as branch there without a
  * new security review.
  */
+// Codex (and some other clients) send an `Accept` header missing either
+// `application/json` or `text/event-stream`. The SDK validates the header
+// and returns 406 otherwise. Normalize once at the single dispatch choke
+// point so every GET/POST path is covered. (Ported from ai-dev e923f95.)
+function normalizeStreamableHttpAcceptHeader(req: express.Request) {
+  // req.headers is always present on a real express request. Unit-test
+  // doubles stub only the fields under test, so bail when there is no
+  // headers object at all rather than fabricating one.
+  if (!req.headers) return;
+  const acceptHeader = req.headers.accept;
+  const acceptsJson =
+    typeof acceptHeader === "string" &&
+    acceptHeader.includes("application/json");
+  const acceptsEventStream =
+    typeof acceptHeader === "string" &&
+    acceptHeader.includes("text/event-stream");
+
+  if (!acceptsJson || !acceptsEventStream) {
+    req.headers.accept = "application/json, text/event-stream";
+  }
+}
+
 function handleRequestWithUserContext(
   authReq: ApiKeyAuthenticatedRequest,
   transport: StreamableHTTPServerTransport,
   req: express.Request,
   res: express.Response,
 ): Promise<void> {
+  normalizeStreamableHttpAcceptHeader(req);
+  // Codex compat: POST responses are plain JSON (not SSE). Forcing the
+  // content type keeps clients that sniff it from misreading the body.
+  // GET stays untouched — it is a long-lived event-stream.
+  if (req.method === "POST" && typeof res.type === "function") {
+    res.type("application/json");
+  }
   const context =
     authReq.authMethod === "oauth" && authReq.oauthUserId
       ? { userId: authReq.oauthUserId }
@@ -1076,6 +1105,9 @@ streamableHttpRouter.post(
 
         // Create transport with the predetermined session ID
         const transport = new StreamableHTTPServerTransport({
+          // Codex compat: respond with plain JSON instead of SSE
+          // (ai-dev e923f95).
+          enableJsonResponse: true,
           sessionIdGenerator: () => newSessionId,
           onsessioninitialized: async (sessionId) => {
             try {
