@@ -55,7 +55,10 @@ export interface RequestWithSessionRecoveryOptions<T> {
  *
  * `tools/call` and the dynamic-find path in `metamcp-proxy.ts` have had
  * this cascade since PR #13/#16; the OpenAPI bridge since its own
- * regression fix. The aggregate list handlers were the remaining gap:
+ * regression fix. (`tools/call` has since been narrowed to replay only on
+ * `isToolCallReplaySafeError`, because it is not idempotent; this helper
+ * is for list requests, which are.) The aggregate list handlers were the
+ * remaining gap:
  * their catch blocks logged-and-continued, so a dead pooled session
  * (e.g. after a Watchtower swap of the backend container) made the
  * namespace return a "successful" 0-tool response on every request,

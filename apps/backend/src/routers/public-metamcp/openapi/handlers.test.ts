@@ -12,13 +12,20 @@
  *
  *   1. tools/call recovers from the session-lost envelope (invalidate
  *      → re-init → retry once → return success).
- *   2. tools/call does NOT retry on a non-recoverable error.
+ *   2. tools/call does NOT retry on a non-recoverable error, nor on any
+ *      failure after which the backend may have run the call (timeout,
+ *      mid-call drop, 5xx, a backend-answered McpError).
  *   3. tools/list recovers from the session-lost envelope.
  *   4. The retried-and-still-failed case propagates the retry error.
  */
 
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  CallToolResult,
+  ErrorCode,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // db/index.ts throws at import if DATABASE_URL is unset — stub the
 // whole module so transitive imports don't blow up the test.
@@ -225,6 +232,86 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
       ),
     ).rejects.toThrow(/failed to re-initialize/);
 
+    expect(invalidateServerConnectionMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A tools/call is not idempotent, so the bridge replays one only when the
+// failure proves the backend never ran it. The 2026-09-30 double delete was a
+// timeout (-32001) read as session-lost and re-sent.
+describe("OpenAPI bridge: tools/call replay guard", () => {
+  const callRequest = {
+    method: "tools/call" as const,
+    params: { name: "autotask__autotask_resolve_id", arguments: {} },
+  };
+  const context = { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" };
+
+  beforeEach(() => {
+    invalidateServerConnectionMock.mockReset();
+    getSessionMock.mockReset();
+  });
+
+  // A failing replay case leaves its unconsumed mockResolvedValueOnce queued,
+  // and the next block only clears mocks, so reset here to keep a failure
+  // reported against the test that caused it.
+  afterEach(() => {
+    invalidateServerConnectionMock.mockReset();
+    getSessionMock.mockReset();
+  });
+
+  it.each([
+    [
+      "a request timeout (-32001)",
+      new McpError(ErrorCode.RequestTimeout, "Request timed out", {
+        timeout: 60000,
+      }),
+    ],
+    [
+      "a connection dropped mid-call (-32000)",
+      new McpError(ErrorCode.ConnectionClosed, "Connection closed"),
+    ],
+    [
+      "a backend-answered -32603 'Not connected'",
+      new McpError(ErrorCode.InternalError, "Not connected"),
+    ],
+    [
+      "a 5xx answer to the POST",
+      new StreamableHTTPError(502, "Error POSTing to endpoint: Bad Gateway"),
+    ],
+  ])("surfaces %s with no replay", async (_label, failure) => {
+    const stale = makeFakeSession(vi.fn().mockRejectedValueOnce(failure));
+    getSessionMock.mockResolvedValueOnce(stale);
+
+    const handler = createOriginalCallToolHandler();
+    await expect(handler(callRequest, context)).rejects.toBe(failure);
+
+    expect(stale.client.request).toHaveBeenCalledTimes(1);
+    expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
+    expect(getSessionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      "an HTTP 404 'Session not found' StreamableHTTPError",
+      new StreamableHTTPError(
+        404,
+        'Error POSTing to endpoint: {"jsonrpc":"2.0","error":{"code":-32001,"message":"Session not found"},"id":null}',
+      ),
+    ],
+    ["the SDK's pre-send 'Not connected'", new Error("Not connected")],
+  ])("replays once after %s", async (_label, failure) => {
+    const successResult: CallToolResult = {
+      content: [{ type: "text", text: "ok" }],
+    };
+    const stale = makeFakeSession(vi.fn().mockRejectedValueOnce(failure));
+    const fresh = makeFakeSession(vi.fn().mockResolvedValueOnce(successResult));
+    getSessionMock.mockResolvedValueOnce(stale).mockResolvedValueOnce(fresh);
+
+    const handler = createOriginalCallToolHandler();
+    await expect(handler(callRequest, context)).resolves.toEqual(successResult);
+
+    expect(stale.client.request).toHaveBeenCalledTimes(1);
+    expect(fresh.client.request).toHaveBeenCalledTimes(1);
     expect(invalidateServerConnectionMock).toHaveBeenCalledTimes(1);
   });
 });
