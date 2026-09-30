@@ -131,7 +131,7 @@ describe("isBackendSessionLostError", () => {
 
   // -32001 is also the SDK's ErrorCode.RequestTimeout. Classing a timeout
   // as session-lost made tools/call re-send a call the backend may already
-  // have run (the 2026-09-30 double delete). The code alone is never enough.
+  // have run (found in the 2026-09-30 audit). The code alone is never enough.
   it("does not match the SDK's request-timeout McpError (-32001 'Request timed out')", () => {
     const timeout = new McpError(
       ErrorCode.RequestTimeout,
@@ -273,6 +273,25 @@ describe("isToolCallReplaySafeError", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it.each([
+    new StreamableHTTPError(
+      502,
+      "Error POSTing to endpoint: downstream failed (HTTP 404): Session not found",
+    ),
+    new Error(
+      "Error POSTing to endpoint (HTTP 500): downstream failed (HTTP 404): Session not found",
+    ),
+    new StreamableHTTPError(
+      -1,
+      'Unexpected content type: text/plain; detail="HTTP 404 Session not found"',
+    ),
+    new Error(
+      "Dispatch failed: Error POSTing to endpoint (HTTP 404): Session not found",
+    ),
+  ])("refuses a 404 marker embedded in another failure: %s", (error) => {
+    expect(isToolCallReplaySafeError(error)).toBe(false);
   });
 
   it("refuses an HTTP 404 that does not name the session", () => {
@@ -460,35 +479,71 @@ describe("classification of real MCP SDK failures", () => {
     expect(isRecoverableBackendError(error)).toBe(true);
   });
 
-  it("a real streamable-http 404 'Session not found' is session-lost and replay-safe", async () => {
-    let executions = 0;
-    const serverTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-    });
-    await newBackend(async () => {
-      executions += 1;
-      return { content: [] };
-    }).connect(serverTransport);
-    const base = await listen((req, res) => {
-      void serverTransport.handleRequest(req, res);
-    });
-    const client = new Client({ name: "gateway", version: "1.0.0" });
-    await client.connect(
-      new StreamableHTTPClientTransport(new URL("/mcp", base)),
-    );
-    cleanups.push(() => client.close());
+  it.each(["json", "text"])(
+    "a real streamable-http 404 with a %s body is session-lost and replay-safe",
+    async (format) => {
+      let executions = 0;
+      let sessionKnown = true;
+      const serverTransport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+      });
+      await newBackend(async () => {
+        executions += 1;
+        return { content: [] };
+      }).connect(serverTransport);
+      const base = await listen((req, res) => {
+        if (!sessionKnown && format === "text") {
+          res.writeHead(404).end("Session not found");
+          return;
+        }
+        void serverTransport.handleRequest(req, res);
+      });
+      const client = new Client({ name: "gateway", version: "1.0.0" });
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL("/mcp", base)),
+      );
+      cleanups.push(() => client.close());
 
-    // The backend drops its session (a restart or an idle reap). The SDK
-    // server then answers every POST for it with 404 -32001 "Session not
-    // found" before any handler runs.
-    await serverTransport.close();
-    const error = await rejectionOf(callTool(client));
+      // The backend drops its session (a restart or an idle reap). The SDK
+      // server then answers every POST for it with 404 -32001 "Session not
+      // found" before any handler runs.
+      await serverTransport.close();
+      sessionKnown = false;
+      const error = await rejectionOf(callTool(client));
+
+      expect(error).toBeInstanceOf(StreamableHTTPError);
+      expect((error as StreamableHTTPError).code).toBe(404);
+      expect(executions).toBe(0);
+      expect(isBackendSessionLostError(error)).toBe(true);
+      expect(isToolCallReplaySafeError(error)).toBe(true);
+    },
+  );
+
+  it("a real streamable-http 502 cannot borrow replay permission from its body", async () => {
+    let executions = 0;
+    const base = await listen((_req, res) => {
+      executions += 1;
+      // A gateway can fail after a side effect and relay a downstream error.
+      // Only this POST's HTTP status says whether our session was refused.
+      res.writeHead(502).end("Downstream failed (HTTP 404): Session not found");
+    });
+    const transport = new StreamableHTTPClientTransport(new URL("/mcp", base));
+    await transport.start();
+    cleanups.push(() => transport.close());
+
+    const error = await rejectionOf(
+      transport.send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "delete_file", arguments: {} },
+      }),
+    );
 
     expect(error).toBeInstanceOf(StreamableHTTPError);
-    expect((error as StreamableHTTPError).code).toBe(404);
-    expect(executions).toBe(0);
-    expect(isBackendSessionLostError(error)).toBe(true);
-    expect(isToolCallReplaySafeError(error)).toBe(true);
+    expect((error as StreamableHTTPError).code).toBe(502);
+    expect(executions).toBe(1);
+    expect(isToolCallReplaySafeError(error)).toBe(false);
   });
 
   it("a real SSE 404 'Session not found' is session-lost and replay-safe", async () => {

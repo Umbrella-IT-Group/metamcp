@@ -5,9 +5,9 @@
  * SDKs also surface a JSON-RPC error body with code -32001 or -32600 and
  * message "Session not found".
  *
- * The MCP TypeScript SDK's StreamableHTTPClientTransport wraps this as a
- * generic Error whose message embeds the HTTP status and raw JSON-RPC body,
- * so we match on substrings. Example:
+ * The MCP TypeScript SDK's StreamableHTTPClientTransport carries the HTTP
+ * status in `.code` and the response body in its message. The SSE transport
+ * embeds both in a generic Error. Example:
  *
  *   Error POSTing to endpoint (HTTP 404):
  *   {"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
@@ -23,8 +23,8 @@
  *   1. Walks the `.cause` chain on Error inputs (max depth 8).
  *   2. Falls back to `String(error)` for non-Error throwables (some SDK
  *      paths reject with plain objects, McpError wrappers, or strings).
- *   3. Inspects a numeric/string `.code` field on object inputs (some
- *      RPC layers strip the message but preserve the code).
+ *   3. Inspects a numeric/string `.code` field alongside the session-not-found
+ *      message, including HTTP 404 responses with a plain-text body.
  *
  * When this fires, the cached backend connection is dead: MetaMCP must drop
  * it, send a new `initialize`, and replay the failed request. The MCP spec
@@ -43,8 +43,9 @@
  * `maxTotalTimeout` breach carries the same code. So the code is only ever a
  * confirming signal next to "Session not found", never a marker on its own.
  * Treating a bare -32001 as session-lost classed every 60 s timeout as a lost
- * session, and the tools/call path then re-sent the call, so a delete on a
- * client machine ran twice (found 2026-09-30).
+ * session, and the tools/call path then re-sent the call. This latent gateway
+ * retry was found while investigating a client-side double execution on
+ * 2026-09-30.
  */
 
 const SESSION_NOT_FOUND = "Session not found";
@@ -263,6 +264,26 @@ function isMcpErrorShape(error: Error): boolean {
   );
 }
 
+function isHttpSessionNotFoundError(error: Error): boolean {
+  if (!error.message.includes(SESSION_NOT_FOUND)) {
+    return false;
+  }
+
+  const status = (error as { code?: unknown }).code;
+  // Match the transport's own POST error, never a status quoted in the body.
+  // A 5xx can relay "HTTP 404: Session not found" from a downstream service
+  // after performing a side effect; replaying that request executes it twice.
+  if (status !== undefined) {
+    return (
+      status === 404 &&
+      error.message.startsWith(
+        "Streamable HTTP error: Error POSTing to endpoint: ",
+      )
+    );
+  }
+  return error.message.startsWith("Error POSTing to endpoint (HTTP 404): ");
+}
+
 /**
  * Decide whether a failed backend `tools/call` may be sent a second time.
  *
@@ -271,8 +292,8 @@ function isMcpErrorShape(error: Error): boolean {
  * most a duplicate read. A tool call is not: it can delete a file on a
  * client endpoint, reboot a machine or reset a password, and replaying one
  * the backend already ran executes it twice and loses the first result. A
- * double delete on a client machine was traced to exactly that on
- * 2026-09-30: a 60 s gateway timeout (-32001) was classed as session-lost
+ * client-side double execution prompted an audit on 2026-09-30 that found a
+ * separate gateway retry: a 60 s timeout (-32001) was classed as session-lost
  * and the call was re-sent. So this returns true only when the failure
  * PROVES the backend never executed the request:
  *
@@ -294,12 +315,12 @@ function isMcpErrorShape(error: Error): boolean {
  * request (a nested gateway relaying "-32603 Not connected" included).
  *
  * Only the error exactly as `client.request()` rejects is inspected, with no
- * `.cause` walk and no substring match: nothing wraps it on the tools/call
- * path, and a proof that has to be dug out of a wrapper or a rendered string
- * is not a proof. When the gateway cannot tell "never reached the backend"
- * from "sent and maybe executed", it must not replay. Do not widen this to
- * {@link isRecoverableBackendError}; that is the regression it exists to
- * prevent.
+ * `.cause` walk and no status substring match: nothing wraps it on the
+ * tools/call path, and a proof that has to be dug out of a wrapper or a
+ * rendered string is not a proof. When the gateway cannot tell "never reached
+ * the backend" from "sent and maybe executed", it must not replay. Do not
+ * widen this to {@link isRecoverableBackendError}; that is the regression it
+ * exists to prevent.
  */
 export function isToolCallReplaySafeError(error: unknown): boolean {
   if (!(error instanceof Error) || isMcpErrorShape(error)) {
@@ -313,9 +334,7 @@ export function isToolCallReplaySafeError(error: unknown): boolean {
   }
 
   // Case 1: an HTTP 404 answer carrying the session-not-found marker.
-  const status = (error as { code?: unknown }).code;
-  const answeredHttp404 = status === 404 || error.message.includes(HTTP_404);
-  return answeredHttp404 && error.message.includes(SESSION_NOT_FOUND);
+  return isHttpSessionNotFoundError(error);
 }
 
 export function isBackendSessionLostError(error: unknown): boolean {
@@ -333,6 +352,11 @@ export function isBackendSessionLostError(error: unknown): boolean {
   let depth = 0;
   while (current != null && depth < MAX_CAUSE_DEPTH) {
     if (current instanceof Error) {
+      // Streamable HTTP keeps 404 in `.code`, so a plain-text response has
+      // neither an HTTP status nor a JSON-RPC code inside its message.
+      if (isHttpSessionNotFoundError(current)) {
+        return true;
+      }
       if (current.message && stringMatchesSessionLost(current.message)) {
         return true;
       }

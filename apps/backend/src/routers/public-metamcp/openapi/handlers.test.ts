@@ -237,8 +237,8 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
 });
 
 // A tools/call is not idempotent, so the bridge replays one only when the
-// failure proves the backend never ran it. The 2026-09-30 double delete was a
-// timeout (-32001) read as session-lost and re-sent.
+// failure proves the backend never ran it. The 2026-09-30 audit found that a
+// timeout (-32001) was read as session-lost and re-sent.
 describe("OpenAPI bridge: tools/call replay guard", () => {
   const callRequest = {
     method: "tools/call" as const,
@@ -277,6 +277,19 @@ describe("OpenAPI bridge: tools/call replay guard", () => {
     [
       "a 5xx answer to the POST",
       new StreamableHTTPError(502, "Error POSTing to endpoint: Bad Gateway"),
+    ],
+    [
+      "a Streamable HTTP 502 body quoting a downstream session error",
+      new StreamableHTTPError(
+        502,
+        "Error POSTing to endpoint: downstream (HTTP 404): Session not found",
+      ),
+    ],
+    [
+      "an SSE HTTP 500 body quoting a downstream session error",
+      new Error(
+        "Error POSTing to endpoint (HTTP 500): downstream (HTTP 404): Session not found",
+      ),
     ],
   ])("surfaces %s with no replay", async (_label, failure) => {
     const stale = makeFakeSession(vi.fn().mockRejectedValueOnce(failure));

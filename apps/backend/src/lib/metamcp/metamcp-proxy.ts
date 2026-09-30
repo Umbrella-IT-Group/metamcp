@@ -778,9 +778,9 @@ export const createServer = async (
       // idempotent (a delete, a reboot, a password reset), so a timeout, a
       // connection dropped mid-call or a 5xx surfaces to the client instead:
       // the backend may have executed it, and a second send runs it twice.
-      // That is how a delete on a client machine ran twice (2026-09-30,
-      // a 60 s timeout's -32001 read as session-lost). Do not swap this back
-      // to isRecoverableBackendError; see isToolCallReplaySafeError.
+      // The 2026-09-30 client-side duplicate prompted finding this separate
+      // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
+      // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
       if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${

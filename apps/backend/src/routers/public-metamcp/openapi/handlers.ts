@@ -332,8 +332,9 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       // never ran it (HTTP 404 "Session not found", or a transport closed
       // before the send). A timeout, a mid-call drop or a 5xx surfaces
       // with no replay, because the backend may already have executed a
-      // non-idempotent tool and a second send runs it twice (the
-      // 2026-09-30 double delete). Same rule as metamcp-proxy.ts.
+      // non-idempotent tool and a second send runs it twice. Found while
+      // investigating the 2026-09-30 client-side duplicate; same rule as
+      // metamcp-proxy.ts.
       if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool ${JSON.stringify(name)} through ${

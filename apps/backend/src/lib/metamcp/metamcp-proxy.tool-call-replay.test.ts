@@ -1,22 +1,21 @@
 /**
  * tools/call replay guard in `metamcp-proxy.ts`, driven end to end.
  *
- * On 2026-09-30 a delete on a client machine ran twice: the gateway's
- * backend tools/call hit the 60 s MCP_TIMEOUT, the SDK rejected with
- * McpError -32001 "Request timed out", the session-lost detector read -32001
- * as a lost session, and the proxy invalidated the pool and re-sent the
- * call. A tool call is not idempotent, so the gateway now replays one only
+ * On 2026-09-30 a client-side retry ran a delete twice. The ensuing audit
+ * found a separate gateway retry: when a backend tools/call hit the 60 s
+ * MCP_TIMEOUT, the SDK rejected with McpError -32001 "Request timed out",
+ * the session-lost detector read -32001 as a lost session, and the proxy
+ * invalidated the pool and re-sent the call. A tool call is not idempotent,
+ * so the gateway now replays one only
  * when the failure proves the backend never ran it (HTTP 404 "Session not
  * found", or a transport already closed before the send).
  *
- * Everything here is the real MCP SDK: a consumer `Client` talks to the
- * gateway's own `Server` from `createServer`, and the pooled backend
- * sessions are SDK `Client`s connected to SDK backend `Server`s over
- * `InMemoryTransport`. The one exception is the HTTP 404 case, where the
- * stale session rejects with the SDK's own `StreamableHTTPError` because an
- * in-memory transport has no HTTP status (`session-error.test.ts` captures
- * that error from a real HTTP round trip). Each backend counts how many
- * times its tool actually executed, which is the property under test.
+ * A real SDK consumer `Client` talks to the gateway's own `Server` from
+ * `createServer`. Backend sessions use SDK `Client`s and `Server`s over
+ * `InMemoryTransport`, except HTTP failures: those use a pooled-session stub
+ * rejecting with the SDK's HTTP error shapes (`session-error.test.ts`
+ * captures real HTTP round trips). Real backends count tool executions;
+ * the HTTP stubs count tools/call requests to detect a replay.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -279,10 +278,17 @@ describe("metamcp-proxy tools/call: no replay once the call may have run", () =>
     expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
   });
 
-  it("does not replay a 5xx answer to the POST", async () => {
-    const stale = staleSession(
-      new StreamableHTTPError(502, "Error POSTing to endpoint: Bad Gateway"),
-    );
+  it.each([
+    new StreamableHTTPError(502, "Error POSTing to endpoint: Bad Gateway"),
+    new StreamableHTTPError(
+      502,
+      "Error POSTing to endpoint: Bad Gateway (HTTP 404): Session not found",
+    ),
+    new Error(
+      "Error POSTing to endpoint (HTTP 500): Bad Gateway (HTTP 404): Session not found",
+    ),
+  ])("does not replay a 5xx answer to the POST: %s", async (failure) => {
+    const stale = staleSession(failure);
     getSessionMock.mockResolvedValue(stale.session);
 
     const error = await rejectionOf(callTool(await connectConsumer()));
@@ -347,6 +353,47 @@ describe("metamcp-proxy tools/call: one replay when the call provably never ran"
 });
 
 describe("metamcp-proxy dynamic-find tools/list keeps its recovery", () => {
+  it("recovers a plain-text streamable-http 404 during tool discovery", async () => {
+    const stale = await realBackend(async () => deleted);
+    const listRequest = vi
+      .spyOn(stale.session.client, "request")
+      .mockRejectedValueOnce(
+        new StreamableHTTPError(
+          404,
+          "Error POSTing to endpoint: Session not found",
+        ),
+      );
+    const fresh = await realBackend(async () => deleted);
+    getSessionMock
+      .mockResolvedValueOnce(stale.session)
+      .mockResolvedValueOnce(fresh.session);
+
+    const result = await callTool(await connectConsumer());
+
+    expect(result.content).toEqual(deleted.content);
+    expect(listRequest.mock.calls[0]?.[0].method).toBe("tools/list");
+    expect(stale.executions()).toBe(0);
+    expect(fresh.executions()).toBe(1);
+    expect(invalidateServerConnectionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a usable session after a tools/list timeout", async () => {
+    const target = await realBackend(async () => deleted);
+    vi.spyOn(target.session.client, "request").mockRejectedValueOnce(
+      new McpError(ErrorCode.RequestTimeout, "Request timed out"),
+    );
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+
+    await expect(callTool(consumer)).rejects.toThrow("Unknown tool");
+    expect(target.executions()).toBe(0);
+    // A timed-out read does not imply a lost session. A subsequent lookup
+    // can succeed on the same client without disrupting other callers.
+    expect((await callTool(consumer)).content).toEqual(deleted.content);
+    expect(target.executions()).toBe(1);
+    expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
+  });
+
   it("still invalidates and retries the list on a dead pooled transport", async () => {
     // tools/list is idempotent, so it keeps the broad detector: a closed
     // transport on the routing lookup is recovered, and the tool call then
