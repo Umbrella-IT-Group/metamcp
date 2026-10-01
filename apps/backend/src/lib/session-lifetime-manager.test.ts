@@ -20,6 +20,13 @@ vi.mock("@/utils/logger", () => ({
 // TTL path, but the import graph still resolves it.
 vi.mock("@/db", () => ({ db: {}, pool: { on: vi.fn() } }));
 
+import { PublicSessionSweeper } from "../routers/public-metamcp/public-session-sweeper";
+import {
+  checkConcurrentSessionCeiling,
+  registerSessionActivityProbe,
+  registerSessionCounter,
+  resetSessionCountersForTests,
+} from "./metamcp/credential-session-quota";
 import type { SessionIdentity } from "./metamcp/session-auth";
 import {
   bindingMatches,
@@ -215,5 +222,107 @@ describe("countSessionsForIdentity feeds the per-credential ceiling", () => {
     const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
     mgr.addSession("nobind", { id: "nobind" });
     expect(mgr.countSessionsForIdentity(KEY_A)).toBe(0);
+  });
+});
+
+describe("listSessionsForIdentity feeds the ceiling summary", () => {
+  const ep = (endpointName: string) => ({
+    namespaceUuid: "ns-A",
+    endpointName,
+  });
+
+  it("lists only the sessions bound to the given identity, with their endpoints", () => {
+    const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
+    mgr.addSession("a1", { id: "a1" }, { ...ep("ep-1"), identity: KEY_A });
+    mgr.addSession("a2", { id: "a2" }, { ...ep("ep-2"), identity: KEY_A });
+    mgr.addSession("b1", { id: "b1" }, { ...ep("ep-1"), identity: KEY_B });
+
+    expect(mgr.listSessionsForIdentity(KEY_A)).toEqual([
+      { sessionId: "a1", endpointName: "ep-1" },
+      { sessionId: "a2", endpointName: "ep-2" },
+    ]);
+    expect(mgr.listSessionsForIdentity(KEY_B)).toEqual([
+      { sessionId: "b1", endpointName: "ep-1" },
+    ]);
+  });
+
+  it("always agrees with countSessionsForIdentity", () => {
+    const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
+    for (let i = 0; i < 5; i += 1) {
+      mgr.addSession(
+        `a${i}`,
+        { id: `a${i}` },
+        { ...ep("ep"), identity: KEY_A },
+      );
+    }
+    mgr.removeSession("a2");
+    mgr.addSession("nobind", { id: "nobind" });
+
+    expect(mgr.listSessionsForIdentity(KEY_A)).toHaveLength(
+      mgr.countSessionsForIdentity(KEY_A),
+    );
+    expect(mgr.listSessionsForIdentity(KEY_A)).toHaveLength(4);
+  });
+
+  it("returns an empty list for an identity with no sessions and skips unbound sessions", () => {
+    const mgr = new SessionLifetimeManagerImpl<{ id: string }>("test");
+    mgr.addSession("nobind", { id: "nobind" });
+    expect(mgr.listSessionsForIdentity(KEY_A)).toEqual([]);
+  });
+});
+
+describe("ceiling summary, end to end with the real manager and sweeper", () => {
+  it("names the endpoints, splits in-flight from idle, and counts SSE-style sessions as untracked", () => {
+    resetSessionCountersForTests();
+    const streamable = new SessionLifetimeManagerImpl<{ id: string }>("http");
+    const sse = new SessionLifetimeManagerImpl<{ id: string }>("sse");
+    registerSessionCounter(streamable);
+    registerSessionCounter(sse);
+
+    let clock = 1_000_000;
+    const sweeper = new PublicSessionSweeper(
+      "http",
+      { ttlMs: 60_000, intervalMs: 5_000 },
+      { reapSession: async () => undefined, now: () => clock },
+    );
+    registerSessionActivityProbe((id) => sweeper.getActivity(id));
+
+    const bind = (endpointName: string) => ({
+      namespaceUuid: "ns-A",
+      endpointName,
+      identity: KEY_A,
+    });
+    // Three Streamable HTTP sessions: two idle (one for 40 s), one in flight.
+    streamable.addSession("h1", { id: "h1" }, bind("autotask"));
+    streamable.addSession("h2", { id: "h2" }, bind("autotask"));
+    streamable.addSession("h3", { id: "h3" }, bind("ninja"));
+    sweeper.beginTracking("h1");
+    sweeper.beginTracking("h2");
+    sweeper.beginTracking("h3");
+    clock += 40_000;
+    sweeper.touch("h1");
+    sweeper.markInFlight("h3");
+    clock += 5_000;
+    // One SSE session the sweeper does not track.
+    sse.addSession("s1", { id: "s1" }, bind("ninja"));
+    // Another credential's session must not appear.
+    streamable.addSession(
+      "x1",
+      { id: "x1" },
+      { ...bind("itglue"), identity: KEY_B },
+    );
+
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "4";
+    const decision = checkConcurrentSessionCeiling(KEY_A, { label: "Example" });
+    delete process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL;
+    resetSessionCountersForTests();
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.current).toBe(4);
+    expect(decision.liveSummary).toBe(
+      "live: autotask=2, ninja=2; in-flight 1, idle 2, oldest idle 45s, untracked 1",
+    );
+    // h1 was touched 5 s ago, h2 has been idle 45 s: the oldest is h2's.
+    expect(decision.liveSummary).not.toMatch(/\bh\d\b|\bs1\b|\bx1\b/);
   });
 });

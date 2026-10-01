@@ -558,3 +558,44 @@ describe("PublicSessionSweeper — stats surface", () => {
     expect(stats.lastSweepAt).not.toBeNull();
   });
 });
+
+describe("PublicSessionSweeper — getActivity (read-only, for the ceiling summary)", () => {
+  it("reports idle time and in-flight state for a tracked session", () => {
+    const { sweeper, clock } = makeSweeper();
+    sweeper.beginTracking("a");
+    clock.advance(12_345);
+
+    expect(sweeper.getActivity("a")).toEqual({
+      idleMs: 12_345,
+      inFlight: false,
+    });
+
+    sweeper.markInFlight("a");
+    expect(sweeper.getActivity("a")).toEqual({ idleMs: 0, inFlight: true });
+
+    clock.advance(1_000);
+    expect(sweeper.getActivity("a")).toEqual({ idleMs: 1_000, inFlight: true });
+
+    sweeper.markSettled("a");
+    expect(sweeper.getActivity("a")?.inFlight).toBe(false);
+  });
+
+  it("is undefined for a session it does not track", () => {
+    const { sweeper } = makeSweeper();
+    expect(sweeper.getActivity("never-tracked")).toBeUndefined();
+    sweeper.beginTracking("a");
+    sweeper.forget("a");
+    expect(sweeper.getActivity("a")).toBeUndefined();
+  });
+
+  it("never mutates tracking state", () => {
+    const { sweeper, clock } = makeSweeper();
+    sweeper.beginTracking("a");
+    const before = sweeper.getLastActivity("a");
+    clock.advance(5_000);
+    sweeper.getActivity("a");
+    sweeper.getActivity("missing");
+    expect(sweeper.getLastActivity("a")).toBe(before);
+    expect(sweeper.getStats().trackedSessions).toBe(1);
+  });
+});

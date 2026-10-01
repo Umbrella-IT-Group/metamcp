@@ -99,16 +99,20 @@ function buildMessage(
   current: number,
   ceiling: number,
   suppressed: number,
+  liveSummary?: string,
 ): string {
   const base =
     kind === "refused"
       ? `session refused: concurrent-session ceiling reached (${current}/${ceiling})`
       : `concurrent sessions at ${current}/${ceiling}, approaching the ceiling`;
-  if (suppressed <= 0) {
-    return base;
-  }
   const noun = kind === "refused" ? "refusals" : "warnings";
-  return `${base} (${suppressed} more ${noun} suppressed in the last 60s)`;
+  const withSuppressed =
+    suppressed <= 0
+      ? base
+      : `${base} (${suppressed} more ${noun} suppressed in the last 60s)`;
+  // The summary says WHAT fills the credential (endpoint names and counts only,
+  // never a session id). Appended last so the existing prefix is unchanged.
+  return liveSummary ? `${withSuppressed}; ${liveSummary}` : withSuppressed;
 }
 
 /**
@@ -163,6 +167,7 @@ export function recordSessionCeilingEvent(params: {
         decision.current,
         decision.ceiling,
         suppressed,
+        decision.liveSummary,
       ),
       clientName: label,
     });

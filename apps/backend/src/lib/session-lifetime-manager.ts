@@ -118,12 +118,23 @@ export function classifyBindingDenial(
   return "session_credential_mismatch";
 }
 
+/**
+ * One live session of a credential, as far as an operator-facing summary needs:
+ * its id (so an activity probe can look it up; it is NEVER written into a log
+ * line) and the endpoint it is bound to.
+ */
+export interface SessionListing {
+  sessionId: string;
+  endpointName: string;
+}
+
 export interface SessionLifetimeManager<T> {
   addSession(sessionId: string, session: T, binding?: SessionBinding): void;
   removeSession(sessionId: string): void;
   getSession(sessionId: string): T | undefined;
   getSessionBinding(sessionId: string): SessionBinding | undefined;
   countSessionsForIdentity(identity: SessionIdentity): number;
+  listSessionsForIdentity(identity: SessionIdentity): SessionListing[];
   getAllSessions(): Map<string, T>;
   getSessionAge(sessionId: string): number | undefined;
   isSessionExpired(sessionId: string): Promise<boolean>;
@@ -188,6 +199,22 @@ export class SessionLifetimeManagerImpl<T>
       if (identityMatches(binding.identity, identity)) count += 1;
     }
     return count;
+  }
+
+  // The live sessions this manager holds for a credential identity, with the
+  // endpoint each is bound to. Derived from the binding map exactly as
+  // `countSessionsForIdentity` is, so the two always agree and nothing is
+  // maintained separately. Only called on the rare path where a credential is
+  // approaching or at its session ceiling, to say WHAT is filling it; the hot
+  // path never calls this.
+  listSessionsForIdentity(identity: SessionIdentity): SessionListing[] {
+    const listing: SessionListing[] = [];
+    for (const [sessionId, binding] of this.sessionBindings.entries()) {
+      if (identityMatches(binding.identity, identity)) {
+        listing.push({ sessionId, endpointName: binding.endpointName });
+      }
+    }
+    return listing;
   }
 
   getAllSessions(): Map<string, T> {
