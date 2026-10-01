@@ -1,17 +1,22 @@
 import { createHash } from "node:crypto";
 
+import logger from "@/utils/logger";
+
 import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import { parseToolName } from "../tool-name-parser";
+import { isUnknownToolError } from "../unknown-tool";
 import {
   ArgsShape,
   argsShapeEnabled,
   buildArgsShape,
 } from "./audit-args-shape";
+import { CallVerdict, classifyCallResult } from "./audit-classify";
 import {
   CallToolMiddleware,
   MetaMCPHandlerContext,
 } from "./functional-middleware";
+import { getRetiredToolInfo } from "./retired-tool-marker";
 
 /**
  * Auditing middleware — records every proxied `tools/call` to the Live Logs
@@ -23,6 +28,16 @@ import {
  * only thing written to the store was connection errors, so the view showed
  * nothing but reconnect noise. Each entry is also mirrored to stdout by the
  * store (→ Loki/Grafana, the durable system of record).
+ *
+ * OUTCOME CLASSIFICATION. `success` and `error_code` come from
+ * `classifyCallResult` (audit-classify), which reads the result WITHOUT
+ * modifying it: this middleware returns the very same object it received, so
+ * the wire is unchanged. A tool's in-band refusal (`{error: true, ...}` with
+ * `isError` unset) is recorded as `success=false, error_code='inband_error'`
+ * with the tool's code token in `error_detail`; a retired-name redirect as
+ * `tool_retired`; a call to a name nobody serves as `unknown_tool`; any other
+ * `isError` result as `tool_error`. A classifier fault is logged once and the
+ * row is recorded exactly as it was before the classifier existed.
  *
  * Placed OUTERMOST in the call-tool chain so it captures the full outcome —
  * including calls denied by the filter/override middleware (those surface as a
@@ -129,7 +144,80 @@ function shapeOf(args: unknown): ArgsShape | null {
   }
 }
 
+// The Grafana "MCP errors" panels count any metamcp line matching this as an
+// error. The in-band and retired log lines are deliberately worded without
+// these words (an in-band refusal is a handled outcome, not a gateway fault),
+// so a detail token that happens to BE one of them is not echoed.
+const DASHBOARD_ERROR_WORDS = /\b(error|fatal|panic|exception)\b/i;
+
+/**
+ * Classify a result without ever throwing. A fault in the classifier must not
+ * reach the tool call or change what is recorded: it logs one WARN and the row
+ * is written the way it was before the classifier existed (success follows
+ * `isError`, class `tool_error`).
+ */
+function safeVerdict(result: unknown): CallVerdict {
+  try {
+    return classifyCallResult(result);
+  } catch (error) {
+    logger.warn(
+      `Audit classifier fault; recording the call by isError only: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    try {
+      return (result as { isError?: unknown } | null | undefined)?.isError ===
+        true
+        ? { failed: true, errorCode: "tool_error" }
+        : { failed: false };
+    } catch {
+      return { failed: false };
+    }
+  }
+}
+
+/** Live Logs level and text for a classified result. */
+function describeOutcome(
+  toolName: string,
+  verdict: CallVerdict,
+  durationMs: number,
+  result: unknown,
+): { level: "info" | "warn" | "error"; message: string } {
+  if (!verdict.failed) {
+    return { level: "info", message: `${toolName} (${durationMs}ms)` };
+  }
+  if (verdict.errorCode === "inband_error") {
+    const detail =
+      verdict.errorDetail && !DASHBOARD_ERROR_WORDS.test(verdict.errorDetail)
+        ? verdict.errorDetail
+        : "unclassified";
+    return {
+      level: "warn",
+      message: `${toolName} refused in-band: ${detail} (${durationMs}ms)`,
+    };
+  }
+  if (verdict.errorCode === "tool_retired") {
+    const replacement = getRetiredToolInfo(result)?.replacement;
+    return {
+      level: "warn",
+      message: replacement
+        ? `${toolName} is retired; replacement ${replacement} (${durationMs}ms)`
+        : `${toolName} is retired; no replacement (${durationMs}ms)`,
+    };
+  }
+  // isError results (tool_error, unknown_tool) keep the original level and
+  // text, so the dashboards that count them behave exactly as before.
+  return {
+    level: "error",
+    message: `${toolName} returned an error (${durationMs}ms)`,
+  };
+}
+
 function errorCode(error: unknown): string {
+  // A thrown "Unknown tool: ..." is the gateway's own answer for a name nobody
+  // serves. Record it as the class `unknown_tool` instead of the JS class name
+  // `Error`, so unmapped or mistyped tool names are measurable too.
+  if (isUnknownToolError(error)) return "unknown_tool";
   if (error && typeof error === "object") {
     const code = (error as { code?: unknown }).code;
     if (typeof code === "number" || typeof code === "string") {
@@ -185,15 +273,22 @@ export function createAuditingMiddleware(): CallToolMiddleware {
       // backend tool's own error come back as `isError: true` with a normal
       // resolve. Recording those as success=true said "the tool ran" about a
       // call that was refused — the exact rows an investigation would filter
-      // OUT while looking for denials.
-      const failed = result?.isError === true;
+      // OUT while looking for denials. A tool's in-band refusal (isError
+      // unset, a structured `error` envelope) is the same story one level
+      // down, and the classifier reads it; see audit-classify.
+      const verdict = safeVerdict(result);
+      const failed = verdict.failed;
+      const { level, message } = describeOutcome(
+        toolName,
+        verdict,
+        durationMs,
+        result,
+      );
       metamcpLogStore.record({
         category: "tool_call",
         serverName,
-        level: failed ? "error" : "info",
-        message: failed
-          ? `${toolName} returned an error (${durationMs}ms)`
-          : `${toolName} (${durationMs}ms)`,
+        level,
+        message,
         toolName,
         durationMs,
         clientName,
@@ -206,11 +301,13 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         tool_name: toolName,
         params_hash: paramsHash,
         success: !failed,
-        // No `code` exists on an isError result — the MCP shape carries the
-        // reason as human text in `content`, which is not something to put in
-        // an indexed column. A fixed marker keeps the class queryable and
-        // distinct from the protocol-level codes the catch branch records.
-        error_code: failed ? "tool_error" : undefined,
+        // A class from a small fixed vocabulary, never the result's text: the
+        // MCP shape carries the reason as human text in `content`, which is not
+        // something to put in a column. The class stays queryable and distinct
+        // from the protocol-level codes the catch branch records; the tool's
+        // own code token (when it gave one) rides `error_detail`.
+        error_code: failed ? verdict.errorCode : undefined,
+        error_detail: failed ? verdict.errorDetail : undefined,
         latency_ms: durationMs,
         args_shape: argsShape,
         ...caller,

@@ -3,12 +3,16 @@ import { createHash } from "node:crypto";
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import logger from "@/utils/logger";
+
 import { runWithCallerContext } from "../caller-context-store";
+import { metamcpLogStore } from "../log-store";
 import {
   createAuditingMiddleware,
   setAuditRecorderForTesting,
 } from "./auditing.functional";
 import { MetaMCPHandlerContext } from "./functional-middleware";
+import { markRetiredToolResult } from "./retired-tool-marker";
 
 const context: MetaMCPHandlerContext = {
   namespaceUuid: "ns-123",
@@ -490,5 +494,345 @@ describe("args_shape (migration 0039)", () => {
 
     expect(result).toEqual({ content: [] });
     expect(recorder.mock.calls[0][0].args_shape).toBeNull();
+  });
+});
+
+describe("in-band classification (migration 0039 error_detail)", () => {
+  const inbandBody = {
+    error: true,
+    code: "invalid_input",
+    message: "mode is not allowed here",
+  };
+  const inbandResult = () => ({
+    content: [{ type: "text", text: JSON.stringify(inbandBody) }],
+    structuredContent: { ...inbandBody },
+  });
+  const handlerReturning = (result: unknown) =>
+    vi.fn().mockResolvedValue(result);
+
+  it("records an in-band refusal as failed, inband_error, with the tool's code", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(
+      handlerReturning(inbandResult()),
+    );
+    await wrapped(makeRequest({ mode: "list", company: "c1" }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("inband_error");
+    expect(entry.error_detail).toBe("invalid_input");
+    expect(entry.args_shape).toEqual({
+      sel: { mode: "list" },
+      keys: ["company", "mode"],
+    });
+  });
+
+  it("returns the IDENTICAL object it received, for failed, in-band and success results", async () => {
+    setAuditRecorderForTesting(vi.fn().mockResolvedValue(undefined));
+    const results = [
+      { isError: true, content: [{ type: "text", text: "denied" }] },
+      inbandResult(),
+      { content: [{ type: "text", text: "ok" }] },
+      markRetiredToolResult(
+        { isError: true, content: [{ type: "text", text: "retired" }] },
+        { replacement: "a__b" },
+      ),
+    ];
+    for (const result of results) {
+      const wrapped = createAuditingMiddleware()(handlerReturning(result));
+      const returned = await wrapped(makeRequest({ a: 1 }), context);
+      // toBe, not toEqual: the wire must be unchanged, so it is the same object.
+      expect(returned).toBe(result);
+    }
+  });
+
+  it("does not mutate a deep-frozen in-band result", async () => {
+    setAuditRecorderForTesting(vi.fn().mockResolvedValue(undefined));
+    const frozen = Object.freeze({
+      content: Object.freeze([
+        Object.freeze({ type: "text", text: JSON.stringify(inbandBody) }),
+      ]),
+      structuredContent: Object.freeze({ ...inbandBody }),
+    });
+    const wrapped = createAuditingMiddleware()(handlerReturning(frozen));
+    await expect(wrapped(makeRequest({ a: 1 }), context)).resolves.toBe(frozen);
+  });
+
+  it("a success with error:null stays a success", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ok = {
+      content: [],
+      structuredContent: { status: "dispatched", error: null },
+    };
+
+    const wrapped = createAuditingMiddleware()(handlerReturning(ok));
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(true);
+    expect(entry.error_code).toBeUndefined();
+    expect(entry.error_detail).toBeUndefined();
+  });
+
+  it("records a retired-name redirect as tool_retired", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const redirect = markRetiredToolResult(
+      { isError: true, content: [{ type: "text", text: "retired" }] },
+      { replacement: "autotask__ticket_manage" },
+    );
+
+    const wrapped = createAuditingMiddleware()(handlerReturning(redirect));
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("tool_retired");
+    expect(entry.server_name).toBe("autotask");
+  });
+
+  it("records an isError 'Unknown tool' result as unknown_tool", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const unknown = {
+      isError: true,
+      content: [{ type: "text", text: "Unknown tool: 'add_note'" }],
+    };
+
+    const wrapped = createAuditingMiddleware()(handlerReturning(unknown));
+    await wrapped(makeRequest({ a: 1 }), context);
+    await flush();
+
+    expect(recorder.mock.calls[0][0].error_code).toBe("unknown_tool");
+  });
+
+  it("records a thrown 'Unknown tool' as unknown_tool and still rethrows it", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failing = vi.fn().mockRejectedValue(new Error("Unknown tool: x__y"));
+
+    const wrapped = createAuditingMiddleware()(failing);
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toThrow(
+      "Unknown tool: x__y",
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("unknown_tool");
+  });
+
+  it("any other thrown error keeps its original class", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const timeout = Object.assign(new Error("Request timed out"), {
+      code: -32001,
+    });
+
+    const wrapped = createAuditingMiddleware()(
+      vi.fn().mockRejectedValue(timeout),
+    );
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(timeout);
+    await flush();
+
+    expect(recorder.mock.calls[0][0].error_code).toBe("-32001");
+  });
+
+  describe("kill switch", () => {
+    const saved = process.env.TOOL_AUDIT_INBAND_CLASSIFY;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.TOOL_AUDIT_INBAND_CLASSIFY;
+      else process.env.TOOL_AUDIT_INBAND_CLASSIFY = saved;
+    });
+
+    it("off makes an in-band error a success again but leaves isError handling intact", async () => {
+      process.env.TOOL_AUDIT_INBAND_CLASSIFY = "off";
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+
+      await createAuditingMiddleware()(handlerReturning(inbandResult()))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+      await createAuditingMiddleware()(
+        handlerReturning({
+          isError: true,
+          content: [{ type: "text", text: "denied" }],
+        }),
+      )(makeRequest({ a: 1 }), context);
+      await flush();
+
+      expect(recorder.mock.calls[0][0].success).toBe(true);
+      expect(recorder.mock.calls[0][0].error_code).toBeUndefined();
+      expect(recorder.mock.calls[1][0].success).toBe(false);
+      expect(recorder.mock.calls[1][0].error_code).toBe("tool_error");
+    });
+  });
+
+  describe("classifier fault", () => {
+    it("records the row as before and never throws out of the middleware", async () => {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      // A plain object whose property reads throw: reachable only through a
+      // hostile Proxy, which a JSON parser cannot produce but proves the guard.
+      const hostile = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error("hostile");
+          },
+          get(_target, property) {
+            // `await` and promise resolution probe `then`; answer that one
+            // honestly so only the classifier's own reads can throw.
+            if (property === "then") return undefined;
+            throw new Error("hostile");
+          },
+        },
+      );
+
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+
+      const wrapped = createAuditingMiddleware()(handlerReturning(hostile));
+      await expect(wrapped(makeRequest({ a: 1 }), context)).resolves.toBe(
+        hostile,
+      );
+      await flush();
+
+      const entry = recorder.mock.calls[0][0];
+      expect(entry.success).toBe(true);
+      expect(entry.error_code).toBeUndefined();
+      // One WARN names the fault, so a systematic classifier bug is visible.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain("Audit classifier fault");
+      warn.mockRestore();
+    });
+  });
+
+  describe("Live Logs wording", () => {
+    // The Grafana "MCP errors" panels count any metamcp line matching this as
+    // an error. In-band refusals and retirements are handled outcomes, so
+    // their lines are worded without these words and logged at warn.
+    const DASHBOARD_ERROR_WORDS = /\b(error|fatal|panic|exception)\b/i;
+
+    const recordSpy = () => vi.spyOn(metamcpLogStore, "record");
+    afterEach(() => vi.restoreAllMocks());
+
+    it("an in-band refusal logs at warn without the dashboard error words", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      await createAuditingMiddleware()(handlerReturning(inbandResult()))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      const logged = spy.mock.calls[0][0];
+      expect(logged.level).toBe("warn");
+      expect(logged.message).toContain("refused in-band: invalid_input");
+      expect(DASHBOARD_ERROR_WORDS.test(logged.message)).toBe(false);
+    });
+
+    it("an in-band refusal with no code logs 'unclassified'", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const noCode = {
+        content: [],
+        structuredContent: { error: "provide query or entity_id" },
+      };
+
+      await createAuditingMiddleware()(handlerReturning(noCode))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      expect(spy.mock.calls[0][0].message).toContain(
+        "refused in-band: unclassified",
+      );
+    });
+
+    it("a code token that is itself a dashboard word is not echoed", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const wordy = {
+        content: [],
+        structuredContent: { error: true, code: "error" },
+      };
+
+      await createAuditingMiddleware()(handlerReturning(wordy))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      const logged = spy.mock.calls[0][0];
+      expect(DASHBOARD_ERROR_WORDS.test(logged.message)).toBe(false);
+      expect(logged.message).toContain("unclassified");
+    });
+
+    it("a retired-name redirect logs at warn without the dashboard error words", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const withReplacement = markRetiredToolResult(
+        { isError: true, content: [{ type: "text", text: "x" }] },
+        { replacement: "autotask__ticket_manage" },
+      );
+      const withoutReplacement = markRetiredToolResult(
+        { isError: true, content: [{ type: "text", text: "x" }] },
+        { replacement: null },
+      );
+
+      await createAuditingMiddleware()(handlerReturning(withReplacement))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+      await createAuditingMiddleware()(handlerReturning(withoutReplacement))(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      const [first, second] = spy.mock.calls.map((call) => call[0]);
+      expect(first.level).toBe("warn");
+      expect(first.message).toContain(
+        "is retired; replacement autotask__ticket_manage",
+      );
+      expect(second.message).toContain("is retired; no replacement");
+      expect(DASHBOARD_ERROR_WORDS.test(first.message)).toBe(false);
+      expect(DASHBOARD_ERROR_WORDS.test(second.message)).toBe(false);
+    });
+
+    it("isError results keep the original error level and text", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      await createAuditingMiddleware()(
+        handlerReturning({
+          isError: true,
+          content: [{ type: "text", text: "boom" }],
+        }),
+      )(makeRequest({ a: 1 }), context);
+
+      const logged = spy.mock.calls[0][0];
+      expect(logged.level).toBe("error");
+      expect(logged.message).toMatch(/^search returned an error \(\d+ms\)$/);
+    });
+
+    it("a success keeps the original info line", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      await createAuditingMiddleware()(okHandler)(
+        makeRequest({ a: 1 }),
+        context,
+      );
+
+      const logged = spy.mock.calls[0][0];
+      expect(logged.level).toBe("info");
+      expect(logged.message).toMatch(/^search \(\d+ms\)$/);
+    });
   });
 });
