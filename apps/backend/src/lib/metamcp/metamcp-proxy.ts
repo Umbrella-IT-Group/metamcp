@@ -46,6 +46,7 @@ import {
   MetaMCPHandlerContext,
 } from "./metamcp-middleware/functional-middleware";
 import { createRetiredToolMiddleware } from "./metamcp-middleware/retired-tool.functional";
+import { createTimeoutHintMiddleware } from "./metamcp-middleware/timeout-hint.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
@@ -867,6 +868,10 @@ export const createServer = async (
         `Access denied to tool "${toolName}": ${reason}`,
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // Innermost, directly around the routing handler: adds one sentence to the
+    // gateway's own -32001 timeout saying the backend may still be running the
+    // call. Same code, same data; text only.
+    createTimeoutHintMiddleware(),
     // Add more middleware here as needed
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);

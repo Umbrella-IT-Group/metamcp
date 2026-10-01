@@ -1,11 +1,11 @@
 /**
- * Retired-tool redirect and audit classification, driven end to end through
- * `createServer`.
+ * Retired-tool redirect, timeout hint and audit classification, driven end to
+ * end through `createServer`.
  *
  * A real SDK consumer `Client` talks to the gateway's own `Server`. Backend
  * sessions are SDK `Client`/`Server` pairs over `InMemoryTransport`, and the
  * backend counts how many times its one real tool actually executed. The audit
- * middleware and the retired-tool middleware are the REAL
+ * middleware and the retired-tool and timeout-hint middleware are the REAL
  * ones; only the filter (which needs the database) is replaced by a small fake
  * that reproduces its fail-closed denial for an unresolvable server prefix, and
  * the override middleware is pass-through.
@@ -15,7 +15,7 @@
  *   - a name that is in the map but IS served still executes exactly once;
  *   - the three ways a retired call fails today all end in the redirect;
  *   - a timeout on a listed name is neither rewritten as a redirect nor
- *     replayed;
+ *     replayed, and carries the adjudication hint;
  *   - tools/list is unchanged;
  *   - the audit rows say tool_retired, unknown_tool and inband_error.
  */
@@ -357,7 +357,7 @@ describe("retired names through the gateway", () => {
     );
   });
 
-  it("(e) a timeout on a listed name is not rewritten as a redirect and not replayed", async () => {
+  it("(e) a timeout on a listed name is not rewritten, not replayed, and carries the hint", async () => {
     config.mcpTimeoutMs = 50;
     let release: () => void = () => undefined;
     const target = await backend(
@@ -381,6 +381,10 @@ describe("retired names through the gateway", () => {
     // Not a redirect: the name is listed, but the failure is a timeout.
     expect(error?.message).not.toContain("tool_retired");
     expect(error?.message).toContain("Request timed out");
+    expect(error?.message).toContain("the backend may still be running it");
+    expect(error?.message).toContain(
+      "read the target's current state before retrying",
+    );
     expect(target.executions()).toBe(1);
     expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
     expect(getSessionMock).toHaveBeenCalledTimes(1);

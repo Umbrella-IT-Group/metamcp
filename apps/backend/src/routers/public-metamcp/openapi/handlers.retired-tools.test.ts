@@ -1,6 +1,7 @@
 /**
- * The OpenAPI bridge answers a retired tool name with the redirect through the
- * REAL chain and the REAL HTTP mapping in `executeToolWithMiddleware`.
+ * The OpenAPI bridge answers a retired tool name with the redirect, and a
+ * gateway timeout with the adjudication hint, through the REAL chain and the
+ * REAL HTTP mapping in `executeToolWithMiddleware`.
  *
  * Why this surface matters: automation workflows reach the gateway through this
  * bridge, and a swallowed failure there is invisible. The bridge routes by
@@ -9,12 +10,13 @@
  * the bridge's usual 403 body. An unmapped unknown name keeps its 404.
  *
  * Only the DB-touching boundary is mocked, as in the neighbouring bridge tests;
- * the audit and redirect middleware and `compose` run for real.
+ * the audit, redirect and timeout-hint middleware and `compose` run for real.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { requestMock } = vi.hoisted(() => ({ requestMock: vi.fn() }));
@@ -227,5 +229,28 @@ describe("OpenAPI bridge: retired names", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ content: [{ type: "text", text: "fine" }] });
+  });
+});
+
+describe("OpenAPI bridge: gateway timeout hint", () => {
+  it("a gateway timeout surfaces as the usual 500 with the adjudication hint in the message", async () => {
+    requestMock.mockRejectedValue(
+      McpError.fromError(ErrorCode.RequestTimeout, "Request timed out", {
+        timeout: 60_000,
+      }),
+    );
+
+    const res = await run("ninja__list_things");
+
+    expect(res.statusCode).toBe(500);
+    const body = res.body as { error: string; message: string };
+    expect(body.error).toBe("Tool execution failed");
+    expect(body.message).toContain("Request timed out");
+    expect(body.message).toContain("the backend may still be running it");
+    expect(body.message).toContain(
+      "read the target's current state before retrying",
+    );
+    // Not replayed: the bridge sent the call once.
+    expect(requestMock).toHaveBeenCalledTimes(1);
   });
 });

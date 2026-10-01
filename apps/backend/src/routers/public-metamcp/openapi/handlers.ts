@@ -27,6 +27,7 @@ import {
   MetaMCPHandlerContext,
 } from "../../../lib/metamcp/metamcp-middleware/functional-middleware";
 import { createRetiredToolMiddleware } from "../../../lib/metamcp/metamcp-middleware/retired-tool.functional";
+import { createTimeoutHintMiddleware } from "../../../lib/metamcp/metamcp-middleware/timeout-hint.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
@@ -461,6 +462,10 @@ export const createMiddlewareEnabledHandlers = (
         `Access denied to tool "${toolName}": ${reason}`,
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // Innermost: one added sentence on the gateway's own -32001 timeout (the
+    // backend may still be running the call), same code and data. The bridge
+    // maps a thrown error to a 500 whose message carries it.
+    createTimeoutHintMiddleware(),
     // Add more middleware here as needed
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);
