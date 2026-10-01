@@ -26,6 +26,7 @@ import {
   ListToolsHandler,
   MetaMCPHandlerContext,
 } from "../../../lib/metamcp/metamcp-middleware/functional-middleware";
+import { createRetiredToolMiddleware } from "../../../lib/metamcp/metamcp-middleware/retired-tool.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
@@ -448,6 +449,12 @@ export const createMiddlewareEnabledHandlers = (
     // servers with the same credentials, so both have to be recorded the same
     // way for retention on this table to mean anything.
     createAuditingMiddleware(),
+    // Second, outside the filter, as in the Streamable-HTTP chain: a call that
+    // already failed as an unknown tool gets the retired-tool map's answer.
+    // The bridge routes by server prefix only, so a retired name on a live
+    // server reaches the backend and comes back as an isError "Unknown tool";
+    // this turns that into a redirect (surfaced as the bridge's usual 403 body).
+    createRetiredToolMiddleware(),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>

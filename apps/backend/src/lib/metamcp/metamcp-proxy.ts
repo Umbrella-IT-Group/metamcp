@@ -45,6 +45,7 @@ import {
   ListToolsHandler,
   MetaMCPHandlerContext,
 } from "./metamcp-middleware/functional-middleware";
+import { createRetiredToolMiddleware } from "./metamcp-middleware/retired-tool.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
@@ -855,6 +856,11 @@ export const createServer = async (
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
     createAuditingMiddleware(),
+    // Second, OUTSIDE the filter so it also sees the filter's fail-closed
+    // denial for a deleted server: answers a call that already failed as an
+    // unknown tool with the replacement from the retired-tool map. Consulted
+    // only AFTER a failure, so it cannot shadow a live tool.
+    createRetiredToolMiddleware(),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>

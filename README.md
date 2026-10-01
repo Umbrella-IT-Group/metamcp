@@ -333,6 +333,8 @@ A refusal is a `429` with a `Retry-After` and writes no audit row (a row per ref
 | `TOOL_AUDIT_RETENTION_DAYS` | `90` | `tool_call_audit` retention. `0` or negative keeps rows forever (pruning is skipped entirely). Values `1`-`29` are raised to `30` at boot with a warning, because migration `0032` makes rows undeletable inside a 30-day window. |
 | `TOOL_AUDIT_ARGS_SHAPE` | on | Records `tool_call_audit.args_shape` (migration `0039`): top-level argument key names plus the value of six allowlisted selector keys, never any other argument value. `off`, `false` or `0` stores NULL instead. Rows are write-once, so a wrong shape cannot be corrected afterwards; this is the kill switch. |
 | `TOOL_AUDIT_INBAND_CLASSIFY` | on | Classifies a tool's in-band refusal as a failure in `tool_call_audit` (`success=false`, `error_code='inband_error'`, the tool's code in `error_detail`). `off`, `false` or `0` disables that step only; `isError`, unknown-tool and retired-name handling keep working. Rows are write-once, so this is the kill switch for a misclassification. |
+| `RETIRED_TOOLS_FILE` | unset | Path of the retired-tool map (JSON). Unset means the redirect is inert and the filesystem is never touched. See [Retired-tool redirect](#retired-tool-redirect). |
+| `RETIRED_TOOLS_RELOAD_SECONDS` | `30` | How often the map file is re-checked, on the failure path only (clamped to 5-3600; an invalid value falls back to 30 with a warning). |
 | `GATEWAY_EVENTS_RETENTION_DAYS` | `90` | `gateway_events` retention. Floor-clamped to 30 with a boot warning: rows are immutable for their first 30 days at the database level, so a lower value cannot take effect. There is no "keep forever" value. Reclaiming in-window space is a deliberate break-glass act, not a config change — see below. |
 | `AUDIT_STORAGE_CHECK_INTERVAL_SWEEPS` | `12` | How many 5-minute cleanup sweeps between audit-table storage checks, so the default is hourly. Values below `1` fall back to the default and anything above `288` (24h) is capped, both with a boot warning: there is deliberately no value that turns the check off. The per-check reading is logged at INFO, so it only reaches stdout (and therefore a log shipper) when `LOG_LEVEL` is `info` or `all`; see the note below. |
 | `AUDIT_STORAGE_WARN_MB` | `2048` | Per-table size at which the storage check escalates from an INFO line to a WARN plus a `system` event in the gateway history. At most one warning per table per 24h while the condition lasts; a table falling below 90% of the threshold re-arms it. Capped at `1048576` (1 TiB) with a boot warning, so a threshold nothing can reach cannot be used as an off switch. |
@@ -350,7 +352,7 @@ A refusal is a `429` with a `Retry-After` and writes no audit row (a row per ref
 | `tool_error` | The result has `isError: true`. `error_detail` carries the tool's code token when the body is an envelope, or `validation` for an argument-validation refusal. |
 | `inband_error` | `isError` is unset but the top level of the result's envelope reports a refusal: `error` is `true`, a non-blank string or a non-empty object, or `status` is `failed` or `partial`, or `partial` is `true`. `error_detail` is the tool's code token (a lowercase snake_case code under 48 characters with no id in it), or a fixed marker (`status_failed`, `partial`), or NULL. |
 | `unknown_tool` | The call named a tool nobody serves: the gateway's own `Unknown tool` error, a backend's not-found answer, or the filter's unresolved-server denial. |
-| `tool_retired` | The gateway's retired-tool redirect answered (reserved here; written once the redirect ships). |
+| `tool_retired` | The retired-tool redirect answered (see [Retired-tool redirect](#retired-tool-redirect)). |
 | anything else | A thrown protocol error: its numeric code (for example `-32001` for a timeout) or its class name. |
 
 The in-band rule inspects the TOP LEVEL only. `error` absent, `null`, `false`, an empty string, a number or an empty collection is a success (a tool may return `error: null` on every success). Nested keys are never read, so a section that degraded inside a good result, a write's failed read-back object and per-item failures inside a list do not mark the call failed. A refusal carried only by `ok: false`, `warning` or `note` is a known false negative.
@@ -358,6 +360,27 @@ The in-band rule inspects the TOP LEVEL only. `error` absent, `null`, `false`, a
 `success` changed meaning at the deploy that introduced `inband_error`: earlier rows recorded such refusals as `success=true` and cannot be reclassified (rows are write-once). Compare failure rates across that date with care.
 
 The Live Logs line for an in-band refusal is `<tool> refused in-band: <detail> (<ms>ms)` at level `warn`, deliberately worded without the words that log-based error panels count.
+
+#### Retired-tool redirect
+
+A client that cached an old tool list, or an automation node that still names a removed tool, calls a name nobody serves and gets a bare `Unknown tool`. When `RETIRED_TOOLS_FILE` points at a map file, the gateway answers such a call with what replaced the tool instead:
+
+```json
+{ "error": true, "code": "tool_retired",
+  "message": "<server>__<tool> was retired on 2026-09-02 and is no longer served. Use <server>__<replacement>(mode=\"x\"). Refresh your tool list (tools/list) if your client cached an older one.",
+  "context": { "retired": "...", "since": "...", "replacement": "...", "replacement_call": "...", "also": [], "skill": "...", "hint": "..." } }
+```
+
+It is returned as an `isError` result with no `structuredContent` (a client validating that against a cached output schema would otherwise turn the message into a validation failure). Over the OpenAPI bridge it surfaces as the bridge's usual `403` body.
+
+Properties that make it safe to run in front of live automation:
+
+- **Failure-gated.** The map is consulted only AFTER a call has already failed as an unknown tool: the gateway's own `Unknown tool` throw, a backend's not-found answer for a name the gateway still routes to it, or the filter's fail-closed denial for a server prefix that no longer resolves. A call that succeeds, and every other failure (timeouts, broker errors, validation refusals), passes through untouched with zero lookups. A map entry therefore cannot shadow a live tool; a wrong or stale entry degrades to the old bare error.
+- **Executes nothing.** The redirect forwards nothing and is not an alias: the old name still does not answer.
+- **Data only, fail open.** The file never influences routing or access. A missing, unreadable or invalid file keeps the last good map (or none) and logs one warning per five minutes. An entry that fails validation is dropped alone with a warning naming it; a wrong version, a non-object root, a file over 262144 bytes or more than 500 entries rejects the file.
+- **Recorded.** The audit row is `error_code='tool_retired'` (`success=false`), so retired-name traffic by consumer is one SQL query even when the caller swallows the failure.
+
+File format (version 1): `{"version": 1, "retired": {"<server>__<tool>": {"since": "YYYY-MM-DD", "replacement": "<server>__<tool>" | null, "args": {"mode": "..."}, "call": "...", "also": ["<server>__<tool>"], "skill": "...", "hint": "..."}}}`. `since` is required and must be a real, non-future date; at least one of `replacement`, `also`, `skill` or `hint` is required. Limits: `args` up to 4 keys (`[a-z_]{1,24}` to `[A-Za-z0-9_|.-]{1,80}`), `call` 160 characters, `also` 4 names, `skill` 80, `hint` 280, no control characters. Mount the file's DIRECTORY read-only rather than the file itself: replacing a checked-out file replaces its inode, and a single-file bind mount would keep serving the old content.
 
 **Break-glass on `gateway_events` and `tool_call_audit`.** Both carry the same 30-day window (migrations `0031` and `0032`), so the same rules apply to each. Nothing in the application can delete a row inside that window, and that includes the retention sweepers: a `DELETE` that touches even one in-window row raises, and the raise rolls back the entire statement, so a mixed-range prune reclaims nothing rather than partially succeeding. That rollback is why both retention variables are floor-clamped rather than trusted: an under-range setting would stop pruning altogether instead of shortening it. Reclaiming space early therefore requires a superuser at the database — `ALTER TABLE <table> DISABLE TRIGGER <table>_no_recent_delete`, or `SET session_replication_role = 'replica'` for the session — and re-enabling afterwards. Treat that as an audit-worthy act: it is the one operation that can remove evidence these tables exist to preserve, it leaves no trace in the table itself, and the ordinary answer to a full disk is to lower the retention variable toward its floor and wait for the window to pass.
 

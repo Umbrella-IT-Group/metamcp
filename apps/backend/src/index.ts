@@ -12,6 +12,7 @@ import {
   buildUpstreamHealthErrorBody,
   isAdminHealthRequest,
 } from "./lib/health-upstream";
+import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
@@ -171,6 +172,18 @@ async function start(): Promise<void> {
     // throws out of the helper (e.g. a constructor error) still
     // doesn't crash the gateway on boot.
     logger.error("Auto-nuke: unexpected error (ignored):", err);
+  }
+
+  // Retired-tool map: load it now so the boot log says how many entries are in
+  // play (and "dropped N" if the platform repository's validator and this
+  // loader ever disagree), or that the feature is inactive. Data only and fail
+  // open: it can only change the text of a call that already failed as an
+  // unknown tool, so it is not fatal and never delays listening. The helper does
+  // not throw; this guard is defence-in-depth.
+  try {
+    initializeRetiredTools();
+  } catch (err) {
+    logger.error("Retired-tools init: unexpected failure (ignored):", err);
   }
 
   // Surface any pre-existing endpoint left in the unpaired state
