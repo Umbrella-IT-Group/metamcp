@@ -1,0 +1,58 @@
+-- tool_call_audit: record the SHAPE of a call's arguments and the failure code a
+-- tool reported, so friction is measurable from SQL for every consumer.
+--
+-- The table stored a sha256 of the arguments and a boolean outcome. That could
+-- say a call happened and whether the gateway saw a protocol-level failure. It
+-- could not say which mode of a tool was called, which parameter names were
+-- sent, or WHY a refused call was refused: a tool's structured refusal comes
+-- back as an ordinary result, so `success` stayed true, and the argument values
+-- are (rightly) never stored. Two nullable columns close that without storing a
+-- single argument value outside a tiny allowlist.
+--
+--   args_shape    jsonb. {sel?, keys, invalid_keys?, truncated?, non_object?}:
+--                 the top-level argument KEY NAMES plus the value of six
+--                 allowlisted selector keys (mode, action, profile, operation,
+--                 entity, method) when the value is a short identifier. Built
+--                 by lib/metamcp/metamcp-middleware/audit-args-shape; the
+--                 charset rules there are what keep a free-text value out.
+--   error_detail  text. The tool's own failure code token (for example
+--                 invalid_input) when a result reported one, a fixed marker for
+--                 a validation refusal, otherwise NULL. `error_code` keeps its
+--                 small class vocabulary (tool_retired, unknown_tool,
+--                 tool_error, inband_error); this column carries the tool's
+--                 code beside it so GROUP BY on the class stays clean.
+--
+-- BOTH ARE NULLABLE, NO DEFAULT, NO CHECK, NO NOT NULL, NO INDEX, and the
+-- reason is the same one 0030 records: the audit write is fire-and-forget and
+-- its failure is swallowed by design, so any constraint that rejects a row
+-- would not surface as an error. It would be a silently missing audit record.
+-- NULL reads as the honest "not recorded". Every row written before this
+-- migration keeps NULL in both columns, and cannot be backfilled: 0032 refuses
+-- every UPDATE on this table at every age. For the same reason a row written
+-- with a wrong value stays wrong for at least the 30-day window, which is why
+-- the writers are strict and carry kill switches (TOOL_AUDIT_ARGS_SHAPE,
+-- TOOL_AUDIT_INBAND_CLASSIFY).
+--
+-- No index. The table is written once per tool call and every index is a
+-- permanent cost on that path. Analysis is windowed on `called_at`, which the
+-- existing tool_call_audit_called_at_idx serves.
+--
+-- ADD COLUMN with no default is a metadata-only change on PostgreSQL 16 and
+-- does not fire the row or statement triggers 0032 installs. The runtime
+-- role's grants are table-level, so a new column needs no re-grant.
+--
+-- Idempotent (ADD COLUMN IF NOT EXISTS) for the reason recorded on
+-- 0014_oauth_refresh_token: a re-run must not crash-loop a deployer.
+--
+-- JOURNAL ORDERING IS LOAD-BEARING. drizzle applies only journal entries whose
+-- "when" exceeds the max already applied, so this entry's "when" is strictly
+-- the largest in the journal (0038 is 1787702400000, this is 1787788800000).
+-- A skipped 0039 would make every audit INSERT reference a missing column and
+-- fail, the failure would be swallowed, and the audit trail would stop
+-- recording with no error anywhere. The layer-1 test in
+-- db/repositories/tool-call-audit-args-shape.integration.test.ts asserts the
+-- ordering, and the deploy check is that count(args_shape) equals count(*) over
+-- the first minutes of rows. See UMBRELLA_FORK.md's migration-ordering note.
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "args_shape" jsonb;
+--> statement-breakpoint
+ALTER TABLE "tool_call_audit" ADD COLUMN IF NOT EXISTS "error_detail" text;

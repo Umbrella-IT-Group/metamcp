@@ -373,3 +373,122 @@ describe("a refused or failing call must not read as a successful one", () => {
     expect(entry.error_code).toBeUndefined();
   });
 });
+
+describe("args_shape (migration 0039)", () => {
+  it("records the shape on a success row, never the values", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(
+      makeRequest({ mode: "note_add", ticket: 123, note: { text: "secret" } }),
+      context,
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.args_shape).toEqual({
+      sel: { mode: "note_add" },
+      keys: ["mode", "note", "ticket"],
+    });
+    expect(JSON.stringify(entry.args_shape)).not.toMatch(/secret|123/);
+  });
+
+  it("records the shape on a failure row (thrown error) too", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failing = vi.fn().mockRejectedValue(new Error("boom"));
+
+    const wrapped = createAuditingMiddleware()(failing);
+    await expect(
+      wrapped(makeRequest({ action: "run_script", identifier: "d1" }), context),
+    ).rejects.toThrow("boom");
+    await flush();
+
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      sel: { action: "run_script" },
+      keys: ["action", "identifier"],
+    });
+  });
+
+  it("records an empty shape (not null) for a call with no arguments", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(makeRequest(undefined), context);
+    await flush();
+
+    // `params_hash` is null for this call, but the shape is still recorded:
+    // args_shape IS NOT NULL is the marker for "a post-0039 row".
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({ keys: [] });
+  });
+
+  it("is computed from the ORIGINAL arguments even when an inner middleware rewrites the request", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const rewriting = vi.fn().mockImplementation(async (request) => {
+      // An inner layer (the override middleware builds a new request) may
+      // mutate what it was handed; the audit shape was taken at entry.
+      request.params.arguments = { rewritten: true };
+      return { content: [] };
+    });
+
+    const wrapped = createAuditingMiddleware()(rewriting);
+    await wrapped(makeRequest({ mode: "list", company: "c1" }), context);
+    await flush();
+
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      sel: { mode: "list" },
+      keys: ["company", "mode"],
+    });
+  });
+
+  describe("kill switch", () => {
+    const saved = process.env.TOOL_AUDIT_ARGS_SHAPE;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.TOOL_AUDIT_ARGS_SHAPE;
+      else process.env.TOOL_AUDIT_ARGS_SHAPE = saved;
+    });
+
+    it("stores NULL when TOOL_AUDIT_ARGS_SHAPE=off and still records the row", async () => {
+      process.env.TOOL_AUDIT_ARGS_SHAPE = "off";
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+
+      const wrapped = createAuditingMiddleware()(okHandler);
+      await wrapped(makeRequest({ mode: "list" }), context);
+      await flush();
+
+      const entry = recorder.mock.calls[0][0];
+      expect(entry.args_shape).toBeNull();
+      expect(entry.success).toBe(true);
+      expect(entry.params_hash).not.toBeNull();
+    });
+  });
+
+  it("never fails the call when the arguments cannot be read", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    // A plain-object Proxy whose key enumeration throws: the one input a JSON
+    // parser cannot produce but that proves the guard is in place.
+    const hostile = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("hostile");
+        },
+      },
+    );
+
+    const wrapped = createAuditingMiddleware()(okHandler);
+    const result = await wrapped(
+      makeRequest(hostile as Record<string, unknown>),
+      context,
+    );
+    await flush();
+
+    expect(result).toEqual({ content: [] });
+    expect(recorder.mock.calls[0][0].args_shape).toBeNull();
+  });
+});

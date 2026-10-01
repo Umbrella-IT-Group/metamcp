@@ -4,6 +4,11 @@ import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import { parseToolName } from "../tool-name-parser";
 import {
+  ArgsShape,
+  argsShapeEnabled,
+  buildArgsShape,
+} from "./audit-args-shape";
+import {
   CallToolMiddleware,
   MetaMCPHandlerContext,
 } from "./functional-middleware";
@@ -27,8 +32,10 @@ import {
  * DB-write discipline: this module's static graph stays DB-free (unit tests
  * import it without a database) — the repository is loaded lazily on first
  * use. Raw params are NEVER persisted; only a sha256 of the JSON-serialized
- * arguments (params can contain passwords). An audit-write failure is
- * swallowed and never fails or delays the tool call.
+ * arguments (params can contain passwords) and the argument SHAPE: top-level
+ * key names plus the value of a six-key allowlist of short enumerations
+ * (audit-args-shape; the one deliberate exception to "no argument values").
+ * An audit-write failure is swallowed and never fails or delays the tool call.
  */
 
 type AuditRecorder = (entry: {
@@ -49,6 +56,10 @@ type AuditRecorder = (entry: {
   acts_as_user_id?: string | null;
   caller_ip?: string | null;
   request_id?: string | null;
+  // Migration 0039. `args_shape` is computed at entry (never from a result);
+  // `error_detail` is filled by the result classifier. NULL = not recorded.
+  args_shape?: ArgsShape | null;
+  error_detail?: string | null;
 }) => Promise<void>;
 
 /**
@@ -104,6 +115,20 @@ function hashParams(args: unknown): string | null {
   }
 }
 
+/**
+ * The argument shape for this call, or null when the kill switch is off or the
+ * builder cannot read the arguments. Null is the honest "not recorded"; a
+ * builder fault must never reach the tool call, so it is swallowed here.
+ */
+function shapeOf(args: unknown): ArgsShape | null {
+  if (!argsShapeEnabled()) return null;
+  try {
+    return buildArgsShape(args);
+  } catch {
+    return null;
+  }
+}
+
 function errorCode(error: unknown): string {
   if (error && typeof error === "object") {
     const code = (error as { code?: unknown }).code;
@@ -148,6 +173,9 @@ export function createAuditingMiddleware(): CallToolMiddleware {
       request_id: source.requestId ?? null,
     };
     const paramsHash = hashParams(request.params.arguments);
+    // Computed here, from the arguments as the caller sent them, before any
+    // inner middleware (which builds a rewritten request) or the handler runs.
+    const argsShape = shapeOf(request.params.arguments);
 
     try {
       const result = await handler(request, context);
@@ -184,6 +212,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         // distinct from the protocol-level codes the catch branch records.
         error_code: failed ? "tool_error" : undefined,
         latency_ms: durationMs,
+        args_shape: argsShape,
         ...caller,
       });
       return result;
@@ -209,6 +238,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
         success: false,
         error_code: errorCode(error),
         latency_ms: durationMs,
+        args_shape: argsShape,
         ...caller,
       });
       throw error;

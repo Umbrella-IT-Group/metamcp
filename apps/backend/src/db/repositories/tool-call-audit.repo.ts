@@ -1,5 +1,6 @@
 import { lt } from "drizzle-orm";
 
+import type { ArgsShape } from "../../lib/metamcp/metamcp-middleware/audit-args-shape";
 import { db } from "../index";
 import { toolCallAuditTable } from "../schema";
 
@@ -23,6 +24,11 @@ export interface ToolCallAuditEntry {
   acts_as_user_id?: string | null;
   caller_ip?: string | null;
   request_id?: string | null;
+  // Migration 0039. NULL = not recorded. `args_shape` is key names plus
+  // allowlisted selector values, never argument values; `error_detail` is the
+  // tool's own failure code token. See audit-args-shape and audit-classify.
+  args_shape?: ArgsShape | null;
+  error_detail?: string | null;
 }
 
 /**

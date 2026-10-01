@@ -26,6 +26,8 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
+import type { ArgsShape } from "../lib/metamcp/metamcp-middleware/audit-args-shape";
+
 // Build the drizzle enums from the shared literal tuples (not
 // `SomeEnum.options`, which zod 4 widens to string[] and breaks pgEnum's
 // literal-union inference — see MCP_SERVER_TYPES in @repo/zod-types).
@@ -947,6 +949,21 @@ export const toolCallAuditTable = pgTable(
     acts_as_user_id: text("acts_as_user_id"),
     caller_ip: text("caller_ip"),
     request_id: text("request_id"),
+    // Migration 0039. Both NULLABLE, unconstrained and unindexed, for the same
+    // reason as the 0030 columns above: the write is fire-and-forget and a
+    // violation would be a swallowed INSERT failure, i.e. a silently missing
+    // audit row. NULL means "not recorded" (every row before the migration,
+    // or the kill switch was off); the table is write-once (0032), so it cannot
+    // be backfilled.
+    //
+    // `args_shape` is the SHAPE of the call: top-level key names plus the value
+    // of six allowlisted selector keys, never any other argument value (see
+    // lib/metamcp/metamcp-middleware/audit-args-shape).
+    // `error_detail` is the tool's own failure code token beside the
+    // `error_code` class (see audit-classify). Type-only import: this module
+    // must stay free of any runtime dependency on lib/.
+    args_shape: jsonb("args_shape").$type<ArgsShape>(),
+    error_detail: text("error_detail"),
   },
   (table) => [
     index("tool_call_audit_called_at_idx").on(table.called_at),

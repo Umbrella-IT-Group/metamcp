@@ -267,6 +267,13 @@
       "when": 1787702400000,
       "tag": "0038_api_key_admin_plane",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1787788800000,
+      "tag": "0039_tool_call_audit_args_shape_and_error_detail",
+      "breakpoints": true
     }
   ]
 }
