@@ -153,6 +153,8 @@ interface Backend {
   executions: () => number;
   /** How many tools/call requests reached the backend, of any name. */
   requests: () => number;
+  /** How many in-flight tools/call requests the backend was told to cancel. */
+  cancelled: () => number;
 }
 
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -166,11 +168,17 @@ async function backend(
   );
   let executions = 0;
   let requests = 0;
+  let cancelled = 0;
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [{ name: "list_things", inputSchema: { type: "object" } }],
   }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     requests += 1;
+    // The SDK client sends notifications/cancelled when its request times out;
+    // the backend's SDK turns that into an abort of this handler's signal.
+    extra.signal.addEventListener("abort", () => {
+      cancelled += 1;
+    });
     if (request.params.name === "list_things") {
       executions += 1;
       return onReal();
@@ -196,6 +204,7 @@ async function backend(
     },
     executions: () => executions,
     requests: () => requests,
+    cancelled: () => cancelled,
   };
 }
 
@@ -381,11 +390,18 @@ describe("retired names through the gateway", () => {
     // Not a redirect: the name is listed, but the failure is a timeout.
     expect(error?.message).not.toContain("tool_retired");
     expect(error?.message).toContain("Request timed out");
-    expect(error?.message).toContain("the backend may still be running it");
+    expect(error?.message).toContain(
+      "and asked the backend to cancel, but the outcome is unknown",
+    );
+    expect(error?.message).not.toContain("did not cancel");
     expect(error?.message).toContain(
       "read the target's current state before retrying",
     );
     expect(target.executions()).toBe(1);
+    // The premise the hint states: the SDK really does send the backend a
+    // cancellation on a timeout. If an SDK upgrade stops doing that, this fails
+    // and the wording must be revisited.
+    await vi.waitFor(() => expect(target.cancelled()).toBe(1));
     expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
     expect(getSessionMock).toHaveBeenCalledTimes(1);
   });

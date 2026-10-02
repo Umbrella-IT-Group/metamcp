@@ -53,12 +53,32 @@ describe("timeout hint: the gateway's own timeout", () => {
     expect(rewritten.message).toMatch(
       /^MCP error -32001: Request timed out\. The gateway stopped waiting after 60 s/,
     );
-    expect(rewritten.message).toContain("the backend may still be running it");
+    expect(rewritten.message).toContain(
+      "and asked the backend to cancel, but the outcome is unknown",
+    );
+    expect(rewritten.message).toContain(
+      "applied, partly applied, or still be finishing",
+    );
     expect(rewritten.message).toContain(
       "read the target's current state before retrying",
     );
     expect(rewritten.message).toContain("A read-only call is safe to retry.");
   });
+
+  // The first wording said "it did not cancel the call", which is false: the
+  // SDK sends notifications/cancelled on a timeout. The hint is copied into the
+  // skills and the tool design spec, so it must never assert either direction.
+  it.each([null, 0, 60])(
+    "never claims the call was, or was not, cancelled (seconds=%s)",
+    (seconds) => {
+      const hint = gatewayTimeoutHint(seconds);
+      expect(hint).not.toMatch(/did not cancel/i);
+      expect(hint).not.toMatch(/not cancel/i);
+      expect(hint).not.toMatch(/still be running it/i);
+      expect(hint).not.toMatch(/was cancelled|has been cancelled/i);
+      expect(hint).toMatch(/outcome is unknown/);
+    },
+  );
 
   it("also covers the maximum-total-timeout form", async () => {
     const original = McpError.fromError(
@@ -79,10 +99,14 @@ describe("timeout hint: the gateway's own timeout", () => {
   });
 
   it("omits the seconds when the data carries none usable", () => {
-    expect(gatewayTimeoutHint(null)).toMatch(/^The gateway stopped waiting;/);
-    expect(gatewayTimeoutHint(0)).toMatch(/^The gateway stopped waiting;/);
+    expect(gatewayTimeoutHint(null)).toMatch(
+      /^The gateway stopped waiting and asked/,
+    );
+    expect(gatewayTimeoutHint(0)).toMatch(
+      /^The gateway stopped waiting and asked/,
+    );
     expect(gatewayTimeoutHint(5)).toMatch(
-      /^The gateway stopped waiting after 5 s;/,
+      /^The gateway stopped waiting after 5 s and asked/,
     );
   });
 });

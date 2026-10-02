@@ -462,8 +462,8 @@ export const createMiddlewareEnabledHandlers = (
         `Access denied to tool "${toolName}": ${reason}`,
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
-    // Innermost: one added sentence on the gateway's own -32001 timeout (the
-    // backend may still be running the call), same code and data. The bridge
+    // Innermost: added text on the gateway's own -32001 timeout (the outcome is
+    // unknown, read the target's state before retrying), same code and data. The bridge
     // maps a thrown error to a 500 whose message carries it.
     createTimeoutHintMiddleware(),
     // Add more middleware here as needed

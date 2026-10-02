@@ -215,6 +215,9 @@ describe("OpenAPI bridge: retired names", () => {
 
     const res = await run("nosuchserver__lookup");
 
+    // Intentional status change, documented in the fork README: without the
+    // map entry this same thrown error answers 404 "Tool not found" (the test
+    // above); a mapped name is an isError result, which the bridge maps to 403.
     expect(res.statusCode).toBe(403);
     const envelope = JSON.parse((res.body as { message: string }).message);
     expect(envelope.code).toBe("tool_retired");
@@ -246,7 +249,8 @@ describe("OpenAPI bridge: gateway timeout hint", () => {
     const body = res.body as { error: string; message: string };
     expect(body.error).toBe("Tool execution failed");
     expect(body.message).toContain("Request timed out");
-    expect(body.message).toContain("the backend may still be running it");
+    expect(body.message).toContain("the outcome is unknown");
+    expect(body.message).not.toContain("did not cancel");
     expect(body.message).toContain(
       "read the target's current state before retrying",
     );

@@ -868,9 +868,9 @@ export const createServer = async (
         `Access denied to tool "${toolName}": ${reason}`,
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
-    // Innermost, directly around the routing handler: adds one sentence to the
-    // gateway's own -32001 timeout saying the backend may still be running the
-    // call. Same code, same data; text only.
+    // Innermost, directly around the routing handler: adds text to the
+    // gateway's own -32001 timeout saying the outcome is unknown and a write's
+    // target should be read before a retry. Same code, same data; text only.
     createTimeoutHintMiddleware(),
     // Add more middleware here as needed
     // createAuthorizationMiddleware(),
