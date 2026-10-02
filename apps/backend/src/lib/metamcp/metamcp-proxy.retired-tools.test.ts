@@ -496,6 +496,15 @@ describe("retired names through the gateway", () => {
 });
 
 describe("argument schemas through real SDK transports", () => {
+  // The audit row for call n, once exactly n rows exist. Reading `.at(-1)` after
+  // a timer tick let a late or missing row pass as another call's row; CI saw
+  // one such failure (2026-10-02, not reproduced locally), so a count mismatch
+  // now fails as a count and a missing schema fails as a shape.
+  const shapeOfRow = async (recorder: ReturnType<typeof vi.fn>, n: number) => {
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(n));
+    return recorder.mock.calls[n - 1][0].args_shape;
+  };
+
   it("an override uses the final exposed name's schema and preserves call arguments", async () => {
     config.listedAlias = "ninja__alias";
     const recorder = vi.fn().mockResolvedValue(undefined);
@@ -505,8 +514,7 @@ describe("argument schemas through real SDK transports", () => {
     const consumer = await connectConsumer();
     expect((await list(consumer)).tools[0].name).toBe("ninja__alias");
     await call(consumer, "ninja__alias", { mode: "list", Alice_Smith: 1 });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: ["mode"],
       sel: { mode: "list" },
       unknown_keys: 1,
@@ -550,8 +558,7 @@ describe("argument schemas through real SDK transports", () => {
         mode: "Alice_Smith",
         Alice_Smith: 1,
       });
-      await flush();
-      expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      expect(await shapeOfRow(recorder, 1)).toEqual({
         keys: ["mode"],
         sel: { mode: "?" },
         unknown_keys: 1,
@@ -568,16 +575,14 @@ describe("argument schemas through real SDK transports", () => {
     getSessionMock.mockResolvedValue(target.session);
     const consumer = await connectConsumer();
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
       unverified_keys: 1,
     });
 
     await list(consumer);
     await call(consumer, REAL_TOOL, { mode: "list" });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 2)).toEqual({
       keys: ["mode"],
       sel: { mode: "list" },
     });
@@ -590,8 +595,7 @@ describe("argument schemas through real SDK transports", () => {
     ]);
     await list(consumer);
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 3)).toEqual({
       keys: [],
       unverified_keys: 1,
     });
@@ -608,8 +612,7 @@ describe("argument schemas through real SDK transports", () => {
       [...target.session.listChangedSubscribers].map((notify) => notify()),
     );
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
       unverified_keys: 1,
     });
@@ -631,8 +634,7 @@ describe("argument schemas through real SDK transports", () => {
     pause.release();
     await pending;
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
       unverified_keys: 1,
     });
@@ -658,8 +660,7 @@ describe("argument schemas through real SDK transports", () => {
     pause.release();
     await older;
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
-    await flush();
-    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+    expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
       unverified_keys: 1,
     });
