@@ -212,6 +212,43 @@ describe("codeToken: the column is never fed free text", () => {
     expect(codeToken(exact)).toBe(exact);
   });
 
+  it("keeps the leading-token boundary at exactly the maximum length", () => {
+    const at = `a_${"b".repeat(ERROR_DETAIL_MAX - 2)}`;
+    const over = `${at}b`;
+    expect(codeToken(`${at} (status=500): boom`)).toBe(at);
+    expect(codeToken(`${over} (status=500): boom`)).toBeNull();
+    expect(codeToken(`${at}`)).toBe(at);
+    expect(codeToken(over)).toBeNull();
+  });
+
+  // A refutation measured the old leading-token pattern (two overlapping greedy
+  // runs split on an underscore) at 895 ms for 32 KB and 13.5 s for 128 KB of
+  // `a_a_a_...!`, blocking the gateway's whole event loop. structuredContent has
+  // no size cap, so the match itself must be bounded, not just the text path.
+  it.each([
+    ["a long snake-case run ending in a stray character", "a_".repeat(32768)],
+    ["the same shape at 100 KB", "a_".repeat(51200)],
+    ["a long run of word characters with no underscore", "a".repeat(100000)],
+  ])("stays linear on %s", (_label, run) => {
+    const hostile = `${run}!`;
+    const started = performance.now();
+    expect(codeToken(hostile)).toBeNull();
+    expect(codeToken(`${hostile} tail`)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
+  it("stays linear through the whole verdict on a hostile unwrapped envelope", () => {
+    const hostile = `${"a_".repeat(51200)}!`;
+    const started = performance.now();
+    const verdict = classifyCallResult({
+      content: [],
+      structuredContent: { error: hostile },
+    });
+    expect(performance.now() - started).toBeLessThan(50);
+    // Still a failure (a non-blank error string); just no code to record.
+    expect(verdict).toEqual({ failed: true, errorCode: "inband_error" });
+  });
+
   it.each([42, null, undefined, {}, [], true, Symbol("x")])(
     "rejects a non-string %s without throwing",
     (value) => {

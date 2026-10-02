@@ -114,12 +114,20 @@ function own(object: Record<string, unknown>, key: string): unknown {
 
 // A whole-string code: lowercase snake_case, at most ERROR_DETAIL_MAX chars.
 const WHOLE_TOKEN = new RegExp(`^[a-z][a-z0-9_]{0,${ERROR_DETAIL_MAX - 1}}$`);
-// The LEADING token of a longer string. Needs at least one underscore (a plain
-// word such as "provide" is the start of a sentence, not a code) and must be
-// followed by the end of the string, a space, "(" or ":". That accepts
-// "ninja_error (status=500): boom" and "unexpected_error: x" and rejects
-// "device_not_found,bad" and a snake-cased word glued to punctuation.
-const LEADING_TOKEN = /^([a-z][a-z0-9_]*_[a-z0-9_]*)(?=$|[ (:])/;
+// The LEADING token of a longer string. It must be followed by the end of the
+// string, a space, "(" or ":". That accepts "ninja_error (status=500): boom" and
+// "unexpected_error: x" and rejects "device_not_found,bad" and a snake-cased
+// word glued to punctuation. The run is BOUNDED to ERROR_DETAIL_MAX characters
+// in the pattern itself: a longer run is dropped anyway, and the old unbounded
+// `[a-z0-9_]*_[a-z0-9_]*` backtracked quadratically on a long `a_a_a_...!`
+// (32 KB took 0.9 s, 128 KB 13 s of blocked event loop), and structuredContent
+// is not size-capped. The "at least one underscore" rule (a plain word such as
+// "provide" starts a sentence, it is not a code) is a plain includes() check in
+// codeToken, not part of the pattern. Because the lookahead characters are not
+// word characters, the match is always the whole run, never a prefix of it.
+const LEADING_TOKEN = new RegExp(
+  `^([a-z][a-z0-9_]{0,${ERROR_DETAIL_MAX - 1}})(?=$|[ (:])`,
+);
 const FOUR_DIGITS = /\d{4}/;
 
 /**
@@ -142,7 +150,7 @@ export function codeToken(value: unknown): string | null {
     token = trimmed;
   } else {
     const match = LEADING_TOKEN.exec(trimmed);
-    if (match) token = match[1];
+    if (match?.[1].includes("_")) token = match[1];
   }
 
   if (token === null) return null;
