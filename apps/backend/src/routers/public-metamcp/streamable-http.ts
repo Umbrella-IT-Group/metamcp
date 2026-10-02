@@ -22,6 +22,7 @@ import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
   checkConcurrentSessionCeiling,
+  registerSessionActivityProbe,
   registerSessionCounter,
 } from "../../lib/metamcp/credential-session-quota";
 import {
@@ -299,6 +300,14 @@ export const publicSessionSweeper = PublicSessionSweeper.fromEnv(
     measureActiveConnections: () =>
       metaMcpServerPool.getMcpServerPoolStatus().active,
   },
+);
+
+// Let the per-credential ceiling summary ask this sweeper whether a session is
+// in flight or how long it has been idle. Read-only; used only when a credential
+// is approaching or at its ceiling, to say what is filling it. SSE sessions are
+// not tracked here and are reported as untracked.
+registerSessionActivityProbe((sessionId) =>
+  publicSessionSweeper.getActivity(sessionId),
 );
 
 /**

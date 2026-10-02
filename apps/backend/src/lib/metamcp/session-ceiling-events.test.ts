@@ -246,3 +246,76 @@ describe("recordSessionCeilingEvent — it never throws into the request path", 
     ).not.toThrow();
   });
 });
+
+describe("recordSessionCeilingEvent — the live summary", () => {
+  const SUMMARY =
+    "live: autotask=21, itglue=21, ninja=21 (top 3 of 14 endpoints); in-flight 187, idle 113, oldest idle 1710s";
+
+  it("appends the summary to a refused event, after the existing text", () => {
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      label: "Autotask connector",
+      decision: { ...refused(), liveSummary: SUMMARY },
+    });
+
+    const entry = recordMock.mock.calls[0][0];
+    expect(entry.message).toBe(
+      `session refused: concurrent-session ceiling reached (101/100); ${SUMMARY}`,
+    );
+    expect(entry.message.length).toBeLessThan(300);
+  });
+
+  it("appends it to an approaching event", () => {
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      decision: { ...approaching(), liveSummary: SUMMARY },
+    });
+    expect(recordMock.mock.calls[0][0].message).toBe(
+      `concurrent sessions at 81/100, approaching the ceiling; ${SUMMARY}`,
+    );
+  });
+
+  it("keeps the suppressed count and still stays under 300 characters", () => {
+    const decision = { ...refused(), liveSummary: SUMMARY };
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      decision,
+    });
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      decision,
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + SESSION_CEILING_EVENT_INTERVAL_MS + 1);
+      recordSessionCeilingEvent({
+        identity: identityA,
+        endpointName: "ep-1",
+        decision,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(recordMock).toHaveBeenCalledTimes(2);
+    const second = recordMock.mock.calls[1][0].message as string;
+    expect(second).toContain("(1 more refusals suppressed in the last 60s)");
+    expect(second.endsWith(SUMMARY)).toBe(true);
+    expect(second.length).toBeLessThan(300);
+  });
+
+  it("is unchanged when the decision carries no summary", () => {
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      decision: refused(),
+    });
+    expect(recordMock.mock.calls[0][0].message).toBe(
+      "session refused: concurrent-session ceiling reached (101/100)",
+    );
+  });
+});

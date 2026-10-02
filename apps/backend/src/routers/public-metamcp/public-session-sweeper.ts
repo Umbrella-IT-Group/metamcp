@@ -477,6 +477,24 @@ export class PublicSessionSweeper {
     };
   }
 
+  /**
+   * Read-only activity of one tracked session: how long since its last request
+   * and whether a request is in flight right now. Undefined for a session this
+   * sweeper does not track (SSE sessions, or one already forgotten). Used by the
+   * per-credential session summary, which counts an untracked session as such
+   * rather than guessing; it never mutates tracking state.
+   */
+  getActivity(
+    sessionId: string,
+  ): { idleMs: number; inFlight: boolean } | undefined {
+    const last = this.lastActivity.get(sessionId);
+    if (last === undefined) return undefined;
+    return {
+      idleMs: Math.max(0, this.now() - last),
+      inFlight: (this.inFlight.get(sessionId) ?? 0) > 0,
+    };
+  }
+
   // ---- test-only introspection ----
   getLastActivity(sessionId: string): number | undefined {
     return this.lastActivity.get(sessionId);

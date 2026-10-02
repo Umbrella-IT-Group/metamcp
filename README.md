@@ -301,6 +301,12 @@ Better-auth's own rate limiter stays pinned off and should not be enabled instea
 
 A refusal is a `429` with a `Retry-After` and writes no audit row (a row per refusal would amplify the writes being bounded); it is reported to the log instead, at most one line a minute, carrying a running total since startup.
 
+#### Per-credential session ceiling
+
+`MCP_MAX_SESSIONS_PER_CREDENTIAL` (default `100`, `0` disables) bounds how many concurrent MCP sessions one credential may hold; a credential at the limit gets a `429` on its next `initialize`. Past 80% the gateway logs `Concurrent-session usage high for <method> credential "<name>": N/M live sessions`, and at the limit `Concurrent-session ceiling reached ...`, plus a throttled `client` gateway event.
+
+Those lines now end with a short clause saying what is filling the credential, for example `live: autotask=21, itglue=21, ninja=21 (top 5 of 14 endpoints); in-flight 187, idle 113, oldest idle 1710s`: sessions per endpoint (highest first, at most five names), how many hold a request in flight (an open stream counts) versus idle, and how long the quietest idle one has been silent. Sessions the idle sweeper does not track (SSE) are counted as `untracked`. A mostly-idle, old set means abandoned sessions from a client that never closes them; a mostly in-flight set means open streams. The clause carries counts and endpoint names only, never a session id or a token, is bounded to about 180 characters, is built only when a credential is approaching or at the ceiling, and cannot affect the admission decision (a fault building it just leaves the line without the clause).
+
 ### OAuth and session lifetimes
 
 | Variable | Default | Purpose |
