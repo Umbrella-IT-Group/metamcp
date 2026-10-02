@@ -45,7 +45,7 @@ export const namespacesImplementations = {
     try {
       // Determine user ownership based on input.user_id or default to current user
       const effectiveUserId =
-        input.user_id !== undefined ? input.user_id : null;
+        input.user_id !== undefined ? input.user_id : userId;
       const isPublicNamespace = effectiveUserId === null;
 
       // Validate server accessibility and relationship rules
