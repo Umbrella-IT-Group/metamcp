@@ -44,6 +44,10 @@ describe("looksLikeUnknownTool", () => {
     ["a tool name only", "autotask__search"],
     ["a not-found that starts elsewhere", "Ticket 123 not found"],
     ["Tool ... not found split over lines", "Tool x\nnot found"],
+    [
+      "prose starting with the same words",
+      "Unknown tool operation is disabled",
+    ],
   ])("does not match %s", (_label, text) => {
     expect(looksLikeUnknownTool(text)).toBe(false);
   });
@@ -64,9 +68,30 @@ describe("looksLikeUnknownTool", () => {
     const longName = "n".repeat(130);
     expect(looksLikeUnknownTool(`Tool ${longName} not found`)).toBe(false);
   });
+
+  it("can require the missing name to match the requested tool", () => {
+    for (const message of [
+      "Unknown tool: autotask__add_note",
+      "Unknown tool: 'add_note'",
+      "Tool add_note not found",
+      'Access denied to tool "autotask__add_note": server could not be resolved',
+    ]) {
+      expect(looksLikeUnknownTool(message, "autotask__add_note")).toBe(true);
+      expect(looksLikeUnknownTool(message, "autotask__search")).toBe(false);
+    }
+  });
 });
 
 describe("isUnknownToolError", () => {
+  it("treats an unreadable message as an opaque failure without throwing", () => {
+    const failure = {
+      get message() {
+        throw new Error("private-fault-data");
+      },
+    };
+    expect(isUnknownToolError(failure)).toBe(false);
+  });
+
   it("is true for the gateway's own thrown error", () => {
     expect(isUnknownToolError(new Error("Unknown tool: a__b"))).toBe(true);
     expect(isUnknownToolError(new Error('Unknown tool: "a__b"'))).toBe(true);

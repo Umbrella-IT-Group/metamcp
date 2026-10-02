@@ -352,7 +352,13 @@ describe("summarizeCredentialSessions — what is filling a credential", () => {
       listingCounter({ "key-1": sessions("s", "autotask", 2) }),
     );
 
-    expect(summarizeCredentialSessions(API_KEY_IDENTITY).total).toBe(2);
+    const summary = summarizeCredentialSessions(API_KEY_IDENTITY);
+    expect(summary.total).toBe(2);
+    expect(summary.incomplete).toBe(true);
+    // A skipped manager must not make the remaining sessions look complete.
+    expect(formatCredentialSessionSummary(summary)).toBe("");
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(String(loggerMock.warn.mock.calls[0][0])).not.toContain("boom");
   });
 
   it("a probe that throws counts that session as untracked and does not stop the summary", () => {
@@ -360,12 +366,16 @@ describe("summarizeCredentialSessions — what is filling a credential", () => {
       listingCounter({ "key-1": sessions("s", "autotask", 3) }),
     );
     registerSessionActivityProbe((sessionId) => {
-      if (sessionId.endsWith("-1")) throw new Error("probe fault");
+      if (sessionId.endsWith("-1")) throw new Error("private-probe-data");
       return { idleMs: 1000, inFlight: false };
     });
 
     const summary = summarizeCredentialSessions(API_KEY_IDENTITY);
     expect(summary).toMatchObject({ total: 3, idle: 2, untracked: 1 });
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(String(loggerMock.warn.mock.calls[0][0])).not.toContain(
+      "private-probe-data",
+    );
   });
 
   it("asks a later probe when an earlier one does not track the session", () => {
@@ -591,7 +601,7 @@ describe("checkConcurrentSessionCeiling — the live summary", () => {
     registerSessionCounter({
       countSessionsForIdentity: () => 4,
       listSessionsForIdentity: () => {
-        throw new Error("lister fault");
+        throw new Error("private-lister-data");
       },
     });
     registerSessionActivityProbe(() => {
@@ -606,9 +616,62 @@ describe("checkConcurrentSessionCeiling — the live summary", () => {
       ceiling: 4,
       approaching: true,
     });
-    // The original WARN is still written, just without a summary.
-    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
-    expect(String(loggerMock.warn.mock.calls[0][0])).not.toContain(" live: ");
+    // The summary fault is visible, and the original refusal WARN still runs.
+    expect(loggerMock.warn).toHaveBeenCalledTimes(2);
+    expect(String(loggerMock.warn.mock.calls[0][0])).not.toContain(
+      "private-lister-data",
+    );
+    expect(String(loggerMock.warn.mock.calls[1][0])).toMatch(
+      /^Concurrent-session ceiling reached/,
+    );
+    expect(String(loggerMock.warn.mock.calls[1][0])).not.toContain(" live: ");
+  });
+
+  it("does not publish a partial breakdown when one of two listers fails", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "4";
+    registerBusyCredential(2);
+    registerSessionCounter({
+      countSessionsForIdentity: () => 2,
+      listSessionsForIdentity: () => {
+        throw new Error("private session id");
+      },
+    });
+    expect(checkConcurrentSessionCeiling(API_KEY_IDENTITY)).toEqual({
+      allowed: false,
+      current: 4,
+      ceiling: 4,
+      approaching: true,
+    });
+    expect(loggerMock.warn).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(
+      "private session id",
+    );
+  });
+
+  it("reports a rendering fault without changing admission or leaking the fault object", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    registerSessionCounter({
+      countSessionsForIdentity: () => 1,
+      listSessionsForIdentity: () => [
+        {
+          sessionId: "private-session-id",
+          endpointName: null as unknown as string,
+        },
+      ],
+    });
+    expect(checkConcurrentSessionCeiling(API_KEY_IDENTITY)).toEqual({
+      allowed: false,
+      current: 1,
+      ceiling: 1,
+      approaching: true,
+    });
+    expect(loggerMock.warn).toHaveBeenCalledTimes(2);
+    expect(loggerMock.warn.mock.calls[0][0]).toBe(
+      "Session ceiling summary could not be rendered; continuing admission check.",
+    );
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(
+      "private-session-id",
+    );
   });
 
   it("keeps the exact WARN text when no counter can list (today's behavior)", () => {

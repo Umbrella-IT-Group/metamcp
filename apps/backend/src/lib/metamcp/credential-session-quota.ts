@@ -147,6 +147,8 @@ export interface CredentialSessionSummary {
   oldestIdleSeconds: number | null;
   /** Sessions no probe tracks (SSE, or untracked): neither idle nor in flight. */
   untracked: number;
+  /** A lister fault omitted sessions; do not publish the remaining counts as complete. */
+  incomplete?: true;
 }
 
 const SUMMARY_TOP_ENDPOINTS = 5;
@@ -181,12 +183,15 @@ export function summarizeCredentialSessions(
   let idle = 0;
   let untracked = 0;
   let oldestIdleMs = -1;
+  let listerFaults = 0;
+  let probeFaults = 0;
 
   for (const counter of counters) {
     let sessions: SessionListing[] = [];
     try {
       sessions = counter.listSessionsForIdentity?.(identity) ?? [];
     } catch {
+      listerFaults += 1;
       continue;
     }
     for (const session of sessions) {
@@ -201,6 +206,7 @@ export function summarizeCredentialSessions(
         try {
           activity = probe(session.sessionId);
         } catch {
+          probeFaults += 1;
           activity = undefined;
         }
         if (activity !== undefined) break;
@@ -221,6 +227,14 @@ export function summarizeCredentialSessions(
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .slice(0, SUMMARY_TOP_ENDPOINTS);
 
+  if (listerFaults > 0 || probeFaults > 0) {
+    // Fault objects can contain credentials or session IDs. Log counts only,
+    // once per summary, while preserving the independent admission decision.
+    logger.warn(
+      `Session ceiling summary degraded: ${listerFaults} lister faults, ${probeFaults} activity probe faults.`,
+    );
+  }
+
   return {
     total,
     byEndpoint,
@@ -230,6 +244,7 @@ export function summarizeCredentialSessions(
     oldestIdleSeconds:
       oldestIdleMs >= 0 ? Math.floor(oldestIdleMs / 1000) : null,
     untracked,
+    ...(listerFaults > 0 && { incomplete: true as const }),
   };
 }
 
@@ -251,7 +266,7 @@ function safeEndpointName(name: string): string {
 export function formatCredentialSessionSummary(
   summary: CredentialSessionSummary,
 ): string {
-  if (summary.total === 0) return "";
+  if (summary.total === 0 || summary.incomplete) return "";
 
   const tail: string[] = [];
   if (summary.inFlight > 0 || summary.idle > 0) {
@@ -290,6 +305,9 @@ function liveSummaryFor(identity: SessionIdentity): string {
       summarizeCredentialSessions(identity),
     );
   } catch {
+    logger.warn(
+      "Session ceiling summary could not be rendered; continuing admission check.",
+    );
     return "";
   }
 }

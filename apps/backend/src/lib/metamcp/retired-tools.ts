@@ -231,6 +231,15 @@ export type ParseOutcome =
  * other rejection is definitive.
  */
 export function parseRetiredToolsFile(text: string, now: Date): ParseOutcome {
+  // A checkout can replace or grow the file after stat. Check the actual
+  // bytes before JSON.parse too, so that race cannot bypass the file limit.
+  if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) {
+    return {
+      ok: false,
+      reason: `file is larger than ${MAX_FILE_BYTES} bytes`,
+      transient: false,
+    };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -511,18 +520,10 @@ export class RetiredToolsRegistry {
       this.warnDegraded(outcome.reason);
       return;
     }
-    // Stat again after the read so the signature describes what was parsed.
-    let after = st;
-    try {
-      after = await stat(path);
-    } catch {
-      // Keep the pre-read signature; the next interval re-checks.
-    }
-    this.adopt(
-      outcome,
-      { mtimeMs: after.mtimeMs, size: after.size },
-      "reloaded",
-    );
+    // Retain the pre-read signature. A replacement arriving during/after the
+    // read must be checked next interval; a post-read stat could otherwise
+    // bless old bytes with the new file's signature and suppress reloads.
+    this.adopt(outcome, { mtimeMs: st.mtimeMs, size: st.size }, "reloaded");
   }
 
   private async readAndParse(path: string): Promise<ParseOutcome> {

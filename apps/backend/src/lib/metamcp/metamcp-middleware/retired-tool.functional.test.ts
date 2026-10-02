@@ -136,6 +136,34 @@ describe("retired-tool middleware: zero cost off the failure path", () => {
       wrapped2(request("autotask__never_existed"), context),
     ).resolves.toBe(returned);
   });
+
+  it.each([
+    "Unknown tool: internal_helper",
+    "Tool internal_helper not found",
+    'Access denied to tool "other__add_note": server could not be resolved',
+    "Unknown tool operation is disabled",
+  ])(
+    "does not retire a live tool for a different failure: %s",
+    async (message) => {
+      const lookup = makeLookup();
+      const result = errText(message);
+      const returned = createRetiredToolMiddleware({ lookup })(
+        async () => result,
+      );
+      await expect(
+        returned(request("autotask__add_note"), context),
+      ).resolves.toBe(result);
+
+      const error = new Error(message);
+      const thrown = createRetiredToolMiddleware({ lookup })(async () => {
+        throw error;
+      });
+      await expect(thrown(request("autotask__add_note"), context)).rejects.toBe(
+        error,
+      );
+      expect(lookup).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("retired-tool middleware: the redirect", () => {
@@ -285,6 +313,22 @@ describe("retired-tool middleware: the redirect", () => {
     const wrapped = createRetiredToolMiddleware({ lookup })(async () => odd);
     await expect(wrapped(request("autotask__add_note"), context)).resolves.toBe(
       odd,
+    );
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("rethrows the identical opaque failure when its message cannot be read", async () => {
+    const lookup = makeLookup();
+    const failure = {
+      get message() {
+        throw new Error("private-fault-data");
+      },
+    };
+    const wrapped = createRetiredToolMiddleware({ lookup })(async () => {
+      throw failure;
+    });
+    await expect(wrapped(request("autotask__add_note"), context)).rejects.toBe(
+      failure,
     );
     expect(lookup).not.toHaveBeenCalled();
   });

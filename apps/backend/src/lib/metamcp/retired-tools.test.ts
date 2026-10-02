@@ -11,8 +11,13 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { fsCalls } = vi.hoisted(() => ({
+const { fsCalls, fsRaces } = vi.hoisted(() => ({
   fsCalls: { stat: 0, readFile: 0, statSync: 0, readFileSync: 0 },
+  fsRaces: {
+    beforeSyncRead: undefined as (() => void) | undefined,
+    beforeAsyncRead: undefined as (() => void) | undefined,
+    afterAsyncRead: undefined as (() => void) | undefined,
+  },
 }));
 
 vi.mock("@/utils/logger", () => ({
@@ -31,7 +36,15 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     },
     readFile: (...args: Parameters<typeof actual.readFile>) => {
       fsCalls.readFile += 1;
-      return actual.readFile(...args);
+      const before = fsRaces.beforeAsyncRead;
+      fsRaces.beforeAsyncRead = undefined;
+      before?.();
+      return actual.readFile(...args).then((text) => {
+        const after = fsRaces.afterAsyncRead;
+        fsRaces.afterAsyncRead = undefined;
+        after?.();
+        return text;
+      });
     },
   };
 });
@@ -45,6 +58,9 @@ vi.mock("node:fs", async (importOriginal) => {
     },
     readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
       fsCalls.readFileSync += 1;
+      const before = fsRaces.beforeSyncRead;
+      fsRaces.beforeSyncRead = undefined;
+      before?.();
       return actual.readFileSync(...args);
     },
   };
@@ -123,6 +139,9 @@ beforeEach(() => {
   file = path.join(dir, "retired-tools.json");
   clock = NOW;
   mtimeCounter = 1_000_000;
+  fsRaces.beforeSyncRead = undefined;
+  fsRaces.beforeAsyncRead = undefined;
+  fsRaces.afterAsyncRead = undefined;
   for (const key of Object.keys(fsCalls) as (keyof typeof fsCalls)[]) {
     fsCalls[key] = 0;
   }
@@ -193,6 +212,14 @@ describe("RetiredToolsRegistry: boot", () => {
     const registry = makeRegistry();
     expect(registry.size).toBe(0);
     expect(warnings()[0]).toContain("not valid JSON");
+  });
+
+  it("rejects oversized bytes when the file grows after the boot stat", () => {
+    write(goodFile());
+    fsRaces.beforeSyncRead = () =>
+      write(`${JSON.stringify(goodFile())}${" ".repeat(MAX_FILE_BYTES)}`);
+    expect(makeRegistry().size).toBe(0);
+    expect(warnings().some((w) => w.includes("larger than"))).toBe(true);
   });
 });
 
@@ -365,6 +392,31 @@ describe("RetiredToolsRegistry: reload", () => {
     expect(warnings().some((w) => w.includes("larger than"))).toBe(true);
   });
 
+  it("rejects oversized bytes when the file grows after the reload stat", async () => {
+    write(goodFile());
+    const registry = makeRegistry();
+    write({ version: 1, retired: {} });
+    fsRaces.beforeAsyncRead = () =>
+      write(
+        `${JSON.stringify({ version: 1, retired: {} })}${" ".repeat(MAX_FILE_BYTES)}`,
+      );
+    clock += 31_000;
+    await expect(registry.get("autotask__add_note")).resolves.not.toBeNull();
+    expect(warnings().some((w) => w.includes("larger than"))).toBe(true);
+  });
+
+  it("rechecks a replacement that arrives after reading the previous contents", async () => {
+    write(goodFile());
+    const registry = makeRegistry();
+    write({ version: 1, retired: {} });
+    fsRaces.afterAsyncRead = () => write(goodFile());
+    clock += 31_000;
+    await expect(registry.get("autotask__add_note")).resolves.toBeNull();
+    clock += 31_000;
+    await expect(registry.get("autotask__add_note")).resolves.not.toBeNull();
+    expect(fsCalls.readFile).toBe(2);
+  });
+
   it("never throws out of get", async () => {
     write(goodFile());
     const registry = makeRegistry();
@@ -398,6 +450,19 @@ describe("parseRetiredToolsFile: whole-file rules", () => {
   it("flags broken JSON as transient (a write may be in progress)", () => {
     const outcome = parseRetiredToolsFile("{ broken", now);
     expect(outcome).toMatchObject({ ok: false, transient: true });
+  });
+
+  it("enforces the byte cap before parsing, including multibyte text", () => {
+    const text = JSON.stringify({
+      version: 1,
+      retired: {},
+      pad: "é".repeat(MAX_FILE_BYTES / 2),
+    });
+    expect(text.length).toBeLessThan(MAX_FILE_BYTES);
+    expect(parseRetiredToolsFile(text, now)).toMatchObject({
+      ok: false,
+      transient: false,
+    });
   });
 
   it("rejects more than the maximum entry count", () => {

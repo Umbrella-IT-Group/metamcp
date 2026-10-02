@@ -140,6 +140,10 @@ function shapeOf(args: unknown): ArgsShape | null {
   try {
     return buildArgsShape(args);
   } catch {
+    // Never echo the fault: a getter can put argument values in its message.
+    logger.warn(
+      "Audit argument shape fault; recording the call without args_shape",
+    );
     return null;
   }
 }

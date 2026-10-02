@@ -62,7 +62,7 @@ function buildRedirect(name: string, entry: RetiredEntry): CallToolResult {
 }
 
 /** True when a returned result is an isError "no such tool" answer. */
-function isUnknownToolResult(result: unknown): boolean {
+function isUnknownToolResult(result: unknown, expectedName: string): boolean {
   try {
     if (result === null || typeof result !== "object") return false;
     const candidate = result as { isError?: unknown; content?: unknown };
@@ -73,7 +73,9 @@ function isUnknownToolResult(result: unknown): boolean {
     const first: unknown = candidate.content[0];
     if (first === null || typeof first !== "object") return false;
     const block = first as { type?: unknown; text?: unknown };
-    return block.type === "text" && looksLikeUnknownTool(block.text);
+    return (
+      block.type === "text" && looksLikeUnknownTool(block.text, expectedName)
+    );
   } catch {
     // A result that cannot be read is not rewritten.
     return false;
@@ -105,7 +107,7 @@ export function createRetiredToolMiddleware(
     try {
       result = await handler(request, context);
     } catch (error) {
-      if (isUnknownToolError(error)) {
+      if (isUnknownToolError(error, request.params.name)) {
         const redirect = await redirectFor(request.params.name);
         if (redirect) return redirect;
       }
@@ -113,7 +115,7 @@ export function createRetiredToolMiddleware(
       throw error;
     }
 
-    if (isUnknownToolResult(result)) {
+    if (isUnknownToolResult(result, request.params.name)) {
       const redirect = await redirectFor(request.params.name);
       if (redirect) return redirect;
     }

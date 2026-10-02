@@ -486,6 +486,7 @@ describe("args_shape (migration 0039)", () => {
     );
 
     const wrapped = createAuditingMiddleware()(okHandler);
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
     const result = await wrapped(
       makeRequest(hostile as Record<string, unknown>),
       context,
@@ -494,6 +495,12 @@ describe("args_shape (migration 0039)", () => {
 
     expect(result).toEqual({ content: [] });
     expect(recorder.mock.calls[0][0].args_shape).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(
+      "Audit argument shape fault",
+    );
+    expect(String(warn.mock.calls[0][0])).not.toContain("hostile");
+    warn.mockRestore();
   });
 });
 
@@ -641,6 +648,23 @@ describe("in-band classification (migration 0039 error_detail)", () => {
     await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(timeout);
     await flush();
 
+    expect(recorder.mock.calls[0][0].error_code).toBe("-32001");
+  });
+
+  it("preserves an opaque thrown failure when unknown-tool classification cannot read its message", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failure = {
+      code: -32001,
+      get message() {
+        throw new Error("private-fault-data");
+      },
+    };
+    const wrapped = createAuditingMiddleware()(
+      vi.fn().mockRejectedValue(failure),
+    );
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(failure);
+    await flush();
     expect(recorder.mock.calls[0][0].error_code).toBe("-32001");
   });
 
