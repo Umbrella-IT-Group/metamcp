@@ -1,12 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ToolArgSchema } from "../tool-arg-keys";
 import {
+  MAX_ENUM_VALUES,
+  MAX_SCHEMA_KEYS,
   MAX_TOOLS,
-  recordToolArgSchema,
-  resetToolArgSchemasForTest,
   schemaFromInputSchema,
-  toolArgSchema,
+  ToolArgSchemaRegistry,
 } from "../tool-arg-keys";
 import {
   argsShapeEnabled,
@@ -14,6 +14,7 @@ import {
   KEY_MAX_LEN,
   MAX_KEYS,
   SELECTOR_KEYS,
+  SELECTOR_UNENUMERATED_MARKER,
   SELECTOR_VALUE_MAX,
 } from "./audit-args-shape";
 
@@ -23,7 +24,16 @@ import {
 function allowAll(args: unknown): ToolArgSchema | undefined {
   if (args === null || typeof args !== "object" || Array.isArray(args))
     return undefined;
-  return { keys: new Set(Object.keys(args)), enums: new Map() };
+  // Each selector the call sends is declared as an enum holding the value sent
+  // (an empty enum for a non-string), so membership passes and the length and
+  // character rules alone decide. Values are stored only from a closed set.
+  const enums = new Map<string, ReadonlySet<string>>();
+  for (const key of SELECTOR_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(args, key)) continue;
+    const v = (args as Record<string, unknown>)[key];
+    enums.set(key, new Set(typeof v === "string" ? [v] : []));
+  }
+  return { keys: new Set(Object.keys(args)), enums };
 }
 const shapeAllowAll = (args: unknown) => buildArgsShape(args, allowAll(args));
 
@@ -282,7 +292,7 @@ describe("buildArgsShape: the tool schema decides which names are stored (Sol re
   it("a caller-chosen key the schema does not declare is counted, never stored", () => {
     const shape = buildArgsShape(
       { mode: "list", ticket: 1, Alice_Smith: 1, client_secret_SAMPLE: "x" },
-      schema({ mode: {}, ticket: {} }),
+      schema({ mode: { enum: ["list"] }, ticket: {} }),
     );
     expect(shape).toEqual({
       keys: ["mode", "ticket"],
@@ -313,39 +323,213 @@ describe("buildArgsShape: the tool schema decides which names are stored (Sol re
     expect(buildArgsShape({ mode: "zzz" }, s).sel).toEqual({ mode: "?" });
   });
 
+  it.each([
+    "a".repeat(SELECTOR_VALUE_MAX + 1),
+    "person@client.example",
+    "has space",
+  ])(
+    "an enum member still obeys the selector size and character limits: %s",
+    (value) => {
+      const s = schema({ mode: { enum: [value] } });
+      expect(buildArgsShape({ mode: value }, s).sel).toEqual({ mode: "?" });
+    },
+  );
+
+  it.each([
+    { values: [] },
+    { values: [1, 2] },
+    { values: [null] },
+    { values: [false] },
+  ])(
+    "an enum without string members cannot allow a caller-chosen string: $values",
+    ({ values }) => {
+      const s = schema({ mode: { enum: values } });
+      expect(buildArgsShape({ mode: "Alice_Smith" }, s).sel).toEqual({
+        mode: "?",
+      });
+    },
+  );
+
+  it("a constant selector stores only its declared identifier", () => {
+    const s = schema({ mode: { const: "list" } });
+    expect(buildArgsShape({ mode: "list" }, s).sel).toEqual({ mode: "list" });
+    expect(buildArgsShape({ mode: "get" }, s).sel).toEqual({ mode: "?" });
+  });
+
+  it.each([
+    { const: "list" },
+    { $ref: "#/$defs/Mode" },
+    { oneOf: [{ enum: ["list"] }, { type: "null" }] },
+    { allOf: [{ enum: ["list"] }] },
+    { anyOf: [{ anyOf: [{ enum: ["list"] }] }, { type: "null" }] },
+  ])(
+    "a composed or referenced selector never falls back to an arbitrary identifier: %j",
+    (def) => {
+      const s = schema({ mode: def });
+      expect(buildArgsShape({ mode: "Alice_Smith" }, s).sel).toEqual({
+        mode: "?",
+      });
+    },
+  );
+
   it("a selector the schema does not declare is just an unknown key", () => {
     const shape = buildArgsShape({ action: "run", q: 1 }, schema({ q: {} }));
     expect(shape).toEqual({ keys: ["q"], unknown_keys: 1 });
   });
 });
 
-describe("tool-arg-keys: the process-global schema record", () => {
-  afterEach(() => resetToolArgSchemasForTest());
+describe("tool-arg-keys: a routing instance's schema snapshot", () => {
+  let registry: ToolArgSchemaRegistry;
+  beforeEach(() => {
+    registry = new ToolArgSchemaRegistry();
+  });
 
   it("records and looks up by the exposed name", () => {
-    recordToolArgSchema("autotask__search", {
+    registry.record("autotask__search", {
       type: "object",
-      properties: { query: {}, sort: { enum: ["recency"] } },
+      properties: { query: {}, mode: { enum: ["recency"] } },
     });
-    const s = toolArgSchema("autotask__search");
-    expect(s && [...s.keys].sort()).toEqual(["query", "sort"]);
-    expect(s?.enums.get("sort")).toEqual(new Set(["recency"]));
-    expect(toolArgSchema("autotask__other")).toBeUndefined();
+    const s = registry.get("autotask__search");
+    expect(s && [...s.keys].sort()).toEqual(["mode", "query"]);
+    expect(s?.enums.get("mode")).toEqual(new Set(["recency"]));
+    expect(registry.get("autotask__other")).toBeUndefined();
   });
 
   it("a schema with no properties object leaves the tool unknown, and clears a stale entry", () => {
-    recordToolArgSchema("x__t", { type: "object", properties: { a: {} } });
-    recordToolArgSchema("x__t", { type: "object" });
-    expect(toolArgSchema("x__t")).toBeUndefined();
+    registry.record("x__t", { type: "object", properties: { a: {} } });
+    registry.record("x__t", { type: "object" });
+    expect(registry.get("x__t")).toBeUndefined();
   });
 
   it("never throws on hostile input and stays bounded", () => {
-    expect(() => recordToolArgSchema("x__t", null)).not.toThrow();
-    expect(() => recordToolArgSchema("x__t", "nope")).not.toThrow();
+    expect(() => registry.record("x__t", null)).not.toThrow();
+    expect(() => registry.record("x__t", "nope")).not.toThrow();
     for (let i = 0; i < MAX_TOOLS + 10; i++) {
-      recordToolArgSchema(`s__t${i}`, { properties: { a: {} } });
+      registry.record(`s__t${i}`, { properties: { a: {} } });
     }
-    expect(toolArgSchema("s__t0")).toBeUndefined();
-    expect(toolArgSchema(`s__t${MAX_TOOLS + 9}`)).toBeDefined();
+    expect(registry.get("s__t0")).toBeUndefined();
+    expect(registry.get(`s__t${MAX_TOOLS + 9}`)).toBeDefined();
+  });
+
+  it("different routing instances cannot teach each other a key or enum", () => {
+    const other = new ToolArgSchemaRegistry();
+    registry.record("shared__search", {
+      properties: { ticket: {}, mode: { enum: ["get"] } },
+    });
+    other.record("shared__search", {
+      properties: { Alice_Smith: {}, mode: { enum: ["Alice_Smith"] } },
+    });
+    expect(
+      buildArgsShape(
+        { Alice_Smith: 1, mode: "Alice_Smith" },
+        registry.get("shared__search"),
+      ),
+    ).toEqual({ keys: ["mode"], sel: { mode: "?" }, unknown_keys: 1 });
+  });
+
+  it("a replacement snapshot clears renamed and removed tools", () => {
+    registry.record("s__old", { properties: { mode: {} } });
+    registry.replace([
+      { name: "s__new", inputSchema: { properties: { query: {} } } },
+    ]);
+    expect(
+      buildArgsShape({ mode: "Alice_Smith" }, registry.get("s__old")),
+    ).toEqual({ keys: [], unverified_keys: 1 });
+    expect(registry.get("s__new")?.keys).toEqual(new Set(["query"]));
+    registry.replace([]);
+    expect(registry.get("s__new")).toBeUndefined();
+  });
+
+  it("duplicate final exposed names are unknown, including a third duplicate", () => {
+    registry.replace(
+      ["a", "b", "c"].map((key) => ({
+        name: "s__alias",
+        inputSchema: { properties: { [key]: {} } },
+      })),
+    );
+    expect(registry.get("s__alias")).toBeUndefined();
+  });
+
+  it("additionalProperties never declares caller-chosen names", () => {
+    registry.record("s__t", {
+      properties: { query: {} },
+      additionalProperties: true,
+    });
+    expect(
+      buildArgsShape({ query: "x", Alice_Smith: 1 }, registry.get("s__t")),
+    ).toEqual({ keys: ["query"], unknown_keys: 1 });
+  });
+
+  it("a faulting schema clears a stale entry without throwing", () => {
+    registry.record("s__t", { properties: { mode: {} } });
+    expect(() =>
+      registry.record("s__t", {
+        get properties() {
+          throw new Error("fault");
+        },
+      }),
+    ).not.toThrow();
+    expect(registry.get("s__t")).toBeUndefined();
+  });
+
+  it("a faulting snapshot becomes entirely unknown without throwing", () => {
+    registry.record("s__old", { properties: { mode: {} } });
+    expect(() =>
+      registry.replace([
+        {
+          name: "s__new",
+          get inputSchema() {
+            throw new Error("fault");
+          },
+        },
+      ]),
+    ).not.toThrow();
+    expect(registry.get("s__old")).toBeUndefined();
+    expect(registry.get("s__new")).toBeUndefined();
+  });
+
+  it("oversized property and enum collections cannot grow retained data", () => {
+    registry.record("s__t", {
+      properties: Object.fromEntries(
+        Array.from({ length: MAX_SCHEMA_KEYS + 1 }, (_, i) => [`key${i}`, {}]),
+      ),
+    });
+    expect(registry.get("s__t")).toBeUndefined();
+    registry.record("s__t", {
+      properties: {
+        mode: {
+          enum: Array.from(
+            { length: MAX_ENUM_VALUES + 1 },
+            (_, i) => `mode${i}`,
+          ),
+        },
+      },
+    });
+    expect(buildArgsShape({ mode: "mode0" }, registry.get("s__t")).sel).toEqual(
+      { mode: "?" },
+    );
+  });
+});
+
+describe("buildArgsShape: a selector with no enum stores only that it was sent (Sol review, second pass)", () => {
+  it("a plain-string mode stores the marker, never the caller's value", () => {
+    const schema = { keys: new Set(["mode", "q"]), enums: new Map() };
+    const shape = buildArgsShape(
+      { mode: "client_secret_SAMPLE", q: 1 },
+      schema,
+    );
+    expect(shape.sel).toEqual({ mode: SELECTOR_UNENUMERATED_MARKER });
+    expect(JSON.stringify(shape)).not.toMatch(/secret/);
+  });
+
+  it("an enum member is stored; a non-member is the misuse marker", () => {
+    const schema = {
+      keys: new Set(["mode"]),
+      enums: new Map([["mode", new Set(["list"])]]),
+    };
+    expect(buildArgsShape({ mode: "list" }, schema).sel).toEqual({
+      mode: "list",
+    });
+    expect(buildArgsShape({ mode: "lst" }, schema).sel).toEqual({ mode: "?" });
   });
 });

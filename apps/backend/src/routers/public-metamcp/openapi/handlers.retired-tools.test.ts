@@ -86,6 +86,7 @@ vi.mock("../../../lib/metamcp/consumer-identity-resolver", () => ({
   resolveClientIdentity: vi.fn().mockResolvedValue({ name: "test-consumer" }),
 }));
 
+import { setAuditRecorderForTesting } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
   RetiredToolsRegistry,
   setRetiredToolsRegistryForTesting,
@@ -110,12 +111,12 @@ function makeRes() {
   return res;
 }
 
-const run = async (toolName: string) => {
+const run = async (toolName: string, args: Record<string, unknown> = {}) => {
   const res = makeRes();
   await executeToolWithMiddleware(
     { namespaceUuid: "ns-1", params: { tool_name: toolName } } as never,
     res as never,
-    {},
+    args,
   );
   return res;
 };
@@ -144,6 +145,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setRetiredToolsRegistryForTesting(undefined);
+  setAuditRecorderForTesting(null);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -233,6 +235,24 @@ describe("OpenAPI bridge: retired names", () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ content: [{ type: "text", text: "fine" }] });
   });
+
+  it("a bridge call without a verified listing records counts without caller-chosen names or values", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    requestMock.mockResolvedValue({
+      content: [{ type: "text", text: "fine" }],
+    });
+    const res = await run("ninja__list_things", {
+      mode: "client_secret_SAMPLE",
+      Alice_Smith: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(res.statusCode).toBe(200);
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 2,
+    });
+  });
 });
 
 describe("OpenAPI bridge: gateway timeout hint", () => {
@@ -250,7 +270,9 @@ describe("OpenAPI bridge: gateway timeout hint", () => {
     expect(body.error).toBe("Tool execution failed");
     expect(body.message).toContain("Request timed out");
     expect(body.message).toContain("The outcome is unknown");
-    expect(body.message).not.toMatch(/gateway stopped waiting|asked the backend/i);
+    expect(body.message).not.toMatch(
+      /gateway stopped waiting|asked the backend/i,
+    );
     expect(body.message).not.toContain("did not cancel");
     expect(body.message).toContain(
       "read the target's current state before retrying",

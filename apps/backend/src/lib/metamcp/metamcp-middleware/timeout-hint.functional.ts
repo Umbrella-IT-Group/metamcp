@@ -3,7 +3,7 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { CallToolMiddleware } from "./functional-middleware";
 
 /**
- * Adjudication hint on the gateway's own tools/call timeout.
+ * Adjudication hint on an SDK-shaped tools/call timeout.
  *
  * WHAT HAPPENS. When a backend tool call outlives the gateway's request timeout
  * (`MCP_TIMEOUT`, 60 s in production) the MCP SDK rejects with
@@ -34,11 +34,12 @@ import { CallToolMiddleware } from "./functional-middleware";
  * that branch on the code, or match "Request timed out", behave exactly as
  * before. Nothing about routing, retry or what the backend sees changes.
  *
- * WHAT IT MATCHES, narrowly. Only the SDK's two locally raised timeouts:
+ * WHAT IT MATCHES, narrowly. The SDK's two timeout message/data shapes:
  * "Request timed out" (carrying `data.timeout`) and "Maximum total timeout
  * exceeded" (carrying `data.maxTotalTimeout`). The code -32001 is overloaded: a
  * backend answering an unknown session id also uses it, with no such data and a
  * different message, and that answer must never be described as a timeout.
+ * A backend timeout with the SDK's shape also matches; provenance is unknown.
  *
  * It sits innermost, directly around the routing handler, so the audit
  * middleware (outermost) still records the same numeric code, and an error that
@@ -50,12 +51,11 @@ const TIMEOUT_MESSAGE =
 
 interface TimeoutShape {
   base: string;
-  seconds: number | null;
   data: unknown;
 }
 
-/** The SDK's locally raised timeout, or null for anything else. */
-function asGatewayTimeout(error: unknown): TimeoutShape | null {
+/** An SDK-shaped timeout, or null for anything else. */
+function asSdkShapedTimeout(error: unknown): TimeoutShape | null {
   if (!(error instanceof Error) || error.name !== "McpError") return null;
   const { code, data } = error as { code?: unknown; data?: unknown };
   if (code !== ErrorCode.RequestTimeout) return null;
@@ -72,10 +72,9 @@ function asGatewayTimeout(error: unknown): TimeoutShape | null {
       : typeof record.maxTotalTimeout === "number"
         ? record.maxTotalTimeout
         : null;
-  // A backend's own -32001 carries neither field; only the SDK's local timeout
-  // does. Without one of them this is not the gateway's timeout.
+  // These fields select the SDK's timeout shapes, not the actor that raised it.
   if (ms === null) return null;
-  return { base: match[1], seconds: Math.round(ms / 1000), data };
+  return { base: match[1], data };
 }
 
 export function gatewayTimeoutHint(_seconds?: number | null): string {
@@ -89,13 +88,13 @@ export function gatewayTimeoutHint(_seconds?: number | null): string {
   );
 }
 
-/** Rewrite a gateway timeout with the hint, or return the error unchanged. */
+/** Rewrite an SDK-shaped timeout with the hint, or return the error unchanged. */
 export function annotateGatewayTimeout(error: unknown): unknown {
-  const shape = asGatewayTimeout(error);
+  const shape = asSdkShapedTimeout(error);
   if (!shape) return error;
   return new McpError(
     ErrorCode.RequestTimeout,
-    `${shape.base}. ${gatewayTimeoutHint(shape.seconds)}`,
+    `${shape.base}. ${gatewayTimeoutHint()}`,
     shape.data,
   );
 }

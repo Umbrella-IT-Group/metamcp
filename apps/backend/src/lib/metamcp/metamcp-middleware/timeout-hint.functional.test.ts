@@ -139,7 +139,7 @@ describe("timeout hint: everything else is untouched", () => {
   });
 
   it("a -32001 that says 'Request timed out' but carries no timeout data is left alone", async () => {
-    // Only the SDK's local timeout carries data.timeout; a relayed one does not.
+    // No SDK-shaped timeout data: this error is outside the annotation rule.
     const relayed = new McpError(ErrorCode.RequestTimeout, "Request timed out");
     expect(await run(relayed)).toBe(relayed);
   });

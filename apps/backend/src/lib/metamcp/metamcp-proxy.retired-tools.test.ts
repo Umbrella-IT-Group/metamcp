@@ -34,10 +34,15 @@ import {
   ListToolsRequestSchema,
   ListToolsResultSchema,
   McpError,
+  Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectedClient } from "./client";
+import type {
+  CallToolHandler,
+  ListToolsHandler,
+} from "./metamcp-middleware/functional-middleware";
 
 const {
   getSessionMock,
@@ -48,7 +53,7 @@ const {
   getSessionMock: vi.fn(),
   invalidateServerConnectionMock: vi.fn(),
   findServersMock: vi.fn(),
-  config: { mcpTimeoutMs: 5_000 },
+  config: { mcpTimeoutMs: 5_000, listedAlias: undefined as string | undefined },
 }));
 
 vi.mock("@/utils/logger", () => ({
@@ -118,8 +123,37 @@ vi.mock("./metamcp-middleware/filter-tools.functional", () => ({
   createFilterListToolsMiddleware: () => (next: unknown) => next,
 }));
 vi.mock("./metamcp-middleware/tool-overrides.functional", () => ({
-  createToolOverridesCallToolMiddleware: () => (next: unknown) => next,
-  createToolOverridesListToolsMiddleware: () => (next: unknown) => next,
+  createToolOverridesCallToolMiddleware:
+    () =>
+    (next: CallToolHandler) =>
+    async (
+      request: Parameters<CallToolHandler>[0],
+      context: Parameters<CallToolHandler>[1],
+    ) =>
+      next(
+        config.listedAlias && request.params.name === config.listedAlias
+          ? {
+              ...request,
+              params: { ...request.params, name: "ninja__list_things" },
+            }
+          : request,
+        context,
+      ),
+  createToolOverridesListToolsMiddleware:
+    () =>
+    (next: ListToolsHandler) =>
+    async (
+      request: Parameters<ListToolsHandler>[0],
+      context: Parameters<ListToolsHandler>[1],
+    ) => {
+      const result = await next(request, context);
+      return {
+        ...result,
+        tools: result.tools.map((tool) =>
+          config.listedAlias ? { ...tool, name: config.listedAlias } : tool,
+        ),
+      };
+    },
   mapOverrideNameToOriginal: vi.fn(async (name: string) => name),
 }));
 vi.mock("./cold-connect-broker-fallback", () => ({
@@ -149,6 +183,8 @@ const real: CallToolResult = {
 
 interface Backend {
   session: ConnectedClient;
+  setTools: (tools: Tool[]) => void;
+  pauseNextListing: () => { started: Promise<void>; release: () => void };
   /** How many times the one real tool executed. */
   executions: () => number;
   /** How many tools/call requests reached the backend, of any name. */
@@ -169,17 +205,28 @@ async function backend(
   let executions = 0;
   let requests = 0;
   let cancelled = 0;
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: "list_things",
-        inputSchema: {
-          type: "object",
-          properties: { mode: { type: "string" } },
-        },
+  let listingPause: { started: () => void; wait: Promise<void> } | undefined;
+  let tools: Tool[] = [
+    {
+      name: "list_things",
+      inputSchema: {
+        type: "object",
+        // Selector values are stored only from a closed set, so the test
+        // backend declares its modes as an enum.
+        properties: { mode: { type: "string", enum: ["list", "x1"] } },
       },
-    ],
-  }));
+    },
+  ];
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const snapshot = tools;
+    const pause = listingPause;
+    listingPause = undefined;
+    if (pause) {
+      pause.started();
+      await pause.wait;
+    }
+    return { tools: snapshot };
+  });
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     requests += 1;
     // The SDK client sends notifications/cancelled when its request times out;
@@ -205,6 +252,21 @@ async function backend(
   await client.connect(clientSide);
   cleanups.push(() => client.close());
   return {
+    setTools: (next) => {
+      tools = next;
+    },
+    pauseNextListing: () => {
+      let started!: () => void;
+      let release!: () => void;
+      const began = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const wait = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      listingPause = { started, wait };
+      return { started: began, release };
+    },
     session: {
       client,
       cleanup: () => client.close(),
@@ -216,8 +278,11 @@ async function backend(
   };
 }
 
-async function connectConsumer(): Promise<Client> {
-  const { server } = await createServer("ns-1", "sess-1");
+async function connectConsumer(
+  namespace = "ns-1",
+  session = "sess-1",
+): Promise<Client> {
+  const { server } = await createServer(namespace, session);
   const [consumerSide, gatewaySide] = InMemoryTransport.createLinkedPair();
   await server.connect(gatewaySide);
   const consumer = new Client({ name: "consumer", version: "1.0.0" });
@@ -240,6 +305,9 @@ const call = (
 const envelopeOf = (result: {
   content: Array<{ type: string; text?: string }>;
 }) => JSON.parse(result.content[0].text ?? "{}");
+
+const list = (consumer: Client) =>
+  consumer.request({ method: "tools/list", params: {} }, ListToolsResultSchema);
 
 let dir: string;
 
@@ -284,6 +352,7 @@ beforeEach(() => {
   findServersMock.mockResolvedValue([]);
   warmSessions.clear();
   config.mcpTimeoutMs = 5_000;
+  config.listedAlias = undefined;
   installMap();
 });
 
@@ -426,6 +495,177 @@ describe("retired names through the gateway", () => {
   });
 });
 
+describe("argument schemas through real SDK transports", () => {
+  it("an override uses the final exposed name's schema and preserves call arguments", async () => {
+    config.listedAlias = "ninja__alias";
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+    expect((await list(consumer)).tools[0].name).toBe("ninja__alias");
+    await call(consumer, "ninja__alias", { mode: "list", Alice_Smith: 1 });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: ["mode"],
+      sel: { mode: "list" },
+      unknown_keys: 1,
+    });
+    expect(target.executions()).toBe(1);
+  });
+
+  it.each(["ns-1", "ns-2"])(
+    "another proxy in %s cannot change the first proxy's schema",
+    async (otherNamespace) => {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      const first = await backend();
+      first.setTools([
+        {
+          name: "list_things",
+          inputSchema: {
+            type: "object",
+            properties: { mode: { enum: ["list"] }, ticket: {} },
+          },
+        },
+      ]);
+      getSessionMock.mockResolvedValue(first.session);
+      const firstConsumer = await connectConsumer();
+      await list(firstConsumer);
+
+      const second = await backend();
+      second.setTools([
+        {
+          name: "list_things",
+          inputSchema: {
+            type: "object",
+            properties: { mode: { enum: ["Alice_Smith"] }, Alice_Smith: {} },
+          },
+        },
+      ]);
+      getSessionMock.mockResolvedValue(second.session);
+      await list(await connectConsumer(otherNamespace, "sess-2"));
+
+      await call(firstConsumer, REAL_TOOL, {
+        mode: "Alice_Smith",
+        Alice_Smith: 1,
+      });
+      await flush();
+      expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+        keys: ["mode"],
+        sel: { mode: "?" },
+        unknown_keys: 1,
+      });
+      expect(first.executions()).toBe(1);
+      expect(second.executions()).toBe(0);
+    },
+  );
+
+  it("a call before a listing stores counts, and a rename discards the old schema", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+
+    await list(consumer);
+    await call(consumer, REAL_TOOL, { mode: "list" });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: ["mode"],
+      sel: { mode: "list" },
+    });
+
+    target.setTools([
+      {
+        name: "renamed",
+        inputSchema: { type: "object", properties: { query: {} } },
+      },
+    ]);
+    await list(consumer);
+    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+
+  it("a list-changed notification invalidates the previous audit schema", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+    await list(consumer);
+    await Promise.all(
+      [...target.session.listChangedSubscribers].map((notify) => notify()),
+    );
+    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+
+  it("a notification during a listing prevents an old response from restoring the schema", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+    await list(consumer);
+    const pause = target.pauseNextListing();
+    const pending = list(consumer);
+    await pause.started;
+    await Promise.all(
+      [...target.session.listChangedSubscribers].map((notify) => notify()),
+    );
+    pause.release();
+    await pending;
+    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+
+  it("an older concurrent listing cannot restore an obsolete schema", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+    await list(consumer);
+    const pause = target.pauseNextListing();
+    const older = list(consumer);
+    await pause.started;
+    target.setTools([
+      {
+        name: "list_things",
+        inputSchema: { type: "object", properties: { query: {} } },
+      },
+    ]);
+    await list(consumer);
+    pause.release();
+    await older;
+    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await flush();
+    expect(recorder.mock.calls.at(-1)?.[0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+});
+
 describe("the audit rows for those outcomes", () => {
   const rowsFor = async (
     run: (consumer: Client) => Promise<unknown>,
@@ -486,10 +726,10 @@ describe("the audit rows for those outcomes", () => {
       ],
       structuredContent: { error: true, code: "invalid_input", message: "m" },
     }));
-    const [row] = await rowsFor(
-      (consumer) => call(consumer, REAL_TOOL, { mode: "list" }),
-      refusing,
-    );
+    const [row] = await rowsFor(async (consumer) => {
+      await list(consumer);
+      return call(consumer, REAL_TOOL, { mode: "list" });
+    }, refusing);
 
     expect(row).toMatchObject({
       success: false,

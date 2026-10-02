@@ -56,7 +56,7 @@ import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
 } from "./session-error";
-import { recordToolArgSchema } from "./tool-arg-keys";
+import { ToolArgSchemaRegistry } from "./tool-arg-keys";
 import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
 import {
   parseToolName,
@@ -197,6 +197,10 @@ export const createServer = async (
 
     const subscriber = async (): Promise<void> => {
       toolsSyncCache.clear(mcpServerUuid);
+      // A changed backend surface invalidates the audit snapshot immediately;
+      // stale names must not remain verified until the consumer lists again.
+      toolSchemaGeneration += 1;
+      toolArgSchemas.replace([]);
       try {
         await server.notification({
           method: "notifications/tools/list_changed",
@@ -230,6 +234,8 @@ export const createServer = async (
     namespaceUuid,
     sessionId,
   };
+  const toolArgSchemas = new ToolArgSchemaRegistry();
+  let toolSchemaGeneration = 0;
 
   // Original List Tools Handler
   const originalListToolsHandler: ListToolsHandler = async (
@@ -487,10 +493,6 @@ export const createServer = async (
             }
             toolToClient[toolName] = activeSession;
             toolToServerUuid[toolName] = mcpServerUuid;
-            // The audit stores only argument names this schema declares
-            // (tool-arg-keys.ts); any session's listing teaches the process.
-            recordToolArgSchema(toolName, tool.inputSchema);
-
             toolsWithSource.push({
               ...tool,
               name: toolName,
@@ -860,7 +862,7 @@ export const createServer = async (
 
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
-    createAuditingMiddleware(),
+    createAuditingMiddleware((name) => toolArgSchemas.get(name)),
     // Second, OUTSIDE the filter so it also sees the filter's fail-closed
     // denial for a deleted server: answers a call that already failed as an
     // unknown tool with the replacement from the retired-tool map. Consulted
@@ -873,7 +875,7 @@ export const createServer = async (
     }),
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     // Innermost, directly around the routing handler: adds text to the
-    // gateway's own -32001 timeout saying the outcome is unknown and a write's
+    // SDK-shaped -32001 timeout saying the outcome is unknown and a write's
     // target should be read before a retry. Same code, same data; text only.
     createTimeoutHintMiddleware(),
     // Add more middleware here as needed
@@ -882,7 +884,17 @@ export const createServer = async (
 
   // Set up the handlers with middleware
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
-    return await listToolsWithMiddleware(request, handlerContext);
+    const generation = ++toolSchemaGeneration;
+    toolArgSchemas.replace([]);
+    const result = await listToolsWithMiddleware(request, handlerContext);
+    // Use final names after filters and overrides, and discard removed names.
+    // Another proxy's listing cannot teach this routing instance a schema.
+    // A notification or overlapping listing makes an older response unsafe to
+    // retain. Counts-only is honest until a fresh uncontested listing arrives.
+    toolArgSchemas.replace(
+      generation === toolSchemaGeneration ? result.tools : [],
+    );
+    return result;
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

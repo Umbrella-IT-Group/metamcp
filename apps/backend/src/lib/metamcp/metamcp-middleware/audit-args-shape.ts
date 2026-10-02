@@ -16,9 +16,11 @@
  * `client_secret_x` into an immutable row):
  *   keys            the top-level key names the tool's schema declares, sorted.
  *   sel             the value of each allowlisted selector key the schema
- *                   declares, when the value is one of the property's declared
- *                   enum values or, with no enum, a short identifier-shaped
- *                   string; otherwise the literal marker "?".
+ *                   declares, only when the property declares an enum or const
+ *                   and the value is one of its members (and short and
+ *                   identifier-shaped); a member-less value stores "?", and a
+ *                   selector whose schema has no enum stores "*" (sent, value
+ *                   not from a closed set, so not stored).
  *   unknown_keys    count of identifier-shaped keys the schema does not declare.
  *   invalid_keys    count of key names that are not identifier-shaped.
  *   unverified_keys when the tool's schema is not known to this process yet
@@ -65,6 +67,12 @@ export const MAX_KEYS = 32;
 
 /** Marker stored in place of a selector value that failed the value policy. */
 export const SELECTOR_MISUSE_MARKER = "?";
+
+/**
+ * Marker stored for a selector the schema declares without an enum or const:
+ * it was sent, but its value is not from a closed set, so it is not stored.
+ */
+export const SELECTOR_UNENUMERATED_MARKER = "*";
 
 export interface ArgsShape {
   /** Allowlisted selector values, keyed by selector name. Omitted when none. */
@@ -173,9 +181,17 @@ export function buildArgsShape(
     if (!schema.keys.has(selector)) continue;
     const value = args[selector];
     const declared = schema.enums.get(selector);
+    if (!declared) {
+      // No enum or const in the schema: any string is possible, so the value
+      // could be caller-chosen content (Sol review 2026-10-02, second pass).
+      // Record only that the selector was sent.
+      sel[selector] = SELECTOR_UNENUMERATED_MARKER;
+      continue;
+    }
     const ok =
       typeof value === "string" &&
-      (declared ? declared.has(value) : SELECTOR_VALUE_PATTERN.test(value));
+      SELECTOR_VALUE_PATTERN.test(value) &&
+      declared.has(value);
     sel[selector] = ok ? (value as string) : SELECTOR_MISUSE_MARKER;
   }
   if (Object.keys(sel).length > 0) {
