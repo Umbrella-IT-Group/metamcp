@@ -9,15 +9,23 @@
  * selector keys whose values are short enumerations (a mode, an action, a
  * profile) and never free text.
  *
- * WHAT IS STORED, and the only values that ever are:
- *   keys  every top-level own key name that looks like an identifier, sorted.
- *   sel   the value of each allowlisted selector key that is present, when the
- *         value is a short identifier-shaped string; otherwise the literal
- *         marker "?" so misuse stays visible without echoing the value.
+ * WHAT IS STORED, and the only values that ever are. A key name is chosen by the
+ * caller before any tool validates it, so a name is stored only when the tool's
+ * OWN published inputSchema declares it (`tool-arg-keys.ts`, filled from
+ * tools/list; Sol review 2026-10-02: identifier syntax alone let `Alice_Smith` or
+ * `client_secret_x` into an immutable row):
+ *   keys            the top-level key names the tool's schema declares, sorted.
+ *   sel             the value of each allowlisted selector key the schema
+ *                   declares, when the value is one of the property's declared
+ *                   enum values or, with no enum, a short identifier-shaped
+ *                   string; otherwise the literal marker "?".
+ *   unknown_keys    count of identifier-shaped keys the schema does not declare.
+ *   invalid_keys    count of key names that are not identifier-shaped.
+ *   unverified_keys when the tool's schema is not known to this process yet
+ *                   (never listed, or a retired name): the count of keys, and
+ *                   NO names and NO selector values at all.
  * Argument VALUES outside `sel` are never stored, nested key names are never
- * stored, and a key name that is not identifier-shaped is counted
- * (`invalid_keys`) and never echoed, because a caller-controlled key name must
- * not become a data channel into an immutable table.
+ * stored, and no caller-chosen name is ever echoed.
  *
  * PURE and DB-free (the middleware imports this statically; the repository
  * stays a lazy import). It never throws on a well-formed JSON-RPC argument
@@ -28,6 +36,8 @@
  * backfilled. That is why the charset rules below are strict and why there is a
  * kill switch (`TOOL_AUDIT_ARGS_SHAPE=off` stores NULL).
  */
+
+import type { ToolArgSchema } from "../tool-arg-keys";
 
 /**
  * Selector keys whose VALUE is recorded. A code constant, so widening it is a
@@ -63,6 +73,10 @@ export interface ArgsShape {
   keys: string[];
   /** Count of top-level keys that failed the key policy (never echoed). */
   invalid_keys?: number;
+  /** Count of identifier-shaped keys the tool's schema does not declare (never echoed). */
+  unknown_keys?: number;
+  /** Key count when the tool's schema is unknown; then no names or selector values are stored. */
+  unverified_keys?: number;
   /** True when more than MAX_KEYS valid keys were sent. */
   truncated?: true;
   /** True when the arguments were not a plain object (array, string, ...). */
@@ -100,7 +114,10 @@ export function argsShapeEnabled(): boolean {
   return raw !== "off" && raw !== "false" && raw !== "0";
 }
 
-export function buildArgsShape(args: unknown): ArgsShape {
+export function buildArgsShape(
+  args: unknown,
+  schema?: ToolArgSchema,
+): ArgsShape {
   if (args === undefined || args === null) {
     return { keys: [] };
   }
@@ -111,13 +128,24 @@ export function buildArgsShape(args: unknown): ArgsShape {
   // Object.keys, not for...in: own enumerable string keys only, so nothing
   // inherited is ever read. A JSON.parse'd `__proto__` is an OWN key and shows
   // up here as an ordinary (valid-shaped) name without touching the prototype.
+  const allKeys = Object.keys(args);
+  if (!schema) {
+    // Unknown tool: no caller-chosen name or value may be stored. The count
+    // still shows the call's size.
+    return allKeys.length > 0
+      ? { keys: [], unverified_keys: allKeys.length }
+      : { keys: [] };
+  }
   const valid: string[] = [];
   let invalid = 0;
-  for (const key of Object.keys(args)) {
-    if (KEY_PATTERN.test(key)) {
-      valid.push(key);
-    } else {
+  let unknown = 0;
+  for (const key of allKeys) {
+    if (!KEY_PATTERN.test(key)) {
       invalid += 1;
+    } else if (!schema.keys.has(key)) {
+      unknown += 1;
+    } else {
+      valid.push(key);
     }
   }
   // Default sort: UTF-16 code-unit order, locale independent, so the same call
@@ -132,17 +160,23 @@ export function buildArgsShape(args: unknown): ArgsShape {
   if (invalid > 0) {
     shape.invalid_keys = invalid;
   }
+  if (unknown > 0) {
+    shape.unknown_keys = unknown;
+  }
 
   const sel: Record<string, string> = {};
   for (const selector of SELECTOR_KEYS) {
     // hasOwnProperty, not `in`: a selector present only on a prototype is not
     // something the caller sent.
     if (!Object.prototype.hasOwnProperty.call(args, selector)) continue;
+    // A selector the schema does not declare is just an unknown key (counted above).
+    if (!schema.keys.has(selector)) continue;
     const value = args[selector];
-    sel[selector] =
-      typeof value === "string" && SELECTOR_VALUE_PATTERN.test(value)
-        ? value
-        : SELECTOR_MISUSE_MARKER;
+    const declared = schema.enums.get(selector);
+    const ok =
+      typeof value === "string" &&
+      (declared ? declared.has(value) : SELECTOR_VALUE_PATTERN.test(value));
+    sel[selector] = ok ? (value as string) : SELECTOR_MISUSE_MARKER;
   }
   if (Object.keys(sel).length > 0) {
     shape.sel = sel;

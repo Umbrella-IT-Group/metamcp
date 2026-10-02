@@ -175,6 +175,45 @@ describe("classifyCallResult: status and partial signals", () => {
   });
 });
 
+describe("classifyCallResult: a standalone error_code (Sol review 2026-10-02)", () => {
+  it("a non-blank top-level error_code fails with its token", () => {
+    expect(
+      classifyCallResult({
+        content: [],
+        structuredContent: { error_code: "invalid_input", message: "bad mode" },
+      }),
+    ).toEqual({
+      failed: true,
+      errorCode: "inband_error",
+      errorDetail: "invalid_input",
+    });
+  });
+
+  it("the text-JSON fallback reads it too", () => {
+    expect(
+      classifyCallResult({ content: [text({ error_code: "not_found" })] }),
+    ).toEqual({
+      failed: true,
+      errorCode: "inband_error",
+      errorDetail: "not_found",
+    });
+  });
+
+  it.each([
+    { error_code: null },
+    { error_code: "" },
+    { error_code: "   " },
+    { error_code: 5 },
+    { error_code: false },
+    { result_meta: { error_code: "x" } },
+    { items: [{ error_code: "x" }] },
+  ])("%j is not a failure", (body) => {
+    expect(
+      classifyCallResult({ content: [], structuredContent: body }),
+    ).toEqual({ failed: false });
+  });
+});
+
 describe("codeToken: the column is never fed free text", () => {
   it.each([
     ["invalid_input", "invalid_input"],

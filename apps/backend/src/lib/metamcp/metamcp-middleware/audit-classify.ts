@@ -35,6 +35,8 @@
  *   - `e === true`
  *   - `e` is a string with a non-blank value
  *   - `e` is a plain object with at least one own key
+ *   - `envelope.error_code` is a string with a non-blank value (a standalone
+ *     `{error_code: "invalid_input", ...}` refusal; Sol review 2026-10-02)
  *   - `envelope.status === "failed"` or `"partial"`, or `envelope.partial === true`
  *     (the batch-envelope vocabulary: a batch whose items were refused or not
  *     all dispatched, which carries no top-level `error`)
@@ -249,18 +251,24 @@ export function inbandFailure(
     (typeof error === "string" && error.trim() !== "") ||
     (isPlainObject(error) && Object.keys(error).length > 0);
 
+  const errorCode = own(envelope, "error_code");
+  const errorCodeFlag =
+    typeof errorCode === "string" && errorCode.trim() !== "";
+
   const status = own(envelope, "status");
   const statusFailed = status === "failed";
   const statusPartial =
     status === "partial" || own(envelope, "partial") === true;
 
-  if (!errorFlag && !statusFailed && !statusPartial) return null;
+  if (!errorFlag && !errorCodeFlag && !statusFailed && !statusPartial) {
+    return null;
+  }
 
   const token = envelopeCodeToken(envelope);
   if (token !== null) return { detail: token };
   // A marker only when the error key itself said nothing: an error with no
   // token stays class-only, as the design records.
-  if (errorFlag) return {};
+  if (errorFlag || errorCodeFlag) return {};
   return { detail: statusFailed ? DETAIL_STATUS_FAILED : DETAIL_PARTIAL };
 }
 

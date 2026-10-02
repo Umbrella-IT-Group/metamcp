@@ -249,7 +249,8 @@ describe("OpenAPI bridge: gateway timeout hint", () => {
     const body = res.body as { error: string; message: string };
     expect(body.error).toBe("Tool execution failed");
     expect(body.message).toContain("Request timed out");
-    expect(body.message).toContain("the outcome is unknown");
+    expect(body.message).toContain("The outcome is unknown");
+    expect(body.message).not.toMatch(/gateway stopped waiting|asked the backend/i);
     expect(body.message).not.toContain("did not cancel");
     expect(body.message).toContain(
       "read the target's current state before retrying",

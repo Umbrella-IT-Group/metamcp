@@ -1,12 +1,24 @@
 import { createHash } from "node:crypto";
 
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import logger from "@/utils/logger";
 
 import { runWithCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
+import {
+  recordToolArgSchema,
+  resetToolArgSchemasForTest,
+} from "../tool-arg-keys";
 import {
   createAuditingMiddleware,
   setAuditRecorderForTesting,
@@ -24,6 +36,23 @@ const context: MetaMCPHandlerContext = {
   callerIp: "203.0.113.7",
   requestId: "req-aaaa",
 };
+
+// The audit stores only names the tool's own schema declares (tool-arg-keys.ts).
+// Every request below calls autotask__search, declared here as a listing would.
+beforeEach(() => {
+  recordToolArgSchema("autotask__search", {
+    type: "object",
+    properties: {
+      mode: {},
+      ticket: {},
+      note: {},
+      action: {},
+      identifier: {},
+      company: {},
+    },
+  });
+});
+afterAll(() => resetToolArgSchemasForTest());
 
 const makeRequest = (args?: Record<string, unknown>): CallToolRequest =>
   ({
@@ -379,6 +408,27 @@ describe("a refused or failing call must not read as a successful one", () => {
 });
 
 describe("args_shape (migration 0039)", () => {
+  it("an unlisted tool name stores counts only, never caller-chosen names", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const wrapped = createAuditingMiddleware()(okHandler);
+    await wrapped(
+      {
+        method: "tools/call",
+        params: {
+          name: "autotask__unlisted",
+          arguments: { mode: "x", Alice_Smith: 1 },
+        },
+      } as CallToolRequest,
+      context,
+    );
+    await flush();
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 2,
+    });
+  });
+
   it("records the shape on a success row, never the values", async () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);

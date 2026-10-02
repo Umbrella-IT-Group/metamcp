@@ -170,7 +170,15 @@ async function backend(
   let requests = 0;
   let cancelled = 0;
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [{ name: "list_things", inputSchema: { type: "object" } }],
+    tools: [
+      {
+        name: "list_things",
+        inputSchema: {
+          type: "object",
+          properties: { mode: { type: "string" } },
+        },
+      },
+    ],
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     requests += 1;
@@ -390,9 +398,7 @@ describe("retired names through the gateway", () => {
     // Not a redirect: the name is listed, but the failure is a timeout.
     expect(error?.message).not.toContain("tool_retired");
     expect(error?.message).toContain("Request timed out");
-    expect(error?.message).toContain(
-      "and asked the backend to cancel, but the outcome is unknown",
-    );
+    expect(error?.message).toContain("The outcome is unknown");
     expect(error?.message).not.toContain("did not cancel");
     expect(error?.message).toContain(
       "read the target's current state before retrying",
@@ -446,7 +452,8 @@ describe("the audit rows for those outcomes", () => {
       tool_name: "add_note",
       success: false,
       error_code: "tool_retired",
-      args_shape: { sel: { mode: "x1" }, keys: ["mode", "ticket"] },
+      // A retired name is never listed, so its schema is unknown: counts only.
+      args_shape: { keys: [], unverified_keys: 2 },
     });
   });
 

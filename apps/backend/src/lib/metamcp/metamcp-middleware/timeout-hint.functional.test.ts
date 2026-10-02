@@ -51,13 +51,15 @@ describe("timeout hint: the gateway's own timeout", () => {
     // The original message stays the first sentence, so a client that matches
     // "Request timed out" or branches on -32001 behaves as before.
     expect(rewritten.message).toMatch(
-      /^MCP error -32001: Request timed out\. The gateway stopped waiting after 60 s/,
+      /^MCP error -32001: Request timed out\. The outcome is unknown/,
+    );
+    // Sol review 2026-10-02: a backend can raise the same -32001 with the same
+    // data, so the hint names no actor and no duration.
+    expect(rewritten.message).not.toMatch(
+      /gateway|stopped waiting|asked the backend/i,
     );
     expect(rewritten.message).toContain(
-      "and asked the backend to cancel, but the outcome is unknown",
-    );
-    expect(rewritten.message).toContain(
-      "applied, partly applied, or still be finishing",
+      "may have applied the change, partly applied it, or still be finishing",
     );
     expect(rewritten.message).toContain(
       "read the target's current state before retrying",
@@ -90,7 +92,7 @@ describe("timeout hint: the gateway's own timeout", () => {
 
     expect(rewritten.code).toBe(ErrorCode.RequestTimeout);
     expect(rewritten.message).toMatch(
-      /^MCP error -32001: Maximum total timeout exceeded\. The gateway stopped waiting after 120 s/,
+      /^MCP error -32001: Maximum total timeout exceeded\. The outcome is unknown/,
     );
     expect(rewritten.data).toEqual({
       maxTotalTimeout: 120_000,
@@ -98,16 +100,30 @@ describe("timeout hint: the gateway's own timeout", () => {
     });
   });
 
-  it("omits the seconds when the data carries none usable", () => {
-    expect(gatewayTimeoutHint(null)).toMatch(
-      /^The gateway stopped waiting and asked/,
+  it.each([null, 0, 5, 60_000])(
+    "names no actor and no duration, whatever data says (seconds=%s)",
+    (seconds) => {
+      const hint = gatewayTimeoutHint(seconds);
+      expect(hint).toMatch(/^The outcome is unknown/);
+      expect(hint).not.toMatch(/gateway|stopped waiting|asked the backend/i);
+      expect(hint).not.toMatch(/\d+ s\b/);
+    },
+  );
+
+  it("a backend-raised -32001 with SDK-shaped data gets no false gateway claim", async () => {
+    // Sol review 2026-10-02: reproduced through real SDK transports; the
+    // annotation is now true whoever raised the timeout.
+    const backendTimeout = McpError.fromError(
+      ErrorCode.RequestTimeout,
+      "Request timed out",
+      { timeout: 1000 },
     );
-    expect(gatewayTimeoutHint(0)).toMatch(
-      /^The gateway stopped waiting and asked/,
+    const rewritten = (await run(backendTimeout)) as McpError;
+    expect(rewritten.code).toBe(ErrorCode.RequestTimeout);
+    expect(rewritten.message).toMatch(
+      /^MCP error -32001: Request timed out\. The outcome is unknown/,
     );
-    expect(gatewayTimeoutHint(5)).toMatch(
-      /^The gateway stopped waiting after 5 s and asked/,
-    );
+    expect(rewritten.message).not.toMatch(/gateway|1 s/i);
   });
 });
 

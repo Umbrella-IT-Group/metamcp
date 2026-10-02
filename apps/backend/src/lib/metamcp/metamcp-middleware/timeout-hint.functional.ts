@@ -18,10 +18,14 @@ import { CallToolMiddleware } from "./functional-middleware";
  * and a retried write can run twice (the gateway itself never re-sends a
  * timed-out tools/call).
  *
- * The hint states only what is known (the gateway stopped waiting and asked the
- * backend to cancel, the outcome is unknown) and never claims the call was or
- * was not cancelled. An earlier wording said "it did not cancel the call"; that
- * was false, and it was being copied into the skills and the tool design spec.
+ * The hint states only what is true whoever raised the timeout: the call timed
+ * out and its outcome is unknown. It names no actor. A backend can return the
+ * same -32001 "Request timed out" with the same `data` shape (Sol review
+ * 2026-10-02, reproduced through real SDK transports), so a claim that the
+ * GATEWAY stopped waiting and asked the backend to cancel could be false, and so
+ * could the seconds in `data`. Earlier wordings ("it did not cancel the call",
+ * then "the gateway stopped waiting after N s and asked the backend to cancel")
+ * each claimed more than is knowable here.
  *
  * WHAT THIS CHANGES: text only. The same error code (-32001), the same `data`,
  * and the original message kept as its first sentence, with added text saying
@@ -74,16 +78,14 @@ function asGatewayTimeout(error: unknown): TimeoutShape | null {
   return { base: match[1], seconds: Math.round(ms / 1000), data };
 }
 
-export function gatewayTimeoutHint(seconds: number | null): string {
-  const waited =
-    seconds !== null && seconds > 0
-      ? `The gateway stopped waiting after ${seconds} s`
-      : "The gateway stopped waiting";
+export function gatewayTimeoutHint(_seconds?: number | null): string {
+  // `_seconds` is kept for callers; it is not shown, because a backend-raised
+  // timeout can carry any number in `data` and the hint must stay true.
   return (
-    `${waited} and asked the backend to cancel, but the outcome is unknown: ` +
-    "the call may have been applied, partly applied, or still be finishing. " +
-    "If this tool changes anything, read the target's current state before retrying: " +
-    "a repeat call can apply the change twice. A read-only call is safe to retry."
+    "The outcome is unknown: the tool may have applied the change, partly " +
+    "applied it, or still be finishing. If this tool changes " +
+    "anything, read the target's current state before retrying: a repeat call " +
+    "can apply the change twice. A read-only call is safe to retry."
   );
 }
 

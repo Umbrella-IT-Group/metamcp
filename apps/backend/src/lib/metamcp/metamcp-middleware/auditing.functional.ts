@@ -4,6 +4,7 @@ import logger from "@/utils/logger";
 
 import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
+import { toolArgSchema } from "../tool-arg-keys";
 import { parseToolName } from "../tool-name-parser";
 import { isUnknownToolError } from "../unknown-tool";
 import {
@@ -135,10 +136,10 @@ function hashParams(args: unknown): string | null {
  * builder cannot read the arguments. Null is the honest "not recorded"; a
  * builder fault must never reach the tool call, so it is swallowed here.
  */
-function shapeOf(args: unknown): ArgsShape | null {
+function shapeOf(toolName: string, args: unknown): ArgsShape | null {
   if (!argsShapeEnabled()) return null;
   try {
-    return buildArgsShape(args);
+    return buildArgsShape(args, toolArgSchema(toolName));
   } catch {
     // Never echo the fault: a getter can put argument values in its message.
     logger.warn(
@@ -267,7 +268,7 @@ export function createAuditingMiddleware(): CallToolMiddleware {
     const paramsHash = hashParams(request.params.arguments);
     // Computed here, from the arguments as the caller sent them, before any
     // inner middleware (which builds a rewritten request) or the handler runs.
-    const argsShape = shapeOf(request.params.arguments);
+    const argsShape = shapeOf(fullName, request.params.arguments);
 
     try {
       const result = await handler(request, context);

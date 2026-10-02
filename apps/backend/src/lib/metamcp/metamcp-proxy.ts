@@ -56,6 +56,7 @@ import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
 } from "./session-error";
+import { recordToolArgSchema } from "./tool-arg-keys";
 import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
 import {
   parseToolName,
@@ -486,6 +487,9 @@ export const createServer = async (
             }
             toolToClient[toolName] = activeSession;
             toolToServerUuid[toolName] = mcpServerUuid;
+            // The audit stores only argument names this schema declares
+            // (tool-arg-keys.ts); any session's listing teaches the process.
+            recordToolArgSchema(toolName, tool.inputSchema);
 
             toolsWithSource.push({
               ...tool,
