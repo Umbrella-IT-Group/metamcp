@@ -17,12 +17,17 @@ vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 import {
   checkConcurrentSessionCeiling,
   countLiveSessionsForIdentity,
+  DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS,
   DEFAULT_MAX_SESSIONS_PER_CREDENTIAL,
   formatCredentialSessionSummary,
+  type IdentitySessionCounter,
+  MIN_CEILING_EVICT_MIN_IDLE_SECONDS,
   registerSessionActivityProbe,
   registerSessionCounter,
   resetSessionCountersForTests,
+  resolveEvictionConfig,
   resolveSessionCeiling,
+  selectEvictionCandidate,
   summarizeCredentialSessions,
 } from "./credential-session-quota";
 import { SessionIdentity } from "./session-auth";
@@ -33,6 +38,17 @@ const API_KEY_IDENTITY: SessionIdentity = {
 };
 
 const ORIGINAL_ENV = process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL;
+const ORIGINAL_EVICT_ENV = process.env.MCP_SESSION_CEILING_EVICT_IDLE;
+const ORIGINAL_EVICT_IDLE_ENV =
+  process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS;
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
 
 function counterReturning(count: number) {
   return { countSessionsForIdentity: vi.fn().mockReturnValue(count) };
@@ -42,14 +58,17 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetSessionCountersForTests();
   delete process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL;
+  delete process.env.MCP_SESSION_CEILING_EVICT_IDLE;
+  delete process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS;
 });
 
 afterEach(() => {
-  if (ORIGINAL_ENV === undefined) {
-    delete process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL;
-  } else {
-    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = ORIGINAL_ENV;
-  }
+  restoreEnv("MCP_MAX_SESSIONS_PER_CREDENTIAL", ORIGINAL_ENV);
+  restoreEnv("MCP_SESSION_CEILING_EVICT_IDLE", ORIGINAL_EVICT_ENV);
+  restoreEnv(
+    "MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS",
+    ORIGINAL_EVICT_IDLE_ENV,
+  );
 });
 
 describe("resolveSessionCeiling", () => {
@@ -683,5 +702,570 @@ describe("checkConcurrentSessionCeiling — the live summary", () => {
     expect(loggerMock.warn.mock.calls[0][0]).toBe(
       'Concurrent-session ceiling reached for api_key credential "Example": 3/3 live sessions; refusing a new session. Raise MCP_MAX_SESSIONS_PER_CREDENTIAL if this is a legitimate consumer.',
     );
+  });
+});
+
+describe("resolveEvictionConfig", () => {
+  it("is on with a 120s idle floor by default", () => {
+    expect(resolveEvictionConfig()).toEqual({
+      enabled: true,
+      minIdleMs: DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS * 1000,
+    });
+    expect(DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS).toBe(120);
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+
+  it("turns off for every recognised off value, in any case and padding", () => {
+    for (const value of ["false", "0", "off", "no", " FALSE ", "Off"]) {
+      process.env.MCP_SESSION_CEILING_EVICT_IDLE = value;
+      expect(resolveEvictionConfig().enabled).toBe(false);
+    }
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+
+  it("stays on for every recognised on value and for an empty value", () => {
+    for (const value of ["true", "1", "on", "yes", "TRUE", ""]) {
+      process.env.MCP_SESSION_CEILING_EVICT_IDLE = value;
+      expect(resolveEvictionConfig().enabled).toBe(true);
+    }
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+
+  it("falls back to on with a WARN for a malformed kill-switch value", () => {
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "fasle";
+    expect(resolveEvictionConfig().enabled).toBe(true);
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(loggerMock.warn.mock.calls[0][0]).toBe(
+      "MCP_SESSION_CEILING_EVICT_IDLE=fasle invalid; falling back to default true.",
+    );
+  });
+
+  it("parses a configured idle floor in seconds", () => {
+    process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS = "300";
+    expect(resolveEvictionConfig().minIdleMs).toBe(300_000);
+  });
+
+  it("falls back to the default floor with a WARN on a malformed or negative value", () => {
+    for (const value of ["soon", "-5"]) {
+      vi.clearAllMocks();
+      process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS = value;
+      expect(resolveEvictionConfig().minIdleMs).toBe(120_000);
+      expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+      expect(loggerMock.warn.mock.calls[0][0]).toContain(
+        "falling back to default 120",
+      );
+    }
+  });
+
+  it("raises a floor below the minimum (including 0) to the minimum, with a WARN", () => {
+    for (const value of ["0", "9"]) {
+      vi.clearAllMocks();
+      process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS = value;
+      expect(resolveEvictionConfig().minIdleMs).toBe(
+        MIN_CEILING_EVICT_MIN_IDLE_SECONDS * 1000,
+      );
+      expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+      expect(loggerMock.warn.mock.calls[0][0]).toContain(
+        "is below the minimum; using 10.",
+      );
+    }
+    vi.clearAllMocks();
+    process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS = "10";
+    expect(resolveEvictionConfig().minIdleMs).toBe(10_000);
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A counter that behaves like the StreamableHTTP manager behind its adapter:
+ * lists per identity, and its evictor removes the session synchronously (the
+ * contract the reservation logic depends on) and returns a teardown promise.
+ */
+function evictableCounter(
+  byIdentity: Record<
+    string,
+    Array<{ sessionId: string; endpointName: string }>
+  >,
+  options: { evictReturns?: "promise" | "undefined" | "throw" } = {},
+) {
+  const evicted: string[] = [];
+  const counter: IdentitySessionCounter & {
+    evictSessionForAdmission: ReturnType<typeof vi.fn>;
+  } = {
+    countSessionsForIdentity: (identity: SessionIdentity) =>
+      (byIdentity[identity.credentialId ?? ""] ?? []).length,
+    listSessionsForIdentity: (identity: SessionIdentity) => [
+      ...(byIdentity[identity.credentialId ?? ""] ?? []),
+    ],
+    evictSessionForAdmission: vi.fn((sessionId: string) => {
+      if (options.evictReturns === "throw") {
+        throw new Error("private-evictor-fault");
+      }
+      if (options.evictReturns === "undefined") {
+        return undefined;
+      }
+      for (const list of Object.values(byIdentity)) {
+        const index = list.findIndex((s) => s.sessionId === sessionId);
+        if (index >= 0) list.splice(index, 1);
+      }
+      evicted.push(sessionId);
+      return Promise.resolve();
+    }),
+  };
+  return { counter, evicted };
+}
+
+/** Probe table: session id -> activity; unlisted ids are untracked. */
+const activityTable =
+  (table: Record<string, { idleMs: number; inFlight: boolean }>) =>
+  (sessionId: string) =>
+    table[sessionId];
+
+const idle = (seconds: number) => ({ idleMs: seconds * 1000, inFlight: false });
+
+describe("selectEvictionCandidate — which session the ceiling may evict", () => {
+  const OTHER: SessionIdentity = { method: "api_key", credentialId: "key-2" };
+  const MIN_IDLE = { minIdleMs: 120_000 };
+
+  it("picks the credential's session that has been idle longest", () => {
+    const { counter } = evictableCounter({
+      "key-1": [
+        { sessionId: "s-a", endpointName: "autotask" },
+        { sessionId: "s-b", endpointName: "ninja" },
+        { sessionId: "s-c", endpointName: "itglue" },
+      ],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(
+      activityTable({ "s-a": idle(200), "s-b": idle(1700), "s-c": idle(600) }),
+    );
+
+    const candidate = selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE);
+
+    expect(candidate).toMatchObject({
+      sessionId: "s-b",
+      endpointName: "ninja",
+      idleMs: 1_700_000,
+    });
+    expect(candidate?.counter).toBe(counter);
+  });
+
+  it("never picks a session with a request or an open stream in flight, however old", () => {
+    const { counter } = evictableCounter({
+      "key-1": [
+        { sessionId: "s-stream", endpointName: "autotask" },
+        { sessionId: "s-idle", endpointName: "autotask" },
+      ],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(
+      activityTable({
+        "s-stream": { idleMs: 9_000_000, inFlight: true },
+        "s-idle": idle(130),
+      }),
+    );
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)?.sessionId).toBe(
+      "s-idle",
+    );
+  });
+
+  it("never picks a session idle for less than the floor", () => {
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: "s-recent", endpointName: "autotask" }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(activityTable({ "s-recent": idle(119) }));
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)).toBeUndefined();
+  });
+
+  it("counts exactly the floor as eligible", () => {
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: "s-edge", endpointName: "autotask" }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(activityTable({ "s-edge": idle(120) }));
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)?.sessionId).toBe(
+      "s-edge",
+    );
+  });
+
+  it("never picks a session no probe tracks", () => {
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: "s-untracked", endpointName: "autotask" }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(activityTable({}));
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)).toBeUndefined();
+  });
+
+  it("never picks a session from a counter without an evictor (the SSE manager)", () => {
+    // Listed and reported idle, but its counter cannot evict: an SSE session
+    // is one open stream, never an idle orphan.
+    registerSessionCounter({
+      countSessionsForIdentity: () => 1,
+      listSessionsForIdentity: () => [
+        { sessionId: "s-sse", endpointName: "autotask" },
+      ],
+    });
+    registerSessionActivityProbe(activityTable({ "s-sse": idle(5000) }));
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)).toBeUndefined();
+  });
+
+  it("never picks another credential's session", () => {
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: "s-mine", endpointName: "autotask" }],
+      "key-2": [{ sessionId: "s-theirs", endpointName: "autotask" }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(
+      activityTable({ "s-mine": idle(10), "s-theirs": idle(9000) }),
+    );
+
+    // key-1's only session is under the floor; key-2's idle one is NOT a
+    // fallback, however much older it is.
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)).toBeUndefined();
+    expect(selectEvictionCandidate(OTHER, MIN_IDLE)?.sessionId).toBe(
+      "s-theirs",
+    );
+  });
+
+  it("breaks an idle-time tie by session id, so the choice is deterministic", () => {
+    const { counter } = evictableCounter({
+      "key-1": [
+        { sessionId: "s-z", endpointName: "autotask" },
+        { sessionId: "s-a", endpointName: "autotask" },
+      ],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(
+      activityTable({ "s-z": idle(500), "s-a": idle(500) }),
+    );
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)?.sessionId).toBe(
+      "s-a",
+    );
+  });
+
+  it("never evicts for an anonymous identity", () => {
+    const { counter } = evictableCounter({
+      "": [{ sessionId: "s-anon", endpointName: "public" }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(activityTable({ "s-anon": idle(5000) }));
+
+    expect(
+      selectEvictionCandidate(
+        { method: "anonymous", credentialId: null },
+        MIN_IDLE,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("skips a faulting lister or probe, reports counts only, and still chooses from the rest", () => {
+    registerSessionCounter({
+      countSessionsForIdentity: () => 1,
+      listSessionsForIdentity: () => {
+        throw new Error("private-lister-data");
+      },
+      evictSessionForAdmission: () => Promise.resolve(),
+    });
+    const { counter } = evictableCounter({
+      "key-1": [
+        { sessionId: "s-faulty", endpointName: "autotask" },
+        { sessionId: "s-ok", endpointName: "autotask" },
+      ],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe((sessionId) => {
+      if (sessionId === "s-faulty") throw new Error("private-probe-data");
+      return idle(300);
+    });
+
+    expect(selectEvictionCandidate(API_KEY_IDENTITY, MIN_IDLE)?.sessionId).toBe(
+      "s-ok",
+    );
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    const message = String(loggerMock.warn.mock.calls[0][0]);
+    expect(message).toBe(
+      "Session ceiling eviction scan degraded: 1 lister faults, 1 activity probe faults.",
+    );
+  });
+});
+
+describe("checkConcurrentSessionCeiling — evicting an idle session at the ceiling", () => {
+  function atCeilingWithIdleSessions(
+    sessions: Array<{ sessionId: string; endpointName: string; idleS: number }>,
+  ) {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = String(sessions.length);
+    const listed = sessions.map(({ sessionId, endpointName }) => ({
+      sessionId,
+      endpointName,
+    }));
+    const harness = evictableCounter({ "key-1": listed });
+    registerSessionCounter(harness.counter);
+    registerSessionActivityProbe(
+      activityTable(
+        Object.fromEntries(sessions.map((s) => [s.sessionId, idle(s.idleS)])),
+      ),
+    );
+    return harness;
+  }
+
+  const REFUSAL_WARN =
+    'Concurrent-session ceiling reached for api_key credential "Example": 2/2 live sessions; refusing a new session. Raise MCP_MAX_SESSIONS_PER_CREDENTIAL if this is a legitimate consumer.';
+
+  it("evicts the longest-idle session and admits, logging one INFO line and no refusal WARN", async () => {
+    const { counter, evicted } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 300 },
+      { sessionId: "s-2", endpointName: "ninja", idleS: 1710 },
+    ]);
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "Example",
+      evictIdle: true,
+    });
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.current).toBe(2);
+    expect(decision.ceiling).toBe(2);
+    expect(decision.approaching).toBe(true);
+    expect(decision.eviction).toMatchObject({
+      endpointName: "ninja",
+      idleSeconds: 1710,
+    });
+    expect(counter.evictSessionForAdmission).toHaveBeenCalledTimes(1);
+    expect(counter.evictSessionForAdmission).toHaveBeenCalledWith("s-2");
+    expect(evicted).toEqual(["s-2"]);
+    await expect(decision.eviction?.teardown).resolves.toBeUndefined();
+
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    expect(loggerMock.info).toHaveBeenCalledTimes(1);
+    expect(loggerMock.info.mock.calls[0][0]).toBe(
+      'Concurrent-session ceiling: evicted idle session on ninja (idle 1710s) for api_key credential "Example" to admit a new session (2/2) live: autotask=1, ninja=1; in-flight 0, idle 2, oldest idle 1710s',
+    );
+  });
+
+  it("holds the freed slot until release, so the count stays at the ceiling", () => {
+    atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 300 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 400 },
+    ]);
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+
+    // One session left the manager; the reservation takes its place.
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(2);
+    decision.eviction?.release();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+    // Idempotent: a second release (the router's `finally`) changes nothing.
+    decision.eviction?.release();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+  });
+
+  it("concurrent admissions evict DISTINCT victims, then refuse once none is left", () => {
+    const { evicted } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 300 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 900 },
+      { sessionId: "s-3", endpointName: "autotask", idleS: 600 },
+    ]);
+
+    // Three admissions arrive before any of them registers its session.
+    const decisions = [1, 2, 3, 4].map(() =>
+      checkConcurrentSessionCeiling(API_KEY_IDENTITY, { evictIdle: true }),
+    );
+
+    expect(decisions.slice(0, 3).every((d) => d.allowed)).toBe(true);
+    expect(evicted).toEqual(["s-2", "s-3", "s-1"]);
+    // The fourth found nothing left to evict and is refused exactly as today.
+    expect(decisions[3]).toEqual({
+      allowed: false,
+      current: 3,
+      ceiling: 3,
+      approaching: true,
+    });
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+  });
+
+  it("refuses with today's exact WARN and decision when nothing is eligible", () => {
+    const { counter } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 30 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 60 },
+    ]);
+    const without = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "Example",
+    });
+    vi.clearAllMocks();
+
+    const withEvict = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "Example",
+      evictIdle: true,
+    });
+
+    expect(withEvict).toEqual(without);
+    expect(withEvict.allowed).toBe(false);
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(
+      String(loggerMock.warn.mock.calls[0][0]).startsWith(REFUSAL_WARN),
+    ).toBe(true);
+    expect(loggerMock.info).not.toHaveBeenCalled();
+  });
+
+  it("kill switch off: refuses exactly as today and never calls the evictor", () => {
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "false";
+    const { counter } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 5000 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 6000 },
+    ]);
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      label: "Example",
+      evictIdle: true,
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.eviction).toBeUndefined();
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(
+      String(loggerMock.warn.mock.calls[0][0]).startsWith(REFUSAL_WARN),
+    ).toBe(true);
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(2);
+  });
+
+  it("never evicts without the caller opting in", () => {
+    const { counter } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 5000 },
+    ]);
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY);
+
+    expect(decision.allowed).toBe(false);
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+  });
+
+  it("never evicts below the ceiling", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "3";
+    const { counter } = evictableCounter({
+      "key-1": [
+        { sessionId: "s-1", endpointName: "autotask" },
+        { sessionId: "s-2", endpointName: "autotask" },
+      ],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.eviction).toBeUndefined();
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+  });
+
+  it("refuses as before when the evictor declines (session busy or gone after all)", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const { counter } = evictableCounter(
+      { "key-1": [{ sessionId: "s-1", endpointName: "autotask" }] },
+      { evictReturns: "undefined" },
+    );
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(counter.evictSessionForAdmission).toHaveBeenCalledWith("s-1");
+    // Nothing reserved: the count is just the session that is still there.
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+    expect(String(loggerMock.warn.mock.calls[0][0])).toMatch(
+      /^Concurrent-session ceiling reached for api_key credential: 1\/1/,
+    );
+  });
+
+  it("a throwing evictor falls back to the refusal and never leaks the fault", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const { counter } = evictableCounter(
+      { "key-1": [{ sessionId: "s-1", endpointName: "autotask" }] },
+      { evictReturns: "throw" },
+    );
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(loggerMock.warn).toHaveBeenCalledTimes(2);
+    expect(loggerMock.warn.mock.calls[0][0]).toBe(
+      "Session ceiling eviction faulted; refusing the new session as before.",
+    );
+    expect(String(loggerMock.warn.mock.calls[1][0])).toMatch(
+      /^Concurrent-session ceiling reached/,
+    );
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(
+      "private-evictor-fault",
+    );
+  });
+
+  it("a teardown that rejects despite the contract is reported and never rejects the admission", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    registerSessionCounter({
+      countSessionsForIdentity: () => 1,
+      listSessionsForIdentity: () => [
+        { sessionId: "s-1", endpointName: "autotask" },
+      ],
+      evictSessionForAdmission: () =>
+        Promise.reject(new Error("private-teardown-fault")),
+    });
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+
+    expect(decision.allowed).toBe(true);
+    await expect(decision.eviction?.teardown).resolves.toBeUndefined();
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      "Session ceiling eviction: the evicted session's teardown rejected; admitting the new session anyway.",
+    );
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(
+      "private-teardown-fault",
+    );
+    decision.eviction?.release();
+  });
+
+  it("never puts a session id in the INFO line or the decision", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const uuid = "0b3f6c1e-aaaa-4bbb-8ccc-000000000001";
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: uuid, endpointName: 'bad\nname"x' }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+
+    const line = String(loggerMock.info.mock.calls[0][0]);
+    expect(line).not.toContain(uuid);
+    expect(JSON.stringify(decision)).not.toContain(uuid);
+    // The victim's endpoint name goes through the same log-safe reduction as
+    // the summary, so it cannot forge a second line.
+    expect(decision.eviction?.endpointName).toBe("bad?name?x");
+    expect(line).not.toContain("\n");
+    decision.eviction?.release();
   });
 });

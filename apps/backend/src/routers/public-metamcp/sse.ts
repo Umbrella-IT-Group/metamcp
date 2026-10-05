@@ -17,6 +17,7 @@ import {
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
+  type CeilingEviction,
   checkConcurrentSessionCeiling,
   registerSessionCounter,
 } from "../../lib/metamcp/credential-session-quota";
@@ -135,6 +136,12 @@ const sessionManager = new SessionLifetimeManagerImpl<Transport>("SSE");
 // Register as a source of live-session counts for the per-credential
 // concurrent-session ceiling, so a credential's budget spans SSE and
 // StreamableHTTP together rather than being counted separately per transport.
+//
+// Deliberately WITHOUT an eviction hook, and with no activity probe: an SSE
+// session is one open stream, so it is in use for as long as it exists and is
+// never idle in the sense the ceiling's eviction means. Its sessions are
+// therefore never chosen; a new SSE stream at the ceiling can still be
+// admitted by evicting the credential's idle StreamableHTTP session.
 registerSessionCounter(sessionManager);
 
 /**
@@ -203,6 +210,10 @@ sseRouter.get(
   async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
+    // Same contract as the StreamableHTTP initialize path: an admission that
+    // evicted holds a reserved slot until its session is registered below, and
+    // the `finally` hands it back on every other exit.
+    let admissionEviction: CeilingEviction | undefined;
 
     try {
       // Per-credential concurrent-session ceiling, enforced at creation: the
@@ -217,8 +228,13 @@ sseRouter.get(
       // moving it up costs nothing.
       const clientIdentity = await resolveClientIdentity(authReq);
       const identity = resolveSessionIdentity(authReq);
+      //
+      // `evictIdle`: at the ceiling, evict the credential's longest-idle
+      // StreamableHTTP session if it has one and admit; otherwise refuse
+      // exactly as before. See `checkConcurrentSessionCeiling`.
       const ceiling = checkConcurrentSessionCeiling(identity, {
         label: clientIdentity?.name,
+        evictIdle: true,
       });
       recordSessionCeilingEvent({
         identity,
@@ -231,6 +247,11 @@ sseRouter.get(
           error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
         });
         return;
+      }
+      admissionEviction = ceiling.eviction;
+      if (admissionEviction) {
+        // The victim releases its pool state first. Never rejects.
+        await admissionEviction.teardown;
       }
 
       logger.info(
@@ -279,6 +300,9 @@ sseRouter.get(
         webAppTransport,
         requestBinding(authReq),
       );
+      // The new session now counts itself; hand back an eviction's reserved
+      // slot in the same synchronous step.
+      admissionEviction?.release();
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -295,6 +319,8 @@ sseRouter.get(
       // instead of serializing the raw error object to the client; it also
       // destroys an already streaming SSE socket correctly.
       return next(error);
+    } finally {
+      admissionEviction?.release();
     }
   },
 );

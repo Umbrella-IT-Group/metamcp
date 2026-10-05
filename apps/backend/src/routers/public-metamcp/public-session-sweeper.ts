@@ -482,7 +482,9 @@ export class PublicSessionSweeper {
    * and whether a request is in flight right now. Undefined for a session this
    * sweeper does not track (SSE sessions, or one already forgotten). Used by the
    * per-credential session summary, which counts an untracked session as such
-   * rather than guessing; it never mutates tracking state.
+   * rather than guessing, and by the ceiling's choice of an idle session to
+   * evict, which never picks an untracked or in-flight one. It never mutates
+   * tracking state.
    */
   getActivity(
     sessionId: string,

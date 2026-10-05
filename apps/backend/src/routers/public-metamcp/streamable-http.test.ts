@@ -1123,6 +1123,7 @@ describe("buildSessionsHealthPayload — detail is admin-only", () => {
 
     expect(payload.status).toBe("ok");
     expect(Object.keys(payload).sort()).toEqual([
+      "ceilingEvictions",
       "metaMcpPoolStatus",
       "publicSessionSweeper",
       "status",
@@ -1201,6 +1202,7 @@ describe("GET /health/sessions — route consults the admin gate", () => {
       "metaMcpPoolStatus",
       "totalActiveSessions",
       "publicSessionSweeper",
+      "ceilingEvictions",
       "timestamp",
     ]) {
       expect(body).not.toHaveProperty(withheld);

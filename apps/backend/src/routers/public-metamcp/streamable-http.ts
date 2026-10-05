@@ -21,6 +21,7 @@ import {
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
+  type CeilingEviction,
   checkConcurrentSessionCeiling,
   registerSessionActivityProbe,
   registerSessionCounter,
@@ -275,7 +276,98 @@ const sessionManager =
 // concurrent-session ceiling. The ceiling sums across every registered manager
 // (this one plus the SSE manager), so a credential's session budget spans both
 // transports rather than being per-transport.
-registerSessionCounter(sessionManager);
+//
+// Registered through a small adapter rather than the manager itself so it can
+// carry the eviction hook: at the ceiling, the quota module may ask THIS
+// counter to evict one of its idle sessions (see
+// `evictIdleSessionForAdmission`). Counting and listing still read the
+// manager's binding map directly, so the count stays derived.
+registerSessionCounter({
+  countSessionsForIdentity: (identity) =>
+    sessionManager.countSessionsForIdentity(identity),
+  listSessionsForIdentity: (identity) =>
+    sessionManager.listSessionsForIdentity(identity),
+  evictSessionForAdmission: (sessionId) =>
+    evictIdleSessionForAdmission(sessionId),
+});
+
+/**
+ * Teardowns of sessions evicted at the ceiling that have not finished yet,
+ * keyed by session id. `recoverPersistedSession` waits on an entry here before
+ * rebuilding a transport under the same id; see `evictIdleSessionForAdmission`
+ * for why. An entry removes itself when its teardown settles.
+ */
+const evictionTeardowns = new Map<string, Promise<void>>();
+
+/** Sessions evicted at the ceiling since boot, for `/health/sessions`. */
+let ceilingEvictionsTotal = 0;
+
+/**
+ * Evict one idle session so a new one can be admitted at the per-credential
+ * ceiling. Called only through the counter hook above, by
+ * `checkConcurrentSessionCeiling`, which has already chosen this session as
+ * the credential's longest-idle one with nothing in flight.
+ *
+ * Two phases, and the split is the point:
+ *
+ *  1. Synchronously, before returning: drop the session from the manager (so
+ *     it leaves the credential's count and can never be chosen again by a
+ *     concurrent admission) and from the idle sweeper.
+ *  2. Then the sweeper's row-PRESERVING teardown (`cleanupSessionInternal`
+ *     with `deleteRow: false`): close the transport and release its pool
+ *     state, keeping the `mcp_sessions` row. A client that is still alive and
+ *     comes back with this id lazily recovers it, exactly as after a sweep;
+ *     the row-deleting variant would answer it 404 instead.
+ *
+ * The window between the phases is guarded. A request that arrives for the
+ * id once phase 1 has run finds no resident session and goes to lazy
+ * recovery, which waits for this teardown before rebuilding (see the
+ * `evictionTeardowns` check in `recoverPersistedSession`). Without that wait
+ * the rebuild could pick up the victim's still-registered pool instance, or
+ * have the teardown's later steps remove and release the session it just
+ * rebuilt, since both the server pool and the backend pool are keyed by
+ * session id. `cleanupSessionInternal` also refuses to tear down a transport
+ * that replaced the victim under the same id, as a second line.
+ *
+ * Returns undefined, evicting nothing, when the session is no longer resident
+ * or has a request in flight (re-checked here so this hook can never tear
+ * down a busy session whoever calls it). The returned promise never rejects:
+ * a teardown failure is logged, and the in-memory state is already gone.
+ *
+ * Exported for tests; production reaches it only through the counter hook.
+ */
+export function evictIdleSessionForAdmission(
+  sessionId: string,
+): Promise<void> | undefined {
+  const transport = sessionManager.getSession(sessionId);
+  if (!transport) {
+    return undefined;
+  }
+  if (publicSessionSweeper.getActivity(sessionId)?.inFlight) {
+    return undefined;
+  }
+
+  sessionManager.removeSession(sessionId);
+  publicSessionSweeper.forget(sessionId);
+  ceilingEvictionsTotal += 1;
+
+  const teardown: Promise<void> = cleanupSessionInternal(sessionId, transport, {
+    deleteRow: false,
+  })
+    .catch((error: unknown) => {
+      logger.warn(
+        `Teardown of session ${sessionId}, evicted at the concurrent-session ceiling, failed; its in-memory state is already released.`,
+        error,
+      );
+    })
+    .finally(() => {
+      if (evictionTeardowns.get(sessionId) === teardown) {
+        evictionTeardowns.delete(sessionId);
+      }
+    });
+  evictionTeardowns.set(sessionId, teardown);
+  return teardown;
+}
 
 // Idle-TTL sweeper for public-endpoint sessions. This reaps on a DIFFERENT
 // axis than the age-based `sessionManager.startCleanupTimer` below: last
@@ -302,10 +394,11 @@ export const publicSessionSweeper = PublicSessionSweeper.fromEnv(
   },
 );
 
-// Let the per-credential ceiling summary ask this sweeper whether a session is
-// in flight or how long it has been idle. Read-only; used only when a credential
-// is approaching or at its ceiling, to say what is filling it. SSE sessions are
-// not tracked here and are reported as untracked.
+// Let the per-credential ceiling ask this sweeper whether a session is in flight
+// or how long it has been idle. Read-only; used only when a credential is
+// approaching or at its ceiling, to say what is filling it and, at the ceiling,
+// to choose which idle session to evict. SSE sessions are not tracked here: they
+// are reported as untracked and are never eviction candidates.
 registerSessionActivityProbe((sessionId) =>
   publicSessionSweeper.getActivity(sessionId),
 );
@@ -460,6 +553,21 @@ export async function recoverPersistedSession(
   | { status: "auth_failed" }
   | { status: "not_found" }
 > {
+  // A session evicted at the ceiling is out of `sessionManager` before its
+  // teardown has finished, so its next request lands here mid-teardown. Wait
+  // for the teardown first: the pools are keyed by session id, and a rebuild
+  // that overlapped it could be handed the victim's half-released server
+  // instance, or have the teardown's remaining steps release the transport
+  // this call is about to register. Afterwards it is an ordinary recovery
+  // from the row the eviction kept. The promise never rejects.
+  const pendingEviction = evictionTeardowns.get(sessionId);
+  if (pendingEviction) {
+    logger.info(
+      `Lazy recovery: session ${sessionId} is still being torn down after a ceiling eviction; waiting for it to finish.`,
+    );
+    await pendingEviction;
+  }
+
   let stored;
   try {
     stored = await mcpSessionsRepository.findById(sessionId);
@@ -685,16 +793,35 @@ const cleanupSessionInternal = async (
 ): Promise<void> => {
   logger.info(`Cleaning up StreamableHTTP session ${sessionId}`);
 
-  try {
-    // Use provided transport or get from session manager
-    const sessionTransport = transport || sessionManager.getSession(sessionId);
+  // Use provided transport or get from session manager. Captured before the
+  // first await so the supersession checks below compare against the
+  // transport THIS call set out to tear down.
+  const sessionTransport = transport || sessionManager.getSession(sessionId);
 
+  try {
     if (sessionTransport) {
       logger.info(`Closing transport for session ${sessionId}`);
       await sessionTransport.close();
       logger.info(`Transport cleaned up for session ${sessionId}`);
     } else {
       logger.info(`No transport found for session ${sessionId}`);
+    }
+
+    // Everything below is keyed by session id alone: the manager entry, the
+    // sweeper's tracking, and both pools. If a DIFFERENT transport became
+    // resident under this id while the close was awaited (a lazy recovery
+    // that overlapped this teardown), those entries now belong to it, and
+    // removing or releasing them would strand a live session. Leave them; the
+    // only thing this call owned was the transport it just closed. The row
+    // decision still stands, since it reflects what the caller asked for.
+    if (isSupersededDuringCleanup(sessionId, sessionTransport)) {
+      logger.warn(
+        `Session ${sessionId} was re-established under the same id while its old transport was closing; leaving the new transport and its pool state in place.`,
+      );
+      if (deleteRow) {
+        deletePersistedSessionRow(sessionId);
+      }
+      return;
     }
 
     // Remove from session manager
@@ -708,17 +835,7 @@ const cleanupSessionInternal = async (
     await metaMcpServerPool.cleanupSession(sessionId);
 
     if (deleteRow) {
-      // Drop the persisted row so a future DELETE-then-reuse can't lazy-
-      // recover a session the client explicitly tore down. Best-effort —
-      // pruner reaps stragglers.
-      mcpSessionsRepository
-        .delete(sessionId)
-        .catch((error: unknown) =>
-          logger.warn(
-            `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
-            error,
-          ),
-        );
+      deletePersistedSessionRow(sessionId);
     }
 
     logger.info(
@@ -727,13 +844,46 @@ const cleanupSessionInternal = async (
     );
   } catch (error) {
     logger.error(`Error during cleanup of session ${sessionId}:`, error);
-    // Even if cleanup fails, remove the session from manager to prevent memory leaks
-    sessionManager.removeSession(sessionId);
-    publicSessionSweeper.forget(sessionId);
-    logger.info(`Removed orphaned session ${sessionId} due to cleanup error`);
+    // Even if cleanup fails, remove the session from manager to prevent memory
+    // leaks, unless the id now belongs to a newer transport (see above).
+    if (!isSupersededDuringCleanup(sessionId, sessionTransport)) {
+      sessionManager.removeSession(sessionId);
+      publicSessionSweeper.forget(sessionId);
+      logger.info(`Removed orphaned session ${sessionId} due to cleanup error`);
+    }
     throw error;
   }
 };
+
+/**
+ * True when the manager now holds a DIFFERENT transport under `sessionId` than
+ * the one a cleanup set out to tear down. Absent (nothing resident) is not a
+ * supersession: that is the normal state once the cleanup itself, or an
+ * eviction before it, has removed the entry.
+ */
+function isSupersededDuringCleanup(
+  sessionId: string,
+  tornDown: StreamableHTTPServerTransport | undefined,
+): boolean {
+  const resident = sessionManager.getSession(sessionId);
+  return resident !== undefined && resident !== tornDown;
+}
+
+/**
+ * Drop the persisted row so a future DELETE-then-reuse can't lazy-recover a
+ * session the client explicitly tore down. Best-effort: the pruner reaps
+ * stragglers.
+ */
+function deletePersistedSessionRow(sessionId: string): void {
+  mcpSessionsRepository
+    .delete(sessionId)
+    .catch((error: unknown) =>
+      logger.warn(
+        `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
+        error,
+      ),
+    );
+}
 
 // Explicit client DELETE + the age-based sessionLifetime cleanup timer:
 // the session is genuinely over, so the persisted row goes too.
@@ -895,6 +1045,13 @@ export function buildSessionsHealthPayload(
   };
   body.totalActiveSessions = sessionCount + poolStatus.active;
   body.publicSessionSweeper = publicSessionSweeper.getStats();
+  // Idle sessions evicted to admit a new one at the per-credential ceiling
+  // (see `evictIdleSessionForAdmission`), and how many of those teardowns are
+  // still running. Counts only, like every other field here.
+  body.ceilingEvictions = {
+    total: ceilingEvictionsTotal,
+    tearingDown: evictionTeardowns.size,
+  };
 
   return body;
 }
@@ -1020,6 +1177,11 @@ streamableHttpRouter.post(
     const clientIdentity = await resolveClientIdentity(authReq);
 
     if (!sessionId) {
+      // Set when this admission got its slot by evicting an idle session. The
+      // slot is reserved for it until the new session is registered below;
+      // the `finally` releases it on every other exit (refusal, a failed pool
+      // acquisition, a throw), so a failed admission can never hold a slot.
+      let admissionEviction: CeilingEviction | undefined;
       try {
         // Per-credential concurrent-session ceiling, enforced at creation. A
         // credential already holding the maximum is refused here rather than
@@ -1028,9 +1190,15 @@ streamableHttpRouter.post(
         // consumer's display name is threaded into the WARN and the throttled
         // gateway event so a leaking credential is nameable from the logs and
         // the History view, never from a database prompt.
+        //
+        // `evictIdle`: at the ceiling, first evict this credential's
+        // longest-idle session with nothing in flight, if it has one, and
+        // admit; otherwise refuse exactly as before. See
+        // `checkConcurrentSessionCeiling`.
         const identity = resolveSessionIdentity(authReq);
         const ceiling = checkConcurrentSessionCeiling(identity, {
           label: clientIdentity?.name,
+          evictIdle: true,
         });
         recordSessionCeilingEvent({
           identity,
@@ -1043,6 +1211,13 @@ streamableHttpRouter.post(
             error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
           });
           return;
+        }
+        admissionEviction = ceiling.eviction;
+        if (admissionEviction) {
+          // Let the victim release its pool state before this session takes
+          // its own, so an eviction never adds to backend-pool pressure. The
+          // teardown never rejects.
+          await admissionEviction.teardown;
         }
 
         logger.info(
@@ -1130,6 +1305,9 @@ streamableHttpRouter.post(
           transport,
           requestBinding(authReq),
         );
+        // The new session now counts itself, so the slot reserved for it by
+        // an eviction is handed back in the same synchronous step.
+        admissionEviction?.release();
         // Seed idle-TTL tracking for the new session (dispatchTracked's
         // markInFlight/touch calls are guarded to no-op on an untracked
         // session — see their doc comments — so this unconditional seed is
@@ -1195,6 +1373,8 @@ streamableHttpRouter.post(
         // Constant body via the terminal error handler; no error message or
         // endpoint name in the client-facing response (detail is logged above).
         return next(error);
+      } finally {
+        admissionEviction?.release();
       }
     } else {
       // logger.info(
