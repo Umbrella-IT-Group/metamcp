@@ -52,7 +52,7 @@ const evicted = (): CeilingDecision => ({
   eviction: {
     endpointName: "ninja",
     idleSeconds: 1710,
-    teardown: Promise.resolve(),
+    teardownWait: Promise.resolve(),
     release: () => {},
   },
 });

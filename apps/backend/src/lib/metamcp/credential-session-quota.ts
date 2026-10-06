@@ -25,7 +25,8 @@ import { SessionIdentity } from "./session-auth";
  * term is the short-lived slot reservation an EVICTING admission holds between
  * evicting its victim and registering its own session (see
  * `admissionReservations`); it is released by the admitting request itself,
- * in a `finally`, never by a cleanup path.
+ * in a `finally`, never by a cleanup path (or, if the decision faults before
+ * it can hand the eviction over, by the decision code on its way out).
  */
 export interface IdentitySessionCounter {
   countSessionsForIdentity(identity: SessionIdentity): number;
@@ -88,6 +89,19 @@ export const DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS = 120;
 // a concurrent admission could evict a session that is still being opened.
 // Ten seconds is far beyond that window and still short enough to be useful.
 export const MIN_CEILING_EVICT_MIN_IDLE_SECONDS = 10;
+
+// Longest an evicting admission waits for its victim's teardown before going
+// ahead anyway. The wait exists so the victim hands its backend connections
+// back before the new session takes its own; it must not turn a slow or hung
+// backend into a stalled initialize, because the backend pool releases a
+// session's extra connections one after another, each bounded only by its own
+// DELETE timeout. Going ahead is safe: the new session has a fresh id, so it
+// shares nothing with the victim's half-finished teardown, and the teardown
+// carries on in the background. Recovery of the victim's own id still waits
+// for the whole teardown (see `recoverPersistedSession`), since that rebuild
+// reuses the id.
+export const EVICTION_ADMISSION_WAIT_MS = 5_000;
+let evictionAdmissionWaitMs = EVICTION_ADMISSION_WAIT_MS;
 
 const counters: IdentitySessionCounter[] = [];
 const activityProbes: SessionActivityProbe[] = [];
@@ -160,6 +174,18 @@ export function resetSessionCountersForTests(): void {
   counters.length = 0;
   activityProbes.length = 0;
   admissionReservations.clear();
+  evictionAdmissionWaitMs = EVICTION_ADMISSION_WAIT_MS;
+}
+
+/**
+ * TEST-ONLY: shorten the admission's bounded wait on a victim's teardown, so a
+ * route test over real sockets (real timers) can exercise the timeout without
+ * sleeping for the production bound. `undefined` restores the default.
+ */
+export function setEvictionAdmissionWaitMsForTests(
+  ms: number | undefined,
+): void {
+  evictionAdmissionWaitMs = ms ?? EVICTION_ADMISSION_WAIT_MS;
 }
 
 /**
@@ -190,17 +216,31 @@ export interface CeilingEvictionConfig {
   minIdleMs: number;
 }
 
-const EVICT_ENABLED_VALUES = ["true", "1", "on", "yes"];
-const EVICT_DISABLED_VALUES = ["false", "0", "off", "no"];
+const EVICT_ENABLED_VALUES = ["true", "1", "on", "yes", "enable", "enabled"];
+// `disable` and `disabled` are accepted because this is an emergency lever: an
+// operator reaching for it under pressure is likely to type either, and an
+// unrecognised value leaves eviction ON (with a WARN), the wrong way for a
+// kill switch to fail.
+const EVICT_DISABLED_VALUES = [
+  "false",
+  "0",
+  "off",
+  "no",
+  "disable",
+  "disabled",
+];
 
 /**
- * Resolve the ceiling-eviction settings from the environment, read per call
- * (only on the at-ceiling path) so a changed value needs no restart hook.
+ * Resolve the ceiling-eviction settings from the environment. Read from
+ * `process.env` on each at-ceiling decision, but that environment is fixed
+ * when the gateway process starts: a changed value takes effect only when the
+ * gateway restarts with it (a compose recreate), never on a live process.
  *
- * `MCP_SESSION_CEILING_EVICT_IDLE` is the kill switch: `false`, `0`, `off` or
- * `no` (any case) restores the plain refusal. Unset or empty means on. Any
- * other value falls back to on with a WARN, the same treatment
- * `resolveSessionCeiling` gives a malformed ceiling, so a typo is visible.
+ * `MCP_SESSION_CEILING_EVICT_IDLE` is the kill switch: `false`, `0`, `off`,
+ * `no`, `disable` or `disabled` (any case) restores the plain refusal. Unset
+ * or empty means on. Any other value falls back to on with a WARN, the same
+ * treatment `resolveSessionCeiling` gives a malformed ceiling, so a typo is
+ * visible.
  *
  * `MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS` (default 120) is how long a
  * session must have been idle to be chosen. Malformed or negative falls back
@@ -409,8 +449,13 @@ export interface CeilingEviction {
   endpointName: string;
   /** How long the evicted session had been idle, whole seconds. */
   idleSeconds: number;
-  /** Settles when the victim's teardown is finished. Never rejects. */
-  teardown: Promise<void>;
+  /**
+   * What the admitting request awaits before taking its own pool state:
+   * settles when the victim's teardown has finished, or after
+   * `EVICTION_ADMISSION_WAIT_MS` (with a WARN) if it has not, whichever comes
+   * first. Never rejects. A timed-out teardown keeps running.
+   */
+  teardownWait: Promise<void>;
   /** Give back the reserved slot. Idempotent. */
   release: () => void;
 }
@@ -599,6 +644,7 @@ function liveSummaryFor(identity: SessionIdentity): string {
 function evictForAdmission(
   identity: SessionIdentity,
 ): CeilingEviction | undefined {
+  let release: (() => void) | undefined;
   try {
     const config = resolveEvictionConfig();
     if (!config.enabled) {
@@ -610,6 +656,11 @@ function evictForAdmission(
     if (candidate === undefined) {
       return undefined;
     }
+    // Everything that could fault is computed BEFORE the eviction, so that
+    // once a session has been evicted and a slot reserved, nothing between
+    // here and the caller can throw and strand the reservation.
+    const endpointName = safeEndpointName(candidate.endpointName);
+    const idleSeconds = Math.floor(candidate.idleMs / 1000);
     const teardown = candidate.counter.evictSessionForAdmission?.(
       candidate.sessionId,
     );
@@ -618,28 +669,59 @@ function evictForAdmission(
     }
     // Reserve in the same synchronous step as the eviction: the victim has
     // already left the count, and no other admission may run between the two.
-    const release = reserveAdmissionSlot(identity);
+    release = reserveAdmissionSlot(identity);
+    // The counter contract says this never rejects; hold it to that here
+    // as well, loudly, so an awaiting admission can never be failed by it.
+    const settled = Promise.resolve(teardown).then(
+      () => undefined,
+      () => {
+        logger.warn(
+          "Session ceiling eviction: the evicted session's teardown rejected; admitting the new session anyway.",
+        );
+      },
+    );
     return {
-      endpointName: safeEndpointName(candidate.endpointName),
-      idleSeconds: Math.floor(candidate.idleMs / 1000),
-      // The counter contract says this never rejects; hold it to that here
-      // as well, loudly, so an awaiting admission can never be failed by it.
-      teardown: teardown.then(
-        () => undefined,
-        () => {
-          logger.warn(
-            "Session ceiling eviction: the evicted session's teardown rejected; admitting the new session anyway.",
-          );
-        },
-      ),
+      endpointName,
+      idleSeconds,
+      teardownWait: boundedTeardownWait(settled, endpointName),
       release,
     };
   } catch {
+    // Unreachable in practice (see the ordering above); if it ever happens
+    // after a reservation, give the slot back rather than hold it until a
+    // restart.
+    release?.();
     logger.warn(
       "Session ceiling eviction faulted; refusing the new session as before.",
     );
     return undefined;
   }
+}
+
+/**
+ * Settle when `teardown` does or after `evictionAdmissionWaitMs`, whichever is
+ * first; see `EVICTION_ADMISSION_WAIT_MS` for why the admission's wait is
+ * bounded. The timer is cleared as soon as the teardown wins, and unref'd so
+ * it never holds the process open.
+ */
+function boundedTeardownWait(
+  teardown: Promise<void>,
+  endpointName: string,
+): Promise<void> {
+  const waitMs = evictionAdmissionWaitMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      logger.warn(
+        `Session ceiling eviction: the evicted session's teardown on ${endpointName} ` +
+          `has not finished after ${waitMs} ms; admitting the new session without ` +
+          `waiting for it. The teardown continues in the background.`,
+      );
+      resolve();
+    }, waitMs);
+    timer.unref?.();
+  });
+  return Promise.race([teardown, timedOut]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -714,12 +796,20 @@ export function checkConcurrentSessionCeiling(
     if (eviction) {
       // The summary was taken before the eviction, so it still describes what
       // filled the credential at the moment it hit the ceiling.
-      logger.info(
-        `Concurrent-session ceiling: evicted idle session on ${eviction.endpointName} ` +
-          `(idle ${eviction.idleSeconds}s) for ${identity.method} credential${labelSuffix} ` +
-          `to admit a new session (${current}/${ceiling})` +
-          summarySuffix,
-      );
+      try {
+        logger.info(
+          `Concurrent-session ceiling: evicted idle session on ${eviction.endpointName} ` +
+            `(idle ${eviction.idleSeconds}s) for ${identity.method} credential${labelSuffix} ` +
+            `to admit a new session (${current}/${ceiling})` +
+            summarySuffix,
+        );
+      } catch (error) {
+        // The caller only learns of the eviction from the return value, so if
+        // this throws it can never release the slot reserved for it. Release
+        // it here and let the failure surface as before.
+        eviction.release();
+        throw error;
+      }
       return {
         allowed: true,
         current,

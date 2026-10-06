@@ -544,15 +544,26 @@ assertRecoveryHydrationContract();
  *
  * The recovered transport is added to `sessionManager` so subsequent
  * requests in the same metamcp lifetime skip the DB hop entirely.
+ *
+ * SINGLE-FLIGHT PER SESSION ID. Two requests on the same non-resident id
+ * (a client with no standalone GET stream firing calls in parallel after an
+ * eviction, a sweep reap or a restart) used to run two recoveries at once.
+ * Both pools are keyed by session id, so the second was handed the instance
+ * the first had just connected, and `server.connect` threw: the second
+ * request got a 500. Now the first request leads and later ones wait for it.
+ *
+ * A waiter never takes the leader's RESULT. It re-resolves the id through
+ * `resolveBoundSession`, the same endpoint-and-credential check every
+ * resident request passes, because the leader may have been a different
+ * caller: handing its transport over would cross one consumer's session into
+ * another's. So a waiter with another credential gets the same reinitialize
+ * 404 it would get a moment later, and a waiter whose leader failed (a wrong
+ * credential, a lookup fault) finds nothing resident and recovers on its own.
  */
 export async function recoverPersistedSession(
   sessionId: string,
   authReq: ApiKeyAuthenticatedRequest,
-): Promise<
-  | { status: "recovered"; transport: StreamableHTTPServerTransport }
-  | { status: "auth_failed" }
-  | { status: "not_found" }
-> {
+): Promise<SessionRecoveryResult> {
   // A session evicted at the ceiling is out of `sessionManager` before its
   // teardown has finished, so its next request lands here mid-teardown. Wait
   // for the teardown first: the pools are keyed by session id, and a rebuild
@@ -560,6 +571,11 @@ export async function recoverPersistedSession(
   // instance, or have the teardown's remaining steps release the transport
   // this call is about to register. Afterwards it is an ordinary recovery
   // from the row the eviction kept. The promise never rejects.
+  //
+  // Deliberately NOT time-bounded, unlike the admission side's wait (see
+  // `CeilingEviction.teardownWait`): this rebuild reuses the victim's id, so
+  // overlapping its teardown is exactly the crossing this wait prevents. A
+  // slow backend stalls only this one returning client.
   const pendingEviction = evictionTeardowns.get(sessionId);
   if (pendingEviction) {
     logger.info(
@@ -568,6 +584,69 @@ export async function recoverPersistedSession(
     await pendingEviction;
   }
 
+  // Bounded: each pass either leads or waits for a leader that started
+  // before it, and a recovery that settles removes its own entry.
+  for (;;) {
+    const leader = recoveriesInFlight.get(sessionId);
+    if (!leader) {
+      break;
+    }
+    logger.info(
+      `Lazy recovery: session ${sessionId} is already being recovered by a concurrent request; waiting for it.`,
+    );
+    // Only its settling matters here. A rejection is the leader's own
+    // failure, reported by the leader's request; this one goes on to
+    // re-resolve and, finding nothing resident, recovers for itself.
+    await leader.then(
+      () => undefined,
+      () => undefined,
+    );
+    const resolved = resolveBoundSession(sessionId, authReq);
+    if (resolved.outcome === "ok") {
+      return { status: "recovered", transport: resolved.transport };
+    }
+    if (resolved.outcome === "refused") {
+      // Resident, but not this caller's (`resolveBoundSession` has recorded
+      // the denial). The route answers the same 404 as a miss.
+      return { status: "not_found" };
+    }
+    // Absent: the leader did not register a transport. Recover on our own,
+    // unless another request has meanwhile started to lead.
+  }
+
+  const attempt: Promise<SessionRecoveryResult> = recoverPersistedSessionOnce(
+    sessionId,
+    authReq,
+  ).finally(() => {
+    if (recoveriesInFlight.get(sessionId) === attempt) {
+      recoveriesInFlight.delete(sessionId);
+    }
+  });
+  // Registered in the same synchronous step that started the attempt, so a
+  // request that arrives during the attempt's first await already sees it.
+  recoveriesInFlight.set(sessionId, attempt);
+  return attempt;
+}
+
+type SessionRecoveryResult =
+  | { status: "recovered"; transport: StreamableHTTPServerTransport }
+  | { status: "auth_failed" }
+  | { status: "not_found" };
+
+/**
+ * Lazy recoveries in progress, keyed by session id; see the single-flight
+ * note on `recoverPersistedSession`. An entry removes itself when its
+ * recovery settles, whatever the outcome. Waiters only ever await an entry
+ * (never read its result), so a rejected recovery fails its own request and
+ * no other.
+ */
+const recoveriesInFlight = new Map<string, Promise<SessionRecoveryResult>>();
+
+/** One recovery attempt; only `recoverPersistedSession` calls this. */
+async function recoverPersistedSessionOnce(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): Promise<SessionRecoveryResult> {
   let stored;
   try {
     stored = await mcpSessionsRepository.findById(sessionId);
@@ -1200,6 +1279,9 @@ streamableHttpRouter.post(
           label: clientIdentity?.name,
           evictIdle: true,
         });
+        // Taken over before anything else can throw, so the `finally` owns
+        // the reserved slot from the moment the decision returns.
+        admissionEviction = ceiling.eviction;
         recordSessionCeilingEvent({
           identity,
           endpointName,
@@ -1212,12 +1294,13 @@ streamableHttpRouter.post(
           });
           return;
         }
-        admissionEviction = ceiling.eviction;
         if (admissionEviction) {
           // Let the victim release its pool state before this session takes
-          // its own, so an eviction never adds to backend-pool pressure. The
-          // teardown never rejects.
-          await admissionEviction.teardown;
+          // its own, so an eviction does not add to backend-pool pressure.
+          // Bounded (EVICTION_ADMISSION_WAIT_MS): a slow backend teardown
+          // must not stall this initialize, and this session's fresh id
+          // shares nothing with the victim's. Never rejects.
+          await admissionEviction.teardownWait;
         }
 
         logger.info(

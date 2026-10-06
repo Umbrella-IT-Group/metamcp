@@ -236,6 +236,9 @@ sseRouter.get(
         label: clientIdentity?.name,
         evictIdle: true,
       });
+      // Taken over before anything else can throw, so the `finally` owns the
+      // reserved slot from the moment the decision returns.
+      admissionEviction = ceiling.eviction;
       recordSessionCeilingEvent({
         identity,
         endpointName,
@@ -248,10 +251,11 @@ sseRouter.get(
         });
         return;
       }
-      admissionEviction = ceiling.eviction;
       if (admissionEviction) {
-        // The victim releases its pool state first. Never rejects.
-        await admissionEviction.teardown;
+        // The victim releases its pool state first, for at most
+        // EVICTION_ADMISSION_WAIT_MS (see the StreamableHTTP path). Never
+        // rejects.
+        await admissionEviction.teardownWait;
       }
 
       logger.info(

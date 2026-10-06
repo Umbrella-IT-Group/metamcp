@@ -40,9 +40,18 @@ import {
 const h = vi.hoisted(() => {
   const rows = new Map<string, unknown>();
   const trace: string[] = [];
+  // How long the fake `mcp_sessions` lookup takes. Zero by default; the
+  // concurrent-recovery tests raise it so two requests on one id are inside
+  // recovery at the same time, as they are against a real database.
+  const db = { findByIdDelayMs: 0 };
   return {
     rows,
     trace,
+    db,
+    // Raw api key -> key uuid for a second credential in the same test. The
+    // endpoint lookup fake falls back to the test's own key for anything not
+    // listed here.
+    otherKeys: new Map<string, string>(),
     logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
     record: vi.fn(),
     getServer: vi.fn(),
@@ -56,6 +65,9 @@ const h = vi.hoisted(() => {
     }),
     findById: vi.fn(async (sessionId: string) => {
       trace.push(`findById:${sessionId}`);
+      if (db.findByIdDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, db.findByIdDelayMs));
+      }
       return rows.get(sessionId) ?? null;
     }),
     deleteRow: vi.fn(async (sessionId: string) => {
@@ -118,7 +130,10 @@ import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 
-import { countLiveSessionsForIdentity } from "../../lib/metamcp/credential-session-quota";
+import {
+  countLiveSessionsForIdentity,
+  setEvictionAdmissionWaitMsForTests,
+} from "../../lib/metamcp/credential-session-quota";
 import type { SessionIdentity } from "../../lib/metamcp/session-auth";
 import { __resetSessionCeilingThrottleForTesting } from "../../lib/metamcp/session-ceiling-events";
 import streamableHttpRouter, {
@@ -216,17 +231,32 @@ async function openSession(endpoint = "ep-1"): Promise<string> {
   return sessionId;
 }
 
-function ping(sessionId: string, endpoint = "ep-1"): Promise<Response> {
+/**
+ * JSON-RPC ids for `ping`, distinct per call as a real client's are: the SDK
+ * transport routes each response by request id, so two concurrent requests
+ * sharing one id on one session would answer only one of them.
+ */
+let pingId = 0;
+
+function ping(
+  sessionId: string,
+  endpoint = "ep-1",
+  key = rawKey,
+): Promise<Response> {
   return fetch(`${baseUrl}/metamcp/${endpoint}/mcp`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
-      "x-api-key": rawKey,
+      "x-api-key": key,
       "mcp-session-id": sessionId,
       "mcp-protocol-version": PROTOCOL_VERSION,
     },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "ping" }),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: (pingId += 1),
+      method: "ping",
+    }),
   });
 }
 
@@ -286,12 +316,13 @@ beforeAll(async () => {
     next: () => void,
   ) => {
     const endpoint = String(req.params.endpoint_name);
+    const presented = String(req.headers["x-api-key"] ?? "");
     Object.assign(req, {
       namespaceUuid: `ns-${endpoint}`,
       endpointName: endpoint,
       endpoint: { uuid: `uuid-${endpoint}`, name: endpoint },
       authMethod: "api_key",
-      apiKeyUuid: keyUuid,
+      apiKeyUuid: h.otherKeys.get(presented) ?? keyUuid,
       auditRequestId: "req-evict",
       auditClientIp: "203.0.113.20",
     });
@@ -326,6 +357,8 @@ afterAll(async () => {
 beforeEach(() => {
   vi.clearAllMocks();
   h.trace.length = 0;
+  h.db.findByIdDelayMs = 0;
+  h.otherKeys.clear();
   __resetSessionCeilingThrottleForTesting();
   keyCounter += 1;
   keyUuid = `3f7f8a1e-0000-4000-8000-${String(keyCounter).padStart(12, "0")}`;
@@ -339,6 +372,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  setEvictionAdmissionWaitMsForTests(undefined);
   restoreEnv("MCP_MAX_SESSIONS_PER_CREDENTIAL", ORIGINAL_ENV.ceiling);
   restoreEnv("MCP_SESSION_CEILING_EVICT_IDLE", ORIGINAL_ENV.evict);
   restoreEnv(
@@ -549,6 +583,60 @@ describe("POST initialize at the ceiling — an idle session is evicted and the 
     );
     expect(evictedEvents).toHaveLength(1);
   });
+
+  it("concurrent initializes while every victim's close is slow: distinct victims, never over the ceiling", async () => {
+    // The test above has fast closes, so each victim is fully torn down before
+    // the next admission's ceiling check and would pass even if the evictor
+    // left the victim in the manager until its teardown finished. Here every
+    // close takes 150 ms, so the later admissions run their checks while the
+    // first victim is still closing: only the evictor's SYNCHRONOUS removal
+    // from the manager and the sweeper keeps them from choosing that same
+    // victim again and admitting over the ceiling.
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "3";
+    const originals: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      originals.push(await openSession());
+      advanceSeconds(1);
+    }
+    advanceSeconds(300);
+    for (const id of originals) {
+      const transport = transportOf(id);
+      const close = transport.close.bind(transport);
+      vi.spyOn(transport, "close").mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await close();
+      });
+    }
+    const observed: number[] = [];
+    h.getServer.mockImplementation(async () => {
+      observed.push(countLiveSessionsForIdentity(identity()));
+      return makeServerInstance();
+    });
+    h.persist.mockImplementation(async (row: { session_id: string }) => {
+      observed.push(countLiveSessionsForIdentity(identity()));
+      h.rows.set(row.session_id, {
+        ...row,
+        created_at: new Date(),
+        last_seen_at: new Date(),
+      });
+    });
+
+    const responses = await Promise.all([
+      initialize(),
+      initialize(),
+      initialize(),
+    ]);
+
+    expect(responses.map((r) => r.status)).toEqual([200, 200, 200]);
+    await Promise.all(responses.map((r) => r.text()));
+    const victims = h.cleanupSession.mock.calls.map((call) => call[0]);
+    expect(victims).toHaveLength(3);
+    expect(new Set(victims)).toEqual(new Set(originals));
+    expect(observed.length).toBeGreaterThanOrEqual(6);
+    expect(Math.max(...observed)).toBeLessThanOrEqual(3);
+    expect(countLiveSessionsForIdentity(identity())).toBe(3);
+    expect(evictionLines()).toHaveLength(3);
+  });
 });
 
 describe("a failed admission never holds the slot it reserved", () => {
@@ -723,6 +811,201 @@ describe("a request that lands on the victim mid-teardown", () => {
       returningResponse.headers.get("Mcp-Session-Reinitialize-Required"),
     ).toBe("true");
     expect(isResident(victim)).toBe(false);
+  });
+});
+
+describe("an evicting admission does not stall on a hung victim teardown", () => {
+  it("admits after the bounded wait while the teardown carries on; the victim's own recovery still waits for all of it", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    setEvictionAdmissionWaitMsForTests(100);
+    const victim = await openSession();
+    advanceSeconds(300);
+    // The victim's backend release never finishes until the test says so,
+    // like a backend whose DELETEs are timing out one after another.
+    let finishTeardown!: () => void;
+    h.cleanupSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishTeardown = () => {
+            h.trace.push("victim-teardown-finished");
+            resolve();
+          };
+        }),
+    );
+    const tearingDownBefore = (
+      buildSessionsHealthPayload(true).ceilingEvictions as {
+        tearingDown: number;
+      }
+    ).tearingDown;
+
+    // `Date` is faked in this file; `performance` is not.
+    const started = performance.now();
+    const response = await initialize();
+    const elapsedMs = performance.now() - started;
+
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(elapsedMs).toBeLessThan(2_000);
+    expect(h.cleanupSession).toHaveBeenCalledWith(victim);
+    expect(warnLines()).toContain(
+      "Session ceiling eviction: the evicted session's teardown on ep-1 has not finished after 100 ms; admitting the new session without waiting for it. The teardown continues in the background.",
+    );
+    expect(
+      (
+        buildSessionsHealthPayload(true).ceilingEvictions as {
+          tearingDown: number;
+        }
+      ).tearingDown,
+    ).toBe(tearingDownBefore + 1);
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+
+    // The victim's id is rebuilt only once the whole teardown is done: that
+    // wait is the one that keeps two transports off one id, and it is not
+    // bounded.
+    const returning = ping(victim);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(h.findById).not.toHaveBeenCalledWith(victim);
+    finishTeardown();
+    const returningResponse = await returning;
+    expect(returningResponse.status).toBe(200);
+    expect(await returningResponse.text()).toContain('"result":{}');
+    expect(h.trace.indexOf(`findById:${victim}`)).toBeGreaterThan(
+      h.trace.indexOf("victim-teardown-finished"),
+    );
+    expect(
+      (
+        buildSessionsHealthPayload(true).ceilingEvictions as {
+          tearingDown: number;
+        }
+      ).tearingDown,
+    ).toBe(tearingDownBefore);
+  });
+});
+
+describe("two requests on one non-resident id at once: recovery runs once", () => {
+  /**
+   * A pool fake that behaves like `MetaMcpServerPool` where it matters here:
+   * it hands back the instance it already holds for a session id instead of
+   * building another, and forgets it on `cleanupSession`. With the default
+   * fake (a fresh instance per call) two overlapping recoveries of one id
+   * never meet in the pool, and the collision this block is about cannot
+   * happen.
+   */
+  function usePoolKeyedBySessionId(): void {
+    const held = new Map<string, ReturnType<typeof makeServerInstance>>();
+    h.getServer.mockImplementation(async (sessionId: string) => {
+      const existing = held.get(sessionId);
+      if (existing) return existing;
+      const instance = makeServerInstance();
+      held.set(sessionId, instance);
+      return instance;
+    });
+    h.cleanupSession.mockImplementation(async (sessionId: string) => {
+      held.delete(sessionId);
+    });
+  }
+
+  const recoveriesOf = (sessionId: string) =>
+    h.getServer.mock.calls.filter((call) => call[0] === sessionId).length;
+
+  it("after an eviction: both concurrent requests are served by ONE recovered transport", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    usePoolKeyedBySessionId();
+    const evicted = await openSession();
+    advanceSeconds(300);
+    const admit = await initialize();
+    expect(admit.status).toBe(200);
+    await admit.text();
+    expect(isResident(evicted)).toBe(false);
+    h.db.findByIdDelayMs = 40;
+
+    const responses = await Promise.all([ping(evicted), ping(evicted)]);
+
+    expect(responses.map((r) => r.status)).toEqual([200, 200]);
+    for (const response of responses) {
+      expect(response.headers.get("mcp-session-id")).toBe(evicted);
+      expect(await response.text()).toContain('"result":{}');
+    }
+    // One recovery: one row read, one pool instance, one resident transport.
+    expect(h.findById.mock.calls.filter((c) => c[0] === evicted)).toHaveLength(
+      1,
+    );
+    expect(recoveriesOf(evicted)).toBe(2); // the original open, then one recovery
+    expect(isResident(evicted)).toBe(true);
+  });
+
+  it("after an idle-sweeper reap: both concurrent requests are served", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "10";
+    usePoolKeyedBySessionId();
+    const sessionId = await openSession();
+    await reapIdleSession(sessionId);
+    expect(isResident(sessionId)).toBe(false);
+    h.db.findByIdDelayMs = 40;
+
+    const responses = await Promise.all([ping(sessionId), ping(sessionId)]);
+
+    expect(responses.map((r) => r.status)).toEqual([200, 200]);
+    for (const response of responses) {
+      expect(await response.text()).toContain('"result":{}');
+    }
+    expect(recoveriesOf(sessionId)).toBe(2);
+  });
+
+  it("a different credential waiting on the same id gets the 404, never the recovered transport", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "10";
+    usePoolKeyedBySessionId();
+    const sessionId = await openSession();
+    await reapIdleSession(sessionId);
+    const intruderKey = `intruder-${rawKey}`;
+    h.otherKeys.set(intruderKey, "9e9e9e9e-0000-4000-8000-000000000001");
+    h.db.findByIdDelayMs = 60;
+
+    const owner = ping(sessionId);
+    await vi.waitFor(() => expect(h.findById).toHaveBeenCalledWith(sessionId));
+    const intruder = ping(sessionId, "ep-1", intruderKey);
+    const [ownerResponse, intruderResponse] = await Promise.all([
+      owner,
+      intruder,
+    ]);
+
+    expect(ownerResponse.status).toBe(200);
+    expect(await ownerResponse.text()).toContain('"result":{}');
+    // Same answer it gets when the session is already resident under its
+    // owner: the reinitialize 404, which says nothing about whose id it is.
+    expect(intruderResponse.status).toBe(404);
+    expect(
+      intruderResponse.headers.get("Mcp-Session-Reinitialize-Required"),
+    ).toBe("true");
+    expect(await intruderResponse.text()).not.toContain('"result"');
+    expect(isResident(sessionId)).toBe(true);
+  });
+
+  it("a waiter whose leader failed runs its own recovery", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "10";
+    usePoolKeyedBySessionId();
+    const sessionId = await openSession();
+    await reapIdleSession(sessionId);
+    const intruderKey = `intruder-${rawKey}`;
+    h.otherKeys.set(intruderKey, "9e9e9e9e-0000-4000-8000-000000000002");
+    h.db.findByIdDelayMs = 60;
+
+    // The wrong credential arrives first and leads; its recovery fails the
+    // principal check. The owner, waiting behind it, must not inherit that.
+    const intruder = ping(sessionId, "ep-1", intruderKey);
+    await vi.waitFor(() => expect(h.findById).toHaveBeenCalledWith(sessionId));
+    const owner = ping(sessionId);
+    const [intruderResponse, ownerResponse] = await Promise.all([
+      intruder,
+      owner,
+    ]);
+
+    expect(intruderResponse.status).toBe(401);
+    expect(ownerResponse.status).toBe(200);
+    expect(await ownerResponse.text()).toContain('"result":{}');
+    expect(
+      h.findById.mock.calls.filter((c) => c[0] === sessionId),
+    ).toHaveLength(2);
+    expect(isResident(sessionId)).toBe(true);
   });
 });
 
