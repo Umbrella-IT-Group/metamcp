@@ -22,11 +22,11 @@ import { SessionIdentity } from "./session-auth";
  * The managers delete a session's binding on removeSession, so the derived
  * count is self-healing: it falls the moment a session ends, through every
  * cleanup path, without this module having to be told. The one maintained
- * term is the short-lived slot reservation an opt-in admission holds before
- * registering its own session (see
- * `admissionReservations`); it is released by the admitting request itself,
- * in a `finally`, never by a cleanup path (or, if the decision faults before
- * it can hand the eviction over, by the decision code on its way out).
+ * term is the short-lived slot reservation an opt-in admission or a lazy
+ * recovery holds before registering its session (see
+ * `admissionReservations`); it is released by that request itself, in a
+ * `finally`, never by a cleanup path (or, if the decision faults before it
+ * can hand the reservation over, by the decision code on its way out).
  */
 export interface IdentitySessionCounter {
   countSessionsForIdentity(identity: SessionIdentity): number;
@@ -38,13 +38,14 @@ export interface IdentitySessionCounter {
    */
   listSessionsForIdentity?(identity: SessionIdentity): SessionListing[];
   /**
-   * Optional: evict one of this counter's sessions so a new session can be
-   * admitted at the ceiling (see `checkConcurrentSessionCeiling`'s
-   * `evictIdle`). Only a counter that has this hook AND a lister can ever have
-   * a session chosen; the SSE manager has neither eviction nor idle tracking,
-   * so its sessions are never candidates.
+   * Optional: evict one of this counter's sessions so a new or lazily
+   * recovered session can be admitted at the ceiling (see
+   * `checkConcurrentSessionCeiling`'s `evictIdle` and
+   * `checkConcurrentSessionCeilingForRecovery`). Only a counter that has this
+   * hook AND a lister can ever have a session chosen; the SSE manager has
+   * neither eviction nor idle tracking, so its sessions are never candidates.
    *
-   * Contract, which the admission path depends on:
+   * Contract, which the admission and recovery paths depend on:
    *  - Before returning, the session is gone from `countSessionsForIdentity`
    *    and `listSessionsForIdentity`. That is what lets the next concurrent
    *    admission see the freed slot as taken (by the reservation) and pick a
@@ -52,7 +53,9 @@ export interface IdentitySessionCounter {
    *  - The returned promise settles when the teardown has finished and never
    *    rejects; a failure is logged by the counter.
    *  - `undefined` means nothing was evicted (the session is no longer
-   *    resident, or is busy after all); the caller then refuses as before.
+   *    resident, or is busy after all); the caller then takes its
+   *    no-eviction path (an admission is refused as before; a lazy recovery
+   *    recovers over the ceiling).
    */
   evictSessionForAdmission?(sessionId: string): Promise<void> | undefined;
 }
@@ -88,16 +91,22 @@ export const DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS = 120;
 // session is not immediately evictable while its client prepares the next call.
 export const MIN_CEILING_EVICT_MIN_IDLE_SECONDS = 10;
 
-// Longest an evicting admission waits for its victim's teardown before going
-// ahead anyway. The wait exists so the victim hands its backend connections
-// back before the new session takes its own; it must not turn a slow or hung
-// backend into a stalled initialize, because the backend pool releases a
-// session's extra connections one after another, each bounded only by its own
-// DELETE timeout. Going ahead is safe: the new session has a fresh id, so it
-// shares nothing with the victim's half-finished teardown, and the teardown
-// carries on in the background. Recovery of the victim's own id still waits
-// for the whole teardown (see `recoverPersistedSession`), since that rebuild
-// reuses the id.
+// Longest a request waits on an eviction teardown. Two waits use it, and
+// they end differently on timeout:
+//
+//  - An evicting admission (or an evicting recovery of ANOTHER id) waits for
+//    its victim so the victim hands its backend connections back before the
+//    new session takes its own; past the bound it goes ahead, which is safe
+//    because its session id differs from the victim's, so it shares nothing
+//    with the half-finished teardown, which carries on in the background.
+//  - A lazy recovery of the victim's OWN id (see `recoverPersistedSession`)
+//    must not overlap that teardown at all, since both pools are keyed by
+//    session id. Past the bound it gives up and answers the reinitialize
+//    404, and the client opens a fresh session (Alex's ruling, 2026-10-06).
+//
+// Either way a slow or hung backend must not stall the request: the backend
+// pool releases a session's extra connections one after another, each bounded
+// only by its own DELETE timeout.
 export const EVICTION_ADMISSION_WAIT_MS = 5_000;
 let evictionAdmissionWaitMs = EVICTION_ADMISSION_WAIT_MS;
 
@@ -105,16 +114,18 @@ const counters: IdentitySessionCounter[] = [];
 const activityProbes: SessionActivityProbe[] = [];
 
 /**
- * Slots held by enabled opt-in admissions that have not yet registered
- * their own sessions. Keyed per credential identity (method + id, the same pair
- * `identityMatches` compares) and summed into `countLiveSessionsForIdentity`.
+ * Slots held by enabled opt-in admissions and lazy recoveries that have not
+ * yet registered their sessions. Keyed per credential identity (method + id,
+ * the same pair `identityMatches` compares) and summed into
+ * `countLiveSessionsForIdentity`.
  *
- * WHY. The new session is added to its manager only after an await (the pool
+ * WHY. The session is added to its manager only after an await (the pool
  * hands out a server instance first). Without a reservation, concurrent
- * initializes can all claim the same free slot, including one just freed by
- * eviction. Each enabled admission reserves synchronously, so the next one
- * sees the correct capacity. The router releases on registration, failure or
- * disconnection and refuses to register a late result after cancellation.
+ * initializes and recoveries can all claim the same free slot, including one
+ * just freed by eviction. Each enabled admission or recovery reserves
+ * synchronously, so the next one sees the correct capacity. The router
+ * releases on registration, failure or disconnection and refuses to register
+ * a late admission result after cancellation.
  */
 const admissionReservations = new Map<string, number>();
 
@@ -174,9 +185,11 @@ export function resetSessionCountersForTests(): void {
 }
 
 /**
- * TEST-ONLY: shorten the admission's bounded wait on a victim's teardown, so a
- * route test over real sockets (real timers) can exercise the timeout without
- * sleeping for the production bound. `undefined` restores the default.
+ * TEST-ONLY: shorten the bounded wait on an eviction teardown (both the
+ * admission's and the victim's own recovery's, see
+ * `EVICTION_ADMISSION_WAIT_MS`), so a route test over real sockets (real
+ * timers) can exercise the timeout without sleeping for the production bound.
+ * `undefined` restores the default.
  */
 export function setEvictionAdmissionWaitMsForTests(
   ms: number | undefined,
@@ -426,21 +439,24 @@ export interface CeilingDecision {
   // descriptive, so the four fields above are identical with or without it.
   liveSummary?: string;
   // Present only when the credential was at its ceiling and an idle session
-  // was evicted to admit this one (`allowed` is then true). The caller owns
-  // `release()`: see `CeilingEviction`.
+  // was evicted to admit this one, new or lazily recovered (`allowed` is then
+  // true). The caller owns `release()`: see `CeilingEviction`.
   eviction?: CeilingEviction;
-  /** Every opt-in admission reserves a slot, including below the ceiling.
-   * Release synchronously when registered and in a finally on other exits. */
+  /** Every opt-in admission and every enabled lazy recovery reserves a slot,
+   * including below the ceiling. Release synchronously when registered and
+   * in a finally on other exits. */
   releaseAdmission?: () => void;
 }
 
 /**
- * An idle session evicted so a new one could be admitted at the ceiling.
+ * An idle session evicted so another could be admitted at the ceiling: a new
+ * one, or a lazily recovered one.
  *
- * The CALLER of `checkConcurrentSessionCeiling({ evictIdle: true })` must call
- * `release()` once its new session is registered with a manager, and again in
- * a `finally` on every other exit (it is idempotent). Until then the slot the
- * victim left is reserved for this admission, so a concurrent admission keeps
+ * The CALLER of `checkConcurrentSessionCeiling({ evictIdle: true })` or of
+ * `checkConcurrentSessionCeilingForRecovery` must call `release()` once its
+ * session is registered with a manager, and again in a `finally` on every
+ * other exit (it is idempotent). Until then the slot the victim left is
+ * reserved for this caller, so a concurrent admission or recovery keeps
  * seeing the credential at its ceiling and evicts its own victim instead of
  * slipping in over the limit.
  */
@@ -450,8 +466,8 @@ export interface CeilingEviction {
   /** How long the evicted session had been idle, whole seconds. */
   idleSeconds: number;
   /**
-   * What the admitting request awaits before taking its own pool state:
-   * settles when the victim's teardown has finished, or after
+   * What the admitting (or recovering) request awaits before taking its own
+   * pool state: settles when the victim's teardown has finished, or after
    * `EVICTION_ADMISSION_WAIT_MS` (with a WARN) if it has not, whichever comes
    * first. Never rejects. A timed-out teardown keeps running.
    */
@@ -633,17 +649,43 @@ function liveSummaryFor(identity: SessionIdentity): string {
 }
 
 /**
- * Evict one idle session of `identity` so a new one can be admitted, or return
- * undefined and leave everything as it was. Only reached when the credential
- * is at its ceiling and the caller opted in.
+ * Whose admission an eviction makes room for. Only the wording of the
+ * eviction's own WARN lines differs; the selection, the reserved slot, the
+ * bounded wait and the INFO line are the same for both.
+ */
+type EvictionPurpose = "admission" | "recovery";
+
+const EVICTION_WORDING: Record<
+  EvictionPurpose,
+  { admitted: string; fallback: string }
+> = {
+  admission: {
+    admitted: "the new session",
+    fallback: "refusing the new session as before",
+  },
+  recovery: {
+    admitted: "the recovered session",
+    fallback: "recovering the session without evicting",
+  },
+};
+
+/**
+ * Evict one idle session of `identity` so a session can be admitted (a new
+ * one, or a lazily recovered one), or return undefined and leave everything
+ * as it was. Only reached when the credential is at its ceiling and the
+ * caller opted in.
  *
- * Never throws: a fault anywhere here must end in today's refusal, not in a
- * failed request, so it is caught, reported (without the fault object, which
- * can carry a session id) and turned into "nothing evicted".
+ * Never throws: a fault anywhere here must end in the caller's no-eviction
+ * outcome (a refusal for an admission, an over-ceiling recovery for a
+ * recovery), not in a failed request, so it is caught, reported (without the
+ * fault object, which can carry a session id) and turned into "nothing
+ * evicted".
  */
 function evictForAdmission(
   identity: SessionIdentity,
+  purpose: EvictionPurpose,
 ): CeilingEviction | undefined {
+  const wording = EVICTION_WORDING[purpose];
   let release: (() => void) | undefined;
   try {
     const config = resolveEvictionConfig();
@@ -676,14 +718,14 @@ function evictForAdmission(
       () => undefined,
       () => {
         logger.warn(
-          "Session ceiling eviction: the evicted session's teardown rejected; admitting the new session anyway.",
+          `Session ceiling eviction: the evicted session's teardown rejected; admitting ${wording.admitted} anyway.`,
         );
       },
     );
     return {
       endpointName,
       idleSeconds,
-      teardownWait: boundedTeardownWait(settled, endpointName),
+      teardownWait: boundedTeardownWait(settled, endpointName, purpose),
       release,
     };
   } catch {
@@ -691,37 +733,122 @@ function evictForAdmission(
     // after a reservation, give the slot back rather than hold it until a
     // restart.
     release?.();
-    logger.warn(
-      "Session ceiling eviction faulted; refusing the new session as before.",
-    );
+    logger.warn(`Session ceiling eviction faulted; ${wording.fallback}.`);
     return undefined;
   }
 }
 
 /**
- * Settle when `teardown` does or after `evictionAdmissionWaitMs`, whichever is
- * first; see `EVICTION_ADMISSION_WAIT_MS` for why the admission's wait is
- * bounded. The timer is cleared as soon as the teardown wins, and unref'd so
+ * Wait for an eviction teardown for at most `EVICTION_ADMISSION_WAIT_MS`.
+ * Resolves `true` when the teardown settles first, and `false` when the bound
+ * passes first, calling `onTimeout` (with the bound in milliseconds) at that
+ * moment. Never rejects: a teardown that rejects counts as finished, since it
+ * is over either way, and a throwing `onTimeout` cannot stop the wait from
+ * settling. The timer is cleared as soon as the teardown wins, and unref'd so
  * it never holds the process open.
+ *
+ * Shared by the evicting admission's wait (`CeilingEviction.teardownWait`) and
+ * the recovery gate in `recoverPersistedSession`, so both are held to the same
+ * bound; see `EVICTION_ADMISSION_WAIT_MS` for what each does on timeout.
+ */
+export function waitForEvictionTeardown(
+  teardown: Promise<unknown>,
+  onTimeout: (waitMs: number) => void,
+): Promise<boolean> {
+  const waitMs = evictionAdmissionWaitMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => {
+      try {
+        onTimeout(waitMs);
+      } catch {
+        // A failing log sink must not leave the waiting request hanging.
+      }
+      resolve(false);
+    }, waitMs);
+    timer.unref?.();
+  });
+  const finished = teardown.then(
+    () => true,
+    () => true,
+  );
+  return Promise.race([finished, timedOut]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * The evicting request's wait on its victim's teardown: settles when the
+ * teardown does or after the bound (with a WARN), whichever is first. The
+ * victim's id differs from the waiting request's, so going ahead after the
+ * bound is safe; see `EVICTION_ADMISSION_WAIT_MS`.
  */
 function boundedTeardownWait(
   teardown: Promise<void>,
   endpointName: string,
+  purpose: EvictionPurpose,
 ): Promise<void> {
-  const waitMs = evictionAdmissionWaitMs;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<void>((resolve) => {
-    timer = setTimeout(() => {
-      logger.warn(
-        `Session ceiling eviction: the evicted session's teardown on ${endpointName} ` +
-          `has not finished after ${waitMs} ms; admitting the new session without ` +
-          `waiting for it. The teardown continues in the background.`,
-      );
-      resolve();
-    }, waitMs);
-    timer.unref?.();
-  });
-  return Promise.race([teardown, timedOut]).finally(() => clearTimeout(timer));
+  const { admitted } = EVICTION_WORDING[purpose];
+  return waitForEvictionTeardown(teardown, (waitMs) => {
+    logger.warn(
+      `Session ceiling eviction: the evicted session's teardown on ${endpointName} ` +
+        `has not finished after ${waitMs} ms; admitting ${admitted} without ` +
+        `waiting for it. The teardown continues in the background.`,
+    );
+  }).then(() => undefined);
+}
+
+/** What a decision at the ceiling knows before it tries to evict. */
+interface AtCeilingFacts {
+  current: number;
+  ceiling: number;
+  approaching: boolean;
+  /** ` "<label>"` or "", see `checkConcurrentSessionCeiling`'s `label`. */
+  labelSuffix: string;
+  liveSummary: string;
+}
+
+/**
+ * At the ceiling: evict one idle session (see `evictForAdmission`) and return
+ * the ALLOWING decision that carries the eviction, after logging the eviction
+ * INFO line; or undefined, with nothing changed, when nothing was evicted.
+ *
+ * Shared by admissions and lazy recoveries so both log the SAME line. The
+ * Grafana ceiling rule (`warn-metamcp-credential-session-ceiling`) matches
+ * its `Concurrent-session ceiling: evicted idle session on` prefix, so the
+ * alert keeps seeing a credential held at its ceiling by evictions.
+ */
+function decideByEviction(
+  identity: SessionIdentity,
+  purpose: EvictionPurpose,
+  facts: AtCeilingFacts,
+): CeilingDecision | undefined {
+  const eviction = evictForAdmission(identity, purpose);
+  if (!eviction) return undefined;
+  const { current, ceiling, approaching, labelSuffix, liveSummary } = facts;
+  // The summary was taken before the eviction, so it still describes what
+  // filled the credential at the moment it hit the ceiling.
+  try {
+    logger.info(
+      `Concurrent-session ceiling: evicted idle session on ${eviction.endpointName} ` +
+        `(idle ${eviction.idleSeconds}s) for ${identity.method} credential${labelSuffix} ` +
+        `to admit a new session (${current}/${ceiling})` +
+        (liveSummary ? ` ${liveSummary}` : ""),
+    );
+  } catch (error) {
+    // The caller only learns of the eviction from the return value, so if
+    // this throws it can never release the slot reserved for it. Release
+    // it here and let the failure surface to the caller.
+    eviction.release();
+    throw error;
+  }
+  return {
+    allowed: true,
+    current,
+    ceiling,
+    approaching,
+    ...(liveSummary && { liveSummary }),
+    eviction,
+    releaseAdmission: eviction.release,
+  };
 }
 
 /**
@@ -743,7 +870,9 @@ function boundedTeardownWait(
  * refused for most of that TTL even though most of what it held was idle.
  * Evicting preserves the session's `mcp_sessions` row (the counter's teardown
  * is the sweeper's row-preserving variant), so a client that does come back
- * with the id lazily recovers it, exactly as after a sweep.
+ * with the id lazily recovers it, exactly as after a sweep. That recovery has
+ * its own decision, `checkConcurrentSessionCeilingForRecovery`, which never
+ * refuses.
  *
  * Anonymous callers are exempt: an ALLOW_UNAUTHENTICATED_ENDPOINTS endpoint has
  * no per-caller identity (every caller shares one), so a ceiling there would be
@@ -791,35 +920,17 @@ export function checkConcurrentSessionCeiling(
   const summarySuffix = liveSummary ? ` ${liveSummary}` : "";
 
   if (!allowed) {
-    const eviction = options?.evictIdle
-      ? evictForAdmission(identity)
+    const evicted = options?.evictIdle
+      ? decideByEviction(identity, "admission", {
+          current,
+          ceiling,
+          approaching,
+          labelSuffix,
+          liveSummary,
+        })
       : undefined;
-    if (eviction) {
-      // The summary was taken before the eviction, so it still describes what
-      // filled the credential at the moment it hit the ceiling.
-      try {
-        logger.info(
-          `Concurrent-session ceiling: evicted idle session on ${eviction.endpointName} ` +
-            `(idle ${eviction.idleSeconds}s) for ${identity.method} credential${labelSuffix} ` +
-            `to admit a new session (${current}/${ceiling})` +
-            summarySuffix,
-        );
-      } catch (error) {
-        // The caller only learns of the eviction from the return value, so if
-        // this throws it can never release the slot reserved for it. Release
-        // it here and let the failure surface as before.
-        eviction.release();
-        throw error;
-      }
-      return {
-        allowed: true,
-        current,
-        ceiling,
-        approaching,
-        ...(liveSummary && { liveSummary }),
-        eviction,
-        releaseAdmission: eviction.release,
-      };
+    if (evicted) {
+      return evicted;
     }
     logger.warn(
       `Concurrent-session ceiling reached for ${identity.method} credential${labelSuffix}: ` +
@@ -852,4 +963,112 @@ export function checkConcurrentSessionCeiling(
     ...(liveSummary && { liveSummary }),
     ...(releaseAdmission && { releaseAdmission }),
   };
+}
+
+/**
+ * The ceiling's part in a LAZY RECOVERY: `recoverPersistedSession` rebuilding
+ * a session that is not resident (evicted, reaped by the idle sweeper, or lost
+ * to a restart) from its `mcp_sessions` row, under the same id. Alex's ruling
+ * of 2026-10-06, "evict, never refuse":
+ *
+ *  - Kill switch off (`MCP_SESSION_CEILING_EVICT_IDLE`), a ceiling of 0, or
+ *    an anonymous identity: `undefined`, and nothing is counted, reserved or
+ *    logged, so recovery behaves exactly as it did before eviction existed.
+ *  - Below the ceiling: reserve the slot, so a concurrent initialize or
+ *    recovery sees it as taken, and evict nothing. No log line, not even the
+ *    80% WARN: a reconnect opens no new session, and the credential's
+ *    admissions already report it approaching the ceiling.
+ *  - At the ceiling, with an idle session to evict: evict it exactly as an
+ *    admission would (same selection, reserved slot, bounded teardown wait,
+ *    and the same INFO line, so the ceiling alert keeps seeing the credential
+ *    at its ceiling).
+ *  - At the ceiling, with nothing evictable: recover anyway, over the ceiling,
+ *    with the slot reserved and ONE INFO line that deliberately matches none
+ *    of the ceiling alert's patterns, because nothing was refused.
+ *
+ * WHY A RECOVERY MAY EXCEED THE CEILING. The ceiling bounds how many sessions
+ * a credential may OPEN; a recovering client opened this one already and lost
+ * it only from the gateway's memory. Refusing it would turn the gateway's own
+ * housekeeping into a client-visible failure on a request that is mid-session,
+ * where a 429 is not something MCP clients recover from.
+ *
+ * The caller must call `releaseAdmission` once the recovered session is
+ * registered, and again in a `finally` on every other exit (idempotent).
+ * Never throws: a fault is reported without the fault object, anything already
+ * reserved is given back, and the answer is `undefined` (recover with no
+ * ceiling interaction), so the ceiling can never fail a recovery.
+ */
+export function checkConcurrentSessionCeilingForRecovery(
+  identity: SessionIdentity,
+  options?: { label?: string },
+): CeilingDecision | undefined {
+  let release: (() => void) | undefined;
+  try {
+    // The kill switch is read FIRST, so with it off not even the ceiling
+    // variable is parsed.
+    if (!resolveEvictionEnabled()) {
+      return undefined;
+    }
+    const ceiling = resolveSessionCeiling();
+    if (
+      ceiling === 0 ||
+      identity.method === "anonymous" ||
+      identity.credentialId === null
+    ) {
+      return undefined;
+    }
+
+    const current = countLiveSessionsForIdentity(identity);
+    const approaching = current >= Math.floor(ceiling * 0.8);
+    if (current < ceiling) {
+      release = reserveAdmissionSlot(identity);
+      return {
+        allowed: true,
+        current,
+        ceiling,
+        approaching,
+        releaseAdmission: release,
+      };
+    }
+
+    const labelSuffix = options?.label ? ` "${options.label}"` : "";
+    const liveSummary = liveSummaryFor(identity);
+    const evicted = decideByEviction(identity, "recovery", {
+      current,
+      ceiling,
+      approaching,
+      labelSuffix,
+      liveSummary,
+    });
+    if (evicted) {
+      return evicted;
+    }
+
+    release = reserveAdmissionSlot(identity);
+    // Must NOT match the Grafana ceiling rule's patterns (`Concurrent-session
+    // (ceiling reached|usage high) for` and `Concurrent-session ceiling:
+    // evicted idle session on`): nothing was refused or evicted. Counts, the
+    // display label and endpoint names only, like every ceiling line.
+    logger.info(
+      `Session recovery over the concurrent-session ceiling for ${identity.method} credential${labelSuffix}: ` +
+        `${current}/${ceiling} live sessions and none idle long enough to evict; ` +
+        `recovering it anyway, since a reconnect is never refused.` +
+        (liveSummary ? ` ${liveSummary}` : ""),
+    );
+    return {
+      allowed: true,
+      current,
+      ceiling,
+      approaching,
+      ...(liveSummary && { liveSummary }),
+      releaseAdmission: release,
+    };
+  } catch {
+    // An eviction whose INFO line threw has already released its own slot.
+    release?.();
+    logger.warn(
+      "Session ceiling check for a lazy recovery faulted; recovering without it.",
+    );
+    return undefined;
+  }
 }

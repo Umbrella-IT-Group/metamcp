@@ -3,7 +3,10 @@ import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 
-import { mcpSessionsRepository } from "@/db/repositories/mcp-sessions.repo";
+import {
+  mcpSessionsRepository,
+  type PersistedMcpSession,
+} from "@/db/repositories/mcp-sessions.repo";
 import {
   ApiKeyAuthenticatedRequest,
   authenticateApiKey,
@@ -23,8 +26,10 @@ import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resol
 import {
   type CeilingEviction,
   checkConcurrentSessionCeiling,
+  checkConcurrentSessionCeilingForRecovery,
   registerSessionActivityProbe,
   registerSessionCounter,
+  waitForEvictionTeardown,
 } from "../../lib/metamcp/credential-session-quota";
 import {
   GATEWAY_BOOT_ID,
@@ -293,9 +298,10 @@ registerSessionCounter({
 
 /**
  * Teardowns of sessions evicted at the ceiling that have not finished yet,
- * keyed by session id. `recoverPersistedSession` waits on an entry here before
- * rebuilding a transport under the same id; see `evictIdleSessionForAdmission`
- * for why. An entry removes itself when its teardown settles.
+ * keyed by session id. `recoverPersistedSession` waits on an entry here (for
+ * at most `EVICTION_ADMISSION_WAIT_MS`) before rebuilding a transport under
+ * the same id; see `evictIdleSessionForAdmission` for why. An entry removes
+ * itself when its teardown settles.
  */
 const evictionTeardowns = new Map<string, Promise<void>>();
 
@@ -303,10 +309,12 @@ const evictionTeardowns = new Map<string, Promise<void>>();
 let ceilingEvictionsTotal = 0;
 
 /**
- * Evict one idle session so a new one can be admitted at the per-credential
- * ceiling. Called only through the counter hook above, by
- * `checkConcurrentSessionCeiling`, which has already chosen this session as
- * the credential's longest-idle one with nothing in flight.
+ * Evict one idle session so a new or lazily recovered one can be admitted at
+ * the per-credential ceiling. Called only through the counter hook above, by
+ * the quota module's admission or recovery decision
+ * (`checkConcurrentSessionCeiling`, `checkConcurrentSessionCeilingForRecovery`),
+ * which has already chosen this session as the credential's longest-idle one
+ * with nothing in flight.
  *
  * Two phases, and the split is the point:
  *
@@ -321,13 +329,15 @@ let ceilingEvictionsTotal = 0;
  *
  * The window between the phases is guarded. A request that arrives for the
  * id once phase 1 has run finds no resident session and goes to lazy
- * recovery, which waits for this teardown before rebuilding (see the
- * `evictionTeardowns` check in `recoverPersistedSession`). Without that wait
- * the rebuild could pick up the victim's still-registered pool instance, or
- * have the teardown's later steps remove and release the session it just
- * rebuilt, since both the server pool and the backend pool are keyed by
- * session id. `cleanupSessionInternal` also refuses to tear down a transport
- * that replaced the victim under the same id, as a second line.
+ * recovery, which waits for this teardown before rebuilding, for at most
+ * `EVICTION_ADMISSION_WAIT_MS`, and past that answers the reinitialize 404
+ * instead of rebuilding (see the `evictionTeardowns` check in
+ * `recoverPersistedSession`). Without that wait the rebuild could pick up the
+ * victim's still-registered pool instance, or have the teardown's later steps
+ * remove and release the session it just rebuilt, since both the server pool
+ * and the backend pool are keyed by session id. `cleanupSessionInternal` also
+ * refuses to tear down a transport that replaced the victim under the same
+ * id, as a second line.
  *
  * Returns undefined, evicting nothing, when the session is no longer resident
  * or has a request in flight (re-checked here so this hook can never tear
@@ -545,6 +555,15 @@ assertRecoveryHydrationContract();
  * The recovered transport is added to `sessionManager` so subsequent
  * requests in the same metamcp lifetime skip the DB hop entirely.
  *
+ * PER-CREDENTIAL CEILING: "evict, never refuse" (Alex's ruling, 2026-10-06).
+ * A recovery that passes every check on the row takes part in the ceiling
+ * through `checkConcurrentSessionCeilingForRecovery`: at the ceiling it
+ * first evicts an idle session of the same credential, exactly as an
+ * admission would, and when nothing qualifies it recovers anyway, over the
+ * ceiling. It is never refused or failed because of the ceiling. Below the
+ * ceiling it evicts nothing, and with `MCP_SESSION_CEILING_EVICT_IDLE` off it
+ * has no ceiling interaction at all.
+ *
  * SINGLE-FLIGHT PER SESSION ID. Two requests on the same non-resident id
  * (a client with no standalone GET stream firing calls in parallel after an
  * eviction, a sweep reap or a restart) used to run two recoveries at once.
@@ -570,18 +589,32 @@ export async function recoverPersistedSession(
   // that overlapped it could be handed the victim's half-released server
   // instance, or have the teardown's remaining steps release the transport
   // this call is about to register. Afterwards it is an ordinary recovery
-  // from the row the eviction kept. The promise never rejects.
+  // from the row the eviction kept.
   //
-  // Deliberately NOT time-bounded, unlike the admission side's wait (see
-  // `CeilingEviction.teardownWait`): this rebuild reuses the victim's id, so
-  // overlapping its teardown is exactly the crossing this wait prevents. A
-  // slow backend stalls only this one returning client.
+  // Bounded by `EVICTION_ADMISSION_WAIT_MS` (Alex's ruling, 2026-10-06), the
+  // same bound as the admission side's wait, but the timeout ends the other
+  // way: this rebuild reuses the victim's id, so going ahead would be exactly
+  // the crossing this wait prevents. Past the bound the request gets the
+  // reinitialize 404 and the client opens a fresh session, so a slow or hung
+  // backend teardown cannot stall a returning client. The WARN carries no
+  // session id.
   const pendingEviction = evictionTeardowns.get(sessionId);
   if (pendingEviction) {
     logger.info(
       "Lazy recovery is waiting for a ceiling eviction teardown to finish.",
     );
-    await pendingEviction;
+    const finished = await waitForEvictionTeardown(
+      pendingEviction,
+      (waitMs) => {
+        logger.warn(
+          `Lazy recovery: a ceiling eviction teardown has not finished after ${waitMs} ms; ` +
+            "answering 404 so the client re-initializes. The teardown continues in the background.",
+        );
+      },
+    );
+    if (!finished) {
+      return { status: "not_found" };
+    }
   }
 
   // Bounded: each pass either leads or waits for a leader that started
@@ -751,6 +784,63 @@ async function recoverPersistedSessionOnce(
     return { status: "auth_failed" };
   }
 
+  // Resolved before the ceiling decision so its lines can name the
+  // credential, and reused to re-stamp the rebuilt instance.
+  const recoveredIdentity = await resolveClientIdentity(authReq);
+
+  // Per-credential ceiling, "evict, never refuse" (see the doc comment on
+  // `recoverPersistedSession`). Taken only after the row has passed every
+  // check above, so only the credential that owns this session can make its
+  // recovery evict anything. `undefined` (kill switch off, ceiling 0) means no
+  // ceiling interaction at all. The decision reserves this session's slot,
+  // which registration replaces and the `finally` gives back on every other
+  // exit.
+  const identity = resolveSessionIdentity(authReq);
+  const ceiling = checkConcurrentSessionCeilingForRecovery(identity, {
+    label: recoveredIdentity?.name,
+  });
+  try {
+    if (ceiling?.eviction) {
+      // Only evictions are recorded: the History view counts them whichever
+      // request caused them, while a recovery that evicted nothing records
+      // nothing, as recovery never has.
+      recordSessionCeilingEvent({
+        identity,
+        endpointName: authReq.endpointName,
+        label: recoveredIdentity?.name,
+        decision: ceiling,
+      });
+      // The victim releases its pool state first, for at most
+      // EVICTION_ADMISSION_WAIT_MS. Its id is not this session's, so going
+      // ahead after the bound shares nothing with its teardown. Never rejects.
+      await ceiling.eviction.teardownWait;
+    }
+    return await rebuildRecoveredTransport(
+      sessionId,
+      stored,
+      authReq,
+      recoveredIdentity?.name,
+      ceiling?.releaseAdmission,
+    );
+  } finally {
+    ceiling?.releaseAdmission?.();
+  }
+}
+
+/**
+ * Rebuild the transport for a row that passed every recovery check, register
+ * it under the stored session id, and call `onRegistered` in the same
+ * synchronous step as the registration (it hands back the ceiling's
+ * reservation, which the registered session now replaces in the count). Only
+ * `recoverPersistedSessionOnce` calls this.
+ */
+async function rebuildRecoveredTransport(
+  sessionId: string,
+  stored: PersistedMcpSession,
+  authReq: ApiKeyAuthenticatedRequest,
+  clientName: string | undefined,
+  onRegistered: (() => void) | undefined,
+): Promise<SessionRecoveryResult> {
   // Auth + scope match. Rebuild the transport with the stored sessionId
   // so the consumer's cached id stays valid across the rebuild.
   const mcpServerInstance = await metaMcpServerPool.getServer(
@@ -766,12 +856,7 @@ async function recoverPersistedSessionOnce(
   // Re-stamp the consumer identity onto the rebuilt instance's context so
   // post-restart tool calls stay attributed (the registry/in-memory state is
   // gone after a restart; authReq is the re-validated current caller).
-  const recoveredIdentity = await resolveClientIdentity(authReq);
-  stampCallerContext(
-    mcpServerInstance.handlerContext,
-    authReq,
-    recoveredIdentity?.name,
-  );
+  stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
     onsessioninitialized: async (sid) => {
@@ -808,6 +893,8 @@ async function recoverPersistedSessionOnce(
   // Recording the recovering caller's identity is not a rebind: recovery is
   // only reached with the credential whose hash the row already stores.
   sessionManager.addSession(sessionId, transport, requestBinding(authReq));
+  // Registration replaces the ceiling's reservation synchronously.
+  onRegistered?.();
   // Resume idle-TTL tracking for the recovered session. Required whether
   // this recovery followed a sweep reap (the reap's forget() dropped
   // tracking; without this the recovered session would never be

@@ -310,6 +310,22 @@ const refusalLines = () =>
   warnLines().filter((line) =>
     line.startsWith("Concurrent-session ceiling reached"),
   );
+const recoveryOverCeilingLines = () =>
+  infoLines().filter((line) =>
+    line.startsWith("Session recovery over the concurrent-session ceiling"),
+  );
+/** Every log line, any level, that mentions the ceiling at all. */
+const ceilingLines = () =>
+  [...infoLines(), ...warnLines()].filter((line) =>
+    /concurrent-session|session ceiling/i.test(line),
+  );
+
+/**
+ * The Grafana rule `warn-metamcp-credential-session-ceiling`
+ * (Grafana-Logs alerting/metamcp-rules.yml) filters with this expression.
+ */
+const GRAFANA_CEILING_RULE =
+  /Concurrent-session (ceiling reached|usage high) for|Concurrent-session ceiling: evicted idle session on/;
 
 const refusalBody = (current: number, ceiling: number) => ({
   error: `Too many concurrent sessions for this credential (${current}/${ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
@@ -989,9 +1005,13 @@ describe("the evicted client comes back — lazy recovery under the same id", ()
     expect(h.findById).toHaveBeenCalledWith(evicted);
     expect(isResident(evicted)).toBe(true);
     expect(transportOf(evicted)).not.toBe(victimTransport);
-    // Recovery has no ceiling check (unchanged): the returning client is
-    // served even though the credential is at its ceiling again.
+    // "Evict, never refuse" (2026-10-06): the credential is at its ceiling
+    // again and the newcomer is under the idle floor, so there is nothing to
+    // evict; the returning client is served anyway, over the ceiling, and
+    // never refused. The block on recovery at the ceiling pins the rest.
     expect(countLiveSessionsForIdentity(identity())).toBe(2);
+    expect(recoveryOverCeilingLines()).toHaveLength(1);
+    expect(refusalLines()).toEqual([]);
   });
 
   it("its next GET (the standalone stream) is served under the same session id", async () => {
@@ -1116,7 +1136,7 @@ describe("a request that lands on the victim mid-teardown", () => {
 });
 
 describe("an evicting admission does not stall on a hung victim teardown", () => {
-  it("admits after the bounded wait while the teardown carries on; the victim's own recovery still waits for all of it", async () => {
+  it("admits after the bounded wait while the teardown carries on; the victim's own recovery gives up at the same bound with the reinitialize 404, and recovers once the teardown is done", async () => {
     process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
     setEvictionAdmissionWaitMsForTests(100);
     const victim = await openSession();
@@ -1160,26 +1180,39 @@ describe("an evicting admission does not stall on a hung victim teardown", () =>
     ).toBe(tearingDownBefore + 1);
     expect(countLiveSessionsForIdentity(identity())).toBe(1);
 
-    // The victim's id is rebuilt only once the whole teardown is done: that
-    // wait is the one that keeps two transports off one id, and it is not
-    // bounded.
-    const returning = ping(victim);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Ruling (2), 2026-10-06: the victim's own recovery waits for the
+    // teardown only up to the same bound, then answers the reinitialize 404
+    // rather than rebuild its id over a teardown still in progress.
+    const returning = await ping(victim);
+    expect(returning.status).toBe(404);
+    expect(returning.headers.get("Mcp-Session-Reinitialize-Required")).toBe(
+      "true",
+    );
+    await returning.text();
     expect(h.findById).not.toHaveBeenCalledWith(victim);
+    expect(warnLines()).toContain(
+      "Lazy recovery: a ceiling eviction teardown has not finished after 100 ms; answering 404 so the client re-initializes. The teardown continues in the background.",
+    );
+    expect(isResident(victim)).toBe(false);
+
+    // Once the teardown is done, the same id recovers from its kept row.
     finishTeardown();
-    const returningResponse = await returning;
-    expect(returningResponse.status).toBe(200);
-    expect(await returningResponse.text()).toContain('"result":{}');
+    await vi.waitFor(() =>
+      expect(
+        (
+          buildSessionsHealthPayload(true).ceilingEvictions as {
+            tearingDown: number;
+          }
+        ).tearingDown,
+      ).toBe(tearingDownBefore),
+    );
+    const later = await ping(victim);
+    expect(later.status).toBe(200);
+    expect(later.headers.get("mcp-session-id")).toBe(victim);
+    expect(await later.text()).toContain('"result":{}');
     expect(h.trace.indexOf(`findById:${victim}`)).toBeGreaterThan(
       h.trace.indexOf("victim-teardown-finished"),
     );
-    expect(
-      (
-        buildSessionsHealthPayload(true).ceilingEvictions as {
-          tearingDown: number;
-        }
-      ).tearingDown,
-    ).toBe(tearingDownBefore);
   });
 });
 
@@ -1343,5 +1376,511 @@ describe("cleanup never tears down a newer transport registered under the same i
     const response = await ping(sessionId);
     expect(response.status).toBe(200);
     expect(await response.text()).toContain('"result":{}');
+  });
+});
+
+describe("lazy recovery at the ceiling: evict, never refuse (Alex's rulings, 2026-10-06)", () => {
+  /**
+   * A session the gateway no longer holds in memory while its row survives:
+   * what a returning client finds after an idle-sweeper reap, an eviction or a
+   * restart. Reaped rather than evicted so the eviction under test is the
+   * RECOVERY's own.
+   */
+  async function openThenReap(endpoint = "ep-1"): Promise<string> {
+    const sessionId = await openSession(endpoint);
+    await reapIdleSession(sessionId);
+    expect(isResident(sessionId, endpoint)).toBe(false);
+    expect(h.rows.has(sessionId)).toBe(true);
+    return sessionId;
+  }
+
+  /** Forget the setup's calls, keeping every mock's behaviour. */
+  function startObserving(): void {
+    h.cleanupSession.mockClear();
+    h.getServer.mockClear();
+    h.findById.mockClear();
+    h.deleteRow.mockClear();
+    h.record.mockClear();
+    h.logger.info.mockClear();
+    h.logger.warn.mockClear();
+    h.logger.error.mockClear();
+    h.trace.length = 0;
+  }
+
+  /** Record the credential's count each time the pool is asked for a server. */
+  function sampleCountOnPoolAcquire(): number[] {
+    const observed: number[] = [];
+    h.getServer.mockImplementation(async (sessionId: string) => {
+      h.trace.push(`getServer:${sessionId}`);
+      observed.push(countLiveSessionsForIdentity(identity()));
+      return makeServerInstance();
+    });
+    return observed;
+  }
+
+  const ceilingEvents = () =>
+    h.record.mock.calls
+      .map((call) => String(call[0].message))
+      .filter(
+        (message) =>
+          message.startsWith("session refused") ||
+          message.startsWith("idle session evicted") ||
+          message.startsWith("concurrent sessions at"),
+      );
+
+  const evictionsTotal = () =>
+    (buildSessionsHealthPayload(true).ceilingEvictions as { total: number })
+      .total;
+
+  it("at the ceiling with an idle session: evicts exactly one victim, recovers under the same id, and the count never exceeds the ceiling", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    const returning = await openThenReap();
+    const oldest = await openSession();
+    advanceSeconds(10);
+    const other = await openSession("ep-2");
+    advanceSeconds(300);
+    const evictionsBefore = evictionsTotal();
+    startObserving();
+    const observed = sampleCountOnPoolAcquire();
+
+    const response = await ping(returning);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("mcp-session-id")).toBe(returning);
+    expect(await response.text()).toContain('"result":{}');
+    observed.push(countLiveSessionsForIdentity(identity()));
+    // While the recovery acquired its pool instance (victim gone, slot
+    // reserved) and after it registered: at the ceiling, never above it.
+    expect(observed).toEqual([2, 2]);
+    expect(h.cleanupSession.mock.calls).toEqual([[oldest]]);
+    expect(isResident(oldest)).toBe(false);
+    expect(isResident(other, "ep-2")).toBe(true);
+    expect(isResident(returning)).toBe(true);
+    // The victim's row is kept for its own recovery.
+    expect(h.rows.has(oldest)).toBe(true);
+    expect(h.deleteRow).not.toHaveBeenCalled();
+    // The existing eviction INFO line, which the ceiling alert matches.
+    expect(evictionLines()).toEqual([
+      'Concurrent-session ceiling: evicted idle session on ep-1 (idle 310s) for api_key credential "test-consumer" to admit a new session (2/2) live: ep-1=1, ep-2=1; in-flight 0, idle 2, oldest idle 310s',
+    ]);
+    expect(evictionLines()[0]).toMatch(GRAFANA_CEILING_RULE);
+    expect(recoveryOverCeilingLines()).toEqual([]);
+    expect(refusalLines()).toEqual([]);
+    expect(ceilingEvents()).toEqual([
+      "idle session evicted to admit a new session at the concurrent-session ceiling (2/2): ep-1, idle 310s; live: ep-1=1, ep-2=1; in-flight 0, idle 2, oldest idle 310s",
+    ]);
+    expect(evictionsTotal()).toBe(evictionsBefore + 1);
+  });
+
+  it("at the ceiling with nothing evictable: still recovers (200, same id), over the ceiling, with one INFO line the alert does not match and never the refusal WARN", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const returning = await openThenReap();
+    const live = await openSession();
+    const abort = new AbortController();
+    const stream = await openGetStream(live, abort.signal);
+    expect(stream.status).toBe(200);
+    try {
+      // However long it has been quiet, a session holding its standalone GET
+      // stream is a live client and is never evicted, not even to recover.
+      advanceSeconds(3600);
+      startObserving();
+      const observed = sampleCountOnPoolAcquire();
+
+      const response = await ping(returning);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("mcp-session-id")).toBe(returning);
+      expect(await response.text()).toContain('"result":{}');
+      // Reserved while acquiring its pool instance, then registered: one
+      // over the ceiling, and nobody evicted for it.
+      expect(observed).toEqual([2]);
+      expect(countLiveSessionsForIdentity(identity())).toBe(2);
+      expect(isResident(live)).toBe(true);
+      expect(isResident(returning)).toBe(true);
+      expect(h.cleanupSession).not.toHaveBeenCalled();
+      expect(recoveryOverCeilingLines()).toEqual([
+        'Session recovery over the concurrent-session ceiling for api_key credential "test-consumer": 1/1 live sessions and none idle long enough to evict; recovering it anyway, since a reconnect is never refused. live: ep-1=1; in-flight 1, idle 0',
+      ]);
+      expect(recoveryOverCeilingLines()[0]).not.toMatch(GRAFANA_CEILING_RULE);
+      expect(recoveryOverCeilingLines()[0]).not.toMatch(
+        new RegExp(GRAFANA_CEILING_RULE.source, "i"),
+      );
+      expect(recoveryOverCeilingLines()[0]).not.toContain(returning);
+      expect(recoveryOverCeilingLines()[0]).not.toContain(live);
+      expect(recoveryOverCeilingLines()[0]).not.toContain(rawKey);
+      // That one line is everything the ceiling said: no refusal, no
+      // eviction, no 80% WARN, and no gateway event.
+      expect(ceilingLines()).toEqual(recoveryOverCeilingLines());
+      expect(ceilingEvents()).toEqual([]);
+    } finally {
+      abort.abort();
+    }
+  });
+
+  it("below the ceiling: recovers without evicting, even past 80% with idle sessions to spare, and says nothing about the ceiling", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "4";
+    const returning = await openThenReap();
+    const residents = [
+      await openSession(),
+      await openSession(),
+      await openSession(),
+    ];
+    // 3/4 is past the 80% line, and all three are long idle.
+    advanceSeconds(600);
+    startObserving();
+    const observed = sampleCountOnPoolAcquire();
+
+    const response = await ping(returning);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("mcp-session-id")).toBe(returning);
+    expect(await response.text()).toContain('"result":{}');
+    expect(h.cleanupSession).not.toHaveBeenCalled();
+    for (const resident of residents) {
+      expect(isResident(resident)).toBe(true);
+    }
+    // The recovery's slot is reserved while it acquires its pool instance.
+    expect(observed).toEqual([4]);
+    expect(countLiveSessionsForIdentity(identity())).toBe(4);
+    expect(ceilingLines()).toEqual([]);
+    expect(ceilingEvents()).toEqual([]);
+  });
+
+  it("registration replaces the recovery's reservation in the same step, so the recovered session is never counted twice", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "4";
+    const returning = await openThenReap();
+    const resident = await openSession();
+    startObserving();
+    const observed = sampleCountOnPoolAcquire();
+    // `beginTracking` runs synchronously right after the recovered session is
+    // registered, before the recovery returns to release anything else.
+    const beginTracking =
+      publicSessionSweeper.beginTracking.bind(publicSessionSweeper);
+    const spy = vi
+      .spyOn(publicSessionSweeper, "beginTracking")
+      .mockImplementation((sessionId: string) => {
+        if (sessionId === returning) {
+          observed.push(countLiveSessionsForIdentity(identity()));
+        }
+        beginTracking(sessionId);
+      });
+    try {
+      const response = await ping(returning);
+      expect(response.status).toBe(200);
+      await response.text();
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Pool acquisition: the resident session plus the reservation. At
+    // registration: the resident and the recovered session, nothing more.
+    expect(observed).toEqual([2, 2]);
+    expect(isResident(resident)).toBe(true);
+    expect(countLiveSessionsForIdentity(identity())).toBe(2);
+  });
+
+  it("kill switch off: recovery has no ceiling interaction at all (no eviction, no reservation, no ceiling line or event)", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "false";
+    const returning = await openThenReap();
+    const idleSession = await openSession();
+    // Evictable if eviction were on.
+    advanceSeconds(3600);
+    startObserving();
+    const observed = sampleCountOnPoolAcquire();
+
+    const response = await ping(returning);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("mcp-session-id")).toBe(returning);
+    expect(await response.text()).toContain('"result":{}');
+    // No reservation: only the resident session counted while it acquired.
+    expect(observed).toEqual([1]);
+    expect(h.cleanupSession).not.toHaveBeenCalled();
+    expect(isResident(idleSession)).toBe(true);
+    expect(countLiveSessionsForIdentity(identity())).toBe(2);
+    expect(ceilingLines()).toEqual([]);
+    expect(ceilingEvents()).toEqual([]);
+  });
+
+  it("a recovery that fails the credential check evicts nothing", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const returning = await openThenReap();
+    const idleSession = await openSession();
+    advanceSeconds(300);
+    startObserving();
+
+    // The same credential id, but a token whose hash is not the one the row
+    // stores: recovery answers 401, and its ceiling decision is never taken.
+    const response = await ping(returning, "ep-1", `${rawKey}-rotated`);
+
+    expect(response.status).toBe(401);
+    await response.text();
+    expect(h.cleanupSession).not.toHaveBeenCalled();
+    expect(isResident(idleSession)).toBe(true);
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+    expect(ceilingLines()).toEqual([]);
+  });
+
+  it("concurrent recoveries and initializes at the ceiling: distinct victims, never over the ceiling, and no reservation left once all settle", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "4";
+    const returning = [await openThenReap(), await openThenReap()];
+    const idleSessions: string[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      idleSessions.push(await openSession());
+      advanceSeconds(1);
+    }
+    advanceSeconds(600);
+    startObserving();
+    // The row lookup and the pool are both slow, so the four ceiling
+    // decisions are taken while earlier requests are still waiting on the
+    // pool, which is where a shared victim or a leaked slot would show.
+    h.db.findByIdDelayMs = 30;
+    const observed: number[] = [];
+    let acquiring = 0;
+    let maxAcquiring = 0;
+    h.getServer.mockImplementation(async () => {
+      observed.push(countLiveSessionsForIdentity(identity()));
+      acquiring += 1;
+      maxAcquiring = Math.max(maxAcquiring, acquiring);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      acquiring -= 1;
+      return makeServerInstance();
+    });
+    h.persist.mockImplementation(async (row: { session_id: string }) => {
+      observed.push(countLiveSessionsForIdentity(identity()));
+      h.rows.set(row.session_id, {
+        ...row,
+        created_at: new Date(),
+        last_seen_at: new Date(),
+      });
+    });
+
+    const [recovered1, admitted1, recovered2, admitted2] = await Promise.all([
+      ping(returning[0]),
+      initialize(),
+      ping(returning[1]),
+      initialize(),
+    ]);
+
+    expect(
+      [recovered1, admitted1, recovered2, admitted2].map((r) => r.status),
+    ).toEqual([200, 200, 200, 200]);
+    expect(recovered1.headers.get("mcp-session-id")).toBe(returning[0]);
+    expect(recovered2.headers.get("mcp-session-id")).toBe(returning[1]);
+    await Promise.all(
+      [recovered1, admitted1, recovered2, admitted2].map((r) => r.text()),
+    );
+    const admitted = [admitted1, admitted2].map(
+      (r) => r.headers.get("mcp-session-id") as string,
+    );
+
+    const victims = h.cleanupSession.mock.calls.map((call) => call[0]);
+    expect(victims).toHaveLength(4);
+    expect(new Set(victims)).toEqual(new Set(idleSessions));
+    for (const id of idleSessions) {
+      expect(isResident(id)).toBe(false);
+    }
+    for (const id of [...returning, ...admitted]) {
+      expect(isResident(id)).toBe(true);
+    }
+    expect(maxAcquiring).toBeGreaterThan(1);
+    expect(observed.length).toBeGreaterThanOrEqual(6);
+    expect(Math.max(...observed)).toBeLessThanOrEqual(4);
+    expect(evictionLines()).toHaveLength(4);
+    expect(recoveryOverCeilingLines()).toEqual([]);
+    expect(refusalLines()).toEqual([]);
+
+    // Once everything has settled the count is exactly the four resident
+    // sessions: a leaked reservation would make it 5. The next initialize
+    // proves it from the outside: everything is fresh, so it is refused, and
+    // the refusal reports 4/4.
+    expect(countLiveSessionsForIdentity(identity())).toBe(4);
+    const next = await initialize();
+    expect(next.status).toBe(429);
+    expect(await next.json()).toEqual(refusalBody(4, 4));
+  });
+
+  it("a recovery that fails after evicting hands its slot back", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    const returning = await openThenReap();
+    const first = await openSession();
+    advanceSeconds(10);
+    const second = await openSession();
+    advanceSeconds(300);
+    startObserving();
+    // The pool cannot hand out an instance: the recovery fails after its
+    // eviction, before anything is registered.
+    h.getServer.mockResolvedValueOnce(undefined);
+
+    const response = await ping(returning);
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Mcp-Session-Reinitialize-Required")).toBe(
+      "true",
+    );
+    await response.text();
+    expect(h.cleanupSession.mock.calls).toEqual([[first]]);
+    expect(isResident(returning)).toBe(false);
+    expect(isResident(second)).toBe(true);
+    // Only `second` is left; nothing holds the evicted slot.
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+
+    const retry = await initialize();
+    expect(retry.status).toBe(200);
+    await retry.text();
+    expect(h.cleanupSession).toHaveBeenCalledTimes(1);
+    expect(countLiveSessionsForIdentity(identity())).toBe(2);
+  });
+
+  it("an evicting recovery lets its victim release the pool first, then takes its own", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const returning = await openThenReap();
+    const victim = await openSession();
+    advanceSeconds(300);
+    startObserving();
+    sampleCountOnPoolAcquire();
+    let finishTeardown!: () => void;
+    h.cleanupSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishTeardown = () => {
+            h.trace.push("victim-teardown-finished");
+            resolve();
+          };
+        }),
+    );
+
+    const pending = ping(returning);
+    await vi.waitFor(() =>
+      expect(h.cleanupSession).toHaveBeenCalledWith(victim),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.trace).not.toContain(`getServer:${returning}`);
+    finishTeardown();
+    const response = await pending;
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('"result":{}');
+    expect(h.trace.indexOf(`getServer:${returning}`)).toBeGreaterThan(
+      h.trace.indexOf("victim-teardown-finished"),
+    );
+  });
+
+  it("an evicting recovery does not stall on a hung victim teardown: it goes ahead after the bound", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    setEvictionAdmissionWaitMsForTests(100);
+    const returning = await openThenReap();
+    const victim = await openSession();
+    advanceSeconds(300);
+    startObserving();
+    let finishTeardown!: () => void;
+    h.cleanupSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishTeardown = resolve;
+        }),
+    );
+    try {
+      const started = performance.now();
+      const response = await ping(returning);
+      const elapsedMs = performance.now() - started;
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("mcp-session-id")).toBe(returning);
+      expect(await response.text()).toContain('"result":{}');
+      expect(elapsedMs).toBeLessThan(2_000);
+      expect(h.cleanupSession).toHaveBeenCalledWith(victim);
+      expect(warnLines()).toContain(
+        "Session ceiling eviction: the evicted session's teardown on ep-1 has not finished after 100 ms; admitting the recovered session without waiting for it. The teardown continues in the background.",
+      );
+      expect(countLiveSessionsForIdentity(identity())).toBe(1);
+    } finally {
+      finishTeardown();
+    }
+  });
+
+  it(
+    "a recovery waiting on its own id's hung eviction teardown answers the reinitialize 404 at about 5 s, and logs no session id",
+    { timeout: 20_000 },
+    async () => {
+      process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+      // The production bound: no test seam here.
+      const victim = await openSession();
+      advanceSeconds(300);
+      let finishTeardown!: () => void;
+      h.cleanupSession.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishTeardown = resolve;
+          }),
+      );
+      const admitting = initialize();
+      await vi.waitFor(() =>
+        expect(h.cleanupSession).toHaveBeenCalledWith(victim),
+      );
+      try {
+        const started = performance.now();
+        const returning = await ping(victim);
+        const elapsedMs = performance.now() - started;
+
+        expect(returning.status).toBe(404);
+        expect(returning.headers.get("Mcp-Session-Reinitialize-Required")).toBe(
+          "true",
+        );
+        expect(await returning.json()).toMatchObject({
+          error: "Session not found",
+        });
+        expect(elapsedMs).toBeGreaterThanOrEqual(4_900);
+        expect(elapsedMs).toBeLessThan(8_000);
+        // It never rebuilt the id over the unfinished teardown.
+        expect(h.findById).not.toHaveBeenCalledWith(victim);
+        expect(isResident(victim)).toBe(false);
+        expect(warnLines()).toContain(
+          "Lazy recovery: a ceiling eviction teardown has not finished after 5000 ms; answering 404 so the client re-initializes. The teardown continues in the background.",
+        );
+        expect(warnLines().filter((line) => line.includes(victim))).toEqual([]);
+        expect(
+          infoLines().filter(
+            (line) => line.includes("ceiling") && line.includes(victim),
+          ),
+        ).toEqual([]);
+      } finally {
+        finishTeardown();
+      }
+      const admitted = await admitting;
+      expect(admitted.status).toBe(200);
+      await admitted.text();
+    },
+  );
+
+  it("the victim of a recovery's eviction can itself recover later, under its own id", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const first = await openThenReap();
+    const second = await openSession();
+    const secondTransport = transportOf(second);
+    advanceSeconds(300);
+
+    const firstBack = await ping(first);
+    expect(firstBack.status).toBe(200);
+    expect(firstBack.headers.get("mcp-session-id")).toBe(first);
+    await firstBack.text();
+    expect(isResident(second)).toBe(false);
+    expect(h.rows.has(second)).toBe(true);
+
+    advanceSeconds(300);
+    startObserving();
+    const secondBack = await ping(second);
+
+    expect(secondBack.status).toBe(200);
+    expect(secondBack.headers.get("mcp-session-id")).toBe(second);
+    expect(await secondBack.text()).toContain('"result":{}');
+    expect(transportOf(second)).not.toBe(secondTransport);
+    // It recovered at the ceiling, so it evicted the now-idle `first`.
+    expect(h.cleanupSession.mock.calls).toEqual([[first]]);
+    expect(isResident(first)).toBe(false);
+    expect(h.rows.has(first)).toBe(true);
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+    expect(evictionLines()).toHaveLength(1);
   });
 });

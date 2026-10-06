@@ -16,6 +16,7 @@ vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
 import {
   checkConcurrentSessionCeiling,
+  checkConcurrentSessionCeilingForRecovery,
   countLiveSessionsForIdentity,
   DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS,
   DEFAULT_MAX_SESSIONS_PER_CREDENTIAL,
@@ -30,6 +31,7 @@ import {
   resolveSessionCeiling,
   selectEvictionCandidate,
   summarizeCredentialSessions,
+  waitForEvictionTeardown,
 } from "./credential-session-quota";
 import { SessionIdentity } from "./session-auth";
 
@@ -1453,5 +1455,396 @@ describe("checkConcurrentSessionCeiling: the admission's wait on the victim's te
     await vi.advanceTimersByTimeAsync(EVICTION_ADMISSION_WAIT_MS);
     expect(loggerMock.warn).not.toHaveBeenCalled();
     decision.eviction?.release();
+  });
+});
+
+/**
+ * The Grafana rule `warn-metamcp-credential-session-ceiling`
+ * (Grafana-Logs alerting/metamcp-rules.yml) filters with this expression.
+ * An eviction line must match it, so the alert keeps seeing a credential held
+ * at its ceiling; an over-ceiling recovery line must not, since nothing was
+ * refused or evicted.
+ */
+const GRAFANA_CEILING_RULE =
+  /Concurrent-session (ceiling reached|usage high) for|Concurrent-session ceiling: evicted idle session on/;
+
+const RECOVERY_OVER_CEILING_PREFIX =
+  "Session recovery over the concurrent-session ceiling for";
+
+describe("checkConcurrentSessionCeilingForRecovery: evict, never refuse (rulings 2026-10-06)", () => {
+  function atCeilingWithIdleSessions(
+    sessions: Array<{ sessionId: string; endpointName: string; idleS: number }>,
+  ) {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = String(sessions.length);
+    const harness = evictableCounter({
+      "key-1": sessions.map(({ sessionId, endpointName }) => ({
+        sessionId,
+        endpointName,
+      })),
+    });
+    registerSessionCounter(harness.counter);
+    registerSessionActivityProbe(
+      activityTable(
+        Object.fromEntries(sessions.map((s) => [s.sessionId, idle(s.idleS)])),
+      ),
+    );
+    return harness;
+  }
+
+  it("kill switch off: no ceiling interaction at all (nothing counted, reserved, evicted or logged)", () => {
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "false";
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: "s-1", endpointName: "autotask" }],
+    });
+    const count = vi.spyOn(counter, "countSessionsForIdentity");
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeilingForRecovery(
+      API_KEY_IDENTITY,
+      { label: "Example" },
+    );
+
+    expect(decision).toBeUndefined();
+    expect(count).not.toHaveBeenCalled();
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+    expect(loggerMock.info).not.toHaveBeenCalled();
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    count.mockRestore();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+  });
+
+  it("kill switch off: a malformed ceiling is not even read", () => {
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "off";
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "not-a-number";
+    registerSessionCounter(counterReturning(3));
+
+    expect(
+      checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY),
+    ).toBeUndefined();
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+
+  it("a ceiling of 0 or an anonymous caller: no interaction", () => {
+    registerSessionCounter(counterReturning(3));
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "0";
+    expect(
+      checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY),
+    ).toBeUndefined();
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    expect(
+      checkConcurrentSessionCeilingForRecovery({
+        method: "anonymous",
+        credentialId: null,
+      }),
+    ).toBeUndefined();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+  });
+
+  it("below the ceiling: reserves the slot, evicts nothing and logs nothing, even past 80%", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "3";
+    const { counter } = evictableCounter({
+      "key-1": [
+        { sessionId: "s-1", endpointName: "autotask" },
+        { sessionId: "s-2", endpointName: "autotask" },
+      ],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeilingForRecovery(
+      API_KEY_IDENTITY,
+      { label: "Example" },
+    );
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      current: 2,
+      ceiling: 3,
+      approaching: true,
+    });
+    expect(decision?.eviction).toBeUndefined();
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+    expect(loggerMock.info).not.toHaveBeenCalled();
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    // The reservation: a concurrent admission now sees the credential full.
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+    decision?.releaseAdmission?.();
+    decision?.releaseAdmission?.();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(2);
+  });
+
+  it("at the ceiling with an idle session: evicts it like an admission, with the same INFO line the ceiling alert matches", async () => {
+    const { counter, evicted } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 300 },
+      { sessionId: "s-2", endpointName: "ninja", idleS: 1710 },
+    ]);
+
+    const decision = checkConcurrentSessionCeilingForRecovery(
+      API_KEY_IDENTITY,
+      { label: "Example" },
+    );
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      current: 2,
+      ceiling: 2,
+      eviction: { endpointName: "ninja", idleSeconds: 1710 },
+    });
+    expect(counter.evictSessionForAdmission).toHaveBeenCalledTimes(1);
+    expect(evicted).toEqual(["s-2"]);
+    await expect(decision?.eviction?.teardownWait).resolves.toBeUndefined();
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    expect(loggerMock.info).toHaveBeenCalledTimes(1);
+    const line = String(loggerMock.info.mock.calls[0][0]);
+    expect(line).toBe(
+      'Concurrent-session ceiling: evicted idle session on ninja (idle 1710s) for api_key credential "Example" to admit a new session (2/2) live: autotask=1, ninja=1; in-flight 0, idle 2, oldest idle 1710s',
+    );
+    expect(line).toMatch(GRAFANA_CEILING_RULE);
+    // The victim left; the reservation holds its slot until registration.
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(2);
+    expect(decision?.releaseAdmission).toBe(decision?.eviction?.release);
+    decision?.releaseAdmission?.();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+  });
+
+  it("at the ceiling with nothing evictable: still allowed, over the ceiling, with one INFO line the ceiling alert does not match and no WARN", () => {
+    const { counter } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 30 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 60 },
+    ]);
+
+    const decision = checkConcurrentSessionCeilingForRecovery(
+      API_KEY_IDENTITY,
+      { label: "Example" },
+    );
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      current: 2,
+      ceiling: 2,
+      approaching: true,
+    });
+    expect(decision?.eviction).toBeUndefined();
+    expect(counter.evictSessionForAdmission).not.toHaveBeenCalled();
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    expect(loggerMock.info).toHaveBeenCalledTimes(1);
+    const line = String(loggerMock.info.mock.calls[0][0]);
+    expect(line).toBe(
+      'Session recovery over the concurrent-session ceiling for api_key credential "Example": 2/2 live sessions and none idle long enough to evict; recovering it anyway, since a reconnect is never refused. live: autotask=2; in-flight 0, idle 2, oldest idle 60s',
+    );
+    expect(line).not.toMatch(GRAFANA_CEILING_RULE);
+    expect(line).not.toMatch(new RegExp(GRAFANA_CEILING_RULE.source, "i"));
+    // Reserved, so a concurrent admission sees 3/2 and cannot slip in.
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+    decision?.releaseAdmission?.();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(2);
+  });
+
+  it("the over-ceiling line carries no session id even when the listing is uuid-shaped", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const uuid = "0b3f6c1e-aaaa-4bbb-8ccc-000000000002";
+    const { counter } = evictableCounter({
+      "key-1": [{ sessionId: uuid, endpointName: "autotask" }],
+    });
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => ({ idleMs: 0, inFlight: true }));
+
+    const decision = checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+
+    const line = String(loggerMock.info.mock.calls[0][0]);
+    expect(line.startsWith(RECOVERY_OVER_CEILING_PREFIX)).toBe(true);
+    expect(line).not.toContain(uuid);
+    expect(JSON.stringify(decision)).not.toContain(uuid);
+    decision?.releaseAdmission?.();
+  });
+
+  it("concurrent recoveries and admissions at the ceiling evict DISTINCT victims, then admissions are refused and recoveries go over", () => {
+    const { evicted } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 300 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 900 },
+      { sessionId: "s-3", endpointName: "autotask", idleS: 600 },
+    ]);
+
+    // Four decisions before any of them registers its session.
+    const recovery1 =
+      checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+    const admission1 = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+    const recovery2 =
+      checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+    const admission2 = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+    const recovery3 =
+      checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+
+    expect(evicted).toEqual(["s-2", "s-3", "s-1"]);
+    expect(recovery1?.eviction).toBeDefined();
+    expect(admission1.eviction).toBeDefined();
+    expect(recovery2?.eviction).toBeDefined();
+    // Nothing left to evict: the admission is refused as today, the recovery
+    // goes over the ceiling.
+    expect(admission2.allowed).toBe(false);
+    expect(admission2.releaseAdmission).toBeUndefined();
+    expect(recovery3).toMatchObject({ allowed: true, current: 3 });
+    expect(recovery3?.eviction).toBeUndefined();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(4);
+
+    for (const decision of [recovery1, admission1, recovery2, recovery3]) {
+      decision?.releaseAdmission?.();
+    }
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(0);
+  });
+
+  it("a throwing evictor falls back to recovering over the ceiling, with recovery wording and no fault text", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const { counter } = evictableCounter(
+      { "key-1": [{ sessionId: "s-1", endpointName: "autotask" }] },
+      { evictReturns: "throw" },
+    );
+    registerSessionCounter(counter);
+    registerSessionActivityProbe(() => idle(5000));
+
+    const decision = checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+
+    expect(decision).toMatchObject({ allowed: true, current: 1 });
+    expect(loggerMock.warn.mock.calls.map((c) => c[0])).toEqual([
+      "Session ceiling eviction faulted; recovering the session without evicting.",
+    ]);
+    expect(
+      String(loggerMock.info.mock.calls[0][0]).startsWith(
+        RECOVERY_OVER_CEILING_PREFIX,
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(
+      "private-evictor-fault",
+    );
+    decision?.releaseAdmission?.();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+  });
+
+  it("never throws: a log fault after reserving gives the slot back and answers undefined", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    registerSessionCounter(counterReturning(1));
+    loggerMock.info.mockImplementationOnce(() => {
+      throw new Error("log sink down");
+    });
+
+    let decision: ReturnType<typeof checkConcurrentSessionCeilingForRecovery> =
+      { allowed: false, current: -1, ceiling: -1, approaching: false };
+    expect(() => {
+      decision = checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+    }).not.toThrow();
+
+    expect(decision).toBeUndefined();
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      "Session ceiling check for a lazy recovery faulted; recovering without it.",
+    );
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(
+      "log sink down",
+    );
+  });
+
+  it("never throws: an eviction whose INFO line faults releases its own slot, the victim stays evicted", () => {
+    const { evicted } = atCeilingWithIdleSessions([
+      { sessionId: "s-1", endpointName: "autotask", idleS: 300 },
+      { sessionId: "s-2", endpointName: "autotask", idleS: 900 },
+    ]);
+    loggerMock.info.mockImplementationOnce(() => {
+      throw new Error("log sink down");
+    });
+
+    const decision = checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+
+    expect(decision).toBeUndefined();
+    expect(evicted).toEqual(["s-2"]);
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+  });
+
+  it("an evicting recovery's bounded wait uses the recovery wording", async () => {
+    vi.useFakeTimers();
+    try {
+      process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+      let resident = true;
+      registerSessionCounter({
+        countSessionsForIdentity: () => (resident ? 1 : 0),
+        listSessionsForIdentity: () =>
+          resident ? [{ sessionId: "s-1", endpointName: "autotask" }] : [],
+        evictSessionForAdmission: () => {
+          resident = false;
+          return new Promise<void>(() => {});
+        },
+      });
+      registerSessionActivityProbe(() => idle(5000));
+
+      const decision =
+        checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+      await vi.advanceTimersByTimeAsync(EVICTION_ADMISSION_WAIT_MS);
+      await expect(decision?.eviction?.teardownWait).resolves.toBeUndefined();
+
+      expect(loggerMock.warn.mock.calls.map((c) => c[0])).toEqual([
+        "Session ceiling eviction: the evicted session's teardown on autotask has not finished after 5000 ms; admitting the recovered session without waiting for it. The teardown continues in the background.",
+      ]);
+      decision?.releaseAdmission?.();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("waitForEvictionTeardown: the shared bounded wait", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resolves true when the teardown settles first, without calling onTimeout or leaving a timer", async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const onTimeout = vi.fn();
+    const result = waitForEvictionTeardown(
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+      onTimeout,
+    );
+    await vi.advanceTimersByTimeAsync(EVICTION_ADMISSION_WAIT_MS - 1);
+    finish();
+    await expect(result).resolves.toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  it("resolves false at the bound, calling onTimeout once with the bound", async () => {
+    vi.useFakeTimers();
+    const onTimeout = vi.fn();
+    let settled: boolean | undefined;
+    void waitForEvictionTeardown(new Promise<void>(() => {}), onTimeout).then(
+      (finished) => {
+        settled = finished;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(EVICTION_ADMISSION_WAIT_MS - 1);
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(false);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(onTimeout).toHaveBeenCalledWith(EVICTION_ADMISSION_WAIT_MS);
+  });
+
+  it("a rejecting teardown counts as finished, and a throwing onTimeout still settles the wait", async () => {
+    vi.useFakeTimers();
+    await expect(
+      waitForEvictionTeardown(Promise.reject(new Error("gone")), vi.fn()),
+    ).resolves.toBe(true);
+
+    const result = waitForEvictionTeardown(new Promise<void>(() => {}), () => {
+      throw new Error("log sink down");
+    });
+    await vi.advanceTimersByTimeAsync(EVICTION_ADMISSION_WAIT_MS);
+    await expect(result).resolves.toBe(false);
   });
 });
