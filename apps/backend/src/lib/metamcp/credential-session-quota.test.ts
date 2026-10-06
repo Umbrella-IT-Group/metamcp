@@ -160,6 +160,50 @@ describe("checkConcurrentSessionCeiling", () => {
   });
 });
 
+describe("admissions starting below the ceiling", () => {
+  it("reserves a free slot before a concurrent admission checks it", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    registerSessionCounter(counterReturning(0));
+    const first = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+    const second = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+    expect(first.allowed).toBe(true);
+    expect(second.allowed).toBe(false);
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(1);
+  });
+
+  it("with the kill switch off, free-slot decisions stay identical to the old path", () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    registerSessionCounter(counterReturning(0));
+    const oldDecision = checkConcurrentSessionCeiling(API_KEY_IDENTITY);
+    const oldLogs = [...loggerMock.warn.mock.calls];
+    loggerMock.warn.mockClear();
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "false";
+    const decision = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+    expect(decision).toEqual(oldDecision);
+    expect(loggerMock.warn.mock.calls).toEqual(oldLogs);
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(0);
+  });
+
+  it.each([
+    "120junk",
+    "1.5",
+    "1e2",
+    "Infinity",
+    "9007199254740992",
+    "9".repeat(400),
+  ])("rejects a malformed or unsafe idle floor %s", (value) => {
+    process.env.MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS = value;
+    expect(resolveEvictionConfig().minIdleMs).toBe(120_000);
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("checkConcurrentSessionCeiling — credential label in the WARN text", () => {
   // The label names WHICH credential is at the ceiling so a leak is
   // identifiable from the logs. It is a display name (api-key name or user

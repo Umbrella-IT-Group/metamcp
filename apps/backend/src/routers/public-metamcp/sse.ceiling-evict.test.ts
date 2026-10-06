@@ -103,12 +103,11 @@ function makeInstance() {
 }
 
 /** Open the SSE stream and wait for its `endpoint` frame. */
-async function openStream(): Promise<{
+async function openStream(abort = new AbortController()): Promise<{
   status: number;
   abort: AbortController;
   body: string;
 }> {
-  const abort = new AbortController();
   const response = await fetch(`${baseUrl}/metamcp/ep-1/sse`, {
     signal: abort.signal,
   });
@@ -259,6 +258,60 @@ describe("GET /sse at the ceiling", () => {
       expect(countLiveSessionsForIdentity(IDENTITY)).toBe(1);
     } finally {
       first.abort.abort();
+    }
+  });
+
+  it("reserves a free slot while the SSE pool acquisition is pending", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    let release!: () => void;
+    h.getServer.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return makeInstance();
+    });
+    const first = openStream();
+    await vi.waitFor(() => expect(h.getServer).toHaveBeenCalledTimes(1));
+    try {
+      const second = await openStream();
+      expect(second.status).toBe(429);
+    } finally {
+      release();
+      const stream = await first;
+      stream.abort.abort();
+    }
+  });
+
+  it("a cancelled SSE admission releases its slot and rejects a late pool result", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    let release!: () => void;
+    h.getServer.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return makeInstance();
+    });
+    const abort = new AbortController();
+    const first = openStream(abort).catch(() => null);
+    await vi.waitFor(() => expect(h.getServer).toHaveBeenCalledTimes(1));
+    try {
+      abort.abort();
+      await first;
+      await vi.waitFor(() =>
+        expect(countLiveSessionsForIdentity(IDENTITY)).toBe(0),
+      );
+    } finally {
+      release();
+    }
+    await vi.waitFor(() => expect(h.getServer).toHaveBeenCalledTimes(1));
+    // Give the route a turn to handle the completed pool acquisition.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(countLiveSessionsForIdentity(IDENTITY)).toBe(0);
+    const retry = await openStream();
+    try {
+      expect(retry.status).toBe(200);
+    } finally {
+      retry.abort.abort();
     }
   });
 

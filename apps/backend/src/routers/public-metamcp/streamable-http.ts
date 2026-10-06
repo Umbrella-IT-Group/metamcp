@@ -353,11 +353,11 @@ export function evictIdleSessionForAdmission(
 
   const teardown: Promise<void> = cleanupSessionInternal(sessionId, transport, {
     deleteRow: false,
+    eviction: true,
   })
-    .catch((error: unknown) => {
+    .catch(() => {
       logger.warn(
-        `Teardown of session ${sessionId}, evicted at the concurrent-session ceiling, failed; its in-memory state is already released.`,
-        error,
+        "Session ceiling eviction teardown failed; its in-memory state is already released.",
       );
     })
     .finally(() => {
@@ -579,7 +579,7 @@ export async function recoverPersistedSession(
   const pendingEviction = evictionTeardowns.get(sessionId);
   if (pendingEviction) {
     logger.info(
-      `Lazy recovery: session ${sessionId} is still being torn down after a ceiling eviction; waiting for it to finish.`,
+      "Lazy recovery is waiting for a ceiling eviction teardown to finish.",
     );
     await pendingEviction;
   }
@@ -592,7 +592,7 @@ export async function recoverPersistedSession(
       break;
     }
     logger.info(
-      `Lazy recovery: session ${sessionId} is already being recovered by a concurrent request; waiting for it.`,
+      "Lazy recovery is waiting for a concurrent recovery to finish.",
     );
     // Only its settling matters here. A rejection is the leader's own
     // failure, reported by the leader's request; this one goes on to
@@ -868,22 +868,35 @@ async function recoverPersistedSessionOnce(
 const cleanupSessionInternal = async (
   sessionId: string,
   transport: StreamableHTTPServerTransport | undefined,
-  { deleteRow }: { deleteRow: boolean },
+  { deleteRow, eviction = false }: { deleteRow: boolean; eviction?: boolean },
 ): Promise<void> => {
-  logger.info(`Cleaning up StreamableHTTP session ${sessionId}`);
+  // Eviction adds a new operator signal; neither its victim id nor an
+  // upstream exception belongs in that signal. Other cleanup logs stay as before.
+  const sessionLabel = eviction ? "evicted session" : `session ${sessionId}`;
+  logger.info(`Cleaning up StreamableHTTP ${sessionLabel}`);
 
   // Use provided transport or get from session manager. Captured before the
   // first await so the supersession checks below compare against the
   // transport THIS call set out to tear down.
   const sessionTransport = transport || sessionManager.getSession(sessionId);
 
+  let closeFailed = false;
+  let closeError: unknown;
   try {
     if (sessionTransport) {
-      logger.info(`Closing transport for session ${sessionId}`);
-      await sessionTransport.close();
-      logger.info(`Transport cleaned up for session ${sessionId}`);
+      logger.info(`Closing transport for ${sessionLabel}`);
+      try {
+        await sessionTransport.close();
+        logger.info(`Transport cleaned up for ${sessionLabel}`);
+      } catch (error) {
+        if (!eviction) throw error;
+        // A failed close must still release the id-keyed pools. Otherwise the
+        // eviction gate opens onto an old, already-connected server instance.
+        closeFailed = true;
+        closeError = error;
+      }
     } else {
-      logger.info(`No transport found for session ${sessionId}`);
+      logger.info(`No transport found for ${sessionLabel}`);
     }
 
     // Everything below is keyed by session id alone: the manager entry, the
@@ -895,7 +908,7 @@ const cleanupSessionInternal = async (
     // decision still stands, since it reflects what the caller asked for.
     if (isSupersededDuringCleanup(sessionId, sessionTransport)) {
       logger.warn(
-        `Session ${sessionId} was re-established under the same id while its old transport was closing; leaving the new transport and its pool state in place.`,
+        "A session was re-established while its old transport was closing; leaving the new transport and its pool state in place.",
       );
       if (deleteRow) {
         deletePersistedSessionRow(sessionId);
@@ -917,18 +930,23 @@ const cleanupSessionInternal = async (
       deletePersistedSessionRow(sessionId);
     }
 
+    if (closeFailed) throw closeError;
     logger.info(
-      `Session ${sessionId} cleanup completed successfully` +
+      `${sessionLabel} cleanup completed successfully` +
         (deleteRow ? "" : " (mcp_sessions row preserved for lazy recovery)"),
     );
   } catch (error) {
-    logger.error(`Error during cleanup of session ${sessionId}:`, error);
+    if (eviction) {
+      logger.error("Error during eviction cleanup; releasing in-memory state.");
+    } else {
+      logger.error(`Error during cleanup of session ${sessionId}:`, error);
+    }
     // Even if cleanup fails, remove the session from manager to prevent memory
     // leaks, unless the id now belongs to a newer transport (see above).
     if (!isSupersededDuringCleanup(sessionId, sessionTransport)) {
       sessionManager.removeSession(sessionId);
       publicSessionSweeper.forget(sessionId);
-      logger.info(`Removed orphaned session ${sessionId} due to cleanup error`);
+      logger.info(`Removed orphaned ${sessionLabel} due to cleanup error`);
     }
     throw error;
   }
@@ -1256,11 +1274,37 @@ streamableHttpRouter.post(
     const clientIdentity = await resolveClientIdentity(authReq);
 
     if (!sessionId) {
-      // Set when this admission got its slot by evicting an idle session. The
-      // slot is reserved for it until the new session is registered below;
-      // the `finally` releases it on every other exit (refusal, a failed pool
-      // acquisition, a throw), so a failed admission can never hold a slot.
+      // Enabled admissions reserve a slot until registration, whether they
+      // evict or use free capacity. Release on failure and disconnection too;
+      // a late pool result must not resurrect an abandoned admission.
       let admissionEviction: CeilingEviction | undefined;
+      let releaseAdmission: (() => void) | undefined;
+      let initializingSessionId: string | undefined;
+      let admissionClosed = false;
+      let admissionCleanup: Promise<void> | undefined;
+      const cleanupAdmission = (id: string): Promise<void> => {
+        if (admissionCleanup) return admissionCleanup;
+        // This fresh initialize failed or lost its caller. Drop its count
+        // before a potentially slow close, and tear down only once.
+        const transport = sessionManager.getSession(id);
+        sessionManager.removeSession(id);
+        publicSessionSweeper.forget(id);
+        admissionCleanup = cleanupSession(id, transport).catch(() => {
+          logger.warn("Cleanup of an abandoned session admission failed.");
+        });
+        return admissionCleanup;
+      };
+      const onAdmissionClose = () => {
+        if (res.writableEnded || !releaseAdmission) return;
+        // A disconnected caller must not hold a reservation until a hung
+        // pool resolves. The flag also prevents that late result registering.
+        admissionClosed = true;
+        releaseAdmission();
+        if (initializingSessionId) {
+          void cleanupAdmission(initializingSessionId);
+        }
+      };
+      res.once("close", onAdmissionClose);
       try {
         // Per-credential concurrent-session ceiling, enforced at creation. A
         // credential already holding the maximum is refused here rather than
@@ -1282,6 +1326,8 @@ streamableHttpRouter.post(
         // Taken over before anything else can throw, so the `finally` owns
         // the reserved slot from the moment the decision returns.
         admissionEviction = ceiling.eviction;
+        releaseAdmission = ceiling.releaseAdmission;
+        if (res.destroyed && !res.writableEnded) onAdmissionClose();
         recordSessionCeilingEvent({
           identity,
           endpointName,
@@ -1302,6 +1348,7 @@ streamableHttpRouter.post(
           // shares nothing with the victim's. Never rejects.
           await admissionEviction.teardownWait;
         }
+        if (admissionClosed) return;
 
         logger.info(
           `New public endpoint StreamableHttp connection request for ${endpointName} -> namespace ${namespaceUuid}`,
@@ -1318,6 +1365,10 @@ streamableHttpRouter.post(
           newSessionId,
           namespaceUuid,
         );
+        if (admissionClosed) {
+          await cleanupAdmission(newSessionId);
+          return;
+        }
         if (!mcpServerInstance) {
           throw new Error("Failed to get MetaMCP server instance from pool");
         }
@@ -1388,14 +1439,19 @@ streamableHttpRouter.post(
           transport,
           requestBinding(authReq),
         );
-        // The new session now counts itself, so the slot reserved for it by
-        // an eviction is handed back in the same synchronous step.
-        admissionEviction?.release();
+        // Registration replaces the admission's reservation synchronously.
+        releaseAdmission?.();
         // Seed idle-TTL tracking for the new session (dispatchTracked's
         // markInFlight/touch calls are guarded to no-op on an untracked
         // session — see their doc comments — so this unconditional seed is
         // required before the first dispatch, not just a convenience).
         publicSessionSweeper.beginTracking(newSessionId);
+        // The initialize request is already running. A slow connect can exceed
+        // any idle floor; protect it BEFORE the first connect/persist await.
+        initializingSessionId = newSessionId;
+        if (releaseAdmission) {
+          publicSessionSweeper.markInFlight(newSessionId);
+        }
 
         logger.info(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,
@@ -1410,6 +1466,7 @@ streamableHttpRouter.post(
 
         // Connect the server to the transport before handling the request
         await mcpServerInstance.server.connect(transport);
+        if (admissionClosed) return;
 
         // Persist the session row so a later metamcp restart can lazy-
         // recover this consumer's cached sessionId. Best-effort — a DB
@@ -1452,12 +1509,19 @@ streamableHttpRouter.post(
           clientIdentity?.name,
         );
       } catch (error) {
+        if (releaseAdmission && initializingSessionId && !admissionClosed) {
+          await cleanupAdmission(initializingSessionId);
+        }
         logger.error("Error in public endpoint /mcp POST route:", error);
         // Constant body via the terminal error handler; no error message or
         // endpoint name in the client-facing response (detail is logged above).
         return next(error);
       } finally {
-        admissionEviction?.release();
+        res.off("close", onAdmissionClose);
+        if (initializingSessionId && releaseAdmission) {
+          publicSessionSweeper.markSettled(initializingSessionId);
+        }
+        releaseAdmission?.();
       }
     } else {
       // logger.info(

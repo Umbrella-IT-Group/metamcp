@@ -25,6 +25,7 @@
 import type { Server as HttpServer } from "node:http";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { PingRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import {
   afterAll,
@@ -138,6 +139,7 @@ import type { SessionIdentity } from "../../lib/metamcp/session-auth";
 import { __resetSessionCeilingThrottleForTesting } from "../../lib/metamcp/session-ceiling-events";
 import streamableHttpRouter, {
   buildSessionsHealthPayload,
+  evictIdleSessionForAdmission,
   publicSessionSweeper,
   reapIdleSession,
   recoverPersistedSession,
@@ -200,9 +202,13 @@ function authReqFor(endpoint = "ep-1"): ApiKeyAuthenticatedRequest {
   } as unknown as ApiKeyAuthenticatedRequest;
 }
 
-function initialize(endpoint = "ep-1"): Promise<Response> {
+function initialize(
+  endpoint = "ep-1",
+  signal?: AbortSignal,
+): Promise<Response> {
   return fetch(`${baseUrl}/metamcp/${endpoint}/mcp`, {
     method: "POST",
+    signal,
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -639,6 +645,301 @@ describe("POST initialize at the ceiling — an idle session is evicted and the 
   });
 });
 
+describe("admission races before the first dispatch", () => {
+  it("reserves the final free slot while a pool acquisition is pending", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    let release!: () => void;
+    h.getServer.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return makeServerInstance();
+    });
+    const first = initialize();
+    await vi.waitFor(() => expect(h.getServer).toHaveBeenCalledTimes(1));
+    try {
+      const second = await initialize();
+      expect(second.status).toBe(429);
+      expect(await second.json()).toEqual(refusalBody(1, 1));
+    } finally {
+      release();
+      const response = await first;
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+  });
+
+  it("does not evict a session whose initialize is still connecting", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const instance = makeServerInstance();
+    const connect = instance.server.connect.bind(instance.server);
+    let release!: () => void;
+    vi.spyOn(instance.server, "connect").mockImplementationOnce(
+      async (transport) => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await connect(transport);
+      },
+    );
+    h.getServer.mockResolvedValueOnce(instance);
+    const first = initialize();
+    await vi.waitFor(() =>
+      expect(instance.server.connect).toHaveBeenCalledTimes(1),
+    );
+    advanceSeconds(300);
+    try {
+      const second = await initialize();
+      expect(second.status).toBe(429);
+      expect(h.cleanupSession).not.toHaveBeenCalled();
+    } finally {
+      release();
+      const response = await first;
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+  });
+
+  it("a failed free-slot acquisition releases its reservation", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    h.getServer.mockResolvedValueOnce(undefined);
+    const failed = await initialize();
+    expect(failed.status).toBe(500);
+    await failed.text();
+    expect(countLiveSessionsForIdentity(identity())).toBe(0);
+    const retry = await initialize();
+    expect(retry.status).toBe(200);
+    await retry.text();
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+  });
+
+  it("with eviction off, initialization activity tracking remains unchanged", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    process.env.MCP_SESSION_CEILING_EVICT_IDLE = "false";
+    const instance = makeServerInstance();
+    const connect = instance.server.connect.bind(instance.server);
+    let release!: () => void;
+    vi.spyOn(instance.server, "connect").mockImplementationOnce(
+      async (transport) => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await connect(transport);
+      },
+    );
+    h.getServer.mockResolvedValueOnce(instance);
+    const request = initialize();
+    await vi.waitFor(() =>
+      expect(instance.server.connect).toHaveBeenCalledTimes(1),
+    );
+    try {
+      const id = String(h.getServer.mock.calls[0][0]);
+      expect(publicSessionSweeper.getActivity(id)?.inFlight).toBe(false);
+    } finally {
+      release();
+      const response = await request;
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+  });
+
+  it("a failed connect removes its partially registered session", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const instance = makeServerInstance();
+    vi.spyOn(instance.server, "connect").mockRejectedValueOnce(
+      new Error("connect failed"),
+    );
+    h.getServer.mockResolvedValueOnce(instance);
+    const failed = await initialize();
+    expect(failed.status).toBe(500);
+    await failed.text();
+    expect(countLiveSessionsForIdentity(identity())).toBe(0);
+    expect(h.cleanupSession).toHaveBeenCalledTimes(1);
+    expect(h.persist).not.toHaveBeenCalled();
+    const retry = await initialize();
+    expect(retry.status).toBe(200);
+    await retry.text();
+  });
+
+  it("a real SDK request remains protected throughout its handler", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const instance = makeServerInstance();
+    let release!: () => void;
+    const handler = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return {};
+    });
+    instance.server.setRequestHandler(PingRequestSchema, handler);
+    h.getServer.mockResolvedValueOnce(instance);
+    const id = await openSession();
+    const request = ping(id);
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    advanceSeconds(300);
+    try {
+      expect(publicSessionSweeper.getActivity(id)?.inFlight).toBe(true);
+      const second = await initialize();
+      expect(second.status).toBe(429);
+      expect(h.cleanupSession).not.toHaveBeenCalled();
+    } finally {
+      release();
+      const response = await request;
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+    expect(publicSessionSweeper.getActivity(id)?.inFlight).toBe(false);
+  });
+
+  it("cancellation while an eviction is closing releases the slot without acquiring a new pool", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const victim = await openSession();
+    let finish!: () => void;
+    h.cleanupSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    advanceSeconds(300);
+    const abort = new AbortController();
+    const cancelled = initialize("ep-1", abort.signal).catch(() => null);
+    await vi.waitFor(() =>
+      expect(h.cleanupSession).toHaveBeenCalledWith(victim),
+    );
+    try {
+      abort.abort();
+      await cancelled;
+      await vi.waitFor(() =>
+        expect(countLiveSessionsForIdentity(identity())).toBe(0),
+      );
+      const replacement = await initialize();
+      expect(replacement.status).toBe(200);
+      await replacement.text();
+    } finally {
+      finish();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.getServer).toHaveBeenCalledTimes(2);
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+  });
+
+  it("cancellation during initialize connect drops the session before a late connect completes", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const instance = makeServerInstance();
+    const connect = instance.server.connect.bind(instance.server);
+    let release!: () => void;
+    vi.spyOn(instance.server, "connect").mockImplementationOnce(
+      async (transport) => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await connect(transport);
+      },
+    );
+    h.getServer.mockResolvedValueOnce(instance);
+    const abort = new AbortController();
+    const cancelled = initialize("ep-1", abort.signal).catch(() => null);
+    await vi.waitFor(() =>
+      expect(instance.server.connect).toHaveBeenCalledTimes(1),
+    );
+    try {
+      abort.abort();
+      await cancelled;
+      await vi.waitFor(() =>
+        expect(countLiveSessionsForIdentity(identity())).toBe(0),
+      );
+    } finally {
+      release();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.persist).not.toHaveBeenCalled();
+    expect(countLiveSessionsForIdentity(identity())).toBe(0);
+  });
+
+  it("a cancelled admission releases its slot and never registers a late pool result", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    let release!: () => void;
+    let abandonedId = "";
+    h.getServer.mockImplementationOnce(async (id: string) => {
+      abandonedId = id;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return makeServerInstance();
+    });
+    const abort = new AbortController();
+    const abandoned = initialize("ep-1", abort.signal).catch(() => null);
+    await vi.waitFor(() => expect(h.getServer).toHaveBeenCalledTimes(1));
+    try {
+      abort.abort();
+      await abandoned;
+      await vi.waitFor(() =>
+        expect(countLiveSessionsForIdentity(identity())).toBe(0),
+      );
+      const replacement = await initialize();
+      expect(replacement.status).toBe(200);
+      await replacement.text();
+    } finally {
+      release();
+    }
+    await vi.waitFor(() =>
+      expect(h.cleanupSession).toHaveBeenCalledWith(abandonedId),
+    );
+    expect(isResident(abandonedId)).toBe(false);
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+  });
+
+  it("eviction failure logs expose neither the victim id nor the exception", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const victim = await openSession();
+    vi.spyOn(transportOf(victim), "close").mockRejectedValueOnce(
+      new Error("https://private-token.example/secret"),
+    );
+    h.logger.info.mockClear();
+    h.logger.warn.mockClear();
+    h.logger.error.mockClear();
+    await evictIdleSessionForAdmission(victim);
+    const records = JSON.stringify(
+      [
+        ...h.logger.info.mock.calls,
+        ...h.logger.warn.mock.calls,
+        ...h.logger.error.mock.calls,
+      ],
+      (_key, value) => (value instanceof Error ? value.stack : value),
+    );
+    expect(records).not.toContain(victim);
+    expect(records).not.toContain("private-token");
+    expect(h.logger.warn).toHaveBeenCalled();
+  });
+
+  it("releases the pool even if the evicted transport fails to close", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const held = new Map<string, ReturnType<typeof makeServerInstance>>();
+    h.getServer.mockImplementation(async (id: string) => {
+      const instance = held.get(id) ?? makeServerInstance();
+      held.set(id, instance);
+      return instance;
+    });
+    h.cleanupSession.mockImplementation(async (id: string) => {
+      held.delete(id);
+    });
+    const victim = await openSession();
+    vi.spyOn(transportOf(victim), "close").mockRejectedValueOnce(
+      new Error("private-close-fault"),
+    );
+    advanceSeconds(300);
+    const admitted = await initialize();
+    expect(admitted.status).toBe(200);
+    await admitted.text();
+    expect(h.cleanupSession).toHaveBeenCalledWith(victim);
+    const returning = await ping(victim);
+    expect(returning.status).toBe(200);
+    expect(await returning.text()).toContain('"result":{}');
+  });
+});
+
 describe("a failed admission never holds the slot it reserved", () => {
   it("an initialize that fails after evicting hands its slot back", async () => {
     process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
@@ -1035,7 +1336,7 @@ describe("cleanup never tears down a newer transport registered under the same i
     expect(publicSessionSweeper.getLastActivity(sessionId)).toBeDefined();
     expect(h.cleanupSession).not.toHaveBeenCalled();
     expect(warnLines()).toContain(
-      `Session ${sessionId} was re-established under the same id while its old transport was closing; leaving the new transport and its pool state in place.`,
+      "A session was re-established while its old transport was closing; leaving the new transport and its pool state in place.",
     );
 
     // And the newer transport really serves.

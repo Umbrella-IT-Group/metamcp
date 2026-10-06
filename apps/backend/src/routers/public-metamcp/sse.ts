@@ -210,10 +210,17 @@ sseRouter.get(
   async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
-    // Same contract as the StreamableHTTP initialize path: an admission that
-    // evicted holds a reserved slot until its session is registered below, and
-    // the `finally` hands it back on every other exit.
+    // Enabled admissions reserve until registration, including free capacity.
+    // Disconnection and every failure release the reservation too.
     let admissionEviction: CeilingEviction | undefined;
+    let releaseAdmission: (() => void) | undefined;
+    let admissionClosed = false;
+    const onAdmissionClose = () => {
+      if (!releaseAdmission) return;
+      admissionClosed = true;
+      releaseAdmission();
+    };
+    res.once("close", onAdmissionClose);
 
     try {
       // Per-credential concurrent-session ceiling, enforced at creation: the
@@ -239,6 +246,8 @@ sseRouter.get(
       // Taken over before anything else can throw, so the `finally` owns the
       // reserved slot from the moment the decision returns.
       admissionEviction = ceiling.eviction;
+      releaseAdmission = ceiling.releaseAdmission;
+      if (res.destroyed) onAdmissionClose();
       recordSessionCeilingEvent({
         identity,
         endpointName,
@@ -257,6 +266,7 @@ sseRouter.get(
         // rejects.
         await admissionEviction.teardownWait;
       }
+      if (admissionClosed) return;
 
       logger.info(
         `New public endpoint SSE connection request for ${endpointName} -> namespace ${namespaceUuid}`,
@@ -275,6 +285,13 @@ sseRouter.get(
         sessionId,
         namespaceUuid,
       );
+      if (admissionClosed) {
+        // The pool can complete after the client disconnects. It must never
+        // register a session that nobody owns, or consume the released slot.
+        await webAppTransport.close();
+        await metaMcpServerPool.cleanupSession(sessionId);
+        return;
+      }
       if (!mcpServerInstance) {
         throw new Error("Failed to get MetaMCP server instance from pool");
       }
@@ -304,9 +321,8 @@ sseRouter.get(
         webAppTransport,
         requestBinding(authReq),
       );
-      // The new session now counts itself; hand back an eviction's reserved
-      // slot in the same synchronous step.
-      admissionEviction?.release();
+      // Registration replaces the admission's reservation synchronously.
+      releaseAdmission?.();
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -324,7 +340,8 @@ sseRouter.get(
       // destroys an already streaming SSE socket correctly.
       return next(error);
     } finally {
-      admissionEviction?.release();
+      res.off("close", onAdmissionClose);
+      releaseAdmission?.();
     }
   },
 );

@@ -22,8 +22,8 @@ import { SessionIdentity } from "./session-auth";
  * The managers delete a session's binding on removeSession, so the derived
  * count is self-healing: it falls the moment a session ends, through every
  * cleanup path, without this module having to be told. The one maintained
- * term is the short-lived slot reservation an EVICTING admission holds between
- * evicting its victim and registering its own session (see
+ * term is the short-lived slot reservation an opt-in admission holds before
+ * registering its own session (see
  * `admissionReservations`); it is released by the admitting request itself,
  * in a `finally`, never by a cleanup path (or, if the decision faults before
  * it can hand the eviction over, by the decision code on its way out).
@@ -83,11 +83,9 @@ export const DEFAULT_MAX_SESSIONS_PER_CREDENTIAL = 100;
 // slot back now instead of at the next sweep.
 export const DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS = 120;
 
-// Hard floor for the idle threshold. A brand-new session is registered and
-// tracked a few awaits BEFORE its first request is marked in flight (the
-// initialize path connects the server in between), so with a floor of zero
-// a concurrent admission could evict a session that is still being opened.
-// Ten seconds is far beyond that window and still short enough to be useful.
+// Hard floor for the idle threshold. Enabled initial connects are marked in flight;
+// keep a conservative floor after they settle too, so a freshly negotiated
+// session is not immediately evictable while its client prepares the next call.
 export const MIN_CEILING_EVICT_MIN_IDLE_SECONDS = 10;
 
 // Longest an evicting admission waits for its victim's teardown before going
@@ -107,18 +105,16 @@ const counters: IdentitySessionCounter[] = [];
 const activityProbes: SessionActivityProbe[] = [];
 
 /**
- * Slots held by admissions that evicted a session and have not yet registered
- * their own. Keyed per credential identity (method + id, the same pair
+ * Slots held by enabled opt-in admissions that have not yet registered
+ * their own sessions. Keyed per credential identity (method + id, the same pair
  * `identityMatches` compares) and summed into `countLiveSessionsForIdentity`.
  *
  * WHY. The new session is added to its manager only after an await (the pool
- * hands out a server instance first), but the victim leaves the count at once.
- * Without the reservation, every concurrent initialize arriving in that gap
- * would see a free slot and be admitted WITHOUT evicting, pushing the
- * credential over its ceiling by the size of the burst. With it, the count
- * stays at the ceiling throughout and each concurrent admission evicts its own
- * victim. Released by the router once the new session is registered, and in a
- * `finally` on every other exit, so a failed admission cannot hold a slot.
+ * hands out a server instance first). Without a reservation, concurrent
+ * initializes can all claim the same free slot, including one just freed by
+ * eviction. Each enabled admission reserves synchronously, so the next one
+ * sees the correct capacity. The router releases on registration, failure or
+ * disconnection and refuses to register a late result after cancellation.
  */
 const admissionReservations = new Map<string, number>();
 
@@ -231,8 +227,8 @@ const EVICT_DISABLED_VALUES = [
 ];
 
 /**
- * Resolve the ceiling-eviction settings from the environment. Read from
- * `process.env` on each at-ceiling decision, but that environment is fixed
+ * Resolve the ceiling-eviction settings from the environment. The enabled
+ * setting is read for each opt-in admission, the idle floor at the ceiling, but that environment is fixed
  * when the gateway process starts: a changed value takes effect only when the
  * gateway restarts with it (a compose recreate), never on a live process.
  *
@@ -245,7 +241,7 @@ const EVICT_DISABLED_VALUES = [
  * `MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS` (default 120) is how long a
  * session must have been idle to be chosen. Malformed or negative falls back
  * to the default with a WARN; a value under `MIN_CEILING_EVICT_MIN_IDLE_SECONDS`
- * is raised to it with a WARN (see that constant for why zero is unsafe).
+ * is raised to it with a WARN (see that constant for the conservative floor).
  */
 export function resolveEvictionConfig(): CeilingEvictionConfig {
   return {
@@ -273,8 +269,10 @@ function resolveEvictionMinIdleSeconds(): number {
   if (raw === undefined || raw.trim() === "") {
     return DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS;
   }
-  const parsed = Number.parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed < 0) {
+  // Partial parses (e.g. "1e2") can silently lower a destructive eviction
+  // threshold. Require a whole decimal integer and safe millisecond arithmetic.
+  const parsed = Number(raw.trim());
+  if (!/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(parsed * 1000)) {
     logger.warn(
       `MCP_SESSION_CEILING_EVICT_MIN_IDLE_SECONDS=${raw} invalid; falling back to default ${DEFAULT_CEILING_EVICT_MIN_IDLE_SECONDS}.`,
     );
@@ -291,8 +289,7 @@ function resolveEvictionMinIdleSeconds(): number {
 
 /**
  * Live sessions across all registered managers for one identity, plus any
- * slots reserved by admissions that evicted a session and have not yet
- * registered their own (see `admissionReservations`). This is the number the
+ * slots reserved by enabled admissions that have not yet registered their own (see `admissionReservations`). This is the number the
  * ceiling compares against.
  */
 export function countLiveSessionsForIdentity(
@@ -432,6 +429,9 @@ export interface CeilingDecision {
   // was evicted to admit this one (`allowed` is then true). The caller owns
   // `release()`: see `CeilingEviction`.
   eviction?: CeilingEviction;
+  /** Every opt-in admission reserves a slot, including below the ceiling.
+   * Release synchronously when registered and in a finally on other exits. */
+  releaseAdmission?: () => void;
 }
 
 /**
@@ -729,7 +729,8 @@ function boundedTeardownWait(
  * creation: the new session is added to a manager by the caller on the allow
  * path, which is what the next call will count.
  *
- * Without `options.evictIdle` this mutates nothing. With it, a credential at
+ * Without `options.evictIdle` this mutates nothing. When enabled, every
+ * opted-in allowed admission reserves its slot until registration. A credential at
  * its ceiling that holds an idle session (see `selectEvictionCandidate`) has
  * that session evicted and is ALLOWED, with the eviction on the decision; the
  * caller must honour `CeilingEviction.release`. When nothing can be evicted,
@@ -817,6 +818,7 @@ export function checkConcurrentSessionCeiling(
         approaching,
         ...(liveSummary && { liveSummary }),
         eviction,
+        releaseAdmission: eviction.release,
       };
     }
     logger.warn(
@@ -834,11 +836,20 @@ export function checkConcurrentSessionCeiling(
     );
   }
 
+  // A free slot must also be reserved before the router awaits its pool.
+  // Otherwise a burst starting BELOW the ceiling can all claim that same slot.
+  // Keep the old behavior for non-opt-in callers and with the kill switch off.
+  const releaseAdmission =
+    allowed && options?.evictIdle && resolveEvictionEnabled()
+      ? reserveAdmissionSlot(identity)
+      : undefined;
+
   return {
     allowed,
     current,
     ceiling,
     approaching,
     ...(liveSummary && { liveSummary }),
+    ...(releaseAdmission && { releaseAdmission }),
   };
 }
