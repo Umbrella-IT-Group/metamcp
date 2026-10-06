@@ -795,6 +795,17 @@ async function recoverPersistedSessionOnce(
   // ceiling interaction at all. The decision reserves this session's slot,
   // which registration replaces and the `finally` gives back on every other
   // exit.
+  //
+  // Unlike an admission, a recovery does not give its slot back when its
+  // client disconnects, and is not cancelled: it is shared with any requests
+  // waiting on the same id (see the single-flight note), and it has always
+  // registered its session whoever is still listening. Giving the slot back
+  // early would let that late registration take the credential over its
+  // ceiling without the eviction a recovery at the ceiling must try first.
+  // The hold is short: after the decision a recovery awaits only the bounded
+  // eviction wait, `getServer` (whose `createServer` builds the instance
+  // without awaiting anything) and `server.connect` (which only starts the
+  // transport).
   const identity = resolveSessionIdentity(authReq);
   const ceiling = checkConcurrentSessionCeilingForRecovery(identity, {
     label: recoveredIdentity?.name,

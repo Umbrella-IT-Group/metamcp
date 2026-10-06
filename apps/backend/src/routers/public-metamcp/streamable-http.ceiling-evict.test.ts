@@ -248,9 +248,11 @@ function ping(
   sessionId: string,
   endpoint = "ep-1",
   key = rawKey,
+  signal?: AbortSignal,
 ): Promise<Response> {
   return fetch(`${baseUrl}/metamcp/${endpoint}/mcp`, {
     method: "POST",
+    signal,
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -1466,8 +1468,11 @@ describe("lazy recovery at the ceiling: evict, never refuse (Alex's rulings, 202
     expect(evictionLines()[0]).toMatch(GRAFANA_CEILING_RULE);
     expect(recoveryOverCeilingLines()).toEqual([]);
     expect(refusalLines()).toEqual([]);
+    // The History-view event says what was admitted: a recovered session,
+    // not a new one (the log line above keeps the admission wording, which
+    // the alert matches).
     expect(ceilingEvents()).toEqual([
-      "idle session evicted to admit a new session at the concurrent-session ceiling (2/2): ep-1, idle 310s; live: ep-1=1, ep-2=1; in-flight 0, idle 2, oldest idle 310s",
+      "idle session evicted to admit a recovered session at the concurrent-session ceiling (2/2): ep-1, idle 310s; live: ep-1=1, ep-2=1; in-flight 0, idle 2, oldest idle 310s",
     ]);
     expect(evictionsTotal()).toBe(evictionsBefore + 1);
   });
@@ -1882,5 +1887,143 @@ describe("lazy recovery at the ceiling: evict, never refuse (Alex's rulings, 202
     expect(h.rows.has(first)).toBe(true);
     expect(countLiveSessionsForIdentity(identity())).toBe(1);
     expect(evictionLines()).toHaveLength(1);
+  });
+
+  it("its GET (the standalone stream) at the ceiling evicts one idle session and opens the stream under the same id", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    const returning = await openThenReap();
+    const oldest = await openSession();
+    advanceSeconds(10);
+    const other = await openSession("ep-2");
+    advanceSeconds(300);
+    startObserving();
+    const observed = sampleCountOnPoolAcquire();
+
+    const abort = new AbortController();
+    try {
+      const stream = await openGetStream(returning, abort.signal);
+
+      expect(stream.status).toBe(200);
+      expect(stream.headers.get("content-type")).toContain("text/event-stream");
+      expect(h.findById).toHaveBeenCalledWith(returning);
+      expect(observed).toEqual([2]);
+      expect(h.cleanupSession.mock.calls).toEqual([[oldest]]);
+      expect(isResident(oldest)).toBe(false);
+      expect(h.rows.has(oldest)).toBe(true);
+      expect(isResident(other, "ep-2")).toBe(true);
+      expect(isResident(returning)).toBe(true);
+      expect(countLiveSessionsForIdentity(identity())).toBe(2);
+      // The held stream marks the recovered session in flight, so the next
+      // decision at the ceiling cannot choose it.
+      expect(publicSessionSweeper.getActivity(returning)?.inFlight).toBe(true);
+      expect(evictionLines()).toHaveLength(1);
+      expect(evictionLines()[0]).toMatch(GRAFANA_CEILING_RULE);
+      expect(recoveryOverCeilingLines()).toEqual([]);
+      expect(refusalLines()).toEqual([]);
+      expect(ceilingEvents()).toEqual([
+        "idle session evicted to admit a recovered session at the concurrent-session ceiling (2/2): ep-1, idle 310s; live: ep-1=1, ep-2=1; in-flight 0, idle 2, oldest idle 310s",
+      ]);
+    } finally {
+      abort.abort();
+    }
+  });
+
+  it("a recovery whose pool acquisition throws below the ceiling gives its slot back: the count returns to its value before the recovery", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "4";
+    const returning = await openThenReap();
+    const resident = await openSession();
+    const before = countLiveSessionsForIdentity(identity());
+    expect(before).toBe(1);
+    startObserving();
+    h.getServer.mockRejectedValueOnce(new Error("pool fault"));
+
+    const response = await ping(returning);
+
+    // The route's existing error path: the terminal error handler answers.
+    expect(response.status).toBe(500);
+    await response.text();
+    expect(isResident(returning)).toBe(false);
+    expect(isResident(resident)).toBe(true);
+    expect(h.cleanupSession).not.toHaveBeenCalled();
+    expect(countLiveSessionsForIdentity(identity())).toBe(before);
+
+    // Nothing is left in flight for the id either: the next request
+    // recovers it normally.
+    const retry = await ping(returning);
+    expect(retry.status).toBe(200);
+    expect(retry.headers.get("mcp-session-id")).toBe(returning);
+    await retry.text();
+    expect(countLiveSessionsForIdentity(identity())).toBe(before + 1);
+  });
+
+  it("a recovery whose pool acquisition throws after evicting at the ceiling gives its slot back", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    const returning = await openThenReap();
+    const first = await openSession();
+    advanceSeconds(10);
+    const second = await openSession();
+    advanceSeconds(300);
+    startObserving();
+    h.getServer.mockRejectedValueOnce(new Error("pool fault"));
+
+    const response = await ping(returning);
+
+    expect(response.status).toBe(500);
+    await response.text();
+    expect(h.cleanupSession.mock.calls).toEqual([[first]]);
+    expect(isResident(returning)).toBe(false);
+    expect(isResident(second)).toBe(true);
+    // Only `second` is left; the slot the victim left is not held.
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+  });
+
+  it("a client that disconnects during an evicting recovery: the recovery completes, its slot is held until then and handed to the recovered session, never leaked", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";
+    const returning = await openThenReap();
+    const victim = await openSession();
+    advanceSeconds(300);
+    startObserving();
+    let finishTeardown!: () => void;
+    h.cleanupSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishTeardown = resolve;
+        }),
+    );
+
+    const abort = new AbortController();
+    const pending = ping(returning, "ep-1", rawKey, abort.signal).then(
+      () => "answered",
+      () => "aborted",
+    );
+    // The recovery has evicted its victim and is waiting on its teardown.
+    await vi.waitFor(() =>
+      expect(h.cleanupSession).toHaveBeenCalledWith(victim),
+    );
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+
+    abort.abort();
+    expect(await pending).toBe("aborted");
+    // Give the server time to see the disconnect.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Still reserved: the recovery has not settled, so an initialize that
+    // arrives now sees the credential at its ceiling, finds nothing it may
+    // evict (the victim is gone, the recovery not yet registered) and is
+    // refused, rather than slipping in beside the recovery.
+    expect(isResident(returning)).toBe(false);
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+    const meanwhile = await initialize();
+    expect(meanwhile.status).toBe(429);
+    expect(await meanwhile.json()).toEqual(refusalBody(1, 1));
+
+    finishTeardown();
+    await vi.waitFor(() => expect(isResident(returning)).toBe(true));
+
+    // The recovered session replaced the reservation: the credential holds
+    // exactly that one session.
+    expect(countLiveSessionsForIdentity(identity())).toBe(1);
+    expect(evictionLines()).toHaveLength(1);
+    expect(recoveryOverCeilingLines()).toEqual([]);
   });
 });

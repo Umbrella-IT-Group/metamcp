@@ -50,6 +50,19 @@ const evicted = (): CeilingDecision => ({
   ceiling: 300,
   approaching: true,
   eviction: {
+    purpose: "admission",
+    endpointName: "ninja",
+    idleSeconds: 1710,
+    teardownWait: Promise.resolve(),
+    release: () => {},
+  },
+});
+
+/** The same eviction, made by a lazy recovery rather than an initialize. */
+const evictedForRecovery = (): CeilingDecision => ({
+  ...evicted(),
+  eviction: {
+    purpose: "recovery",
     endpointName: "ninja",
     idleSeconds: 1710,
     teardownWait: Promise.resolve(),
@@ -351,6 +364,55 @@ describe("recordSessionCeilingEvent — evictions", () => {
     expect(entry.clientName).toBe("cowork workspace");
     expect(entry.message).toBe(
       "idle session evicted to admit a new session at the concurrent-session ceiling (300/300): ninja, idle 1710s",
+    );
+  });
+
+  it("an eviction made by a lazy recovery says it admitted a recovered session, never a new one", () => {
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      label: "cowork workspace",
+      decision: evictedForRecovery(),
+    });
+
+    expect(recordMock).toHaveBeenCalledTimes(1);
+    const entry = recordMock.mock.calls[0][0];
+    expect(entry.level).toBe("info");
+    expect(entry.message).toBe(
+      "idle session evicted to admit a recovered session at the concurrent-session ceiling (300/300): ninja, idle 1710s",
+    );
+    expect(entry.message).not.toContain("new session");
+  });
+
+  it("an admission's and a recovery's evictions share one throttle window", () => {
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      decision: evicted(),
+    });
+    recordSessionCeilingEvent({
+      identity: identityA,
+      endpointName: "ep-1",
+      decision: evictedForRecovery(),
+    });
+    expect(recordMock).toHaveBeenCalledTimes(1);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + SESSION_CEILING_EVENT_INTERVAL_MS + 1);
+      recordSessionCeilingEvent({
+        identity: identityA,
+        endpointName: "ep-1",
+        decision: evictedForRecovery(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(recordMock).toHaveBeenCalledTimes(2);
+    expect(recordMock.mock.calls[1][0].message).toBe(
+      "idle session evicted to admit a recovered session at the concurrent-session ceiling (300/300): ninja, idle 1710s " +
+        "(1 more evictions suppressed in the last 60s)",
     );
   });
 

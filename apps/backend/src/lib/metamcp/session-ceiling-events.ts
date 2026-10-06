@@ -34,7 +34,9 @@ import type { SessionIdentity } from "./session-auth";
 /**
  * Which ceiling condition an event describes. Part of the throttle key.
  * `evicted`: the credential was at its ceiling and an idle session was evicted
- * so the new one could be admitted (see `checkConcurrentSessionCeiling`).
+ * so a new session could be admitted (`checkConcurrentSessionCeiling`) or a
+ * returning one recovered (`checkConcurrentSessionCeilingForRecovery`). Both
+ * share the kind, and so the throttle window; only the message says which.
  */
 type SessionCeilingEventKind = "refused" | "evicted" | "approaching";
 
@@ -104,11 +106,16 @@ function buildMessage(
   suppressed: number,
 ): string {
   const { current, ceiling, eviction, liveSummary } = decision;
+  // A lazy recovery admits no NEW session, so its eviction must not say it
+  // did. The log line keeps one wording for both (the Grafana ceiling rule
+  // matches it); this event is read by a person, so it says which it was.
+  const admitted =
+    eviction?.purpose === "recovery" ? "a recovered session" : "a new session";
   const base =
     kind === "refused"
       ? `session refused: concurrent-session ceiling reached (${current}/${ceiling})`
       : kind === "evicted"
-        ? `idle session evicted to admit a new session at the concurrent-session ceiling (${current}/${ceiling})` +
+        ? `idle session evicted to admit ${admitted} at the concurrent-session ceiling (${current}/${ceiling})` +
           (eviction
             ? `: ${eviction.endpointName}, idle ${eviction.idleSeconds}s`
             : "")
@@ -132,10 +139,11 @@ function buildMessage(
  * Record a durable, throttled ceiling event for one session-creation decision.
  *
  * Call once per decision at each refusal site, right after
- * `checkConcurrentSessionCeiling`. Emits a `refused` event when the decision
- * refused, an `evicted` event when it admitted by evicting an idle session, an
- * `approaching` event when it allowed but the credential is at or past the 80%
- * WARN threshold, and nothing otherwise. The `evicted` event is `info`, not
+ * `checkConcurrentSessionCeiling`, and for a lazy recovery's decision when it
+ * evicted. Emits a `refused` event when the decision refused, an `evicted`
+ * event when it admitted (a new session, or a recovered one) by evicting an
+ * idle session, an `approaching` event when it allowed but the credential is
+ * at or past the 80% WARN threshold, and nothing otherwise. The `evicted` event is `info`, not
  * `warn`: nothing was turned away, which keeps a refusal the only `warn`
  * outcome at the ceiling. `label` is the
  * credential's DISPLAY NAME (api-key name or OAuth user email) — never a token,

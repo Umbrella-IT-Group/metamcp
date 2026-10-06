@@ -461,6 +461,13 @@ export interface CeilingDecision {
  * slipping in over the limit.
  */
 export interface CeilingEviction {
+  /**
+   * Whose admission the eviction made room for: a new session or a lazily
+   * recovered one. Only the wording of what is reported about it differs
+   * (the History-view event says which); the selection, reservation and wait
+   * are the same for both.
+   */
+  purpose: EvictionPurpose;
   /** The evicted session's endpoint, reduced to log-safe characters. */
   endpointName: string;
   /** How long the evicted session had been idle, whole seconds. */
@@ -650,10 +657,12 @@ function liveSummaryFor(identity: SessionIdentity): string {
 
 /**
  * Whose admission an eviction makes room for. Only the wording of the
- * eviction's own WARN lines differs; the selection, the reserved slot, the
- * bounded wait and the INFO line are the same for both.
+ * eviction's own WARN lines and of its History-view event differs; the
+ * selection, the reserved slot, the bounded wait and the INFO line are the
+ * same for both. The INFO line stays identical on purpose: the Grafana
+ * ceiling rule matches it, whichever request caused the eviction.
  */
-type EvictionPurpose = "admission" | "recovery";
+export type EvictionPurpose = "admission" | "recovery";
 
 const EVICTION_WORDING: Record<
   EvictionPurpose,
@@ -723,6 +732,7 @@ function evictForAdmission(
       },
     );
     return {
+      purpose,
       endpointName,
       idleSeconds,
       teardownWait: boundedTeardownWait(settled, endpointName, purpose),

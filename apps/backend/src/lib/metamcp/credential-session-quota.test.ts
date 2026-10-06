@@ -15,6 +15,7 @@ const { loggerMock } = vi.hoisted(() => ({
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
 import {
+  type CeilingDecision,
   checkConcurrentSessionCeiling,
   checkConcurrentSessionCeilingForRecovery,
   countLiveSessionsForIdentity,
@@ -1101,6 +1102,7 @@ describe("checkConcurrentSessionCeiling — evicting an idle session at the ceil
     expect(decision.ceiling).toBe(2);
     expect(decision.approaching).toBe(true);
     expect(decision.eviction).toMatchObject({
+      purpose: "admission",
       endpointName: "ninja",
       idleSeconds: 1710,
     });
@@ -1590,7 +1592,11 @@ describe("checkConcurrentSessionCeilingForRecovery: evict, never refuse (rulings
       allowed: true,
       current: 2,
       ceiling: 2,
-      eviction: { endpointName: "ninja", idleSeconds: 1710 },
+      eviction: {
+        purpose: "recovery",
+        endpointName: "ninja",
+        idleSeconds: 1710,
+      },
     });
     expect(counter.evictSessionForAdmission).toHaveBeenCalledTimes(1);
     expect(evicted).toEqual(["s-2"]);
@@ -1697,6 +1703,49 @@ describe("checkConcurrentSessionCeilingForRecovery: evict, never refuse (rulings
       decision?.releaseAdmission?.();
     }
     expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(0);
+  });
+
+  it("evictions are one-for-one: they hold an over-ceiling credential where it is and never bring it back down", () => {
+    // A credential already over its ceiling (recoveries that found nothing
+    // to evict took it there). Every later eviction, by a recovery or an
+    // initialize, frees one slot for exactly one registration, so only the
+    // idle sweeper or clients closing their sessions lower the count.
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    const sessions = [
+      { sessionId: "s-1", endpointName: "autotask" },
+      { sessionId: "s-2", endpointName: "autotask" },
+      { sessionId: "s-3", endpointName: "autotask" },
+    ];
+    const { evicted, counter } = evictableCounter({ "key-1": sessions });
+    registerSessionCounter(counter);
+    // The original three are long idle; a session registered here is in use.
+    registerSessionActivityProbe((sessionId) =>
+      sessionId.startsWith("s-") ? idle(600) : { idleMs: 0, inFlight: true },
+    );
+    // What the router does at registration: the session joins its manager
+    // and the reservation is handed back in the same step.
+    const register = (
+      decision: CeilingDecision | undefined,
+      sessionId: string,
+    ) => {
+      sessions.push({ sessionId, endpointName: "autotask" });
+      decision?.releaseAdmission?.();
+    };
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+
+    const recovery = checkConcurrentSessionCeilingForRecovery(API_KEY_IDENTITY);
+    expect(recovery?.eviction).toBeDefined();
+    register(recovery, "recovered-1");
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+
+    const admission = checkConcurrentSessionCeiling(API_KEY_IDENTITY, {
+      evictIdle: true,
+    });
+    expect(admission.eviction).toBeDefined();
+    register(admission, "admitted-1");
+    expect(countLiveSessionsForIdentity(API_KEY_IDENTITY)).toBe(3);
+
+    expect(evicted).toEqual(["s-1", "s-2"]);
   });
 
   it("a throwing evictor falls back to recovering over the ceiling, with recovery wording and no fault text", () => {
