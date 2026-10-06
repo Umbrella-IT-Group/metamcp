@@ -1517,32 +1517,46 @@ export class McpServerPool {
     try {
       const sessionLifetime = await configService.getSessionLifetime();
 
-      // If session lifetime is null, sessions are infinite - skip cleanup
-      if (sessionLifetime === null) {
-        return;
-      }
+      // If session lifetime is configured, find expired sessions
+      if (sessionLifetime !== null) {
+        const now = Date.now();
+        const expiredSessionIds: string[] = [];
 
-      const now = Date.now();
-      const expiredSessionIds: string[] = [];
+        for (const [sessionId, timestamp] of Object.entries(
+          this.sessionTimestamps,
+        )) {
+          if (now - timestamp > sessionLifetime) {
+            expiredSessionIds.push(sessionId);
+          }
+        }
 
-      // Find expired sessions
-      for (const [sessionId, timestamp] of Object.entries(
-        this.sessionTimestamps,
-      )) {
-        if (now - timestamp > sessionLifetime) {
-          expiredSessionIds.push(sessionId);
+        // Clean up expired sessions
+        if (expiredSessionIds.length > 0) {
+          logger.info(
+            `Cleaning up ${expiredSessionIds.length} expired MCP server pool sessions: ${expiredSessionIds.join(", ")}`,
+          );
+
+          await Promise.allSettled(
+            expiredSessionIds.map((sessionId) => this.cleanupSession(sessionId)),
+          );
         }
       }
 
-      // Clean up expired sessions
-      if (expiredSessionIds.length > 0) {
-        logger.info(
-          `Cleaning up ${expiredSessionIds.length} expired MCP server pool sessions: ${expiredSessionIds.join(", ")}`,
+      // Proactive capacity check to avoid pool exhaustion (100/100 limit deadlock).
+      // When total connections reach the 75% watermark, evict surplus idle
+      // sessions down to safe headroom before incoming requests hit the hard cap.
+      const total = this.getTotalConnectionCount();
+      const highWatermark = Math.floor(this.maxTotalConnections * 0.75);
+      if (total >= highWatermark) {
+        logger.warn(
+          `Pool total connections (${total}) exceeds high watermark (${highWatermark}/${this.maxTotalConnections}); running proactive idle eviction`,
         );
-
-        await Promise.allSettled(
-          expiredSessionIds.map((sessionId) => this.cleanupSession(sessionId)),
-        );
+        while (
+          this.getTotalConnectionCount() > highWatermark &&
+          Object.keys(this.idleSessions).length > 0
+        ) {
+          await this.evictOneForCapacity("proactive-reaper");
+        }
       }
     } catch (error) {
       logger.error("Error during automatic session cleanup:", error);
