@@ -944,9 +944,16 @@ export class McpServerPool {
    * Pure predicate, no logging: its only caller (createNewConnection) tries
    * evictOneForCapacity when this is false, so a false result is not yet a
    * refusal. createNewConnection logs the refusal if eviction fails.
+   *
+   * The negated `>=` is deliberate, not `total < max`: the cap comes from
+   * parseInt(MAX_TOTAL_CONNECTIONS), so a malformed value is NaN, and every
+   * comparison with NaN is false. This form keeps the pre-existing answer
+   * for NaN (true, the pool is uncapped). `total < max` would answer false,
+   * and every new connection would destroy a live one through
+   * evictOneForCapacity and then be refused anyway.
    */
   private canCreateConnection(): boolean {
-    return this.getTotalConnectionCount() < this.maxTotalConnections;
+    return !(this.getTotalConnectionCount() >= this.maxTotalConnections);
   }
 
   /**

@@ -645,6 +645,22 @@ describe("McpServerPool.createNewConnection: refusal logged only when eviction f
     expect(warnMessages()).toEqual([]);
   });
 
+  it("treats a NaN cap (malformed MAX_TOTAL_CONNECTIONS) as uncapped: admits, evicts nothing, logs nothing", async () => {
+    internals.maxTotalConnections = Number.NaN;
+    const idle = makeFakeClient();
+    internals.idleSessions["server-A"] = idle as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(idle.cleanup).not.toHaveBeenCalled();
+    expect(warnMessages()).toEqual([]);
+  });
+
   it("logs the refusal with its total/cap context when eviction cannot free a slot", async () => {
     // The only connection at the cap belongs to the server being admitted,
     // and eviction never takes the admitted server's own connection.
