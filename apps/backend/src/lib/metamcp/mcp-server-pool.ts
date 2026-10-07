@@ -466,6 +466,15 @@ export class McpServerPool {
     if (!this.canCreateConnection()) {
       const freed = await this.evictOneForCapacity(params.uuid);
       if (!freed || !this.canCreateConnection()) {
+        // The refusal is logged here, after eviction has failed (or a
+        // concurrent creator took the freed slot), and not inside
+        // canCreateConnection: logging there ran BEFORE eviction, so a
+        // connection that eviction then admitted still read as "Refusing to
+        // create new connection". The text is unchanged because operators
+        // and the pool soak check grep for it.
+        logger.warn(
+          `Connection limit reached: ${this.getTotalConnectionCount()}/${this.maxTotalConnections}. Refusing to create new connection.`,
+        );
         logger.warn(
           `Skipping connection for server ${params.name} (${params.uuid}) - connection limit reached`,
         );
@@ -930,17 +939,14 @@ export class McpServerPool {
   }
 
   /**
-   * Check if we can create a new connection (respects maxTotalConnections limit)
+   * Check if we can create a new connection (respects maxTotalConnections limit).
+   *
+   * Pure predicate, no logging: its only caller (createNewConnection) tries
+   * evictOneForCapacity when this is false, so a false result is not yet a
+   * refusal. createNewConnection logs the refusal if eviction fails.
    */
   private canCreateConnection(): boolean {
-    const total = this.getTotalConnectionCount();
-    if (total >= this.maxTotalConnections) {
-      logger.warn(
-        `Connection limit reached: ${total}/${this.maxTotalConnections}. Refusing to create new connection.`,
-      );
-      return false;
-    }
-    return true;
+    return this.getTotalConnectionCount() < this.maxTotalConnections;
   }
 
   /**
@@ -949,21 +955,25 @@ export class McpServerPool {
    *
    * Why this exists: `maxTotalConnections` was a HARD refuse. Under
    * persistent sessions (`sessionLifetime === null`) `cleanupExpiredSessions`
-   * no-ops, and `cleanupSession` RECYCLES active connections back into the
-   * idle pool rather than destroying them — so the idle pool grows
-   * unbounded until `getTotalConnectionCount` hits the cap. Once full,
+   * no-ops, so active sessions that clients never close keep their
+   * connections until `getTotalConnectionCount` hits the cap. Once full,
    * `canCreateConnection` refused EVERY new connection, including the
    * recreation a backend needs after its container restarts (Watchtower).
    * The pool then deadlocked until a manual `docker restart metamcp`
    * (observed against a live deployment: a backend stayed wedged on
    * "connection limit reached" for minutes after a redeploy).
    *
+   * The idle pool is NOT what fills up: `idleSessions` holds at most one
+   * connection per server (every writer checks for an existing entry, and
+   * `cleanupSession` destroys a recycled connection when its server already
+   * has an idle one). The accumulation is active sessions that never close.
+   *
    * Eviction reclaims capacity by DESTROYING (not recycling) the
    * least-valuable slot: an idle session first (no upstream client depends
-   * on it — and idle is where the recycled surplus accumulates), else the
-   * oldest-touched active connection. Returns true if a slot was freed.
-   * Note: we destroy directly here; `cleanupSession` would recycle the
-   * connection back to idle and free nothing.
+   * on it, and there is at most one per server), else the oldest-touched
+   * active connection. Returns true if a slot was freed. Note: we destroy
+   * directly here; `cleanupSession` would recycle the connection back to
+   * idle and free nothing.
    */
   private async evictOneForCapacity(forServerUuid: string): Promise<boolean> {
     // 1. Prefer an idle session. Avoid evicting the server we're about to
