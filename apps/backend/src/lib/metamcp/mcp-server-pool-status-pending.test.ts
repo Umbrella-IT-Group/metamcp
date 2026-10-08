@@ -3,12 +3,10 @@
  * fix-round item A4 — coordinator audit follow-up, 2026-07-14).
  *
  * `/health/upstream`'s `pool.total` previously reported `idle + active`,
- * omitting in-flight idle-session creations (`creatingIdleSessions`) even
- * though `getTotalConnectionCount()` — the function the MAX_TOTAL_CONNECTIONS
- * cap check actually calls — is `idle + active + pending`. A pool sitting at
- * the cap with several creations in flight would read as having headroom it
- * doesn't have. `getPoolStatus()` now surfaces the same count so the health
- * payload's `total` can match the cap logic exactly (wired in index.ts).
+ * omitting in-flight creations even though admission reserved capacity for
+ * them. The count now includes active connects and detached clients awaiting
+ * close, and excludes idle-creation guards that have not reserved a connect.
+ * idle + active + pending matches physical admission accounting.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -51,11 +49,14 @@ const PoolConstructor = McpServerPool as unknown as new () => McpServerPool;
 
 describe("McpServerPool.getPoolStatus — pending count", () => {
   let pool: McpServerPool;
-  let internals: { creatingIdleSessions: Set<string> };
+  let internals: {
+    creatingIdleSessions: Set<string>;
+    pendingConnections: Record<string, number>;
+  };
 
   beforeEach(() => {
     pool = new PoolConstructor();
-    internals = pool as unknown as { creatingIdleSessions: Set<string> };
+    internals = pool as unknown as typeof internals;
   });
 
   it("reports 0 pending with no in-flight idle creations", () => {
@@ -63,10 +64,17 @@ describe("McpServerPool.getPoolStatus — pending count", () => {
     void pool.cleanupAll();
   });
 
-  it("reports pending == creatingIdleSessions.size (the same count the cap check uses)", () => {
+  it("reports actual connection reservations, independently of idle guards", () => {
     internals.creatingIdleSessions.add("server-1");
     internals.creatingIdleSessions.add("server-2");
-    expect(pool.getPoolStatus().pending).toBe(2);
+    expect(pool.getPoolStatus().pending).toBe(0);
+    internals.pendingConnections = { "server-1": 2, "server-3": 1 };
+    expect(pool.getPoolStatus().pending).toBe(3);
+    expect(pool.getPoolStatus().perServerCounts).toEqual({
+      "server-1": 2,
+      "server-3": 1,
+    });
+    internals.pendingConnections = {};
     void pool.cleanupAll();
   });
 });

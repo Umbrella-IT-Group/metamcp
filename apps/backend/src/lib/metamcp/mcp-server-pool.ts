@@ -31,17 +31,39 @@ const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
 // by the in-flight guard forever.
 const TOOLS_SWEEP_MAX_PAGES = 50;
 
+// How long shutdown waits for connects already in flight. A connect has no
+// cancellation hook and can stay pending indefinitely: an SSE backend that
+// heartbeats without sending its `endpoint` event keeps SDK startup pending
+// before the initialize timeout even starts. Established clients drain
+// alongside this wait, never behind it. 5 s is half of Docker's default 10 s
+// stop grace period, leaving the rest for that drain, the MetaMCP server pool
+// and process exit before SIGKILL. A connect abandoned at the deadline still
+// closes its client if it completes later (openReservedConnection).
+export const SHUTDOWN_PENDING_CONNECT_WAIT_MS = 5000;
+
+// One pending connect's hold on its server's capacity. Shutdown releases the
+// hold of a connect it abandons, so `held` makes the release idempotent when
+// that connect settles later and releases its own.
+type ConnectReservation = { serverUuid: string; held: boolean };
+
+// The server resets that one pending connect caused itself.
+// connectMetaMcpClient retries in place, and a STDIO attempt that crashes
+// resets its server (cleanupServerSessions), bumping the generation getSession
+// sampled before connecting. That reset says nothing about a later attempt of
+// the same connect, so getSession excludes exactly these bumps; any other bump
+// still discards its result.
+type OwnCrashResets = { count: number };
+
 export interface McpServerPoolStatus {
   idle: number;
   active: number;
-  // In-flight idle-session creations (this.creatingIdleSessions.size) — the
-  // SAME count getTotalConnectionCount() adds to idle+active for the
-  // MAX_TOTAL_CONNECTIONS cap check. Exposed so /health/upstream's `total`
-  // can match what the cap logic actually compares against, instead of
-  // silently undercounting by the in-flight set (2026-07-14 audit finding).
+  // Reserved connects plus established clients awaiting publication or close.
+  // idle + active + pending is the same physical count admission enforces.
   pending?: number;
   activeSessionIds: string[];
   idleServerUuids: string[];
+  // Usable/connecting clients for upstream reachability. Retiring clients
+  // reserve capacity (in pending) but cannot count as a live upstream route.
   perServerCounts?: Record<string, number>;
   maxConnectionsPerServer?: number;
   // Per-server connect/health telemetry for /health/upstream. A serverUuid
@@ -63,6 +85,22 @@ export class McpServerPool {
 
   // Active sessions: sessionId -> Record<serverUuid, ConnectedClient>
   private activeSessions: Record<string, Record<string, ConnectedClient>> = {};
+
+  // cleanupAll stops the pool's timers, so it is terminal. Both gateway
+  // layers call it during shutdown; share one drain and stop new admission.
+  private cleanupAllPromise: Promise<void> | null = null;
+
+  // Ownership slots can alias one transport. Keep its physical reservation
+  // through connect, publication, detachment and successful close. In
+  // particular, freeing a map entry before close must not free capacity.
+  private liveClients = new Map<ConnectedClient, string>();
+  private pendingConnections: Record<string, number> = {};
+  private connectionAttempts = new Map<
+    Promise<ConnectedClient | undefined>,
+    ConnectReservation
+  >();
+  private retiringClients = new Map<ConnectedClient, string>();
+  private clientCleanupPromises = new Map<ConnectedClient, Promise<void>>();
 
   // Mapping: sessionId -> Set<serverUuid> for cleanup tracking
   private sessionToServers: Record<string, Set<string>> = {};
@@ -182,7 +220,7 @@ export class McpServerPool {
   // Default number of idle sessions per server UUID
   private readonly defaultIdleCount: number;
 
-  // Maximum total connections (idle + active) to prevent runaway process spawning
+  // Maximum physical reservations across connects, owners and retirement.
   private readonly maxTotalConnections: number;
 
   // Maximum connections per individual server UUID (prevents per-server process explosion)
@@ -289,30 +327,91 @@ export class McpServerPool {
     McpServerPool.instance = null;
   }
 
+  private hasActiveOwner(serverUuid: string, client: ConnectedClient): boolean {
+    return Object.values(this.activeSessions).some(
+      (servers) => servers[serverUuid] === client,
+    );
+  }
+
+  private physicalClients(): Map<ConnectedClient, string> {
+    const clients = new Map(this.liveClients);
+    for (const [uuid, client] of Object.entries(this.idleSessions)) {
+      clients.set(client, uuid);
+    }
+    for (const servers of Object.values(this.activeSessions)) {
+      for (const [uuid, client] of Object.entries(servers)) {
+        clients.set(client, uuid);
+      }
+    }
+    return clients;
+  }
+
+  private retireClient(
+    serverUuid: string,
+    client: ConnectedClient,
+  ): Promise<void> {
+    const pending = this.clientCleanupPromises.get(client);
+    if (pending) return pending;
+    this.liveClients.set(client, serverUuid);
+    this.retiringClients.set(client, serverUuid);
+    // Publish the promise before callbacks run, including synchronous throws
+    // or re-entry. Failed closes stay reserved and unavailable for lending;
+    // a later eviction/health sweep can retry them without spawning past caps.
+    const cleanup = Promise.resolve()
+      .then(() => client.cleanup())
+      .then(() => {
+        this.liveClients.delete(client);
+        this.retiringClients.delete(client);
+      })
+      .finally(() => this.clientCleanupPromises.delete(client));
+    this.clientCleanupPromises.set(client, cleanup);
+    return cleanup;
+  }
+
+  private async retryRetiredClients(): Promise<void> {
+    await Promise.allSettled(
+      Array.from(this.retiringClients, async ([client, uuid]) => {
+        if (this.clientCleanupPromises.has(client)) return;
+        try {
+          await this.retireClient(uuid, client);
+        } catch (error) {
+          logger.error(`Error retrying retired connection for ${uuid}:`, error);
+        }
+      }),
+    );
+  }
+
+  private detachServerClients(serverUuid: string): Set<ConnectedClient> {
+    // Server-wide invalidation deliberately releases every owner. Detach the
+    // whole ownership graph before teardown or notification callbacks can
+    // yield/re-enter, and close each transport once even when slots share it.
+    const clients = new Set<ConnectedClient>();
+    for (const [sid, servers] of Object.entries(this.activeSessions)) {
+      if (servers[serverUuid]) {
+        clients.add(servers[serverUuid]);
+        delete servers[serverUuid];
+        this.sessionToServers[sid]?.delete(serverUuid);
+      }
+    }
+    if (this.idleSessions[serverUuid]) {
+      clients.add(this.idleSessions[serverUuid]);
+      delete this.idleSessions[serverUuid];
+    }
+    this.idleSessionGenerations[serverUuid] =
+      (this.idleSessionGenerations[serverUuid] ?? 0) + 1;
+    this.creatingIdleSessions.delete(serverUuid);
+    return clients;
+  }
+
   /**
    * Count all connections (idle + active + pending) for a specific server UUID
    */
   private countConnectionsForServer(serverUuid: string): number {
-    let count = 0;
-
-    // Count idle session
-    if (this.idleSessions[serverUuid]) {
-      count += 1;
-    }
-
-    // Count active sessions across all sessionIds
-    for (const sessionServers of Object.values(this.activeSessions)) {
-      if (sessionServers[serverUuid]) {
-        count += 1;
-      }
-    }
-
-    // Count pending idle creation
-    if (this.creatingIdleSessions.has(serverUuid)) {
-      count += 1;
-    }
-
-    return count;
+    return (
+      Array.from(this.physicalClients().values()).filter(
+        (uuid) => uuid === serverUuid,
+      ).length + (this.pendingConnections[serverUuid] ?? 0)
+    );
   }
 
   /**
@@ -365,6 +464,8 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
+    if (this.cleanupAllPromise) return undefined;
+
     // Update server params cache
     this.serverParamsCache[serverUuid] = params;
 
@@ -406,22 +507,55 @@ export class McpServerPool {
       return idleClient;
     }
 
-    // No idle session available — check per-server cap before spawning
-    if (!this.canCreateConnectionForServer(serverUuid)) {
-      // At cap: reuse the oldest active connection instead of spawning
+    // At either physical cap, borrow a usable client rather than evicting
+    // another server to create an extra connection to this same backend.
+    const perServerCapacity = this.canCreateConnectionForServer(serverUuid);
+    if (!perServerCapacity || !this.canCreateConnection()) {
       const reusable = this.findOldestActiveConnectionForServer(serverUuid);
       if (reusable) {
         logger.info(
-          `Reusing existing connection for server ${serverUuid} (at per-server cap ${this.maxConnectionsPerServer})`,
+          `Reusing existing connection for server ${serverUuid} (physical connection cap reached)`,
         );
         this.activeSessions[sessionId][serverUuid] = reusable;
         this.sessionToServers[sessionId].add(serverUuid);
         return reusable;
       }
+      // The cap can be occupied entirely by connects or retiring clients.
+      // Neither is lendable, and falling through here would bypass that cap.
+      if (!perServerCapacity) return undefined;
     }
 
-    const newClient = await this.createNewConnection(params, namespaceUuid);
+    // The session map's identity also identifies this public-session lifetime.
+    // DELETE can detach it while a connection is being established, and even
+    // a new session with the same id must not inherit that orphaned result.
+    // A generation bump means the server was updated, deleted or reset in the
+    // meantime, except the resets this connect's own crashed attempts caused.
+    const sessionServers = this.activeSessions[sessionId];
+    const generation = this.idleSessionGenerations[serverUuid] ?? 0;
+    const ownCrashResets: OwnCrashResets = { count: 0 };
+    const newClient = await this.createNewConnection(
+      params,
+      namespaceUuid,
+      ownCrashResets,
+    );
     if (!newClient) {
+      return undefined;
+    }
+
+    if (
+      this.cleanupAllPromise ||
+      this.activeSessions[sessionId] !== sessionServers ||
+      (this.idleSessionGenerations[serverUuid] ?? 0) - ownCrashResets.count !==
+        generation
+    ) {
+      try {
+        await this.retireClient(serverUuid, newClient);
+      } catch (error) {
+        logger.error(
+          `Error cleaning up released or invalidated connection ${sessionId}/${serverUuid}:`,
+          error,
+        );
+      }
       return undefined;
     }
 
@@ -429,7 +563,7 @@ export class McpServerPool {
     // (sessionId, serverUuid) pair may have stored a connection while we were awaiting
     // createNewConnection(). If so, discard ours to avoid leaking the spawned process.
     if (this.activeSessions[sessionId]?.[serverUuid]) {
-      newClient.cleanup().catch((error) => {
+      this.retireClient(serverUuid, newClient).catch((error) => {
         logger.error(
           `Error cleaning up duplicate connection for server ${params.uuid}:`,
           error,
@@ -457,7 +591,9 @@ export class McpServerPool {
   private async createNewConnection(
     params: ServerParameters,
     namespaceUuid?: string,
+    ownCrashResets?: OwnCrashResets,
   ): Promise<ConnectedClient | undefined> {
+    if (this.cleanupAllPromise) return undefined;
     // Check connection limit before attempting to create. At the cap,
     // evict the least-valuable slot (oldest idle, else oldest active) and
     // retry instead of hard-refusing — a hard refuse permanently locks out
@@ -482,82 +618,155 @@ export class McpServerPool {
       }
     }
 
-    logger.info(
-      `Creating new connection for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
-    );
-
-    const connectedClient = await connectMetaMcpClient(
-      params,
-      (exitCode, signal) => {
-        logger.info(
-          `Crash handler callback called for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
-        );
-
-        // Handle process crash - always set up crash handler
-        if (namespaceUuid) {
-          // If we have a namespace context, use it
-          this.handleServerCrash(
-            params.uuid,
-            namespaceUuid,
-            exitCode,
-            signal,
-          ).catch((error) => {
-            logger.error(
-              `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
-              error,
-            );
-          });
-        } else {
-          // If no namespace context, still track the crash globally
-          this.handleServerCrashWithoutNamespace(
-            params.uuid,
-            exitCode,
-            signal,
-          ).catch((error) => {
-            logger.error(
-              `Error handling server crash for ${params.uuid} (no namespace):`,
-              error,
-            );
-          });
-        }
-      },
-      (reason, dropError) => {
-        // HTTP/SSE parity with STDIO's `onProcessCrash`. Watchtower
-        // restarts of the backend container leave our pooled
-        // ConnectedClient with a dead socket; this callback fires
-        // when the SDK Transport reports the drop (`onclose` or
-        // `onerror`). We schedule the same cascade invalidation
-        // PR #16 wired for the request-path recovery — fan out
-        // `list_changed` (PR #19) and drop every pool slot for this
-        // serverUuid so the next getSession spawns a fresh
-        // connection. The async wrapper avoids blocking the SDK's
-        // notification dispatcher on cleanup latency.
-        this.handleTransportDrop(params.uuid, reason, dropError).catch(
-          (error) => {
-            logger.error(
-              `Error handling transport drop for ${params.uuid}:`,
-              error,
-            );
-          },
-        );
-      },
-    );
-    if (!connectedClient) {
-      // connectMetaMcpClient swallows its own errors and resolves
-      // undefined, so this is the single chokepoint where every
-      // failed connect attempt (cold start, sweep-triggered rebuild,
-      // half-open probe) lands. Stamp it for /health/upstream.
-      this.lastConnectFailureAt[params.uuid] = Date.now();
+    // Eviction yields. Recheck both caps and terminal shutdown before making
+    // one synchronous reservation; all active and idle creators use this gate.
+    if (
+      this.cleanupAllPromise ||
+      !this.canCreateConnectionForServer(params.uuid)
+    ) {
       return undefined;
     }
+    const reservation: ConnectReservation = {
+      serverUuid: params.uuid,
+      held: true,
+    };
+    this.pendingConnections[params.uuid] =
+      (this.pendingConnections[params.uuid] ?? 0) + 1;
 
-    // Mark this serverUuid as having a recent successful connection.
-    // Used by the recovery-reset threshold: if the next failure-then-
-    // success cycle lands within the threshold, we'll clear the
-    // circuit breaker accumulation.
-    this.markServerSuccess(params.uuid);
+    const attempt = this.openReservedConnection(
+      params,
+      reservation,
+      namespaceUuid,
+      ownCrashResets,
+    );
+    this.connectionAttempts.set(attempt, reservation);
+    const finished = () => this.connectionAttempts.delete(attempt);
+    attempt.then(finished, finished);
+    return attempt;
+  }
 
-    return connectedClient;
+  private async openReservedConnection(
+    params: ServerParameters,
+    reservation: ConnectReservation,
+    namespaceUuid?: string,
+    ownCrashResets?: OwnCrashResets,
+  ): Promise<ConnectedClient | undefined> {
+    try {
+      logger.info(
+        `Creating new connection for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
+      );
+
+      // A crash reported while connecting is one of this connect's own failed
+      // attempts: each failed attempt closes its transport before the retry,
+      // and a closed transport reports no crash. Its reset is credited to
+      // ownCrashResets. Later crashes are the returned client's.
+      let connecting = true;
+      const connectedClient = await connectMetaMcpClient(
+        params,
+        (exitCode, signal) => {
+          logger.info(
+            `Crash handler callback called for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
+          );
+          const ownReset = connecting ? ownCrashResets : undefined;
+
+          // Handle process crash - always set up crash handler
+          if (namespaceUuid) {
+            // If we have a namespace context, use it
+            this.handleServerCrash(
+              params.uuid,
+              namespaceUuid,
+              exitCode,
+              signal,
+              ownReset,
+            ).catch((error) => {
+              logger.error(
+                `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
+                error,
+              );
+            });
+          } else {
+            // If no namespace context, still track the crash globally
+            this.handleServerCrashWithoutNamespace(
+              params.uuid,
+              exitCode,
+              signal,
+              ownReset,
+            ).catch((error) => {
+              logger.error(
+                `Error handling server crash for ${params.uuid} (no namespace):`,
+                error,
+              );
+            });
+          }
+        },
+        (reason, dropError) => {
+          // HTTP/SSE parity with STDIO's `onProcessCrash`. Watchtower
+          // restarts of the backend container leave our pooled
+          // ConnectedClient with a dead socket; this callback fires
+          // when the SDK Transport reports the drop (`onclose` or
+          // `onerror`). We schedule the same cascade invalidation
+          // PR #16 wired for the request-path recovery — fan out
+          // `list_changed` (PR #19) and drop every pool slot for this
+          // serverUuid so the next getSession spawns a fresh
+          // connection. The async wrapper avoids blocking the SDK's
+          // notification dispatcher on cleanup latency.
+          this.handleTransportDrop(params.uuid, reason, dropError).catch(
+            (error) => {
+              logger.error(
+                `Error handling transport drop for ${params.uuid}:`,
+                error,
+              );
+            },
+          );
+        },
+      );
+      connecting = false;
+      if (!connectedClient) {
+        // connectMetaMcpClient swallows its own errors and resolves
+        // undefined, so this is the single chokepoint where every
+        // failed connect attempt (cold start, sweep-triggered rebuild,
+        // half-open probe) lands. Stamp it for /health/upstream.
+        this.lastConnectFailureAt[params.uuid] = Date.now();
+        return undefined;
+      }
+
+      // Convert the attempt reservation to a live-client reservation before
+      // returning to the caller. Its publication happens in a later microtask.
+      this.liveClients.set(connectedClient, params.uuid);
+      this.releaseConnectionReservation(reservation);
+      // Also the late-connect path for a connect shutdown stopped waiting
+      // for: its client is closed here, never returned for publication.
+      if (this.cleanupAllPromise) {
+        try {
+          await this.retireClient(params.uuid, connectedClient);
+        } catch (error) {
+          logger.error(
+            `Error closing late connection for ${params.uuid} during shutdown:`,
+            error,
+          );
+        }
+        return undefined;
+      }
+
+      // Mark this serverUuid as having a recent successful connection.
+      // Used by the recovery-reset threshold: if the next failure-then-
+      // success cycle lands within the threshold, we'll clear the
+      // circuit breaker accumulation.
+      this.markServerSuccess(params.uuid);
+
+      return connectedClient;
+    } finally {
+      this.releaseConnectionReservation(reservation);
+    }
+  }
+
+  private releaseConnectionReservation(reservation: ConnectReservation): void {
+    if (!reservation.held) return;
+    reservation.held = false;
+    const { serverUuid } = reservation;
+    this.pendingConnections[serverUuid]--;
+    if (!this.pendingConnections[serverUuid])
+      delete this.pendingConnections[serverUuid];
   }
 
   /**
@@ -624,6 +833,7 @@ export class McpServerPool {
     // Both checks are synchronous (before any await) so they act as a pre-await
     // mutex, matching the pattern used by createIdleSessionAsync.
     if (
+      this.cleanupAllPromise ||
       this.idleSessions[serverUuid] ||
       this.creatingIdleSessions.has(serverUuid)
     ) {
@@ -654,7 +864,7 @@ export class McpServerPool {
           // Either a concurrent call already stored an idle session, or
           // invalidateIdleSession() bumped the generation while we were awaiting,
           // meaning our result is stale. Discard it.
-          newClient.cleanup().catch((error) => {
+          this.retireClient(serverUuid, newClient).catch((error) => {
             logger.error(
               `Error cleaning up duplicate idle session for ${serverUuid}:`,
               error,
@@ -683,6 +893,7 @@ export class McpServerPool {
   ): void {
     // Don't create if we already have an idle session or are already creating one
     if (
+      this.cleanupAllPromise ||
       this.idleSessions[serverUuid] ||
       this.creatingIdleSessions.has(serverUuid)
     ) {
@@ -720,7 +931,7 @@ export class McpServerPool {
         } else if (newClient) {
           // Either we already have an idle session, or invalidateIdleSession()
           // bumped the generation while we were awaiting (stale result). Discard it.
-          newClient.cleanup().catch((error) => {
+          this.retireClient(serverUuid, newClient).catch((error) => {
             logger.error(
               `Error cleaning up extra idle session for ${serverUuid}:`,
               error,
@@ -793,9 +1004,7 @@ export class McpServerPool {
     // two concurrent cleanups from both deciding that they own the last
     // reference after one of them pauses on an earlier, slow teardown.
     for (const [serverUuid, client] of Object.entries(activeSession)) {
-      const stillActive = Object.values(this.activeSessions).some(
-        (servers) => servers[serverUuid] === client,
-      );
+      const stillActive = this.hasActiveOwner(serverUuid, client);
 
       if (stillActive) {
         // Repair a legacy duplicate idle alias if one exists. A client that is
@@ -816,7 +1025,7 @@ export class McpServerPool {
         cleanupPromises.push(
           (async () => {
             try {
-              await client.cleanup();
+              await this.retireClient(serverUuid, client);
             } catch (error) {
               logger.error(
                 `Error cleaning up extra connection for server ${serverUuid}:`,
@@ -842,31 +1051,27 @@ export class McpServerPool {
   /**
    * Cleanup all sessions
    */
-  async cleanupAll(): Promise<void> {
-    // Cleanup all active sessions
-    const activeSessionIds = Object.keys(this.activeSessions);
-    await Promise.allSettled(
-      activeSessionIds.map((sessionId) => this.cleanupSession(sessionId)),
-    );
+  cleanupAll(): Promise<void> {
+    if (!this.cleanupAllPromise) {
+      // Publish the drain before invoking any cleanup callbacks, including
+      // synchronous ones, so re-entrant/concurrent shutdown settles once.
+      this.cleanupAllPromise = Promise.resolve().then(() => this.drainAll());
+    }
+    return this.cleanupAllPromise;
+  }
 
-    // Cleanup all idle sessions
-    await Promise.allSettled(
-      Object.entries(this.idleSessions).map(async ([_uuid, client]) => {
-        await client.cleanup();
-      }),
-    );
-
-    // Clear all state
-    this.idleSessions = {};
-    this.activeSessions = {};
-    this.sessionToServers = {};
-    this.sessionTimestamps = {};
-    this.serverParamsCache = {};
-
-    // Bump all known generations (never reset to {}) so any in-flight idle
-    // creation that started before cleanupAll() resolves with a stale value
-    // and discards itself. Cover both tracked entries and UUIDs that are only
-    // in creatingIdleSessions (which default to 0 and have no map entry yet).
+  private async drainAll(): Promise<void> {
+    // Stop maintenance first. Already-started connects/closes are drained
+    // below, and terminal admission prevents callbacks from replacing them.
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
+    if (this.toolsSweepTimer) clearInterval(this.toolsSweepTimer);
+    this.cleanupTimer = null;
+    this.healthCheckTimer = null;
+    this.toolsSweepTimer = null;
+    // Retire pending creations before any teardown await. Otherwise a late
+    // idle result can be stored after the idle snapshot and then lost when
+    // maps are cleared, with its transport never closed.
     for (const uuid of new Set([
       ...Object.keys(this.idleSessionGenerations),
       ...this.creatingIdleSessions,
@@ -876,48 +1081,135 @@ export class McpServerPool {
     }
     this.creatingIdleSessions.clear();
 
-    // Clear cleanup timer
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
+    // A connect may complete after shutdown started. It closes its result
+    // before settling, so process exit cannot interrupt that late teardown.
+    // Start the bounded wait first but await it last: one connect can stay
+    // pending indefinitely, and established clients queued behind it were
+    // left open when the process exited.
+    const connectsSettled = this.waitForPendingConnects();
 
-    // Clear health check timer
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-      this.healthCheckTimer = null;
-    }
+    // Cleanup all active sessions
+    const activeSessionIds = Object.keys(this.activeSessions);
+    await Promise.allSettled(
+      activeSessionIds.map((sessionId) => this.cleanupSession(sessionId)),
+    );
 
-    // Clear tool-definition sweep timer
-    if (this.toolsSweepTimer) {
-      clearInterval(this.toolsSweepTimer);
-      this.toolsSweepTimer = null;
-    }
+    // Include detached teardowns and unpublished/failed clients, not just
+    // idle slots. A DELETE already in progress may have removed its entire
+    // session before shutdown took its snapshot. Closed clients stay in the
+    // maps until state is cleared below, so `swept` limits each client to
+    // one sweep. The second sweep then reaches only late connects that
+    // landed after the first: it joins a close still running and retries
+    // one that failed, as shutdown did when it awaited connects first.
+    const swept = new Set<ConnectedClient>();
+    const sweepPhysicalClients = () =>
+      Promise.allSettled(
+        Array.from(this.physicalClients())
+          .filter(([client]) => !swept.has(client))
+          .map(async ([client, uuid]) => {
+            swept.add(client);
+            try {
+              await this.retireClient(uuid, client);
+            } catch (error) {
+              logger.error(
+                `Error cleaning up idle session ${uuid} during shutdown:`,
+                error,
+              );
+            }
+          }),
+      );
+    await sweepPhysicalClients();
+    await connectsSettled;
+    await sweepPhysicalClients();
 
-    logger.info("Cleaned up all MCP server pool sessions");
+    // Clear all state
+    this.idleSessions = {};
+    this.activeSessions = {};
+    this.sessionToServers = {};
+    this.sessionToNamespace = {};
+    this.sessionTimestamps = {};
+    this.serverParamsCache = {};
+
+    if (this.liveClients.size) {
+      logger.error(
+        `MCP server pool shutdown has ${this.liveClients.size} unclosed connections`,
+      );
+    } else {
+      logger.info("Cleaned up all MCP server pool sessions");
+    }
+  }
+
+  /**
+   * Wait up to SHUTDOWN_PENDING_CONNECT_WAIT_MS for the connects in flight
+   * when shutdown began (terminal admission starts no new ones). A connect
+   * still pending at the deadline is abandoned: its reservation is released,
+   * because the terminal pool admits nothing and would otherwise keep
+   * reporting capacity held by a connect shutdown no longer waits for.
+   */
+  private async waitForPendingConnects(): Promise<void> {
+    if (!this.connectionAttempts.size) return;
+    let deadline: NodeJS.Timeout | undefined;
+    const timedOut = await Promise.race([
+      Promise.allSettled(Array.from(this.connectionAttempts.keys())).then(
+        () => false,
+      ),
+      new Promise<boolean>((resolve) => {
+        deadline = setTimeout(
+          () => resolve(true),
+          SHUTDOWN_PENDING_CONNECT_WAIT_MS,
+        );
+      }),
+    ]);
+    clearTimeout(deadline);
+    const abandoned = Array.from(this.connectionAttempts.values());
+    if (!timedOut || !abandoned.length) return;
+    for (const reservation of abandoned) {
+      this.releaseConnectionReservation(reservation);
+    }
+    const servers = new Set(abandoned.map(({ serverUuid }) => serverUuid));
+    logger.warn(
+      `MCP server pool shutdown stopped waiting after ${SHUTDOWN_PENDING_CONNECT_WAIT_MS}ms for ${abandoned.length} pending connect(s) (${Array.from(servers).join(", ")}); each closes its client if it completes later`,
+    );
   }
 
   /**
    * Get pool status for monitoring
    */
   getPoolStatus(): McpServerPoolStatus {
-    const idle = Object.keys(this.idleSessions).length;
-    const active = Object.keys(this.activeSessions).reduce(
-      (total, sessionId) =>
-        total + Object.keys(this.activeSessions[sessionId]).length,
-      0,
+    const activeClients = new Set(
+      Object.values(this.activeSessions).flatMap((servers) =>
+        Object.values(servers),
+      ),
     );
+    const idleClients = new Set(
+      Object.values(this.idleSessions).filter(
+        (client) => !activeClients.has(client),
+      ),
+    );
+    const idle = idleClients.size;
+    const active = activeClients.size;
 
     // Calculate per-server breakdown
     const perServerCounts: Record<string, number> = {};
-    for (const serverUuid of Object.keys(this.serverParamsCache)) {
-      perServerCounts[serverUuid] = this.countConnectionsForServer(serverUuid);
+    for (const serverUuid of new Set([
+      ...Object.keys(this.serverParamsCache),
+      ...this.physicalClients().values(),
+      ...Object.keys(this.pendingConnections),
+    ])) {
+      // /health/upstream uses this count to decide whether a failed backend
+      // has any route left. A failed close must reserve resources without
+      // masquerading as such a route; global pending still accounts for it.
+      const retiring = Array.from(this.retiringClients.values()).filter(
+        (uuid) => uuid === serverUuid,
+      ).length;
+      perServerCounts[serverUuid] =
+        this.countConnectionsForServer(serverUuid) - retiring;
     }
 
     return {
       idle,
       active,
-      pending: this.creatingIdleSessions.size,
+      pending: this.getTotalConnectionCount() - idle - active,
       activeSessionIds: Object.keys(this.activeSessions),
       idleServerUuids: Object.keys(this.idleSessions),
       perServerCounts,
@@ -951,14 +1243,13 @@ export class McpServerPool {
    * Get total connection count (idle + active + pending)
    */
   private getTotalConnectionCount(): number {
-    const idle = Object.keys(this.idleSessions).length;
-    const active = Object.keys(this.activeSessions).reduce(
-      (total, sessionId) =>
-        total + Object.keys(this.activeSessions[sessionId]).length,
-      0,
+    return (
+      this.physicalClients().size +
+      Object.values(this.pendingConnections).reduce(
+        (sum, count) => sum + count,
+        0,
+      )
     );
-    const pending = this.creatingIdleSessions.size;
-    return idle + active + pending;
   }
 
   /**
@@ -1006,6 +1297,13 @@ export class McpServerPool {
    * idle and free nothing.
    */
   private async evictOneForCapacity(forServerUuid: string): Promise<boolean> {
+    // A prior failed close still consumes physical capacity. Retry those
+    // reservations before taking a connection from another live owner.
+    if (this.retiringClients.size) {
+      const before = this.getTotalConnectionCount();
+      await this.retryRetiredClients();
+      if (this.getTotalConnectionCount() < before) return true;
+    }
     // 1. Prefer an idle session. Avoid evicting the server we're about to
     //    (re)connect; fall back to any idle slot if it's the only one.
     const idleUuids = Object.keys(this.idleSessions);
@@ -1013,21 +1311,30 @@ export class McpServerPool {
       idleUuids.find((uuid) => uuid !== forServerUuid) ?? idleUuids[0];
     if (idleTarget) {
       const client = this.idleSessions[idleTarget];
-      // Drop the map entry synchronously so the slot is freed before the
-      // (async) cleanup and a concurrent count sees the reduced total.
+      // Detach synchronously so nobody can adopt a closing client. Its
+      // physical reservation remains until cleanup succeeds.
       delete this.idleSessions[idleTarget];
-      logger.warn(
-        `Pool at cap (${this.maxTotalConnections}); destroying idle session for ${idleTarget} to admit ${forServerUuid}`,
-      );
-      try {
-        await client?.cleanup();
-      } catch (error) {
-        logger.error(
-          `Error destroying idle session ${idleTarget} during capacity eviction:`,
-          error,
+      if (client && this.hasActiveOwner(idleTarget, client)) {
+        // Repair a legacy idle alias, but removing an alias does not free a
+        // physical reservation, so it cannot claim a successful eviction.
+        logger.warn(
+          `Pool at cap (${this.maxTotalConnections}); removed shared idle alias for ${idleTarget} to admit ${forServerUuid}`,
         );
+        return false;
+      } else {
+        logger.warn(
+          `Pool at cap (${this.maxTotalConnections}); destroying idle session for ${idleTarget} to admit ${forServerUuid}`,
+        );
+        try {
+          if (client) await this.retireClient(idleTarget, client);
+        } catch (error) {
+          logger.error(
+            `Error destroying idle session ${idleTarget} during capacity eviction:`,
+            error,
+          );
+        }
+        return !client || !this.liveClients.has(client);
       }
-      return true;
     }
 
     // 2. No idle slots — every slot is an in-use active connection. Destroy
@@ -1051,14 +1358,14 @@ export class McpServerPool {
             `destroying oldest active connection ${victim.sid}/${victim.uuid} to admit ${forServerUuid}`,
         );
         try {
-          await client.cleanup();
+          await this.retireClient(victim.uuid, client);
         } catch (error) {
           logger.error(
             `Error destroying active connection ${victim.sid}/${victim.uuid} during capacity eviction:`,
             error,
           );
         }
-        return true;
+        return !this.liveClients.has(client);
       }
     }
 
@@ -1072,13 +1379,16 @@ export class McpServerPool {
    * namespace's count (and so is never floor-protected).
    */
   private activeConnectionsPerNamespace(): Record<string, number> {
-    const counts: Record<string, number> = {};
+    const clients: Record<string, Set<ConnectedClient>> = {};
     for (const [sid, servers] of Object.entries(this.activeSessions)) {
       const ns = this.sessionToNamespace[sid];
       if (!ns) continue;
-      counts[ns] = (counts[ns] ?? 0) + Object.keys(servers).length;
+      clients[ns] ??= new Set();
+      for (const client of Object.values(servers)) clients[ns].add(client);
     }
-    return counts;
+    return Object.fromEntries(
+      Object.entries(clients).map(([ns, set]) => [ns, set.size]),
+    );
   }
 
   /**
@@ -1097,6 +1407,12 @@ export class McpServerPool {
     respectFloor: boolean,
     perNamespace: Record<string, number>,
   ): { sid: string; uuid: string } | undefined {
+    const owners = new Map<ConnectedClient, number>();
+    for (const servers of Object.values(this.activeSessions)) {
+      for (const client of Object.values(servers)) {
+        owners.set(client, (owners.get(client) ?? 0) + 1);
+      }
+    }
     let oldestSid: string | undefined;
     let oldestUuid: string | undefined;
     let oldestTs = Infinity;
@@ -1114,6 +1430,9 @@ export class McpServerPool {
       }
       for (const uuid of Object.keys(servers)) {
         if (uuid === forServerUuid) continue;
+        // Removing one borrower frees no transport; closing it would break
+        // all surviving borrowers. Only an exclusive owner can be evicted.
+        if ((owners.get(servers[uuid]) ?? 0) > 1) continue;
         oldestTs = ts;
         oldestSid = sid;
         oldestUuid = uuid;
@@ -1173,11 +1492,21 @@ export class McpServerPool {
     // Update server params cache
     this.serverParamsCache[serverUuid] = params;
 
+    // Retire pending creations before teardown yields. A completed stale
+    // creation must not publish an old-parameter client during invalidation.
+    this.idleSessionGenerations[serverUuid] =
+      (this.idleSessionGenerations[serverUuid] ?? 0) + 1;
+    this.creatingIdleSessions.delete(serverUuid);
+
     // Cleanup existing idle session if it exists
     const existingIdleSession = this.idleSessions[serverUuid];
-    if (existingIdleSession) {
+    delete this.idleSessions[serverUuid];
+    if (
+      existingIdleSession &&
+      !this.hasActiveOwner(serverUuid, existingIdleSession)
+    ) {
       try {
-        await existingIdleSession.cleanup();
+        await this.retireClient(serverUuid, existingIdleSession);
         logger.info(
           `Cleaned up existing idle session for server ${serverUuid}`,
         );
@@ -1187,15 +1516,7 @@ export class McpServerPool {
           error,
         );
       }
-      delete this.idleSessions[serverUuid];
     }
-
-    // Bump the generation before clearing the in-progress guard so any
-    // in-flight createIdleSession / createIdleSessionAsync that resolves
-    // after this point will see a stale generation and discard its result.
-    this.idleSessionGenerations[serverUuid] =
-      (this.idleSessionGenerations[serverUuid] ?? 0) + 1;
-    this.creatingIdleSessions.delete(serverUuid);
 
     // Create a new idle session with updated parameters
     await this.createIdleSession(serverUuid, params, namespaceUuid);
@@ -1222,21 +1543,6 @@ export class McpServerPool {
   async cleanupIdleSession(serverUuid: string): Promise<void> {
     logger.info(`Cleaning up idle session for server ${serverUuid}`);
 
-    // Cleanup existing idle session if it exists
-    const existingIdleSession = this.idleSessions[serverUuid];
-    if (existingIdleSession) {
-      try {
-        await existingIdleSession.cleanup();
-        logger.info(`Cleaned up idle session for server ${serverUuid}`);
-      } catch (error) {
-        logger.error(
-          `Error cleaning up idle session for server ${serverUuid}:`,
-          error,
-        );
-      }
-      delete this.idleSessions[serverUuid];
-    }
-
     // Bump rather than delete the generation entry. Deleting would reset the
     // effective value to 0 (via the ?? 0 default), which could spuriously match
     // an in-flight creation that also captured 0 before this cleanup ran,
@@ -1248,6 +1554,25 @@ export class McpServerPool {
 
     // Remove from server params cache
     delete this.serverParamsCache[serverUuid];
+
+    // Detach before cleanup yields so getSession cannot adopt a closing
+    // transport and this cleanup cannot erase a newer replacement slot.
+    const existingIdleSession = this.idleSessions[serverUuid];
+    delete this.idleSessions[serverUuid];
+    if (
+      existingIdleSession &&
+      !this.hasActiveOwner(serverUuid, existingIdleSession)
+    ) {
+      try {
+        await this.retireClient(serverUuid, existingIdleSession);
+        logger.info(`Cleaned up idle session for server ${serverUuid}`);
+      } catch (error) {
+        logger.error(
+          `Error cleaning up idle session for server ${serverUuid}:`,
+          error,
+        );
+      }
+    }
   }
 
   /**
@@ -1319,20 +1644,7 @@ export class McpServerPool {
     // ConnectedClient appears in the pool but no upstream notification
     // is ever emitted (backend FastMCP doesn't emit on its own startup;
     // that's a separate, future PR).
-    const doomedClients: { client: ConnectedClient; sid: string }[] = [];
-
-    for (const [sid, sessionServers] of Object.entries(this.activeSessions)) {
-      const cachedClient = sessionServers[serverUuid];
-      if (!cachedClient) {
-        continue;
-      }
-      doomedClients.push({ client: cachedClient, sid });
-    }
-
-    const idleClient = this.idleSessions[serverUuid];
-    if (idleClient) {
-      doomedClients.push({ client: idleClient, sid: "<idle>" });
-    }
+    const doomedClients = this.detachServerClients(serverUuid);
 
     // Fire `list_changed` subscribers on every doomed client BEFORE we
     // start any cleanup. `cleanup()` clears the subscriber set, so we
@@ -1341,7 +1653,7 @@ export class McpServerPool {
     // Errors from individual subscribers are isolated by the proxy-side
     // try/catch; we additionally guard here so a misbehaving subscriber
     // can't break the invalidation cascade.
-    for (const { client: doomed } of doomedClients) {
+    for (const doomed of doomedClients) {
       const subscribers = Array.from(doomed.listChangedSubscribers);
       // Clear immediately so the upcoming cleanup() can't double-fire
       // a subscriber that we already invoked here.
@@ -1370,51 +1682,16 @@ export class McpServerPool {
     // Now run cleanup. Each cleanup is wrapped so one cleanup failure
     // doesn't short-circuit the rest — we WANT every stale slot dropped
     // from the map.
-    const cleanupPromises: Promise<void>[] = [];
-
-    for (const { client: cachedClient, sid } of doomedClients) {
-      if (sid === "<idle>") {
-        cleanupPromises.push(
-          (async () => {
-            try {
-              await cachedClient.cleanup();
-            } catch (error) {
-              logger.error(
-                `Error cleaning up invalidated idle session for ${serverUuid}:`,
-                error,
-              );
-            }
-          })(),
+    const cleanupPromises = Array.from(doomedClients, async (cachedClient) => {
+      try {
+        await this.retireClient(serverUuid, cachedClient);
+      } catch (error) {
+        logger.error(
+          `Error cleaning up invalidated connection for ${serverUuid}:`,
+          error,
         );
-        delete this.idleSessions[serverUuid];
-      } else {
-        cleanupPromises.push(
-          (async () => {
-            try {
-              await cachedClient.cleanup();
-            } catch (error) {
-              logger.error(
-                `Error cleaning up invalidated active session ${sid}/${serverUuid}:`,
-                error,
-              );
-            }
-          })(),
-        );
-        const sessionServers = this.activeSessions[sid];
-        if (sessionServers) {
-          delete sessionServers[serverUuid];
-        }
-        this.sessionToServers[sid]?.delete(serverUuid);
       }
-    }
-
-    // Drop the in-flight idle-creation guard. Any pending
-    // `createNewConnection` for this server captures the generation
-    // counter at await time and discards its result if the counter has
-    // bumped — so an in-flight stale creation can't sneak a dead
-    // client back into the map between the invalidation and the
-    // recovery's getSession call. (See createIdleSessionAsync.)
-    this.creatingIdleSessions.delete(serverUuid);
+    });
 
     await Promise.all(cleanupPromises);
 
@@ -1431,13 +1708,15 @@ export class McpServerPool {
   }
 
   /**
-   * Handle server process crash
+   * Handle server process crash. `ownCrashResets` is set only by a pending
+   * pool connect whose own attempt crashed (openReservedConnection).
    */
   async handleServerCrash(
     serverUuid: string,
     namespaceUuid: string,
     exitCode: number | null,
     signal: string | null,
+    ownCrashResets?: OwnCrashResets,
   ): Promise<void> {
     logger.warn(
       `Handling server crash for ${serverUuid} in namespace ${namespaceUuid}`,
@@ -1447,7 +1726,7 @@ export class McpServerPool {
     await serverErrorTracker.recordServerCrash(serverUuid, exitCode, signal);
 
     // Clean up any existing sessions for this server
-    await this.cleanupServerSessions(serverUuid);
+    await this.cleanupServerSessions(serverUuid, ownCrashResets);
   }
 
   /**
@@ -1458,6 +1737,7 @@ export class McpServerPool {
     serverUuid: string,
     exitCode: number | null,
     signal: string | null,
+    ownCrashResets?: OwnCrashResets,
   ): Promise<void> {
     logger.warn(
       `Handling server crash for ${serverUuid} (no namespace context)`,
@@ -1468,56 +1748,35 @@ export class McpServerPool {
     await serverErrorTracker.recordServerCrash(serverUuid, exitCode, signal);
 
     // Clean up any existing sessions for this server
-    await this.cleanupServerSessions(serverUuid);
+    await this.cleanupServerSessions(serverUuid, ownCrashResets);
   }
 
   /**
    * Clean up all sessions for a specific server
    */
-  private async cleanupServerSessions(serverUuid: string): Promise<void> {
-    // Bump generation and release the guard FIRST — before any await — so that
-    // an in-flight idle creation that resolves during the cleanup loop below
-    // (e.g. while we await an active-session cleanup) sees a stale generation
-    // and discards its result instead of storing it into the now-empty slot.
-    this.idleSessionGenerations[serverUuid] =
-      (this.idleSessionGenerations[serverUuid] ?? 0) + 1;
-    this.creatingIdleSessions.delete(serverUuid);
-
-    // Clean up idle session
-    const idleSession = this.idleSessions[serverUuid];
-    if (idleSession) {
-      try {
-        await idleSession.cleanup();
-        logger.info(`Cleaned up idle session for crashed server ${serverUuid}`);
-      } catch (error) {
-        logger.error(
-          `Error cleaning up idle session for crashed server ${serverUuid}:`,
-          error,
-        );
-      }
-      delete this.idleSessions[serverUuid];
-    }
-
-    // Clean up active sessions that use this server
-    for (const [sessionId, sessionServers] of Object.entries(
-      this.activeSessions,
-    )) {
-      if (sessionServers[serverUuid]) {
+  private async cleanupServerSessions(
+    serverUuid: string,
+    ownCrashResets?: OwnCrashResets,
+  ): Promise<void> {
+    const clients = this.detachServerClients(serverUuid);
+    // Credit the bump in the same synchronous step that made it, so the
+    // connect's guard sees both or neither. Crediting at crash time instead
+    // would also count a crash whose recording threw before any reset ran,
+    // and that credit would cancel a real invalidation's bump.
+    if (ownCrashResets) ownCrashResets.count++;
+    await Promise.all(
+      Array.from(clients, async (client) => {
         try {
-          await sessionServers[serverUuid].cleanup();
-          logger.info(
-            `Cleaned up active session ${sessionId} for crashed server ${serverUuid}`,
-          );
+          await this.retireClient(serverUuid, client);
+          logger.info(`Cleaned up connection for crashed server ${serverUuid}`);
         } catch (error) {
           logger.error(
-            `Error cleaning up active session ${sessionId} for crashed server ${serverUuid}:`,
+            `Error cleaning up connection for crashed server ${serverUuid}:`,
             error,
           );
         }
-        delete sessionServers[serverUuid];
-        this.sessionToServers[sessionId]?.delete(serverUuid);
-      }
-    }
+      }),
+    );
   }
 
   /**
@@ -1624,6 +1883,7 @@ export class McpServerPool {
    * Servers in ERROR state whose crash counters have been reset are retried.
    */
   private async checkIdleSessionHealth(): Promise<void> {
+    if (this.retiringClients.size) await this.retryRetiredClients();
     // NOTE: no early return on an empty idle map. Zero idle sessions is
     // precisely the state a fully-zombied or fully-capped pool is in -
     // bailing here would skip the ERROR-state recreation loop and the
@@ -1684,17 +1944,26 @@ export class McpServerPool {
         // Ping with a 5-second timeout
         await client.client.ping({ timeout: 5000 });
       } catch {
+        // The ping can finish after getSession promoted this client to active
+        // and filled idle with a replacement. Only retire the slot we pinged;
+        // active clients have their own two-strike health policy below.
+        if (this.idleSessions[serverUuid] !== client) continue;
+        delete this.idleSessions[serverUuid];
+        if (this.hasActiveOwner(serverUuid, client)) continue;
+
         logger.warn(
           `Idle session health check failed for server ${serverUuid}, recreating...`,
         );
 
         // Clean up the dead session
         try {
-          await client.cleanup();
-        } catch {
-          // Already dead, ignore cleanup errors
+          await this.retireClient(serverUuid, client);
+        } catch (error) {
+          logger.error(
+            `Error cleaning up unhealthy idle session for ${serverUuid}:`,
+            error,
+          );
         }
-        delete this.idleSessions[serverUuid];
 
         // Reset error state so we can retry
         await serverErrorTracker.resetServerErrorState(serverUuid);
