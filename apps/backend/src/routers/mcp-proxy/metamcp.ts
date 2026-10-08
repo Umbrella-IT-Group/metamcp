@@ -14,6 +14,7 @@ import {
   runWithCallerContext,
 } from "../../lib/metamcp/caller-context-store";
 import { createServer } from "../../lib/metamcp/index";
+import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 
 const metamcpRouter = express.Router();
@@ -141,6 +142,8 @@ metamcpRouter.post("/:uuid/mcp", async (req, res) => {
 
       const webAppTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: randomUUID,
+        // See lib/metamcp/mcp-request-body-limit for the value and why.
+        maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
         onsessioninitialized: async (newSessionId) => {
           try {
             // Extract includeInactiveServers from query parameters

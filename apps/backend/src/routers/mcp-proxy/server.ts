@@ -26,6 +26,7 @@ import logger from "@/utils/logger";
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
 import { transformDockerUrl } from "../../lib/metamcp/client";
+import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import {
   getDefaultEnvironment,
@@ -710,6 +711,8 @@ serverRouter.post("/mcp", async (req, res) => {
 
       const webAppTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => newSessionId,
+        // See lib/metamcp/mcp-request-body-limit for the value and why.
+        maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
         onsessioninitialized: (sessionId) => {
           webAppTransports.set(sessionId, webAppTransport);
           if (serverTransport) {

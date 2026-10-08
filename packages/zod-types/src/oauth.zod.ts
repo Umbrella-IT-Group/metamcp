@@ -1,11 +1,25 @@
 import { z } from "zod";
 
+// The authorization server a stored upstream credential belongs to. MCP SDK
+// 1.31 `auth()` stamps it on everything it hands to `saveClientInformation` /
+// `saveTokens`, and on read refuses to present a value stamped for a different
+// authorization server (GHSA-6qxp-vccf-f47h). It is not part of the OAuth wire
+// format, so it has to be carried here explicitly: `z.object` strips unknown
+// keys, and while these two schemas lacked the field the stamp was dropped on
+// the way into `oauth_sessions` and every stored client_secret and refresh
+// token read back unbound, i.e. sendable to whatever authorization server the
+// upstream MCP server advertised next. Optional because rows written before
+// 1.31 have none; the Inspector's provider (apps/frontend/lib/oauth-provider)
+// refuses to present those to any authorization server.
+const OAuthIssuerSchema = z.string().optional();
+
 // OAuth Client Information schema (matching MCP SDK)
 export const OAuthClientInformationSchema = z.object({
   client_id: z.string(),
   client_secret: z.string().optional(),
   client_id_issued_at: z.number().optional(),
   client_secret_expires_at: z.number().optional(),
+  issuer: OAuthIssuerSchema,
 });
 
 // OAuth Tokens schema (matching MCP SDK)
@@ -15,6 +29,7 @@ export const OAuthTokensSchema = z.object({
   expires_in: z.number().optional(),
   scope: z.string().optional(),
   refresh_token: z.string().optional(),
+  issuer: OAuthIssuerSchema,
 });
 
 /**

@@ -37,6 +37,7 @@ import {
   shouldRefuseRecovery,
 } from "../../lib/metamcp/gateway-boot-id";
 import { metamcpLogStore } from "../../lib/metamcp/log-store";
+import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
   AuthMethod,
@@ -870,6 +871,9 @@ async function rebuildRecoveredTransport(
   stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
+    // The same body ceiling as a fresh session: a recovered session carries
+    // the same tool calls. See lib/metamcp/mcp-request-body-limit.
+    maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
     onsessioninitialized: async (sid) => {
       logger.info(
         `Lazy-recovered session re-initialized for sessionId: ${sid}`,
@@ -1493,6 +1497,8 @@ streamableHttpRouter.post(
         // Create transport with the predetermined session ID
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => newSessionId,
+          // See lib/metamcp/mcp-request-body-limit for the value and why.
+          maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
           onsessioninitialized: async (sessionId) => {
             try {
               logger.info(`Session initialized for sessionId: ${sessionId}`);
