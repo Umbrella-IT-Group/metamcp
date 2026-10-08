@@ -16,7 +16,15 @@
  * unit-under-test here is the invalidation surface.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from "vitest";
 
 // `mcp-server-pool.ts` instantiates a `connectMetaMcpClient` -driven
 // pool at module load time. Stub the heavy imports so the unit test
@@ -48,6 +56,8 @@ vi.mock("./server-error-tracker", () => ({
     resetServerErrorState: vi.fn(),
   },
 }));
+
+import logger from "@/utils/logger";
 
 import { McpServerPool } from "./mcp-server-pool";
 import { toolsSyncCache } from "./tools-sync-cache";
@@ -412,12 +422,17 @@ describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
 //
 // Before this, `maxTotalConnections` was a HARD refuse. Under
 // persistent sessions (sessionLifetime=null) cleanupExpiredSessions
-// no-ops and cleanupSession RECYCLES active→idle, so the idle pool
-// grows until the cap is hit — then EVERY new connection is refused,
-// including the recreation a backend needs after a Watchtower restart.
-// The pool deadlocked on "connection limit reached" until a manual
-// `docker restart metamcp` (observed against a live deployment: a
-// backend stayed wedged for minutes after a redeploy).
+// no-ops, so active sessions that clients never close keep their
+// connections until the pool reaches the cap, and then EVERY new
+// connection was refused, including the recreation a backend needs
+// after a Watchtower restart. The idle pool is NOT where that
+// accumulation happens: idleSessions holds at most one connection per
+// server (every writer checks for an existing entry, and
+// cleanupSession destroys a recycled connection when its server
+// already has an idle one). The pool deadlocked on "connection limit
+// reached" until a manual `docker restart metamcp` (observed against
+// a live deployment: a backend stayed wedged for minutes after a
+// redeploy).
 //
 // evictOneForCapacity reclaims one slot by DESTROYING (not recycling)
 // the least-valuable connection: idle first, then oldest active.
@@ -508,6 +523,208 @@ describe("McpServerPool.evictOneForCapacity — LRU eviction at the cap", () => 
   it("returns false when the pool is empty (nothing to evict)", async () => {
     const freed = await internals.evictOneForCapacity("server-1");
     expect(freed).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------
+// Refusal wording at the cap
+//
+// `canCreateConnection` used to log "Connection limit reached ...
+// Refusing to create new connection." itself, BEFORE createNewConnection
+// ran evictOneForCapacity. A connection that eviction then admitted
+// therefore read as a refusal in the logs, and an operator grepping
+// "Refusing" during an incident saw refusals that never happened. The
+// refusal line now fires only once eviction has failed (or a concurrent
+// creator re-filled the freed slot). The "Pool at cap" WARN from
+// evictOneForCapacity is the saturation signal and must stay.
+// -------------------------------------------------------------------
+describe("McpServerPool.createNewConnection: refusal logged only when eviction fails", () => {
+  type CapInternals = {
+    activeSessions: Record<string, Record<string, FakeClient>>;
+    idleSessions: Record<string, FakeClient>;
+    sessionToServers: Record<string, Set<string>>;
+    sessionTimestamps: Record<string, number>;
+    maxTotalConnections: number;
+    evictOneForCapacity: (forServerUuid: string) => Promise<boolean>;
+    createNewConnection: (params: {
+      uuid: string;
+      name: string;
+    }) => Promise<unknown>;
+  };
+
+  let pool: McpServerPool;
+  let internals: CapInternals;
+  let connectMock: ReturnType<typeof vi.fn>;
+  let warnSpy: MockInstance<typeof logger.warn>;
+
+  const warnMessages = (): string[] =>
+    warnSpy.mock.calls.map((call) => String(call[0]));
+  const refusalLines = (): string[] =>
+    warnMessages().filter((m) => m.includes("Refusing to create"));
+  const skipLines = (): string[] =>
+    warnMessages().filter((m) => m.startsWith("Skipping connection"));
+  const poolAtCapLines = (): string[] =>
+    warnMessages().filter((m) => m.startsWith("Pool at cap"));
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.sessionTimestamps = {};
+    connectMock = (await import("./client"))
+      .connectMetaMcpClient as unknown as ReturnType<typeof vi.fn>;
+    connectMock.mockReset();
+    connectMock.mockResolvedValue({ client: {}, cleanup: vi.fn() });
+    warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it("logs no refusal and no skip when evicting an idle session admits the connection", async () => {
+    internals.maxTotalConnections = 2;
+    const idleOther = makeFakeClient();
+    internals.idleSessions["server-A"] = idleOther as never;
+    internals.idleSessions["server-B"] = makeFakeClient() as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(idleOther.cleanup).toHaveBeenCalledTimes(1);
+    expect(refusalLines()).toEqual([]);
+    expect(skipLines()).toEqual([]);
+    // The saturation signal (METAMCP-POOL-1 soak criterion) is unchanged.
+    expect(poolAtCapLines()).toEqual([
+      "Pool at cap (2); destroying idle session for server-A to admit server-C",
+    ]);
+  });
+
+  it("logs no refusal and no skip when evicting an active connection admits the connection", async () => {
+    internals.maxTotalConnections = 2;
+    const cOld = makeFakeClient();
+    internals.activeSessions["session-old"] = { "server-A": cOld as never };
+    internals.activeSessions["session-new"] = {
+      "server-B": makeFakeClient() as never,
+    };
+    internals.sessionToServers["session-old"] = new Set(["server-A"]);
+    internals.sessionToServers["session-new"] = new Set(["server-B"]);
+    internals.sessionTimestamps["session-old"] = 1000;
+    internals.sessionTimestamps["session-new"] = 2000;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(cOld.cleanup).toHaveBeenCalledTimes(1);
+    expect(refusalLines()).toEqual([]);
+    expect(skipLines()).toEqual([]);
+    expect(poolAtCapLines()).toEqual([
+      "Pool at cap (2) with no idle slots; destroying oldest active connection session-old/server-A to admit server-C",
+    ]);
+  });
+
+  it("logs nothing below the cap", async () => {
+    internals.maxTotalConnections = 5;
+    internals.idleSessions["server-A"] = makeFakeClient() as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(warnMessages()).toEqual([]);
+  });
+
+  it("treats a NaN cap (malformed MAX_TOTAL_CONNECTIONS) as uncapped: admits, evicts nothing, logs nothing", async () => {
+    internals.maxTotalConnections = Number.NaN;
+    const idle = makeFakeClient();
+    internals.idleSessions["server-A"] = idle as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(idle.cleanup).not.toHaveBeenCalled();
+    expect(warnMessages()).toEqual([]);
+  });
+
+  it("logs the refusal with its total/cap context when eviction cannot free a slot", async () => {
+    // The only connection at the cap belongs to the server being admitted,
+    // and eviction never takes the admitted server's own connection.
+    internals.maxTotalConnections = 1;
+    const cSelf = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-C": cSelf as never };
+    internals.sessionToServers["session-A"] = new Set(["server-C"]);
+    internals.sessionTimestamps["session-A"] = 1000;
+    const realEvict = internals.evictOneForCapacity.bind(pool);
+    const evictSpy = vi.fn(realEvict);
+    internals.evictOneForCapacity = evictSpy;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeUndefined();
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(cSelf.cleanup).not.toHaveBeenCalled();
+    expect(refusalLines()).toEqual([
+      "Connection limit reached: 1/1. Refusing to create new connection.",
+    ]);
+    expect(skipLines()).toEqual([
+      "Skipping connection for server backend-c (server-C) - connection limit reached",
+    ]);
+    expect(poolAtCapLines()).toEqual([]);
+
+    // The refusal is a verdict on a failed eviction, so it must be logged
+    // AFTER eviction was attempted, never before it.
+    expect(evictSpy).toHaveBeenCalledTimes(1);
+    const refusalCallIndex = warnMessages().findIndex((m) =>
+      m.includes("Refusing to create"),
+    );
+    expect(evictSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      warnSpy.mock.invocationCallOrder[refusalCallIndex],
+    );
+  });
+
+  it("logs the refusal when eviction frees a slot but a concurrent creator re-fills it", async () => {
+    // evictOneForCapacity awaits the victim's cleanup, so another creator
+    // can take the freed slot before createNewConnection re-checks. The
+    // connection really is refused in that case, and the log must say so.
+    internals.maxTotalConnections = 1;
+    internals.idleSessions["server-A"] = makeFakeClient() as never;
+    const realEvict = internals.evictOneForCapacity.bind(pool);
+    internals.evictOneForCapacity = vi.fn(async (forServerUuid: string) => {
+      const freed = await realEvict(forServerUuid);
+      internals.idleSessions["server-late"] = makeFakeClient() as never;
+      return freed;
+    });
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeUndefined();
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(refusalLines()).toEqual([
+      "Connection limit reached: 1/1. Refusing to create new connection.",
+    ]);
+    expect(skipLines()).toHaveLength(1);
+    expect(poolAtCapLines()).toHaveLength(1);
   });
 });
 

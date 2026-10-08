@@ -1,14 +1,17 @@
-# Dependencies
-node_modules
+# Dependencies (the **/ form also matches at the context root; a bare name
+# matches only there, so host installs inside workspaces would be copied)
+**/node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Production builds
-.next
-dist
-build
+# Production builds and the local turbo cache (a cache hit could restore
+# host-built output into the builder stage)
+**/.next
+**/dist
+**/build
+**/.turbo
 
 # Environment files
 .env

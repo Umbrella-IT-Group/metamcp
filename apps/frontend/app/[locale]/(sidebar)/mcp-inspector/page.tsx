@@ -18,6 +18,10 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { useConnection } from "@/hooks/useConnection";
 import { useTranslations } from "@/hooks/useTranslations";
+import {
+  buildInspectorConnectionKey,
+  inspectorConnectAction,
+} from "@/lib/inspector-connection-key";
 import { Notification } from "@/lib/notificationTypes";
 import { trpc } from "@/lib/trpc";
 
@@ -100,31 +104,44 @@ function McpInspectorContent() {
     enabled: Boolean(selectedServer && !serversLoading && selectedServerUuid),
   });
 
+  // Reconnect only when the selected server, or a setting its connection uses,
+  // changes. The list query returns a new `servers` array whenever ANY row in
+  // the list changes (another server's status, an edit, an add, a delete; the
+  // cache keeps an unchanged row's object, so `selectedServer` is new only when
+  // its own row changes). An effect that depends on `servers` therefore tears
+  // down and re-spawns a healthy connection, and wipes the notification and
+  // stderr panel, on every unrelated update. The key is a string, so React
+  // compares it by value; see lib/inspector-connection-key.ts for what it holds
+  // and why `name`, `description` and `error_status` are out.
+  const connectionKey = buildInspectorConnectionKey(selectedServer);
+
   // Handle server connection logic and notifications
   React.useEffect(() => {
-    // Clear notifications when switching servers
+    // Clear notifications when switching servers or changing their settings
     clearNotifications();
 
-    // Auto-connect when hook is enabled and not already connected
-    if (connection && selectedServer && !serversLoading && selectedServerUuid) {
-      if (connection.connectionStatus === "connected") {
-        // If we're connected but to a different server, disconnect first
-        connection.disconnect().then(() => {
-          connection.connect();
-        });
-      } else if (connection.connectionStatus === "disconnected") {
-        // Auto-connect when server is selected and not already connected
-        connection.connect();
-      }
+    if (
+      !connection ||
+      !selectedServer ||
+      serversLoading ||
+      !selectedServerUuid
+    ) {
+      return;
     }
+
+    // What each status means, and why the error states connect, is documented
+    // on inspectorConnectAction (and unit tested there).
+    const action = inspectorConnectAction(connection.connectionStatus);
+    if (action === "reconnect") {
+      connection.disconnect().then(() => {
+        connection.connect();
+      });
+    } else if (action === "connect") {
+      connection.connect();
+    }
+    // The key stands in for `selectedServer` on purpose; see above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    selectedServerUuid,
-    selectedServer,
-    servers,
-    serversLoading,
-    clearNotifications,
-  ]);
+  }, [connectionKey, serversLoading]);
 
   const handleConnectionToggle = useMemoizedFn(() => {
     if (connection.connectionStatus === "connected") {
