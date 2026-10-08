@@ -14,6 +14,10 @@ import {
   runWithCallerContext,
 } from "../../lib/metamcp/caller-context-store";
 import { createServer } from "../../lib/metamcp/index";
+import {
+  MCP_REQUEST_BODY_LIMIT_BYTES,
+  refuseDeclaredOversize,
+} from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 
 const metamcpRouter = express.Router();
@@ -123,7 +127,10 @@ metamcpRouter.get("/:uuid/mcp", async (req, res) => {
   }
 });
 
-metamcpRouter.post("/:uuid/mcp", async (req, res) => {
+// A declared oversize is refused before a transport is built. A body refused
+// while it is read leaves nothing behind on this route: the namespace server
+// is created in `onsessioninitialized`, which a refused initialize never runs.
+metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
   const namespaceUuid = req.params.uuid;
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let mcpServerInstance:
@@ -141,6 +148,8 @@ metamcpRouter.post("/:uuid/mcp", async (req, res) => {
 
       const webAppTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: randomUUID,
+        // See lib/metamcp/mcp-request-body-limit for the value and why.
+        maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
         onsessioninitialized: async (newSessionId) => {
           try {
             // Extract includeInactiveServers from query parameters

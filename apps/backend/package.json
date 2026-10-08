@@ -23,7 +23,7 @@
     "db:migrate:dev": "dotenv -e ../../.env.local -- drizzle-kit migrate"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "@repo/trpc": "workspace:*",
     "@repo/zod-types": "workspace:*",
     "@trpc/server": "^11.18.0",
@@ -39,7 +39,7 @@
     "helmet": "^8.1.0",
     "nanoid": "^5.1.16",
     "pg": "^8.16.0",
-    "shell-quote": "^1.8.4",
+    "shell-quote": "^1.11.0",
     "spawn-rx": "^5.1.2",
     "undici": "^7",
     "zod": "^4.4.3"
