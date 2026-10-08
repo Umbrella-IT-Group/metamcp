@@ -35,8 +35,13 @@ import {
   takeConnectBrokerFailure,
 } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
-import { ConnectedClient, connectMetaMcpClient } from "./client";
+import {
+  ConnectedClient,
+  connectMetaMcpClient,
+  TRANSPORT_START_TIMEOUT_MS,
+} from "./client";
 import { metamcpLogStore } from "./log-store";
+import { serverErrorTracker } from "./server-error-tracker";
 
 const ENROLL = "https://mcp.example.com/m365/enroll";
 
@@ -50,7 +55,9 @@ const params = {
   status: "active",
 } as unknown as ServerParameters;
 
-function makeFakeClient(connectImpl: () => Promise<void>): Client {
+function makeFakeClient(
+  connectImpl: (transport: Transport) => Promise<void>,
+): Client {
   return {
     connect: vi.fn(connectImpl),
     close: vi.fn().mockResolvedValue(undefined),
@@ -330,6 +337,222 @@ describe("connectMetaMcpClient — closing guard on established connections", ()
     expect(messages.some((m) => m.includes("backend drop"))).toBe(true);
     expect(messages.some((m) => m.includes("established"))).toBe(true);
     expect(onTransportDrop).toHaveBeenCalledWith("error", expect.any(Error));
+  });
+});
+
+// -------------------------------------------------------------------
+// Transport start deadline
+//
+// `client.connect()` starts the transport, then runs the handshake
+// (`initialize`, then the initialized notification). The SDK times
+// `initialize` out but never start, so an SSE backend that heartbeats
+// without its `endpoint` event left the connect pending forever, its
+// transport open and its pool reservation held. Only start is bounded:
+// a deadline over the whole connect would also cut a handshake the SDK
+// allows, and close a Streamable HTTP transport whose `initialize` had
+// already allocated a backend session. The fake client here does what
+// the SDK's `connect` does, start then handshake, with a handshake the
+// test controls. The real-SDK reproductions live in
+// `mcp-server-pool-connect-deadline.test.ts`.
+// -------------------------------------------------------------------
+
+describe("connectMetaMcpClient — transport start deadline", () => {
+  let recordSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  const deadlineWarnings = () =>
+    warnSpy.mock.calls
+      .map((call: unknown[]) => String(call[0]))
+      .filter((message: string) => message.includes("deadline"));
+
+  /** Start the transport, then run `handshake`, as `Client.connect` does. */
+  const makeStartingClient = (
+    handshake: () => Promise<void> = async () => {},
+  ) =>
+    makeFakeClient(async (transport) => {
+      await transport.start();
+      await handshake();
+    });
+
+  /** A fake transport whose `start` the test controls. */
+  const makeTransportWithStart = (start: () => Promise<void>) => {
+    const transport = makeFakeTransport();
+    const startSpy = vi.fn(start);
+    transport.start = startSpy;
+    return { transport, startSpy };
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    recordSpy = vi
+      .spyOn(metamcpLogStore, "record")
+      .mockImplementation(() => {});
+    warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    // No backoff jitter, so the retry schedule is exact.
+    vi.spyOn(Math, "random").mockReturnValue(0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("cuts a start that never settles at the deadline: rejects, closes its transport once, warns once", async () => {
+    vi.mocked(serverErrorTracker.getServerMaxAttempts).mockResolvedValueOnce(1);
+    const handshake = vi.fn(async () => {});
+    const client = makeStartingClient(handshake);
+    const { transport, startSpy } = makeTransportWithStart(
+      () => new Promise<void>(() => {}),
+    );
+    const createClient = vi.fn(() => ({ client, transport }));
+
+    let settled = false;
+    const pending = connectMetaMcpClient(params, undefined, undefined, {
+      createClient,
+    }).finally(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(TRANSPORT_START_TIMEOUT_MS - 1);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+    expect(transport.close).not.toHaveBeenCalled();
+    expect(deadlineWarnings()).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    // The pool's contract is unchanged: a failed connect resolves undefined.
+    await expect(pending).resolves.toBeUndefined();
+    expect(transport.close).toHaveBeenCalledTimes(1);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    // The handshake never began, so no backend session could exist.
+    expect(handshake).not.toHaveBeenCalled();
+
+    // The start rejected into the ordinary failure path.
+    const attemptLogs = recordedMessages(recordSpy).filter((m) =>
+      m.includes("Connect attempt"),
+    );
+    expect(attemptLogs).toHaveLength(1);
+    expect(attemptLogs[0]).toContain("1/1 failed");
+    expect(attemptLogs[0]).toContain(`${TRANSPORT_START_TIMEOUT_MS}ms`);
+
+    // Exactly one WARN, naming the server and the deadline.
+    expect(deadlineWarnings()).toEqual([
+      expect.stringContaining(`m365 (srv-m365)`),
+    ]);
+    expect(deadlineWarnings()[0]).toContain(`${TRANSPORT_START_TIMEOUT_MS}ms`);
+
+    // Nothing left armed: no later close, warning or attempt.
+    await vi.advanceTimersByTimeAsync(10 * TRANSPORT_START_TIMEOUT_MS);
+    expect(transport.close).toHaveBeenCalledTimes(1);
+    expect(createClient).toHaveBeenCalledTimes(1);
+    expect(deadlineWarnings()).toHaveLength(1);
+  });
+
+  it("bounds every retry's start by its own deadline, so the whole connect settles on schedule", async () => {
+    // maxAttempts (mocked) = 3. Each attempt gets a fresh transport.
+    const transports: Transport[] = [];
+    const client = makeStartingClient();
+    const createClient = vi.fn(() => {
+      const { transport } = makeTransportWithStart(
+        () => new Promise<void>(() => {}),
+      );
+      transports.push(transport);
+      return { client, transport };
+    });
+
+    let settled = false;
+    const pending = connectMetaMcpClient(params, undefined, undefined, {
+      createClient,
+    }).finally(() => {
+      settled = true;
+    });
+
+    // Three deadlines plus the 1 s and 2 s backoff sleeps between them.
+    const whole = 3 * TRANSPORT_START_TIMEOUT_MS + 1000 + 2000;
+    await vi.advanceTimersByTimeAsync(whole - 1);
+    expect(settled).toBe(false);
+    expect(createClient).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(transports).toHaveLength(3);
+    for (const transport of transports) {
+      expect(transport.close).toHaveBeenCalledTimes(1);
+    }
+    // One WARN per timed-out start.
+    expect(deadlineWarnings()).toHaveLength(3);
+  });
+
+  it("leaves a start that settles 1 ms before the deadline untouched, however long the handshake then takes", async () => {
+    // A handshake far longer than the start deadline: once start has
+    // settled, nothing of ours may cut the connect.
+    const handshakeMs = 3 * TRANSPORT_START_TIMEOUT_MS;
+    const client = makeStartingClient(
+      () => new Promise<void>((resolve) => setTimeout(resolve, handshakeMs)),
+    );
+    const { transport } = makeTransportWithStart(
+      () =>
+        new Promise<void>((resolve) =>
+          setTimeout(resolve, TRANSPORT_START_TIMEOUT_MS - 1),
+        ),
+    );
+    const createClient = vi.fn(() => ({ client, transport }));
+
+    let settled = false;
+    const pending = connectMetaMcpClient(params, undefined, undefined, {
+      createClient,
+    }).finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(
+      TRANSPORT_START_TIMEOUT_MS - 1 + handshakeMs - 1,
+    );
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const result = (await pending) as ConnectedClient;
+    expect(result).toBeDefined();
+    expect(result.client).toBe(client);
+
+    // The deadline timer was cleared with start: crossing it later must
+    // not close the live transport or warn.
+    await vi.advanceTimersByTimeAsync(10 * TRANSPORT_START_TIMEOUT_MS);
+    expect(transport.close).not.toHaveBeenCalled();
+    expect(client.close).not.toHaveBeenCalled();
+    expect(deadlineWarnings()).toHaveLength(0);
+    expect(createClient).toHaveBeenCalledTimes(1);
+    expect(
+      recordedMessages(recordSpy).filter((m) => m.includes("Connect attempt")),
+    ).toHaveLength(0);
+  });
+
+  it("never times the handshake: a started connect stays with the SDK's own bounds and is not closed", async () => {
+    // The handshake never settles here. In production the SDK's request
+    // timeout bounds `initialize` and the guarded fetch's idle timeout the
+    // initialized notification, as before this deadline existed; our code
+    // must arm nothing after start, or it would close a transport that may
+    // already hold a backend session (Streamable HTTP allocates one in the
+    // `initialize` response).
+    const client = makeStartingClient(() => new Promise<void>(() => {}));
+    const { transport, startSpy } = makeTransportWithStart(async () => {});
+    const createClient = vi.fn(() => ({ client, transport }));
+
+    let settled = false;
+    void connectMetaMcpClient(params, undefined, undefined, {
+      createClient,
+    }).finally(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(20 * TRANSPORT_START_TIMEOUT_MS);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+    expect(transport.close).not.toHaveBeenCalled();
+    expect(client.close).not.toHaveBeenCalled();
+    expect(createClient).toHaveBeenCalledTimes(1);
+    expect(deadlineWarnings()).toHaveLength(0);
   });
 });
 

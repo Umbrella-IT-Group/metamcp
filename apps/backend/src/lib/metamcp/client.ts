@@ -114,6 +114,46 @@ export const computeReconnectBackoffMs = (attempt: number): number => {
 const SESSION_TERMINATE_TIMEOUT_MS = 2000;
 
 /**
+ * Upper bound on `transport.start()`, the one connect step with no timeout
+ * of its own.
+ *
+ * WHY THIS EXISTS: `client.connect(transport)` awaits start and only then
+ * sends `initialize`, which the SDK bounds with its 60 s request timeout.
+ * An SSE backend that answers the stream GET and then sends heartbeats
+ * without ever sending its `endpoint` event keeps start pending forever
+ * (each heartbeat also resets the guarded fetch's idle timeout), so the
+ * connect never settled, its stream stayed open, and the pool held its
+ * per-server and global reservation indefinitely, out of reach of eviction.
+ *
+ * WHY ONLY START: a deadline over the whole connect also fired after a
+ * Streamable-HTTP `initialize` had answered, so it closed a transport that
+ * held a live backend session, without the session DELETE, and retried into
+ * a fresh one; it also cut handshakes the SDK allows (`initialize` near its
+ * 60 s limit, then the initialized notification). Start finishes before
+ * `initialize` is sent, so cutting it can strand no backend session, and
+ * every step after start keeps the bound it had before this deadline: the
+ * SDK's timeout on `initialize`, the guarded fetch's idle timeout on the
+ * notification POST.
+ *
+ * WHY THIS VALUE: only SSE start does network I/O, one GET whose first
+ * event is `endpoint`: the TypeScript SDK's SSEServerTransport writes it in
+ * the same call as the response headers, and the Python SDK's `connect_sse`
+ * sends it before any message. That GET's slow legitimate phases have their own
+ * limits: the TCP connect undici's 10 s default (the pinned Agent in
+ * url-guard sets no connect timeout), name resolution glibc's resolver
+ * defaults of 5 s per try and 2 tries. 30 s leaves about 10 s past both for
+ * a backend's first write. STDIO start resolves at the spawn event and
+ * Streamable-HTTP start does no I/O, so neither comes near it.
+ *
+ * A timed-out start takes the ordinary failure path (transport closed,
+ * retried with backoff), so a connect whose starts all hang holds its pool
+ * reservation for at most maxAttempts times this plus the backoff sleeps:
+ * 3 x 30 s + 1 s + 2 s (plus jitter), about 93 s, at the default
+ * MCP_MAX_ATTEMPTS of 3.
+ */
+export const TRANSPORT_START_TIMEOUT_MS = 30_000;
+
+/**
  * Send the MCP spec's session-termination `DELETE` (with `Mcp-Session-Id`)
  * to a Streamable-HTTP backend, then let the caller close the transport.
  *
@@ -183,6 +223,58 @@ const terminateBackendSession = async (
       clearTimeout(timeoutHandle);
     }
   }
+};
+
+/**
+ * Bound this transport's `start()` by TRANSPORT_START_TIMEOUT_MS, in place,
+ * before `client.connect(transport)` calls it.
+ *
+ * The SDK calls `start()` from inside `connect`, after wiring its handlers
+ * and before sending `initialize`, so the timer runs for start alone and is
+ * cleared the moment start settles; nothing after start ever runs under it.
+ *
+ * At the deadline this logs one WARN naming the server and the deadline,
+ * then rejects. The rejection surfaces from `client.connect` into the
+ * caller's ordinary connect-failure path, which closes the transport and
+ * retries with backoff, so the transport is closed exactly once, like any
+ * failed attempt's. Closing is the cancellation: SSE aborts its stream
+ * fetch and closes its EventSource. No backend session exists to terminate
+ * first: SSE learns where to post only from the `endpoint` event that never
+ * came, and Streamable HTTP allocates its session in the `initialize`
+ * answer, after start.
+ */
+const boundTransportStart = (
+  transport: Transport,
+  serverParams: ServerParameters,
+): void => {
+  const start = transport.start.bind(transport);
+  transport.start = async () => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const starting = start();
+    // An abandoned start can still reject once its transport is closed;
+    // the sink keeps that late rejection from surfacing as an unhandled
+    // one. The race below still observes a rejection that arrives in time.
+    starting.catch(() => {});
+    try {
+      await Promise.race([
+        starting,
+        new Promise<never>((_resolve, reject) => {
+          timeoutHandle = setTimeout(() => {
+            logger.warn(
+              `Transport start for server ${serverParams.name} (${serverParams.uuid}) passed its ${TRANSPORT_START_TIMEOUT_MS}ms deadline; closing its transport`,
+            );
+            reject(
+              new Error(
+                `Transport start exceeded its ${TRANSPORT_START_TIMEOUT_MS}ms deadline`,
+              ),
+            );
+          }, TRANSPORT_START_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  };
 };
 
 /**
@@ -628,6 +720,9 @@ export const connectMetaMcpClient = async (
         };
       }
 
+      // Only start is bounded here: it has no SDK timeout of its own (see
+      // TRANSPORT_START_TIMEOUT_MS). A timeout lands in the catch below.
+      boundTransportStart(transport, serverParams);
       await client.connect(transport);
       // Handshake complete — from here a transport close/error is a real
       // drop of an established connection, not a connect-time failure.
