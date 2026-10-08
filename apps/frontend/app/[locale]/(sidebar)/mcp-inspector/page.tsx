@@ -18,7 +18,10 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { useConnection } from "@/hooks/useConnection";
 import { useTranslations } from "@/hooks/useTranslations";
-import { buildInspectorConnectionKey } from "@/lib/inspector-connection-key";
+import {
+  buildInspectorConnectionKey,
+  inspectorConnectAction,
+} from "@/lib/inspector-connection-key";
 import { Notification } from "@/lib/notificationTypes";
 import { trpc } from "@/lib/trpc";
 
@@ -102,13 +105,14 @@ function McpInspectorContent() {
   });
 
   // Reconnect only when the selected server, or a setting its connection uses,
-  // changes. The list query returns a new `servers` array and a new
-  // `selectedServer` whenever ANY row in the list changes (another server's
-  // status, an edit, an add, a delete), so an effect that depended on those
-  // objects tore down and re-spawned a healthy connection, and wiped the
-  // notification and stderr panel, on every unrelated update. The key is a
-  // string, so React compares it by value; see lib/inspector-connection-key.ts
-  // for what it holds and why `name`, `description` and `error_status` are out.
+  // changes. The list query returns a new `servers` array whenever ANY row in
+  // the list changes (another server's status, an edit, an add, a delete; the
+  // cache keeps an unchanged row's object, so `selectedServer` is new only when
+  // its own row changes). An effect that depends on `servers` therefore tears
+  // down and re-spawns a healthy connection, and wipes the notification and
+  // stderr panel, on every unrelated update. The key is a string, so React
+  // compares it by value; see lib/inspector-connection-key.ts for what it holds
+  // and why `name`, `description` and `error_status` are out.
   const connectionKey = buildInspectorConnectionKey(selectedServer);
 
   // Handle server connection logic and notifications
@@ -125,23 +129,14 @@ function McpInspectorContent() {
       return;
     }
 
-    const status = connection.connectionStatus;
-    if (status === "connected") {
-      // Connected to the previous server or settings: tear that down first
+    // What each status means, and why the error states connect, is documented
+    // on inspectorConnectAction (and unit tested there).
+    const action = inspectorConnectAction(connection.connectionStatus);
+    if (action === "reconnect") {
       connection.disconnect().then(() => {
         connection.connect();
       });
-    } else if (
-      status === "disconnected" ||
-      status === "error" ||
-      status === "error-connecting-to-proxy"
-    ) {
-      // Auto-connect when a server is selected and not already connected.
-      // After a failed connect (the "error" states) the hook holds no client,
-      // and the failure belongs to the previous server or settings, so a
-      // changed key is a reason to try again. This cannot loop: a failed
-      // connect does not change the key, so the effect does not run again
-      // until the selection or the server's settings change.
+    } else if (action === "connect") {
       connection.connect();
     }
     // The key stands in for `selectedServer` on purpose; see above.

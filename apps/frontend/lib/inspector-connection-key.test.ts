@@ -7,7 +7,11 @@
 import { type McpServer, McpServerSchema } from "@repo/zod-types";
 import { describe, expect, it } from "vitest";
 
-import { buildInspectorConnectionKey } from "./inspector-connection-key";
+import type { ConnectionStatus } from "./constants";
+import {
+  buildInspectorConnectionKey,
+  inspectorConnectAction,
+} from "./inspector-connection-key";
 
 function server(overrides: Partial<McpServer> = {}): McpServer {
   return {
@@ -108,6 +112,16 @@ describe("buildInspectorConnectionKey", () => {
     );
   });
 
+  it("keeps args as an array: one argument with a comma is not two arguments", () => {
+    // Guards against joining args into a string with "," (or any separator
+    // an argument can contain), which would merge these two servers.
+    const joined = server({ args: ["a,b"] });
+    const split = server({ args: ["a", "b"] });
+    expect(buildInspectorConnectionKey(joined)).not.toBe(
+      buildInspectorConnectionKey(split),
+    );
+  });
+
   it("keeps argument order", () => {
     const forward = server({ args: ["a", "b"] });
     const reversed = server({ args: ["b", "a"] });
@@ -143,5 +157,39 @@ describe("buildInspectorConnectionKey", () => {
     // to it would leave the Inspector on the old configuration.
     const classified = [...KEYED, ...IGNORED].map(({ field }) => field).sort();
     expect(Object.keys(McpServerSchema.shape).sort()).toEqual(classified);
+  });
+});
+
+describe("inspectorConnectAction", () => {
+  // The page runs this when the connection key changes or the list finishes
+  // loading. The error rows are the behavior change: after a failed connect the
+  // hook holds no client, so a changed key connects again instead of leaving
+  // the previous server's error showing under the new selection.
+  const CASES: [ConnectionStatus, "reconnect" | "connect" | "none"][] = [
+    ["connected", "reconnect"],
+    ["disconnected", "connect"],
+    ["error", "connect"],
+    ["error-connecting-to-proxy", "connect"],
+    ["connecting", "none"],
+  ];
+
+  it.each(CASES)("%s -> %s", (status, action) => {
+    expect(inspectorConnectAction(status)).toBe(action);
+  });
+
+  it("covers every status the hook can report", () => {
+    // ConnectionStatus is a type, so list the members through a Record: adding
+    // a status to the union makes this object fail to compile until the case
+    // table above is revisited.
+    const all: Record<ConnectionStatus, true> = {
+      connecting: true,
+      disconnected: true,
+      connected: true,
+      error: true,
+      "error-connecting-to-proxy": true,
+    };
+    expect(CASES.map(([status]) => status).sort()).toEqual(
+      Object.keys(all).sort(),
+    );
   });
 });
