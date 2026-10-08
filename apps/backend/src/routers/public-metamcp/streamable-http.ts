@@ -37,7 +37,10 @@ import {
   shouldRefuseRecovery,
 } from "../../lib/metamcp/gateway-boot-id";
 import { metamcpLogStore } from "../../lib/metamcp/log-store";
-import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
+import {
+  MCP_REQUEST_BODY_LIMIT_BYTES,
+  refuseDeclaredOversize,
+} from "../../lib/metamcp/mcp-request-body-limit";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import {
   AuthMethod,
@@ -1069,19 +1072,33 @@ function isSupersededDuringCleanup(
 }
 
 /**
+ * `mcp_sessions` inserts issued at initialize that have not settled yet, by
+ * session id; each entry never rejects and removes itself when it settles.
+ *
+ * WHY: the insert and the delete below are both issued without waiting, so a
+ * delete could overtake a slow insert and leave a row behind for a session
+ * that is gone. A refused initialize makes that likely, because its teardown
+ * follows the insert within milliseconds (see the POST route).
+ */
+const pendingSessionPersists = new Map<string, Promise<unknown>>();
+
+/**
  * Drop the persisted row so a future DELETE-then-reuse can't lazy-recover a
  * session the client explicitly tore down. Best-effort: the pruner reaps
- * stragglers.
+ * stragglers. Waits for the session's own insert if that is still in flight
+ * (see `pendingSessionPersists`).
  */
 function deletePersistedSessionRow(sessionId: string): void {
-  mcpSessionsRepository
-    .delete(sessionId)
-    .catch((error: unknown) =>
-      logger.warn(
-        `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
-        error,
-      ),
-    );
+  const pendingPersist = pendingSessionPersists.get(sessionId);
+  const deleted = pendingPersist
+    ? pendingPersist.then(() => mcpSessionsRepository.delete(sessionId))
+    : mcpSessionsRepository.delete(sessionId);
+  deleted.catch((error: unknown) =>
+    logger.warn(
+      `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
+      error,
+    ),
+  );
 }
 
 // Explicit client DELETE + the age-based sessionLifetime cleanup timer:
@@ -1359,6 +1376,9 @@ streamableHttpRouter.post(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
+  // Before admission: a declared oversize must not take a ceiling slot, a
+  // pooled instance, a registration or a row, nor trigger lazy recovery.
+  refuseDeclaredOversize,
   async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
@@ -1580,7 +1600,7 @@ streamableHttpRouter.post(
         if (rawToken) {
           const authMethod = authMethodFromRequest(authReq);
           const principal = hashAuthPrincipal(rawToken, authMethod);
-          mcpSessionsRepository
+          const persisted = mcpSessionsRepository
             .persist({
               session_id: newSessionId,
               namespace_uuid: namespaceUuid,
@@ -1596,7 +1616,14 @@ streamableHttpRouter.post(
                 `mcp_sessions persist failed for session ${newSessionId}; lazy-recovery will be unavailable for this consumer until next init.`,
                 error,
               ),
-            );
+            )
+            .finally(() => {
+              if (pendingSessionPersists.get(newSessionId) === persisted) {
+                pendingSessionPersists.delete(newSessionId);
+              }
+            });
+          // A row delete waits for this insert; see pendingSessionPersists.
+          pendingSessionPersists.set(newSessionId, persisted);
         } else {
           logger.warn(
             `Session ${newSessionId} initialized without a recognizable credential; skipping mcp_sessions persist (recovery unavailable).`,
@@ -1612,6 +1639,20 @@ streamableHttpRouter.post(
           newSessionId,
           clientIdentity?.name,
         );
+
+        // The transport answered without initializing the session: a body
+        // over the limit found while reading it (a declared oversize never
+        // gets here, see refuseDeclaredOversize), invalid JSON, or a first
+        // request that is not an `initialize`. No session id went out, so
+        // nothing can reach this session again; release everything admitted
+        // above (slot, registration, idle tracking, pooled instance, row)
+        // rather than leave it to the idle sweeper or an eviction.
+        if (transport.sessionId === undefined) {
+          logger.info(
+            `Public endpoint session ${newSessionId} was not initialized (HTTP ${res.statusCode}); releasing it.`,
+          );
+          await cleanupAdmission(newSessionId);
+        }
       } catch (error) {
         if (releaseAdmission && initializingSessionId && !admissionClosed) {
           await cleanupAdmission(initializingSessionId);

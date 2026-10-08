@@ -11,6 +11,15 @@
  * byte more is refused with 413 and a JSON-RPC error, on each construction
  * site. Dropping the option from either site fails the tests for that site.
  *
+ * A refused initialize must not leave its session behind. The route admits a
+ * fresh session (a per-credential slot, a pooled server instance, a resident
+ * transport, an `mcp_sessions` row) before the transport reads the body, and
+ * the 413 carries no session id, so nothing could ever use or close it. So a
+ * declared oversize is refused before any of that, and a body refused only
+ * while it is read is torn down after the transport answers. An oversized
+ * request on a live session, by contrast, is answered 413 and the session
+ * keeps serving.
+ *
  * What is real: the router, the session manager, the SDK transports, a real
  * SDK `Server` per pooled instance (so `initialize` and `ping` are answered by
  * the SDK) and transport-recovery hydration. What is faked: the DB-touching
@@ -21,6 +30,7 @@
 import type { Server as HttpServer } from "node:http";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import {
   afterAll,
@@ -34,11 +44,17 @@ import {
 
 const h = vi.hoisted(() => {
   const rows = new Map<string, unknown>();
-  return {
+  const state = {
     rows,
+    /** Session ids whose pooled server saw its transport close, in order. */
+    closedSessions: [] as string[],
+    /** When set, every `persist` waits for it before writing its row. */
+    persistGate: undefined as Promise<void> | undefined,
     logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
     getServer: vi.fn(),
+    poolCleanup: vi.fn(async (_sessionId: string) => undefined),
     persist: vi.fn(async (row: { session_id: string }) => {
+      await state.persistGate;
       rows.set(row.session_id, {
         ...row,
         created_at: new Date(),
@@ -46,7 +62,11 @@ const h = vi.hoisted(() => {
       });
     }),
     findById: vi.fn(async (sessionId: string) => rows.get(sessionId) ?? null),
+    delete: vi.fn(async (sessionId: string) => {
+      rows.delete(sessionId);
+    }),
   };
+  return state;
 });
 
 vi.mock("@/utils/logger", () => ({ default: h.logger }));
@@ -68,7 +88,7 @@ vi.mock("@/db/repositories/mcp-sessions.repo", () => ({
     persist: h.persist,
     findById: h.findById,
     touch: vi.fn().mockResolvedValue(undefined),
-    delete: vi.fn().mockResolvedValue(undefined),
+    delete: h.delete,
     pruneOlderThan: vi.fn().mockResolvedValue(0),
   },
 }));
@@ -79,7 +99,7 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
   metaMcpServerPool: {
     getServer: h.getServer,
     getServerInstance: vi.fn(),
-    cleanupSession: vi.fn().mockResolvedValue(undefined),
+    cleanupSession: h.poolCleanup,
     getMcpServerPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
     getPoolStatus: vi.fn().mockReturnValue({ idle: 0, active: 0 }),
   },
@@ -87,13 +107,41 @@ vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
 vi.mock("../../lib/metamcp/log-store", () => ({
   metamcpLogStore: { record: vi.fn() },
 }));
+// The real ceiling, observed: a refused request must never reach admission.
+vi.mock(
+  "../../lib/metamcp/credential-session-quota",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("../../lib/metamcp/credential-session-quota")
+      >();
+    return {
+      ...actual,
+      checkConcurrentSessionCeiling: vi.fn(
+        actual.checkConcurrentSessionCeiling,
+      ),
+      checkConcurrentSessionCeilingForRecovery: vi.fn(
+        actual.checkConcurrentSessionCeilingForRecovery,
+      ),
+    };
+  },
+);
 
 import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 
+import {
+  checkConcurrentSessionCeiling,
+  checkConcurrentSessionCeilingForRecovery,
+  countLiveSessionsForIdentity,
+} from "../../lib/metamcp/credential-session-quota";
 import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
-import streamableHttpRouter, { reapIdleSession } from "./streamable-http";
+import streamableHttpRouter, {
+  buildSessionsHealthPayload,
+  publicSessionSweeper,
+  reapIdleSession,
+} from "./streamable-http";
 
 const PROTOCOL_VERSION = "2025-06-18";
 const LIMIT = MCP_REQUEST_BODY_LIMIT_BYTES;
@@ -172,6 +220,46 @@ function post(
   } as RequestInit);
 }
 
+/**
+ * The same bytes sent without a Content-Length (chunked), so the declared-length
+ * check cannot fire and the transport has to count bytes as they arrive.
+ */
+function chunked(body: string): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(body);
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let at = 0; at < bytes.length; at += 1024 * 1024) {
+        controller.enqueue(bytes.subarray(at, at + 1024 * 1024));
+      }
+      controller.close();
+    },
+  });
+}
+
+/** Sessions resident in the route's session manager. */
+function residentSessions(): number {
+  const { streamableHttpSessions } = buildSessionsHealthPayload(true) as {
+    streamableHttpSessions: { count: number };
+  };
+  return streamableHttpSessions.count;
+}
+
+/** This test's credential, as the per-credential ceiling counts it. */
+const liveSessionsForKey = () =>
+  countLiveSessionsForIdentity({ method: "api_key", credentialId: keyUuid });
+
+/** Times a session id's pooled server saw its transport close. */
+const closesOf = (sessionId: string) =>
+  h.closedSessions.filter((closed) => closed === sessionId).length;
+
+/** Let any teardown still queued behind a response run before counting. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+
+const handleRequest = vi.spyOn(
+  StreamableHTTPServerTransport.prototype,
+  "handleRequest",
+);
+
 async function openSession(): Promise<string> {
   const response = await post(initializeBody(1024));
   expect(response.status).toBe(200);
@@ -245,14 +333,20 @@ beforeEach(() => {
   keyCounter += 1;
   keyUuid = `3f7f8a1e-0000-4000-8000-${String(keyCounter).padStart(12, "0")}`;
   rawKey = `body-limit-key-${keyCounter}`;
-  h.getServer.mockImplementation(async () => ({
-    server: new Server(
+  h.persistGate = undefined;
+  h.getServer.mockImplementation(async (sessionId: string) => {
+    const server = new Server(
       { name: "body-limit-gateway", version: "0.0.0" },
       { capabilities: {} },
-    ),
-    cleanup: vi.fn().mockResolvedValue(undefined),
-    handlerContext: {} as Record<string, unknown>,
-  }));
+    );
+    // Fires when the transport the route connected this server to closes.
+    server.onclose = () => h.closedSessions.push(sessionId);
+    return {
+      server,
+      cleanup: vi.fn().mockResolvedValue(undefined),
+      handlerContext: {} as Record<string, unknown>,
+    };
+  });
 });
 
 describe("a fresh session's transport", () => {
@@ -324,13 +418,139 @@ describe("a lazily recovered session's transport", () => {
     expect(await resultOf(response)).toEqual({});
   });
 
-  it("refuses a request one byte over the limit with 413 and a JSON-RPC error", async () => {
+  it("refuses a declared oversize request with 413 before recovering anything", async () => {
     const sessionId = await reapedSession();
+    h.getServer.mockClear();
+    handleRequest.mockClear();
 
     const response = await post(pingBody(LIMIT + 1), sessionId);
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual(TOO_LARGE);
+    expect(h.findById).not.toHaveBeenCalled();
+    expect(checkConcurrentSessionCeilingForRecovery).not.toHaveBeenCalled();
+    expect(h.getServer).not.toHaveBeenCalled();
+    expect(handleRequest).not.toHaveBeenCalled();
+  });
+
+  it("refuses a body over the limit read in chunks, and the recovered session keeps serving", async () => {
+    const sessionId = await reapedSession();
+
+    const response = await post(chunked(pingBody(LIMIT + 1)), sessionId);
 
     expect(h.findById).toHaveBeenCalledWith(sessionId);
     expect(response.status).toBe(413);
     expect(await response.json()).toEqual(TOO_LARGE);
+
+    // Recovery hydrates the transport as initialized and the client holds its
+    // id, so this is an oversized request on a live session: it stays.
+    const ping = await post(pingBody(1024), sessionId);
+    expect(ping.status).toBe(200);
+    expect(await resultOf(ping)).toEqual({});
+    expect(h.findById).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a refused initialize's session", () => {
+  it("is never admitted or allocated when the declared length is over the limit", async () => {
+    const residentBefore = residentSessions();
+
+    const response = await post(initializeBody(LIMIT + 1));
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual(TOO_LARGE);
+    await settle();
+    expect(checkConcurrentSessionCeiling).not.toHaveBeenCalled();
+    expect(h.getServer).not.toHaveBeenCalled();
+    expect(handleRequest).not.toHaveBeenCalled();
+    expect(h.persist).not.toHaveBeenCalled();
+    expect(residentSessions()).toBe(residentBefore);
+    expect(liveSessionsForKey()).toBe(0);
+  });
+
+  it("is torn down when the body is refused while it is read", async () => {
+    // Hold the row write until the 413 is back, so the teardown meets a
+    // slow insert: the order in which a delete issued at once would land
+    // first and leave the row behind.
+    let releasePersist = () => {};
+    h.persistGate = new Promise<void>((resolve) => {
+      releasePersist = resolve;
+    });
+    const residentBefore = residentSessions();
+
+    const response = await post(chunked(initializeBody(LIMIT + 1)));
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual(TOO_LARGE);
+    expect(checkConcurrentSessionCeiling).toHaveBeenCalledTimes(1);
+    expect(h.getServer).toHaveBeenCalledTimes(1);
+    const sessionId = String(h.getServer.mock.calls[0]?.[0]);
+    expect(h.persist).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: sessionId }),
+    );
+
+    // Transport, pool, registration, idle tracking and the credential's slot
+    // are released without waiting for the database.
+    await vi.waitFor(() => {
+      expect(closesOf(sessionId)).toBe(1);
+      expect(h.poolCleanup).toHaveBeenCalledWith(sessionId);
+    });
+    expect(residentSessions()).toBe(residentBefore);
+    expect(publicSessionSweeper.getActivity(sessionId)).toBeUndefined();
+    expect(liveSessionsForKey()).toBe(0);
+    // The row delete waits for the insert instead of overtaking it.
+    expect(h.delete).not.toHaveBeenCalled();
+
+    releasePersist();
+    await vi.waitFor(() => expect(h.delete).toHaveBeenCalledWith(sessionId));
+    await vi.waitFor(() => expect(h.rows.has(sessionId)).toBe(false));
+    await settle();
+    expect(closesOf(sessionId)).toBe(1);
+    expect(h.poolCleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it("is torn down when the first request is not an initialize", async () => {
+    // Within the limit, refused by the transport for another reason: the
+    // client gets no session id either, so the same teardown applies.
+    const residentBefore = residentSessions();
+
+    const response = await post(pingBody(1024));
+
+    expect(response.status).toBe(400);
+    const sessionId = String(h.getServer.mock.calls[0]?.[0]);
+    await vi.waitFor(() => {
+      expect(closesOf(sessionId)).toBe(1);
+      expect(h.poolCleanup).toHaveBeenCalledWith(sessionId);
+      expect(h.rows.has(sessionId)).toBe(false);
+    });
+    expect(residentSessions()).toBe(residentBefore);
+    expect(liveSessionsForKey()).toBe(0);
+  });
+});
+
+describe("an oversized request on a live session", () => {
+  it("is answered 413 and the session keeps serving", async () => {
+    const sessionId = await openSession();
+    const residentBefore = residentSessions();
+
+    const declared = await post(pingBody(LIMIT + 1), sessionId);
+    expect(declared.status).toBe(413);
+    expect(await declared.json()).toEqual(TOO_LARGE);
+
+    const read = await post(chunked(pingBody(LIMIT + 1)), sessionId);
+    expect(read.status).toBe(413);
+    expect(await read.json()).toEqual(TOO_LARGE);
+
+    const ping = await post(pingBody(1024), sessionId);
+    expect(ping.status).toBe(200);
+    expect(await resultOf(ping)).toEqual({});
+    await settle();
+    expect(closesOf(sessionId)).toBe(0);
+    expect(h.poolCleanup).not.toHaveBeenCalled();
+    expect(h.delete).not.toHaveBeenCalled();
+    expect(h.findById).not.toHaveBeenCalled();
+    expect(h.getServer).toHaveBeenCalledTimes(1);
+    expect(residentSessions()).toBe(residentBefore);
+    expect(liveSessionsForKey()).toBe(1);
   });
 });

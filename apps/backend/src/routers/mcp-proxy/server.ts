@@ -26,7 +26,10 @@ import logger from "@/utils/logger";
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
 import { transformDockerUrl } from "../../lib/metamcp/client";
-import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
+import {
+  MCP_REQUEST_BODY_LIMIT_BYTES,
+  refuseDeclaredOversize,
+} from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import {
   getDefaultEnvironment,
@@ -437,6 +440,49 @@ const cleanupSession = async (sessionId: string) => {
   logger.info(`Session ${sessionId} cleanup completed`);
 };
 
+/**
+ * Tear down a POST /mcp session whose first request the transport answered
+ * without initializing it: a body over the limit found while reading it (a
+ * declared oversize never gets this far, see refuseDeclaredOversize),
+ * invalid JSON, or a first request that is not an `initialize`. The client got
+ * no session id, so nothing could ever reach this session again, and without
+ * this its upstream transport (a STDIO child, an SSE stream) stayed open.
+ * `cleanupSession` cannot do it: its maps are filled by `onsessioninitialized`,
+ * which never ran.
+ *
+ * The server transport goes first. Its close reaches the proxy wiring
+ * (lib/mcp-proxy), which marks the server side closed and closes the client
+ * transport itself, so the client transport's close below is normally a no-op
+ * (the SDK transport ignores a second close) rather than the wiring's cue to
+ * close the upstream a second time. It is there for when the wiring did not
+ * run.
+ */
+const closeUninitializedSession = async (
+  sessionId: string,
+  webAppTransport: Transport,
+  serverTransport: Transport,
+) => {
+  logger.info(
+    `Proxy session ${sessionId} was not initialized; closing its transports`,
+  );
+  try {
+    await serverTransport.close();
+  } catch (error) {
+    logger.error(
+      `Error closing server transport for uninitialized session ${sessionId}:`,
+      error,
+    );
+  }
+  try {
+    await webAppTransport.close();
+  } catch (error) {
+    logger.error(
+      `Error closing web app transport for uninitialized session ${sessionId}:`,
+      error,
+    );
+  }
+};
+
 const createTransport = async (req: express.Request): Promise<Transport> => {
   const query = req.query;
   // Only the transport type is logged. The whole query used to be dumped here,
@@ -655,7 +701,8 @@ serverRouter.get("/mcp", async (req, res) => {
   }
 });
 
-serverRouter.post("/mcp", async (req, res) => {
+// A declared oversize is refused before `createTransport` starts anything.
+serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let serverTransport: Transport | undefined;
   if (!sessionId) {
@@ -748,6 +795,16 @@ serverRouter.post("/mcp", async (req, res) => {
         req,
         res,
       );
+
+      // Answered without initializing: no session id went out, so close what
+      // this request started. An initialized session is left as it is.
+      if (webAppTransport.sessionId === undefined) {
+        await closeUninitializedSession(
+          newSessionId,
+          webAppTransport,
+          serverTransport,
+        );
+      }
     } catch (error) {
       logger.error("Error in /mcp POST route:", error);
       res.status(500).json(error);

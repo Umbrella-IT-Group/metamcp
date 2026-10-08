@@ -16,12 +16,27 @@
  * that response ends and a follow-up request on it gets 404 "Transport not
  * found". That is the route's existing behaviour, not something this ceiling
  * changes; it is the same transport object either way.
+ *
+ * Unlike the other two routes, this one allocates nothing for a session until
+ * the transport accepts its initialize (`createServer` runs in
+ * `onsessioninitialized`), so a refused initialize has nothing to tear down.
+ * The tests below pin that, and that a declared oversize is refused before a
+ * transport is even handed the request.
  */
 import type { Server as HttpServer } from "node:http";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 vi.mock("@/utils/logger", () => ({
   default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
@@ -45,7 +60,9 @@ vi.mock("../../lib/metamcp/mcp-server-pool", () => ({
   mcpServerPool: { cleanupSession: vi.fn().mockResolvedValue(undefined) },
 }));
 
+import { createServer } from "../../lib/metamcp/index";
 import { MCP_REQUEST_BODY_LIMIT_BYTES } from "../../lib/metamcp/mcp-request-body-limit";
+import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import metamcpRouter from "./metamcp";
 
 const PROTOCOL_VERSION = "2025-06-18";
@@ -95,7 +112,7 @@ const initializeBody = (bytes: number) =>
     bytes,
   );
 
-function post(body: string): Promise<Response> {
+function post(body: string | ReadableStream<Uint8Array>): Promise<Response> {
   return fetch(`${baseUrl}/mcp-proxy/metamcp/${NAMESPACE_UUID}/mcp`, {
     method: "POST",
     headers: {
@@ -103,6 +120,24 @@ function post(body: string): Promise<Response> {
       accept: "application/json, text/event-stream",
     },
     body,
+    // Required by undici for a streamed body; ignored for a string.
+    duplex: "half",
+  } as RequestInit);
+}
+
+/**
+ * The same bytes sent without a Content-Length (chunked), so the declared-length
+ * check cannot fire and the transport has to count bytes as they arrive.
+ */
+function chunked(body: string): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(body);
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let at = 0; at < bytes.length; at += 1024 * 1024) {
+        controller.enqueue(bytes.subarray(at, at + 1024 * 1024));
+      }
+      controller.close();
+    },
   });
 }
 
@@ -154,5 +189,37 @@ describe("POST /mcp-proxy/metamcp/:uuid/mcp body ceiling", () => {
 
     expect(response.status).toBe(413);
     expect(await response.json()).toEqual(TOO_LARGE);
+  });
+});
+
+describe("POST /mcp-proxy/metamcp/:uuid/mcp resources on a refused request", () => {
+  const handleRequest = vi.spyOn(
+    StreamableHTTPServerTransport.prototype,
+    "handleRequest",
+  );
+
+  beforeEach(() => {
+    vi.mocked(createServer).mockClear();
+    vi.mocked(mcpServerPool.cleanupSession).mockClear();
+    handleRequest.mockClear();
+  });
+
+  it("refuses a declared oversize initialize before a transport is handed it", async () => {
+    const response = await post(initializeBody(LIMIT + 1));
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual(TOO_LARGE);
+    expect(handleRequest).not.toHaveBeenCalled();
+    expect(createServer).not.toHaveBeenCalled();
+  });
+
+  it("allocates nothing for an initialize refused while its body was read", async () => {
+    const response = await post(chunked(initializeBody(LIMIT + 1)));
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual(TOO_LARGE);
+    expect(handleRequest).toHaveBeenCalledTimes(1);
+    expect(createServer).not.toHaveBeenCalled();
+    expect(mcpServerPool.cleanupSession).not.toHaveBeenCalled();
   });
 });

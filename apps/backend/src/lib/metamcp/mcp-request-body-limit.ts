@@ -1,3 +1,8 @@
+import { requestBodyTooLargeMessage } from "@modelcontextprotocol/sdk/server/requestBody.js";
+import type { NextFunction, Request, Response } from "express";
+
+import logger from "@/utils/logger";
+
 /**
  * The largest POST body a Streamable HTTP server transport reads, in bytes.
  *
@@ -50,3 +55,64 @@
  * own fixed 4mb limit, which the SDK does not expose as an option.
  */
 export const MCP_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Express middleware, mounted ahead of the handler on each POST route above:
+ * answers a request whose DECLARED body is over MCP_REQUEST_BODY_LIMIT_BYTES
+ * before the route runs.
+ *
+ * WHY THE TRANSPORT'S OWN CHECK IS NOT ENOUGH. The transport refuses the same
+ * request, but only once the route hands it over, and a request with no
+ * session id has had a session allocated by then: the public route takes a
+ * per-credential admission slot, a pooled server instance, a resident
+ * registration and an `mcp_sessions` row, and `/mcp-proxy/server/mcp` starts
+ * the upstream transport (a STDIO child or an SSE stream). The 413 carries no
+ * session id, so nothing could ever use or close what was allocated, and a
+ * caller repeating oversized initializes pinned it until the idle sweeper or
+ * an eviction reached it. Refused here, a declared oversize allocates
+ * nothing. A body found to be over the limit only while it is read (chunked,
+ * so no Content-Length) still reaches the transport, and those two routes tear
+ * down a session whose initialize the transport refused.
+ *
+ * The same test as the SDK's (`Number(Content-Length) > limit`, so an absent
+ * or non-numeric header passes through to the transport) and the same answer:
+ * 413 with the SDK's JSON-RPC error and message, so a caller cannot tell which
+ * of the two refused it. The message comes from the SDK's own helper so the
+ * two cannot drift apart. One difference: the transport checks Accept and
+ * Content-Type first, so an oversized request that also has the wrong media
+ * type gets this 413 rather than a 406 or 415.
+ *
+ * Requests on an existing session pass through here too and get the answer
+ * the transport would have given; the session is untouched either way, since
+ * the SDK answers an oversized body on an initialized session without closing
+ * it.
+ */
+export function refuseDeclaredOversize(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const declared = Number(req.headers["content-length"]);
+  if (declared > MCP_REQUEST_BODY_LIMIT_BYTES) {
+    // Numbers and the mount path only: the query string on the Inspector
+    // routes can carry a server's env from an older client.
+    logger.warn(
+      `Refused an MCP request on ${JSON.stringify(req.baseUrl)} declaring ${declared} body bytes, over the ${MCP_REQUEST_BODY_LIMIT_BYTES}-byte limit.`,
+    );
+    res
+      .status(413)
+      .setHeader("Content-Type", "application/json")
+      .end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: requestBodyTooLargeMessage(MCP_REQUEST_BODY_LIMIT_BYTES),
+          },
+          id: null,
+        }),
+      );
+    return;
+  }
+  next();
+}
