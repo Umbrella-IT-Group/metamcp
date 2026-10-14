@@ -15,13 +15,15 @@ import { emitAdminEvent } from "../lib/audit/admin-event";
 import { toolsSyncCache } from "../lib/metamcp/tools-sync-cache";
 
 /**
- * AUDITING NOTE for this file. Both writes below emit only when the database
+ * AUDITING NOTE for this file. The writes below emit only when the database
  * was actually touched — `create` skips the empty-input branch and `sync`
  * skips the "tools unchanged" branch. These two procedures are called by the
  * inspector and the server detail pages on every refresh, so emitting on the
  * no-op branches would put an admin-triggered, unbounded stream of rows that
  * record nothing into the same table an investigation is read from. A row here
- * means the shared tools catalog for an MCP server changed.
+ * means the shared tools catalog for an MCP server changed. `syncFromListing`
+ * is reached only after its caller's own "changed" check, so every call is a
+ * write and emits as a system event.
  */
 
 export const toolsImplementations = {
@@ -167,6 +169,11 @@ export const toolsImplementations = {
         };
       }
     } catch (error) {
+      // Release the hash claimed above. Left in place, it would answer every
+      // later sync of the same tool set, here or from the tools/list path that
+      // shares this cache, with "unchanged, skipped" although nothing was
+      // written.
+      toolsSyncCache.clear(input.mcpServerUuid);
       console.error("Error syncing tools to database:", error);
       return {
         success: false as const,
@@ -174,5 +181,45 @@ export const toolsImplementations = {
         error: error instanceof Error ? error.message : "Internal server error",
       };
     }
+  },
+
+  /**
+   * Write a server's tool catalog from the gateway's own tools/list
+   * (`lib/metamcp/metamcp-proxy.ts`), which has already decided that the list
+   * changed and claimed its hash in `toolsSyncCache`.
+   *
+   * WHY NO CACHE CHECK HERE. The handler used to call `sync` above after
+   * claiming the hash, and `sync` checked the same singleton cache again, found
+   * the hash it had just been given, and returned "Tools unchanged, skipped
+   * sync". So a server's catalog was never written from this path; it moved
+   * only on a namespace's Refresh Tools. One gate per path: the caller owns it
+   * and releases its claim if this throws.
+   *
+   * Throws on a database error instead of returning a failure object: the
+   * caller logs it and releases the claim, so the next tools/list retries
+   * rather than skipping a write that never happened.
+   *
+   * The repository keeps every tool a namespace has a mapping row for, listed
+   * or not (see `ToolsRepository.syncTools`), so a momentarily short list can
+   * never cascade away a curator's INACTIVE rows.
+   */
+  syncFromListing: async (
+    input: z.infer<typeof CreateToolRequestSchema>,
+  ): Promise<{ upserted: number; deleted: number }> => {
+    const { upserted, deleted } = await toolsRepository.syncTools({
+      tools: input.tools,
+      mcpServerUuid: input.mcpServerUuid,
+    });
+
+    // No actor: nothing about a proxied tools/list identifies an operator, so
+    // the row is recorded as the system's (see emitEvent in admin-event.ts).
+    emitAdminEvent(undefined, {
+      action: "tools.sync",
+      target_type: "mcp_server",
+      target_id: input.mcpServerUuid,
+      detail: { upserted: upserted.length, deleted: deleted.length },
+    });
+
+    return { upserted: upserted.length, deleted: deleted.length };
   },
 };

@@ -152,11 +152,13 @@ export class McpServerPool {
   //     invalidation fan-out reaches no one and nothing downstream ever
   //     touches toolsSyncCache. Comparing against that frozen cache would
   //     re-detect the SAME already-handled change every tick, forever.
-  //   - tools.impl.sync overwrites toolsSyncCache with the
-  //     NAMESPACE-FILTERED tool set whenever filterOutOverrideTools drops a
-  //     tool, while the sweep always lists the UNFILTERED set — a
+  //   - Until 2026-10-14 tools.impl.sync overwrote toolsSyncCache with the
+  //     NAMESPACE-FILTERED tool set whenever filterOutOverrideTools dropped
+  //     a tool, while the sweep always lists the UNFILTERED set — a
   //     permanent false-drift mismatch even for servers with active
-  //     consumers.
+  //     consumers. The tools/list path now claims the unfiltered set, but
+  //     the cache still belongs to that path and to the UI's sync, so the
+  //     sweep keeps its own baseline.
   // Owning a separate baseline makes both impossible: always
   // unfiltered-vs-unfiltered, and updating it the moment a change is
   // observed makes the invalidate fire exactly ONCE per real change.

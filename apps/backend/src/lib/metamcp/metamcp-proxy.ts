@@ -443,14 +443,23 @@ export const createServer = async (
               );
 
               if (toolsToSave.length > 0) {
-                // Update cache with the full definitions we just observed
+                // Claim the full definitions we just observed, so concurrent
+                // listings of the same set skip, then write. The write must
+                // not re-check this cache: `tools.impl` sync used to, found
+                // the hash claimed here and skipped, so this path never wrote
+                // the catalog (see syncFromListing). The claim is released if
+                // the write fails, so the next tools/list retries it instead
+                // of skipping a write that never happened.
                 toolsSyncCache.update(mcpServerUuid, allServerTools);
-
-                // Sync with cleanup
-                await toolsImplementations.sync({
-                  tools: toolsToSave,
-                  mcpServerUuid: mcpServerUuid,
-                });
+                try {
+                  await toolsImplementations.syncFromListing({
+                    tools: toolsToSave,
+                    mcpServerUuid: mcpServerUuid,
+                  });
+                } catch (writeError) {
+                  toolsSyncCache.clear(mcpServerUuid);
+                  throw writeError;
+                }
               }
             }
           } catch (dbError) {

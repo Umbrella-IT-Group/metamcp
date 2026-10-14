@@ -72,7 +72,7 @@ function emitEvent(
     // A MISSING actor bundle means there was no tRPC request behind this call
     // at all, which is a different claim from "a user whose id we could not
     // read" — and it is reachable: `lib/metamcp/metamcp-proxy.ts` calls
-    // `toolsImplementations.sync` directly during a proxied MCP `tools/list`,
+    // `toolsImplementations.syncFromListing` during a proxied MCP `tools/list`,
     // with no session and no request context. Labelling that row `user` with
     // five null columns would put a phantom administrator in the table for
     // something a background refresh did. An actor bundle that EXISTS but
