@@ -1,9 +1,0 @@
-[ERROR] 2026/10/14 - 14:40:59 | Error cleaning up invalidated connection for server-1: Error: cleanup raised
-    at Object.<anonymous> (/home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.test.ts:203:13)
-    at Object.Mock [as cleanup] (file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+spy@4.1.11/node_modules/@vitest/spy/dist/index.js:332:34)
-    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.ts:391:26
-    at processTicksAndRejections (node:internal/process/task_queues:104:5)
-    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.ts:1717:9
-    at async Promise.all (index 0)
-    at McpServerPool.invalidateServerConnection (/home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.ts:1726:5)
-    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.test.ts:209:5

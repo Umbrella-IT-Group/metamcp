@@ -521,6 +521,39 @@ describe("client_secret_post", () => {
   });
 });
 
+describe.each(["log", "enforce"] as const)(
+  "malformed POST client secret, mode %s",
+  (mode) => {
+    it.each([
+      ["an object that cannot be coerced", { toString: "untrusted-value" }],
+      ["an array containing the right secret", [RIGHT_SECRET]],
+    ])("records %s as invalid without coercing it", async (_label, secret) => {
+      process.env[ENV] = mode;
+      oauthRepositoryMock.getClient.mockResolvedValue(
+        clientRow("client_secret_post"),
+      );
+      // Express accepts JSON objects here. Coercing this one while hashing
+      // throws, which used to turn the observational mode into a refusal.
+      const res = await post(
+        refreshBody({
+          client_id: CLIENT_ID,
+          client_secret: secret,
+        }),
+      );
+
+      if (mode === "log") {
+        expectIssued(res);
+        expect(issuedLine()).toMatch(/ client_auth=invalid$/);
+        expect(refreshRow().detail?.client_auth).toBe("invalid");
+      } else {
+        expectRefusedUntouched(res, "Invalid client secret");
+      }
+      expect(loggedText()).not.toContain("untrusted-value");
+      expectNoSecretRecorded();
+    });
+  },
+);
+
 describe("client_secret_basic", () => {
   beforeEach(() => {
     oauthRepositoryMock.getClient.mockResolvedValue(

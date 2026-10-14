@@ -958,9 +958,10 @@ async function rebuildRecoveredTransport(
 /**
  * Give back the pool instance a lazy recovery acquired under `sessionId` when
  * the recovery did not register its session (`server.connect` threw, or the
- * transport could not be hydrated). `metaMcpServerPool.cleanupSession` closes
- * the instance and releases its backend connections, the same release a
- * session teardown performs.
+ * transport could not be hydrated). Close the SDK server first, then release
+ * the backend connections through `metaMcpServerPool.cleanupSession`: that
+ * pool cleanup only releases backends, it does not close the SDK transport or
+ * run the server's onclose hook that detaches list_changed subscribers.
  *
  * Only when the pool still holds THIS instance under the id and no transport
  * is resident under it: both pools are keyed by session id alone, so if
@@ -973,6 +974,24 @@ async function releaseFailedRecoveryInstance(
   sessionId: string,
   instance: MetaMcpServerInstance,
 ): Promise<void> {
+  if (
+    metaMcpServerPool.getServerInstance(sessionId) !== instance ||
+    sessionManager.getSession(sessionId) !== undefined
+  ) {
+    return;
+  }
+  try {
+    // SDK connect binds its transport before awaiting start, so a failed
+    // start still needs close. Keep releasing backends if this close fails.
+    await instance.server.close();
+  } catch (error) {
+    logger.error(
+      `Failed to close SDK server after lazy recovery failed for session ${sessionId}.`,
+      error,
+    );
+  }
+  // Closing awaits and invokes onclose hooks. Recheck before releasing the
+  // id-keyed pool so a replacement installed during that await survives.
   if (
     metaMcpServerPool.getServerInstance(sessionId) !== instance ||
     sessionManager.getSession(sessionId) !== undefined
@@ -1456,13 +1475,24 @@ streamableHttpRouter.post(
       let admissionEviction: CeilingEviction | undefined;
       let releaseAdmission: (() => void) | undefined;
       let initializingSessionId: string | undefined;
+      let initializingTransport: StreamableHTTPServerTransport | undefined;
       let admissionClosed = false;
       let admissionCleanup: Promise<void> | undefined;
       const cleanupAdmission = (id: string): Promise<void> => {
         if (admissionCleanup) return admissionCleanup;
         // This fresh initialize failed or lost its caller. Drop its count
         // before a potentially slow close, and tear down only once.
-        const transport = sessionManager.getSession(id);
+        const resident = sessionManager.getSession(id);
+        // A recovery may have replaced this admission while it was awaiting
+        // connect or dispatch. Its transport and id-keyed pools are its own.
+        if (
+          initializingTransport &&
+          resident &&
+          resident !== initializingTransport
+        ) {
+          return Promise.resolve();
+        }
+        const transport = initializingTransport ?? resident;
         sessionManager.removeSession(id);
         publicSessionSweeper.forget(id);
         admissionCleanup = cleanupSession(id, transport).catch(() => {
@@ -1600,6 +1630,7 @@ streamableHttpRouter.post(
             }
           },
         });
+        initializingTransport = transport;
 
         // Note: Cleanup is handled explicitly via DELETE requests
         // StreamableHTTP is designed to persist across multiple requests
@@ -1708,15 +1739,20 @@ streamableHttpRouter.post(
           await cleanupAdmission(newSessionId);
         }
       } catch (error) {
-        // Whatever this initialize registered or acquired is released on a
-        // throw, whether or not the per-credential ceiling admitted it. The
+        // Release an initialize that failed before giving the client its
+        // session, whether or not the per-credential ceiling admitted it. The
         // guard used to require `releaseAdmission`, which exists only when
         // the ceiling and its eviction are on, so with the ceiling off (or
         // for a credential it does not count) a throw during connect or
         // dispatch left the registration, the pooled instance and the
         // `mcp_sessions` row behind for the idle sweeper.
+        // Once an initialized transport's response started, its id belongs
+        // to the client. A later dispatch throw must leave that live session
+        // available for subsequent requests and DELETE, as the Inspector does.
         // `!admissionClosed`: a disconnect already started this cleanup.
-        if (initializingSessionId && !admissionClosed) {
+        const answeredInitialize =
+          initializingTransport?.sessionId !== undefined && res.headersSent;
+        if (initializingSessionId && !admissionClosed && !answeredInitialize) {
           await cleanupAdmission(initializingSessionId);
         }
         logger.error("Error in public endpoint /mcp POST route:", error);

@@ -847,9 +847,19 @@ async function handleRefreshTokenGrant(
       });
     }
   }
-  const clientAuth = clientData
-    ? evaluateClientCredentials(req, clientData)
-    : null;
+  // A JSON body can put an object or array in client_secret. Hashing coerces
+  // it to a string, which can throw (an object with a non-callable toString)
+  // or authenticate an array containing the secret. Refresh must classify
+  // malformed credentials without breaking log mode's existing response;
+  // keep the authorization-code grant's existing evaluation unchanged.
+  const clientAuth: ReturnType<typeof evaluateClientCredentials> =
+    clientData?.token_endpoint_auth_method === "client_secret_post" &&
+    req.body.client_secret &&
+    typeof req.body.client_secret !== "string"
+      ? { outcome: "invalid", refusal: "Invalid client secret" }
+      : clientData
+        ? evaluateClientCredentials(req, clientData)
+        : null;
   if (clientAuth && clientAuth.outcome !== "verified") {
     if (clientAuthMode === "enforce") {
       // Not audited, by the doctrine on emitTokenLifecycle: the refusal

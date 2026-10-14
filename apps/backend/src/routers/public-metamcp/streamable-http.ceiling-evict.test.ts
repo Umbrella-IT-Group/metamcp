@@ -2029,7 +2029,7 @@ describe("lazy recovery at the ceiling: evict, never refuse (Alex's rulings, 202
   });
 });
 
-describe("a failed initialize releases its session with no ceiling slot reserved (METAMCP-SETUP-ERROR-LEAKS)", () => {
+describe("initialize failure cleanup preserves live and replacement sessions (METAMCP-SETUP-ERROR-LEAKS)", () => {
   // The POST route's error path released a failed initialize only when the
   // ceiling had reserved a slot for it (`releaseAdmission`). That reservation
   // exists only with the ceiling and its eviction on, so with the ceiling off,
@@ -2048,6 +2048,7 @@ describe("a failed initialize releases its session with no ceiling slot reserved
 
   describe.each([
     ["the ceiling is off", { MCP_MAX_SESSIONS_PER_CREDENTIAL: "0" }],
+    ["the ceiling is active", { MCP_MAX_SESSIONS_PER_CREDENTIAL: "5" }],
     [
       "the eviction kill switch is off",
       {
@@ -2096,6 +2097,69 @@ describe("a failed initialize releases its session with no ceiling slot reserved
       expect(isResident(failedId)).toBe(false);
       await vi.waitFor(() => expect(h.rows.has(failedId)).toBe(false));
       await retryAndPing();
+    });
+
+    it("keeps a session whose initialize was answered before dispatch throws", async () => {
+      const realHandleRequest =
+        StreamableHTTPServerTransport.prototype.handleRequest;
+      vi.spyOn(
+        StreamableHTTPServerTransport.prototype,
+        "handleRequest",
+      ).mockImplementationOnce(async function (
+        this: StreamableHTTPServerTransport,
+        ...args: Parameters<StreamableHTTPServerTransport["handleRequest"]>
+      ) {
+        await realHandleRequest.apply(this, args);
+        throw new Error("failed after answering initialize");
+      });
+
+      const opened = await initialize();
+      expect(opened.status).toBe(200);
+      await opened.text();
+      const sessionId = opened.headers.get("mcp-session-id") ?? "";
+      expect(sessionId).not.toBe("");
+      // Wait for the route's catch, which ran cleanup before logging its
+      // error, so checking immediately cannot miss a queued teardown.
+      await vi.waitFor(() => expect(h.logger.error).toHaveBeenCalled());
+
+      expect(isResident(sessionId)).toBe(true);
+      expect(h.cleanupSession).not.toHaveBeenCalled();
+      expect(h.rows.has(sessionId)).toBe(true);
+      const pinged = await ping(sessionId);
+      expect(pinged.status).toBe(200);
+      await pinged.text();
+    });
+
+    it("does not tear down a replacement recovery when the admission throws", async () => {
+      vi.spyOn(
+        StreamableHTTPServerTransport.prototype,
+        "handleRequest",
+      ).mockImplementationOnce(async () => {
+        const sessionId = String(h.getServer.mock.calls[0][0]);
+        // Replace the admission through the actual teardown and recovery
+        // paths while its dispatch is pending. The later catch owns only
+        // the original admission, even though both paths use the same id.
+        await reapIdleSession(sessionId);
+        const recovered = await recoverPersistedSession(
+          sessionId,
+          authReqFor("ep-1"),
+        );
+        expect(recovered.status).toBe("recovered");
+        throw new Error("admission failed after replacement");
+      });
+
+      const failed = await initialize();
+      expect(failed.status).toBe(500);
+      await failed.text();
+      const sessionId = String(h.getServer.mock.calls[0][0]);
+
+      expect(h.cleanupSession).toHaveBeenCalledTimes(1);
+      expect(isResident(sessionId)).toBe(true);
+      expect(h.rows.has(sessionId)).toBe(true);
+      const pinged = await ping(sessionId);
+      expect(pinged.status).toBe(200);
+      await pinged.text();
+      expect(h.getServer).toHaveBeenCalledTimes(2);
     });
   });
 });
