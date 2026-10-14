@@ -300,7 +300,12 @@ export function createFilterListToolsMiddleware(
 }
 
 /**
- * Creates a Call Tool middleware that blocks calls to inactive tools
+ * Creates a Call Tool middleware that blocks calls to inactive tools.
+ *
+ * It judges the name it is handed, and an override name has no mapping row of
+ * its own (it reads as "no mapping, allowed"), so it must be composed INSIDE
+ * `createToolOverridesCallToolMiddleware`, which resolves an override name to
+ * the original tool first. See the call chain in `metamcp-proxy.ts`.
  */
 export function createFilterCallToolMiddleware(
   config: FilterToolsConfig = {},

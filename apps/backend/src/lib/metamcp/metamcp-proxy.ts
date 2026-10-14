@@ -877,12 +877,22 @@ export const createServer = async (
     // unknown tool with the replacement from the retired-tool map. Consulted
     // only AFTER a failure, so it cannot shadow a live tool.
     createRetiredToolMiddleware(),
+    // Override names resolve BEFORE the filter, so the INACTIVE check judges
+    // the tool that will actually run. With the filter outside this, a call
+    // by an override name (`<server>__<alias>`) reached the filter as the
+    // alias, found no mapping row for it, read that as "allowed", and was then
+    // routed to the original tool, so a tool curated INACTIVE stayed callable
+    // by its alias while its real name was refused. This mirrors the list
+    // chain above, where the filter also runs on the real names, inside the
+    // rename. A name that is not an override passes this middleware unchanged,
+    // so the filter sees exactly the name it saw before; an alias call is
+    // refused with the same text its real name gets (it names the real tool).
+    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
         `Access denied to tool "${toolName}": ${reason}`,
     }),
-    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     // Innermost, directly around the routing handler: adds text to the
     // SDK-shaped -32001 timeout saying the outcome is unknown and a write's
     // target should be read before a retry. Same code, same data; text only.
