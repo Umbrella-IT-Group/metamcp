@@ -109,10 +109,16 @@ describe("drizzle journal ordering for 0039", () => {
     expect(entry?.idx).toBe(39);
   });
 
-  it("has a `when` STRICTLY GREATER than every other entry", () => {
+  it("has a `when` STRICTLY GREATER than every earlier entry", () => {
     const entry = journal.entries.find((e) => e.tag === MIGRATION_TAG);
     const when = entry?.when ?? Number.NEGATIVE_INFINITY;
-    const others = journal.entries.filter((e) => e.tag !== MIGRATION_TAG);
+    // EARLIER entries only. This compared against every other entry while
+    // 0039 was the newest, which made it fail the moment 0040 landed although
+    // 0039's ordering was still right; the whole-journal ordering is the
+    // monotonic test below.
+    const others = journal.entries.filter(
+      (e) => entry !== undefined && e.idx < entry.idx,
+    );
     const maxOther = Math.max(...others.map((e) => e.when));
 
     // drizzle applies only entries whose `when` exceeds the max already

@@ -650,6 +650,13 @@ export const createServer = async (
         // entirely — no wait — when the DB has no record of this tool:
         // that's a genuinely unknown tool, not a reconnect race, and it
         // must still 404 immediately.
+        //
+        // The candidates are ACTIVE mapping rows only
+        // (findServersForNamespaceToolName), so this never warms or routes
+        // a server whose row for the tool is switched off, nor, under the
+        // `allowlist` tool policy, one with no row. The filter middleware
+        // already refused those by name; the query keeps the server this
+        // picks inside the same rule rather than relying on that.
         if (!clientForTool) {
           const candidates =
             await namespacesRepository.findServersForNamespaceToolName(

@@ -92,7 +92,18 @@
     "toggleTooFast": "Toggle Too Fast",
     "toggleTooFastDescription": "Please wait before toggling again to allow the session to initialize properly.",
     "forceReset": "Force Reset",
-    "anErrorOccurredWhileDeleting": "An error occurred while deleting the namespace"
+    "anErrorOccurredWhileDeleting": "An error occurred while deleting the namespace",
+    "toolPolicy": "Tool Policy",
+    "toolPolicyAllowAll": "Allow all",
+    "toolPolicyAllowlist": "Allowlist",
+    "toolPolicyAllowAllHelp": "Tools with no row in Tools Management are served, including tools added to a server later.",
+    "toolPolicyAllowlistHelp": "Only tools switched on in Tools Management are served. New tools stay hidden until switched on.",
+    "toolPolicySwitchLabel": "Allowlist mode",
+    "toolPolicyConfirmTitle": "Switch to allowlist mode?",
+    "toolPolicyConfirmDescription": "Every tool in \"{{name}}\" that is not switched on in Tools Management stops being listed or callable at once, and tools added to its servers later stay hidden until switched on. Switching back to allow all restores them.",
+    "toolPolicyConfirm": "Switch to allowlist",
+    "toolPolicyUpdated": "Tool policy updated",
+    "toolPolicyUpdateFailed": "Failed to update the tool policy"
   },
   "enhancedToolsTable": {
     "toolName": "Tool Name",

@@ -1,10 +1,11 @@
 /**
- * RBAC gate tests for the three namespace CURATION mutations gated to
+ * RBAC gate tests for the namespace CURATION mutations gated to
  * adminProcedure per coordinator direction (2026-07-14 follow-up on
  * PR #68's own review): updateServerStatus, updateToolStatus,
  * updateToolOverrides change which servers/tools an agent sees through a
  * namespace — the same "destructive update" class as namespace
- * create/update/delete. refreshTools (namespaces) and reconnect
+ * create/update/delete. setToolPolicy (migration 0040) joined them: one flip
+ * decides whether every tool with no mapping row is served. refreshTools (namespaces) and reconnect
  * (mcpServers) stay protectedProcedure so a non-admin OWNER can still act on
  * what they own, and are commented in-line at their router definitions. That
  * is a procedure-level statement only: both carry an impl-level admin gate
@@ -25,7 +26,9 @@ import { describe, expect, it, vi } from "vitest";
 
 const okImpl = <T>(value: T) => vi.fn().mockResolvedValue(value);
 
-const buildRouter = () =>
+const buildRouter = (
+  overrides: Partial<Parameters<typeof createNamespacesRouter>[0]> = {},
+) =>
   createNamespacesRouter({
     create: okImpl({ success: true } as never),
     list: okImpl({ namespaces: [] } as never),
@@ -37,7 +40,9 @@ const buildRouter = () =>
     updateServerStatus: okImpl({ success: true }),
     updateToolStatus: okImpl({ success: true, message: "updated" }),
     updateToolOverrides: okImpl({ success: true, message: "updated" }),
+    setToolPolicy: okImpl({ success: true, message: "set" }),
     refreshTools: okImpl({ success: true, message: "refreshed" }),
+    ...overrides,
   });
 
 const adminCtx = {
@@ -109,6 +114,44 @@ describe("namespaces curation mutations — admin gate", () => {
     await expect(
       router.createCaller(memberCtx).updateToolOverrides(toolOverridesInput),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("setToolPolicy: admin allowed, member FORBIDDEN, impl untouched by a member", async () => {
+    const setToolPolicy = okImpl({ success: true, message: "set" });
+    const router = buildRouter({ setToolPolicy });
+    const input = {
+      namespaceUuid: NAMESPACE_UUID,
+      toolPolicy: "allowlist" as const,
+    };
+
+    await expect(
+      router.createCaller(memberCtx).setToolPolicy(input),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    // The gate refuses before the implementation runs: no write, no audit row
+    // claiming a member changed the policy.
+    expect(setToolPolicy).not.toHaveBeenCalled();
+
+    await expect(
+      router.createCaller(adminCtx).setToolPolicy(input),
+    ).resolves.toEqual({ success: true, message: "set" });
+    // The audit actor is built from the session, so the audit row names the
+    // administrator who flipped the policy.
+    expect(setToolPolicy).toHaveBeenCalledWith(
+      input,
+      "admin-1",
+      expect.objectContaining({ actor_id: "admin-1" }),
+    );
+  });
+
+  it("setToolPolicy rejects a value outside the two policies before the impl", async () => {
+    const router = buildRouter();
+
+    await expect(
+      router.createCaller(adminCtx).setToolPolicy({
+        namespaceUuid: NAMESPACE_UUID,
+        toolPolicy: "deny_all" as never,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
   // Procedure level only: the impl denies a non-admin on a PUBLIC namespace

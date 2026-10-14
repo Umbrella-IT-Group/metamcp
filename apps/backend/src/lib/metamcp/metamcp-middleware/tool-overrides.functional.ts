@@ -14,6 +14,7 @@ import {
   CallToolMiddleware,
   ListToolsMiddleware,
 } from "./functional-middleware";
+import { findNamespaceServerUuidsByName } from "./namespace-server-lookup";
 
 /**
  * Configuration for the tool overrides middleware
@@ -220,15 +221,29 @@ async function getToolOverrides(
   }
 
   try {
-    // Get server UUID by name
-    const [server] = await db
-      .select({ uuid: mcpServersTable.uuid })
-      .from(mcpServersTable)
-      .where(eq(mcpServersTable.name, serverName));
+    // The server this prefix means IN THIS NAMESPACE (upstream
+    // metatool-ai/metamcp#364, see namespace-server-lookup.ts). Resolved by
+    // name alone, the lookup could land on another owner's same-named server,
+    // find no mapping row there, and silently drop this namespace's override.
+    const serverUuids = await findNamespaceServerUuidsByName(
+      namespaceUuid,
+      serverName,
+    );
 
-    if (!server) {
+    if (serverUuids.length !== 1) {
+      if (serverUuids.length > 1) {
+        // Two mounted servers share the name, so which one's override applies
+        // cannot be told from the prefix; the routing maps already warn about
+        // the collision. Apply none rather than pick by heap order: the tool
+        // then shows under its real name, and the filter judges it against
+        // both servers.
+        logger.warn(
+          `Tool overrides skipped for ${serverName}__${toolName} in namespace ${namespaceUuid}: ${serverUuids.length} mounted servers share the name "${serverName}"`,
+        );
+      }
       return null;
     }
+    const server = { uuid: serverUuids[0] };
 
     // Query database for tool overrides
     const [toolMapping] = await db

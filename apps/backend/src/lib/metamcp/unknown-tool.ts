@@ -11,8 +11,9 @@
  *   2. The backend answering for a name the gateway still routes to it: a
  *      FastMCP backend returns an isError result `Unknown tool: '<name>'`; a
  *      TypeScript-SDK backend returns `Tool <name> not found`.
- *   3. The filter middleware's fail-closed denial when the server prefix no
- *      longer resolves at all (a deleted server):
+ *   3. The filter middleware's fail-closed denial when the server prefix
+ *      matches no server mounted in the namespace (a deleted server, or one
+ *      mounted only elsewhere):
  *      `Access denied to tool "<name>": server could not be resolved`.
  *
  * ANCHORED, deliberately: every pattern must match at the START of the text
@@ -22,13 +23,15 @@
  * the redirect would rewrite a real error. The text is also capped at the first
  * 512 characters so the check stays O(1) on a large error body.
  *
- * KNOWN SHAPE OF A FALSE POSITIVE, accepted and documented: the third form is
- * also what the filter returns for a LIVE tool when the server-name lookup
- * fails for a transient database reason (the lookup fails closed). That call is
- * recorded as `unknown_tool` rather than `tool_error`. A stale map entry can
- * also redirect that refusal. Redirect callers must require the missing name
- * to match the requested tool, so a live tool's failure about an internal
- * helper cannot become a retirement notice for the live tool itself.
+ * The third form is no longer what a LIVE tool gets when the server lookup
+ * fails for a transient database reason: since the lookup became
+ * namespace-scoped (migration 0040's change, upstream metatool-ai/metamcp#364)
+ * it no longer swallows the error into "not found", so that call is refused as
+ * `tool status could not be verified`, which matches no pattern here. It used
+ * to be recorded as `unknown_tool`, and a stale map entry could redirect it.
+ * Redirect callers must still require the missing name to match the requested
+ * tool, so a live tool's failure about an internal helper cannot become a
+ * retirement notice for the live tool itself.
  *
  * PURE and import-free so the audit middleware's static graph stays DB-free.
  */

@@ -7,6 +7,7 @@ import {
   McpServerErrorStatusEnum,
   McpServerStatusEnum,
   McpServerTypeEnum,
+  type NamespaceToolPolicy,
   type OAuthClientRegistrationSource,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
@@ -282,6 +283,16 @@ export const namespacesTable = pgTable(
     user_id: text("user_id").references(() => usersTable.id, {
       onDelete: "cascade",
     }),
+    // How the tool filter treats a tool with NO namespace_tool_mappings row
+    // (migration 0040): 'allow_all' serves it (the original behaviour, and the
+    // default, so the column's arrival changes nothing), 'allowlist' hides it,
+    // so only ACTIVE rows are listed or callable. Text plus the CHECK below
+    // rather than a pgEnum; the reasoning is in the migration. Written only by
+    // the admin-gated `namespaces.setToolPolicy`.
+    tool_policy: text("tool_policy")
+      .$type<NamespaceToolPolicy>()
+      .notNull()
+      .default("allow_all"),
   },
   (table) => [
     index("namespaces_user_id_idx").on(table.user_id),
@@ -290,6 +301,12 @@ export const namespacesTable = pgTable(
     sql`CONSTRAINT namespaces_name_regex_check CHECK (
         name ~ '^[a-zA-Z0-9_-]+$'
       )`,
+    // Mirrored from migration 0040 so a fresh `drizzle-kit generate` re-adds
+    // nothing; refuses any other value even on a row written outside the app.
+    check(
+      "namespaces_tool_policy_check",
+      sql`${table.tool_policy} IN ('allow_all', 'allowlist')`,
+    ),
   ],
 );
 

@@ -8,6 +8,8 @@ import {
   ListNamespacesResponseSchema,
   RefreshNamespaceToolsRequestSchema,
   RefreshNamespaceToolsResponseSchema,
+  SetNamespaceToolPolicyRequestSchema,
+  SetNamespaceToolPolicyResponseSchema,
   UpdateNamespaceRequestSchema,
   UpdateNamespaceResponseSchema,
   UpdateNamespaceServerStatusRequestSchema,
@@ -84,6 +86,11 @@ export const createNamespacesRouter = (
       userId: string,
       actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceToolOverridesResponseSchema>>;
+    setToolPolicy: (
+      input: z.infer<typeof SetNamespaceToolPolicyRequestSchema>,
+      userId: string,
+      actor: AuditActor,
+    ) => Promise<z.infer<typeof SetNamespaceToolPolicyResponseSchema>>;
     // `isAdmin` decides whether a PUBLIC (unowned) namespace may be
     // refreshed, for the reason spelled out at the procedure below. Threaded
     // from `ctx.user.role` at the call site, like `get`'s flag above.
@@ -206,6 +213,22 @@ export const createNamespacesRouter = (
       .output(UpdateNamespaceToolOverridesResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.updateToolOverrides(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
+      }),
+
+    // Admin only: switch the namespace between `allow_all` (a tool with no
+    // mapping row is served) and `allowlist` (only ACTIVE rows are served).
+    // Curation, and the widest form of it: one flip hides or exposes every
+    // tool in the namespace that has no row, so it gets the same gate as
+    // updateToolStatus and its own audit event (`namespace.tool_policy`).
+    setToolPolicy: adminProcedure
+      .input(SetNamespaceToolPolicyRequestSchema)
+      .output(SetNamespaceToolPolicyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.setToolPolicy(
           input,
           ctx.user.id,
           auditActor(ctx),

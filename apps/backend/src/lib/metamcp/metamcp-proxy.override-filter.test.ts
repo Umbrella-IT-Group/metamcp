@@ -21,6 +21,14 @@
  *   - a name that is not an override gets the same answer as before, and the
  *     filter judges the very name the caller sent;
  *   - tools/list is unchanged.
+ *
+ * And, for the per-namespace `allowlist` tool policy (migration 0040), through
+ * the same real chain:
+ *   - tools/list serves only ACTIVE rows, under their override names;
+ *   - an alias of an allowlisted (ACTIVE) tool runs, an alias of an INACTIVE
+ *     tool and a tool with no row are refused, and the backend runs nothing;
+ *   - the tools/call reconnect-window fallback is never reached for a tool the
+ *     policy refuses, and still recovers an allowlisted one.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -39,11 +47,19 @@ import type {
   FakeToolMappingState,
 } from "./metamcp-middleware/tool-mapping-db.fixtures";
 
-const { state, queries, getSessionMock } = vi.hoisted(() => ({
-  state: { servers: [], mappings: [] } as FakeToolMappingState,
-  queries: [] as FakeQuery[],
-  getSessionMock: vi.fn(),
-}));
+const { state, queries, getSessionMock, findServersMock, warmupMock } =
+  vi.hoisted(() => ({
+    state: {
+      servers: [],
+      mappings: [],
+      mounts: [],
+      namespaces: [],
+    } as FakeToolMappingState,
+    queries: [] as FakeQuery[],
+    getSessionMock: vi.fn(),
+    findServersMock: vi.fn(),
+    warmupMock: vi.fn(),
+  }));
 
 vi.mock("@/utils/logger", () => ({
   default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
@@ -66,7 +82,7 @@ vi.mock("../../db", async () => ({
   ).createToolMappingDb(state, queries),
 }));
 vi.mock("../../db/repositories/namespaces.repo", () => ({
-  namespacesRepository: { findServersForNamespaceToolName: async () => [] },
+  namespacesRepository: { findServersForNamespaceToolName: findServersMock },
 }));
 vi.mock("../../db/repositories/oauth-sessions.repo", () => ({
   oauthSessionsRepository: {},
@@ -101,7 +117,7 @@ vi.mock("./cold-connect-broker-fallback", () => ({
   resolveColdConnectBrokerFallback: () => undefined,
 }));
 vi.mock("./tool-call-warmup", () => ({
-  acquireSessionWithBoundedWarmup: vi.fn(async () => undefined),
+  acquireSessionWithBoundedWarmup: warmupMock,
 }));
 
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
@@ -119,6 +135,8 @@ const SERVER = { uuid: "server-ninja", name: "ninja" };
  */
 const CURATION: FakeToolMappingState = {
   servers: [SERVER],
+  mounts: [{ namespaceUuid: NS, serverUuid: SERVER.uuid }],
+  namespaces: [{ uuid: NS, toolPolicy: "allow_all" }],
   mappings: [
     {
       namespaceUuid: NS,
@@ -158,6 +176,7 @@ const BACKEND_TOOLS = [
 ];
 
 const INACTIVE = "Tool has been marked as inactive in this namespace";
+const NOT_ALLOWLISTED = "Tool is not on this namespace's allowlist";
 
 const cleanups: Array<() => Promise<unknown>> = [];
 
@@ -218,16 +237,27 @@ const statusLookups = () =>
     .filter((q) => "tools.name" in q.where)
     .map((q) => q.where["tools.name"]);
 
+/** The same curation under `policy`. */
+const usePolicy = (policy: "allow_all" | "allowlist") => {
+  state.namespaces = [{ uuid: NS, toolPolicy: policy }];
+};
+
 beforeEach(async () => {
   clearFilterCache();
   clearOverrideCache();
   state.servers = CURATION.servers;
   state.mappings = CURATION.mappings;
+  state.mounts = CURATION.mounts;
+  state.namespaces = CURATION.namespaces;
   queries.length = 0;
   ran = [];
   setAuditRecorderForTesting(null);
   getSessionMock.mockReset();
   getSessionMock.mockResolvedValue(await backend());
+  findServersMock.mockReset();
+  findServersMock.mockResolvedValue([]);
+  warmupMock.mockReset();
+  warmupMock.mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
@@ -331,5 +361,119 @@ describe("tools/list: unchanged", () => {
       "ninja__things",
       "ninja__unmapped",
     ]);
+  });
+});
+
+describe("allowlist policy: only ACTIVE rows are served, by any name", () => {
+  beforeEach(() => usePolicy("allowlist"));
+
+  it("tools/list serves only ACTIVE rows, under their override names", async () => {
+    const consumer = await connectConsumer();
+
+    const { tools } = await consumer.request(
+      { method: "tools/list", params: {} },
+      ListToolsResultSchema,
+    );
+
+    // `unmapped` has no row, so the allowlist hides it.
+    expect(tools.map((tool) => tool.name).sort()).toEqual([
+      "ninja__plain_read",
+      "ninja__things",
+    ]);
+  });
+
+  it("runs an allowlisted tool by its alias and by its real name", async () => {
+    const consumer = await connectConsumer();
+
+    const byAlias = await call(consumer, "ninja__things");
+    const byName = await call(consumer, "ninja__list_things");
+
+    expect(textOf(byAlias)).toBe("ran list_things");
+    expect(textOf(byName)).toBe("ran list_things");
+    expect(ran).toEqual(["list_things", "list_things"]);
+    // The alias was judged as the tool it runs, never as the alias.
+    expect(statusLookups()).not.toContain("things");
+  });
+
+  it("refuses an INACTIVE tool by its alias exactly as by its real name", async () => {
+    const consumer = await connectConsumer();
+
+    const byAlias = await call(consumer, "ninja__purge");
+    const byName = await call(consumer, "ninja__delete_things");
+
+    expect(textOf(byAlias)).toBe(
+      `Access denied to tool "ninja__delete_things": ${INACTIVE}`,
+    );
+    expect(byAlias.content).toEqual(byName.content);
+    expect(ran).toEqual([]);
+  });
+
+  it("refuses a tool with no row, which allow_all would have run", async () => {
+    const result = await call(await connectConsumer(), "ninja__unmapped");
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe(
+      `Access denied to tool "ninja__unmapped": ${NOT_ALLOWLISTED}`,
+    );
+    expect(ran).toEqual([]);
+  });
+
+  it("switching back to allow_all serves the no-row tool again (the rollback)", async () => {
+    const consumer = await connectConsumer();
+    expect((await call(consumer, "ninja__unmapped")).isError).toBe(true);
+
+    usePolicy("allow_all");
+    clearFilterCache(NS); // what namespaces.setToolPolicy does after writing
+
+    expect(textOf(await call(consumer, "ninja__unmapped"))).toBe(
+      "ran unmapped",
+    );
+  });
+});
+
+describe("tools/call reconnect-window fallback under the allowlist policy", () => {
+  beforeEach(() => usePolicy("allowlist"));
+
+  /**
+   * The reconnect window: no live session for the owning server, so the
+   * dynamic-find loop finds nothing and the handler falls back to
+   * findServersForNamespaceToolName plus a bounded warm-up.
+   */
+  const inReconnectWindow = async () => {
+    const warmed = await backend();
+    getSessionMock.mockReset();
+    getSessionMock.mockResolvedValue(undefined);
+    warmupMock.mockResolvedValue(warmed);
+    findServersMock.mockResolvedValue([
+      { serverUuid: SERVER.uuid, serverName: SERVER.name },
+    ]);
+  };
+
+  it("never reaches the fallback for a tool the policy refuses", async () => {
+    const consumer = await connectConsumer();
+    await inReconnectWindow();
+
+    const result = await call(consumer, "ninja__unmapped");
+
+    expect(textOf(result)).toBe(
+      `Access denied to tool "ninja__unmapped": ${NOT_ALLOWLISTED}`,
+    );
+    // Refused by the filter before the routing handler ran: no fallback
+    // lookup, no warm-up, nothing executed.
+    expect(findServersMock).not.toHaveBeenCalled();
+    expect(warmupMock).not.toHaveBeenCalled();
+    expect(ran).toEqual([]);
+  });
+
+  it("still recovers an allowlisted tool called by its alias", async () => {
+    const consumer = await connectConsumer();
+    await inReconnectWindow();
+
+    const result = await call(consumer, "ninja__things");
+
+    expect(textOf(result)).toBe("ran list_things");
+    // The fallback looked up the ORIGINAL tool name in this namespace.
+    expect(findServersMock).toHaveBeenCalledWith(NS, "list_things");
+    expect(warmupMock).toHaveBeenCalledTimes(1);
   });
 });

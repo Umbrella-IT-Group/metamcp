@@ -93,11 +93,13 @@ export class ToolsRepository {
    * as those rows, INACTIVE ones included: a namespace that must expose one
    * tool of a server holds an INACTIVE row for every other one. Deleting a tool
    * row cascades its rows away, and when the tool is listed again it is
-   * inserted under a new uuid with no row at all, which the tool filter treats
-   * as ACTIVE ("no mapping exists or tool is active"). A server that lists
-   * fewer tools for a moment (a restart, a degraded partial list, a tool
-   * registered only when configured) would therefore silently re-enable every
-   * tool a curator had switched off. An obsolete tool that NO namespace maps
+   * inserted under a new uuid with no row at all. Under the default
+   * `allow_all` tool policy (migration 0040) the filter serves a tool with no
+   * row, so a server that lists fewer tools for a moment (a restart, a
+   * degraded partial list, a tool registered only when configured) would
+   * silently re-enable every tool a curator had switched off; under
+   * `allowlist` it would silently drop every tool a curator had switched on.
+   * An obsolete tool that NO namespace maps
    * carries no curation, so removing it loses nothing and keeps the catalog
    * honest. A retired tool that is still mapped stays until its rows are
    * removed deliberately; the next catalog write after that prunes it.

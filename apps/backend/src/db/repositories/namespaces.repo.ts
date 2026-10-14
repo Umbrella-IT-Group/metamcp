@@ -3,6 +3,7 @@ import {
   DatabaseNamespaceTool,
   DatabaseNamespaceWithServers,
   NamespaceCreateInput,
+  NamespaceToolPolicy,
   NamespaceUpdateInput,
 } from "@repo/zod-types";
 import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
@@ -78,6 +79,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        tool_policy: namespacesTable.tool_policy,
       })
       .from(namespacesTable)
       .orderBy(desc(namespacesTable.created_at));
@@ -93,6 +95,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        tool_policy: namespacesTable.tool_policy,
       })
       .from(namespacesTable)
       .where(
@@ -114,6 +117,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        tool_policy: namespacesTable.tool_policy,
       })
       .from(namespacesTable)
       .where(isNull(namespacesTable.user_id))
@@ -130,6 +134,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        tool_policy: namespacesTable.tool_policy,
       })
       .from(namespacesTable)
       .where(eq(namespacesTable.user_id, userId))
@@ -145,6 +150,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        tool_policy: namespacesTable.tool_policy,
       })
       .from(namespacesTable)
       .where(eq(namespacesTable.uuid, uuid));
@@ -165,6 +171,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        tool_policy: namespacesTable.tool_policy,
       })
       .from(namespacesTable)
       .where(
@@ -288,6 +295,16 @@ export class NamespacesRepository {
    * backend server in a namespace, disambiguated only by the
    * server-name prefix on the call side, so callers must filter by
    * `sanitizeName(serverName) === serverPrefix` themselves.
+   *
+   * ACTIVE rows only. This fallback picks the server it routes to from these
+   * rows, AFTER the filter middleware judged the call by name, so a row it
+   * returns has to be one the filter would serve on its own: an ACTIVE row is
+   * served under both tool policies (allow_all and allowlist), an INACTIVE row
+   * under neither. Returning INACTIVE rows (as this did before the per-
+   * namespace tool policy) meant the fallback could warm and route a server
+   * whose row for this tool is switched off, relying entirely on the filter
+   * having refused first. A tool with no row was never found here (the join
+   * requires a row), which is unchanged.
    */
   async findServersForNamespaceToolName(
     namespaceUuid: string,
@@ -311,10 +328,53 @@ export class NamespacesRepository {
         and(
           eq(namespaceToolMappingsTable.namespace_uuid, namespaceUuid),
           eq(toolsTable.name, toolName),
+          eq(namespaceToolMappingsTable.status, "ACTIVE"),
         ),
       );
 
     return rows;
+  }
+
+  /**
+   * Set the namespace's tool policy and report the value it replaced, for the
+   * audit row. The read locks the row (FOR UPDATE) so the previous value is the
+   * one this write actually replaced, not one a concurrent call already
+   * overwrote. The UPDATE also conflicts with the FOR SHARE lock the mapping
+   * writers take on this row (namespace-mappings.repo), so a refresh runs
+   * entirely before or entirely after a flip, never with a policy that changed
+   * underneath it.
+   *
+   * @returns undefined when no namespace has this uuid
+   */
+  async setToolPolicy(
+    uuid: string,
+    toolPolicy: NamespaceToolPolicy,
+  ): Promise<
+    { previous: NamespaceToolPolicy; namespace: DatabaseNamespace } | undefined
+  > {
+    return await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select({ tool_policy: namespacesTable.tool_policy })
+        .from(namespacesTable)
+        .where(eq(namespacesTable.uuid, uuid))
+        .for("update");
+
+      if (!current) {
+        return undefined;
+      }
+
+      const [updated] = await tx
+        .update(namespacesTable)
+        .set({ tool_policy: toolPolicy, updated_at: new Date() })
+        .where(eq(namespacesTable.uuid, uuid))
+        .returning();
+
+      if (!updated) {
+        return undefined;
+      }
+
+      return { previous: current.tool_policy, namespace: updated };
+    });
   }
 
   async deleteByUuid(uuid: string): Promise<DatabaseNamespace | undefined> {
@@ -388,13 +448,25 @@ export class NamespacesRepository {
             .where(inArray(toolsTable.mcp_server_uuid, input.mcpServerUuids));
 
           if (serverTools.length > 0) {
+            // A tool with no previous row is a tool nobody has reviewed for
+            // this namespace. Under `allowlist` it must not come back ACTIVE
+            // just because the server list was saved again, so it starts
+            // INACTIVE there; under `allow_all` it starts ACTIVE, as it always
+            // has (no row and an ACTIVE row serve the same). The policy is
+            // read from the row this transaction just updated, which also
+            // holds that row's lock until commit, so a concurrent
+            // setToolPolicy cannot change it in between.
+            const newRowStatus: "ACTIVE" | "INACTIVE" =
+              updatedNamespace.tool_policy === "allow_all"
+                ? "ACTIVE"
+                : "INACTIVE";
             const toolMappings = serverTools.map((tool) => ({
               namespace_uuid: input.uuid,
               tool_uuid: tool.uuid,
               mcp_server_uuid: tool.mcp_server_uuid,
-              // Preserve existing status if tool was previously mapped, otherwise default to ACTIVE
-              status:
-                existingToolStatusMap.get(tool.uuid) || ("ACTIVE" as const),
+              // Preserve existing status if tool was previously mapped,
+              // otherwise the policy's default for a new row (above).
+              status: existingToolStatusMap.get(tool.uuid) || newRowStatus,
             }));
 
             await tx.insert(namespaceToolMappingsTable).values(toolMappings);

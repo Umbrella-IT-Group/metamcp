@@ -25,6 +25,7 @@ import { trpc } from "@/lib/trpc";
 
 import { NamespaceServersTable } from "./components/namespace-servers-table";
 import { NamespaceToolManagement } from "./components/namespace-tool-management";
+import { NamespaceToolPolicyRow } from "./components/namespace-tool-policy";
 
 interface NamespaceDetailPageProps {
   params: Promise<{
@@ -495,6 +496,11 @@ export default function NamespaceDetailPage({
                   <p className="text-sm">{formatDate(namespace.updated_at)}</p>
                 </div>
               </div>
+              <NamespaceToolPolicyRow
+                namespaceUuid={namespace.uuid}
+                namespaceName={namespace.name}
+                toolPolicy={namespace.tool_policy}
+              />
             </div>
           </div>
 

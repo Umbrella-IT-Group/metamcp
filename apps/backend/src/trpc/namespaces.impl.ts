@@ -9,6 +9,8 @@ import {
   ListNamespacesResponseSchema,
   RefreshNamespaceToolsRequestSchema,
   RefreshNamespaceToolsResponseSchema,
+  SetNamespaceToolPolicyRequestSchema,
+  SetNamespaceToolPolicyResponseSchema,
   UpdateNamespaceRequestSchema,
   UpdateNamespaceResponseSchema,
   UpdateNamespaceServerStatusRequestSchema,
@@ -30,6 +32,7 @@ import {
 } from "../db/repositories";
 import { NamespacesSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { clearFilterCache } from "../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   clearOverrideCache,
   mapOverrideNameToOriginal,
@@ -745,6 +748,84 @@ export const namespacesImplementations = {
     }
   },
 
+  setToolPolicy: async (
+    input: z.infer<typeof SetNamespaceToolPolicyRequestSchema>,
+    userId: string,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof SetNamespaceToolPolicyResponseSchema>> => {
+    try {
+      const namespace = await namespacesRepository.findByUuid(
+        input.namespaceUuid,
+      );
+
+      if (!namespace) {
+        return {
+          success: false as const,
+          message: "Namespace not found",
+        };
+      }
+
+      // Same ownership rule as the other curation mutations: the procedure is
+      // adminProcedure, and a PRIVATE namespace is still changed only by its
+      // owner.
+      if (namespace.user_id && namespace.user_id !== userId) {
+        return {
+          success: false as const,
+          message:
+            "Access denied: You can only set the tool policy for namespaces you own",
+        };
+      }
+
+      const result = await namespacesRepository.setToolPolicy(
+        input.namespaceUuid,
+        input.toolPolicy,
+      );
+
+      if (!result) {
+        return {
+          success: false as const,
+          message: "Namespace not found",
+        };
+      }
+
+      // The filter caches the policy (and statuses) for up to a second; clear
+      // this namespace's entries so the flip applies to the very next
+      // tools/list or tools/call rather than within the TTL.
+      clearFilterCache(input.namespaceUuid);
+
+      // Recorded with the value it replaced so the audit trail alone says
+      // whether a namespace was opened up or locked down, and when. A no-op
+      // set (same value) is recorded too: it is still an administrator
+      // asserting the namespace's policy.
+      emitAdminEvent(actor, {
+        action: "namespace.tool_policy",
+        target_type: "namespace",
+        target_id: input.namespaceUuid,
+        detail: {
+          name: result.namespace.name,
+          previous: result.previous,
+          tool_policy: result.namespace.tool_policy,
+        },
+      });
+
+      return {
+        success: true as const,
+        message:
+          result.namespace.tool_policy === "allowlist"
+            ? "Tool policy set to allowlist: only tools with an ACTIVE row are served"
+            : "Tool policy set to allow_all: tools with no row are served",
+        data: NamespacesSerializer.serializeNamespace(result.namespace),
+      };
+    } catch (error) {
+      logger.error("Error setting namespace tool policy:", error);
+      return {
+        success: false as const,
+        message:
+          error instanceof Error ? error.message : "Internal server error",
+      };
+    }
+  },
+
   refreshTools: async (
     input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
     userId: string,
@@ -953,6 +1034,9 @@ export const namespacesImplementations = {
 
       let totalToolsCreated = 0;
       let totalMappingsCreated = 0;
+      // The policy the mapping writes followed, as each write read it under
+      // its own lock (see bulkUpsertNamespaceToolMappings).
+      let allowlistWrite = false;
 
       // Process tools for each server
       for (const [serverName, serverData] of Object.entries(
@@ -972,20 +1056,27 @@ export const namespacesImplementations = {
 
         totalToolsCreated += upsertedTools.length;
 
-        // Create namespace tool mappings
+        // Create namespace tool mappings. ACTIVE is what a refresh asks for;
+        // in an `allowlist` namespace the repository creates new rows
+        // INACTIVE instead and leaves existing rows' status alone, so a
+        // refresh never allowlists a tool (the platform's admin CLI runs one
+        // during provisioning).
         const toolMappings = upsertedTools.map((tool) => ({
           toolUuid: tool.uuid,
           serverUuid: serverUuid,
           status: "ACTIVE" as const,
         }));
 
-        const createdMappings =
+        const { mappings: createdMappings, toolPolicy } =
           await namespaceMappingsRepository.bulkUpsertNamespaceToolMappings({
             namespaceUuid: input.namespaceUuid,
             toolMappings,
           });
 
         totalMappingsCreated += createdMappings.length;
+        if (toolPolicy !== undefined && toolPolicy !== "allow_all") {
+          allowlistWrite = true;
+        }
 
         logger.info(
           `Processed ${tools.length} tools for server "${serverName}" (${serverUuid})`,
@@ -1027,7 +1118,11 @@ export const namespacesImplementations = {
 
       return {
         success: true as const,
-        message: `Successfully refreshed ${totalToolsCreated} tools with ${totalMappingsCreated} mappings`,
+        message:
+          `Successfully refreshed ${totalToolsCreated} tools with ${totalMappingsCreated} mappings` +
+          (allowlistWrite
+            ? " (allowlist namespace: new mappings were created INACTIVE and existing statuses were kept)"
+            : ""),
         toolsCreated: totalToolsCreated,
         mappingsCreated: totalMappingsCreated,
       };
