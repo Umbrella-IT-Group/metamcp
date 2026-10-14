@@ -25,11 +25,16 @@ const {
   isInternalTarget,
   GATEWAY_BACKEND_AUTH_HEADER,
   CROSS_ORIGIN_REDIRECT_REFUSED,
+  MCP_URL_HAS_NO_HOST,
+  MCP_URL_NOT_PARSABLE,
+  MCP_URL_SCHEME_NOT_HTTP,
   NOT_A_PERMITTED_TARGET,
+  REDIRECT_TARGET_NOT_PARSABLE,
   RESPONSE_TOO_LARGE,
   TOO_MANY_REDIRECTS,
   UNREPLAYABLE_REDIRECT_BODY,
 } = await import("./url-guard");
+const { default: logger } = await import("@/utils/logger");
 
 /** A routable public address, used wherever "somewhere on the internet" is the point. */
 const PUBLIC_V4 = "93.184.216.34";
@@ -195,12 +200,12 @@ describe("assertPublicMcpUrl — refusals", () => {
   ])("refuses the non-http(s) scheme in %s", async (url) => {
     await expect(
       assertPublicMcpUrl(url, { lookup: resolvesTo(PUBLIC_V4) }),
-    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+    ).rejects.toThrow(MCP_URL_SCHEME_NOT_HTTP);
   });
 
   it("refuses a URL that does not parse", async () => {
     await expect(assertPublicMcpUrl("not-a-url")).rejects.toThrow(
-      NOT_A_PERMITTED_TARGET,
+      MCP_URL_NOT_PARSABLE,
     );
   });
 
@@ -553,6 +558,154 @@ describe("assertPublicMcpUrl — the refusal is an oracle-free constant", () => 
     expect(message).not.toContain("leaky");
     expect(message).not.toContain("169.254");
     expect(message).not.toContain("10.");
+  });
+});
+
+/**
+ * Every refusal names its real cause: in the message when the URL text alone
+ * decides it, and in the log line when the network does (where the message
+ * must stay the one oracle-free string above).
+ *
+ * The message used to blame a public-address rule for every refusal, which was
+ * wrong for the URL-text causes and for the pooled posture, where private
+ * ranges are allowed. Each case pins the exact message (equality, not the
+ * substring match `rejects.toThrow` does) and the reason the log carries.
+ */
+describe("assertPublicMcpUrl — each refusal names its real cause", () => {
+  const warn = vi.mocked(logger.warn);
+
+  beforeEach(() => {
+    warn.mockClear();
+  });
+
+  const refusalFor = async (
+    run: () => Promise<unknown>,
+  ): Promise<{ message: string; logged: string }> => {
+    try {
+      await run();
+    } catch (error) {
+      expect(warn).toHaveBeenCalledTimes(1);
+      return {
+        message: (error as Error).message,
+        logged: String(warn.mock.calls[0][0]),
+      };
+    }
+    throw new Error("expected a refusal");
+  };
+
+  const redirect = (location: string) =>
+    new Response(null, { status: 302, headers: { location } });
+
+  it.each([
+    {
+      cause: "a URL that does not parse",
+      run: () => assertPublicMcpUrl("not-a-url"),
+      message: MCP_URL_NOT_PARSABLE,
+      logged: "not a parsable absolute URL",
+    },
+    {
+      cause: "a non-http(s) scheme",
+      run: () =>
+        assertPublicMcpUrl("ftp://mcp.example.com/", {
+          lookup: resolvesTo(PUBLIC_V4),
+        }),
+      message: MCP_URL_SCHEME_NOT_HTTP,
+      logged: 'scheme "ftp:" is not http(s)',
+    },
+    {
+      cause: "a host that normalises to nothing",
+      // `URL` keeps "." as the hostname; the trailing-dot strip empties it.
+      run: () =>
+        assertPublicMcpUrl("http://./mcp", { lookup: resolvesTo(PUBLIC_V4) }),
+      message: MCP_URL_HAS_NO_HOST,
+      logged: "no host",
+    },
+    {
+      cause: "a redirect Location that does not parse",
+      run: () =>
+        createGuardedFetch({
+          baseFetch: vi.fn().mockResolvedValueOnce(redirect("http://[::1")),
+          lookup: resolvesTo(PUBLIC_V4),
+        })("https://mcp.example.com/mcp"),
+      message: REDIRECT_TARGET_NOT_PARSABLE,
+      logged: "redirect target is not a parsable URL",
+    },
+    {
+      cause: "a redirect to a non-http(s) scheme",
+      run: () =>
+        createGuardedFetch({
+          baseFetch: vi.fn().mockResolvedValueOnce(redirect("file:///etc/x")),
+          lookup: resolvesTo(PUBLIC_V4),
+        })("https://mcp.example.com/mcp"),
+      message: MCP_URL_SCHEME_NOT_HTTP,
+      logged: 'scheme "file:" is not http(s)',
+    },
+    {
+      cause: "a name that does not resolve",
+      run: () =>
+        assertPublicMcpUrl("https://mcp.example.com/sse", {
+          lookup: vi.fn(async () => {
+            throw new Error("ENOTFOUND");
+          }),
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"mcp.example.com" did not resolve',
+    },
+    {
+      cause: "a name that resolves to nothing",
+      run: () =>
+        assertPublicMcpUrl("https://mcp.example.com/sse", {
+          lookup: resolvesTo(),
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"mcp.example.com" resolved to nothing',
+    },
+    {
+      cause: "a name that resolves into a refused range",
+      run: () =>
+        assertPublicMcpUrl("https://mcp.example.com/sse", {
+          lookup: resolvesTo("10.0.0.5"),
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"mcp.example.com" resolves into 10.0.0.0/8',
+    },
+    {
+      cause: "an IP literal in a refused range",
+      run: () => assertPublicMcpUrl("http://169.254.169.254/latest/"),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"169.254.169.254" resolves into 169.254.0.0/16 link-local',
+    },
+    {
+      cause: "a pooled backend in CGNAT, where private ranges are allowed",
+      run: () =>
+        assertPublicMcpUrl("http://backend.internal/mcp", {
+          lookup: resolvesTo("100.64.0.1"),
+          allowPrivateAddresses: true,
+        }),
+      message: NOT_A_PERMITTED_TARGET,
+      logged: '"backend.internal" resolves into 100.64.0.0/10',
+    },
+  ])("$cause", async ({ run, message, logged }) => {
+    const refusal = await refusalFor(run);
+
+    expect(refusal.message).toBe(message);
+    expect(refusal.logged).toContain(logged);
+  });
+
+  it("no longer blames a public-address rule for any refusal", async () => {
+    // The pooled posture permits private backends, so "must be reachable at a
+    // public address" is false there, and it was never the cause of a
+    // URL-text refusal.
+    for (const message of [
+      NOT_A_PERMITTED_TARGET,
+      MCP_URL_NOT_PARSABLE,
+      MCP_URL_SCHEME_NOT_HTTP,
+      MCP_URL_HAS_NO_HOST,
+      REDIRECT_TARGET_NOT_PARSABLE,
+    ]) {
+      expect(message).not.toMatch(/public/i);
+    }
+    expect(NOT_A_PERMITTED_TARGET).toContain("gateway log");
   });
 });
 

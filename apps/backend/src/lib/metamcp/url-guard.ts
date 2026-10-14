@@ -37,17 +37,53 @@ import logger from "@/utils/logger";
  */
 
 /**
- * One refusal string for every way a destination can fail this check.
+ * One refusal string for every way a DESTINATION can fail this check: the host
+ * does not resolve, resolves to nothing, or resolves (or is a literal) into a
+ * range this posture refuses.
  *
- * Deliberately says nothing about WHICH rule refused and never echoes the
- * caller's URL. A caller who can tell "blocked because private" from "blocked
- * because it did not resolve" has a network-mapping oracle: the difference
- * between those two answers is exactly the information a blind SSRF is trying
- * to recover. The specific reason goes to the log, where an operator
- * debugging their own misconfiguration can read it.
+ * Deliberately says nothing about WHICH of those rules refused and never
+ * echoes the caller's URL. A caller who can tell "blocked because private"
+ * from "blocked because it did not resolve" has a network-mapping oracle: the
+ * difference between those two answers is exactly the information a blind
+ * SSRF is trying to recover. The specific reason goes to the log, where an
+ * operator debugging their own misconfiguration can read it, and the message
+ * says so.
+ *
+ * It names the class of cause, which is true under both postures. It used to
+ * add "Remote MCP servers must be reachable at a public address", which is
+ * false for the pooled data plane (private ranges are allowed there, so its
+ * destination refusals are a dead name or a never-a-backend range such as the
+ * metadata address, CGNAT, multicast or a reserved block) and for every
+ * refusal that was not about an address at all, so an operator debugging a
+ * failed backend was pointed at the wrong cause.
  */
 export const NOT_A_PERMITTED_TARGET =
-  "The requested MCP server URL is not a permitted destination. Remote MCP servers must be reachable at a public address.";
+  "The MCP server URL, or a URL it redirected to, is not a permitted destination: its host does not resolve, or resolves to an address range this gateway does not connect to. The gateway log records the specific reason.";
+
+/*
+ * Refusals decided by the URL TEXT alone, before any resolver is asked. Each
+ * names its own cause, unlike the destination refusal above: the caller can
+ * compute every one of them from the string they sent (or the redirect their
+ * server returned) without the network, so naming them tells the caller
+ * nothing about what lies behind the gateway. A resolver-dependent cause must
+ * never get a message of its own; it belongs under NOT_A_PERMITTED_TARGET.
+ */
+
+/** The URL did not parse as an absolute URL. */
+export const MCP_URL_NOT_PARSABLE =
+  "The MCP server URL is not a valid absolute URL.";
+
+/** The URL, or a redirect hop, uses a scheme other than http or https. */
+export const MCP_URL_SCHEME_NOT_HTTP =
+  "The MCP server URL, or a URL it redirected to, does not use http or https.";
+
+/** The URL, or a redirect hop, has an empty host once normalised. */
+export const MCP_URL_HAS_NO_HOST =
+  "The MCP server URL, or a URL it redirected to, has no host.";
+
+/** A redirect `Location` that does not parse against the request URL. */
+export const REDIRECT_TARGET_NOT_PARSABLE =
+  "The MCP server URL redirected to a target that is not a valid URL.";
 
 /** A redirect chain that never terminates is refused rather than followed. */
 export const TOO_MANY_REDIRECTS =
@@ -656,16 +692,22 @@ const applyGatewayTrustHeader = (
 };
 
 /**
- * Build the single refusal Error and log the real reason beside it.
+ * Build a refusal Error and log the real reason beside it.
+ *
+ * `message` defaults to the oracle-free destination refusal; only the
+ * URL-text refusals (see MCP_URL_NOT_PARSABLE and its siblings) pass their own.
  *
  * CALLER CONTRACT: `reason` is interpolated raw, so anything caller-supplied
  * inside it — a hostname above all — must already be `JSON.stringify`'d by the
  * caller. A refused URL is by definition attacker-chosen, and an unescaped
  * newline in one forges whole log lines.
  */
-const refuse = (reason: string): Error => {
+const refuse = (
+  reason: string,
+  message: string = NOT_A_PERMITTED_TARGET,
+): Error => {
   logger.warn(`MCP proxy remote URL refused: ${reason}`);
-  return new Error(NOT_A_PERMITTED_TARGET);
+  return new Error(message);
 };
 
 /**
@@ -683,17 +725,20 @@ export const assertPublicMcpUrl = async (
   try {
     url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
   } catch {
-    throw refuse("not a parsable absolute URL");
+    throw refuse("not a parsable absolute URL", MCP_URL_NOT_PARSABLE);
   }
 
   // `file:`, `gopher:` and friends are how an SSRF turns into a file read or a
   // protocol-smuggling primitive. Both transports here only ever speak HTTP.
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw refuse(`scheme ${JSON.stringify(url.protocol)} is not http(s)`);
+    throw refuse(
+      `scheme ${JSON.stringify(url.protocol)} is not http(s)`,
+      MCP_URL_SCHEME_NOT_HTTP,
+    );
   }
 
   const hostname = normalizeHostname(url.hostname);
-  if (!hostname) throw refuse("no host");
+  if (!hostname) throw refuse("no host", MCP_URL_HAS_NO_HOST);
 
   const allowedHosts = options.allowedHosts
     ? new Set([...options.allowedHosts].map(normalizeHostname))
@@ -1084,7 +1129,10 @@ export const createGuardedFetch = (
       try {
         nextUrl = new URL(location, target.url);
       } catch {
-        throw refuse("redirect target is not a parsable URL");
+        throw refuse(
+          "redirect target is not a parsable URL",
+          REDIRECT_TARGET_NOT_PARSABLE,
+        );
       }
 
       // Pooled posture: a redirect to another origin is refused outright, not
