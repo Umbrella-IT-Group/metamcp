@@ -41,7 +41,10 @@ import {
   MCP_REQUEST_BODY_LIMIT_BYTES,
   refuseDeclaredOversize,
 } from "../../lib/metamcp/mcp-request-body-limit";
-import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
+import {
+  type MetaMcpServerInstance,
+  metaMcpServerPool,
+} from "../../lib/metamcp/metamcp-server-pool";
 import {
   AuthMethod,
   hashAuthPrincipal,
@@ -868,74 +871,125 @@ async function rebuildRecoveredTransport(
     );
     return { status: "not_found" };
   }
-  // Re-stamp the consumer identity onto the rebuilt instance's context so
-  // post-restart tool calls stay attributed (the registry/in-memory state is
-  // gone after a restart; authReq is the re-validated current caller).
-  stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => sessionId,
-    // The same body ceiling as a fresh session: a recovered session carries
-    // the same tool calls. See lib/metamcp/mcp-request-body-limit.
-    maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
-    onsessioninitialized: async (sid) => {
-      logger.info(
-        `Lazy-recovered session re-initialized for sessionId: ${sid}`,
-      );
-    },
-  });
-  await mcpServerInstance.server.connect(transport);
+  // From here the pools hold an instance (and its backend connections) under
+  // this session id. Every exit that does not register the session must give
+  // it back, or it stays allocated with nothing to release it: no transport
+  // is resident to be DELETEd, swept or evicted, and the next recovery of the
+  // same id is handed the same instance by `getServer` (keyed by session id),
+  // whose `server.connect` then throws because it is still connected.
+  let registered = false;
+  try {
+    // Re-stamp the consumer identity onto the rebuilt instance's context so
+    // post-restart tool calls stay attributed (the registry/in-memory state is
+    // gone after a restart; authReq is the re-validated current caller).
+    stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId,
+      // The same body ceiling as a fresh session: a recovered session carries
+      // the same tool calls. See lib/metamcp/mcp-request-body-limit.
+      maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
+      onsessioninitialized: async (sid) => {
+        logger.info(
+          `Lazy-recovered session re-initialized for sessionId: ${sid}`,
+        );
+      },
+    });
+    await mcpServerInstance.server.connect(transport);
 
-  // Restore the SDK session state the (skipped) `initialize` handshake
-  // would have set. Without this the rebuilt transport stays
-  // `_initialized=false` and rejects the client's first request with
-  // 400 {-32000 "Server not initialized"} → relayed as -32600. See
-  // `hydrateRecoveredTransport` for the full rationale.
-  if (!hydrateRecoveredTransport(transport, sessionId)) {
-    // SDK internal shape changed — don't cache a transport we can't
-    // prove is serviceable. Fall back to the 404 reinit path.
-    await transport
-      .close()
+    // Restore the SDK session state the (skipped) `initialize` handshake
+    // would have set. Without this the rebuilt transport stays
+    // `_initialized=false` and rejects the client's first request with
+    // 400 {-32000 "Server not initialized"} → relayed as -32600. See
+    // `hydrateRecoveredTransport` for the full rationale.
+    if (!hydrateRecoveredTransport(transport, sessionId)) {
+      // SDK internal shape changed — don't cache a transport we can't
+      // prove is serviceable. Fall back to the 404 reinit path.
+      await transport
+        .close()
+        .catch((error: unknown) =>
+          logger.warn(
+            `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
+            error,
+          ),
+        );
+      return { status: "not_found" };
+    }
+    // Bind the recovered session to its endpoint and to the caller. The row
+    // already passed the namespace_uuid + endpoint_name match AND the
+    // auth_method + auth_principal comparison above, so this request's endpoint
+    // and identity ARE the session's true binding — record them so subsequent
+    // in-memory lookups go through the same check as the fresh-session path.
+    // Recording the recovering caller's identity is not a rebind: recovery is
+    // only reached with the credential whose hash the row already stores.
+    sessionManager.addSession(sessionId, transport, requestBinding(authReq));
+    registered = true;
+    // Registration replaces the ceiling's reservation synchronously.
+    onRegistered?.();
+    // Resume idle-TTL tracking for the recovered session. Required whether
+    // this recovery followed a sweep reap (the reap's forget() dropped
+    // tracking; without this the recovered session would never be
+    // TTL-swept again if abandoned a second time) or a gateway restart (the
+    // sweeper's in-memory map is empty after boot regardless of cause).
+    // beginTracking() is the unconditional seed — see its doc comment for
+    // why touch()/markInFlight() further down (in dispatchTracked) are
+    // deliberately guarded and would no-op here without this call.
+    publicSessionSweeper.beginTracking(sessionId);
+    // Best-effort touch; failure is non-fatal — pruner only deletes
+    // genuinely stale rows.
+    mcpSessionsRepository
+      .touch(sessionId)
       .catch((error: unknown) =>
         logger.warn(
-          `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
+          `mcp_sessions touch failed for session ${sessionId}; pruner may reap prematurely.`,
           error,
         ),
       );
-    return { status: "not_found" };
-  }
-  // Bind the recovered session to its endpoint and to the caller. The row
-  // already passed the namespace_uuid + endpoint_name match AND the
-  // auth_method + auth_principal comparison above, so this request's endpoint
-  // and identity ARE the session's true binding — record them so subsequent
-  // in-memory lookups go through the same check as the fresh-session path.
-  // Recording the recovering caller's identity is not a rebind: recovery is
-  // only reached with the credential whose hash the row already stores.
-  sessionManager.addSession(sessionId, transport, requestBinding(authReq));
-  // Registration replaces the ceiling's reservation synchronously.
-  onRegistered?.();
-  // Resume idle-TTL tracking for the recovered session. Required whether
-  // this recovery followed a sweep reap (the reap's forget() dropped
-  // tracking; without this the recovered session would never be
-  // TTL-swept again if abandoned a second time) or a gateway restart (the
-  // sweeper's in-memory map is empty after boot regardless of cause).
-  // beginTracking() is the unconditional seed — see its doc comment for
-  // why touch()/markInFlight() further down (in dispatchTracked) are
-  // deliberately guarded and would no-op here without this call.
-  publicSessionSweeper.beginTracking(sessionId);
-  // Best-effort touch; failure is non-fatal — pruner only deletes
-  // genuinely stale rows.
-  mcpSessionsRepository
-    .touch(sessionId)
-    .catch((error: unknown) =>
-      logger.warn(
-        `mcp_sessions touch failed for session ${sessionId}; pruner may reap prematurely.`,
-        error,
-      ),
+    logger.info(
+      `Lazy-recovered session ${sessionId} for endpoint ${stored.endpoint_name} (namespace ${stored.namespace_uuid}); persisted state restored from DB.`,
     );
-  logger.info(
-    `Lazy-recovered session ${sessionId} for endpoint ${stored.endpoint_name} (namespace ${stored.namespace_uuid}); persisted state restored from DB.`,
-  );
-  return { status: "recovered", transport };
+    return { status: "recovered", transport };
+  } finally {
+    if (!registered) {
+      await releaseFailedRecoveryInstance(sessionId, mcpServerInstance);
+    }
+  }
+}
+
+/**
+ * Give back the pool instance a lazy recovery acquired under `sessionId` when
+ * the recovery did not register its session (`server.connect` threw, or the
+ * transport could not be hydrated). `metaMcpServerPool.cleanupSession` closes
+ * the instance and releases its backend connections, the same release a
+ * session teardown performs.
+ *
+ * Only when the pool still holds THIS instance under the id and no transport
+ * is resident under it: both pools are keyed by session id alone, so if
+ * another path has meanwhile taken the id over (or released it already),
+ * the entries are not this recovery's to release. Never throws, so the
+ * recovery's own outcome (its 404, or the connect error the route answers
+ * with 500) is what the caller sees.
+ */
+async function releaseFailedRecoveryInstance(
+  sessionId: string,
+  instance: MetaMcpServerInstance,
+): Promise<void> {
+  if (
+    metaMcpServerPool.getServerInstance(sessionId) !== instance ||
+    sessionManager.getSession(sessionId) !== undefined
+  ) {
+    return;
+  }
+  try {
+    await metaMcpServerPool.cleanupSession(sessionId);
+    logger.info(
+      `Lazy recovery for session ${sessionId} failed; released its pool instance.`,
+    );
+  } catch (error) {
+    logger.error(
+      `Lazy recovery for session ${sessionId} failed, and releasing its pool instance also failed.`,
+      error,
+    );
+  }
 }
 
 /**
