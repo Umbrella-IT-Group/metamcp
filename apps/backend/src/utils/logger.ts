@@ -256,6 +256,14 @@ export class Logger {
       }
       old.end();
     } else {
+      // KNOWN LOSS on this path: the rename above already replaced any
+      // previous `<name>.1`, so restoring `<name>.1` to `<name>` leaves NO
+      // `.1` generation; the prior one is gone although nothing rotated. The
+      // success path drops it too, by the single-generation design. Kept
+      // rather than parking the old `.1` aside first, because that adds a
+      // rename that can fail on its own, and a reopen failure (already logged
+      // once by openStream) is the rarer event. Pinned by
+      // logger-rotation-reopen-failure.test.ts.
       try {
         renameSync(`${filePath}.1`, filePath);
       } catch (restoreErr) {

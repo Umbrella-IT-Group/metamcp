@@ -352,8 +352,19 @@ export class McpServerPool {
    * bypasses getInstance() entirely and would have missed this bug too).
    * Callers must cleanupAll() the outgoing instance themselves first — this
    * only clears the reference, it doesn't tear down timers/sessions.
+   *
+   * Refuses outside a test run (vitest sets NODE_ENV to "test" when it is
+   * unset). Called in a running gateway it would orphan the live pool, its
+   * timers and every connection it holds behind a fresh, empty one, so a
+   * stray call fails loudly instead. Production leaves NODE_ENV unset or sets
+   * "production", and both refuse.
    */
   static resetInstanceForTests(): void {
+    if (process.env.NODE_ENV !== "test") {
+      throw new Error(
+        `McpServerPool.resetInstanceForTests() is test-only (NODE_ENV=${process.env.NODE_ENV ?? "unset"})`,
+      );
+    }
     McpServerPool.instance = null;
   }
 

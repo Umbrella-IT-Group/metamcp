@@ -132,4 +132,30 @@ describe("McpServerPool.getInstance — honors MAX_TOTAL_CONNECTIONS / MAX_CONNE
     expect(second).not.toBe(first);
     expect(second.getPoolConfig().maxTotalConnections).toBe(250);
   });
+
+  it.each([["production"], [undefined]])(
+    "resetInstanceForTests() refuses when NODE_ENV is %s and keeps the live pool",
+    (nodeEnv) => {
+      const live = McpServerPool.getInstance();
+      const saved = process.env.NODE_ENV;
+      if (nodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = nodeEnv;
+      }
+      try {
+        expect(() => McpServerPool.resetInstanceForTests()).toThrow(
+          /test-only/,
+        );
+      } finally {
+        // Assigning undefined to process.env stores the string "undefined".
+        if (saved === undefined) {
+          delete process.env.NODE_ENV;
+        } else {
+          process.env.NODE_ENV = saved;
+        }
+      }
+      expect(McpServerPool.getInstance()).toBe(live);
+    },
+  );
 });
