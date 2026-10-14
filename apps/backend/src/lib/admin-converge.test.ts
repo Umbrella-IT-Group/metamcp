@@ -2,7 +2,7 @@
  * Boot-time admin converge (fork issue #196).
  *
  * The repository is replaced by an in-memory users table whose `promoteToAdmin`
- * honours the same `role <> 'admin'` predicate the real UPDATE carries (pinned
+ * honours the same email and `role <> 'admin'` predicates the real UPDATE carries (pinned
  * as SQL in `users.repo.admin-converge.test.ts`), so these cases can assert on
  * the RESULTING roles and on a second boot, not only on which calls were made.
  * The audit sink is the real `emitAdminEvent` path with a capturing sink, so the
@@ -97,13 +97,18 @@ beforeEach(() => {
         .filter((u) => emails.includes(u.email.toLowerCase()))
         .map((u) => ({ ...u })),
   );
-  usersRepositoryMock.promoteToAdmin.mockImplementation(async (id: string) => {
-    // Same predicate as the real UPDATE: matches only a non-admin row.
-    const row = users.find((u) => u.id === id && u.role !== "admin");
-    if (!row) return undefined;
-    row.role = "admin";
-    return { id: row.id, email: row.email };
-  });
+  usersRepositoryMock.promoteToAdmin.mockImplementation(
+    async (id: string, email: string) => {
+      // Same predicates as the UPDATE: only a still-named non-admin row.
+      const row = users.find(
+        (u) =>
+          u.id === id && u.email.toLowerCase() === email && u.role !== "admin",
+      );
+      if (!row) return undefined;
+      row.role = "admin";
+      return { id: row.id, email: row.email };
+    },
+  );
   usersRepositoryMock.countAdmins.mockImplementation(async () => ({
     admins: users.filter((u) => u.role === "admin").length,
     users: users.length,
@@ -225,7 +230,10 @@ describe("convergeConfiguredAdmins: promotion", () => {
 
     expect(roleOf("u-other")).toBe("member");
     expect(usersRepositoryMock.promoteToAdmin).toHaveBeenCalledTimes(1);
-    expect(usersRepositoryMock.promoteToAdmin).toHaveBeenCalledWith("u-member");
+    expect(usersRepositoryMock.promoteToAdmin).toHaveBeenCalledWith(
+      "u-member",
+      "pat@example.com",
+    );
   });
 
   it("never demotes an administrator the list does not name", async () => {
@@ -237,6 +245,7 @@ describe("convergeConfiguredAdmins: promotion", () => {
     expect(roleOf("u-other")).toBe("admin");
     expect(usersRepositoryMock.promoteToAdmin).not.toHaveBeenCalledWith(
       "u-admin",
+      expect.any(String),
     );
     expect(auditRows.map((r) => r.target_id)).toEqual(["u-other"]);
   });
@@ -255,6 +264,10 @@ describe("convergeConfiguredAdmins: promotion", () => {
     ]);
     expect(roleOf("u-member")).toBe("admin");
     expect(roleOf("u-mixed")).toBe("admin");
+    expect(usersRepositoryMock.promoteToAdmin).toHaveBeenCalledWith(
+      "u-mixed",
+      "robin@example.com",
+    );
     expect(result.promoted.sort()).toEqual(["u-member", "u-mixed"]);
     // The audit row carries the address as stored, not as configured.
     expect(
@@ -397,6 +410,27 @@ describe("convergeConfiguredAdmins: failures never stop the boot", () => {
     });
     await flush();
 
+    expect(result.promoted).toEqual([]);
+    expect(auditRows).toEqual([]);
+  });
+
+  it("does not promote or audit an account renamed after the lookup", async () => {
+    usersRepositoryMock.findByEmailsIgnoringCase.mockImplementationOnce(
+      async () => {
+        const account = users.find((u) => u.id === "u-member");
+        if (!account) throw new Error("missing member fixture");
+        const before = { ...account };
+        account.email = "renamed@example.com";
+        return [before];
+      },
+    );
+
+    const result = await convergeConfiguredAdmins({
+      [ADMIN_EMAIL_ENV]: "pat@example.com",
+    });
+    await flush();
+
+    expect(roleOf("u-member")).toBe("member");
     expect(result.promoted).toEqual([]);
     expect(auditRows).toEqual([]);
   });

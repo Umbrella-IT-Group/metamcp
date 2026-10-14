@@ -14,6 +14,8 @@
  *     role is not already `admin`. The first half is the "never demotes"
  *     guarantee at the SQL level; the second is what makes a no-change restart
  *     return no row and therefore write no audit row.
+ *     The configured email is rechecked in that same write so a renamed
+ *     account cannot inherit a promotion from a stale lookup.
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
@@ -44,18 +46,23 @@ describe("buildFindUsersByEmailsQuery", () => {
 });
 
 describe("buildPromoteToAdminQuery", () => {
-  it("sets only role=admin, and only on a row that is not already admin", async () => {
+  it("sets role=admin only on a still-named row that is not already admin", async () => {
     const { buildPromoteToAdminQuery } = await import("./users.repo");
     const now = new Date("2026-10-14T00:00:00.000Z");
-    const { sql, params } = buildPromoteToAdminQuery("u-1", now).toSQL();
+    const { sql, params } = buildPromoteToAdminQuery(
+      "u-1",
+      "pat@example.com",
+      now,
+    ).toSQL();
 
     expect(sql).toBe(
       'update "users" set "role" = $1, "updated_at" = $2 ' +
-        'where ("users"."id" = $3 and "users"."role" <> $4) ' +
+        'where ("users"."id" = $3 and lower("users"."email") = $4 and "users"."role" <> $5) ' +
         'returning "id", "email"',
     );
     expect(params[0]).toBe("admin");
     expect(params[2]).toBe("u-1");
-    expect(params[3]).toBe("admin");
+    expect(params[3]).toBe("pat@example.com");
+    expect(params[4]).toBe("admin");
   });
 });

@@ -132,18 +132,24 @@ export const mcpServersImplementations = {
     }
   },
 
-  // Every server, whoever owns it. Only reachable through the admin-gated
-  // `listAll` procedure, so it serializes for an administrator (`true`): the
-  // same unredacted view an admin's `list` already returns for the rows it
-  // can see, extended to rows owned by other users. `list` above keeps its
-  // public-plus-own filter for every caller.
-  listAll: async (): Promise<z.infer<typeof ListMcpServersResponseSchema>> => {
+  // Every server, whoever owns it. Inventory visibility does not grant
+  // another owner's private connection credentials: those rows use the
+  // existing redacted view. Public and owned rows keep the admin view they
+  // already have through `list`, whose public-plus-own filter is unchanged.
+  listAll: async (
+    userId: string,
+  ): Promise<z.infer<typeof ListMcpServersResponseSchema>> => {
     try {
       const servers = await mcpServersRepository.findAll();
 
       return {
         success: true as const,
-        data: McpServersSerializer.serializeMcpServerList(servers, true),
+        data: servers.map((server) =>
+          McpServersSerializer.serializeMcpServer(
+            server,
+            server.user_id === null || server.user_id === userId,
+          ),
+        ),
         message: "MCP servers retrieved successfully",
       };
     } catch (error) {

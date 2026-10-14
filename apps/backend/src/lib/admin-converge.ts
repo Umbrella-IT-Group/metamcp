@@ -240,10 +240,10 @@ async function promoteNamedAccounts(
     }
 
     try {
-      const promoted = await usersRepository.promoteToAdmin(account.id);
+      const promoted = await usersRepository.promoteToAdmin(account.id, email);
       if (!promoted) {
         // Became an administrator between the read and the write, or was
-        // deleted. Either way this run changed nothing, so it records nothing.
+        // deleted or renamed. This run changed nothing, so it records nothing.
         continue;
       }
       result.promoted.push(promoted.id);

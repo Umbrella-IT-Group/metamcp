@@ -19,6 +19,9 @@
  *     is still served while the database is failing;
  *   - a failed write from the UI's `tools.sync` cannot leave a claim behind
  *     that makes the next tools/list skip its write.
+ *   - namespace presentation aliases cannot suppress native backend names;
+ *   - an older listing or UI write that commits last cannot leave the newer
+ *     listing cached as current against a stale catalog.
  *
  * Which rows the write may delete is a property of the SQL, pinned against a
  * real Postgres in `db/repositories/tools.repo.sync.integration.test.ts`.
@@ -35,13 +38,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectedClient } from "./client";
 
-const { getSessionMock, syncToolsMock, emitAdminEventMock } = vi.hoisted(
-  () => ({
-    getSessionMock: vi.fn(),
-    syncToolsMock: vi.fn(),
-    emitAdminEventMock: vi.fn(),
-  }),
-);
+const {
+  getSessionMock,
+  syncToolsMock,
+  emitAdminEventMock,
+  mapOverrideNameMock,
+} = vi.hoisted(() => ({
+  getSessionMock: vi.fn(),
+  syncToolsMock: vi.fn(),
+  emitAdminEventMock: vi.fn(),
+  mapOverrideNameMock: vi.fn(),
+}));
 
 vi.mock("@/utils/logger", () => ({
   default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
@@ -92,12 +99,12 @@ vi.mock("./metamcp-middleware/filter-tools.functional", () => ({
   createFilterCallToolMiddleware: () => (next: unknown) => next,
   createFilterListToolsMiddleware: () => (next: unknown) => next,
 }));
-// No overrides: `filterOutOverrideTools` keeps every tool, which is exactly
-// the production shape in which the catalog never synced.
+// Namespace presentation is inert here; the reverse-name seam lets a test
+// prove that presentation aliases cannot change the shared raw catalog.
 vi.mock("./metamcp-middleware/tool-overrides.functional", () => ({
   createToolOverridesCallToolMiddleware: () => (next: unknown) => next,
   createToolOverridesListToolsMiddleware: () => (next: unknown) => next,
-  mapOverrideNameToOriginal: vi.fn(async (name: string) => name),
+  mapOverrideNameToOriginal: mapOverrideNameMock,
 }));
 vi.mock("./cold-connect-broker-fallback", () => ({
   resolveColdConnectBrokerFallback: () => undefined,
@@ -179,6 +186,8 @@ beforeEach(() => {
     }),
   );
   emitAdminEventMock.mockReset();
+  mapOverrideNameMock.mockReset();
+  mapOverrideNameMock.mockImplementation(async (name: string) => name);
 });
 
 afterEach(async () => {
@@ -221,6 +230,21 @@ describe("tools/list writes the server's tool catalog", () => {
     await list(await connectConsumer());
 
     expect(syncToolsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("saves a genuine backend tool even when a namespace uses its name as an alias", async () => {
+    const target = await backend([tool("list_things"), tool("meeting_notes")]);
+    getSessionMock.mockResolvedValue(target.session);
+    mapOverrideNameMock.mockImplementation(async (name: string) =>
+      name === "ninja__meeting_notes" ? "ninja__list_things" : name,
+    );
+
+    await list(await connectConsumer());
+
+    // This is a raw backend listing, before gateway presentation overrides.
+    // Dropping a native name because one namespace aliases to it would hide
+    // that tool from curation in every namespace sharing the server/cache.
+    expect(writtenNames()).toEqual([["list_things", "meeting_notes"]]);
   });
 
   it("writes again, with the new tool, when the set changes", async () => {
@@ -270,5 +294,80 @@ describe("tools/list writes the server's tool catalog", () => {
     await list(await connectConsumer());
 
     expect(syncToolsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries the current listing when an older listing commits last", async () => {
+    const target = await backend([tool("list_things")]);
+    getSessionMock.mockResolvedValue(target.session);
+    const olderConsumer = await connectConsumer();
+    const currentConsumer = await connectConsumer();
+    let finishOlder!: () => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    syncToolsMock.mockImplementationOnce(async (input) => {
+      signalStarted();
+      await new Promise<void>((resolve) => {
+        finishOlder = resolve;
+      });
+      return { upserted: input.tools, deleted: [] };
+    });
+
+    const olderListing = list(olderConsumer);
+    await started;
+    target.setTools([tool("list_things"), tool("meeting_notes")]);
+    try {
+      await list(currentConsumer);
+    } finally {
+      finishOlder();
+      await olderListing;
+    }
+
+    // The database now holds the older set. Its completed write must replace
+    // the newer claim, or every future listing of the current set skips forever.
+    await list(currentConsumer);
+    expect(writtenNames()).toEqual([
+      ["list_things"],
+      ["list_things", "meeting_notes"],
+      ["list_things", "meeting_notes"],
+    ]);
+  });
+
+  it("retries the current listing when an older UI sync commits last", async () => {
+    const target = await backend([tool("list_things"), tool("meeting_notes")]);
+    getSessionMock.mockResolvedValue(target.session);
+    let finishOlder!: () => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    syncToolsMock.mockImplementationOnce(async (input) => {
+      signalStarted();
+      await new Promise<void>((resolve) => {
+        finishOlder = resolve;
+      });
+      return { upserted: input.tools, deleted: [] };
+    });
+
+    const olderSync = toolsImplementations.sync({
+      mcpServerUuid: SERVER_UUID,
+      tools: [tool("list_things")],
+    });
+    await started;
+    const consumer = await connectConsumer();
+    try {
+      await list(consumer);
+    } finally {
+      finishOlder();
+      await olderSync;
+    }
+
+    await list(consumer);
+    expect(writtenNames()).toEqual([
+      ["list_things"],
+      ["list_things", "meeting_notes"],
+      ["list_things", "meeting_notes"],
+    ]);
   });
 });

@@ -151,6 +151,7 @@ const serverRow = (uuid: string, name: string, user_id: string | null) => ({
 // the situation that makes widening `list` unsafe for a by-name consumer.
 const SERVERS = [
   serverRow("srv-public", "autotask", null),
+  serverRow("srv-admin", "admin-own", "admin-1"),
   serverRow("srv-private", "autotask", OTHER_USER),
 ];
 
@@ -246,19 +247,63 @@ describe("mcpServers.listAll", () => {
     expect(repos.mcpServers.findAll).not.toHaveBeenCalled();
   });
 
-  it("shows an admin another user's private server, with its owner, serialized for an admin", async () => {
+  it("shows another owner's private server without exposing its connection credentials", async () => {
+    const privateTemplate = SERVERS.find((s) => s.uuid === "srv-private");
+    if (!privateTemplate) throw new Error("missing private server fixture");
+    const privateServer = {
+      ...privateTemplate,
+      command: "private-command",
+      args: ["--token", "private-argument"],
+      env: { API_KEY: "private-env-value" },
+      headers: { Authorization: "Bearer private-header-value" },
+      bearerToken: "private-bearer-value",
+    };
+    repos.mcpServers.findAll.mockResolvedValue([
+      ...SERVERS.filter((s) => s.uuid !== "srv-private"),
+      privateServer,
+    ]);
     const result = await router().createCaller(adminCtx).listAll();
 
     expect(result.success).toBe(true);
     expect(result.data.map((s) => [s.uuid, s.user_id])).toEqual([
       ["srv-public", null],
+      ["srv-admin", "admin-1"],
       ["srv-private", OTHER_USER],
     ]);
-    // Admin serialization keeps the connection URL (a member's is redacted to
-    // null) and, like every path, never returns the bearer token.
+    // Inventory visibility does not grant another owner's connection secrets.
     const privateRow = result.data.find((s) => s.uuid === "srv-private");
-    expect(privateRow?.url).toBe("http://autotask:3000/mcp");
-    expect(privateRow?.bearerToken).toBeNull();
+    expect(privateRow).toMatchObject({
+      command: null,
+      args: [],
+      env: {},
+      url: null,
+      headers: {},
+      bearerToken: null,
+    });
+    expect(privateRow?.env).toEqual({});
+    expect(privateRow?.headers).toEqual({});
+  });
+
+  it("retains the existing admin connection view for public and owned servers", async () => {
+    const accessible = SERVERS.filter((s) => s.user_id !== OTHER_USER).map(
+      (s) => ({
+        ...s,
+        env: { API_KEY: "accessible-env-value" },
+        headers: { "X-API-Key": "accessible-header-value" },
+        bearerToken: "still-never-returned",
+      }),
+    );
+    repos.mcpServers.findAll.mockResolvedValue(accessible);
+
+    const result = await router().createCaller(adminCtx).listAll();
+
+    expect(result.data).toHaveLength(2);
+    for (const row of result.data) {
+      expect(row.url).toBe(accessible.find((s) => s.uuid === row.uuid)?.url);
+      expect(row.env).toEqual({ API_KEY: "accessible-env-value" });
+      expect(row.headers).toEqual({ "X-API-Key": "accessible-header-value" });
+      expect(row.bearerToken).toBeNull();
+    }
   });
 
   it("leaves list unchanged: a by-name consumer of list still sees one 'autotask'", async () => {
@@ -266,6 +311,6 @@ describe("mcpServers.listAll", () => {
     // row leaked into `list`, both rows would compete for the one key.
     const result = await router().createCaller(adminCtx).list();
 
-    expect(result.data.map((s) => s.uuid)).toEqual(["srv-public"]);
+    expect(result.data.map((s) => s.uuid)).toEqual(["srv-public", "srv-admin"]);
   });
 });

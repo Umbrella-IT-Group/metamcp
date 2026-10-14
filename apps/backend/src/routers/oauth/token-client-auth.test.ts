@@ -335,6 +335,16 @@ describe("authorization_code: client_secret_basic", () => {
     expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(CLIENT_ID);
   });
 
+  it.each(["basic", "bAsIc"])(
+    "accepts the case-insensitive auth scheme %s",
+    async (scheme) => {
+      const header = basic(CLIENT_ID, RIGHT_SECRET).replace("Basic", scheme);
+
+      expectIssued(await post(codeBody(), header));
+      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(CLIENT_ID);
+    },
+  );
+
   it("still issues when the body repeats the same client id", async () => {
     expectIssued(
       await post(
@@ -470,6 +480,21 @@ describe("refresh_token: client_secret_basic", () => {
       },
     );
   });
+
+  it.each(["basic", "bAsIc"])(
+    "checks the refresh client for case-insensitive auth scheme %s",
+    async (scheme) => {
+      const header = basic(OTHER_CLIENT_ID, RIGHT_SECRET).replace(
+        "Basic",
+        scheme,
+      );
+
+      expectRefusedUntouched(await post(refreshBody(), header), 400, {
+        error: "invalid_client",
+        error_description: "Client ID does not match",
+      });
+    },
+  );
 });
 
 describe("conflicting client ids in the body and the Basic header", () => {
@@ -519,4 +544,21 @@ describe("conflicting client ids in the body and the Basic header", () => {
     );
     expect(oauthRepositoryMock.getByRefreshToken).not.toHaveBeenCalled();
   });
+
+  it.each(["basic", "bAsIc"])(
+    "refuses conflicting ids for case-insensitive auth scheme %s",
+    async (scheme) => {
+      const header = basic(OTHER_CLIENT_ID, RIGHT_SECRET).replace(
+        "Basic",
+        scheme,
+      );
+
+      expectRefusedUntouched(
+        await post(refreshBody({ client_id: CLIENT_ID }), header),
+        401,
+        conflict,
+      );
+      expect(oauthRepositoryMock.getByRefreshToken).not.toHaveBeenCalled();
+    },
+  );
 });

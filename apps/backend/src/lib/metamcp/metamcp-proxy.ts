@@ -50,7 +50,6 @@ import { createTimeoutHintMiddleware } from "./metamcp-middleware/timeout-hint.f
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
-  mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
 import {
   isRecoverableBackendError,
@@ -65,56 +64,6 @@ import {
 } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
-
-/**
- * Filter out tools that are overrides of existing tools to prevent duplicates in database
- * Uses the existing tool overrides cache for optimal performance
- */
-async function filterOutOverrideTools(
-  tools: Tool[],
-  namespaceUuid: string,
-  serverName: string,
-): Promise<Tool[]> {
-  if (!tools || tools.length === 0) {
-    return tools;
-  }
-
-  const filteredTools: Tool[] = [];
-
-  await Promise.allSettled(
-    tools.map(async (tool) => {
-      try {
-        // Check if this tool name is actually an override name for an existing tool
-        // by using the existing mapOverrideNameToOriginal function
-        const fullToolName = `${sanitizeName(serverName)}__${tool.name}`;
-        const originalName = await mapOverrideNameToOriginal(
-          fullToolName,
-          namespaceUuid,
-          true, // use cache
-        );
-
-        // If the original name is different from the current name,
-        // this tool is an override and should be filtered out
-        if (originalName !== fullToolName) {
-          // This is an override, skip it (don't save to database)
-          return;
-        }
-
-        // This is not an override, include it
-        filteredTools.push(tool);
-      } catch (error) {
-        logger.error(
-          `Error checking if tool ${tool.name} is an override:`,
-          error,
-        );
-        // On error, include the tool (fail-safe behavior)
-        filteredTools.push(tool);
-      }
-    }),
-  );
-
-  return filteredTools;
-}
 
 export const createServer = async (
   namespaceUuid: string,
@@ -420,7 +369,10 @@ export const createServer = async (
 
           // Save original tools to database (before middleware processing)
           // This ensures we only save the actual tool names, not override names
-          // Filter out tools that are overrides of existing tools to prevent duplicates
+          // These are raw backend names. A namespace alias can match a real
+          // backend tool, so reverse-mapping here would omit that native tool
+          // from the catalog shared by every namespace. Presentation overrides
+          // belong only in the response middleware, never in this write.
           try {
             // PERFORMANCE OPTIMIZATION: Check hash FIRST to avoid expensive operations
             // Hash the FULL definitions (name + description + inputSchema); a
@@ -435,31 +387,28 @@ export const createServer = async (
               `[DEBUG-TOOLS] 🔍 Hash check for ${serverName}: ${hasChanged ? "CHANGED" : "UNCHANGED"}`,
             );
 
-            if (hasChanged) {
-              const toolsToSave = await filterOutOverrideTools(
-                allServerTools,
-                namespaceUuid,
-                serverName,
-              );
-
-              if (toolsToSave.length > 0) {
-                // Claim the full definitions we just observed, so concurrent
-                // listings of the same set skip, then write. The write must
-                // not re-check this cache: `tools.impl` sync used to, found
-                // the hash claimed here and skipped, so this path never wrote
-                // the catalog (see syncFromListing). The claim is released if
-                // the write fails, so the next tools/list retries it instead
-                // of skipping a write that never happened.
+            if (hasChanged && allServerTools.length > 0) {
+              // Claim the full definitions we just observed, so concurrent
+              // listings of the same set skip, then write. The write must
+              // not re-check this cache: `tools.impl` sync used to, found
+              // the hash claimed here and skipped, so this path never wrote
+              // the catalog (see syncFromListing). The claim is released if
+              // the write fails, so the next tools/list retries it instead
+              // of skipping a write that never happened.
+              toolsSyncCache.update(mcpServerUuid, allServerTools);
+              try {
+                await toolsImplementations.syncFromListing({
+                  tools: allServerTools,
+                  mcpServerUuid: mcpServerUuid,
+                });
+                // A different listing can claim a newer hash while this
+                // write is in flight, then commit first. Record the set
+                // THIS completed write persisted, so a later current
+                // listing retries instead of treating a stale catalog as current.
                 toolsSyncCache.update(mcpServerUuid, allServerTools);
-                try {
-                  await toolsImplementations.syncFromListing({
-                    tools: toolsToSave,
-                    mcpServerUuid: mcpServerUuid,
-                  });
-                } catch (writeError) {
-                  toolsSyncCache.clear(mcpServerUuid);
-                  throw writeError;
-                }
+              } catch (writeError) {
+                toolsSyncCache.clear(mcpServerUuid);
+                throw writeError;
               }
             }
           } catch (dbError) {

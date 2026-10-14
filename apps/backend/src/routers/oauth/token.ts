@@ -221,7 +221,9 @@ async function issueTokenPair(
 function parseBasicClientCredentials(
   authorization: string | undefined,
 ): { clientId: string; clientSecret: string } | null | undefined {
-  if (!authorization || !authorization.startsWith("Basic ")) {
+  // RFC 9110 11.1 makes auth schemes case-insensitive. Using an exact-case
+  // match would ignore a valid Basic identity on the refresh grant.
+  if (!authorization || !/^Basic /i.test(authorization)) {
     return undefined;
   }
   const decoded = Buffer.from(authorization.substring(6), "base64").toString();

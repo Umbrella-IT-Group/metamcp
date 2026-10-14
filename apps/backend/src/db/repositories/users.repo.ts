@@ -173,12 +173,25 @@ export function buildFindUsersByEmailsQuery(normalizedEmails: string[]) {
  * nothing and returns no row, so the caller emits its audit event only for a
  * real promotion and a restart that changes nothing leaves no trace. The SET
  * names one value, `admin`, so no caller of this builder can lower a role.
+ * Check the configured address again in the UPDATE: another gateway instance
+ * can change the account's email after the lookup, and its id alone would
+ * then promote an account the configuration no longer names.
  */
-export function buildPromoteToAdminQuery(id: string, now: Date) {
+export function buildPromoteToAdminQuery(
+  id: string,
+  normalizedEmail: string,
+  now: Date,
+) {
   return db
     .update(usersTable)
     .set({ role: "admin", updatedAt: now })
-    .where(and(eq(usersTable.id, id), ne(usersTable.role, "admin")))
+    .where(
+      and(
+        eq(usersTable.id, id),
+        eq(sql`lower(${usersTable.email})`, normalizedEmail),
+        ne(usersTable.role, "admin"),
+      ),
+    )
     .returning({ id: usersTable.id, email: usersTable.email });
 }
 
@@ -257,12 +270,18 @@ export class UsersRepository {
   /**
    * Set one account's role to `admin` if it is not already. Returns the row
    * when this call changed it and undefined when it did not (already an
-   * administrator, or no such id), so the caller records only real changes.
+   * administrator, no such id, or the address changed), so the caller records
+   * only real changes to accounts the configuration still names.
    */
   async promoteToAdmin(
     id: string,
+    normalizedEmail: string,
   ): Promise<{ id: string; email: string } | undefined> {
-    const [updated] = await buildPromoteToAdminQuery(id, new Date());
+    const [updated] = await buildPromoteToAdminQuery(
+      id,
+      normalizedEmail,
+      new Date(),
+    );
     return updated;
   }
 

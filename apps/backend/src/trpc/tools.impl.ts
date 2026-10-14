@@ -144,6 +144,11 @@ export const toolsImplementations = {
           mcpServerUuid: input.mcpServerUuid,
         });
 
+        // The cache is also claimed by concurrent gateway listings. If this
+        // older UI write commits last, its set is now the catalog's state;
+        // retaining a newer claim would make that listing skip forever.
+        toolsSyncCache.update(input.mcpServerUuid, input.tools);
+
         const message =
           deleted.length > 0
             ? `Successfully synced ${upserted.length} tools (removed ${deleted.length} obsolete)`
