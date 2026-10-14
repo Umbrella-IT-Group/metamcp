@@ -175,13 +175,13 @@ metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
 
             await mcpServerInstance.server.connect(webAppTransport);
 
-            // Handle cleanup when connection closes
-            res.on("close", async () => {
-              logger.info(
-                `MetaMCP connection closed for session ${newSessionId}`,
-              );
-              await cleanupSession(newSessionId);
-            });
+            // No cleanup on this response's `close`. A StreamableHTTP session
+            // outlives the request that opened it, and this `res` is only the
+            // initialize response: cleanup used to be registered here, so the
+            // session was torn down as soon as the initialize answer ended and
+            // every follow-up request got 404. The session ends on the DELETE
+            // route below, as it does on the single-server route
+            // (./server.ts) and the public endpoint route.
           } catch (error) {
             logger.error(`Error initializing session ${newSessionId}:`, error);
           }

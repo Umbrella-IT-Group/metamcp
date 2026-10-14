@@ -1708,7 +1708,15 @@ streamableHttpRouter.post(
           await cleanupAdmission(newSessionId);
         }
       } catch (error) {
-        if (releaseAdmission && initializingSessionId && !admissionClosed) {
+        // Whatever this initialize registered or acquired is released on a
+        // throw, whether or not the per-credential ceiling admitted it. The
+        // guard used to require `releaseAdmission`, which exists only when
+        // the ceiling and its eviction are on, so with the ceiling off (or
+        // for a credential it does not count) a throw during connect or
+        // dispatch left the registration, the pooled instance and the
+        // `mcp_sessions` row behind for the idle sweeper.
+        // `!admissionClosed`: a disconnect already started this cleanup.
+        if (initializingSessionId && !admissionClosed) {
           await cleanupAdmission(initializingSessionId);
         }
         logger.error("Error in public endpoint /mcp POST route:", error);

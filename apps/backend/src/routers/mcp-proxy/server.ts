@@ -459,7 +459,7 @@ const cleanupSession = async (sessionId: string) => {
  */
 const closeUninitializedSession = async (
   sessionId: string,
-  webAppTransport: Transport,
+  webAppTransport: Transport | undefined,
   serverTransport: Transport,
 ) => {
   logger.info(
@@ -474,7 +474,7 @@ const closeUninitializedSession = async (
     );
   }
   try {
-    await webAppTransport.close();
+    await webAppTransport?.close();
   } catch (error) {
     logger.error(
       `Error closing web app transport for uninitialized session ${sessionId}:`,
@@ -705,6 +705,9 @@ serverRouter.get("/mcp", async (req, res) => {
 serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let serverTransport: Transport | undefined;
+  // Hoisted so the error path below can tell what this request started.
+  let newSessionId: string | undefined;
+  let webAppTransport: StreamableHTTPServerTransport | undefined;
   if (!sessionId) {
     try {
       logger.info("New StreamableHttp connection request");
@@ -754,60 +757,72 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
       }
 
       // Generate session ID upfront for better tracking
-      const newSessionId = randomUUID();
+      const sessionIdForRequest = randomUUID();
+      newSessionId = sessionIdForRequest;
 
-      const webAppTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => newSessionId,
+      const transportToClient = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionIdForRequest,
         // See lib/metamcp/mcp-request-body-limit for the value and why.
         maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
         onsessioninitialized: (sessionId) => {
-          webAppTransports.set(sessionId, webAppTransport);
+          webAppTransports.set(sessionId, transportToClient);
           if (serverTransport) {
             serverTransports.set(sessionId, serverTransport);
           }
           logger.info("Client <-> Proxy  sessionId: " + sessionId);
         },
       });
+      webAppTransport = transportToClient;
       logger.info("Created StreamableHttp client transport");
 
-      await webAppTransport.start();
+      await transportToClient.start();
 
-      // Set up proxy connection with error handling
-      try {
-        mcpProxy({
-          transportToClient: webAppTransport,
-          transportToServer: serverTransport,
-          onCleanup: async () => {
-            await cleanupSession(newSessionId);
-          },
-        });
-      } catch (error) {
-        logger.error(
-          `Error setting up proxy for session ${newSessionId}:`,
-          error,
-        );
-        await cleanupSession(newSessionId);
-        throw error;
-      }
+      // Set up proxy connection. A throw here reaches the catch below, which
+      // closes both transports (the session is not initialized yet).
+      mcpProxy({
+        transportToClient,
+        transportToServer: serverTransport,
+        onCleanup: async () => {
+          await cleanupSession(sessionIdForRequest);
+        },
+      });
 
       // Handle the actual request - don't pass req.body since it wasn't parsed
-      await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
-        req,
-        res,
-      );
+      await transportToClient.handleRequest(req, res);
 
       // Answered without initializing: no session id went out, so close what
       // this request started. An initialized session is left as it is.
-      if (webAppTransport.sessionId === undefined) {
+      if (transportToClient.sessionId === undefined) {
+        await closeUninitializedSession(
+          sessionIdForRequest,
+          transportToClient,
+          serverTransport,
+        );
+      }
+    } catch (error) {
+      logger.error("Error in /mcp POST route:", error);
+      // Close what this request started unless it became a live session. The
+      // proxy wiring or the first request can throw before
+      // `onsessioninitialized` fills the session maps, and `cleanupSession`
+      // finds nothing in empty maps, so the upstream transport (a STDIO child,
+      // an SSE stream) used to stay open with no session id that could ever
+      // reach it. A session that did initialize is left as the success path
+      // leaves it: its id went to the client, which can use it or DELETE it.
+      if (
+        serverTransport &&
+        newSessionId &&
+        webAppTransports.get(newSessionId) !== webAppTransport
+      ) {
         await closeUninitializedSession(
           newSessionId,
           webAppTransport,
           serverTransport,
         );
       }
-    } catch (error) {
-      logger.error("Error in /mcp POST route:", error);
-      res.status(500).json(error);
+      // A throw after the response started cannot be answered with a status.
+      if (!res.headersSent) {
+        res.status(500).json(error);
+      }
     }
   } else {
     // logger.info(`Received POST message for sessionId ${sessionId}`);

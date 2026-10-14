@@ -11,11 +11,10 @@
  * only the namespace server factory, the connection pool and the database are
  * faked. Dropping `maxRequestBodySize` from the route fails these tests.
  *
- * Only the initialize leg is driven. This route registers its session cleanup
- * on the initialize response's `close` event, so the session is gone once
- * that response ends and a follow-up request on it gets 404 "Transport not
- * found". That is the route's existing behaviour, not something this ceiling
- * changes; it is the same transport object either way.
+ * Later requests on the session are driven too. Until
+ * METAMCP-PROXY-NAMESPACE-SESSION-CLOSE this route tore its session down when
+ * the initialize response ended, so only the initialize leg could be; see
+ * metamcp.session-close.test.ts for the session lifetime itself.
  *
  * Unlike the other two routes, this one allocates nothing for a session until
  * the transport accepts its initialize (`createServer` runs in
@@ -112,12 +111,21 @@ const initializeBody = (bytes: number) =>
     bytes,
   );
 
-function post(body: string | ReadableStream<Uint8Array>): Promise<Response> {
+function post(
+  body: string | ReadableStream<Uint8Array>,
+  sessionId?: string,
+): Promise<Response> {
   return fetch(`${baseUrl}/mcp-proxy/metamcp/${NAMESPACE_UUID}/mcp`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
+      ...(sessionId
+        ? {
+            "mcp-session-id": sessionId,
+            "mcp-protocol-version": PROTOCOL_VERSION,
+          }
+        : {}),
     },
     body,
     // Required by undici for a streamed body; ignored for a string.
@@ -189,6 +197,22 @@ describe("POST /mcp-proxy/metamcp/:uuid/mcp body ceiling", () => {
 
     expect(response.status).toBe(413);
     expect(await response.json()).toEqual(TOO_LARGE);
+  });
+
+  it("holds the same limit for later requests on the session", async () => {
+    const opened = await post(initializeBody(1024));
+    expect(opened.status).toBe(200);
+    await opened.text();
+    const sessionId = opened.headers.get("mcp-session-id") ?? "";
+    expect(sessionId).not.toBe("");
+
+    const atLimit = await post(paddedRequest("ping", {}, LIMIT), sessionId);
+    expect(atLimit.status).toBe(200);
+    expect(await resultOf(atLimit)).toEqual({});
+
+    const over = await post(paddedRequest("ping", {}, LIMIT + 1), sessionId);
+    expect(over.status).toBe(413);
+    expect(await over.json()).toEqual(TOO_LARGE);
   });
 });
 
