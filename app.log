@@ -1,0 +1,139 @@
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 3 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated pooled backend connection for server server-1 (session session-A) — no clients were cached
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 2 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated pooled backend connection for server server-1 (session session-A) — no clients were cached
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 2 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | list_changed subscriber threw synchronously during invalidation of server-1: Error: subscriber blew up
+    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.test.ts:278:13
+    at McpServerPool.invalidateServerConnection (/home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.ts:1697:27)
+    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.test.ts:285:12
+    at file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:302:11
+    at file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:26
+    at file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:2326:20
+    at new Promise (<anonymous>)
+    at runWithCancel (file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:2323:10)
+    at file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:2305:20
+    at new Promise (<anonymous>)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session session-A; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Transport drop for server server-1: reason=close undefined
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 2 pooled backend connection(s) for server server-1 (triggered by session <transport-drop>; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Transport drop for server server-1: reason=close undefined
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-1 (triggered by session <transport-drop>; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Transport drop for server server-1: reason=close undefined
+[INFO] 2026/10/14 - 14:40:59 | Resetting error tracker attempts for server-1 (transient drop within 300000ms of last success)
+[WARN] 2026/10/14 - 14:40:59 | Invalidated pooled backend connection for server server-1 (session <transport-drop>) — no clients were cached
+[WARN] 2026/10/14 - 14:40:59 | Transport drop for server server-1: reason=close undefined
+[WARN] 2026/10/14 - 14:40:59 | Invalidated pooled backend connection for server server-1 (session <transport-drop>) — no clients were cached
+[WARN] 2026/10/14 - 14:40:59 | Transport drop for server server-1: reason=error Error: boom
+    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.test.ts:414:62
+    at file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:20
+[WARN] 2026/10/14 - 14:40:59 | Invalidated pooled backend connection for server server-1 (session <transport-drop>) — no clients were cached
+[WARN] 2026/10/14 - 14:40:59 | Pool at cap (100); destroying idle session for server-2 to admit server-1
+[WARN] 2026/10/14 - 14:40:59 | Pool at cap (100); destroying idle session for server-1 to admit server-1
+[WARN] 2026/10/14 - 14:40:59 | Pool at cap (100) with no idle slots; destroying oldest active connection session-old/server-2 to admit server-1
+[INFO] 2026/10/14 - 14:40:59 | Creating new connection for server backend-c (server-C) with namespace: none
+[INFO] 2026/10/14 - 14:40:59 | Creating new connection for server backend-c (server-C) with namespace: none
+[INFO] 2026/10/14 - 14:40:59 | Creating new connection for server backend-c (server-C) with namespace: none
+[INFO] 2026/10/14 - 14:40:59 | Creating new connection for server backend-c (server-C) with namespace: none
+[WARN] 2026/10/14 - 14:40:59 | Active session health check: 1/1 connection(s) for server server-1 failed ping (strike 1 of 2; evicting on the next consecutive failure)
+[WARN] 2026/10/14 - 14:40:59 | Active session health check: 2/2 connection(s) for server server-1 failed ping (strike 1 of 2; evicting on the next consecutive failure)
+[WARN] 2026/10/14 - 14:40:59 | Active session health check failed on two consecutive sweeps for server server-1 (2/2 dead); cascade-invalidating every pooled connection and rebuilding
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 2 pooled backend connection(s) for server server-1 (triggered by session <health-check>; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Active session health check: 1/1 connection(s) for server server-1 failed ping (strike 1 of 2; evicting on the next consecutive failure)
+[WARN] 2026/10/14 - 14:40:59 | Active session health check: 1/1 connection(s) for server server-1 failed ping (strike 1 of 2; evicting on the next consecutive failure)
+[WARN] 2026/10/14 - 14:40:59 | Active session health check: 1/1 connection(s) for server server-dead failed ping (strike 1 of 2; evicting on the next consecutive failure)
+[WARN] 2026/10/14 - 14:40:59 | Active session health check failed on two consecutive sweeps for server server-dead (1/1 dead); cascade-invalidating every pooled connection and rebuilding
+[WARN] 2026/10/14 - 14:40:59 | Invalidated 1 pooled backend connection(s) for server server-dead (triggered by session <health-check>; cascaded across every active + idle slot for this serverUuid)
+[WARN] 2026/10/14 - 14:40:59 | Half-open probe for ERROR-gated server server-err: resetting error state and attempting reconnect (probe interval 300000ms)
+[WARN] 2026/10/14 - 14:40:59 | Half-open probe for ERROR-gated server server-err: resetting error state and attempting reconnect (probe interval 300000ms)
+[WARN] 2026/10/14 - 14:40:59 | Half-open probe for ERROR-gated server server-err: resetting error state and attempting reconnect (probe interval 300000ms)
+[WARN] 2026/10/14 - 14:40:59 | Half-open probe for ERROR-gated server server-err: resetting error state and attempting reconnect (probe interval 300000ms)
+[INFO] 2026/10/14 - 14:40:59 | Creating new connection for server down-backend (server-down) with namespace: none
+[INFO] 2026/10/14 - 14:40:59 | Creating new connection for server flapping-backend (server-flap) with namespace: none
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | tool definitions changed for server-1, resyncing
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 1 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 2 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: iteration failed for server-bad, skipping this tick: Error: mid-restart
+    at /home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/apps/backend/src/lib/metamcp/mcp-server-pool.test.ts:1248:52
+    at file:///home/master/COWORK/PROJECTS/Umbrella-IT-Group/metamcp-wt-oauth-b4/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:20
+[INFO] 2026/10/14 - 14:40:59 | tool definitions changed for server-good, resyncing
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 1 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-bad to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-good to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 2, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep skipped: previous sweep still in progress
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | tool definitions changed for server-1, resyncing
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 1 changed
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | tool definitions changed for server-1, resyncing
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 1 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[WARN] 2026/10/14 - 14:40:59 | Tool-definition sweep: backend returned a non-advancing tools/list cursor, stopping pagination early
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[WARN] 2026/10/14 - 14:40:59 | Tool-definition sweep: backend returned a non-advancing tools/list cursor, stopping pagination early
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[WARN] 2026/10/14 - 14:40:59 | Tool-definition sweep: hit the 50-page cap while paginating tools/list, stopping pagination early
+[DEBUG] 2026/10/14 - 14:40:59 | Tool-definition sweep: 1 server(s) checked, 0 changed
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Tool-definition sweep disabled (TOOLS_SWEEP_INTERVAL_SECONDS <= 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[WARN] 2026/10/14 - 14:40:59 | Idle session health check failed for server server-1, recreating...
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
+[WARN] 2026/10/14 - 14:40:59 | Active session health check: 1/2 connection(s) for server server-1 failed ping (strike 1 of 2; evicting on the next consecutive failure)
+[INFO] 2026/10/14 - 14:40:59 | Recycled active connection for server server-1 to idle pool (session session-A)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-A (borrowed: 0, recycled: 1, destroyed: 0)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up session session-B (borrowed: 0, recycled: 0, destroyed: 1)
+[INFO] 2026/10/14 - 14:40:59 | Cleaned up all MCP server pool sessions
