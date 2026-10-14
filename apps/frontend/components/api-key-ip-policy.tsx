@@ -1,5 +1,6 @@
 "use client";
 
+import type { GetGlobalIpPolicyResponse } from "@repo/zod-types";
 import { Globe } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -35,7 +36,7 @@ import { trpc } from "@/lib/trpc";
 
 /**
  * API-key IP allowlist controls for the API keys admin section (migration
- * 0040). Rendered only inside the page's `isAdmin` block, and every read and
+ * 0041). Rendered only inside the page's `isAdmin` block, and every read and
  * write behind them is `adminProcedure`, so this is presentation, not the
  * boundary. English copy, like the rest of that admin section.
  *
@@ -76,16 +77,45 @@ export function ApiKeyIpPolicyCell({
 
 /** The global policy, applied to every key with no list of its own. */
 export function GlobalIpPolicyCard() {
+  const { data, isError, error } =
+    trpc.frontend.apiKeys.getGlobalIpPolicy.useQuery();
+  // Mount an editable form only after reading the stored policy. A default
+  // "off" form after a failed read could disable an existing enforce policy.
+  if (!data) {
+    return (
+      <div className="rounded-md border p-4 space-y-3">
+        <h3 className="font-medium">Global IP policy</h3>
+        <p
+          role={isError ? "alert" : "status"}
+          className="text-sm text-muted-foreground"
+        >
+          {isError ? error.message : "Loading global IP policy..."}
+        </p>
+      </div>
+    );
+  }
+  return (
+    <GlobalIpPolicyEditor
+      data={data}
+      loadError={isError ? error.message : null}
+    />
+  );
+}
+
+function GlobalIpPolicyEditor({
+  data,
+  loadError,
+}: {
+  data: GetGlobalIpPolicyResponse;
+  loadError: string | null;
+}) {
   const utils = trpc.useUtils();
-  const { data } = trpc.frontend.apiKeys.getGlobalIpPolicy.useQuery();
-  const [mode, setMode] = useState<IpPolicyMode>("off");
-  const [text, setText] = useState("");
+  const [mode, setMode] = useState<IpPolicyMode>(data.mode);
+  const [text, setText] = useState(cidrsToText(data.allowed_cidrs));
 
   useEffect(() => {
-    if (data) {
-      setMode(data.mode);
-      setText(cidrsToText(data.allowed_cidrs));
-    }
+    setMode(data.mode);
+    setText(cidrsToText(data.allowed_cidrs));
   }, [data]);
 
   const saveMutation = trpc.frontend.apiKeys.setGlobalIpPolicy.useMutation({
@@ -105,19 +135,24 @@ export function GlobalIpPolicyCard() {
       <div className="flex items-center gap-2">
         <Globe className="h-4 w-4 text-primary" />
         <h3 className="font-medium">Global IP policy</h3>
-        <Badge variant="outline">{data?.mode ?? "off"}</Badge>
+        <Badge variant="outline">{data.mode}</Badge>
       </div>
       <p className="text-sm text-muted-foreground">
         Applies to every API key that has no list of its own. OAuth sign-ins are
         never affected. {MODE_HELP[mode]}
       </p>
-      {data?.kill_switch_active && (
+      {loadError !== null && (
+        <p role="alert" className="text-sm text-destructive">
+          {loadError}
+        </p>
+      )}
+      {data.kill_switch_active && (
         <p className="text-sm text-destructive">
           API_KEY_IP_POLICY_DISABLED is set on the gateway: no IP policy is
           evaluated until it is unset.
         </p>
       )}
-      {data?.problems?.map((problem) => (
+      {data.problems.map((problem) => (
         <p key={problem} className="text-sm text-destructive">
           {problem}
         </p>
@@ -150,7 +185,7 @@ export function GlobalIpPolicyCard() {
           </Select>
           <Button
             className="w-full mt-2"
-            disabled={saveMutation.isPending}
+            disabled={saveMutation.isPending || loadError !== null}
             onClick={() =>
               saveMutation.mutate({ mode, allowed_cidrs: parseCidrText(text) })
             }

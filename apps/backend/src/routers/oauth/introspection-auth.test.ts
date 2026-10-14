@@ -207,7 +207,7 @@ describe("POST /oauth/introspect — anonymous callers are refused", () => {
     );
 
     expect(res.statusCode).toBe(401);
-    // The second argument is the explicit IP-policy opt-in (migration 0040);
+    // The second argument is the explicit IP-policy opt-in (migration 0041);
     // its contents are pinned in the IP-policy suite at the end of this file.
     expect(validateApiKeyMock).toHaveBeenCalledWith(
       "sk_mt_not_a_real_key",
@@ -307,7 +307,7 @@ describe("POST /oauth/revoke — deliberately left public", () => {
   });
 });
 
-describe("POST /oauth/introspect: API-key IP policy (migration 0040)", () => {
+describe("POST /oauth/introspect: API-key IP policy (migration 0041)", () => {
   it("passes the explicit IP-policy opt-in with CF-Connecting-IP, never req.ip", async () => {
     await post(
       "/oauth/introspect",

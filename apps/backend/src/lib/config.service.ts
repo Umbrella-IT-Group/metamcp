@@ -165,7 +165,7 @@ export const configService = {
   },
 
   /**
-   * The GLOBAL API-key IP policy (migration 0040), read live on every key
+   * The GLOBAL API-key IP policy (migration 0041), read live on every key
    * validation that needs it, the way DISABLE_BASIC_AUTH is read per request:
    * one query for both rows, no cache, so a change made through the admin
    * plane applies to the very next request. `problems` lists stored values the
@@ -186,14 +186,14 @@ export const configService = {
 
   /**
    * Write the global policy. The caller (apiKeys.setGlobalIpPolicy) has
-   * already validated and canonicalised the list; both rows go in one
-   * transaction.
+   * already validated and canonicalised the list; both rows and the snapshots
+   * used for the audit/readback share one serialized transaction.
    */
   async setApiKeyIpPolicy(policy: {
     mode: IpPolicyMode;
     cidrs: string[];
-  }): Promise<void> {
-    await configRepo.setConfigs([
+  }): Promise<{ before: GlobalIpPolicy; after: GlobalIpPolicy }> {
+    const snapshots = await configRepo.setConfigs([
       {
         id: ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE,
         value: policy.mode,
@@ -207,6 +207,15 @@ export const configService = {
           "Global API-key IP allowlist (JSON array of CIDRs) for keys with no allowed_cidrs of their own",
       },
     ]);
+    const parse = (rows: Array<{ id: string; value: string }>) =>
+      parseStoredGlobalPolicy(
+        rows.find((row) => row.id === ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE)
+          ?.value,
+        rows.find(
+          (row) => row.id === ConfigKeyEnum.enum.API_KEY_IP_ALLOWED_CIDRS,
+        )?.value,
+      );
+    return { before: parse(snapshots.before), after: parse(snapshots.after) };
   },
 
   async getConfig(key: ConfigKey): Promise<string | undefined> {

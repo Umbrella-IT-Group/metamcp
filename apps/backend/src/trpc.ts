@@ -59,7 +59,7 @@ export const createContext = async ({
   let user: User | undefined;
   let session: Session | undefined;
   // Set when an admin-plane bearer was refused by its IP policy (migration
-  // 0040). Thrown AFTER the try/catch below, which swallows everything.
+  // 0041). Thrown AFTER the try/catch below, which swallows everything.
   let adminPlaneIpDenied = false;
 
   try {

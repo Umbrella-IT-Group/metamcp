@@ -39,7 +39,7 @@ import { configService } from "../lib/config.service";
 const apiKeysRepository = new ApiKeysRepository();
 
 /**
- * Validate a requested IP policy (migration 0040) for a write, returning the
+ * Validate a requested IP policy (migration 0041) for a write, returning the
  * canonical list. Shared by the per-key and the global setter so both refuse
  * the same things with the same words. Every refusal is BAD_REQUEST before any
  * write.
@@ -451,7 +451,7 @@ export const apiKeysImplementations = {
     }
   },
 
-  // ---- IP allowlists (migration 0040), admin-only at the router ----
+  // ---- IP allowlists (migration 0041), admin-only at the router ----
 
   setIpPolicy: async (
     input: z.infer<typeof SetApiKeyIpPolicyRequestSchema>,
@@ -515,40 +515,31 @@ export const apiKeysImplementations = {
   ): Promise<z.infer<typeof SetGlobalIpPolicyResponseSchema>> => {
     const cidrs = validatedCidrs(input.allowed_cidrs, input.mode, "global");
 
-    // The before-picture must never fail the write it describes, the same
-    // ordering config.impl.ts's previousValue applies to every other
-    // auth-posture setter.
-    let oldValue: { mode: string; allowed_cidrs: string[] } | null = null;
-    try {
-      const previous = await configService.getApiKeyIpPolicy();
-      oldValue = { mode: previous.mode, allowed_cidrs: previous.cidrs };
-    } catch {
-      oldValue = null;
-    }
-
-    await configService.setApiKeyIpPolicy({ mode: input.mode, cidrs });
+    const { before, after } = await configService.setApiKeyIpPolicy({
+      mode: input.mode,
+      cidrs,
+    });
 
     emitAdminEvent(actor, {
       action: "config.api_key_ip_policy.set",
       target_type: "config_key",
       target_id: "API_KEY_IP_POLICY",
       detail: {
-        old_value: oldValue,
-        new_value: { mode: input.mode, allowed_cidrs: cidrs },
+        old_value: { mode: before.mode, allowed_cidrs: before.cidrs },
+        new_value: { mode: after.mode, allowed_cidrs: after.cidrs },
       },
     });
 
-    // Read back from the store rather than echoing the input, so the caller
-    // confirms what a reader will actually see.
-    const stored = await configService.getApiKeyIpPolicy();
-    return { mode: stored.mode, allowed_cidrs: stored.cidrs };
+    // Read back inside the write transaction so another writer cannot replace
+    // this mutation's response, or a later read failure turn success into 500.
+    return { mode: after.mode, allowed_cidrs: after.cidrs };
   },
 
   validate: async (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
   ): Promise<z.infer<typeof ValidateApiKeyResponseSchema>> => {
     try {
-      // NO IP check, deliberately (migration 0040): this is an admin UI
+      // NO IP check, deliberately (migration 0041): this is an admin UI
       // oracle, not an authentication, and it has no caller address worth
       // judging (the browser's, not the key holder's). Passing one would
       // make the answer depend on where the administrator is sitting. The

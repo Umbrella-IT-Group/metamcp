@@ -196,7 +196,7 @@ export const configImplementations = {
     input: SetConfigRequest,
     actor?: AuditActor,
   ): Promise<{ success: boolean }> => {
-    // The global API-key IP policy (migration 0040) is two rows that must be
+    // The global API-key IP policy (migration 0041) is two rows that must be
     // validated together and written together; this escape hatch would write
     // one unvalidated string into one of them, and the evaluator reads a bad
     // value fail-closed (an unknown mode as enforce), which can lock out

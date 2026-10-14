@@ -1,5 +1,5 @@
 /**
- * Admin management of API-key IP allowlists (migration 0040), at the impl.
+ * Admin management of API-key IP allowlists (migration 0041), at the impl.
  *
  * Pins:
  *  - setIpPolicy validates every CIDR (reporting all bad entries), canonicalises
@@ -272,14 +272,18 @@ describe("apiKeys global IP policy", () => {
     });
   });
 
-  it("setGlobalIpPolicy writes the canonical list, audits old and new, and reads back", async () => {
-    configServiceMock.getApiKeyIpPolicy
-      .mockResolvedValueOnce({ mode: "off", cidrs: [], problems: [] })
-      .mockResolvedValueOnce({
-        mode: "audit",
-        cidrs: ["198.51.100.0/24"],
-        problems: [],
-      });
+  it("setGlobalIpPolicy audits and returns the snapshots from its own write, even if another writer changes the policy", async () => {
+    configServiceMock.setApiKeyIpPolicy.mockResolvedValue({
+      before: { mode: "enforce", cidrs: ["203.0.113.0/24"] },
+      after: { mode: "audit", cidrs: ["198.51.100.0/24"] },
+    });
+    // A separate read could already observe another writer's value. Neither
+    // the audit history nor this write's response may be built from that read.
+    configServiceMock.getApiKeyIpPolicy.mockResolvedValue({
+      mode: "off",
+      cidrs: [],
+      problems: [],
+    });
 
     const result = await apiKeysImplementations.setGlobalIpPolicy(
       { mode: "audit", allowed_cidrs: ["198.51.100.0/24"] },
@@ -302,9 +306,10 @@ describe("apiKeys global IP policy", () => {
       target_id: "API_KEY_IP_POLICY",
     });
     expect(rows[0].detail).toEqual({
-      old_value: { mode: "off", allowed_cidrs: [] },
+      old_value: { mode: "enforce", allowed_cidrs: ["203.0.113.0/24"] },
       new_value: { mode: "audit", allowed_cidrs: ["198.51.100.0/24"] },
     });
+    expect(configServiceMock.getApiKeyIpPolicy).not.toHaveBeenCalled();
   });
 
   it("refuses enforce with an empty global list", async () => {

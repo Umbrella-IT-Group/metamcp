@@ -155,7 +155,7 @@ function emitDenied(
  * for cookie-carrying requests so a valid cookie user is never refused.
  */
 /**
- * The admin-plane key's IP policy refused the request (migration 0040).
+ * The admin-plane key's IP policy refused the request (migration 0041).
  * Distinct from null (which leaves the request unauthenticated, a 401) so
  * createContext can answer 403 with the generic refusal, matching the data
  * plane, instead of looking like an unknown key.
@@ -174,7 +174,7 @@ export async function resolveAdminPlaneSession(
   // switch is on cannot amplify audit writes.
   if (adminPlaneTokenAuthDisabled()) return null;
 
-  // Explicit IP-policy opt-in (migration 0040): the control plane is an
+  // Explicit IP-policy opt-in (migration 0041): the control plane is an
   // authentication, so the admin-plane key's allowlist applies. Address from
   // CF-Connecting-IP via lib/client-ip, never req.ip.
   const result = await apiKeysRepository.validateAdminPlaneApiKey(token, {

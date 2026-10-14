@@ -1235,7 +1235,7 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     // was accepted when no legitimate caller depended on this route, and
     // gating it does not change who depends on it.
     const credential = await requireIntrospectionCredential(req);
-    // A real key refused by its IP policy (migration 0040): 403 with the
+    // A real key refused by its IP policy (migration 0041): 403 with the
     // generic body, and NOT recorded against the failed-lookup limiter, ahead
     // of the invalid-credential branch below, mirroring the data plane. No
     // audit row here: the policy module already wrote the throttled one.

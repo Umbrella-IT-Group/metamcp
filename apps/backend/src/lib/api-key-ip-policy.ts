@@ -5,7 +5,7 @@ import logger from "@/utils/logger";
 import { type AuditRequestContext, emit } from "./audit/audit-emitter";
 
 /**
- * API-key IP allowlists (migration 0040).
+ * API-key IP allowlists (migration 0041).
  *
  * WHAT THIS CLOSES. An API key used to work from any address on earth, so a key
  * copied out of a config file, a log or a laptop worked for whoever held it.

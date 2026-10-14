@@ -1,5 +1,5 @@
 /**
- * The two key validators and the API-key IP policy (migration 0040).
+ * The two key validators and the API-key IP policy (migration 0041).
  *
  * Pins, against the REAL validators and the REAL policy module with only the
  * database mocked:

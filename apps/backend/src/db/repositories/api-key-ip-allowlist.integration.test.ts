@@ -1,5 +1,5 @@
 /**
- * Migration 0040 and the API-key IP policy against a REAL Postgres.
+ * Migration 0041 and the API-key IP policy against a REAL Postgres.
  *
  * Layer 1 (always runs): the migration SQL, the drizzle journal and the
  * schema.ts mirror are asserted directly. A journal entry whose `when` does not
@@ -39,7 +39,7 @@ const JOURNAL_PATH = path.resolve(
 );
 const SCHEMA_PATH = path.resolve(__dirname, "../schema.ts");
 
-describe("migration 0040: the DDL", () => {
+describe("migration 0041: the DDL", () => {
   const raw = readFileSync(MIGRATION_PATH, "utf8");
   const sql = raw
     .split("\n")
@@ -67,12 +67,12 @@ describe("migration 0040: the DDL", () => {
   });
 });
 
-describe("drizzle journal for 0040", () => {
+describe("drizzle journal for 0041", () => {
   const journal = JSON.parse(readFileSync(JOURNAL_PATH, "utf8")) as {
     entries: { idx: number; when: number; tag: string }[];
   };
 
-  it("registers 0040 with a `when` strictly above every EARLIER entry", () => {
+  it("registers 0041 with a `when` strictly above every EARLIER entry", () => {
     const entry = journal.entries.find(
       (e) => e.tag === "0041_api_key_ip_allowlist",
     );
@@ -82,8 +82,9 @@ describe("drizzle journal for 0040", () => {
     expect(entry?.when).toBeGreaterThan(
       Math.max(...earlier.map((e) => e.when)),
     );
-    // 0039's `when`; get this wrong and 0040 is skipped WITHOUT an error.
-    expect(entry?.when).toBeGreaterThan(1787788800000);
+    // 0040's `when` (namespace tool policy); get this wrong and 0041 is
+    // skipped WITHOUT an error.
+    expect(entry?.when).toBeGreaterThan(1787875200000);
   });
 });
 
@@ -325,6 +326,46 @@ describeIfDb("API-key IP policy against a REAL postgres", () => {
       await repo.validateApiKey("sk_mt_own_list_wins_06", check("192.0.2.7")),
     ).toMatchObject({ valid: false, ip_denied: true });
   });
+
+  it.each([false, true])(
+    "serializes concurrent global writes and their audit snapshots (existing rows: %s)",
+    async (existing) => {
+      const initial = existing
+        ? { mode: "enforce" as const, cidrs: ["192.0.2.254/32"] }
+        : { mode: "off" as const, cidrs: [] };
+      if (existing) await configService.setApiKeyIpPolicy(initial);
+
+      const policies = Array.from({ length: 8 }, (_, i) => ({
+        mode: "audit" as const,
+        cidrs: [`192.0.2.${i + 1}/32`],
+      }));
+      const snapshots = await Promise.all(
+        policies.map((policy) => configService.setApiKeyIpPolicy(policy)),
+      );
+      const key = (policy: { mode: string; cidrs: string[] }) =>
+        JSON.stringify([policy.mode, policy.cidrs]);
+      const transitions = new Map(
+        snapshots.map(({ before, after }, i) => {
+          expect(after).toMatchObject(policies[i]);
+          return [key(before), after];
+        }),
+      );
+      // All eight writes must form one history, including when the config
+      // rows did not exist yet. A read before acquiring the lock repeats the
+      // same old value across writers and breaks this chain.
+      expect(transitions.size).toBe(policies.length);
+      let current: { mode: string; cidrs: string[] } = initial;
+      for (let i = 0; i < policies.length; i += 1) {
+        const next = transitions.get(key(current));
+        expect(next).toBeDefined();
+        if (!next) throw new Error("Concurrent policy history is disconnected");
+        transitions.delete(key(current));
+        current = next;
+      }
+      expect(transitions.size).toBe(0);
+      expect(await configService.getApiKeyIpPolicy()).toMatchObject(current);
+    },
+  );
 
   it("the any-IP exemption admits any address, and no address, under enforce", async () => {
     await insertKey({

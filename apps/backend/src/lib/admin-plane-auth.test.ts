@@ -82,7 +82,7 @@ const activeAdminOwner = () => ({
 });
 
 /**
- * Narrow a resolution to its session arm. Since migration 0040 the resolver
+ * Narrow a resolution to its session arm. Since migration 0041 the resolver
  * can also return `{ ipDenied: true }`, which these accepted-path tests never
  * produce; the cast keeps their assertions as they were.
  */
@@ -241,7 +241,7 @@ describe("kill switch — ADMIN_PLANE_TOKEN_AUTH_DISABLED", () => {
   });
 });
 
-describe("resolveAdminPlaneSession: API-key IP policy (migration 0040)", () => {
+describe("resolveAdminPlaneSession: API-key IP policy (migration 0041)", () => {
   it("passes the explicit opt-in with CF-Connecting-IP and surface admin_plane", async () => {
     validateAdminPlaneApiKeyMock.mockResolvedValue(activeAdminOwner());
 

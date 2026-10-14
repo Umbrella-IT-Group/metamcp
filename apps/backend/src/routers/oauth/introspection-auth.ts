@@ -63,7 +63,7 @@ function apiKeys(): ApiKeysRepository {
 export type IntrospectionCredentialCheck =
   | { ok: true; userId: string | null }
   | { ok: false; reason: "missing_credential" | "invalid_credential" }
-  // The key is real but its IP policy (migration 0040) refuses this caller's
+  // The key is real but its IP policy (migration 0041) refuses this caller's
   // address. Distinct so the handler answers 403 and does NOT count it toward
   // the failed-lookup limiter, the same way the data plane treats it.
   | { ok: false; reason: "ip_not_allowed" };
@@ -112,7 +112,7 @@ export async function requireIntrospectionCredential(
     return { ok: false, reason: "missing_credential" };
   }
 
-  // Explicit IP-policy opt-in (migration 0040): introspection is an
+  // Explicit IP-policy opt-in (migration 0041): introspection is an
   // authentication like the data plane, so the presenting key's allowlist
   // applies here too. CF-Connecting-IP via lib/client-ip, never req.ip.
   const result = await apiKeys().validateApiKey(presented, {

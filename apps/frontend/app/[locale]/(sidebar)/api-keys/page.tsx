@@ -766,7 +766,7 @@ export default function ApiKeysPage() {
             Every API key across all users, including keys you do not own. Only
             administrators can see and revoke these.
           </p>
-          {/* API-key IP allowlists (migration 0040): the global policy, then a
+          {/* API-key IP allowlists (migration 0041): the global policy, then a
               per-key column and editor in the table below. */}
           <GlobalIpPolicyCard />
           <div className="rounded-md border">

@@ -1,6 +1,6 @@
 /**
  * Pure helpers for the API-key IP allowlist controls on the API keys admin
- * page (migration 0040). Kept out of the component so the form's translation
+ * page (migration 0041). Kept out of the component so the form's translation
  * between what an administrator types and what the server stores is
  * unit-tested. The SERVER validates every CIDR (node:net, the same code that
  * matches them); nothing here decides whether an entry is valid.

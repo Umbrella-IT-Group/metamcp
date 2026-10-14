@@ -1,5 +1,5 @@
 /**
- * API-key IP allowlists (migration 0040): the policy module on its own.
+ * API-key IP allowlists (migration 0041): the policy module on its own.
  *
  * Pins the parts every surface shares: what a valid allowlist entry is, how a
  * client address is matched (including the any-IP exemption and the fail-closed

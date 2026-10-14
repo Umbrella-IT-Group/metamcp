@@ -135,7 +135,7 @@ export class ApiKeysRepository {
         // Plane flag (migration 0038): so the admin view can label a
         // control-plane key loudly, the way acts-as is labelled.
         admin_plane: apiKeysTable.admin_plane,
-        // IP allowlist (migration 0040): the key's own list (NULL = follows
+        // IP allowlist (migration 0041): the key's own list (NULL = follows
         // the global policy), its mode, and the last address it was used
         // from. None of it is credential material.
         allowed_cidrs: apiKeysTable.allowed_cidrs,
@@ -174,7 +174,7 @@ export class ApiKeysRepository {
   /**
    * Resolve a presented DATA-plane key.
    *
-   * `ipCheck` is the EXPLICIT opt-in to the key's IP policy (migration 0040).
+   * `ipCheck` is the EXPLICIT opt-in to the key's IP policy (migration 0041).
    * The authenticating call sites pass it (both API-key branches of
    * authenticateApiKey, and /oauth/introspect); the tRPC `apiKeys.validate`
    * oracle does not, because it authenticates nothing and has no caller
@@ -214,7 +214,7 @@ export class ApiKeysRepository {
         // read so the refusal below costs no second query.
         admin_plane: apiKeysTable.admin_plane,
         last_used_at: apiKeysTable.last_used_at,
-        // IP policy (migration 0040), read on the same row for the same
+        // IP policy (migration 0041), read on the same row for the same
         // reason: a key with its own list costs no extra query at all.
         allowed_cidrs: apiKeysTable.allowed_cidrs,
         ip_policy_mode: apiKeysTable.ip_policy_mode,
@@ -240,7 +240,7 @@ export class ApiKeysRepository {
       return { valid: false };
     }
 
-    // IP POLICY (migration 0040), only under an explicit ipCheck. Placed
+    // IP POLICY (migration 0041), only under an explicit ipCheck. Placed
     // after existence and is_active (an unknown or revoked key is refused as
     // invalid exactly as before, and an unknown key never reaches the policy,
     // so the audit rows it writes are always about a real key) and BEFORE
@@ -307,7 +307,7 @@ export class ApiKeysRepository {
   // fail request auth. The swallow is logged, not silent, so it stays
   // observable.
   //
-  // last_used_ip (migration 0040) rides the SAME throttled write, so it costs
+  // last_used_ip (migration 0041) rides the SAME throttled write, so it costs
   // no extra update; between stamps it can be up to the throttle window stale,
   // which is fine for its purpose (showing an operator where a key is used
   // from while they build its allowlist). Absent ip = leave the column as it
@@ -369,7 +369,7 @@ export class ApiKeysRepository {
         };
       }
     | { valid: false; reason: "unknown_key" | "inactive" | "not_admin_plane" }
-    // The key's IP policy refused the request (migration 0040). Carries the
+    // The key's IP policy refused the request (migration 0041). Carries the
     // key uuid for the caller's log; the policy module already wrote the
     // throttled audit row.
     | { valid: false; reason: "ip_not_allowed"; key_uuid: string }
@@ -406,7 +406,7 @@ export class ApiKeysRepository {
     // unauthenticated and protectedProcedure returns its normal UNAUTHORIZED.
     if (!row.admin_plane) return { valid: false, reason: "not_admin_plane" };
 
-    // IP POLICY (migration 0040), only under an explicit ipCheck, and AFTER
+    // IP POLICY (migration 0041), only under an explicit ipCheck, and AFTER
     // the plane check on purpose. A data-plane key on /trpc is already refused
     // with the same 401 an unknown key gets, so it reveals nothing, and
     // evaluating a data-plane key's policy on a surface it can never use would
@@ -565,7 +565,7 @@ export class ApiKeysRepository {
   }
 
   /**
-   * Admin write of one key's IP policy (migration 0040). The caller
+   * Admin write of one key's IP policy (migration 0041). The caller
    * (apiKeys.setIpPolicy) has validated and canonicalised the list and the
    * mode; this persists them and returns the row as it was BEFORE and AFTER,
    * read and written in one transaction under a row lock, so the audit row's

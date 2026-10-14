@@ -221,7 +221,7 @@ async function start(): Promise<void> {
   warnIfAdminPlaneTokenAuthDisabled();
 
   // One boot-time signal when API-key IP allowlists are switched off with
-  // API_KEY_IP_POLICY_DISABLED=true (migration 0040), so an emergency disable
+  // API_KEY_IP_POLICY_DISABLED=true (migration 0041), so an emergency disable
   // is legible in the boot log rather than discovered when a policy that
   // looks enforced is not.
   warnIfApiKeyIpPolicyDisabled();

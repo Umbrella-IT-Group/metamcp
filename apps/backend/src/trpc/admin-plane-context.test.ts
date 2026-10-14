@@ -157,7 +157,7 @@ describe("createContext — DB-loadable invariant", () => {
   });
 });
 
-describe("createContext: admin-plane key refused by its IP policy (migration 0040)", () => {
+describe("createContext: admin-plane key refused by its IP policy (migration 0041)", () => {
   const GENERIC =
     "This credential is not currently permitted to access this gateway.";
 

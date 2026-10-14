@@ -90,7 +90,7 @@ vi.mock("../db/repositories", () => ({
   usersRepository: usersRepoMock,
 }));
 
-// The impl reads and writes the global API-key IP policy (migration 0040)
+// The impl reads and writes the global API-key IP policy (migration 0041)
 // through config.service, whose repository reaches db/index. Nothing in this
 // file exercises it (api-keys.ip-policy.impl.test.ts does); the stub only
 // keeps the module loadable without a DATABASE_URL.

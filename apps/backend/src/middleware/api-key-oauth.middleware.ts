@@ -477,7 +477,7 @@ export function __resetUnauthenticatedEndpointWarnings(): void {
 }
 
 /**
- * The explicit IP-policy opt-in (migration 0040) both API-key branches pass to
+ * The explicit IP-policy opt-in (migration 0041) both API-key branches pass to
  * validateApiKey. The address is CF-Connecting-IP exactly as lib/client-ip.ts
  * resolves it, never `req.ip` (the in-container rewrite makes that loopback for
  * everyone) and never X-Forwarded-For (caller-appendable). The endpoint rides
@@ -634,7 +634,7 @@ export const authenticateApiKey = async (
 
         return next();
       } else {
-        // IP policy refusal (migration 0040), handled FIRST, before the
+        // IP policy refusal (migration 0041), handled FIRST, before the
         // admin-plane branch and the invalid-credential path, so it is never
         // counted as a failed credential. See refuseIpDenied.
         if (apiKeyResult?.ip_denied) {
@@ -862,7 +862,7 @@ export const authenticateApiKey = async (
 
         return next();
       } else {
-        // IP policy refusal (migration 0040), same handling and placement as
+        // IP policy refusal (migration 0041), same handling and placement as
         // the api-key-only branch above.
         if (apiKeyResult?.ip_denied) {
           return refuseIpDenied(res);

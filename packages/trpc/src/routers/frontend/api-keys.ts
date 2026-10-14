@@ -137,7 +137,7 @@ export const createApiKeysRouter = (implementations: {
         return implementations.validate(input);
       }),
 
-    // API-key IP allowlists (migration 0040). ADMIN ONLY, all three: a policy
+    // API-key IP allowlists (migration 0041). ADMIN ONLY, all three: a policy
     // decides which networks may use a credential, so who may change it is
     // the same question as who may mint one. Each write emits an admin audit
     // row with the old and new value (apikey.ip_policy.set /

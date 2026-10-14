@@ -298,7 +298,7 @@ export const AdminApiKeyItemSchema = z.object({
   created_at: z.date(),
   last_used_at: z.date().nullable(),
   is_active: z.boolean(),
-  // IP allowlist (migration 0040). allowed_cidrs NULL = the key follows the
+  // IP allowlist (migration 0041). allowed_cidrs NULL = the key follows the
   // global policy; non-NULL = its own list, governed by its own
   // ip_policy_mode. last_used_ip is the CF-Connecting-IP of the key's last
   // authenticated request (throttled like last_used_at). None of the three is
@@ -312,7 +312,7 @@ export const ListAllApiKeysResponseSchema = z.object({
   apiKeys: z.array(AdminApiKeyItemSchema),
 });
 
-// ---- API-key IP allowlists (migration 0040) ----
+// ---- API-key IP allowlists (migration 0041) ----
 //
 // off: nothing is evaluated. audit: the request is served and a throttled
 // would-deny audit row is written. enforce: the request is refused with 403.

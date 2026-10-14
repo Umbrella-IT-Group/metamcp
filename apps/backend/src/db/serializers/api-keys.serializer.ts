@@ -136,7 +136,7 @@ export class ApiKeysSerializer {
       created_at: apiKey.created_at,
       last_used_at: apiKey.last_used_at,
       is_active: apiKey.is_active,
-      // IP allowlist (migration 0040). The mode is read through readMode so a
+      // IP allowlist (migration 0041). The mode is read through readMode so a
       // value outside the enum (impossible past the CHECK, but this is the
       // .output() boundary) is shown the way the evaluator reads it.
       allowed_cidrs: apiKey.allowed_cidrs,
