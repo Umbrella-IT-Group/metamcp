@@ -279,7 +279,14 @@
       "idx": 40,
       "version": "7",
       "when": 1787875200000,
-      "tag": "0040_api_key_ip_allowlist",
+      "tag": "0040_namespace_tool_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1787961600000,
+      "tag": "0041_api_key_ip_allowlist",
       "breakpoints": true
     }
   ]

@@ -31,7 +31,7 @@ import { INTEGRATION_DB_LOCK_KEY } from "./integration-db-lock";
 
 const MIGRATION_PATH = path.resolve(
   __dirname,
-  "../../../drizzle/0040_api_key_ip_allowlist.sql",
+  "../../../drizzle/0041_api_key_ip_allowlist.sql",
 );
 const JOURNAL_PATH = path.resolve(
   __dirname,
@@ -74,10 +74,10 @@ describe("drizzle journal for 0040", () => {
 
   it("registers 0040 with a `when` strictly above every EARLIER entry", () => {
     const entry = journal.entries.find(
-      (e) => e.tag === "0040_api_key_ip_allowlist",
+      (e) => e.tag === "0041_api_key_ip_allowlist",
     );
     expect(entry).toBeDefined();
-    expect(entry?.idx).toBe(40);
+    expect(entry?.idx).toBe(41);
     const earlier = journal.entries.filter((e) => e.idx < (entry?.idx ?? 0));
     expect(entry?.when).toBeGreaterThan(
       Math.max(...earlier.map((e) => e.when)),

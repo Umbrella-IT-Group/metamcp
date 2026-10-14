@@ -38,6 +38,7 @@ import { createAuditingMiddleware } from "./metamcp-middleware/auditing.function
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
+  type ToolFilterCallContext,
 } from "./metamcp-middleware/filter-tools.functional";
 import {
   CallToolHandler,
@@ -200,6 +201,15 @@ export const createServer = async (
       context.namespaceUuid,
       includeInactiveServers,
     );
+    // A live proxy outlasts namespace edits. Drop removed owners before the
+    // collision guard so a same-named replacement can list its own tools.
+    for (const [toolName, owner] of toolNameOwner) {
+      if (!serverParams[owner.uuid]) {
+        toolNameOwner.delete(toolName);
+        delete toolToClient[toolName];
+        delete toolToServerUuid[toolName];
+      }
+    }
     const allTools: Tool[] = [];
 
     // Servers that should have contributed but didn't — used for the
@@ -306,6 +316,17 @@ export const createServer = async (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+
+        // The first '__' separates the server from the backend tool. A stored
+        // server name containing it cannot round-trip and could borrow an
+        // ACTIVE row on the parent prefix while listing an unreviewed tool.
+        if (sanitizeName(serverName).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+          );
+          failedServers.push(serverName || mcpServerUuid);
+          return;
+        }
 
         try {
           const toolFetchStart = performance.now();
@@ -487,10 +508,7 @@ export const createServer = async (
   };
 
   // Original Call Tool Handler
-  const originalCallToolHandler: CallToolHandler = async (
-    request,
-    _context,
-  ) => {
+  const originalCallToolHandler: CallToolHandler = async (request, context) => {
     const { name, arguments: args } = request.params;
 
     // Parse the tool name using shared utility
@@ -500,10 +518,22 @@ export const createServer = async (
     }
 
     const { serverName: serverPrefix, originalToolName } = parsed;
+    const { allowedToolServerUuids } = context as ToolFilterCallContext;
+    const isAllowedServer = (uuid: string): boolean =>
+      !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
     // Try to find the tool in pre-populated mappings first
-    let clientForTool = toolToClient[name];
-    let serverUuid = toolToServerUuid[name];
+    let clientForTool: ConnectedClient | undefined = toolToClient[name];
+    let serverUuid: string | undefined = toolToServerUuid[name];
+    if (serverUuid && !isAllowedServer(serverUuid)) {
+      // The filter checked today's mounts, but this live proxy may retain the
+      // removed server's route. Resolve again instead of executing that client.
+      delete toolToClient[name];
+      delete toolToServerUuid[name];
+      toolNameOwner.delete(name);
+      clientForTool = undefined;
+      serverUuid = undefined;
+    }
 
     // If not found in mappings, dynamically find the server and route the call
     if (!clientForTool || !serverUuid) {
@@ -516,6 +546,7 @@ export const createServer = async (
 
         // Find the server with the matching name prefix
         for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
+          if (!isAllowedServer(mcpServerUuid)) continue;
           const session = await mcpServerPool.getSession(
             sessionId,
             mcpServerUuid,
@@ -650,6 +681,13 @@ export const createServer = async (
         // entirely — no wait — when the DB has no record of this tool:
         // that's a genuinely unknown tool, not a reconnect race, and it
         // must still 404 immediately.
+        //
+        // The candidates are ACTIVE mapping rows only
+        // (findServersForNamespaceToolName), so this never warms or routes
+        // a server whose row for the tool is switched off, nor, under the
+        // `allowlist` tool policy, one with no row. The filter middleware
+        // already refused those by name; the query keeps the server this
+        // picks inside the same rule rather than relying on that.
         if (!clientForTool) {
           const candidates =
             await namespacesRepository.findServersForNamespaceToolName(
@@ -658,6 +696,7 @@ export const createServer = async (
             );
           const match = candidates.find(
             (candidate) =>
+              isAllowedServer(candidate.serverUuid) &&
               sanitizeName(candidate.serverName || "") === serverPrefix,
           );
           const paramsForMatch = match

@@ -9,6 +9,16 @@ import { ToolSchema, ToolStatusEnum } from "./tools.zod";
 
 const ToolAnnotationsSchema = z.record(z.string(), z.unknown());
 
+/**
+ * How a namespace treats a tool that has NO namespace_tool_mappings row
+ * (migration 0040). `allow_all` serves it (the original behaviour and the
+ * default); `allowlist` hides it, so only tools with an ACTIVE row are listed
+ * or callable. Set only through the admin-gated `namespaces.setToolPolicy`.
+ */
+export const NAMESPACE_TOOL_POLICIES = ["allow_all", "allowlist"] as const;
+export const NamespaceToolPolicyEnum = z.enum(NAMESPACE_TOOL_POLICIES);
+export type NamespaceToolPolicy = z.infer<typeof NamespaceToolPolicyEnum>;
+
 // Namespace schema definitions
 export const createNamespaceFormSchema = z.object({
   name: z.string().min(1, "validation:namespaceName.required"),
@@ -42,6 +52,10 @@ export const NamespaceSchema = z.object({
   created_at: z.string(),
   updated_at: z.string(),
   user_id: z.string().nullable(),
+  // Carried on every namespace response (list, listAll, get, create, update,
+  // and the namespace embedded in endpoint responses) so the platform's
+  // read-only state export can record which namespaces are allowlists.
+  tool_policy: NamespaceToolPolicyEnum,
 });
 
 // Server within namespace schema - extends McpServerSchema with namespace-specific status
@@ -171,6 +185,20 @@ export const RefreshNamespaceToolsRequestSchema = z.object({
   ),
 });
 
+// Set a namespace's tool policy (admin only). Flipping to `allowlist` hides
+// every tool that has no ACTIVE row in the namespace at once; setting
+// `allow_all` again is the rollback.
+export const SetNamespaceToolPolicyRequestSchema = z.object({
+  namespaceUuid: z.string().uuid(),
+  toolPolicy: NamespaceToolPolicyEnum,
+});
+
+export const SetNamespaceToolPolicyResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string(),
+  data: NamespaceSchema.optional(),
+});
+
 export const RefreshNamespaceToolsResponseSchema = z.object({
   success: z.boolean(),
   message: z.string(),
@@ -228,6 +256,12 @@ export type UpdateNamespaceToolOverridesRequest = z.infer<
 >;
 export type UpdateNamespaceToolOverridesResponse = z.infer<
   typeof UpdateNamespaceToolOverridesResponseSchema
+>;
+export type SetNamespaceToolPolicyRequest = z.infer<
+  typeof SetNamespaceToolPolicyRequestSchema
+>;
+export type SetNamespaceToolPolicyResponse = z.infer<
+  typeof SetNamespaceToolPolicyResponseSchema
 >;
 
 // Repository-specific schemas
@@ -289,6 +323,7 @@ export const DatabaseNamespaceSchema = z.object({
   created_at: z.date(),
   updated_at: z.date(),
   user_id: z.string().nullable(),
+  tool_policy: NamespaceToolPolicyEnum,
 });
 
 export const DatabaseNamespaceServerSchema = z.object({

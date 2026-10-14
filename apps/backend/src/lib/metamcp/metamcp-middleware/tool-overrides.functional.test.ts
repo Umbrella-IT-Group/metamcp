@@ -10,6 +10,11 @@
  * the cache hit did not). These tests hold rows for both servers in an
  * in-memory stand-in for the tables (see tool-mapping-db.fixtures) and assert
  * that every lookup, cached or not, lands on its own server.
+ *
+ * The listing's override lookup also resolves the server prefix among the
+ * servers MOUNTED in the namespace (upstream metatool-ai/metamcp#364): by name
+ * alone it could land on another owner's same-named server, find no row, and
+ * silently drop this namespace's override.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,7 +24,12 @@ import type {
 } from "./tool-mapping-db.fixtures";
 
 const { state, queries } = vi.hoisted(() => ({
-  state: { servers: [], mappings: [] } as FakeToolMappingState,
+  state: {
+    servers: [],
+    mappings: [],
+    mounts: [],
+    namespaces: [],
+  } as FakeToolMappingState,
   queries: [] as FakeQuery[],
 }));
 
@@ -58,6 +68,11 @@ const BETA = { uuid: "server-beta", name: "beta" };
 /** Both servers give a different tool the same alias, `shared`. */
 const bothShareAnAlias = (): FakeToolMappingState => ({
   servers: [ALPHA, BETA],
+  mounts: [
+    { namespaceUuid: NS, serverUuid: ALPHA.uuid },
+    { namespaceUuid: NS, serverUuid: BETA.uuid },
+  ],
+  namespaces: [{ uuid: NS, toolPolicy: "allow_all" }],
   mappings: [
     {
       namespaceUuid: NS,
@@ -76,9 +91,18 @@ const bothShareAnAlias = (): FakeToolMappingState => ({
   ],
 });
 
+const EMPTY: FakeToolMappingState = {
+  servers: [],
+  mappings: [],
+  mounts: [],
+  namespaces: [],
+};
+
 const load = (next: FakeToolMappingState) => {
   state.servers = next.servers;
   state.mappings = next.mappings;
+  state.mounts = next.mounts;
+  state.namespaces = next.namespaces;
 };
 
 const map = (name: string) => mapOverrideNameToOriginal(name, NS, true);
@@ -92,7 +116,7 @@ const tool = (name: string) => ({
 beforeEach(() => {
   clearOverrideCache();
   queries.length = 0;
-  load({ servers: [], mappings: [] });
+  load(EMPTY);
 });
 
 afterEach(() => {
@@ -113,7 +137,7 @@ describe("mapOverrideNameToOriginal: an alias resolves on its own server", () =>
 
   it("does not lend one server's cached alias to a server that has no such alias", async () => {
     load({
-      servers: [ALPHA, BETA],
+      ...bothShareAnAlias(),
       mappings: [bothShareAnAlias().mappings[0]],
     });
 
@@ -137,7 +161,7 @@ describe("mapOverrideNameToOriginal: an alias resolves on its own server", () =>
     ]);
 
     // Empty the tables, so only the cache the listing filled can answer.
-    load({ servers: [], mappings: [] });
+    load(EMPTY);
     queries.length = 0;
 
     expect(await map("alpha__shared")).toBe("alpha__alpha_tool");
@@ -150,7 +174,7 @@ describe("mapOverrideNameToOriginal: an alias resolves on its own server", () =>
     expect(await map("alpha__shared")).toBe("alpha__alpha_tool");
 
     clearOverrideCache(NS);
-    load({ servers: [], mappings: [] });
+    load(EMPTY);
 
     expect(await map("alpha__shared")).toBe("alpha__shared");
   });
@@ -205,5 +229,85 @@ describe("createToolOverridesCallToolMiddleware", () => {
       params: { name: "alpha__plain_read", arguments: { a: 1 } },
     });
     expect(passedContext).toBe(context);
+  });
+});
+
+describe("#364: the listing's override lookup is scoped to the namespace's mounted servers", () => {
+  const OTHER_NS = "ns-2";
+  // Two servers share the name "github". FOREIGN is mounted only in OTHER_NS
+  // and comes FIRST, so a lookup by name alone lands on it.
+  const OURS = { uuid: "github-ours", name: "github" };
+  const FOREIGN = { uuid: "github-foreign", name: "github" };
+
+  const twoGithubs = (): FakeToolMappingState => ({
+    servers: [FOREIGN, OURS],
+    mounts: [
+      { namespaceUuid: OTHER_NS, serverUuid: FOREIGN.uuid },
+      { namespaceUuid: NS, serverUuid: OURS.uuid },
+    ],
+    namespaces: [
+      { uuid: NS, toolPolicy: "allow_all" },
+      { uuid: OTHER_NS, toolPolicy: "allow_all" },
+    ],
+    mappings: [
+      {
+        namespaceUuid: NS,
+        serverUuid: OURS.uuid,
+        toolName: "read",
+        status: "ACTIVE",
+        overrideName: "gh_read",
+      },
+      {
+        namespaceUuid: OTHER_NS,
+        serverUuid: FOREIGN.uuid,
+        toolName: "read",
+        status: "ACTIVE",
+        overrideName: "foreign_read",
+      },
+    ],
+  });
+
+  const listIn = async (namespaceUuid: string) => {
+    const listed = await createToolOverridesListToolsMiddleware({
+      cacheEnabled: false,
+    })(async () => ({ tools: [tool("github__read")] }))(
+      { method: "tools/list", params: {} },
+      { namespaceUuid, sessionId: "sess-1" },
+    );
+    return listed.tools.map((t) => t.name);
+  };
+
+  it("applies each namespace's own override for a same-named server", async () => {
+    load(twoGithubs());
+
+    expect(await listIn(NS)).toEqual(["github__gh_read"]);
+    expect(await listIn(OTHER_NS)).toEqual(["github__foreign_read"]);
+  });
+
+  it("looks the server up inside the namespace being listed", async () => {
+    load(twoGithubs());
+    await listIn(NS);
+
+    expect(queries.filter((q) => q.table === "servers")).toEqual([
+      {
+        table: "servers",
+        where: { "nsm.namespace_uuid": NS, "servers.name": "github" },
+      },
+    ]);
+  });
+
+  it("applies no override when two mounted servers share the prefix", async () => {
+    // Which server's override would apply cannot be told from the name, so
+    // none does; the tool lists under its real name and the filter judges it
+    // against both servers.
+    load({
+      ...twoGithubs(),
+      mounts: [
+        { namespaceUuid: NS, serverUuid: FOREIGN.uuid },
+        { namespaceUuid: NS, serverUuid: OURS.uuid },
+      ],
+    });
+
+    expect(await listIn(NS)).toEqual(["github__read"]);
   });
 });

@@ -66,6 +66,9 @@ vi.mock("../lib/metamcp/metamcp-middleware/tool-overrides.functional", () => ({
   clearOverrideCache: vi.fn(),
   mapOverrideNameToOriginal: vi.fn(),
 }));
+vi.mock("../lib/metamcp/metamcp-middleware/filter-tools.functional", () => ({
+  clearFilterCache: vi.fn(),
+}));
 vi.mock("../lib/metamcp/utils", () => ({
   convertDbServerToParams: vi.fn(),
 }));
@@ -94,6 +97,7 @@ const namespaceRow = (uuid: string, name: string, user_id: string | null) => ({
   created_at: CREATED,
   updated_at: CREATED,
   user_id,
+  tool_policy: "allow_all" as const,
 });
 
 const NAMESPACES = [

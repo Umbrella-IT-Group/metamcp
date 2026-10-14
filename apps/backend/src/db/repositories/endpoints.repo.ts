@@ -144,6 +144,7 @@ export class EndpointsRepository {
           created_at: namespacesTable.created_at,
           updated_at: namespacesTable.updated_at,
           user_id: namespacesTable.user_id,
+          tool_policy: namespacesTable.tool_policy,
         },
       })
       .from(endpointsTable)
@@ -257,6 +258,7 @@ export class EndpointsRepository {
           created_at: namespacesTable.created_at,
           updated_at: namespacesTable.updated_at,
           user_id: namespacesTable.user_id,
+          tool_policy: namespacesTable.tool_policy,
         },
       })
       .from(endpointsTable)
@@ -335,6 +337,7 @@ export class EndpointsRepository {
           created_at: namespacesTable.created_at,
           updated_at: namespacesTable.updated_at,
           user_id: namespacesTable.user_id,
+          tool_policy: namespacesTable.tool_policy,
         },
       })
       .from(endpointsTable)

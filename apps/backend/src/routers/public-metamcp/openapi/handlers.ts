@@ -19,6 +19,7 @@ import { createAuditingMiddleware } from "../../../lib/metamcp/metamcp-middlewar
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
+  type ToolFilterCallContext,
 } from "../../../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   CallToolHandler,
@@ -80,6 +81,16 @@ export const createOriginalListToolsHandler = (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+
+        // This prefix must round-trip through the first-'__' call parser,
+        // otherwise curation would judge a different server and backend name.
+        if (sanitizeName(serverName).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+          );
+          failedServers.push(serverName || mcpServerUuid);
+          return;
+        }
 
         // Get configurable timeout values to bypass MCP SDK default enforcement
         const resetTimeoutOnProgress =
@@ -193,12 +204,16 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
 
     const serverPrefix = name.substring(0, firstDoubleUnderscoreIndex);
     const originalToolName = name.substring(firstDoubleUnderscoreIndex + 2);
+    const { allowedToolServerUuids } = context as ToolFilterCallContext;
+    const isAllowedServer = (uuid: string): boolean =>
+      !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
     // Get server parameters and find the right session for this tool
     const serverParams = await getMcpServers(context.namespaceUuid);
     let targetSession = null;
 
     for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
+      if (!isAllowedServer(mcpServerUuid)) continue;
       const session = await mcpServerPool.getSession(
         context.sessionId,
         mcpServerUuid,
@@ -238,7 +253,9 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     // a live session, then give that one server a short, bounded
     // chance to come back. Skip the wait entirely when the DB has no
     // record of this tool — that's genuinely unknown, not a reconnect
-    // race, and must still 404 immediately.
+    // race, and must still 404 immediately. ACTIVE mapping rows only (see
+    // findServersForNamespaceToolName), as in metamcp-proxy.ts, so this
+    // never routes a server the tool filter would refuse for this tool.
     if (!targetSession) {
       const candidates =
         await namespacesRepository.findServersForNamespaceToolName(
@@ -247,6 +264,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         );
       const match = candidates.find(
         (candidate) =>
+          isAllowedServer(candidate.serverUuid) &&
           sanitizeName(candidate.serverName || "") === serverPrefix,
       );
       const paramsForMatch = match ? serverParams[match.serverUuid] : undefined;
@@ -456,12 +474,21 @@ export const createMiddlewareEnabledHandlers = (
     // server reaches the backend and comes back as an isError "Unknown tool";
     // this turns that into a redirect (surfaced as the bridge's usual 403 body).
     createRetiredToolMiddleware(),
+    // Override names resolve BEFORE the filter, so the filter judges the tool
+    // that will actually run: the same order as the Streamable-HTTP chain in
+    // metamcp-proxy (fork #208). This chain still had the filter outside, so
+    // a call by an alias reached the filter as the alias, which has no
+    // mapping row of its own. Under `allow_all` that read as "no row,
+    // allowed" and an INACTIVE tool stayed callable by its alias; under the
+    // `allowlist` tool policy (migration 0040) it would read as "no row,
+    // refused" and every alias of an allowlisted tool would be refused. A
+    // name that is not an override passes the override middleware unchanged.
+    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
         `Access denied to tool "${toolName}": ${reason}`,
     }),
-    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     // Innermost: added text on the gateway's own -32001 timeout (the outcome is
     // unknown, read the target's state before retrying), same code and data. The bridge
     // maps a thrown error to a 500 whose message carries it.

@@ -1,13 +1,15 @@
 /**
- * An in-memory stand-in for the three tables the tool-status filter and the
- * tool-override middleware read (`mcp_servers`, `tools`,
- * `namespace_tool_mappings`), for tests that need both middlewares REAL.
+ * An in-memory stand-in for the tables the tool-status filter and the
+ * tool-override middleware read (`namespaces`, `mcp_servers`,
+ * `namespace_server_mappings`, `tools`, `namespace_tool_mappings`), for tests
+ * that need both middlewares REAL.
  *
  * The stand-in evaluates the queries rather than routing by call shape, so a
- * test can hold one set of rows and let every lookup (server by name, tool
- * status, overrides, the override-name reverse lookup) answer from it the way
- * the database would. It works by replacing three seams, which a test wires
- * with `vi.mock`:
+ * test can hold one set of rows and let every lookup (the namespace's tool
+ * policy, a server prefix among the namespace's mounted servers, tool status,
+ * overrides, the override-name reverse lookup) answer from it the way the
+ * database would. It works by replacing three seams, which a test wires with
+ * `vi.mock`:
  *   - the schema module, with tables whose columns are plain ids
  *     (`"ntm.status"`, `"servers.name"`, ...);
  *   - drizzle's `eq` and `and`, with builders that keep the column id and the
@@ -15,7 +17,10 @@
  *   - the db module, with `createToolMappingDb(state)`.
  * A `where` keeps the rows whose columns equal every `eq` it was given, and
  * the `select` field map projects them. Join conditions are ignored: every
- * mapping row is pre-joined to its tool name and its server.
+ * mapping row is pre-joined to its tool name and its server, and a server row
+ * exists once per namespace it is MOUNTED in (`mounts`), pre-joined to that
+ * mount, so a server with no mount is invisible to the namespace-scoped
+ * server lookup exactly as it is to the real join.
  *
  * Nothing here imports the db, the schema or drizzle, so a `vi.mock` factory
  * can import it without loading the modules it stands in for.
@@ -24,6 +29,16 @@
 export interface FakeServerRow {
   uuid: string;
   name: string;
+}
+
+export interface FakeMountRow {
+  namespaceUuid: string;
+  serverUuid: string;
+}
+
+export interface FakeNamespaceRow {
+  uuid: string;
+  toolPolicy: string;
 }
 
 export interface FakeMappingRow {
@@ -37,16 +52,29 @@ export interface FakeMappingRow {
 export interface FakeToolMappingState {
   servers: FakeServerRow[];
   mappings: FakeMappingRow[];
+  /** Which namespaces each server is mounted in (namespace_server_mappings). */
+  mounts: FakeMountRow[];
+  /** Namespace rows; a namespace absent here does not exist. */
+  namespaces: FakeNamespaceRow[];
+  /** Make every query against these tables reject, as a database error. */
+  failOn?: Partial<Record<FakeQuery["table"], boolean>>;
+  /** Delay delivery after a query took its snapshot, for invalidation races. */
+  beforeQueryResult?: (query: FakeQuery) => Promise<void>;
 }
 
 /** One query the stand-in answered: its base table and its `eq` filters. */
 export interface FakeQuery {
-  table: "servers" | "mappings";
+  table: "servers" | "mappings" | "namespaces";
   where: Record<string, unknown>;
 }
 
 export const toolMappingSchemaStub = {
+  namespacesTable: { uuid: "ns.uuid", tool_policy: "ns.tool_policy" },
   mcpServersTable: { uuid: "servers.uuid", name: "servers.name" },
+  namespaceServerMappingsTable: {
+    namespace_uuid: "nsm.namespace_uuid",
+    mcp_server_uuid: "nsm.mcp_server_uuid",
+  },
   toolsTable: { uuid: "tools.uuid", name: "tools.name" },
   namespaceToolMappingsTable: {
     namespace_uuid: "ntm.namespace_uuid",
@@ -94,11 +122,27 @@ const rowsFor = (
   state: FakeToolMappingState,
   table: FakeQuery["table"],
 ): Record<string, unknown>[] => {
-  if (table === "servers") {
-    return state.servers.map((server) => ({
-      "servers.uuid": server.uuid,
-      "servers.name": server.name,
+  if (table === "namespaces") {
+    return state.namespaces.map((namespace) => ({
+      "ns.uuid": namespace.uuid,
+      "ns.tool_policy": namespace.toolPolicy,
     }));
+  }
+  if (table === "servers") {
+    // One row per mount: mcp_servers inner-joined to namespace_server_mappings.
+    return state.mounts.flatMap((mount) => {
+      const server = state.servers.find((s) => s.uuid === mount.serverUuid);
+      return server
+        ? [
+            {
+              "servers.uuid": server.uuid,
+              "servers.name": server.name,
+              "nsm.namespace_uuid": mount.namespaceUuid,
+              "nsm.mcp_server_uuid": mount.serverUuid,
+            },
+          ]
+        : [];
+    });
   }
   return state.mappings.map((mapping) => {
     const server = state.servers.find((s) => s.uuid === mapping.serverUuid);
@@ -129,14 +173,19 @@ export function createToolMappingDb(
           table =
             source === toolMappingSchemaStub.mcpServersTable
               ? "servers"
-              : "mappings";
+              : source === toolMappingSchemaStub.namespacesTable
+                ? "namespaces"
+                : "mappings";
           return query;
         },
         innerJoin: () => query,
         where: async (condition: unknown) => {
           const where = flatten(condition);
           queries.push({ table, where });
-          return rowsFor(state, table)
+          if (state.failOn?.[table]) {
+            throw new Error(`fake db: ${table} query failed`);
+          }
+          const result = rowsFor(state, table)
             .filter((row) =>
               Object.entries(where).every(([column, value]) => {
                 if (!(column in row)) {
@@ -153,6 +202,8 @@ export function createToolMappingDb(
                 ]),
               ),
             );
+          await state.beforeQueryResult?.({ table, where });
+          return result;
         },
       };
       return query;

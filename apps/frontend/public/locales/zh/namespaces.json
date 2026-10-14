@@ -85,7 +85,18 @@
     "connect": "连接",
     "connectingToMetaMcp": "正在连接到 MetaMCP...",
     "connectToMetaMcpToEnable": "连接到 MetaMCP 以启用增强的工具管理",
-    "anErrorOccurredWhileDeleting": "删除命名空间时发生错误"
+    "anErrorOccurredWhileDeleting": "删除命名空间时发生错误",
+    "toolPolicy": "工具策略",
+    "toolPolicyAllowAll": "全部允许",
+    "toolPolicyAllowlist": "允许列表",
+    "toolPolicyAllowAllHelp": "在工具管理中没有记录的工具也会提供，包括之后添加到服务器的工具。",
+    "toolPolicyAllowlistHelp": "仅提供在工具管理中已启用的工具。新工具在启用之前保持隐藏。",
+    "toolPolicySwitchLabel": "允许列表模式",
+    "toolPolicyConfirmTitle": "切换到允许列表模式？",
+    "toolPolicyConfirmDescription": "\"{{name}}\" 中所有未在工具管理中启用的工具将立即不再列出或可调用，之后添加到其服务器的工具在启用之前也保持隐藏。切换回全部允许即可恢复。",
+    "toolPolicyConfirm": "切换到允许列表",
+    "toolPolicyUpdated": "工具策略已更新",
+    "toolPolicyUpdateFailed": "更新工具策略失败"
   },
   "enhancedToolsTable": {
     "toolName": "工具名称",

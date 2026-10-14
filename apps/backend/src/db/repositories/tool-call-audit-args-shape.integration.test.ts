@@ -109,16 +109,15 @@ describe("drizzle journal ordering for 0039", () => {
     expect(entry?.idx).toBe(39);
   });
 
-  it("has a `when` STRICTLY GREATER than every EARLIER entry", () => {
+  it("has a `when` STRICTLY GREATER than every earlier entry", () => {
     const entry = journal.entries.find((e) => e.tag === MIGRATION_TAG);
     const when = entry?.when ?? Number.NEGATIVE_INFINITY;
-    // Earlier entries only (idx below 0039's), the same comparison the 0038
-    // suite makes. Comparing against "every other entry" asserted that 0039
-    // stays the NEWEST migration forever, so the first migration after it
-    // (0040) turned this red although 0039's ordering was still correct; the
-    // whole-journal monotonicity test below is what guards later entries.
+    // EARLIER entries only. This compared against every other entry while
+    // 0039 was the newest, which made it fail the moment 0040 landed although
+    // 0039's ordering was still right; the whole-journal ordering is the
+    // monotonic test below.
     const others = journal.entries.filter(
-      (e) => e.tag !== MIGRATION_TAG && e.idx < (entry?.idx ?? 0),
+      (e) => entry !== undefined && e.idx < entry.idx,
     );
     const maxOther = Math.max(...others.map((e) => e.when));
 

@@ -58,6 +58,10 @@ vi.mock("../lib/metamcp/metamcp-middleware/tool-overrides.functional", () => ({
   mapOverrideNameToOriginal: vi.fn(),
 }));
 
+vi.mock("../lib/metamcp/metamcp-middleware/filter-tools.functional", () => ({
+  clearFilterCache: vi.fn(),
+}));
+
 vi.mock("../lib/metamcp/metamcp-server-pool", () => ({
   metaMcpServerPool: {
     invalidateIdleServer: vi.fn(),
@@ -114,7 +118,10 @@ describe("namespaces.refreshTools implementation — access gate", () => {
     ] as never);
     vi.mocked(
       namespaceMappingsRepository.bulkUpsertNamespaceToolMappings,
-    ).mockResolvedValue([{ tool_uuid: "tool-1" }] as never);
+    ).mockResolvedValue({
+      mappings: [{ tool_uuid: "tool-1" }],
+      toolPolicy: "allow_all",
+    } as never);
     vi.mocked(metaMcpServerPool.invalidateIdleServer).mockResolvedValue(
       undefined,
     );
@@ -207,5 +214,82 @@ describe("namespaces.refreshTools implementation — access gate", () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain("not found");
     expect(toolsRepository.bulkUpsert).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The refresh asks for ACTIVE rows; what an allowlist namespace actually gets
+ * is decided in the repository (new rows INACTIVE, existing statuses kept,
+ * proven against real Postgres in namespace-tool-policy.integration.test.ts).
+ * These pin the impl's half: it reports which rule the write followed, so the
+ * admin CLI's provisioning output says plainly that nothing was allowlisted.
+ */
+describe("namespaces.refreshTools implementation: tool policy", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(mcpServersRepository.findByName).mockResolvedValue({
+      uuid: "server-1",
+      name: "autotask",
+    } as never);
+    vi.mocked(mapOverrideNameToOriginal).mockImplementation(
+      async (name: string) => name,
+    );
+    vi.mocked(toolsRepository.bulkUpsert).mockResolvedValue([
+      { uuid: "tool-1" },
+    ] as never);
+    vi.mocked(metaMcpServerPool.invalidateIdleServer).mockResolvedValue(
+      undefined,
+    );
+    vi.mocked(metaMcpServerPool.invalidateOpenApiSessions).mockResolvedValue(
+      undefined,
+    );
+    vi.mocked(namespacesRepository.findByUuid).mockResolvedValue(
+      fakeNamespace({ user_id: null }),
+    );
+  });
+
+  it("says so when the write followed the allowlist rule", async () => {
+    vi.mocked(
+      namespaceMappingsRepository.bulkUpsertNamespaceToolMappings,
+    ).mockResolvedValue({
+      mappings: [{ tool_uuid: "tool-1" }],
+      toolPolicy: "allowlist",
+    } as never);
+
+    const result = await refresh("admin-1", true);
+
+    expect(result.success).toBe(true);
+    expect(result.mappingsCreated).toBe(1);
+    expect(result.message).toContain(
+      "allowlist namespace: new mappings were created INACTIVE",
+    );
+  });
+
+  it("keeps the original message for an allow_all namespace", async () => {
+    vi.mocked(
+      namespaceMappingsRepository.bulkUpsertNamespaceToolMappings,
+    ).mockResolvedValue({
+      mappings: [{ tool_uuid: "tool-1" }],
+      toolPolicy: "allow_all",
+    } as never);
+
+    const result = await refresh("admin-1", true);
+
+    expect(result.message).toBe(
+      "Successfully refreshed 1 tools with 1 mappings",
+    );
+  });
+
+  it("surfaces a mapping write failure instead of reporting success", async () => {
+    // The repository throws when the namespace row is gone by the time it
+    // takes its lock; the refresh must not claim it wrote anything.
+    vi.mocked(
+      namespaceMappingsRepository.bulkUpsertNamespaceToolMappings,
+    ).mockRejectedValue(new Error("Namespace x not found"));
+
+    const result = await refresh("admin-1", true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("not found");
   });
 });

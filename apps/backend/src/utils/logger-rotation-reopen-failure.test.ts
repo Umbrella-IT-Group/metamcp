@@ -11,7 +11,13 @@
  * so this mock never leaks there.
  */
 
-import { existsSync, mkdtempSync, readFileSync, statSync } from "fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -124,5 +130,35 @@ describe("Logger — rotation reopen-failure recovery", () => {
     expect(
       errSpy.mock.calls.some((c) => String(c[0]).includes("failed to open")),
     ).toBe(true);
+  });
+
+  it("loses a pre-existing <name>.1 generation when the reopen fails (documented in rotate())", async () => {
+    // The rename to <name>.1 replaces the previous generation before the
+    // reopen is tried, and the restore renames it back to <name>, so the
+    // older .1 does not survive a rotation that did not happen. Pinned so a
+    // change to that trade-off is deliberate (see the comment in rotate()).
+    writeFileSync(`${logPath}.1`, "PRIOR-GENERATION\n");
+    const logger = new Logger({
+      logFilePath: logPath,
+      errorFilePath: errorPath,
+      shouldConsoleLog: "none",
+      maxSizeBytes: 200,
+    });
+
+    openSyncControl.failNext = true;
+    logger.info("B".repeat(300));
+
+    await waitFor(() => {
+      if (!existsSync(logPath) || existsSync(`${logPath}.1`)) return false;
+      try {
+        return readFileSync(logPath, "utf8").includes("B".repeat(300));
+      } catch {
+        return false;
+      }
+    });
+    logger.close();
+
+    expect(existsSync(`${logPath}.1`)).toBe(false);
+    expect(readFileSync(logPath, "utf8")).not.toContain("PRIOR-GENERATION");
   });
 });

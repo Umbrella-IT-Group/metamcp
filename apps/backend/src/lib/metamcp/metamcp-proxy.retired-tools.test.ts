@@ -174,8 +174,6 @@ import {
 
 const warmSessions = new Map<string, ConnectedClient>();
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
 const REAL_TOOL = "ninja__list_things";
 const real: CallToolResult = {
   content: [{ type: "text", text: "a real answer" }],
@@ -668,6 +666,10 @@ describe("argument schemas through real SDK transports", () => {
 });
 
 describe("the audit rows for those outcomes", () => {
+  // Every case makes exactly one call, so it waits for that call's row rather
+  // than one timer tick: the row is written after the call settles, and on the
+  // timeout path that write lands later than a single tick under full-suite
+  // load (CI on #207 read zero rows once; a fixed flush passed locally 8 of 8).
   const rowsFor = async (
     run: (consumer: Client) => Promise<unknown>,
     target: Backend,
@@ -677,7 +679,7 @@ describe("the audit rows for those outcomes", () => {
     getSessionMock.mockResolvedValue(target.session);
     const consumer = await connectConsumer();
     await run(consumer).catch(() => undefined);
-    await flush();
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
     return recorder.mock.calls.map((callArgs) => callArgs[0]);
   };
 

@@ -106,6 +106,7 @@ const buildNamespacesRouter = () => {
     updateServerStatus: okImpl({ success: true }),
     updateToolStatus: okImpl({ success: true, message: "updated" }),
     updateToolOverrides: okImpl({ success: true, message: "updated" }),
+    setToolPolicy: okImpl({ success: true, message: "set" }),
     refreshTools: okImpl({ success: true, message: "refreshed" }),
   };
   return { router: createNamespacesRouter(impls), impls };

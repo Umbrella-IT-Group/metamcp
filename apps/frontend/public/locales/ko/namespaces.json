@@ -92,7 +92,18 @@
     "toggleTooFast": "토글이 너무 빠름",
     "toggleTooFastDescription": "세션이 제대로 초기화될 수 있도록 다시 토글하기 전에 잠시 기다려 주세요.",
     "forceReset": "강제 재설정",
-    "anErrorOccurredWhileDeleting": "Namespace를 삭제하는 중 오류가 발생했습니다"
+    "anErrorOccurredWhileDeleting": "Namespace를 삭제하는 중 오류가 발생했습니다",
+    "toolPolicy": "도구 정책",
+    "toolPolicyAllowAll": "모두 허용",
+    "toolPolicyAllowlist": "허용 목록",
+    "toolPolicyAllowAllHelp": "도구 관리에 행이 없는 도구도 제공됩니다. 나중에 서버에 추가된 도구도 포함됩니다.",
+    "toolPolicyAllowlistHelp": "도구 관리에서 활성화된 도구만 제공됩니다. 새 도구는 활성화될 때까지 숨겨집니다.",
+    "toolPolicySwitchLabel": "허용 목록 모드",
+    "toolPolicyConfirmTitle": "허용 목록 모드로 전환하시겠습니까?",
+    "toolPolicyConfirmDescription": "\"{{name}}\"에서 도구 관리에 활성화되지 않은 모든 도구가 즉시 목록과 호출에서 제외되며, 나중에 서버에 추가된 도구도 활성화될 때까지 숨겨집니다. 모두 허용으로 되돌리면 복원됩니다.",
+    "toolPolicyConfirm": "허용 목록으로 전환",
+    "toolPolicyUpdated": "도구 정책이 업데이트되었습니다",
+    "toolPolicyUpdateFailed": "도구 정책을 업데이트하지 못했습니다"
   },
   "enhancedToolsTable": {
     "toolName": "Tool 이름",
