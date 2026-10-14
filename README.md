@@ -342,6 +342,7 @@ Lazy recovery takes part in the ceiling under the rule "evict, never refuse" (ru
 |---|---|---|
 | `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `86400` (24h) | MCP OAuth access-token lifetime (was hardcoded 1h upstream). |
 | `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `31536000` (365d) | MCP OAuth refresh-token lifetime. Refresh tokens rotate on use. |
+| `OAUTH_REFRESH_CLIENT_AUTH` | `log` | Client authentication on the refresh_token grant for a confidential client (`client_secret_post` or `client_secret_basic`; public `none` clients are never affected). `log` checks the secret the way the authorization_code grant does, records the outcome (`verified`, `missing` or `invalid`, never the value) as `client_auth=` on the `[oauth] token issued` line and in the `oauth.token.refresh` audit row, warns on anything but `verified`, and still issues. `enforce` refuses anything but `verified` with 401 `invalid_client` (RFC 6749 section 6) and leaves the refresh token unrotated. Any other value falls back to `log` with a warning; the value in effect is logged at boot. |
 | `BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS` | `2592000` (30d) | Better-auth session lifetime. |
 | `BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS` | `604800` (7d) | Better-auth session refresh age. |
 | `SESSION_LIFETIME` | unset (persistent) | Backend MCP session lifetime; unset = never expire. |
