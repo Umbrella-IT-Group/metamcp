@@ -205,6 +205,94 @@ async function issueTokenPair(
 }
 
 /**
+ * Client credentials carried in an `Authorization: Basic` header.
+ *
+ * RFC 6749 section 2.3.1: the client id and secret are each encoded with the
+ * application/x-www-form-urlencoded algorithm, then used as the Basic username
+ * and password. So the decoded header splits at its FIRST colon (RFC 7617: a
+ * user-id cannot contain one, a password can) and each half is form-decoded.
+ * Every id and secret this server issues is base64url, which that decoding
+ * leaves unchanged, so clients that skip the encoding step still verify.
+ *
+ * Returns `undefined` when there is no Basic header at all, and `null` when
+ * there is one that cannot be read (no colon, empty id, or a broken percent
+ * escape), so callers can tell "did not try" from "tried and failed".
+ */
+function parseBasicClientCredentials(
+  authorization: string | undefined,
+): { clientId: string; clientSecret: string } | null | undefined {
+  if (!authorization || !authorization.startsWith("Basic ")) {
+    return undefined;
+  }
+  const decoded = Buffer.from(authorization.substring(6), "base64").toString();
+  const colon = decoded.indexOf(":");
+  if (colon <= 0) {
+    return null;
+  }
+  const formDecode = (value: string) =>
+    decodeURIComponent(value.replace(/\+/g, " "));
+  try {
+    return {
+      clientId: formDecode(decoded.substring(0, colon)),
+      clientSecret: formDecode(decoded.substring(colon + 1)),
+    };
+  } catch {
+    // A malformed percent escape. Unreadable, not absent.
+    return null;
+  }
+}
+
+/**
+ * Work out which client a token request speaks for.
+ *
+ * The body's `client_id` is what this endpoint has always read, and when it is
+ * present it is still the answer, so a `none` or `client_secret_post` client
+ * (every production connector today) takes exactly the path it took before.
+ * A client registered for `client_secret_basic` may send its id ONLY in the
+ * Basic header (RFC 6749 section 2.3.1), so when the body has none, a readable
+ * Basic header supplies it (upstream metatool-ai/metamcp issue #342). Without
+ * this the authorization_code grant refused every such client, and the
+ * refresh_token grant skipped its client check for them.
+ *
+ * When the body and a readable Basic header BOTH name a client and the two
+ * differ, the request is refused with 401 invalid_client, whatever method the
+ * client registered. RFC 6749 section 2.3 says a client MUST NOT use more than
+ * one authentication method in a request, and a request carrying two
+ * different identities has no answer to "which client is this" that is not a
+ * guess: preferring the body would let the header be ignored while it names
+ * someone else, and preferring the header would let a body id be overridden.
+ * The same id in both places is one identity and passes. An unreadable Basic
+ * header is not treated as a conflict: it supplies no identity, so the body
+ * decides as it always has, and a `client_secret_basic` client is still
+ * refused by its own verification below.
+ */
+function resolveRequestClientId(req: express.Request) {
+  // Passed on untouched (not coerced to a string) when it decides the answer,
+  // so a body that worked before reaches the same comparisons with the same
+  // value.
+  const bodyClientId = req.body.client_id;
+  const basic = parseBasicClientCredentials(req.headers.authorization);
+  if (!basic) {
+    return { ok: true as const, clientId: bodyClientId };
+  }
+  if (!bodyClientId) {
+    return { ok: true as const, clientId: basic.clientId };
+  }
+  if (bodyClientId !== basic.clientId) {
+    return { ok: false as const };
+  }
+  return { ok: true as const, clientId: bodyClientId };
+}
+
+function refuseConflictingClientIds(res: express.Response) {
+  return res.status(401).json({
+    error: "invalid_client",
+    error_description:
+      "client_id in the request body does not match the Authorization header",
+  });
+}
+
+/**
  * OAuth 2.0 Token Endpoint
  * Handles token exchange requests from MCP clients
  * Supports authorization_code and refresh_token grant types
@@ -257,7 +345,15 @@ async function handleAuthorizationCodeGrant(
   req: express.Request,
   res: express.Response,
 ) {
-  const { code, redirect_uri, client_id, code_verifier } = req.body;
+  const { code, redirect_uri, code_verifier } = req.body;
+
+  // Resolved before anything is read, so a request naming two different
+  // clients is refused without touching the code (see resolveRequestClientId).
+  const resolvedClient = resolveRequestClientId(req);
+  if (!resolvedClient.ok) {
+    return refuseConflictingClientIds(res);
+  }
+  const client_id = resolvedClient.clientId;
 
   // Validate authorization code
   if (!code) {
@@ -332,28 +428,25 @@ async function handleAuthorizationCodeGrant(
 
   // Validate client authentication based on registered auth method
   if (clientData.token_endpoint_auth_method === "client_secret_basic") {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Basic ")) {
+    // The same parser resolveRequestClientId used, so the id that picked this
+    // client and the credentials verified here can never be read differently.
+    const credentials = parseBasicClientCredentials(req.headers.authorization);
+    if (credentials === undefined) {
       return res.status(401).json({
         error: "invalid_client",
         error_description: "Client authentication required via Basic auth",
       });
     }
 
-    const credentials = Buffer.from(
-      authHeader.substring(6),
-      "base64",
-    ).toString();
-    const [authClientId, authClientSecret] = credentials.split(":");
-
     // The client_id half is not a secret, so a plain compare is fine; the
     // secret half is verified against the salted hash at rest (migration 0036)
     // in constant time (verifyClientSecret -> timingSafeEqualSecret) so the
     // token endpoint is not a timing oracle for a confidential client's secret.
     if (
-      authClientId !== client_id ||
+      credentials === null ||
+      credentials.clientId !== client_id ||
       !verifyClientSecret(
-        authClientSecret,
+        credentials.clientSecret,
         clientData.client_secret,
         clientData.client_secret_salt,
       )
@@ -500,7 +593,17 @@ async function handleRefreshTokenGrant(
   req: express.Request,
   res: express.Response,
 ) {
-  const { refresh_token, client_id } = req.body;
+  const { refresh_token } = req.body;
+
+  // Before the token is read, so a request naming two different clients
+  // neither rotates nor revokes anything (see resolveRequestClientId). A
+  // `client_secret_basic` client's id now comes from its header, which is what
+  // makes the client check below apply to it instead of being skipped.
+  const resolvedClient = resolveRequestClientId(req);
+  if (!resolvedClient.ok) {
+    return refuseConflictingClientIds(res);
+  }
+  const client_id = resolvedClient.clientId;
 
   if (!refresh_token) {
     return res.status(400).json({
