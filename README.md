@@ -95,7 +95,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 ### Access control
 
-- **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry.
+- **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry. Administrators are named by configuration; see [Administrators](#administrators).
 - **Endpoint access groups** — named groups that decide which OAuth users may reach which endpoints, so publishing one connector per business system no longer means publishing all of them to everyone who can log in. See [Access groups](#access-groups).
 
 ### Observability
@@ -283,7 +283,24 @@ Bootstrap is exempt from its own lock, and it has to be. It creates the configur
 
 One limit worth knowing: these controls are only asserted when bootstrap runs at all. A `BOOTSTRAP_ENABLE=false` deploy writes no row, which upstream's readers treat as open, so such a deploy keeps upstream's behaviour and has to close registration by hand in the admin UI.
 
-Admin identity is a deployment concern, not a committed one. Provision the account through `BOOTSTRAP_USERS` and let the deployment name its own administrator through configuration at boot (the private platform overlay supplies the address via `METAMCP_ADMIN_EMAIL`) rather than a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
+### Administrators
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `METAMCP_ADMIN_EMAIL` | unset | Comma-separated email addresses of existing accounts to promote to `admin` on every boot. Matched case-insensitively. |
+
+Accounts get the `member` role by default, and only an administrator can change admin-gated settings or curate servers, namespaces, endpoints and API keys. There is no UI path to grant the role, so the deployment names its administrators here and every boot converges the database toward that list. It runs after migrations and environment bootstrap, so an account `BOOTSTRAP_USERS` creates is promoted on the same boot, and before the server starts listening. It is independent of `BOOTSTRAP_ENABLE`.
+
+- **Named accounts only.** Nothing is ever promoted by position (no "first user" or "only user" rule).
+- **Never demotes.** Removing an address from the list leaves that account an administrator; demote it deliberately in the database.
+- **Never creates accounts.** An address with no account logs a warning and is promoted on the first boot after the account exists.
+- **Ambiguous addresses are skipped.** If one address matches two accounts that differ only in letter case, neither is promoted and a warning says so.
+- **Audited.** Each promotion writes a `user.role.set` row to `audit_log` (`actor_type` `system`, `detail.source` `admin_email_env`). A restart that changes nothing writes nothing.
+- **Unset is a no-op.** With the variable unset or empty, nothing is written; the boot log records how many administrators exist.
+
+If no administrator exists after the pass, the boot log carries a `NO ADMINISTRATOR` warning naming this variable and the SQL fallback: `UPDATE users SET role = 'admin' WHERE email = '<address>';`. **Upgrading an existing install past migration `0020`** turns every existing account into a `member`, so set `METAMCP_ADMIN_EMAIL` to your own address before (or right after) the upgrade and restart.
+
+Admin identity is a deployment concern, not a committed one: name it through `METAMCP_ADMIN_EMAIL`, not a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
 
 ### Sign-in rate limiting
 

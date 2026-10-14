@@ -2,10 +2,10 @@
  * Committed migrations must not name email-address identities.
  *
  * Admin identity is a deployment concern, not a committed one: a deployment
- * names its own operator through configuration at boot (the platform overlay
- * supplies it via METAMCP_ADMIN_EMAIL; a self-hosted deploy provisions the
- * account with BOOTSTRAP_USERS and grants the role in its own seed), rather
- * than inheriting one baked into this public repository. Two early migrations
+ * names its own administrators through METAMCP_ADMIN_EMAIL, which the boot-time
+ * converge in `lib/admin-converge.ts` applies to existing accounts (provision
+ * the account itself with BOOTSTRAP_USERS), rather than inheriting one baked
+ * into this public repository. Two early migrations
  * predate that policy and promote a specific address by literal in the SQL.
  * They are grandfathered here, not by choice but by fact: they have already
  * run in production and this repository's history is public, so rewriting them
@@ -69,8 +69,8 @@ describe("committed migrations name no email-address identities", () => {
         offenders.push(`${name}: ${[...new Set(matches)].join(", ")}`);
       }
     }
-    // Drive admin promotion through the bootstrap path (METAMCP_ADMIN_EMAIL /
-    // BOOTSTRAP_USERS) instead of a literal in committed SQL.
+    // Drive admin promotion through METAMCP_ADMIN_EMAIL (lib/admin-converge.ts)
+    // instead of a literal in committed SQL.
     expect(offenders).toEqual([]);
   });
 });
