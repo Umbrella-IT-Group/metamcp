@@ -58,6 +58,8 @@ export interface FakeToolMappingState {
   namespaces: FakeNamespaceRow[];
   /** Make every query against these tables reject, as a database error. */
   failOn?: Partial<Record<FakeQuery["table"], boolean>>;
+  /** Delay delivery after a query took its snapshot, for invalidation races. */
+  beforeQueryResult?: (query: FakeQuery) => Promise<void>;
 }
 
 /** One query the stand-in answered: its base table and its `eq` filters. */
@@ -183,7 +185,7 @@ export function createToolMappingDb(
           if (state.failOn?.[table]) {
             throw new Error(`fake db: ${table} query failed`);
           }
-          return rowsFor(state, table)
+          const result = rowsFor(state, table)
             .filter((row) =>
               Object.entries(where).every(([column, value]) => {
                 if (!(column in row)) {
@@ -200,6 +202,8 @@ export function createToolMappingDb(
                 ]),
               ),
             );
+          await state.beforeQueryResult?.({ table, where });
+          return result;
         },
       };
       return query;

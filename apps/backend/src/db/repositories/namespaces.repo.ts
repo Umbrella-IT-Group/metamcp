@@ -6,7 +6,7 @@ import {
   NamespaceToolPolicy,
   NamespaceUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notInArray, or } from "drizzle-orm";
 
 import { db } from "../index";
 import {
@@ -406,27 +406,39 @@ export class NamespacesRepository {
 
       // If mcpServerUuids are provided, update the mappings
       if (input.mcpServerUuids) {
-        // Get existing tool mappings to preserve their status
-        const existingToolMappings =
-          await namespaceMappingsRepository.findToolMappingsByNamespace(
-            input.uuid,
-          );
-        const existingToolStatusMap = new Map<string, "ACTIVE" | "INACTIVE">();
+        const allowAll = updatedNamespace.tool_policy === "allow_all";
+        // Preserve allow_all's existing re-save behavior. Under allowlist,
+        // keep retained tool rows instead: snapshotting then recreating them
+        // can restore ACTIVE after a concurrent administrator revokes a tool.
+        const existingToolMappings = allowAll
+          ? await namespaceMappingsRepository.findToolMappingsByNamespace(
+              input.uuid,
+            )
+          : [];
+        const existingToolStatusMap = new Map(
+          existingToolMappings.map((mapping) => [
+            mapping.tool_uuid,
+            mapping.status,
+          ]),
+        );
 
-        // Create a map of existing tool statuses by tool_uuid
-        existingToolMappings.forEach((mapping) => {
-          existingToolStatusMap.set(mapping.tool_uuid, mapping.status);
-        });
-
-        // Delete existing server mappings
         await tx
           .delete(namespaceServerMappingsTable)
           .where(eq(namespaceServerMappingsTable.namespace_uuid, input.uuid));
 
-        // Delete existing tool mappings
         await tx
           .delete(namespaceToolMappingsTable)
-          .where(eq(namespaceToolMappingsTable.namespace_uuid, input.uuid));
+          .where(
+            and(
+              eq(namespaceToolMappingsTable.namespace_uuid, input.uuid),
+              !allowAll && input.mcpServerUuids.length > 0
+                ? notInArray(
+                    namespaceToolMappingsTable.mcp_server_uuid,
+                    input.mcpServerUuids,
+                  )
+                : undefined,
+            ),
+          );
 
         // Create new server mappings if any servers are specified
         if (input.mcpServerUuids.length > 0) {
@@ -464,12 +476,22 @@ export class NamespacesRepository {
               namespace_uuid: input.uuid,
               tool_uuid: tool.uuid,
               mcp_server_uuid: tool.mcp_server_uuid,
-              // Preserve existing status if tool was previously mapped,
-              // otherwise the policy's default for a new row (above).
               status: existingToolStatusMap.get(tool.uuid) || newRowStatus,
             }));
 
-            await tx.insert(namespaceToolMappingsTable).values(toolMappings);
+            const insert = tx
+              .insert(namespaceToolMappingsTable)
+              .values(toolMappings);
+            if (allowAll) {
+              await insert;
+            } else {
+              await insert.onConflictDoNothing({
+                target: [
+                  namespaceToolMappingsTable.namespace_uuid,
+                  namespaceToolMappingsTable.tool_uuid,
+                ],
+              });
+            }
           }
         }
       }

@@ -132,6 +132,7 @@ beforeEach(() => {
   state.mounts = [];
   state.namespaces = [];
   state.failOn = undefined;
+  state.beforeQueryResult = undefined;
   queries.length = 0;
   clearFilterCache();
 });
@@ -246,6 +247,40 @@ describe("allowlist: no row means INACTIVE", () => {
     clearFilterCache(NS);
     expect((await callTool(TOOL_NAME, true)).handler).toHaveBeenCalledTimes(1);
   });
+
+  it.each([NS, undefined])(
+    "a policy read started before clearing %s cannot repopulate the cache",
+    async (namespaceToClear) => {
+      curate("allow_all");
+      let release!: () => void;
+      let started!: () => void;
+      const pendingRead = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const readStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      state.beforeQueryResult = async (query) => {
+        if (query.table === "namespaces") {
+          state.beforeQueryResult = undefined;
+          started();
+          await pendingRead;
+        }
+      };
+
+      const oldCall = callTool(TOOL_NAME, true);
+      await readStarted;
+      state.namespaces = [{ uuid: NS, toolPolicy: "allowlist" }];
+      clearFilterCache(namespaceToClear);
+      release();
+      await oldCall;
+
+      // The in-flight call read before the flip. Later calls and lists must
+      // use the committed policy instead of that call's delayed allow_all.
+      expect((await callTool(TOOL_NAME, true)).handler).not.toHaveBeenCalled();
+      expect(await listNames([TOOL_NAME], true)).toEqual([]);
+    },
+  );
 });
 
 describe("fail closed (operator decision 2026-09-02)", () => {

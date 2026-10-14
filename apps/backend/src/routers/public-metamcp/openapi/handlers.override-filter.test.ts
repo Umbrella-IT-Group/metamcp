@@ -98,9 +98,13 @@ vi.mock("../../../lib/metamcp/tool-call-warmup", () => ({
   acquireSessionWithBoundedWarmup: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { namespacesRepository } from "../../../db/repositories/namespaces.repo";
+import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
+import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
 import { setAuditRecorderForTesting } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import { clearFilterCache } from "../../../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import { clearOverrideCache } from "../../../lib/metamcp/metamcp-middleware/tool-overrides.functional";
+import { acquireSessionWithBoundedWarmup } from "../../../lib/metamcp/tool-call-warmup";
 import { createMiddlewareEnabledHandlers } from "./handlers";
 
 const NS = "ns-1";
@@ -153,6 +157,23 @@ beforeEach(() => {
   clearFilterCache();
   clearOverrideCache();
   queries.length = 0;
+  state.beforeQueryResult = undefined;
+  vi.mocked(getMcpServers).mockResolvedValue({
+    [SERVER.uuid]: { name: SERVER.name },
+  } as never);
+  vi.mocked(mcpServerPool.getSession).mockResolvedValue({
+    client: {
+      request: requestMock,
+      getServerCapabilities: () => ({ tools: {} }),
+      getServerVersion: () => ({ name: SERVER.name, version: "1.0.0" }),
+    },
+  } as never);
+  vi.mocked(namespacesRepository.findServersForNamespaceToolName)
+    .mockReset()
+    .mockResolvedValue([]);
+  vi.mocked(acquireSessionWithBoundedWarmup)
+    .mockReset()
+    .mockResolvedValue(undefined);
   requestMock.mockReset();
   requestMock.mockImplementation(
     async (request: { params: { name: string } }) => ({
@@ -169,6 +190,80 @@ afterEach(() => {
 });
 
 describe("OpenAPI bridge: an alias is judged as the tool it runs", () => {
+  it.each(["live", "reconnect"])(
+    "%s routing cannot pick a replacement the filter did not judge",
+    async (mode) => {
+      curate("allowlist");
+      // Mount replacement lands between the filter's snapshot and routing.
+      // Only the old UUID was judged ACTIVE, so the new UUID must wait for a
+      // fresh request even though it has the same name and a live connection.
+      const replacement = { uuid: "server-replacement", name: SERVER.name };
+      vi.mocked(getMcpServers).mockResolvedValue({
+        [replacement.uuid]: { name: replacement.name },
+      } as never);
+      if (mode === "reconnect") {
+        vi.mocked(mcpServerPool.getSession).mockResolvedValue(undefined);
+        vi.mocked(
+          namespacesRepository.findServersForNamespaceToolName,
+        ).mockResolvedValue([
+          { serverUuid: replacement.uuid, serverName: replacement.name },
+        ]);
+        vi.mocked(acquireSessionWithBoundedWarmup).mockResolvedValue({
+          client: {
+            request: requestMock,
+            getServerCapabilities: () => ({ tools: {} }),
+          },
+        } as never);
+      }
+
+      await expect(call("ninja__list_things")).rejects.toThrow("Unknown tool");
+      expect(ran()).toEqual([]);
+      expect(acquireSessionWithBoundedWarmup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not list an unreviewed tool under another server's allowed prefix", async () => {
+    curate("allowlist");
+    const nested = { uuid: "server-nested", name: "ninja__nested" };
+    state.servers = [SERVER, nested];
+    state.mounts.push({ namespaceUuid: NS, serverUuid: nested.uuid });
+    state.mappings = [
+      {
+        namespaceUuid: NS,
+        serverUuid: SERVER.uuid,
+        toolName: "nested__plain_read",
+        status: "ACTIVE",
+      },
+    ];
+    vi.mocked(getMcpServers).mockResolvedValue({
+      [SERVER.uuid]: { name: SERVER.name },
+      [nested.uuid]: { name: nested.name },
+    } as never);
+    vi.mocked(mcpServerPool.getSession).mockImplementation(
+      async (_sessionId, uuid) =>
+        ({
+          client: {
+            getServerCapabilities: () => ({ tools: {} }),
+            getServerVersion: () => ({ name: SERVER.name, version: "1.0.0" }),
+            request: async () => ({
+              tools:
+                uuid === nested.uuid
+                  ? [{ name: "plain_read", inputSchema: { type: "object" } }]
+                  : [],
+            }),
+          },
+        }) as never,
+    );
+
+    const { handlerContext, listToolsWithMiddleware } =
+      createMiddlewareEnabledHandlers("openapi_ns-1", NS, "test-consumer");
+    const { tools } = await listToolsWithMiddleware(
+      { method: "tools/list", params: {} },
+      handlerContext,
+    );
+    expect(tools).toEqual([]);
+  });
+
   it("allow_all: refuses an INACTIVE tool called by its alias", async () => {
     curate("allow_all");
 

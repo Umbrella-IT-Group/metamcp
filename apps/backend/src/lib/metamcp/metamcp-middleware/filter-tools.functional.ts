@@ -14,6 +14,7 @@ import { parseToolName } from "../tool-name-parser";
 import {
   CallToolMiddleware,
   ListToolsMiddleware,
+  MetaMCPHandlerContext,
 } from "./functional-middleware";
 import { findNamespaceServerUuidsByName } from "./namespace-server-lookup";
 
@@ -24,6 +25,11 @@ export interface FilterToolsConfig {
   cacheEnabled?: boolean;
   cacheTTL?: number; // milliseconds
   customErrorMessage?: (toolName: string, reason: string) => string;
+}
+
+/** The routing handler may use only the servers this call's filter judged. */
+export interface ToolFilterCallContext extends MetaMCPHandlerContext {
+  allowedToolServerUuids?: readonly string[];
 }
 
 /**
@@ -103,6 +109,7 @@ class ToolPolicyCache {
     { policy: NamespaceToolPolicy; expiresAt: number }
   >();
   private ttl: number;
+  private generation = 0;
 
   constructor(ttl: number = 1000) {
     this.ttl = ttl;
@@ -117,7 +124,18 @@ class ToolPolicyCache {
     return entry.policy;
   }
 
-  set(namespaceUuid: string, policy: NamespaceToolPolicy): void {
+  getGeneration(): number {
+    return this.generation;
+  }
+
+  set(
+    namespaceUuid: string,
+    policy: NamespaceToolPolicy,
+    generation: number,
+  ): void {
+    // A read started before a policy flip can finish after the setter cleared
+    // the cache. It must not re-cache allow_all and reopen later calls.
+    if (generation !== this.generation) return;
     this.cache.set(namespaceUuid, {
       policy,
       expiresAt: Date.now() + this.ttl,
@@ -125,6 +143,7 @@ class ToolPolicyCache {
   }
 
   clear(namespaceUuid?: string): void {
+    this.generation++;
     if (namespaceUuid) {
       this.cache.delete(namespaceUuid);
     } else {
@@ -159,6 +178,7 @@ async function getNamespaceToolPolicy(
     }
   }
 
+  const generation = toolPolicyCache.getGeneration();
   const [namespace] = await db
     .select({ toolPolicy: namespacesTable.tool_policy })
     .from(namespacesTable)
@@ -172,7 +192,7 @@ async function getNamespaceToolPolicy(
     namespace.toolPolicy === "allow_all" ? "allow_all" : "allowlist";
 
   if (useCache) {
-    toolPolicyCache.set(namespaceUuid, policy);
+    toolPolicyCache.set(namespaceUuid, policy, generation);
   }
 
   return policy;
@@ -383,7 +403,11 @@ async function isToolAllowed(
   toolName: string,
   namespaceUuid: string,
   useCache: boolean = true,
-): Promise<{ allowed: boolean; reason?: string }> {
+): Promise<{
+  allowed: boolean;
+  reason?: string;
+  serverUuids?: string[];
+}> {
   try {
     const policy = await getNamespaceToolPolicy(namespaceUuid, useCache);
 
@@ -402,16 +426,20 @@ async function isToolAllowed(
     // check entirely and let the call through. judgeParsedTool denies
     // instead, so the call side agrees with the list side and the
     // access-group gate on failure direction.
+    const serverUuids = await findNamespaceServerUuidsByName(
+      namespaceUuid,
+      parsed.serverName,
+    );
     const verdict = await judgeParsedTool(
       namespaceUuid,
-      await findNamespaceServerUuidsByName(namespaceUuid, parsed.serverName),
+      serverUuids,
       parsed.originalToolName,
       policy,
       useCache,
     );
 
     return verdict.served
-      ? { allowed: true }
+      ? { allowed: true, serverUuids }
       : { allowed: false, reason: verdict.reason };
   } catch (error) {
     logger.error(
@@ -486,7 +514,7 @@ export function createFilterCallToolMiddleware(
       // The server is resolved from the tool name's prefix among the servers
       // mounted in THIS namespace (namespace-server-lookup.ts), never by name
       // across the whole estate.
-      const { allowed, reason } = await isToolAllowed(
+      const { allowed, reason, serverUuids } = await isToolAllowed(
         toolName,
         context.namespaceUuid,
         useCache,
@@ -505,8 +533,14 @@ export function createFilterCallToolMiddleware(
         };
       }
 
-      // Tool is allowed, call the original handler
-      return handler(request, context);
+      // Bind the verdict to the server identities it checked. A pooled proxy
+      // can still hold a route for a server replaced by a same-named mount.
+      // Clone the instance context so concurrent calls cannot share verdicts.
+      const callContext: ToolFilterCallContext = {
+        ...context,
+        allowedToolServerUuids: serverUuids,
+      };
+      return handler(request, callContext);
     };
   };
 }

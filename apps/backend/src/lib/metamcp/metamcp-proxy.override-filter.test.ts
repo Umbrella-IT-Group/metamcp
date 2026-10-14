@@ -120,6 +120,7 @@ vi.mock("./tool-call-warmup", () => ({
   acquireSessionWithBoundedWarmup: warmupMock,
 }));
 
+import { getMcpServers } from "./fetch-metamcp";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { clearFilterCache } from "./metamcp-middleware/filter-tools.functional";
 import { clearOverrideCache } from "./metamcp-middleware/tool-overrides.functional";
@@ -183,20 +184,30 @@ const cleanups: Array<() => Promise<unknown>> = [];
 /** The backend's tools/call log: every name it was asked to run. */
 let ran: string[];
 
-async function backend(): Promise<ConnectedClient> {
+async function backend(
+  label?: string,
+  toolNames: string[] = BACKEND_TOOLS,
+): Promise<ConnectedClient> {
   const server = new Server(
     { name: "ninja", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: BACKEND_TOOLS.map((name) => ({
+    tools: toolNames.map((name) => ({
       name,
       inputSchema: { type: "object" as const },
     })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     ran.push(request.params.name);
-    return { content: [{ type: "text", text: `ran ${request.params.name}` }] };
+    return {
+      content: [
+        {
+          type: "text",
+          text: `ran ${request.params.name}${label ? ` on ${label}` : ""}`,
+        },
+      ],
+    };
   });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
@@ -254,6 +265,9 @@ beforeEach(async () => {
   setAuditRecorderForTesting(null);
   getSessionMock.mockReset();
   getSessionMock.mockResolvedValue(await backend());
+  vi.mocked(getMcpServers).mockResolvedValue({
+    [SERVER.uuid]: { name: SERVER.name },
+  } as never);
   findServersMock.mockReset();
   findServersMock.mockResolvedValue([]);
   warmupMock.mockReset();
@@ -366,6 +380,88 @@ describe("tools/list: unchanged", () => {
 
 describe("allowlist policy: only ACTIVE rows are served, by any name", () => {
   beforeEach(() => usePolicy("allowlist"));
+
+  it("does not list an unreviewed tool under another server's allowed name", async () => {
+    // API forms reject '__' in server names, but the database CHECK permits
+    // it. A stored name must not borrow the parent prefix's ACTIVE row.
+    const nested = { uuid: "server-nested", name: "ninja__nested" };
+    state.servers = [SERVER, nested];
+    state.mounts = [
+      { namespaceUuid: NS, serverUuid: SERVER.uuid },
+      { namespaceUuid: NS, serverUuid: nested.uuid },
+    ];
+    state.mappings = [
+      {
+        namespaceUuid: NS,
+        serverUuid: SERVER.uuid,
+        toolName: "nested__plain_read",
+        status: "ACTIVE",
+      },
+    ];
+    vi.mocked(getMcpServers).mockResolvedValue({
+      [SERVER.uuid]: { name: SERVER.name },
+      [nested.uuid]: { name: nested.name },
+    } as never);
+    const normalBackend = await backend("normal", []);
+    const nestedBackend = await backend("nested", ["plain_read"]);
+    getSessionMock.mockImplementation(async (_sessionId, uuid) =>
+      uuid === nested.uuid ? nestedBackend : normalBackend,
+    );
+
+    const consumer = await connectConsumer();
+    const { tools } = await consumer.request(
+      { method: "tools/list", params: {} },
+      ListToolsResultSchema,
+    );
+    expect(tools).toEqual([]);
+  });
+
+  it.each(["call", "list"])(
+    "a same-named replacement uses the current server on tools/%s",
+    async (operation) => {
+      const consumer = await connectConsumer();
+      await consumer.request(
+        { method: "tools/list", params: {} },
+        ListToolsResultSchema,
+      );
+
+      const replacement = { uuid: "server-replacement", name: SERVER.name };
+      state.servers = [SERVER, replacement];
+      state.mounts = [{ namespaceUuid: NS, serverUuid: replacement.uuid }];
+      state.mappings = CURATION.mappings.map((mapping) => ({
+        ...mapping,
+        serverUuid: replacement.uuid,
+      }));
+      clearFilterCache(NS);
+      clearOverrideCache(NS);
+      vi.mocked(getMcpServers).mockResolvedValue({
+        [replacement.uuid]: { name: replacement.name },
+      } as never);
+      getSessionMock.mockResolvedValue(await backend("replacement"));
+
+      if (operation === "call") {
+        const result = await call(consumer, "ninja__plain_read");
+        expect(textOf(result)).toBe("ran plain_read on replacement");
+        expect(ran).toEqual(["plain_read"]);
+      } else {
+        const { tools } = await consumer.request(
+          { method: "tools/list", params: {} },
+          ListToolsResultSchema,
+        );
+        expect(tools.map((tool) => tool.name).sort()).toEqual([
+          "ninja__plain_read",
+          "ninja__things",
+        ]);
+        expect(ran).toEqual([]);
+      }
+      expect(getSessionMock).toHaveBeenLastCalledWith(
+        "sess-1",
+        replacement.uuid,
+        expect.anything(),
+        NS,
+      );
+    },
+  );
 
   it("tools/list serves only ACTIVE rows, under their override names", async () => {
     const consumer = await connectConsumer();

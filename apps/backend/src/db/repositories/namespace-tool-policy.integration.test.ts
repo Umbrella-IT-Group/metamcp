@@ -258,10 +258,11 @@ async function endTransaction(client: {
   }
 }
 
-/** Wait until some backend is blocked waiting on another's row lock. */
-async function waitForRowLockWaiter() {
+/** Wait until a backend blocks on a row lock, or the observed write finishes. */
+async function waitForRowLockWaiter(completed?: () => boolean) {
   const deadline = Date.now() + 5_000;
   for (;;) {
+    if (completed?.()) return;
     const waiting = await db.execute(
       `SELECT count(*)::int AS n FROM pg_locks
         WHERE NOT granted AND locktype IN ('transactionid', 'tuple')` as never,
@@ -497,6 +498,152 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
         delete_repo: "INACTIVE",
         brand_new: "INACTIVE",
       });
+    });
+
+    it("waits for a concurrent policy flip before choosing the default for new rows", async () => {
+      const flipper = await pool.connect();
+      try {
+        await flipper.query("BEGIN");
+        await flipper.query(
+          `UPDATE namespaces SET tool_policy = 'allowlist' WHERE uuid = $1`,
+          [NS_A],
+        );
+
+        const save = resave();
+        await waitForRowLockWaiter();
+        await flipper.query("COMMIT");
+        expect((await save).tool_policy).toBe("allowlist");
+      } finally {
+        await endTransaction(flipper);
+      }
+
+      expect(await statuses(NS_A)).toEqual({
+        read: "ACTIVE",
+        delete_repo: "INACTIVE",
+        brand_new: "INACTIVE",
+      });
+    });
+
+    it("keeps a concurrent admin revocation instead of restoring the old ACTIVE status", async () => {
+      await setPolicyDirect(NS_A, "allowlist");
+      const revoker = await pool.connect();
+      try {
+        await revoker.query("BEGIN");
+        // The same UPDATE as updateToolStatus, left uncommitted so a re-save
+        // sees the old ACTIVE version if it snapshots and recreates rows.
+        await revoker.query(
+          `UPDATE namespace_tool_mappings SET status = 'INACTIVE'
+           WHERE namespace_uuid = $1 AND tool_uuid = $2`,
+          [NS_A, toolA("read")],
+        );
+
+        let saved = false;
+        const save = resave().then((result) => {
+          saved = true;
+          return result;
+        });
+        // A destructive re-save blocks deleting the row after reading ACTIVE.
+        // A re-save that retains the row may complete without waiting.
+        await waitForRowLockWaiter(() => saved);
+        await revoker.query("COMMIT");
+        await save;
+      } finally {
+        await endTransaction(revoker);
+      }
+
+      expect(await statuses(NS_A)).toEqual({
+        read: "INACTIVE",
+        delete_repo: "INACTIVE",
+        brand_new: "INACTIVE",
+      });
+    });
+
+    it("allowlist preserves retained tool overrides and mapping identities", async () => {
+      await setPolicyDirect(NS_A, "allowlist");
+      const before = await namespaceMappingsRepository.updateToolOverrides({
+        namespaceUuid: NS_A,
+        serverUuid: GITHUB_A,
+        toolUuid: toolA("read"),
+        overrideName: "read_only",
+        overrideTitle: "Read only",
+        overrideDescription: "Curated description",
+        overrideAnnotations: { readOnlyHint: true },
+      });
+
+      await resave();
+
+      expect(
+        await namespaceMappingsRepository.findToolMapping(
+          NS_A,
+          toolA("read"),
+          GITHUB_A,
+        ),
+      ).toEqual(before);
+    });
+
+    it.each(["allow_all", "allowlist"] as const)(
+      "%s keeps the existing server-status reset on re-save",
+      async (policy) => {
+        await setPolicyDirect(NS_A, policy);
+        await namespaceMappingsRepository.updateServerStatus({
+          namespaceUuid: NS_A,
+          serverUuid: GITHUB_A,
+          status: "INACTIVE",
+        });
+        await resave();
+        expect(
+          await namespaceMappingsRepository.findServerMapping(NS_A, GITHUB_A),
+        ).toMatchObject({ status: "ACTIVE" });
+      },
+    );
+
+    it("allow_all keeps the existing override reset on re-save", async () => {
+      await namespaceMappingsRepository.updateToolOverrides({
+        namespaceUuid: NS_A,
+        serverUuid: GITHUB_A,
+        toolUuid: toolA("read"),
+        overrideName: "read_only",
+      });
+      await resave();
+      expect(
+        await namespaceMappingsRepository.findToolMapping(
+          NS_A,
+          toolA("read"),
+          GITHUB_A,
+        ),
+      ).toMatchObject({ override_name: null, status: "ACTIVE" });
+    });
+
+    it("removes mappings for deselected servers and clears them for an empty list", async () => {
+      await setPolicyDirect(NS_A, "allowlist");
+      await namespacesRepository.update({
+        uuid: NS_A,
+        name: "policy-a",
+        user_id: USER_A,
+        mcpServerUuids: [GITHUB_A, GITHUB_B],
+      });
+      await resave();
+      expect(
+        await namespaceMappingsRepository.findServerMapping(NS_A, GITHUB_B),
+      ).toBeUndefined();
+      const retained =
+        await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A);
+      expect(retained.every((row) => row.mcp_server_uuid === GITHUB_A)).toBe(
+        true,
+      );
+
+      await namespacesRepository.update({
+        uuid: NS_A,
+        name: "policy-a",
+        user_id: USER_A,
+        mcpServerUuids: [],
+      });
+      expect(
+        await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A),
+      ).toEqual([]);
+      expect(
+        await namespaceMappingsRepository.findServerMapping(NS_A, GITHUB_A),
+      ).toBeUndefined();
     });
   });
 

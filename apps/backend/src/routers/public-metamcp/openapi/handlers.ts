@@ -19,6 +19,7 @@ import { createAuditingMiddleware } from "../../../lib/metamcp/metamcp-middlewar
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
+  type ToolFilterCallContext,
 } from "../../../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   CallToolHandler,
@@ -80,6 +81,16 @@ export const createOriginalListToolsHandler = (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+
+        // This prefix must round-trip through the first-'__' call parser,
+        // otherwise curation would judge a different server and backend name.
+        if (sanitizeName(serverName).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+          );
+          failedServers.push(serverName || mcpServerUuid);
+          return;
+        }
 
         // Get configurable timeout values to bypass MCP SDK default enforcement
         const resetTimeoutOnProgress =
@@ -193,12 +204,16 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
 
     const serverPrefix = name.substring(0, firstDoubleUnderscoreIndex);
     const originalToolName = name.substring(firstDoubleUnderscoreIndex + 2);
+    const { allowedToolServerUuids } = context as ToolFilterCallContext;
+    const isAllowedServer = (uuid: string): boolean =>
+      !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
     // Get server parameters and find the right session for this tool
     const serverParams = await getMcpServers(context.namespaceUuid);
     let targetSession = null;
 
     for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
+      if (!isAllowedServer(mcpServerUuid)) continue;
       const session = await mcpServerPool.getSession(
         context.sessionId,
         mcpServerUuid,
@@ -249,6 +264,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         );
       const match = candidates.find(
         (candidate) =>
+          isAllowedServer(candidate.serverUuid) &&
           sanitizeName(candidate.serverName || "") === serverPrefix,
       );
       const paramsForMatch = match ? serverParams[match.serverUuid] : undefined;
