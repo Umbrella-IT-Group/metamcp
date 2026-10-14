@@ -52,6 +52,54 @@ logger.info(
   `[oauth] token TTLs: access=${ACCESS_TOKEN_EXPIRY}s refresh=${REFRESH_TOKEN_EXPIRY}s`,
 );
 
+/**
+ * Client authentication on the refresh_token grant, for a confidential client
+ * (`client_secret_post` or `client_secret_basic`). RFC 6749 section 6 requires
+ * such a client to authenticate when it refreshes; this handler did not check,
+ * so possession of a confidential client's refresh token alone minted access
+ * tokens. Public (`none`) clients hold no secret and are never affected.
+ *
+ * - `log` (default): evaluate the presented credentials exactly as the
+ *   authorization_code grant does and RECORD the outcome (`verified`,
+ *   `missing`, `invalid`), never the value, then proceed as before. Whether the
+ *   production confidential client sends its secret on refresh is not known,
+ *   so this phase measures before anything is refused.
+ * - `enforce`: refuse anything but `verified` with 401 invalid_client, before
+ *   the token is rotated, so a refused request leaves the chain intact.
+ *
+ * Read per call, like resolveDcrAllowedHosts in ./utils, so a test can switch
+ * modes inside one file and the value in effect is the value in the env.
+ */
+export const OAUTH_REFRESH_CLIENT_AUTH_ENV = "OAUTH_REFRESH_CLIENT_AUTH";
+
+export type RefreshClientAuthMode = "log" | "enforce";
+
+export function resolveRefreshClientAuthMode(): RefreshClientAuthMode {
+  const raw = process.env[OAUTH_REFRESH_CLIENT_AUTH_ENV];
+  if (raw === undefined || raw.trim() === "") {
+    return "log";
+  }
+  const value = raw.trim().toLowerCase();
+  if (value === "log" || value === "enforce") {
+    return value;
+  }
+  // An unrecognised value falls back to `log`, not `enforce`: `log` is the
+  // behaviour every client already has, while guessing `enforce` from a typo
+  // could lock the confidential client out with nothing in the env saying so.
+  // The warning names the value so the operator can see the setting did not
+  // take.
+  logger.warn(
+    `[oauth] ${OAUTH_REFRESH_CLIENT_AUTH_ENV}=${JSON.stringify(raw.slice(0, 40))} is not "log" or "enforce"; using log`,
+  );
+  return "log";
+}
+
+// The effective value at boot, so an operator can confirm the setting was read
+// (not only set) from the startup log.
+logger.info(
+  `[oauth] refresh grant client auth: ${OAUTH_REFRESH_CLIENT_AUTH_ENV}=${resolveRefreshClientAuthMode()}`,
+);
+
 // Umbrella fork: success-path grant observability. Until now the token endpoint
 // logged only FAILURES, so nothing in `app.log` distinguished "the connector
 // refreshed on schedule" from "the connector never refreshed and silently died
@@ -74,12 +122,12 @@ function lastFour(secret: string): string {
 /**
  * Emit one line per successfully issued access token.
  *
- * `clientName` is passed only on the authorization_code path, where the client
- * row is already loaded for auth-method validation. The refresh path never
- * fetches it: a name lookup there would add a DB round-trip to a hot path purely
- * for logging, and it is not needed — every refresh chain begins with an
- * authorization_code grant, so the id-to-name mapping is already in the same log
- * file.
+ * `clientName` is passed only on the authorization_code path. The refresh path
+ * also loads the client row now (for confidential-client authentication, see
+ * OAUTH_REFRESH_CLIENT_AUTH_ENV) but still leaves the name out: it is not
+ * needed, since every refresh chain begins with an authorization_code grant
+ * and the id-to-name mapping is already in the same log file, and adding it
+ * would change every existing refresh line that operators grep.
  */
 function logTokenIssued(fields: {
   grantType: "authorization_code" | "refresh_token";
@@ -92,6 +140,10 @@ function logTokenIssued(fields: {
   // because there was no prior refresh token to rotate, and `rotated=false`
   // there would read as "rotation is off".
   rotatedRefreshToken?: true;
+  // Set only on the refresh path and only for a confidential client (see
+  // OAUTH_REFRESH_CLIENT_AUTH_ENV). Omitted for a public client, whose line
+  // stays byte-identical to what it was before the field existed.
+  clientAuth?: ClientAuthOutcome;
 }) {
   const parts = [
     "[oauth] token issued",
@@ -113,6 +165,9 @@ function logTokenIssued(fields: {
   parts.push(`token=...${lastFour(fields.accessToken)}`);
   if (fields.rotatedRefreshToken) {
     parts.push("rotated=true");
+  }
+  if (fields.clientAuth) {
+    parts.push(`client_auth=${fields.clientAuth}`);
   }
 
   logger.info(parts.join(" "));
@@ -140,6 +195,8 @@ function emitTokenIssued(
     clientName?: string | null;
     userId: string;
     accessToken: string;
+    // Refresh path, confidential client only; see logTokenIssued.
+    clientAuth?: ClientAuthOutcome;
   },
 ): void {
   const audit = auditRequestContext(req);
@@ -163,6 +220,9 @@ function emitTokenIssued(
       client_name: fields.clientName ? fields.clientName.slice(0, 100) : null,
       access_token_sha256: fingerprint.sha256,
       access_token_last4: fingerprint.last4,
+      // The outcome word only. Absent for a public client, so its row keeps
+      // the shape it had before this key existed.
+      ...(fields.clientAuth ? { client_auth: fields.clientAuth } : {}),
     },
   });
 }
@@ -292,6 +352,83 @@ function refuseConflictingClientIds(res: express.Response) {
     error_description:
       "client_id in the request body does not match the Authorization header",
   });
+}
+
+/**
+ * What a confidential client's presented credentials amounted to. A word, never
+ * the value: this is what the refresh grant logs and audits.
+ */
+type ClientAuthOutcome = "verified" | "missing" | "invalid";
+
+/**
+ * Evaluate the client credentials a token request carries against the client's
+ * registered `token_endpoint_auth_method`. The ONE implementation both grants
+ * use, so the refresh grant judges a confidential client exactly as the
+ * authorization_code grant always has, and the two cannot drift apart.
+ *
+ * Returns `null` for any method other than `client_secret_basic` and
+ * `client_secret_post` (in practice `none`): such a client holds no secret,
+ * so there is nothing to evaluate and it proceeds as before. Otherwise the
+ * outcome, plus the 401 description the authorization_code grant has always
+ * answered with for it (kept byte-identical).
+ *
+ * `missing` is "no credential for the registered method was sent"; `invalid`
+ * is "one was sent and it did not verify", which includes an unreadable Basic
+ * header and a Basic header naming a different client. The secret half is
+ * verified against the salted hash at rest (migration 0036) in constant time
+ * (verifyClientSecret -> timingSafeEqualSecret), so the token endpoint is not a
+ * timing oracle for a confidential client's secret.
+ */
+function evaluateClientCredentials(
+  req: express.Request,
+  client: {
+    client_id: string;
+    token_endpoint_auth_method: string;
+    client_secret: string | null;
+    client_secret_salt?: string | null;
+  },
+): { outcome: ClientAuthOutcome; refusal: string } | null {
+  if (client.token_endpoint_auth_method === "client_secret_basic") {
+    // The same parser resolveRequestClientId used, so the id that picked this
+    // client and the credentials verified here can never be read differently.
+    const credentials = parseBasicClientCredentials(req.headers.authorization);
+    if (credentials === undefined) {
+      return {
+        outcome: "missing",
+        refusal: "Client authentication required via Basic auth",
+      };
+    }
+    // The client_id half is not a secret, so a plain compare is fine.
+    if (
+      credentials === null ||
+      credentials.clientId !== client.client_id ||
+      !verifyClientSecret(
+        credentials.clientSecret,
+        client.client_secret,
+        client.client_secret_salt,
+      )
+    ) {
+      return { outcome: "invalid", refusal: "Invalid client credentials" };
+    }
+    return { outcome: "verified", refusal: "" };
+  }
+  if (client.token_endpoint_auth_method === "client_secret_post") {
+    const { client_secret } = req.body;
+    if (!client_secret) {
+      return { outcome: "missing", refusal: "Invalid client secret" };
+    }
+    if (
+      !verifyClientSecret(
+        client_secret,
+        client.client_secret,
+        client.client_secret_salt,
+      )
+    ) {
+      return { outcome: "invalid", refusal: "Invalid client secret" };
+    }
+    return { outcome: "verified", refusal: "" };
+  }
+  return null;
 }
 
 /**
@@ -428,53 +565,17 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Validate client authentication based on registered auth method
-  if (clientData.token_endpoint_auth_method === "client_secret_basic") {
-    // The same parser resolveRequestClientId used, so the id that picked this
-    // client and the credentials verified here can never be read differently.
-    const credentials = parseBasicClientCredentials(req.headers.authorization);
-    if (credentials === undefined) {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Client authentication required via Basic auth",
-      });
-    }
-
-    // The client_id half is not a secret, so a plain compare is fine; the
-    // secret half is verified against the salted hash at rest (migration 0036)
-    // in constant time (verifyClientSecret -> timingSafeEqualSecret) so the
-    // token endpoint is not a timing oracle for a confidential client's secret.
-    if (
-      credentials === null ||
-      credentials.clientId !== client_id ||
-      !verifyClientSecret(
-        credentials.clientSecret,
-        clientData.client_secret,
-        clientData.client_secret_salt,
-      )
-    ) {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Invalid client credentials",
-      });
-    }
-  } else if (clientData.token_endpoint_auth_method === "client_secret_post") {
-    const { client_secret } = req.body;
-    if (
-      !client_secret ||
-      !verifyClientSecret(
-        client_secret,
-        clientData.client_secret,
-        clientData.client_secret_salt,
-      )
-    ) {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Invalid client secret",
-      });
-    }
+  // Validate client authentication based on registered auth method. The row was
+  // loaded by `client_id`, which already matched the code's client above, so
+  // the Basic header's id is compared against the same value it always was.
+  // For the "none" auth method there is nothing to evaluate (null).
+  const clientAuth = evaluateClientCredentials(req, clientData);
+  if (clientAuth && clientAuth.outcome !== "verified") {
+    return res.status(401).json({
+      error: "invalid_client",
+      error_description: clientAuth.refusal,
+    });
   }
-  // For "none" auth method, no additional validation needed
 
   // OAuth 2.1 Security: PKCE is mandatory for all clients
   if (!codeData.code_challenge) {
@@ -719,6 +820,70 @@ async function handleRefreshTokenGrant(
     });
   }
 
+  // Confidential-client authentication (RFC 6749 section 6), per
+  // OAUTH_REFRESH_CLIENT_AUTH_ENV. The client is the one the token was ISSUED
+  // to, not whatever the request names: a request that named a different
+  // client was refused just above, and one that named none is still the
+  // token's client, so this is the row whose secret must be shown.
+  //
+  // Before the disabled check and the rotation below, for the reason the
+  // disabled check gives: a refusal here must leave the token row intact, so a
+  // misconfigured client that is fixed can still refresh.
+  const clientAuthMode = resolveRefreshClientAuthMode();
+  const clientData = await oauthRepository.getClient(tokenData.client_id);
+  if (!clientData) {
+    // Unreachable except in a race: access tokens reference oauth_clients with
+    // ON DELETE CASCADE, so a token cannot outlive its client row. Without a
+    // row there is no method to judge by. `enforce` refuses (fail closed);
+    // `log` proceeds as before, where the mint below fails on that same
+    // foreign key.
+    logger.warn(
+      `[oauth] refresh client auth outcome=client_not_found mode=${clientAuthMode} client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
+    if (clientAuthMode === "enforce") {
+      return res.status(401).json({
+        error: "invalid_client",
+        error_description: "Client not found or not registered",
+      });
+    }
+  }
+  // A JSON body can put an object or array in client_secret. Hashing coerces
+  // it to a string, which can throw (an object with a non-callable toString)
+  // or authenticate an array containing the secret. Refresh must classify
+  // malformed credentials without breaking log mode's existing response;
+  // keep the authorization-code grant's existing evaluation unchanged.
+  const clientAuth: ReturnType<typeof evaluateClientCredentials> =
+    clientData?.token_endpoint_auth_method === "client_secret_post" &&
+    req.body.client_secret &&
+    typeof req.body.client_secret !== "string"
+      ? { outcome: "invalid", refusal: "Invalid client secret" }
+      : clientData
+        ? evaluateClientCredentials(req, clientData)
+        : null;
+  if (clientAuth && clientAuth.outcome !== "verified") {
+    if (clientAuthMode === "enforce") {
+      // Not audited, by the doctrine on emitTokenLifecycle: the refusal
+      // destroys nothing, so it is not self-limiting and a replay would write
+      // a row per attempt. The log line is the record, matching the disabled
+      // refusal below.
+      logger.warn(
+        `[oauth] token rejected reason=client_auth_${clientAuth.outcome} grant=refresh_token ` +
+          `method=${clientData?.token_endpoint_auth_method} client=${tokenData.client_id} user=${tokenData.user_id}`,
+      );
+      return res.status(401).json({
+        error: "invalid_client",
+        error_description: clientAuth.refusal,
+      });
+    }
+    // `log`: record and proceed. The issued line and the audit row below carry
+    // the same outcome; this WARN is what makes an unauthenticated refresh
+    // stand out before enforcement is switched on.
+    logger.warn(
+      `[oauth] refresh client auth outcome=${clientAuth.outcome} mode=log ` +
+        `method=${clientData?.token_endpoint_auth_method} client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
+  }
+
   // `users.disabled` enforcement (migration 0027) — the plane the 2026-08-13
   // attacker actually held. Refresh tokens live 365 days in this fork and the
   // authorize handler is nowhere on this path, so without this check a
@@ -789,6 +954,7 @@ async function handleRefreshTokenGrant(
     userId: tokenData.user_id,
     accessToken,
     rotatedRefreshToken: true,
+    clientAuth: clientAuth?.outcome,
   });
 
   emitTokenIssued(req, {
@@ -797,6 +963,7 @@ async function handleRefreshTokenGrant(
     clientId: tokenData.client_id,
     userId: tokenData.user_id,
     accessToken,
+    clientAuth: clientAuth?.outcome,
   });
 
   res.json({
@@ -886,8 +1053,10 @@ function isoOrNull(value: Date | null | undefined): string | null {
  *    row's `access_token_sha256` joins this row to the `oauth.token.issue` row
  *    that minted it.
  *  - Every OTHER refusal on the grant half of /oauth/token — missing or
- *    mismatched client, bad client secret, PKCE failure, unknown code, unknown
- *    refresh token, disabled account: still NOTHING here. None of them
+ *    mismatched client, bad client secret (on either grant, including the
+ *    refresh grant's `OAUTH_REFRESH_CLIENT_AUTH=enforce` refusal), PKCE
+ *    failure, unknown code, unknown refresh token, disabled account: still
+ *    NOTHING here. None of them
  *    destroys a row, so none is self-limiting; an invented code or refresh
  *    token can be replayed forever. The two disabled-account refusals also
  *    leave the row deliberately intact, because disable must stay reversible,

@@ -1,4 +1,5 @@
 import {
+  ErrorCode,
   ListToolsResultSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -30,6 +31,33 @@ const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
 // sweepToolDefinitions's `finally`, so every future tick would be skipped
 // by the in-flight guard forever.
 const TOOLS_SWEEP_MAX_PAGES = 50;
+
+/**
+ * Whether a rejected health-check ping was in fact ANSWERED by the backend
+ * with JSON-RPC -32601 "Method not found" (upstream metatool-ai/metamcp #337).
+ *
+ * `ping` is optional in the MCP spec ("The Model Context Protocol includes an
+ * optional ping mechanism", basic/utilities/ping), so a healthy backend may
+ * not implement it. Its error reply is still a reply over a working
+ * connection, so it proves the connection alive; the spec's failure signal is
+ * silence ("Timeouts SHOULD be treated as connection failures"). Without this,
+ * both health checks treat such a backend as dead on every sweep: the idle
+ * check recreates its idle connection every 60 s forever, and the active
+ * check cascade-invalidates every pooled connection every second sweep.
+ *
+ * Deliberately narrow: only the numeric code the SDK sets on the McpError it
+ * builds from an error RESPONSE. A timeout (-32001), a closed connection
+ * (-32000) or a transport throw carries a different code or none and still
+ * counts as dead. No message match, so a message that merely mentions "ping"
+ * or "not found" cannot pass for an answer.
+ */
+export function isPingAnsweredError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === ErrorCode.MethodNotFound
+  );
+}
 
 // How long shutdown waits for connects already in flight. A connect has no
 // cancellation hook and can stay pending indefinitely: an SSE backend that
@@ -324,8 +352,19 @@ export class McpServerPool {
    * bypasses getInstance() entirely and would have missed this bug too).
    * Callers must cleanupAll() the outgoing instance themselves first — this
    * only clears the reference, it doesn't tear down timers/sessions.
+   *
+   * Refuses outside a test run (vitest sets NODE_ENV to "test" when it is
+   * unset). Called in a running gateway it would orphan the live pool, its
+   * timers and every connection it holds behind a fresh, empty one, so a
+   * stray call fails loudly instead. Production leaves NODE_ENV unset or sets
+   * "production", and both refuse.
    */
   static resetInstanceForTests(): void {
+    if (process.env.NODE_ENV !== "test") {
+      throw new Error(
+        `McpServerPool.resetInstanceForTests() is test-only (NODE_ENV=${process.env.NODE_ENV ?? "unset"})`,
+      );
+    }
     McpServerPool.instance = null;
   }
 
@@ -1945,7 +1984,9 @@ export class McpServerPool {
       try {
         // Ping with a 5-second timeout
         await client.client.ping({ timeout: 5000 });
-      } catch {
+      } catch (error) {
+        // A backend without `ping` answered: alive (see isPingAnsweredError).
+        if (isPingAnsweredError(error)) continue;
         // The ping can finish after getSession promoted this client to active
         // and filled idle with a replacement. Only retire the slot we pinged;
         // active clients have their own two-strike health policy below.
@@ -2050,7 +2091,10 @@ export class McpServerPool {
       const results = await Promise.allSettled(
         clients.map((c) => c.client.ping({ timeout: 5000 })),
       );
-      const deadCount = results.filter((r) => r.status === "rejected").length;
+      // An answered -32601 is a live connection (see isPingAnsweredError).
+      const deadCount = results.filter(
+        (r) => r.status === "rejected" && !isPingAnsweredError(r.reason),
+      ).length;
 
       if (deadCount === 0) {
         delete this.activePingFailures[serverUuid];

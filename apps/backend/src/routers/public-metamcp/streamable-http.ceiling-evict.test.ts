@@ -25,6 +25,7 @@
 import type { Server as HttpServer } from "node:http";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { PingRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import {
@@ -2025,5 +2026,140 @@ describe("lazy recovery at the ceiling: evict, never refuse (Alex's rulings, 202
     expect(countLiveSessionsForIdentity(identity())).toBe(1);
     expect(evictionLines()).toHaveLength(1);
     expect(recoveryOverCeilingLines()).toEqual([]);
+  });
+});
+
+describe("initialize failure cleanup preserves live and replacement sessions (METAMCP-SETUP-ERROR-LEAKS)", () => {
+  // The POST route's error path released a failed initialize only when the
+  // ceiling had reserved a slot for it (`releaseAdmission`). That reservation
+  // exists only with the ceiling and its eviction on, so with the ceiling off,
+  // or with the eviction kill switch off, a throw during connect or dispatch
+  // left the registration, the pooled instance and the `mcp_sessions` row.
+  // Each case retries and makes a second request on the retried session, so
+  // the route is shown to work after the failure, not only to clean up.
+
+  async function retryAndPing(): Promise<void> {
+    const retried = await openSession();
+    const pinged = await ping(retried);
+    expect(pinged.status).toBe(200);
+    await pinged.text();
+    expect(isResident(retried)).toBe(true);
+  }
+
+  describe.each([
+    ["the ceiling is off", { MCP_MAX_SESSIONS_PER_CREDENTIAL: "0" }],
+    ["the ceiling is active", { MCP_MAX_SESSIONS_PER_CREDENTIAL: "5" }],
+    [
+      "the eviction kill switch is off",
+      {
+        MCP_MAX_SESSIONS_PER_CREDENTIAL: "5",
+        MCP_SESSION_CEILING_EVICT_IDLE: "false",
+      },
+    ],
+  ])("when %s", (_label, env) => {
+    beforeEach(() => {
+      Object.assign(process.env, env);
+    });
+
+    it("a failed connect releases the registration and the pooled instance", async () => {
+      const instance = makeServerInstance();
+      vi.spyOn(instance.server, "connect").mockRejectedValueOnce(
+        new Error("connect failed"),
+      );
+      h.getServer.mockResolvedValueOnce(instance);
+
+      const failed = await initialize();
+      expect(failed.status).toBe(500);
+      await failed.text();
+
+      const failedId = String(h.getServer.mock.calls[0][0]);
+      expect(h.cleanupSession).toHaveBeenCalledTimes(1);
+      expect(h.cleanupSession).toHaveBeenCalledWith(failedId);
+      expect(isResident(failedId)).toBe(false);
+      expect(publicSessionSweeper.getActivity(failedId)).toBeUndefined();
+      expect(h.persist).not.toHaveBeenCalled();
+      await retryAndPing();
+    });
+
+    it("a failed dispatch releases the session and deletes the row it wrote", async () => {
+      vi.spyOn(
+        StreamableHTTPServerTransport.prototype,
+        "handleRequest",
+      ).mockRejectedValueOnce(new Error("dispatch failed"));
+
+      const failed = await initialize();
+      expect(failed.status).toBe(500);
+      await failed.text();
+
+      const failedId = String(h.getServer.mock.calls[0][0]);
+      expect(h.persist).toHaveBeenCalledTimes(1);
+      expect(h.cleanupSession).toHaveBeenCalledWith(failedId);
+      expect(isResident(failedId)).toBe(false);
+      await vi.waitFor(() => expect(h.rows.has(failedId)).toBe(false));
+      await retryAndPing();
+    });
+
+    it("keeps a session whose initialize was answered before dispatch throws", async () => {
+      const realHandleRequest =
+        StreamableHTTPServerTransport.prototype.handleRequest;
+      vi.spyOn(
+        StreamableHTTPServerTransport.prototype,
+        "handleRequest",
+      ).mockImplementationOnce(async function (
+        this: StreamableHTTPServerTransport,
+        ...args: Parameters<StreamableHTTPServerTransport["handleRequest"]>
+      ) {
+        await realHandleRequest.apply(this, args);
+        throw new Error("failed after answering initialize");
+      });
+
+      const opened = await initialize();
+      expect(opened.status).toBe(200);
+      await opened.text();
+      const sessionId = opened.headers.get("mcp-session-id") ?? "";
+      expect(sessionId).not.toBe("");
+      // Wait for the route's catch, which ran cleanup before logging its
+      // error, so checking immediately cannot miss a queued teardown.
+      await vi.waitFor(() => expect(h.logger.error).toHaveBeenCalled());
+
+      expect(isResident(sessionId)).toBe(true);
+      expect(h.cleanupSession).not.toHaveBeenCalled();
+      expect(h.rows.has(sessionId)).toBe(true);
+      const pinged = await ping(sessionId);
+      expect(pinged.status).toBe(200);
+      await pinged.text();
+    });
+
+    it("does not tear down a replacement recovery when the admission throws", async () => {
+      vi.spyOn(
+        StreamableHTTPServerTransport.prototype,
+        "handleRequest",
+      ).mockImplementationOnce(async () => {
+        const sessionId = String(h.getServer.mock.calls[0][0]);
+        // Replace the admission through the actual teardown and recovery
+        // paths while its dispatch is pending. The later catch owns only
+        // the original admission, even though both paths use the same id.
+        await reapIdleSession(sessionId);
+        const recovered = await recoverPersistedSession(
+          sessionId,
+          authReqFor("ep-1"),
+        );
+        expect(recovered.status).toBe("recovered");
+        throw new Error("admission failed after replacement");
+      });
+
+      const failed = await initialize();
+      expect(failed.status).toBe(500);
+      await failed.text();
+      const sessionId = String(h.getServer.mock.calls[0][0]);
+
+      expect(h.cleanupSession).toHaveBeenCalledTimes(1);
+      expect(isResident(sessionId)).toBe(true);
+      expect(h.rows.has(sessionId)).toBe(true);
+      const pinged = await ping(sessionId);
+      expect(pinged.status).toBe(200);
+      await pinged.text();
+      expect(h.getServer).toHaveBeenCalledTimes(2);
+    });
   });
 });

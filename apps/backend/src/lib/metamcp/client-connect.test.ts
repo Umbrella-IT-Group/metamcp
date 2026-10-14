@@ -157,6 +157,41 @@ describe("connectMetaMcpClient — M365 broker short-circuit", () => {
   });
 });
 
+describe("connectMetaMcpClient — every deterministic M365 broker code is one attempt", () => {
+  // The retry class is a Record over the whole code union (client.ts), so a
+  // new code cannot be added without deciding it. This pins the decision for
+  // the codes that exist: each identity rejection is one attempt.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    "credential_missing",
+    "credential_expired",
+    "credential_revoked",
+    "mfa_required",
+    "not_configured",
+  ] as const)("%s is not retried", async (code) => {
+    vi.spyOn(metamcpLogStore, "record").mockImplementation(() => {});
+    const client = makeFakeClient(async () => {
+      throw new M365BrokerError(code, `broker refused: ${code}`, ENROLL);
+    });
+    const createClient = vi.fn(() => ({
+      client,
+      transport: makeFakeTransport(),
+    }));
+
+    await runWithM365UserContext({ userId: "ray" }, async () => {
+      await connectMetaMcpClient(params, undefined, undefined, {
+        createClient,
+      });
+      takeConnectBrokerFailure();
+    });
+
+    expect(client.connect).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("connectMetaMcpClient — M365 mint_failed is retried like a transient failure", () => {
   let recordSpy: ReturnType<typeof vi.spyOn>;
 

@@ -33,7 +33,8 @@ import { readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { join } from "node:path";
 
-import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { DatabaseEndpoint } from "@repo/zod-types";
 // Value import, not `import type`: the /health/sessions gate tests below mount
 // the REAL router on a real socket, which needs express itself. The default
@@ -42,6 +43,7 @@ import type { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -153,6 +155,7 @@ import {
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { hashAuthPrincipal } from "../../lib/metamcp/session-auth";
 import { __resetSessionDenialThrottleForTesting } from "../../lib/metamcp/session-binding-denial";
+import { hydrateRecoveredTransport } from "../../lib/metamcp/transport-recovery-hydration";
 import streamableHttpRouter, {
   buildSessionsHealthPayload,
   cleanupSession,
@@ -316,6 +319,270 @@ describe("recoverPersistedSession — succeeds against a row reapIdleSession lea
 
     const result = await recoverPersistedSession(sessionId, authReq);
     expect(result.status).toBe("auth_failed");
+  });
+});
+
+describe("recoverPersistedSession — a failed recovery releases the pool instance it acquired (METAMCP-RECOVERY-1 part 2)", () => {
+  // Both pools are keyed by session id. A recovery that acquired an instance
+  // under the id and then failed (connect threw, or the transport could not
+  // be hydrated) used to leave it allocated with no resident transport to
+  // release it, and the next recovery of the same id was handed the same,
+  // still-connected instance and failed again. The fake pool below keeps
+  // that keying so the second attempt shows the difference.
+
+  const rawToken = "recovery-release-api-key";
+
+  function storedRow(sessionId: string) {
+    return {
+      session_id: sessionId,
+      namespace_uuid: "ns-release",
+      endpoint_name: "ep-release",
+      auth_principal: hashAuthPrincipal(rawToken, "api_key"),
+      auth_method: "api_key",
+      init_params: {},
+      created_at: new Date(),
+      last_seen_at: new Date(),
+      gateway_boot_id: GATEWAY_BOOT_ID,
+      capability_hash: GATEWAY_CAPABILITY_HASH,
+    };
+  }
+
+  const authReq = () =>
+    fakeAuthReq({
+      namespaceUuid: "ns-release",
+      endpointName: "ep-release",
+      authMethod: "api_key",
+      apiKeyUuid: "key-release",
+      headers: { "x-api-key": rawToken },
+    });
+
+  type FakeInstance = {
+    server: {
+      connect: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    cleanup: ReturnType<typeof vi.fn>;
+    handlerContext: Record<string, unknown>;
+  };
+
+  function makeInstance(connect: ReturnType<typeof vi.fn>): FakeInstance {
+    return {
+      server: { connect, close: vi.fn().mockResolvedValue(undefined) },
+      cleanup: vi.fn().mockResolvedValue(undefined),
+      handlerContext: {},
+    };
+  }
+
+  // One instance per session id, as the real pool keeps it: getServer hands
+  // back the instance already held under the id, and cleanupSession drops it.
+  let pooled: Map<string, FakeInstance>;
+  let nextInstances: FakeInstance[];
+
+  beforeEach(() => {
+    pooled = new Map();
+    nextInstances = [];
+    (
+      metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+    ).mockImplementation(async (sessionId: string) => {
+      const held = pooled.get(sessionId);
+      if (held) return held;
+      const created = nextInstances.shift();
+      if (created) pooled.set(sessionId, created);
+      return created;
+    });
+    (
+      metaMcpServerPool.getServerInstance as ReturnType<typeof vi.fn>
+    ).mockImplementation((sessionId: string) => pooled.get(sessionId));
+    (
+      metaMcpServerPool.cleanupSession as ReturnType<typeof vi.fn>
+    ).mockImplementation(async (sessionId: string) => {
+      pooled.delete(sessionId);
+    });
+  });
+
+  afterEach(() => {
+    (metaMcpServerPool.getServer as ReturnType<typeof vi.fn>).mockReset();
+    (
+      metaMcpServerPool.getServerInstance as ReturnType<typeof vi.fn>
+    ).mockReset();
+  });
+
+  it("a connect that throws releases the instance, so the next recovery of the id succeeds", async () => {
+    const sessionId = "sess-release-connect";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    // A connect that failed part way stays bound to its transport, so every
+    // later connect of the same instance throws as well.
+    const broken = makeInstance(
+      vi.fn().mockRejectedValue(new Error("Already connected to a transport")),
+    );
+    const fresh = makeInstance(vi.fn().mockResolvedValue(undefined));
+    nextInstances.push(broken, fresh);
+
+    await expect(recoverPersistedSession(sessionId, authReq())).rejects.toThrow(
+      "Already connected to a transport",
+    );
+
+    expect(metaMcpServerPool.cleanupSession).toHaveBeenCalledWith(sessionId);
+    expect(pooled.has(sessionId)).toBe(false);
+    expect(resolveBoundSession(sessionId, authReq()).outcome).toBe("absent");
+    expect(publicSessionSweeper.getLastActivity(sessionId)).toBeUndefined();
+
+    const second = await recoverPersistedSession(sessionId, authReq());
+
+    expect(second.status).toBe("recovered");
+    expect(broken.server.connect).toHaveBeenCalledTimes(1);
+    expect(fresh.server.connect).toHaveBeenCalledTimes(1);
+    expect(pooled.get(sessionId)).toBe(fresh);
+    await cleanupSession(sessionId);
+  });
+
+  it("an un-hydratable transport releases the instance and answers not_found", async () => {
+    const sessionId = "sess-release-hydrate";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    (hydrateRecoveredTransport as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      false,
+    );
+    nextInstances.push(makeInstance(vi.fn().mockResolvedValue(undefined)));
+
+    const result = await recoverPersistedSession(sessionId, authReq());
+
+    expect(result.status).toBe("not_found");
+    expect(metaMcpServerPool.cleanupSession).toHaveBeenCalledWith(sessionId);
+    expect(pooled.has(sessionId)).toBe(false);
+    expect(resolveBoundSession(sessionId, authReq()).outcome).toBe("absent");
+  });
+
+  it("closes the SDK server and its transport after start fails part way through connect", async () => {
+    const sessionId = "sess-release-start";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    const sdkServer = new McpServer(
+      { name: "failed-recovery", version: "0.0.0" },
+      { capabilities: {} },
+    );
+    const onClose = vi.fn();
+    sdkServer.onclose = onClose;
+    const instance = makeInstance(vi.fn(sdkServer.connect.bind(sdkServer)));
+    instance.server.close = vi.fn(sdkServer.close.bind(sdkServer));
+    nextInstances.push(instance);
+    const start = vi
+      .spyOn(StreamableHTTPServerTransport.prototype, "start")
+      .mockRejectedValueOnce(new Error("start failed"));
+
+    try {
+      await expect(
+        recoverPersistedSession(sessionId, authReq()),
+      ).rejects.toThrow("start failed");
+
+      // SDK connect binds the transport before awaiting start. Releasing
+      // only the pool entry does not close it or run the server's onclose
+      // hook (which detaches backend list_changed subscribers in production).
+      expect(sdkServer.transport).toBeUndefined();
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(pooled.has(sessionId)).toBe(false);
+    } finally {
+      start.mockRestore();
+      await sdkServer.close();
+    }
+  });
+
+  it("still releases the pool when closing the failed SDK server throws", async () => {
+    const sessionId = "sess-release-close-failed";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    const instance = makeInstance(
+      vi.fn().mockRejectedValue(new Error("connect failed")),
+    );
+    instance.server.close.mockRejectedValue(new Error("close failed"));
+    nextInstances.push(instance);
+
+    await expect(recoverPersistedSession(sessionId, authReq())).rejects.toThrow(
+      "connect failed",
+    );
+
+    expect(instance.server.close).toHaveBeenCalledTimes(1);
+    expect(pooled.has(sessionId)).toBe(false);
+  });
+
+  it("does not release a replacement pool instance installed while the failed server closes", async () => {
+    const sessionId = "sess-release-close-taken-over";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    const other = makeInstance(vi.fn());
+    const failing = makeInstance(
+      vi.fn().mockRejectedValue(new Error("connect failed")),
+    );
+    failing.server.close.mockImplementation(async () => {
+      pooled.set(sessionId, other);
+    });
+    nextInstances.push(failing);
+
+    await expect(recoverPersistedSession(sessionId, authReq())).rejects.toThrow(
+      "connect failed",
+    );
+
+    expect(failing.server.close).toHaveBeenCalledTimes(1);
+    expect(metaMcpServerPool.cleanupSession).not.toHaveBeenCalled();
+    expect(pooled.get(sessionId)).toBe(other);
+  });
+
+  it("leaves a live session alone when a stray recovery of its resident id fails", async () => {
+    const sessionId = "sess-release-resident";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    // The first connect succeeds and makes the session resident; the real SDK
+    // refuses a second connect of the same instance.
+    const live = makeInstance(
+      vi
+        .fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValue(new Error("Already connected to a transport")),
+    );
+    nextInstances.push(live);
+    const first = await recoverPersistedSession(sessionId, authReq());
+    expect(first.status).toBe("recovered");
+
+    await expect(recoverPersistedSession(sessionId, authReq())).rejects.toThrow(
+      "Already connected to a transport",
+    );
+
+    expect(metaMcpServerPool.cleanupSession).not.toHaveBeenCalled();
+    expect(pooled.get(sessionId)).toBe(live);
+    expect(live.server.close).not.toHaveBeenCalled();
+    expect(resolveBoundSession(sessionId, authReq()).outcome).toBe("ok");
+    await cleanupSession(sessionId);
+  });
+
+  it("does not release an id the pool now holds for a different instance", async () => {
+    const sessionId = "sess-release-taken-over";
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(storedRow(sessionId));
+    const other = makeInstance(vi.fn());
+    const failing = makeInstance(
+      vi.fn().mockImplementation(async () => {
+        // Another path took the id over while this connect was in progress.
+        pooled.set(sessionId, other);
+        throw new Error("connect failed");
+      }),
+    );
+    nextInstances.push(failing);
+
+    await expect(recoverPersistedSession(sessionId, authReq())).rejects.toThrow(
+      "connect failed",
+    );
+
+    expect(metaMcpServerPool.cleanupSession).not.toHaveBeenCalled();
+    expect(pooled.get(sessionId)).toBe(other);
+    expect(failing.server.close).not.toHaveBeenCalled();
   });
 });
 

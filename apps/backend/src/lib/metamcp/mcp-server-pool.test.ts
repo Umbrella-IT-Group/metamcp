@@ -57,9 +57,11 @@ vi.mock("./server-error-tracker", () => ({
   },
 }));
 
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+
 import logger from "@/utils/logger";
 
-import { McpServerPool } from "./mcp-server-pool";
+import { isPingAnsweredError, McpServerPool } from "./mcp-server-pool";
 import { toolsSyncCache } from "./tools-sync-cache";
 
 // Bypass the private-constructor discipline once, file-wide, without a
@@ -1438,5 +1440,153 @@ describe("McpServerPool tool-sweep timer lifecycle", () => {
         process.env.TOOLS_SWEEP_INTERVAL_SECONDS = prev;
       }
     }
+  });
+});
+
+describe("health checks: a -32601 answer to ping is alive (upstream #337)", () => {
+  // `ping` is optional in the MCP spec. A backend that does not implement it
+  // answers -32601 "Method not found", which is a reply over a working
+  // connection. Before this, the idle check recreated such a backend's idle
+  // connection every sweep and the active check cascade-invalidated it every
+  // second sweep, forever.
+
+  const methodNotFound = () =>
+    new McpError(ErrorCode.MethodNotFound, "Method not found");
+  const timedOut = () =>
+    new McpError(ErrorCode.RequestTimeout, "Request timed out");
+
+  type PingClient = FakeClient & {
+    client: { ping: ReturnType<typeof vi.fn> };
+  };
+
+  function makeClientRejectingWith(error: unknown): PingClient {
+    const fake = makeFakeClient() as PingClient;
+    fake.client = { ping: vi.fn().mockRejectedValue(error) };
+    return fake;
+  }
+
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, PingClient>>;
+    idleSessions: Record<string, PingClient>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+    serverParamsCache: Record<string, unknown>;
+    activePingFailures: Record<string, number>;
+    checkIdleSessionHealth: () => Promise<void>;
+    checkActiveSessionHealth: () => Promise<void>;
+  };
+  let createIdleSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+    internals.serverParamsCache = {
+      "server-1": { uuid: "server-1", name: "no-ping-backend" },
+    };
+    internals.activePingFailures = {};
+    const tracker = (await import("./server-error-tracker"))
+      .serverErrorTracker as never as {
+      isServerInErrorState: ReturnType<typeof vi.fn>;
+      resetServerErrorState: ReturnType<typeof vi.fn>;
+    };
+    tracker.isServerInErrorState.mockReset().mockResolvedValue(false);
+    tracker.resetServerErrorState.mockReset();
+    createIdleSpy = vi.fn();
+    (
+      pool as never as { createIdleSessionAsync: unknown }
+    ).createIdleSessionAsync = createIdleSpy;
+  });
+
+  afterEach(async () => {
+    await pool.cleanupAll();
+  });
+
+  describe("isPingAnsweredError", () => {
+    it("is true only for the numeric -32601 the SDK sets on an error response", () => {
+      expect(isPingAnsweredError(methodNotFound())).toBe(true);
+      expect(isPingAnsweredError({ code: -32601 })).toBe(true);
+    });
+
+    it.each([
+      ["a timeout", new McpError(ErrorCode.RequestTimeout, "timed out")],
+      [
+        "a closed connection",
+        new McpError(ErrorCode.ConnectionClosed, "closed"),
+      ],
+      ["a plain Error naming the method", new Error("Method not found")],
+      ["a string code", { code: "-32601" }],
+      [
+        "a timeout whose text mentions ping",
+        new Error("timeout waiting for ping response"),
+      ],
+      ["null", null],
+      ["undefined", undefined],
+    ])("is false for %s", (_label, error) => {
+      expect(isPingAnsweredError(error)).toBe(false);
+    });
+  });
+
+  describe("idle check", () => {
+    it("keeps an idle connection whose backend answered -32601", async () => {
+      const idle = makeClientRejectingWith(methodNotFound());
+      internals.idleSessions["server-1"] = idle;
+
+      await internals.checkIdleSessionHealth();
+      await internals.checkIdleSessionHealth();
+
+      expect(idle.client.ping).toHaveBeenCalledTimes(2);
+      expect(internals.idleSessions["server-1"]).toBe(idle);
+      expect(idle.cleanup).not.toHaveBeenCalled();
+      expect(createIdleSpy).not.toHaveBeenCalled();
+    });
+
+    it("still retires and recreates an idle connection whose ping timed out", async () => {
+      const idle = makeClientRejectingWith(timedOut());
+      internals.idleSessions["server-1"] = idle;
+
+      await internals.checkIdleSessionHealth();
+
+      expect(internals.idleSessions["server-1"]).toBeUndefined();
+      expect(idle.cleanup).toHaveBeenCalledTimes(1);
+      expect(createIdleSpy).toHaveBeenCalledWith(
+        "server-1",
+        internals.serverParamsCache["server-1"],
+      );
+    });
+  });
+
+  describe("active check", () => {
+    it("takes no strike and evicts nothing for a -32601 answer", async () => {
+      const active = makeClientRejectingWith(methodNotFound());
+      internals.activeSessions["session-A"] = { "server-1": active };
+      internals.sessionToServers["session-A"] = new Set(["server-1"]);
+      internals.activePingFailures["server-1"] = 1; // a prior strike clears
+
+      await internals.checkActiveSessionHealth();
+      await internals.checkActiveSessionHealth();
+
+      expect(active.client.ping).toHaveBeenCalledTimes(2);
+      expect(internals.activePingFailures["server-1"]).toBeUndefined();
+      expect(active.cleanup).not.toHaveBeenCalled();
+      expect(internals.activeSessions["session-A"]["server-1"]).toBe(active);
+    });
+
+    it("still counts a dead sibling of an answering connection", async () => {
+      const answering = makeClientRejectingWith(methodNotFound());
+      const dead = makeClientRejectingWith(timedOut());
+      internals.activeSessions["session-A"] = { "server-1": answering };
+      internals.activeSessions["session-B"] = { "server-1": dead };
+      internals.sessionToServers["session-A"] = new Set(["server-1"]);
+      internals.sessionToServers["session-B"] = new Set(["server-1"]);
+
+      await internals.checkActiveSessionHealth();
+
+      expect(internals.activePingFailures["server-1"]).toBe(1);
+    });
   });
 });

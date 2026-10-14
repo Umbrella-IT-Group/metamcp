@@ -519,28 +519,44 @@ export interface ConnectMetaMcpClientDeps {
 }
 
 /**
- * M365 broker codes that represent a DETERMINISTIC per-user identity
- * rejection on the connect-time mint — retrying can never change this
- * user's outcome, so a connect that hits one of these short-circuits to a
- * single attempt (see the catch block below). Deliberately every code
- * EXCEPT `mint_failed`: mint-service throws `mint_failed` for TRANSIENT
- * operational failures — the token-endpoint being unreachable
- * (mint-service.ts's network-error catch) or answering 5xx / a
- * non-grant error (mint-service.ts's `classifyRefreshFailure`, the
+ * Whether a connect whose connect-time mint failed with each M365 broker
+ * code is retried. `false` marks a DETERMINISTIC per-user identity
+ * rejection — retrying can never change this user's outcome, so a connect
+ * that hits one short-circuits to a single attempt (see the catch block
+ * below). Deliberately every code EXCEPT `mint_failed`: mint-service throws
+ * `mint_failed` for TRANSIENT operational failures — the token-endpoint
+ * being unreachable (mint-service.ts's network-error catch) or answering
+ * 5xx / a non-grant error (mint-service.ts's `classifyRefreshFailure`, the
  * ">=500 || !body.error" and "invalid_client/invalid_request" branches).
  * Pre-Track-A5 those retried with the normal backoff schedule — free
  * resilience against a brief Entra blip — and that must be preserved, not
  * collapsed into the same one-attempt short-circuit as the deterministic
  * codes.
+ *
+ * A Record over the whole `M365BrokerErrorCode` union rather than a Set of
+ * the non-retryable codes, so a code added to the union fails the type
+ * check here until its retry class is decided. A Set gave a new code no
+ * entry, which silently made it retryable: the safe direction, but a
+ * deterministic refusal would then cost every connect three attempts and a
+ * retry storm in the log.
  */
+const M365_BROKER_CODE_RETRYABLE: Readonly<
+  Record<M365BrokerErrorCode, boolean>
+> = {
+  credential_missing: false,
+  credential_expired: false,
+  credential_revoked: false,
+  mfa_required: false,
+  not_configured: false,
+  mint_failed: true,
+};
+
 const NON_RETRYABLE_M365_BROKER_CODES: ReadonlySet<M365BrokerErrorCode> =
-  new Set([
-    "credential_missing",
-    "credential_expired",
-    "credential_revoked",
-    "mfa_required",
-    "not_configured",
-  ]);
+  new Set(
+    (Object.keys(M365_BROKER_CODE_RETRYABLE) as M365BrokerErrorCode[]).filter(
+      (code) => !M365_BROKER_CODE_RETRYABLE[code],
+    ),
+  );
 
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,

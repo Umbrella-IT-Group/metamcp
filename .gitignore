@@ -48,3 +48,8 @@ compose.override.yml
 
 # Claude Code harness worktrees/scratch
 .claude/
+
+# The backend logger defaults to app.log / error.log in the working directory;
+# a test run from the repo root must not leave them tracked.
+/app.log*
+/error.log*
