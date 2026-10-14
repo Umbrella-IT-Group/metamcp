@@ -2,12 +2,16 @@
  * Endpoint create/update defaults and the restricted => require_scoped_api_key
  * pairing.
  *
- * Two behaviours pinned here:
+ * Three behaviours pinned here:
  *
  *  - A new endpoint defaults CLOSED. Ownership is the creating admin unless the
  *    caller explicitly opts in to public (user_id: null), and a new endpoint
  *    gets a per-credential tool-call ceiling (enable_max_rate on with a
  *    conservative default budget) rather than shipping unbounded.
+ *
+ *  - The companion `<name>-endpoint` MCP server, and the API key minted for
+ *    it, are built only when the caller asks. A create that omits
+ *    `createMcpServer` gets neither.
  *
  *  - The pairing is enforced server-side: restricting an endpoint (on create,
  *    or by editing one that is already restricted) forces the scoped-key
@@ -53,6 +57,8 @@ vi.mock("../db/serializers", () => ({
 vi.mock("../lib/audit/admin-event", () => ({
   emitAdminEvent: vi.fn(),
 }));
+
+import { CreateEndpointRequestSchema } from "@repo/zod-types";
 
 import { endpointsImplementations } from "./endpoints.impl";
 
@@ -181,6 +187,54 @@ describe("endpoints.create: default tool-call ceiling", () => {
       enable_max_rate: true,
       max_rate: 5,
       max_rate_seconds: 1,
+    });
+  });
+});
+
+describe("endpoints.create: companion MCP server is opt-in at the API", () => {
+  // These go through `CreateEndpointRequestSchema.parse` because the default
+  // lives in the schema, not the impl: the tRPC router parses the wire input
+  // with it before the impl runs, so a caller that omits the flag reaches the
+  // impl with whatever the schema filled in.
+  const wireInput = (overrides: Record<string, unknown> = {}) =>
+    CreateEndpointRequestSchema.parse({
+      name: "reporting",
+      namespaceUuid: NAMESPACE_UUID,
+      enableApiKeyAuth: true,
+      requireScopedApiKey: false,
+      enableClientMaxRate: false,
+      enableMaxRate: false,
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    mcpServersRepositoryMock.create.mockResolvedValue({});
+    apiKeyCreateMock.mockResolvedValue({ key: "sk_mt_fresh_scoped_value" });
+  });
+
+  it("mints no key and creates no loopback server row when createMcpServer is omitted", async () => {
+    const input = wireInput();
+
+    const result = await endpointsImplementations.create(input, ADMIN_ID);
+
+    expect(result.success).toBe(true);
+    expect(apiKeyCreateMock).not.toHaveBeenCalled();
+    expect(mcpServersRepositoryMock.create).not.toHaveBeenCalled();
+    expect(input.createMcpServer).toBe(false);
+  });
+
+  it("still builds the companion server and its key on an explicit opt-in", async () => {
+    const result = await endpointsImplementations.create(
+      wireInput({ createMcpServer: true }),
+      ADMIN_ID,
+    );
+
+    expect(result.success).toBe(true);
+    expect(apiKeyCreateMock).toHaveBeenCalledTimes(1);
+    expect(mcpServersRepositoryMock.create).toHaveBeenCalledTimes(1);
+    expect(mcpServersRepositoryMock.create.mock.calls[0][0]).toMatchObject({
+      name: "reporting-endpoint",
+      bearerToken: "sk_mt_fresh_scoped_value",
     });
   });
 });

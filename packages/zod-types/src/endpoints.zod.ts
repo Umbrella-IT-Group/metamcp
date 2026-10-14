@@ -100,7 +100,16 @@ export const CreateEndpointRequestSchema = z.object({
   clientMaxRateStrategyKey: z.string().optional(),
   enableOauth: z.boolean().default(true),
   useQueryParamAuth: z.boolean().default(false),
-  createMcpServer: z.boolean().default(true),
+  // Default OFF. When on, the create also builds a loopback MCP server row
+  // named `<name>-endpoint` whose url is this endpoint's own public URL, and
+  // mints an API key to put in that row as its bearer token. Upstream meant it
+  // as a way to mount one endpoint inside another namespace; nobody asked for
+  // it by omission, and every such row is a live key the operator never saw
+  // plus a server the gateway's warm-up dials through the public URL. The UI
+  // form has sent false since fork #56, but any API caller that left the field
+  // out still got the row and the key (five accumulated in production and were
+  // removed 2026-10-13). An explicit `true` still opts in.
+  createMcpServer: z.boolean().default(false),
   // Ownership / visibility. `undefined` (the default when the caller says
   // nothing) means PRIVATE to the creating admin; the impl fills user_id with
   // the creator. An explicit `null` is the deliberate publish-to-everyone
