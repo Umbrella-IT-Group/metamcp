@@ -10,6 +10,7 @@
   "ownership": "소유권",
   "forMyself": "나만 사용 (비공개)",
   "everyone": "모두 사용 (공개)",
+  "ownershipPublicNote": "Namespace는 공유됩니다. 로그인한 모든 사용자가 볼 수 있으며 관리자가 관리합니다.",
   "selectServers": "MCP Server 선택",
   "selectServersDescription": "이 Namespace에 포함할 MCP Server를 선택하세요",
   "noServersAvailable": "사용 가능한 MCP Server가 없습니다",

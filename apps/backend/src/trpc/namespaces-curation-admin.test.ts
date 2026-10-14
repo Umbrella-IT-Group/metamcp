@@ -29,6 +29,7 @@ const buildRouter = () =>
   createNamespacesRouter({
     create: okImpl({ success: true } as never),
     list: okImpl({ namespaces: [] } as never),
+    listAll: okImpl({ namespaces: [] } as never),
     get: okImpl({ namespace: null } as never),
     getTools: okImpl({ tools: [] } as never),
     delete: okImpl({ success: true } as never),

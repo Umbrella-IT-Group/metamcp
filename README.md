@@ -96,6 +96,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 ### Access control
 
 - **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry. Administrators are named by configuration; see [Administrators](#administrators).
+- **Admin list-all**: `namespaces.listAll`, `endpoints.listAll` and `mcpServers.listAll` are admin-only and return every row with its owner (`user_id`, null for public), so administrators can see rows owned by other users. Opening, editing or deleting such a row still requires being its owner. The existing `list` procedures are unchanged (public rows plus the caller's own, for admins too), because consumers that match rows by name, such as a config sync over `mcpServers.list`, must not start seeing rows they never saw before. The namespace create form always creates a public namespace and no longer offers a "For myself" option, which never made a namespace private.
 - **Endpoint access groups** — named groups that decide which OAuth users may reach which endpoints, so publishing one connector per business system no longer means publishing all of them to everyone who can log in. See [Access groups](#access-groups).
 
 ### Observability

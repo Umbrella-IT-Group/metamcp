@@ -30,6 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
+import { namespaceOwnershipChoices } from "@/lib/namespace-ownership";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
@@ -241,38 +242,47 @@ export function EditNamespace({
               )}
             </div>
 
-            {/* Namespace Ownership */}
+            {/* Namespace Ownership. A public namespace shows a fixed
+                "Everyone": the "For myself" item it used to offer sent no
+                owner, which the update path reads as "keep the current
+                owner", so it did nothing. Only an owned namespace (whose owner
+                is the only one who can open this dialog) keeps the choice, to
+                stay as it is or be published. See lib/namespace-ownership.ts. */}
             <div className="space-y-2">
               <label className="text-sm font-medium">
                 {t("namespaces:ownership")}
               </label>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="outline"
-                    className="w-full justify-between"
-                    type="button"
-                    disabled={isUpdating}
-                  >
-                    {editForm.watch("user_id") === null
-                      ? t("namespaces:everyone")
-                      : t("namespaces:forMyself")}
-                    <ChevronDown className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]">
-                  <DropdownMenuItem
-                    onClick={() => editForm.setValue("user_id", undefined)}
-                  >
-                    {t("namespaces:forMyself")}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onClick={() => editForm.setValue("user_id", null)}
-                  >
-                    {t("namespaces:everyone")}
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+              {namespaceOwnershipChoices(namespace.user_id).length === 1 ? (
+                <p className="text-sm">{t("namespaces:everyone")}</p>
+              ) : (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className="w-full justify-between"
+                      type="button"
+                      disabled={isUpdating}
+                    >
+                      {editForm.watch("user_id") === null
+                        ? t("namespaces:everyone")
+                        : t("namespaces:forMyself")}
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-[var(--radix-dropdown-menu-trigger-width)]">
+                    <DropdownMenuItem
+                      onClick={() => editForm.setValue("user_id", undefined)}
+                    >
+                      {t("namespaces:forMyself")}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => editForm.setValue("user_id", null)}
+                    >
+                      {t("namespaces:everyone")}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
             </div>
 
             {/* MCP Servers Selection */}

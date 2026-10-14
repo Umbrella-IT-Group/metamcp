@@ -160,6 +160,27 @@ export const namespacesImplementations = {
     }
   },
 
+  // Every namespace, whoever owns it. Only reachable through the admin-gated
+  // `listAll` procedure; `list` above keeps its public-plus-own filter.
+  listAll: async (): Promise<z.infer<typeof ListNamespacesResponseSchema>> => {
+    try {
+      const namespaces = await namespacesRepository.findAll();
+
+      return {
+        success: true as const,
+        data: NamespacesSerializer.serializeNamespaceList(namespaces),
+        message: "Namespaces retrieved successfully",
+      };
+    } catch (error) {
+      logger.error("Error fetching all namespaces:", error);
+      return {
+        success: false as const,
+        data: [],
+        message: "Failed to fetch namespaces",
+      };
+    }
+  },
+
   get: async (
     input: {
       uuid: string;

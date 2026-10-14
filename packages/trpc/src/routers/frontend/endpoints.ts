@@ -30,6 +30,9 @@ export const createEndpointsRouter = (
     list: (
       userId: string,
     ) => Promise<z.infer<typeof ListEndpointsResponseSchema>>;
+    // Every endpoint regardless of owner; reached only through the
+    // admin-gated `listAll` procedure below.
+    listAll: () => Promise<z.infer<typeof ListEndpointsResponseSchema>>;
     get: (
       input: {
         uuid: string;
@@ -56,6 +59,17 @@ export const createEndpointsRouter = (
       .output(ListEndpointsResponseSchema)
       .query(async ({ ctx }) => {
         return await implementations.list(ctx.user.id);
+      }),
+
+    // Admin only: every endpoint, whoever owns it, each row carrying its
+    // owner in `user_id` (null = public). Separate from `list` for the reason
+    // given on `namespaces.listAll`: `list` keeps its public-plus-own result
+    // for every caller, so a consumer matching rows by name never meets a
+    // row it could not see before.
+    listAll: adminProcedure
+      .output(ListEndpointsResponseSchema)
+      .query(async () => {
+        return await implementations.listAll();
       }),
 
     // Protected: Get single endpoint by UUID

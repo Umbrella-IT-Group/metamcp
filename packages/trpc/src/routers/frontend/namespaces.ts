@@ -40,6 +40,9 @@ export const createNamespacesRouter = (
     list: (
       userId: string,
     ) => Promise<z.infer<typeof ListNamespacesResponseSchema>>;
+    // Every namespace regardless of owner; reached only through the
+    // admin-gated `listAll` procedure below.
+    listAll: () => Promise<z.infer<typeof ListNamespacesResponseSchema>>;
     // `isAdmin`: the namespace response embeds full server objects, so it
     // carries the same connection-URL / credential redaction contract as the
     // mcpServers router. Threaded from `ctx.user.role` at the call site.
@@ -97,6 +100,19 @@ export const createNamespacesRouter = (
       .output(ListNamespacesResponseSchema)
       .query(async ({ ctx }) => {
         return await implementations.list(ctx.user.id);
+      }),
+
+    // Admin only: every namespace, whoever owns it, each row carrying its
+    // owner in `user_id` (null = public). A separate procedure rather than an
+    // admin branch inside `list`, because `list` has consumers that match rows
+    // by NAME (the platform's config sync does so over `mcpServers.list`), and
+    // a row owned by someone else appearing in their results under a familiar
+    // name could be matched and overwritten. `list` keeps its public-plus-own
+    // semantics for everyone, admins included.
+    listAll: adminProcedure
+      .output(ListNamespacesResponseSchema)
+      .query(async () => {
+        return await implementations.listAll();
       }),
 
     // Protected: Get single namespace by UUID

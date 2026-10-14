@@ -10,6 +10,7 @@
   "ownership": "所有权",
   "forMyself": "仅自己（私有）",
   "everyone": "所有人（公开）",
+  "ownershipPublicNote": "命名空间是共享的：所有已登录用户都可以查看，并由管理员管理。",
   "selectServers": "选择 MCP 服务器",
   "selectServersDescription": "选择要包含在此命名空间中的 MCP 服务器",
   "noServersAvailable": "没有可用的 MCP 服务器",

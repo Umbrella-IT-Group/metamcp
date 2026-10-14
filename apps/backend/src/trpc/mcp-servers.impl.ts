@@ -132,6 +132,30 @@ export const mcpServersImplementations = {
     }
   },
 
+  // Every server, whoever owns it. Only reachable through the admin-gated
+  // `listAll` procedure, so it serializes for an administrator (`true`): the
+  // same unredacted view an admin's `list` already returns for the rows it
+  // can see, extended to rows owned by other users. `list` above keeps its
+  // public-plus-own filter for every caller.
+  listAll: async (): Promise<z.infer<typeof ListMcpServersResponseSchema>> => {
+    try {
+      const servers = await mcpServersRepository.findAll();
+
+      return {
+        success: true as const,
+        data: McpServersSerializer.serializeMcpServerList(servers, true),
+        message: "MCP servers retrieved successfully",
+      };
+    } catch (error) {
+      logger.error("Error fetching all MCP servers:", error);
+      return {
+        success: false as const,
+        data: [],
+        message: "Failed to fetch MCP servers",
+      };
+    }
+  },
+
   bulkImport: async (
     input: z.infer<typeof BulkImportMcpServersRequestSchema>,
     userId: string,

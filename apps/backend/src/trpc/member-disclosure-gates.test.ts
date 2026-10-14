@@ -75,6 +75,7 @@ const buildMcpServersRouter = () => {
   const impls = {
     create: okImpl({ success: true } as never),
     list: okImpl({ success: true, data: [] } as never),
+    listAll: okImpl({ success: true, data: [] } as never),
     bulkImport: okImpl({ success: true } as never),
     get: okImpl({ success: true } as never),
     delete: okImpl({ success: true } as never),
@@ -97,6 +98,7 @@ const buildNamespacesRouter = () => {
   const impls = {
     create: okImpl({ success: true } as never),
     list: okImpl({ namespaces: [] } as never),
+    listAll: okImpl({ namespaces: [] } as never),
     get: okImpl({ success: true } as never),
     getTools: okImpl({ tools: [] } as never),
     delete: okImpl({ success: true } as never),

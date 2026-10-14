@@ -28,6 +28,7 @@ export { createMcpServersRouter } from "./routers/frontend";
 export {
   createAccessGroupsRouter,
   createApiKeysRouter,
+  createEndpointsRouter,
   createNamespacesRouter,
   createConfigRouter,
   createToolsRouter,

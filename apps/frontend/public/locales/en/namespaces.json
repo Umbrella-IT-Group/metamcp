@@ -10,6 +10,7 @@
   "ownership": "Ownership",
   "forMyself": "For myself (Private)",
   "everyone": "Everyone (Public)",
+  "ownershipPublicNote": "Namespaces are shared: every signed-in user can see them, and administrators manage them.",
   "selectServers": "Select MCP Servers",
   "selectServersDescription": "Choose which MCP servers to include in this namespace",
   "noServersAvailable": "No MCP servers available",

@@ -281,6 +281,27 @@ export const endpointsImplementations = {
     }
   },
 
+  // Every endpoint, whoever owns it. Only reachable through the admin-gated
+  // `listAll` procedure; `list` above keeps its public-plus-own filter.
+  listAll: async (): Promise<z.infer<typeof ListEndpointsResponseSchema>> => {
+    try {
+      const endpoints = await endpointsRepository.findAllWithNamespaces();
+
+      return {
+        success: true as const,
+        data: EndpointsSerializer.serializeEndpointWithNamespaceList(endpoints),
+        message: "Endpoints retrieved successfully",
+      };
+    } catch (error) {
+      logger.error("Error fetching all endpoints:", error);
+      return {
+        success: false as const,
+        data: [],
+        message: "Failed to fetch endpoints",
+      };
+    }
+  },
+
   get: async (
     input: {
       uuid: string;
