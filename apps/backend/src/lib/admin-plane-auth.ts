@@ -12,6 +12,7 @@ import {
   getAdminKeyRateLimitIdentifier,
   trpcAdminKeyRateLimiter,
 } from "./auth-rate-limiter";
+import { resolveClientIp } from "./client-ip";
 
 /**
  * The CONTROL-plane (admin-plane, migration 0038) bearer resolver for `/trpc`.
@@ -153,17 +154,45 @@ function emitDenied(
  * CHECK (the 429) lives in the middleware ahead of createContext, which skips it
  * for cookie-carrying requests so a valid cookie user is never refused.
  */
+/**
+ * The admin-plane key's IP policy refused the request (migration 0040).
+ * Distinct from null (which leaves the request unauthenticated, a 401) so
+ * createContext can answer 403 with the generic refusal, matching the data
+ * plane, instead of looking like an unknown key.
+ */
+export interface AdminPlaneIpDenied {
+  ipDenied: true;
+}
+
 export async function resolveAdminPlaneSession(
   token: string,
   req: express.Request,
-): Promise<{ user: User; session: Session } | null> {
+): Promise<{ user: User; session: Session } | AdminPlaneIpDenied | null> {
   // Kill switch: the whole path is off. Not a failed verification and not an
   // "admin-plane request" to record or audit, a bearer here is simply
   // unauthenticated. Returning before the DB read also means a flood while the
   // switch is on cannot amplify audit writes.
   if (adminPlaneTokenAuthDisabled()) return null;
 
-  const result = await apiKeysRepository.validateAdminPlaneApiKey(token);
+  // Explicit IP-policy opt-in (migration 0040): the control plane is an
+  // authentication, so the admin-plane key's allowlist applies. Address from
+  // CF-Connecting-IP via lib/client-ip, never req.ip.
+  const result = await apiKeysRepository.validateAdminPlaneApiKey(token, {
+    clientIp: resolveClientIp(req.headers),
+    surface: "admin_plane",
+    audit: auditRequestContext(req),
+    target: { type: "trpc", id: null, label: null },
+  });
+
+  // IP refusal: handled BEFORE the failure branch below, so it is neither
+  // RECORDED against the admin-key failure limiter (the key is real, and a
+  // wrong-address caller must not spend the budget an operator's CI shares)
+  // nor audited as authn.admin_key.denied (the policy module already wrote
+  // the throttled apikey.ip.denied row; a per-request row here would undo
+  // that throttle). Same placement as the data plane's ip_denied branch.
+  if (!result.valid && result.reason === "ip_not_allowed") {
+    return { ipDenied: true };
+  }
 
   if (!result.valid) {
     trpcAdminKeyRateLimiter.recordFailedAttempt(

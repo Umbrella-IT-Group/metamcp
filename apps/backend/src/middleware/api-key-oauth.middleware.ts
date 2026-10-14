@@ -8,6 +8,10 @@ import { oauthRepository } from "../db/repositories/oauth.repo";
 import { usersRepository } from "../db/repositories/users.repo";
 import { resolveActsAsUserId } from "../lib/api-key-identity";
 import {
+  type ApiKeyIpCheck,
+  CREDENTIAL_NOT_PERMITTED_MESSAGE,
+} from "../lib/api-key-ip-policy";
+import {
   type AuditActorType,
   auditRequestContext,
   type AuditRequestFields,
@@ -23,6 +27,7 @@ import {
   authRateLimiter,
   getAuthRateLimitIdentifier,
 } from "../lib/auth-rate-limiter";
+import { resolveClientIp } from "../lib/client-ip";
 import {
   ENDPOINT_ACCESS_DENIED_MESSAGE,
   isOAuthUserAllowedOnEndpoint,
@@ -472,6 +477,41 @@ export function __resetUnauthenticatedEndpointWarnings(): void {
 }
 
 /**
+ * The explicit IP-policy opt-in (migration 0040) both API-key branches pass to
+ * validateApiKey. The address is CF-Connecting-IP exactly as lib/client-ip.ts
+ * resolves it, never `req.ip` (the in-container rewrite makes that loopback for
+ * everyone) and never X-Forwarded-For (caller-appendable). The endpoint rides
+ * along so an audit row says which endpoint the key was trying to reach.
+ */
+function dataPlaneIpCheck(
+  req: express.Request,
+  endpoint: DatabaseEndpoint,
+): ApiKeyIpCheck {
+  return {
+    clientIp: resolveClientIp(req.headers),
+    surface: "data_plane",
+    audit: auditRequestContext(req),
+    target: { type: "endpoint", id: endpoint.uuid, label: endpoint.name },
+  };
+}
+
+/**
+ * The refusal for an IP-denied key: 403 with the same generic body the
+ * account-disabled refusal uses, so the answer names nothing about the policy,
+ * the key's scope or its plane. Deliberately NOT counted by the
+ * failed-credential limiter (the credential is real) and NOT audited here: the
+ * policy module already wrote the throttled `apikey.ip.denied` row, and a
+ * second, per-request row would undo that throttle.
+ */
+function refuseIpDenied(res: express.Response): express.Response {
+  return res.status(403).json({
+    error: "Access denied",
+    message: CREDENTIAL_NOT_PERMITTED_MESSAGE,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+/**
  * Enhanced authentication middleware organized by 4 clear conditions
  * to prevent infinite retry issues with MCP inspector
  */
@@ -525,8 +565,11 @@ export const authenticateApiKey = async (
         return sendApiKeyRequiredResponse(req, res);
       }
 
-      // Validate API key
-      const apiKeyResult = await apiKeysRepository.validateApiKey(token);
+      // Validate API key, with the key's IP policy evaluated (explicit opt-in).
+      const apiKeyResult = await apiKeysRepository.validateApiKey(
+        token,
+        dataPlaneIpCheck(req, endpoint),
+      );
 
       if (apiKeyResult?.valid) {
         // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
@@ -591,6 +634,13 @@ export const authenticateApiKey = async (
 
         return next();
       } else {
+        // IP policy refusal (migration 0040), handled FIRST, before the
+        // admin-plane branch and the invalid-credential path, so it is never
+        // counted as a failed credential. See refuseIpDenied.
+        if (apiKeyResult?.ip_denied) {
+          return refuseIpDenied(res);
+        }
+
         // CONTROL-plane (admin-plane) key on the DATA plane (migration 0038).
         // validateApiKey refuses it as not-valid so it lands here; refuse it
         // BEFORE the invalid-credential path so it answers the same 403
@@ -741,8 +791,13 @@ export const authenticateApiKey = async (
         }
       }
 
-      // Try API key validation
-      const apiKeyResult = await apiKeysRepository.validateApiKey(token);
+      // Try API key validation, with the key's IP policy evaluated (explicit
+      // opt-in). Only ever reached for a credential that did not resolve as
+      // an OAuth token, so no OAuth caller is affected by the IP policy.
+      const apiKeyResult = await apiKeysRepository.validateApiKey(
+        token,
+        dataPlaneIpCheck(req, endpoint),
+      );
 
       if (apiKeyResult?.valid) {
         // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
@@ -807,6 +862,12 @@ export const authenticateApiKey = async (
 
         return next();
       } else {
+        // IP policy refusal (migration 0040), same handling and placement as
+        // the api-key-only branch above.
+        if (apiKeyResult?.ip_denied) {
+          return refuseIpDenied(res);
+        }
+
         // CONTROL-plane (admin-plane) key on the DATA plane (migration 0038),
         // same refusal as the api-key-only branch above, placed before the
         // invalid-credential path for the same reasons (403 access-denied, not

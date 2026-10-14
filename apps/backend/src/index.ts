@@ -5,6 +5,7 @@ import { logBasicAuthEnforcementState } from "./auth";
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
 import { convergeConfiguredAdmins } from "./lib/admin-converge";
 import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
+import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
 import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
@@ -218,6 +219,12 @@ async function start(): Promise<void> {
   // been switched off with ADMIN_PLANE_TOKEN_AUTH_DISABLED=true (migration
   // 0038), so an emergency disable is legible in the boot log.
   warnIfAdminPlaneTokenAuthDisabled();
+
+  // One boot-time signal when API-key IP allowlists are switched off with
+  // API_KEY_IP_POLICY_DISABLED=true (migration 0040), so an emergency disable
+  // is legible in the boot log rather than discovered when a policy that
+  // looks enforced is not.
+  warnIfApiKeyIpPolicyDisabled();
 
   // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
   // boot log records whether password login is on. Reads the DB-backed setting,

@@ -156,3 +156,55 @@ describe("createContext — DB-loadable invariant", () => {
     expect(typeof createContext).toBe("function");
   });
 });
+
+describe("createContext: admin-plane key refused by its IP policy (migration 0040)", () => {
+  const GENERIC =
+    "This credential is not currently permitted to access this gateway.";
+
+  it("throws FORBIDDEN with the generic sentence instead of leaving the request unauthenticated", async () => {
+    resolveMock.mockResolvedValue({ ipDenied: true });
+
+    await expect(
+      createContext(makeCtxArgs({ authorization: "Bearer sk_mt_ci_key" })),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", message: GENERIC });
+  });
+
+  it("answers HTTP 403 through the real tRPC request handler, for any procedure", async () => {
+    resolveMock.mockResolvedValue({ ipDenied: true });
+    const { router, protectedProcedure, publicProcedure } = await import(
+      "../trpc"
+    );
+    const { fetchRequestHandler } = await import("@trpc/server/adapters/fetch");
+    const appRouter = router({
+      ping: protectedProcedure.query(() => "pong"),
+      open: publicProcedure.query(() => "open"),
+    });
+
+    for (const path of ["ping", "open"]) {
+      const response = await fetchRequestHandler({
+        endpoint: "/trpc",
+        req: new Request(`http://gateway.example.invalid/trpc/${path}`),
+        router: appRouter,
+        createContext: () =>
+          createContext(makeCtxArgs({ authorization: "Bearer sk_mt_ci_key" })),
+      });
+      const body = (await response.json()) as {
+        error?: { message?: string; data?: { code?: string } };
+      };
+
+      expect(response.status).toBe(403);
+      expect(body.error?.message).toBe(GENERIC);
+      expect(body.error?.data?.code).toBe("FORBIDDEN");
+    }
+  });
+
+  it("a null resolution is still a plain unauthenticated request (401 path unchanged)", async () => {
+    resolveMock.mockResolvedValue(null);
+
+    const ctx = await createContext(
+      makeCtxArgs({ authorization: "Bearer sk_mt_unknown" }),
+    );
+
+    expect(ctx.user).toBeUndefined();
+  });
+});

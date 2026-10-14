@@ -81,6 +81,17 @@ const activeAdminOwner = () => ({
   },
 });
 
+/**
+ * Narrow a resolution to its session arm. Since migration 0040 the resolver
+ * can also return `{ ipDenied: true }`, which these accepted-path tests never
+ * produce; the cast keeps their assertions as they were.
+ */
+type ResolvedSession = {
+  user: { id: string; email: string };
+  session: unknown;
+};
+const asSession = (result: unknown) => result as ResolvedSession | null;
+
 let rows: AuditRow[];
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 let recordSpy: ReturnType<typeof vi.spyOn>;
@@ -106,7 +117,9 @@ describe("resolveAdminPlaneSession — accepted", () => {
   it("authenticates a valid admin-plane key as its owner, role from the DB row", async () => {
     validateAdminPlaneApiKeyMock.mockResolvedValue(activeAdminOwner());
 
-    const result = await resolveAdminPlaneSession(ADMIN_PLANE_KEY, makeReq());
+    const result = asSession(
+      await resolveAdminPlaneSession(ADMIN_PLANE_KEY, makeReq()),
+    );
 
     expect(result).not.toBeNull();
     expect(result?.user.id).toBe(OWNER_ID);
@@ -126,7 +139,9 @@ describe("resolveAdminPlaneSession — accepted", () => {
     demoted.user.role = "member";
     validateAdminPlaneApiKeyMock.mockResolvedValue(demoted);
 
-    const result = await resolveAdminPlaneSession(ADMIN_PLANE_KEY, makeReq());
+    const result = asSession(
+      await resolveAdminPlaneSession(ADMIN_PLANE_KEY, makeReq()),
+    );
     expect((result?.user as { role?: string }).role).toBe("member");
   });
 
@@ -223,5 +238,44 @@ describe("kill switch — ADMIN_PLANE_TOKEN_AUTH_DISABLED", () => {
     vi.stubEnv("ADMIN_PLANE_TOKEN_AUTH_DISABLED", "");
     warnIfAdminPlaneTokenAuthDisabled();
     expect(loggerMock.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveAdminPlaneSession: API-key IP policy (migration 0040)", () => {
+  it("passes the explicit opt-in with CF-Connecting-IP and surface admin_plane", async () => {
+    validateAdminPlaneApiKeyMock.mockResolvedValue(activeAdminOwner());
+
+    await resolveAdminPlaneSession(
+      ADMIN_PLANE_KEY,
+      makeReq({ "cf-connecting-ip": "203.0.113.50" }),
+    );
+
+    expect(validateAdminPlaneApiKeyMock).toHaveBeenCalledTimes(1);
+    const [token, ipCheck] = validateAdminPlaneApiKeyMock.mock.calls[0];
+    expect(token).toBe(ADMIN_PLANE_KEY);
+    expect(ipCheck).toMatchObject({
+      clientIp: "203.0.113.50",
+      surface: "admin_plane",
+      target: { type: "trpc" },
+    });
+  });
+
+  it("an IP refusal resolves to { ipDenied }, not counted, not audited here", async () => {
+    validateAdminPlaneApiKeyMock.mockResolvedValue({
+      valid: false,
+      reason: "ip_not_allowed",
+      key_uuid: KEY_UUID,
+    });
+
+    const result = await resolveAdminPlaneSession(ADMIN_PLANE_KEY, makeReq());
+    await flush();
+
+    expect(result).toEqual({ ipDenied: true });
+    // The key is real: a wrong-address caller must not spend the failure
+    // budget the operator's CI shares, and the policy module already wrote
+    // the throttled apikey.ip.denied row (the repository is mocked here, so
+    // no row at all proves this function adds none of its own).
+    expect(recordSpy).not.toHaveBeenCalled();
+    expect(rows).toEqual([]);
   });
 });

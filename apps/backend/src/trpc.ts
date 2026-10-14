@@ -3,6 +3,7 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import type { Request, Response } from "express";
 
 import { auth, type Session, type User } from "./auth";
+import { CREDENTIAL_NOT_PERMITTED_MESSAGE } from "./lib/api-key-ip-policy";
 import { auditRequestContext } from "./lib/audit/audit-emitter";
 import logger from "./utils/logger";
 
@@ -57,6 +58,9 @@ export const createContext = async ({
 }): Promise<Context> => {
   let user: User | undefined;
   let session: Session | undefined;
+  // Set when an admin-plane bearer was refused by its IP policy (migration
+  // 0040). Thrown AFTER the try/catch below, which swallows everything.
+  let adminPlaneIpDenied = false;
 
   try {
     // Check if we have cookies in the request
@@ -131,7 +135,9 @@ export const createContext = async ({
       if (authHeader && authHeader.startsWith("Bearer ")) {
         const token = authHeader.substring(7);
         const resolved = await resolveAdminPlaneBearer(token, req);
-        if (resolved) {
+        if (resolved && "ipDenied" in resolved) {
+          adminPlaneIpDenied = true;
+        } else if (resolved) {
           user = resolved.user;
           session = resolved.session;
         }
@@ -140,6 +146,18 @@ export const createContext = async ({
   } catch (error) {
     // Log error but don't throw - we want to allow unauthenticated requests
     logger.error("Error getting session in tRPC context:", error);
+  }
+
+  // An admin-plane key refused by its IP policy gets 403, not the 401 an
+  // unknown key gets, matching the data plane's answer for the same refusal,
+  // with the same generic sentence. tRPC v11 captures a TRPCError thrown from
+  // createContext and answers every call in the request with it (through the
+  // errorFormatter below), so this needs no change to the procedures.
+  if (adminPlaneIpDenied) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: CREDENTIAL_NOT_PERMITTED_MESSAGE,
+    });
   }
 
   return {

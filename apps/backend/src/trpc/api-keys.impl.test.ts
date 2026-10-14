@@ -90,6 +90,17 @@ vi.mock("../db/repositories", () => ({
   usersRepository: usersRepoMock,
 }));
 
+// The impl reads and writes the global API-key IP policy (migration 0040)
+// through config.service, whose repository reaches db/index. Nothing in this
+// file exercises it (api-keys.ip-policy.impl.test.ts does); the stub only
+// keeps the module loadable without a DATABASE_URL.
+vi.mock("../lib/config.service", () => ({
+  configService: {
+    getApiKeyIpPolicy: vi.fn(),
+    setApiKeyIpPolicy: vi.fn(),
+  },
+}));
+
 // lib/api-key-identity deliberately needs no mock: the impl's disabled-identity
 // gate resolves an acts-as binding through the REAL resolveActsAsUserId, the
 // same pure function the data-plane middleware runs, so the two planes cannot

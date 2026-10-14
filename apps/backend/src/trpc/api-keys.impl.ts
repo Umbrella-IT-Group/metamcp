@@ -4,8 +4,13 @@ import {
   CreateApiKeyResponseSchema,
   DeleteApiKeyRequestSchema,
   DeleteApiKeyResponseSchema,
+  GetGlobalIpPolicyResponseSchema,
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
+  SetApiKeyIpPolicyRequestSchema,
+  SetApiKeyIpPolicyResponseSchema,
+  SetGlobalIpPolicyRequestSchema,
+  SetGlobalIpPolicyResponseSchema,
   UpdateApiKeyRequestSchema,
   UpdateApiKeyResponseSchema,
   ValidateApiKeyRequestSchema,
@@ -23,9 +28,54 @@ import {
 } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
 import { resolveActsAsUserId } from "../lib/api-key-identity";
+import {
+  apiKeyIpPolicyDisabled,
+  type IpPolicyMode,
+  normalizeCidrList,
+} from "../lib/api-key-ip-policy";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { configService } from "../lib/config.service";
 
 const apiKeysRepository = new ApiKeysRepository();
+
+/**
+ * Validate a requested IP policy (migration 0040) for a write, returning the
+ * canonical list. Shared by the per-key and the global setter so both refuse
+ * the same things with the same words. Every refusal is BAD_REQUEST before any
+ * write.
+ *
+ * Two guards beyond CIDR syntax, both against an administrator locking out
+ * callers by accident:
+ *  - enforce with an EMPTY list is refused. It would refuse every request for
+ *    the key (or, globally, for every key that follows the global policy).
+ *    To stop a key, deactivate it; that is the revocation with a name.
+ *  - (per-key only) a mode other than off with allowed_cidrs null is refused:
+ *    a per-key mode is only read when the key has its own list, so accepting
+ *    it would store a setting that does nothing while looking like a policy.
+ */
+function validatedCidrs(
+  cidrs: string[],
+  mode: IpPolicyMode,
+  scope: "key" | "global",
+): string[] {
+  const normalized = normalizeCidrList(cidrs);
+  if (!normalized.ok) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Invalid allowlist entries: ${normalized.errors.join("; ")}`,
+    });
+  }
+  if (mode === "enforce" && normalized.cidrs.length === 0) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message:
+        scope === "key"
+          ? "Enforce with an empty list would refuse every request for this key. Add at least one CIDR, or deactivate the key instead."
+          : "Enforce with an empty global list would refuse every key that follows the global policy. Add at least one CIDR.",
+    });
+  }
+  return normalized.cidrs;
+}
 
 export const apiKeysImplementations = {
   create: async (
@@ -401,10 +451,109 @@ export const apiKeysImplementations = {
     }
   },
 
+  // ---- IP allowlists (migration 0040), admin-only at the router ----
+
+  setIpPolicy: async (
+    input: z.infer<typeof SetApiKeyIpPolicyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof SetApiKeyIpPolicyResponseSchema>> => {
+    if (input.allowed_cidrs === null && input.ip_policy_mode !== "off") {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "A per-key mode needs a per-key list. Pass allowed_cidrs with the mode, or allowed_cidrs: null with mode off to make the key follow the global policy.",
+      });
+    }
+    const allowedCidrs =
+      input.allowed_cidrs === null
+        ? null
+        : validatedCidrs(input.allowed_cidrs, input.ip_policy_mode, "key");
+
+    const result = await apiKeysRepository.setIpPolicy(input.uuid, {
+      allowed_cidrs: allowedCidrs,
+      ip_policy_mode: input.ip_policy_mode,
+    });
+    if (!result) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "API key not found" });
+    }
+
+    // After the write, with the value it replaced (read under the same row
+    // lock), so "what did this change" is answerable from the row alone.
+    // CIDRs and modes only: no credential material.
+    emitAdminEvent(actor, {
+      action: "apikey.ip_policy.set",
+      target_type: "api_key",
+      target_id: input.uuid,
+      detail: {
+        name: result.after.name,
+        old_value: result.before,
+        new_value: {
+          allowed_cidrs: result.after.allowed_cidrs,
+          ip_policy_mode: result.after.ip_policy_mode,
+        },
+      },
+    });
+
+    return ApiKeysSerializer.serializeApiKeyIpPolicy(result.after);
+  },
+
+  getGlobalIpPolicy: async (): Promise<
+    z.infer<typeof GetGlobalIpPolicyResponseSchema>
+  > => {
+    const policy = await configService.getApiKeyIpPolicy();
+    return {
+      mode: policy.mode,
+      allowed_cidrs: policy.cidrs,
+      problems: policy.problems,
+      kill_switch_active: apiKeyIpPolicyDisabled(),
+    };
+  },
+
+  setGlobalIpPolicy: async (
+    input: z.infer<typeof SetGlobalIpPolicyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof SetGlobalIpPolicyResponseSchema>> => {
+    const cidrs = validatedCidrs(input.allowed_cidrs, input.mode, "global");
+
+    // The before-picture must never fail the write it describes, the same
+    // ordering config.impl.ts's previousValue applies to every other
+    // auth-posture setter.
+    let oldValue: { mode: string; allowed_cidrs: string[] } | null = null;
+    try {
+      const previous = await configService.getApiKeyIpPolicy();
+      oldValue = { mode: previous.mode, allowed_cidrs: previous.cidrs };
+    } catch {
+      oldValue = null;
+    }
+
+    await configService.setApiKeyIpPolicy({ mode: input.mode, cidrs });
+
+    emitAdminEvent(actor, {
+      action: "config.api_key_ip_policy.set",
+      target_type: "config_key",
+      target_id: "API_KEY_IP_POLICY",
+      detail: {
+        old_value: oldValue,
+        new_value: { mode: input.mode, allowed_cidrs: cidrs },
+      },
+    });
+
+    // Read back from the store rather than echoing the input, so the caller
+    // confirms what a reader will actually see.
+    const stored = await configService.getApiKeyIpPolicy();
+    return { mode: stored.mode, allowed_cidrs: stored.cidrs };
+  },
+
   validate: async (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
   ): Promise<z.infer<typeof ValidateApiKeyResponseSchema>> => {
     try {
+      // NO IP check, deliberately (migration 0040): this is an admin UI
+      // oracle, not an authentication, and it has no caller address worth
+      // judging (the browser's, not the key holder's). Passing one would
+      // make the answer depend on where the administrator is sitting. The
+      // second argument of validateApiKey is the explicit opt-in, so its
+      // absence here is the opt-out; api-keys.impl.test.ts pins it.
       const result = await apiKeysRepository.validateApiKey(input.key);
 
       // Disabled-identity gate (migration 0027). The DATA plane already

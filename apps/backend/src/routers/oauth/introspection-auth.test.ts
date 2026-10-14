@@ -207,7 +207,12 @@ describe("POST /oauth/introspect — anonymous callers are refused", () => {
     );
 
     expect(res.statusCode).toBe(401);
-    expect(validateApiKeyMock).toHaveBeenCalledWith("sk_mt_not_a_real_key");
+    // The second argument is the explicit IP-policy opt-in (migration 0040);
+    // its contents are pinned in the IP-policy suite at the end of this file.
+    expect(validateApiKeyMock).toHaveBeenCalledWith(
+      "sk_mt_not_a_real_key",
+      expect.objectContaining({ surface: "oauth_introspect" }),
+    );
   });
 
   it("refuses an admin-plane (control-plane) key — the third data-plane surface", async () => {
@@ -299,5 +304,76 @@ describe("POST /oauth/revoke — deliberately left public", () => {
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       LIVE_TOKEN,
     );
+  });
+});
+
+describe("POST /oauth/introspect: API-key IP policy (migration 0040)", () => {
+  it("passes the explicit IP-policy opt-in with CF-Connecting-IP, never req.ip", async () => {
+    await post(
+      "/oauth/introspect",
+      { token: LIVE_TOKEN },
+      { "x-api-key": VALID_API_KEY, "cf-connecting-ip": "203.0.113.77" },
+    );
+
+    expect(validateApiKeyMock).toHaveBeenCalledTimes(1);
+    const [, ipCheck] = validateApiKeyMock.mock.calls[0];
+    expect(ipCheck).toMatchObject({
+      clientIp: "203.0.113.77",
+      surface: "oauth_introspect",
+      target: { type: "oauth_route", id: "introspect" },
+    });
+  });
+
+  it("answers 403 with the generic refusal for an IP-denied key and reads no token row", async () => {
+    validateApiKeyMock.mockResolvedValue({
+      valid: false,
+      ip_denied: true,
+      key_uuid: "key-uuid",
+    });
+
+    const res = await post(
+      "/oauth/introspect",
+      { token: LIVE_TOKEN },
+      { "x-api-key": VALID_API_KEY, "cf-connecting-ip": "203.0.113.78" },
+    );
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual({
+      error: "access_denied",
+      error_description:
+        "This credential is not currently permitted to access this gateway.",
+    });
+    expect(res.body).not.toHaveProperty("active");
+    expect(oauthRepositoryMock.getAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("does NOT count an IP denial toward the failed-lookup limiter", async () => {
+    // The limiter refuses at 20 recorded failures per source. Thirty IP
+    // denials from ONE source must all still be answered 403 (none counted),
+    // and a valid request from that same source must then be served, not 429.
+    validateApiKeyMock.mockResolvedValue({
+      valid: false,
+      ip_denied: true,
+      key_uuid: "key-uuid",
+    });
+    const sameSource = (headers: Record<string, string>) => {
+      // post() rotates req.ip per call; pin it so every attempt lands in one
+      // limiter bucket, which is the case the limiter exists for.
+      ipCounter = 199;
+      return post("/oauth/introspect", { token: LIVE_TOKEN }, headers);
+    };
+    for (let i = 0; i < 30; i += 1) {
+      const res = await sameSource({ "x-api-key": VALID_API_KEY });
+      expect(res.statusCode).toBe(403);
+    }
+
+    validateApiKeyMock.mockImplementation(async () => ({
+      valid: true,
+      user_id: USER_ID,
+      key_uuid: "key-uuid",
+    }));
+    const served = await sameSource({ "x-api-key": VALID_API_KEY });
+    expect(served.statusCode).toBe(200);
+    expect(served.body?.active).toBe(true);
   });
 });

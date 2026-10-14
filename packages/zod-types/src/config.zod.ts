@@ -16,6 +16,15 @@ export const ConfigKeyEnum = z.enum([
   // owning server to reconnect before falling back to "Unknown tool".
   // See config.service.ts's getMcpToolCallReconnectWarmupTimeout.
   "MCP_TOOL_CALL_RECONNECT_WARMUP_TIMEOUT",
+  // The GLOBAL API-key IP policy (migration 0040), applied to every key whose
+  // own api_keys.allowed_cidrs is NULL. MODE is off | audit | enforce (unset
+  // reads as off); ALLOWED_CIDRS is a JSON array of CIDR strings. Written ONLY
+  // through apiKeys.setGlobalIpPolicy, which validates both and writes them in
+  // one transaction; the generic config.setConfig refuses these two keys so an
+  // unvalidated value cannot reach the evaluator. See
+  // apps/backend/src/lib/api-key-ip-policy.ts.
+  "API_KEY_IP_POLICY_MODE",
+  "API_KEY_IP_ALLOWED_CIDRS",
 ]);
 
 // Config schema

@@ -98,6 +98,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 - **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry. Administrators are named by configuration; see [Administrators](#administrators).
 - **Admin list-all**: `namespaces.listAll`, `endpoints.listAll` and `mcpServers.listAll` are admin-only and return every row with its owner (`user_id`, null for public), so administrators can see rows owned by other users. Opening, editing or deleting such a row still requires being its owner. The existing `list` procedures are unchanged (public rows plus the caller's own, for admins too), because consumers that match rows by name, such as a config sync over `mcpServers.list`, must not start seeing rows they never saw before. The namespace create form always creates a public namespace and no longer offers a "For myself" option, which never made a namespace private.
 - **Endpoint access groups** — named groups that decide which OAuth users may reach which endpoints, so publishing one connector per business system no longer means publishing all of them to everyone who can log in. See [Access groups](#access-groups).
+- **API-key IP allowlists**: per-key or global CIDR lists in audit or enforce mode, checked on the data plane, token introspection and the admin-plane bearer. OAuth is never affected. See [API-key IP allowlists](#api-key-ip-allowlists).
 
 ### Observability
 
@@ -510,6 +511,28 @@ Three properties worth stating plainly, because each is a deliberate boundary ra
 Membership decisions are cached in-process for 60 seconds and dropped immediately when any group or endpoint mapping changes, so a revocation takes effect on the caller's next request. Across multiple backend replicas the cache is per-process, and 60 seconds is the worst-case convergence.
 
 One limit worth knowing: the gate runs per request, so restricting an endpoint does not disconnect a notification stream that is already open. No tool call can land through it, because every call is a fresh request that re-runs the gate, but `list_changed` and log notifications keep flowing on that connection until the client disconnects.
+
+### API-key IP allowlists
+
+An API key normally works from any address, so a key that leaks works for whoever holds it. An IP allowlist binds a key to the networks its real caller uses. It applies to API keys only: OAuth sign-ins (MCP connectors, browser and SSO sessions) are never evaluated against it.
+
+Each key either has its own list (`api_keys.allowed_cidrs`) with its own mode, or has none and follows the **global** list and mode. A mode is one of:
+
+| mode | effect on a request from an address outside the list |
+| --- | --- |
+| `off` (default) | nothing is checked |
+| `audit` | the request is served and a throttled `apikey.ip.would_deny` audit row is written |
+| `enforce` | the request is refused with `403` and the same generic message other credential refusals use, and a throttled `apikey.ip.denied` audit row is written |
+
+Both rows carry `detail.reason = "api_key_ip_not_allowed"`, the surface (`data_plane`, `oauth_introspect` or `admin_plane`), the policy source (`key` or `global`) and why the address failed (`not_in_list`, `missing`, `unparsable`). Rows are throttled to one per key and address per ten minutes, plus a per-key budget per window, with the suppressed counts carried on the next row, so a refused caller cannot flood the append-only audit table.
+
+Where it is checked: inside both key validators, so it covers the data plane (`/metamcp/*`, both API-key branches), `POST /oauth/introspect` and the admin-plane bearer on `/trpc`. The admin UI's `apiKeys.validate` helper deliberately does not check it. The client address is `CF-Connecting-IP` (see the trust note in `middleware/audit-context.middleware.ts`); `X-Forwarded-For` and the socket address are never used. Under `enforce`, a request with no readable address is refused.
+
+The one exemption is explicit: a list holding both `0.0.0.0/0` and `::/0` admits any address and also a request with no address, for callers with no stable address such as CI runners.
+
+An IP refusal is evaluated before the plane, account and endpoint-scope checks, so a holder from the wrong address learns nothing about the key, and it is not counted by the failed-credential rate limiter, because the credential itself is valid.
+
+It ships inert: every existing key follows the global policy, whose mode is unset (`off`). Administrators manage policies on the **API Keys** page (an **IP policy** column and editor in the admin table, and a **Global IP policy** panel above it) or through the admin-only tRPC procedures `apiKeys.setIpPolicy`, `apiKeys.getGlobalIpPolicy` and `apiKeys.setGlobalIpPolicy`; each write emits an `apikey.ip_policy.set` or `config.api_key_ip_policy.set` audit row with the old and new value. `apiKeys.listAll` shows each key's list, mode and `last_used_ip` (the address of its last request, updated with `last_used_at`). The server refuses `enforce` with an empty list, a per-key mode without a per-key list, and any entry that is not a valid CIDR (including one with host bits set). `API_KEY_IP_POLICY_DISABLED=true` turns all IP evaluation off process-wide (see `example.env`).
 
 For reverse-proxy (nginx) setups with SSE long connections, see [`nginx.conf.example`](nginx.conf.example). A 2–4GB instance is the practical minimum for a hosted deployment.
 

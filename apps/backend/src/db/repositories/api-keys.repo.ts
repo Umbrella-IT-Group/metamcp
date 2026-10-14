@@ -1,14 +1,41 @@
+import { isIP } from "node:net";
+
 import { ApiKeyCreateInput, ApiKeyUpdateInput } from "@repo/zod-types";
 import { and, desc, eq, isNull, or } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { customAlphabet } from "nanoid";
 
 import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
+import {
+  type ApiKeyIpCheck,
+  applyApiKeyIpPolicy,
+  type GlobalIpPolicy,
+  type IpPolicyMode,
+} from "@/lib/api-key-ip-policy";
+import { configService } from "@/lib/config.service";
 import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { apiKeysTable, usersTable } from "../schema";
 import { shouldTouchLastUsed } from "./api-keys.last-used";
+
+/**
+ * The global IP policy, read live (one config query) only when a key with no
+ * list of its own is validated under an explicit IP check. A function rather
+ * than a direct call so the policy module stays free of database imports.
+ */
+const readGlobalIpPolicy = async (): Promise<GlobalIpPolicy> =>
+  configService.getApiKeyIpPolicy();
+
+/**
+ * The address to record in api_keys.last_used_ip: only a value that parses as
+ * an IP, so the admin view never shows a malformed header as if it were where
+ * the key was used from. Undefined leaves the stored value as it is.
+ */
+function stampableIp(ipCheck: ApiKeyIpCheck | undefined): string | undefined {
+  const ip = ipCheck?.clientIp;
+  return ip !== undefined && isIP(ip) !== 0 ? ip : undefined;
+}
 
 const nanoid = customAlphabet(
   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
@@ -108,6 +135,12 @@ export class ApiKeysRepository {
         // Plane flag (migration 0038): so the admin view can label a
         // control-plane key loudly, the way acts-as is labelled.
         admin_plane: apiKeysTable.admin_plane,
+        // IP allowlist (migration 0040): the key's own list (NULL = follows
+        // the global policy), its mode, and the last address it was used
+        // from. None of it is credential material.
+        allowed_cidrs: apiKeysTable.allowed_cidrs,
+        ip_policy_mode: apiKeysTable.ip_policy_mode,
+        last_used_ip: apiKeysTable.last_used_ip,
       })
       .from(apiKeysTable)
       .leftJoin(usersTable, eq(apiKeysTable.user_id, usersTable.id))
@@ -138,7 +171,21 @@ export class ApiKeysRepository {
       .orderBy(desc(apiKeysTable.created_at));
   }
 
-  async validateApiKey(key: string): Promise<{
+  /**
+   * Resolve a presented DATA-plane key.
+   *
+   * `ipCheck` is the EXPLICIT opt-in to the key's IP policy (migration 0040).
+   * The authenticating call sites pass it (both API-key branches of
+   * authenticateApiKey, and /oauth/introspect); the tRPC `apiKeys.validate`
+   * oracle does not, because it authenticates nothing and has no caller
+   * address to judge. Omitted means the policy is not evaluated at all, which
+   * is why it is a separate argument rather than a default: a caller that
+   * forgets it gets today's behaviour, never a silent refusal.
+   */
+  async validateApiKey(
+    key: string,
+    ipCheck?: ApiKeyIpCheck,
+  ): Promise<{
     valid: boolean;
     user_id?: string | null;
     key_uuid?: string;
@@ -148,6 +195,13 @@ export class ApiKeysRepository {
     // sites can name the refusal precisely. A valid data-plane key never
     // carries it.
     admin_plane?: boolean;
+    // Set true ONLY when the key's IP policy refused the request (enforce
+    // mode, address not allowed). The call sites answer it with a 403 BEFORE
+    // their invalid-credential branch, so it is never counted by the
+    // failed-credential limiter: the credential is real, the address is not
+    // permitted. The policy module has already written the throttled audit
+    // row, so the call sites emit nothing of their own for it.
+    ip_denied?: boolean;
   }> {
     const [apiKey] = await db
       .select({
@@ -160,6 +214,10 @@ export class ApiKeysRepository {
         // read so the refusal below costs no second query.
         admin_plane: apiKeysTable.admin_plane,
         last_used_at: apiKeysTable.last_used_at,
+        // IP policy (migration 0040), read on the same row for the same
+        // reason: a key with its own list costs no extra query at all.
+        allowed_cidrs: apiKeysTable.allowed_cidrs,
+        ip_policy_mode: apiKeysTable.ip_policy_mode,
       })
       .from(apiKeysTable)
       // Hash-for-hash comparison (migration 0034): the presented value is
@@ -182,6 +240,30 @@ export class ApiKeysRepository {
       return { valid: false };
     }
 
+    // IP POLICY (migration 0040), only under an explicit ipCheck. Placed
+    // after existence and is_active (an unknown or revoked key is refused as
+    // invalid exactly as before, and an unknown key never reaches the policy,
+    // so the audit rows it writes are always about a real key) and BEFORE
+    // everything the call sites decide afterwards: the plane refusal below,
+    // the disabled-account check and the endpoint-scope check. A holder of a
+    // valid key from a wrong address therefore learns nothing about the key's
+    // plane, owner or scope; every such request gets the same generic 403.
+    // Also before the last_used stamp: a refused request is not a use.
+    if (ipCheck) {
+      const { denied } = await applyApiKeyIpPolicy(
+        {
+          uuid: apiKey.uuid,
+          allowed_cidrs: apiKey.allowed_cidrs,
+          ip_policy_mode: apiKey.ip_policy_mode,
+        },
+        ipCheck,
+        readGlobalIpPolicy,
+      );
+      if (denied) {
+        return { valid: false, ip_denied: true, key_uuid: apiKey.uuid };
+      }
+    }
+
     // PLANE SEPARATION (migration 0038), enforced HERE so it holds for every
     // data-plane surface that resolves a key through this ONE validator,
     // present and future, rather than at each call site (the MCP bearer and
@@ -202,7 +284,7 @@ export class ApiKeysRepository {
     // (b) never awaited and never allowed to reject — a telemetry write must
     // not add latency to, or fail, request authentication.
     if (shouldTouchLastUsed(apiKey.last_used_at, Date.now())) {
-      void this.touchLastUsedAt(apiKey.uuid);
+      void this.touchLastUsedAt(apiKey.uuid, stampableIp(ipCheck));
     }
 
     return {
@@ -224,11 +306,22 @@ export class ApiKeysRepository {
   // admin view shows a slightly stale timestamp) whereas propagating it would
   // fail request auth. The swallow is logged, not silent, so it stays
   // observable.
-  private async touchLastUsedAt(uuid: string): Promise<void> {
+  //
+  // last_used_ip (migration 0040) rides the SAME throttled write, so it costs
+  // no extra update; between stamps it can be up to the throttle window stale,
+  // which is fine for its purpose (showing an operator where a key is used
+  // from while they build its allowlist). Absent ip = leave the column as it
+  // is, so the validate oracle and a request with no CF-Connecting-IP never
+  // blank it.
+  private async touchLastUsedAt(uuid: string, ip?: string): Promise<void> {
     try {
       await db
         .update(apiKeysTable)
-        .set({ last_used_at: new Date() })
+        .set(
+          ip === undefined
+            ? { last_used_at: new Date() }
+            : { last_used_at: new Date(), last_used_ip: ip },
+        )
         .where(eq(apiKeysTable.uuid, uuid));
     } catch (error) {
       logger.debug(
@@ -256,7 +349,10 @@ export class ApiKeysRepository {
    * Hashes the presented key through hashApiKey exactly as validateApiKey does
    * (never a second encoding, per the api-key-hash.ts contract).
    */
-  async validateAdminPlaneApiKey(key: string): Promise<
+  async validateAdminPlaneApiKey(
+    key: string,
+    ipCheck?: ApiKeyIpCheck,
+  ): Promise<
     | {
         valid: true;
         key_uuid: string;
@@ -273,6 +369,10 @@ export class ApiKeysRepository {
         };
       }
     | { valid: false; reason: "unknown_key" | "inactive" | "not_admin_plane" }
+    // The key's IP policy refused the request (migration 0040). Carries the
+    // key uuid for the caller's log; the policy module already wrote the
+    // throttled audit row.
+    | { valid: false; reason: "ip_not_allowed"; key_uuid: string }
   > {
     const [row] = await db
       .select({
@@ -280,6 +380,8 @@ export class ApiKeysRepository {
         is_active: apiKeysTable.is_active,
         admin_plane: apiKeysTable.admin_plane,
         last_used_at: apiKeysTable.last_used_at,
+        allowed_cidrs: apiKeysTable.allowed_cidrs,
+        ip_policy_mode: apiKeysTable.ip_policy_mode,
         user_id: usersTable.id,
         email: usersTable.email,
         name: usersTable.name,
@@ -304,11 +406,37 @@ export class ApiKeysRepository {
     // unauthenticated and protectedProcedure returns its normal UNAUTHORIZED.
     if (!row.admin_plane) return { valid: false, reason: "not_admin_plane" };
 
+    // IP POLICY (migration 0040), only under an explicit ipCheck, and AFTER
+    // the plane check on purpose. A data-plane key on /trpc is already refused
+    // with the same 401 an unknown key gets, so it reveals nothing, and
+    // evaluating a data-plane key's policy on a surface it can never use would
+    // write audit rows that misdescribe where the key is used. Before the
+    // disabled-owner check and the last_used stamp, so a wrong-address
+    // request learns nothing about the owner and is not recorded as a use.
+    if (ipCheck) {
+      const { denied } = await applyApiKeyIpPolicy(
+        {
+          uuid: row.key_uuid,
+          allowed_cidrs: row.allowed_cidrs,
+          ip_policy_mode: row.ip_policy_mode,
+        },
+        ipCheck,
+        readGlobalIpPolicy,
+      );
+      if (denied) {
+        return {
+          valid: false,
+          reason: "ip_not_allowed",
+          key_uuid: row.key_uuid,
+        };
+      }
+    }
+
     // Throttled fire-and-forget last-used stamp for an ACCEPTED admin-plane
     // request (owner not disabled), same discipline as validateApiKey. A
     // disabled owner's request is rejected downstream, so it does not stamp.
     if (!row.disabled && shouldTouchLastUsed(row.last_used_at, Date.now())) {
-      void this.touchLastUsedAt(row.key_uuid);
+      void this.touchLastUsedAt(row.key_uuid, stampableIp(ipCheck));
     }
 
     return {
@@ -434,5 +562,59 @@ export class ApiKeysRepository {
     }
 
     return deletedApiKey;
+  }
+
+  /**
+   * Admin write of one key's IP policy (migration 0040). The caller
+   * (apiKeys.setIpPolicy) has validated and canonicalised the list and the
+   * mode; this persists them and returns the row as it was BEFORE and AFTER,
+   * read and written in one transaction under a row lock, so the audit row's
+   * old value is the value this write actually replaced, not one a concurrent
+   * write had already changed. Returns null when no key has that uuid.
+   */
+  async setIpPolicy(
+    uuid: string,
+    policy: { allowed_cidrs: string[] | null; ip_policy_mode: IpPolicyMode },
+  ): Promise<{
+    before: { allowed_cidrs: string[] | null; ip_policy_mode: string };
+    after: {
+      uuid: string;
+      name: string;
+      last4: string;
+      is_active: boolean;
+      allowed_cidrs: string[] | null;
+      ip_policy_mode: string;
+      last_used_ip: string | null;
+    };
+  } | null> {
+    return await db.transaction(async (tx) => {
+      const [before] = await tx
+        .select({
+          allowed_cidrs: apiKeysTable.allowed_cidrs,
+          ip_policy_mode: apiKeysTable.ip_policy_mode,
+        })
+        .from(apiKeysTable)
+        .where(eq(apiKeysTable.uuid, uuid))
+        .for("update");
+      if (!before) return null;
+      const [after] = await tx
+        .update(apiKeysTable)
+        .set({
+          allowed_cidrs: policy.allowed_cidrs,
+          ip_policy_mode: policy.ip_policy_mode,
+        })
+        .where(eq(apiKeysTable.uuid, uuid))
+        .returning({
+          uuid: apiKeysTable.uuid,
+          name: apiKeysTable.name,
+          last4: apiKeysTable.last4,
+          is_active: apiKeysTable.is_active,
+          allowed_cidrs: apiKeysTable.allowed_cidrs,
+          ip_policy_mode: apiKeysTable.ip_policy_mode,
+          last_used_ip: apiKeysTable.last_used_ip,
+        });
+      if (!after) return null;
+      return { before, after };
+    });
   }
 }

@@ -18,6 +18,11 @@ import { toast } from "sonner";
 import { z } from "zod";
 
 import {
+  ApiKeyIpPolicyButton,
+  ApiKeyIpPolicyCell,
+  GlobalIpPolicyCard,
+} from "@/components/api-key-ip-policy";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -761,6 +766,9 @@ export default function ApiKeysPage() {
             Every API key across all users, including keys you do not own. Only
             administrators can see and revoke these.
           </p>
+          {/* API-key IP allowlists (migration 0040): the global policy, then a
+              per-key column and editor in the table below. */}
+          <GlobalIpPolicyCard />
           <div className="rounded-md border">
             <Table>
               <TableHeader>
@@ -771,6 +779,7 @@ export default function ApiKeysPage() {
                   <TableHead>{t("api-keys:scope")}</TableHead>
                   <TableHead>{t("api-keys:created")}</TableHead>
                   <TableHead>Last used</TableHead>
+                  <TableHead>IP policy</TableHead>
                   <TableHead>{t("common:status")}</TableHead>
                   <TableHead className="w-[100px]">
                     {t("common:actions")}
@@ -780,7 +789,7 @@ export default function ApiKeysPage() {
               <TableBody>
                 {allApiKeys?.apiKeys?.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="text-center py-12">
+                    <TableCell colSpan={9} className="text-center py-12">
                       <p className="text-muted-foreground">
                         {t("api-keys:noApiKeys")}
                       </p>
@@ -828,6 +837,13 @@ export default function ApiKeysPage() {
                         )}
                       </TableCell>
                       <TableCell>
+                        <ApiKeyIpPolicyCell
+                          allowedCidrs={apiKey.allowed_cidrs}
+                          mode={apiKey.ip_policy_mode}
+                          lastUsedIp={apiKey.last_used_ip}
+                        />
+                      </TableCell>
+                      <TableCell>
                         <Badge
                           variant={apiKey.is_active ? "success" : "danger"}
                         >
@@ -838,6 +854,10 @@ export default function ApiKeysPage() {
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
+                          <ApiKeyIpPolicyButton
+                            apiKey={apiKey}
+                            onSaved={() => refetchAll()}
+                          />
                           <Button
                             size="sm"
                             variant="ghost"

@@ -3,8 +3,13 @@ import {
   CreateApiKeyResponseSchema,
   DeleteApiKeyRequestSchema,
   DeleteApiKeyResponseSchema,
+  GetGlobalIpPolicyResponseSchema,
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
+  SetApiKeyIpPolicyRequestSchema,
+  SetApiKeyIpPolicyResponseSchema,
+  SetGlobalIpPolicyRequestSchema,
+  SetGlobalIpPolicyResponseSchema,
   UpdateApiKeyRequestSchema,
   UpdateApiKeyResponseSchema,
   ValidateApiKeyRequestSchema,
@@ -44,6 +49,17 @@ export const createApiKeysRouter = (implementations: {
   validate: (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
   ) => Promise<z.infer<typeof ValidateApiKeyResponseSchema>>;
+  setIpPolicy: (
+    input: z.infer<typeof SetApiKeyIpPolicyRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof SetApiKeyIpPolicyResponseSchema>>;
+  getGlobalIpPolicy: () => Promise<
+    z.infer<typeof GetGlobalIpPolicyResponseSchema>
+  >;
+  setGlobalIpPolicy: (
+    input: z.infer<typeof SetGlobalIpPolicyRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof SetGlobalIpPolicyResponseSchema>>;
 }) => {
   return router({
     // Create a key. Minting is effectively ADMIN-ONLY since the migration
@@ -119,6 +135,31 @@ export const createApiKeysRouter = (implementations: {
       .output(ValidateApiKeyResponseSchema)
       .query(async ({ input }) => {
         return implementations.validate(input);
+      }),
+
+    // API-key IP allowlists (migration 0040). ADMIN ONLY, all three: a policy
+    // decides which networks may use a credential, so who may change it is
+    // the same question as who may mint one. Each write emits an admin audit
+    // row with the old and new value (apikey.ip_policy.set /
+    // config.api_key_ip_policy.set).
+    setIpPolicy: adminProcedure
+      .input(SetApiKeyIpPolicyRequestSchema)
+      .output(SetApiKeyIpPolicyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.setIpPolicy(input, auditActor(ctx));
+      }),
+
+    getGlobalIpPolicy: adminProcedure
+      .output(GetGlobalIpPolicyResponseSchema)
+      .query(async () => {
+        return implementations.getGlobalIpPolicy();
+      }),
+
+    setGlobalIpPolicy: adminProcedure
+      .input(SetGlobalIpPolicyRequestSchema)
+      .output(SetGlobalIpPolicyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.setGlobalIpPolicy(input, auditActor(ctx));
       }),
   });
 };

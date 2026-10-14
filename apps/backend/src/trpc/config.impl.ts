@@ -1,5 +1,6 @@
 import type { AuditActor } from "@repo/trpc";
 import { SetConfigRequest } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { configService } from "../lib/config.service";
@@ -195,6 +196,22 @@ export const configImplementations = {
     input: SetConfigRequest,
     actor?: AuditActor,
   ): Promise<{ success: boolean }> => {
+    // The global API-key IP policy (migration 0040) is two rows that must be
+    // validated together and written together; this escape hatch would write
+    // one unvalidated string into one of them, and the evaluator reads a bad
+    // value fail-closed (an unknown mode as enforce), which can lock out
+    // every key that follows the global policy. Refused before any read or
+    // write, so it leaves no audit row: nothing happened.
+    if (
+      input.key === "API_KEY_IP_POLICY_MODE" ||
+      input.key === "API_KEY_IP_ALLOWED_CIDRS"
+    ) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "The API-key IP policy is set through apiKeys.setGlobalIpPolicy, which validates the mode and the list together.",
+      });
+    }
     // The generic escape hatch: `key` is the full ConfigKey enum, so this one
     // procedure can set DISABLE_SIGNUP without going through the named setter
     // above. It therefore has to be audited even though the named setters are

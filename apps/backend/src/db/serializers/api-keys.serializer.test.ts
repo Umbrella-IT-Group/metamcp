@@ -47,6 +47,9 @@ describe("ApiKeysSerializer — key_prefix is rendered from the stored last4", (
       acts_as_email: null,
       owner_email: "member@example.com",
       admin_plane: false,
+      allowed_cidrs: null,
+      ip_policy_mode: "off",
+      last_used_ip: null,
     };
 
     const fromMemberList = ApiKeysSerializer.serializeApiKeyList([memberRow])[0]

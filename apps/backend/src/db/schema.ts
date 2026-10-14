@@ -507,6 +507,17 @@ export const apiKeysTable = pgTable(
     // control-plane key cannot reach the data plane and vice versa. NOT NULL
     // default false so the deploy is inert and no live key changes behaviour.
     admin_plane: boolean("admin_plane").notNull().default(false),
+    // IP allowlist (migration 0040). NULL = the key has no list of its own and
+    // follows the GLOBAL policy (config rows API_KEY_IP_ALLOWED_CIDRS and
+    // API_KEY_IP_POLICY_MODE). Non-NULL (even empty) = the key's own list, and
+    // its own ip_policy_mode applies. See lib/api-key-ip-policy.ts.
+    allowed_cidrs: text("allowed_cidrs").array(),
+    // off | audit | enforce (CHECK below). Read only when allowed_cidrs is
+    // non-NULL. Default 'off' so the deploy is inert.
+    ip_policy_mode: text("ip_policy_mode").notNull().default("off"),
+    // CF-Connecting-IP of the last authenticated request, written in the same
+    // throttled stamp as last_used_at. Admin view only.
+    last_used_ip: text("last_used_ip"),
   },
   (table) => [
     index("api_keys_user_id_idx").on(table.user_id),
@@ -550,6 +561,12 @@ export const apiKeysTable = pgTable(
     check(
       "api_keys_admin_plane_no_acts_as",
       sql`${table.admin_plane} = false OR ${table.acts_as_user_id} IS NULL`,
+    ),
+    // IP policy mode (migration 0040): a row written outside the app cannot
+    // carry a mode the evaluator does not know.
+    check(
+      "api_keys_ip_policy_mode_valid",
+      sql`${table.ip_policy_mode} IN ('off', 'audit', 'enforce')`,
     ),
   ],
 );
