@@ -16,7 +16,6 @@ import {
   namespaceToolMappingsTable,
   toolsTable,
 } from "../schema";
-import { namespaceMappingsRepository } from "./namespace-mappings.repo";
 
 export class NamespacesRepository {
   async create(input: NamespaceCreateInput): Promise<DatabaseNamespace> {
@@ -386,6 +385,29 @@ export class NamespacesRepository {
     return deletedNamespace;
   }
 
+  /**
+   * Update a namespace and, when `mcpServerUuids` is given, make its server set
+   * that list.
+   *
+   * Rows are reconciled, not rebuilt: only the rows of servers that left the
+   * list are deleted, and a row for a server or tool the namespace has no row
+   * for yet is inserted with ON CONFLICT DO NOTHING. A retained row is never
+   * touched, so everything an administrator set on it since it was created
+   * (a tool's status and its four override columns, a server's status) survives
+   * the save, and a change another administrator commits meanwhile
+   * (updateToolStatus, updateToolOverrides, updateServerStatus) is never
+   * overwritten with a value read earlier. The same path serves both tool
+   * policies; they differ only in the status a NEW tool row starts with: ACTIVE
+   * under allow_all (a tool with no row is served there anyway), INACTIVE under
+   * allowlist (an unreviewed tool must not be served because the server list
+   * was saved again).
+   *
+   * The namespace row's UPDATE below holds that row's lock until commit, so two
+   * saves, a save and a refresh (bulkUpsertNamespaceToolMappings, FOR SHARE) and
+   * a save and a policy flip (setToolPolicy, FOR UPDATE) each run entirely
+   * before or after the other, and the policy read from RETURNING is the one in
+   * force for the whole write.
+   */
   async update(input: NamespaceUpdateInput): Promise<DatabaseNamespace> {
     return await db.transaction(async (tx) => {
       // Update the namespace
@@ -404,94 +426,96 @@ export class NamespacesRepository {
         throw new Error("Namespace not found");
       }
 
-      // If mcpServerUuids are provided, update the mappings
+      // If mcpServerUuids are provided, reconcile the mappings with them
       if (input.mcpServerUuids) {
-        const allowAll = updatedNamespace.tool_policy === "allow_all";
-        // Preserve allow_all's existing re-save behavior. Under allowlist,
-        // keep retained tool rows instead: snapshotting then recreating them
-        // can restore ACTIVE after a concurrent administrator revokes a tool.
-        const existingToolMappings = allowAll
-          ? await namespaceMappingsRepository.findToolMappingsByNamespace(
-              input.uuid,
-            )
-          : [];
-        const existingToolStatusMap = new Map(
-          existingToolMappings.map((mapping) => [
-            mapping.tool_uuid,
-            mapping.status,
-          ]),
-        );
-
-        await tx
-          .delete(namespaceServerMappingsTable)
-          .where(eq(namespaceServerMappingsTable.namespace_uuid, input.uuid));
+        const serverUuids = [...new Set(input.mcpServerUuids)];
+        // Only the rows of servers no longer in the list go. An empty list
+        // removes every row, which is the wipe the admin CLI's docs warn about.
+        const removedTools =
+          serverUuids.length > 0
+            ? notInArray(
+                namespaceToolMappingsTable.mcp_server_uuid,
+                serverUuids,
+              )
+            : undefined;
+        const removedServers =
+          serverUuids.length > 0
+            ? notInArray(
+                namespaceServerMappingsTable.mcp_server_uuid,
+                serverUuids,
+              )
+            : undefined;
 
         await tx
           .delete(namespaceToolMappingsTable)
           .where(
             and(
               eq(namespaceToolMappingsTable.namespace_uuid, input.uuid),
-              !allowAll && input.mcpServerUuids.length > 0
-                ? notInArray(
-                    namespaceToolMappingsTable.mcp_server_uuid,
-                    input.mcpServerUuids,
-                  )
-                : undefined,
+              removedTools,
+            ),
+          );
+        await tx
+          .delete(namespaceServerMappingsTable)
+          .where(
+            and(
+              eq(namespaceServerMappingsTable.namespace_uuid, input.uuid),
+              removedServers,
             ),
           );
 
-        // Create new server mappings if any servers are specified
-        if (input.mcpServerUuids.length > 0) {
-          const serverMappings = input.mcpServerUuids.map((serverUuid) => ({
-            namespace_uuid: input.uuid,
-            mcp_server_uuid: serverUuid,
-            status: "ACTIVE" as const,
-          }));
+        if (serverUuids.length > 0) {
+          // A server new to the namespace starts ACTIVE; a retained one keeps
+          // the status it has (DO NOTHING).
+          await tx
+            .insert(namespaceServerMappingsTable)
+            .values(
+              serverUuids.map((serverUuid) => ({
+                namespace_uuid: input.uuid,
+                mcp_server_uuid: serverUuid,
+                status: "ACTIVE" as const,
+              })),
+            )
+            .onConflictDoNothing({
+              target: [
+                namespaceServerMappingsTable.namespace_uuid,
+                namespaceServerMappingsTable.mcp_server_uuid,
+              ],
+            });
 
-          await tx.insert(namespaceServerMappingsTable).values(serverMappings);
-
-          // Also create namespace-tool mappings for all tools of the selected servers
           const serverTools = await tx
             .select({
               uuid: toolsTable.uuid,
               mcp_server_uuid: toolsTable.mcp_server_uuid,
             })
             .from(toolsTable)
-            .where(inArray(toolsTable.mcp_server_uuid, input.mcpServerUuids));
+            .where(inArray(toolsTable.mcp_server_uuid, serverUuids));
 
           if (serverTools.length > 0) {
-            // A tool with no previous row is a tool nobody has reviewed for
-            // this namespace. Under `allowlist` it must not come back ACTIVE
-            // just because the server list was saved again, so it starts
-            // INACTIVE there; under `allow_all` it starts ACTIVE, as it always
-            // has (no row and an ACTIVE row serve the same). The policy is
-            // read from the row this transaction just updated, which also
-            // holds that row's lock until commit, so a concurrent
-            // setToolPolicy cannot change it in between.
+            // A tool with no row is a tool nobody has reviewed for this
+            // namespace. The policy is read from the row this transaction just
+            // updated (see above), so a concurrent setToolPolicy cannot change
+            // it in between.
             const newRowStatus: "ACTIVE" | "INACTIVE" =
               updatedNamespace.tool_policy === "allow_all"
                 ? "ACTIVE"
                 : "INACTIVE";
-            const toolMappings = serverTools.map((tool) => ({
-              namespace_uuid: input.uuid,
-              tool_uuid: tool.uuid,
-              mcp_server_uuid: tool.mcp_server_uuid,
-              status: existingToolStatusMap.get(tool.uuid) || newRowStatus,
-            }));
 
-            const insert = tx
+            await tx
               .insert(namespaceToolMappingsTable)
-              .values(toolMappings);
-            if (allowAll) {
-              await insert;
-            } else {
-              await insert.onConflictDoNothing({
+              .values(
+                serverTools.map((tool) => ({
+                  namespace_uuid: input.uuid,
+                  tool_uuid: tool.uuid,
+                  mcp_server_uuid: tool.mcp_server_uuid,
+                  status: newRowStatus,
+                })),
+              )
+              .onConflictDoNothing({
                 target: [
                   namespaceToolMappingsTable.namespace_uuid,
                   namespaceToolMappingsTable.tool_uuid,
                 ],
               });
-            }
           }
         }
       }
