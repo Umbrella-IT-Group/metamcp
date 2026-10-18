@@ -138,13 +138,17 @@ const protectedResourceHandler: express.RequestHandler = async (req, res) => {
 
     const baseUrl = getBaseUrl(req);
 
-    // For MCP implementation, we point to our better-auth OAuth server
-    // The authorization server is hosted at the same base URL
-    const authServerUrl = baseUrl;
+    // RFC 9728 requires this identifier to match the authorization
+    // server's advertised issuer exactly, including the trailing slash.
+    const authServerUrl = getIssuerIdentifier(req);
 
-    // Ensure the resource URL has a trailing slash for OAuth validation
-    // This is required by RFC 9728 for exact resource matching
-    const resourceUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+    // Path-scoped discovery describes the resource whose path was queried.
+    // Preserve its URL-encoded spelling; unscoped discovery retains the
+    // historical origin resource for existing MCP clients.
+    const resourceUrl =
+      target.kind === "endpoint"
+        ? `${baseUrl}${req.path.slice(PROTECTED_RESOURCE_PATH.length)}`
+        : `${baseUrl}/`;
 
     const metadata = {
       // Resource identifier - the protected resource's canonical URI
