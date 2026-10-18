@@ -163,9 +163,8 @@ describe("discovery IS served where OAuth is in use", () => {
   it.each(BOTH_DOCUMENTS)(
     "serves the unscoped %s while any endpoint has OAuth enabled",
     async (document) => {
-      // The live Claude.ai connectors reach discovery this way: the 401
-      // challenge advertises the BARE resource_metadata URL, so a 404 here
-      // would break them.
+      // Keep unscoped discovery for clients that use the fallback path,
+      // although 401 challenges now advertise path-scoped metadata URLs.
       const res = await dispatch(document);
 
       expect(res.statusCode).toBe(200);
