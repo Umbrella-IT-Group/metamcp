@@ -180,7 +180,7 @@ describe("discovery IS served where OAuth is in use", () => {
     const resource = await dispatch(PROTECTED_RESOURCE);
     expect(resource.body).toMatchObject({
       resource: "https://mcp.example.test/",
-      authorization_servers: ["https://mcp.example.test"],
+      authorization_servers: ["https://mcp.example.test/"],
     });
 
     const server = await dispatch(AUTHORIZATION_SERVER);
@@ -197,6 +197,36 @@ describe("discovery IS served where OAuth is in use", () => {
     expect((server.body as { issuer: string }).issuer).toBe(
       getIssuerIdentifier({ headers: {} } as unknown as express.Request),
     );
+  });
+
+  it.each(["mcp", "sse", "api"])(
+    "advertises the full endpoint resource for %s",
+    async (transport) => {
+      const suffix = `/metamcp/${OAUTH_ENDPOINT}/${transport}`;
+      const resource = await dispatch(`${PROTECTED_RESOURCE}${suffix}`);
+      const server = await dispatch(AUTHORIZATION_SERVER);
+
+      expect(resource.statusCode).toBe(200);
+      expect(resource.body).toMatchObject({
+        resource: `https://mcp.example.test${suffix}`,
+        authorization_servers: [(server.body as { issuer: string }).issuer],
+      });
+    },
+  );
+
+  it("preserves URL-encoded endpoint names in resource metadata", async () => {
+    endpointsRepositoryMock.findByName.mockResolvedValue({
+      uuid: "ep-spaced",
+      name: "my endpoint",
+      enable_oauth: true,
+    });
+
+    const resource = await dispatch(
+      `${PROTECTED_RESOURCE}/metamcp/my%20endpoint/mcp`,
+    );
+    expect(resource.body).toMatchObject({
+      resource: "https://mcp.example.test/metamcp/my%20endpoint/mcp",
+    });
   });
 
   it("advertises RFC 9207 iss support and S256-only PKCE", async () => {
