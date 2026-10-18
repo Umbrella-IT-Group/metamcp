@@ -229,6 +229,48 @@ describe("discovery IS served where OAuth is in use", () => {
     });
   });
 
+  it.each([
+    "https://mcp.example.test/",
+    "https://mcp.example.test///",
+  ])("normalizes APP_URL %s across discovery documents", async (appUrl) => {
+    const previousAppUrl = process.env.APP_URL;
+    process.env.APP_URL = appUrl;
+    try {
+      const resource = await dispatch(
+        `${PROTECTED_RESOURCE}/metamcp/${OAUTH_ENDPOINT}/mcp`,
+      );
+      const unscopedResource = await dispatch(PROTECTED_RESOURCE);
+      const server = await dispatch(AUTHORIZATION_SERVER);
+
+      expect(resource.body).toMatchObject({
+        resource: "https://mcp.example.test/metamcp/claude-connector/mcp",
+        authorization_servers: ["https://mcp.example.test/"],
+        resource_server_capabilities: {
+          introspection_endpoint: "https://mcp.example.test/oauth/introspect",
+          revocation_endpoint: "https://mcp.example.test/oauth/revoke",
+        },
+      });
+      expect(unscopedResource.body).toMatchObject({
+        resource: "https://mcp.example.test/",
+      });
+      expect(server.body).toMatchObject({
+        issuer: "https://mcp.example.test/",
+        authorization_endpoint: "https://mcp.example.test/oauth/authorize",
+        token_endpoint: "https://mcp.example.test/oauth/token",
+        registration_endpoint: "https://mcp.example.test/oauth/register",
+      });
+      expect(getIssuerIdentifier({ headers: {} } as unknown as express.Request)).toBe(
+        (server.body as { issuer: string }).issuer,
+      );
+    } finally {
+      if (previousAppUrl === undefined) {
+        delete process.env.APP_URL;
+      } else {
+        process.env.APP_URL = previousAppUrl;
+      }
+    }
+  });
+
   it("advertises RFC 9207 iss support and S256-only PKCE", async () => {
     // The authorization response now carries `iss`; the metadata must say so,
     // and it must keep advertising S256 as the only PKCE method (plain is
