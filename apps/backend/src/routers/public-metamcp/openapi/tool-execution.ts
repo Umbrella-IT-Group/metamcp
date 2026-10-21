@@ -3,6 +3,7 @@ import express from "express";
 
 import logger from "@/utils/logger";
 
+import { isBackendUnavailableError } from "../../../lib/metamcp/backend-unavailable";
 import { resolveCallerContext } from "../../../lib/metamcp/caller-context";
 import { resolveClientIdentity } from "../../../lib/metamcp/consumer-identity-resolver";
 import { metaMcpServerPool } from "../../../lib/metamcp/metamcp-server-pool";
@@ -88,6 +89,20 @@ export const executeToolWithMiddleware = async (
     logger.error(`Error executing tool ${JSON.stringify(toolName)}:`, error);
 
     // Handle different types of errors
+    if (isBackendUnavailableError(error)) {
+      // A mounted server could not be used and the tool did not run. The
+      // status stays 404, the code a routing miss has always answered here,
+      // because live pipelines retry around this endpoint and key on its
+      // status; moving the transient case to 503 is a separate decision. The
+      // body says what happened, so a caller can tell it from a typo.
+      return res.status(404).json({
+        error: "Backend unavailable",
+        message: error.message,
+        retryable: true,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     if (error instanceof Error) {
       if (error.message.includes("Unknown tool")) {
         return res.status(404).json({

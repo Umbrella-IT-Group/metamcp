@@ -283,6 +283,36 @@ describe("allowlist: no row means INACTIVE", () => {
   );
 });
 
+describe("the call context carries the verdict to the routing handler", () => {
+  // The routing handler widens its fallback for a tool with no mapping row
+  // only under `allow_all` (tool-call-routing.ts), and only for the servers
+  // judged here. It must read the policy this verdict used, not a fresh one.
+  it.each(["allow_all", "allowlist"] as const)(
+    "binds the judged policy (%s) and the judged servers",
+    async (policy) => {
+      curate(policy, [{ tool: "mytool", status: "ACTIVE" }]);
+      const { handler } = await callTool();
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          toolPolicy: policy,
+          allowedToolServerUuids: [SRV.uuid],
+        }),
+      );
+    },
+  );
+
+  it("binds allow_all for an unprefixed name too", async () => {
+    curate("allow_all");
+    const { handler } = await callTool("bare");
+    expect(handler).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ toolPolicy: "allow_all" }),
+    );
+  });
+});
+
 describe("fail closed (operator decision 2026-09-02)", () => {
   it("excludes and denies when the server prefix resolves to no mounted server", async () => {
     curate("allow_all");

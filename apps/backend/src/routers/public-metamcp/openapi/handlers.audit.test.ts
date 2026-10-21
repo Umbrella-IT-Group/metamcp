@@ -46,6 +46,9 @@ vi.mock(
 // through the chain that still produces an audited outcome.
 vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn().mockResolvedValue({}),
+  // No server mounted under any name, error-gated or not, so the miss is a
+  // genuine unknown tool rather than an unavailable backend.
+  getNamespaceServerStates: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("../../../db/repositories/namespaces.repo", () => ({

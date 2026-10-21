@@ -9,7 +9,6 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { namespacesRepository } from "../../../db/repositories/namespaces.repo";
 import { configService } from "../../../lib/config.service";
 import { ConnectedClient } from "../../../lib/metamcp";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
@@ -37,7 +36,11 @@ import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
 } from "../../../lib/metamcp/session-error";
-import { acquireSessionWithBoundedWarmup } from "../../../lib/metamcp/tool-call-warmup";
+import {
+  recoverFailedSession,
+  SessionRecoveries,
+} from "../../../lib/metamcp/session-recovery";
+import { routeUnmappedToolCall } from "../../../lib/metamcp/tool-call-routing";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
 // Original List Tools Handler (adapted from metamcp-proxy.ts)
@@ -184,11 +187,22 @@ export const createOriginalListToolsHandler = (
   };
 };
 
+// Session recoveries for the bridge, per OpenAPI session id. A handler is
+// built per request, so the map that lets concurrent calls share one recovery
+// has to outlive it. The bridge's session id is `openapi_<namespace uuid>`
+// (tool-execution.ts), so this holds one small WeakMap per namespace.
+const openApiRecoveries = new Map<string, SessionRecoveries>();
+const recoveriesFor = (sessionId: string): SessionRecoveries => {
+  let recoveries = openApiRecoveries.get(sessionId);
+  if (!recoveries) {
+    recoveries = new WeakMap();
+    openApiRecoveries.set(sessionId, recoveries);
+  }
+  return recoveries;
+};
+
 // Original Call Tool Handler (adapted from metamcp-proxy.ts)
 export const createOriginalCallToolHandler = (): CallToolHandler => {
-  const toolToClient: Record<string, ConnectedClient> = {};
-  const toolToServerUuid: Record<string, string> = {};
-
   return async (request, context) => {
     // `name` is the caller-controlled tool name (a URL-decoded path segment on
     // the OpenAPI path). Every log line and thrown message below runs it
@@ -208,98 +222,44 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     const isAllowedServer = (uuid: string): boolean =>
       !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
-    // Get server parameters and find the right session for this tool
+    // Resolve the server from the tool's prefix, touching only the servers
+    // whose name matches it. The bridge keeps no routing map across calls (a
+    // handler is built per request) and routes by prefix without listing, as
+    // it always has; what it shares with metamcp-proxy.ts is the candidate
+    // choice, the fallbacks and the honest "backend unavailable" answer for a
+    // mounted server it could not reach. See tool-call-routing.ts.
     const serverParams = await getMcpServers(context.namespaceUuid);
-    let targetSession = null;
-
-    for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
-      if (!isAllowedServer(mcpServerUuid)) continue;
-      const session = await mcpServerPool.getSession(
-        context.sessionId,
-        mcpServerUuid,
-        params,
-        context.namespaceUuid,
-      );
-      if (!session) continue;
-
-      const capabilities = session.client.getServerCapabilities();
-      if (!capabilities?.tools) continue;
-
-      // Use name assigned by user, fallback to name from server
-      const serverName =
-        params.name || session.client.getServerVersion()?.name || "";
-
-      if (sanitizeName(serverName) === serverPrefix) {
-        targetSession = session;
-        toolToClient[name] = session;
-        toolToServerUuid[name] = mcpServerUuid;
-        break;
-      }
-    }
-
-    // Reconnect-window fallback (mirrors metamcp-proxy.ts's
-    // originalCallToolHandler). The loop above only reaches the
-    // name-prefix check when `getSession` already has a live
-    // connection — during an upstream reconnect,
-    // `invalidateServerConnection` tears the pooled client down and
-    // fires `list_changed` BEFORE the replacement exists
-    // (mcp-server-pool.ts), so a call landing in that gap sees
-    // `getSession` return `undefined` for the owning server too and
-    // falls straight to "Unknown tool" (tool-execution.ts maps that to
-    // a literal HTTP 404) despite the tool being real.
-    //
-    // Resolve the owning server from the DB `toolsTable` (last known
-    // good, from the last successful tools/list sync) without needing
-    // a live session, then give that one server a short, bounded
-    // chance to come back. Skip the wait entirely when the DB has no
-    // record of this tool — that's genuinely unknown, not a reconnect
-    // race, and must still 404 immediately. ACTIVE mapping rows only (see
-    // findServersForNamespaceToolName), as in metamcp-proxy.ts, so this
-    // never routes a server the tool filter would refuse for this tool.
-    if (!targetSession) {
-      const candidates =
-        await namespacesRepository.findServersForNamespaceToolName(
-          context.namespaceUuid,
-          originalToolName,
-        );
-      const match = candidates.find(
-        (candidate) =>
-          isAllowedServer(candidate.serverUuid) &&
-          sanitizeName(candidate.serverName || "") === serverPrefix,
-      );
-      const paramsForMatch = match ? serverParams[match.serverUuid] : undefined;
-
-      // No `paramsForMatch` means the server isn't in the
-      // active/non-error namespace set right now (already filtered out
-      // of `serverParams` above) — removed/disabled, not mid-reconnect.
-      if (match && paramsForMatch) {
-        const warmupTimeoutMs =
-          await configService.getMcpToolCallReconnectWarmupTimeout();
-        const warmedSession = await acquireSessionWithBoundedWarmup({
-          pool: mcpServerPool,
-          sessionId: context.sessionId,
-          serverUuid: match.serverUuid,
-          params: paramsForMatch,
-          namespaceUuid: context.namespaceUuid,
-          timeoutMs: warmupTimeoutMs,
-        });
-
-        if (
-          warmedSession &&
-          warmedSession.client.getServerCapabilities()?.tools
-        ) {
-          targetSession = warmedSession;
-          toolToClient[name] = warmedSession;
-          toolToServerUuid[name] = match.serverUuid;
+    const route = await routeUnmappedToolCall({
+      namespaceUuid: context.namespaceUuid,
+      sessionId: context.sessionId,
+      toolName: name,
+      serverPrefix,
+      originalToolName,
+      serverParams,
+      isAllowedServer,
+      toolPolicy: (context as ToolFilterCallContext).toolPolicy,
+      includeInactiveServers: false,
+      unknownToolMessage: `Unknown tool: ${JSON.stringify(name)}`,
+      pool: mcpServerPool,
+      logPrefix: "OpenAPI bridge: ",
+      probe: async (session, candidate) => {
+        if (!session.client.getServerCapabilities()?.tools) {
+          return { kind: "absent" };
         }
-      }
-    }
+        // The configured name already matched the prefix; this is the final
+        // gate for a server stored with no name.
+        const serverName =
+          candidate.params.name ||
+          session.client.getServerVersion()?.name ||
+          "";
+        return sanitizeName(serverName) === serverPrefix
+          ? { kind: "found", session }
+          : { kind: "absent" };
+      },
+    });
 
-    if (!targetSession) {
-      throw new Error(`Unknown tool: ${JSON.stringify(name)}`);
-    }
-
-    const targetServerUuid = toolToServerUuid[name];
+    const targetSession: ConnectedClient = route.session;
+    const targetServerUuid = route.serverUuid;
 
     // Get configurable timeout values to bypass MCP SDK default enforcement
     const resetTimeoutOnProgress =
@@ -366,41 +326,43 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       }
 
       logger.warn(
-        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool ${JSON.stringify(name)}; invalidating pool and retrying once. (envelope: ${
+        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
 
-      await mcpServerPool.invalidateServerConnection(
-        context.sessionId,
-        targetServerUuid,
-      );
-      delete toolToClient[name];
-      delete toolToServerUuid[name];
-
-      const serverParamsAfter = await getMcpServers(context.namespaceUuid);
-      const paramsForServer = serverParamsAfter[targetServerUuid];
-      if (!paramsForServer) {
-        throw new Error(
-          `Cannot re-initialize OpenAPI session: server ${targetServerUuid} no longer present in namespace ${context.namespaceUuid}`,
-        );
-      }
-
-      const freshSession = await mcpServerPool.getSession(
-        context.sessionId,
-        targetServerUuid,
-        paramsForServer,
-        context.namespaceUuid,
-      );
+      // One recovery per failed client across every concurrent bridge call
+      // on this session id, and no invalidation when the client was already
+      // retired by another recovery (session-recovery.ts), as in
+      // metamcp-proxy.ts.
+      const failedClient = targetSession;
+      const freshSession = await recoverFailedSession({
+        pool: mcpServerPool,
+        recoveries: recoveriesFor(context.sessionId),
+        sessionId: context.sessionId,
+        serverUuid: targetServerUuid,
+        failedClient,
+        reacquire: async () => {
+          const serverParamsAfter = await getMcpServers(context.namespaceUuid);
+          const paramsForServer = serverParamsAfter[targetServerUuid];
+          if (!paramsForServer) {
+            throw new Error(
+              `Cannot re-initialize OpenAPI session: server ${targetServerUuid} no longer present in namespace ${context.namespaceUuid}`,
+            );
+          }
+          return await mcpServerPool.getSession(
+            context.sessionId,
+            targetServerUuid,
+            paramsForServer,
+            context.namespaceUuid,
+          );
+        },
+      });
       if (!freshSession) {
         throw new Error(
           `OpenAPI bridge: failed to re-initialize session for server ${targetServerUuid} after backend session loss`,
         );
       }
-
-      toolToClient[name] = freshSession;
-      toolToServerUuid[name] = targetServerUuid;
-
       try {
         return (await callOnce(freshSession)) as CallToolResult;
       } catch (retryError) {

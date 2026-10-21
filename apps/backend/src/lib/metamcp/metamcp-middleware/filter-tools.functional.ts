@@ -30,6 +30,14 @@ export interface FilterToolsConfig {
 /** The routing handler may use only the servers this call's filter judged. */
 export interface ToolFilterCallContext extends MetaMCPHandlerContext {
   allowedToolServerUuids?: readonly string[];
+  /**
+   * The namespace tool policy this call was judged under. The routing handler
+   * routes a tool with no mapping row through its prefix-matched server only
+   * under `allow_all` (tool-call-routing.ts), so it reads the same policy the
+   * verdict used rather than reading it again. Absent when no filter ran, and
+   * the handler then never widens.
+   */
+  toolPolicy?: NamespaceToolPolicy;
 }
 
 /**
@@ -407,6 +415,7 @@ async function isToolAllowed(
   allowed: boolean;
   reason?: string;
   serverUuids?: string[];
+  policy?: NamespaceToolPolicy;
 }> {
   try {
     const policy = await getNamespaceToolPolicy(namespaceUuid, useCache);
@@ -417,7 +426,7 @@ async function isToolAllowed(
       // `allow_all` lets it through to the handler as before (which rejects
       // the format); `allowlist` refuses it here.
       return policy === "allow_all"
-        ? { allowed: true }
+        ? { allowed: true, policy }
         : { allowed: false, reason: NOT_ALLOWLISTED_REASON };
     }
 
@@ -439,7 +448,7 @@ async function isToolAllowed(
     );
 
     return verdict.served
-      ? { allowed: true, serverUuids }
+      ? { allowed: true, serverUuids, policy }
       : { allowed: false, reason: verdict.reason };
   } catch (error) {
     logger.error(
@@ -514,7 +523,7 @@ export function createFilterCallToolMiddleware(
       // The server is resolved from the tool name's prefix among the servers
       // mounted in THIS namespace (namespace-server-lookup.ts), never by name
       // across the whole estate.
-      const { allowed, reason, serverUuids } = await isToolAllowed(
+      const { allowed, reason, serverUuids, policy } = await isToolAllowed(
         toolName,
         context.namespaceUuid,
         useCache,
@@ -539,6 +548,7 @@ export function createFilterCallToolMiddleware(
       const callContext: ToolFilterCallContext = {
         ...context,
         allowedToolServerUuids: serverUuids,
+        toolPolicy: policy,
       };
       return handler(request, callContext);
     };

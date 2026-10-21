@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import logger from "@/utils/logger";
 
+import { BackendUnavailableError } from "../backend-unavailable";
 import { runWithCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import { ToolArgSchemaRegistry } from "../tool-arg-keys";
@@ -691,6 +692,26 @@ describe("in-band classification (migration 0039 error_detail)", () => {
     const entry = recorder.mock.calls[0][0];
     expect(entry.success).toBe(false);
     expect(entry.error_code).toBe("unknown_tool");
+  });
+
+  it("records a thrown backend-unavailable as its own class, never unknown_tool, and rethrows it", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const unavailable = new BackendUnavailableError(
+      "cipp__graph_query",
+      "cipp",
+      "no_session",
+    );
+
+    const wrapped = auditing()(vi.fn().mockRejectedValue(unavailable));
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(
+      unavailable,
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("backend_unavailable");
   });
 
   it("any other thrown error keeps its original class", async () => {

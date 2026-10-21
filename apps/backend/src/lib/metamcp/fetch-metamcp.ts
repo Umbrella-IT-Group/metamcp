@@ -15,6 +15,46 @@ import { getDefaultEnvironment } from "./utils";
 // Define IOType for stderr handling
 export type IOType = "overlapped" | "pipe" | "ignore" | "inherit";
 
+/** One server mounted in a namespace, whatever its mount status and error gate. */
+export interface NamespaceServerState {
+  uuid: string;
+  name: string;
+  /** namespace_server_mappings.status: ACTIVE or INACTIVE. */
+  mountStatus: string;
+  /** mcp_servers.error_status: NONE, or ERROR when the server is error-gated. */
+  errorStatus: string;
+}
+
+/**
+ * Every server mounted in the namespace, INCLUDING the error-gated ones
+ * `getMcpServers` leaves out, with each one's mount status and error gate.
+ *
+ * tools/call routing uses it only after a miss, to tell a name whose server is
+ * mounted but error-gated (a transient "backend unavailable") from a name no
+ * mounted server carries ("Unknown tool"); see tool-call-routing.ts.
+ *
+ * Unlike `getMcpServers`, a database error is NOT caught: it must stay
+ * distinguishable from "no such server", so the caller can refuse to call a
+ * real tool unknown just because the lookup failed.
+ */
+export async function getNamespaceServerStates(
+  namespaceUuid: string,
+): Promise<NamespaceServerState[]> {
+  return await db
+    .select({
+      uuid: mcpServersTable.uuid,
+      name: mcpServersTable.name,
+      mountStatus: namespaceServerMappingsTable.status,
+      errorStatus: mcpServersTable.error_status,
+    })
+    .from(mcpServersTable)
+    .innerJoin(
+      namespaceServerMappingsTable,
+      eq(mcpServersTable.uuid, namespaceServerMappingsTable.mcp_server_uuid),
+    )
+    .where(eq(namespaceServerMappingsTable.namespace_uuid, namespaceUuid));
+}
+
 export async function getMcpServers(
   namespaceUuid: string,
   includeInactiveServers: boolean = false,

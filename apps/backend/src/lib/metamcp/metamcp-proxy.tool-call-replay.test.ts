@@ -71,6 +71,7 @@ vi.mock("../config.service", () => ({
 
 vi.mock("./fetch-metamcp", () => ({
   getMcpServers: vi.fn(async () => ({ "server-ninja": { name: "ninja" } })),
+  getNamespaceServerStates: vi.fn(async () => []),
 }));
 
 vi.mock("./mcp-server-pool", () => ({
@@ -78,6 +79,9 @@ vi.mock("./mcp-server-pool", () => ({
     getSession: getSessionMock,
     invalidateServerConnection: invalidateServerConnectionMock,
     cleanupSession: vi.fn(),
+    // Every failed client here still holds its pool slot, so a recovery
+    // invalidates exactly as before (session-recovery.ts).
+    isPooledClient: () => true,
   },
 }));
 
@@ -385,7 +389,12 @@ describe("metamcp-proxy dynamic-find tools/list keeps its recovery", () => {
     getSessionMock.mockResolvedValue(target.session);
     const consumer = await connectConsumer();
 
-    await expect(callTool(consumer)).rejects.toThrow("Unknown tool");
+    // The server is mounted and did not answer the lookup: that is an
+    // unavailable backend (the tool was not run), not an unknown tool. This
+    // answered "Unknown tool" before the routing fix.
+    await expect(callTool(consumer)).rejects.toThrow(
+      'Backend "ninja" is unavailable (tool_lookup_failed): tool "ninja__delete_file" was not run. Retry the call.',
+    );
     expect(target.executions()).toBe(0);
     // A timed-out read does not imply a lost session. A subsequent lookup
     // can succeed on the same client without disrupting other callers.

@@ -102,6 +102,7 @@ vi.mock("../config.service", () => ({
 
 vi.mock("./fetch-metamcp", () => ({
   getMcpServers: vi.fn(async () => ({ "server-ninja": { name: "ninja" } })),
+  getNamespaceServerStates: vi.fn(async () => []),
 }));
 
 vi.mock("./mcp-server-pool", () => ({
@@ -571,5 +572,58 @@ describe("tools/call reconnect-window fallback under the allowlist policy", () =
     // The fallback looked up the ORIGINAL tool name in this namespace.
     expect(findServersMock).toHaveBeenCalledWith(NS, "list_things");
     expect(warmupMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("tools/call with no mapping row under allow_all (the zero-rows gap)", () => {
+  /**
+   * The reconnect window again, but in the namespace shape that hit it in
+   * production: the tool has no mapping row, so the row-based fallback finds
+   * nothing to warm. The real filter allows the call (no row, `allow_all`) and
+   * binds that policy, so routing warms the prefix's server itself.
+   */
+  const inReconnectWindowWithNoRow = async (warmed?: ConnectedClient) => {
+    getSessionMock.mockReset();
+    getSessionMock.mockResolvedValue(undefined);
+    warmupMock.mockResolvedValue(warmed);
+    findServersMock.mockResolvedValue([]);
+  };
+
+  it("recovers a row-less tool through the prefix's server", async () => {
+    const consumer = await connectConsumer();
+    await inReconnectWindowWithNoRow(await backend());
+
+    const result = await call(consumer, "ninja__unmapped");
+
+    expect(textOf(result)).toBe("ran unmapped");
+    expect(findServersMock).toHaveBeenCalledWith(NS, "unmapped");
+    expect(warmupMock).toHaveBeenCalledTimes(1);
+    expect(warmupMock.mock.calls[0]?.[0]).toMatchObject({
+      serverUuid: SERVER.uuid,
+    });
+  });
+
+  it("answers backend unavailable, not Unknown tool, when the warm-up comes back empty", async () => {
+    const consumer = await connectConsumer();
+    await inReconnectWindowWithNoRow(undefined);
+
+    await expect(call(consumer, "ninja__unmapped")).rejects.toThrow(
+      'Backend "ninja" is unavailable (no_session): tool "ninja__unmapped" was not run. Retry the call.',
+    );
+    expect(ran).toEqual([]);
+  });
+
+  it("does not warm anything for a row-less tool under allowlist (the filter refuses it first)", async () => {
+    usePolicy("allowlist");
+    const consumer = await connectConsumer();
+    await inReconnectWindowWithNoRow(await backend());
+
+    const result = await call(consumer, "ninja__unmapped");
+
+    expect(textOf(result)).toBe(
+      `Access denied to tool "ninja__unmapped": ${NOT_ALLOWLISTED}`,
+    );
+    expect(warmupMock).not.toHaveBeenCalled();
+    expect(ran).toEqual([]);
   });
 });

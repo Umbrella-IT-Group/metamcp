@@ -327,6 +327,61 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
 //      failure).
 // -------------------------------------------------------------------
 
+describe("McpServerPool.isPooledClient", () => {
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, FakeClient>>;
+    idleSessions: Record<string, FakeClient>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+  };
+
+  beforeEach(() => {
+    pool = new PoolConstructor();
+    internals = pool as any;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+  });
+
+  it("is true for a client in any session's active slot or in the idle slot", () => {
+    const active = makeFakeClient();
+    const idle = makeFakeClient();
+    internals.activeSessions["session-B"] = { "server-1": active };
+    internals.idleSessions["server-1"] = idle;
+
+    expect(pool.isPooledClient("server-1", active as never)).toBe(true);
+    expect(pool.isPooledClient("server-1", idle as never)).toBe(true);
+  });
+
+  it("is false for the same client under another server, and for a stranger", () => {
+    const active = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-1": active };
+
+    expect(pool.isPooledClient("server-2", active as never)).toBe(false);
+    expect(pool.isPooledClient("server-1", makeFakeClient() as never)).toBe(
+      false,
+    );
+  });
+
+  it("is false for every client an invalidation retired", async () => {
+    const a = makeFakeClient();
+    const b = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-1": a };
+    internals.activeSessions["session-B"] = { "server-1": b };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+    internals.sessionToServers["session-B"] = new Set(["server-1"]);
+
+    await pool.invalidateServerConnection("session-A", "server-1");
+
+    // A recovery in session B now knows its client was already retired and
+    // must not cascade a second time.
+    expect(pool.isPooledClient("server-1", a as never)).toBe(false);
+    expect(pool.isPooledClient("server-1", b as never)).toBe(false);
+  });
+});
+
 describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
   let pool: McpServerPool;
   let internals: {

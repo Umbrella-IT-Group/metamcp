@@ -46,6 +46,9 @@ vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi
     .fn()
     .mockResolvedValue({ "server-ninja": { name: "ninja" } }),
+  // Read only after a routing miss with no prefix-matched server, to tell an
+  // error-gated mounted server from an unknown name (tool-call-routing.ts).
+  getNamespaceServerStates: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("../../../db/repositories/namespaces.repo", () => ({
   namespacesRepository: {

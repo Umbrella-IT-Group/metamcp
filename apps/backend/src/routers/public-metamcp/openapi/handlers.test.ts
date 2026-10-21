@@ -75,6 +75,9 @@ vi.mock("../../../lib/metamcp/mcp-server-pool", () => ({
   mcpServerPool: {
     invalidateServerConnection: invalidateServerConnectionMock,
     getSession: getSessionMock,
+    // Every failed client here still holds its pool slot, so a recovery
+    // invalidates exactly as before (session-recovery.ts).
+    isPooledClient: () => true,
   },
 }));
 

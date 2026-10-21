@@ -23,7 +23,6 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { namespacesRepository } from "../../db/repositories/namespaces.repo";
 import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
@@ -56,8 +55,13 @@ import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
 } from "./session-error";
+import { recoverFailedSession, SessionRecoveries } from "./session-recovery";
 import { ToolArgSchemaRegistry } from "./tool-arg-keys";
-import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
+import {
+  PrefixCandidate,
+  ProbeOutcome,
+  routeUnmappedToolCall,
+} from "./tool-call-routing";
 import {
   parseToolName,
   registerToolRoute,
@@ -507,6 +511,144 @@ export const createServer = async (
     return { tools: allTools };
   };
 
+  // Session recoveries started by this proxy's tool calls, one per failed
+  // client however many calls fail on it (session-recovery.ts). Per proxy,
+  // because a proxy serves exactly one session id.
+  const recoveries: SessionRecoveries = new WeakMap();
+
+  const listToolPages = async (
+    session: ConnectedClient,
+  ): Promise<z.infer<typeof ListToolsResultSchema>[]> => {
+    const pages: z.infer<typeof ListToolsResultSchema>[] = [];
+    let cursor: string | undefined = undefined;
+    let hasMore = true;
+    while (hasMore) {
+      const page: z.infer<typeof ListToolsResultSchema> =
+        await session.client.request(
+          {
+            method: "tools/list",
+            params: { cursor },
+          },
+          ListToolsResultSchema,
+        );
+      pages.push(page);
+      cursor = page.nextCursor;
+      hasMore = !!page.nextCursor;
+    }
+    return pages;
+  };
+
+  /**
+   * Does this prefix-matched server serve the tool? Lists its tools (all
+   * pages) and looks for the backend name. A stale pooled session answers
+   * tools/list with the same session-lost envelope as tools/call, so a
+   * recoverable failure gets one recovery (shared with any parallel call
+   * failing on the same client) and one more listing; a timeout or any other
+   * failure is reported as a failed lookup, never as "no such tool".
+   */
+  const probeServerForTool = async (
+    session: ConnectedClient,
+    candidate: PrefixCandidate,
+    name: string,
+    serverPrefix: string,
+    originalToolName: string,
+  ): Promise<ProbeOutcome> => {
+    // Idempotent. Tools discovered only through this lookup never pass the
+    // list handler's getSession, so without this they would never get a
+    // list_changed subscriber.
+    registerListChangedSubscriber(session, candidate.uuid);
+
+    if (!session.client.getServerCapabilities()?.tools) {
+      return { kind: "absent" };
+    }
+    // The configured name already matched the prefix; this is the final gate
+    // for a server stored with no name, identified by its backend name.
+    const serverName =
+      candidate.params.name || session.client.getServerVersion()?.name || "";
+    if (sanitizeName(serverName) !== serverPrefix) {
+      return { kind: "absent" };
+    }
+
+    let activeSession = session;
+    let pages: z.infer<typeof ListToolsResultSchema>[];
+    try {
+      pages = await listToolPages(activeSession);
+    } catch (error) {
+      if (!isRecoverableBackendError(error)) {
+        logger.warn(
+          `Tool lookup on server ${candidate.uuid} failed while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool. (${
+            error instanceof Error ? error.message : String(error)
+          })`,
+        );
+        return { kind: "lookup_failed" };
+      }
+      logger.warn(
+        `Backend connection lost for server ${candidate.uuid} on dynamic tools/list while routing tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
+      let fresh: ConnectedClient | undefined;
+      try {
+        fresh = await recoverFailedSession({
+          pool: mcpServerPool,
+          recoveries,
+          sessionId,
+          serverUuid: candidate.uuid,
+          failedClient: activeSession,
+          reacquire: () =>
+            mcpServerPool.getSession(
+              sessionId,
+              candidate.uuid,
+              candidate.params,
+              namespaceUuid,
+            ),
+        });
+      } catch (recoveryError) {
+        logger.error(
+          `Failed to re-initialize session for server ${candidate.uuid} after backend session loss during dynamic tool routing:`,
+          recoveryError,
+        );
+        return { kind: "no_session" };
+      }
+      if (!fresh) {
+        logger.error(
+          `Failed to re-initialize session for server ${candidate.uuid} after backend session loss during dynamic tool routing`,
+        );
+        return { kind: "no_session" };
+      }
+      registerListChangedSubscriber(fresh, candidate.uuid);
+      activeSession = fresh;
+      try {
+        pages = await listToolPages(activeSession);
+      } catch (retryError) {
+        logger.warn(
+          `Tool lookup on server ${candidate.uuid} failed again after session recovery while routing tool ${JSON.stringify(name)}. (${
+            retryError instanceof Error
+              ? retryError.message
+              : String(retryError)
+          })`,
+        );
+        return { kind: "lookup_failed" };
+      }
+    }
+
+    const listed = pages.some((page) =>
+      page.tools?.some((tool: Tool) => tool.name === originalToolName),
+    );
+    return listed
+      ? { kind: "found", session: activeSession }
+      : { kind: "absent" };
+  };
+
+  /** Drop every route that still points at a client whose recovery failed. */
+  const forgetRoutesTo = (failedClient: ConnectedClient): void => {
+    for (const [routedName, routedClient] of Object.entries(toolToClient)) {
+      if (routedClient === failedClient) {
+        delete toolToClient[routedName];
+      }
+    }
+  };
+
   // Original Call Tool Handler
   const originalCallToolHandler: CallToolHandler = async (request, context) => {
     const { name, arguments: args } = request.params;
@@ -535,214 +677,43 @@ export const createServer = async (
       serverUuid = undefined;
     }
 
-    // If not found in mappings, dynamically find the server and route the call
+    // Not in the routing map: resolve the server from the tool's prefix.
+    // Only the namespace's servers whose name matches the prefix are touched;
+    // a miss on a mounted server answers "backend unavailable" (the tool was
+    // not run, retry) instead of "Unknown tool". See tool-call-routing.ts.
     if (!clientForTool || !serverUuid) {
-      try {
-        // Get all MCP servers for this namespace
-        const serverParams = await getMcpServers(
-          namespaceUuid,
-          includeInactiveServers,
-        );
-
-        // Find the server with the matching name prefix
-        for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
-          if (!isAllowedServer(mcpServerUuid)) continue;
-          const session = await mcpServerPool.getSession(
-            sessionId,
-            mcpServerUuid,
-            params,
-            namespaceUuid,
-          );
-
-          if (session) {
-            // Idempotent — see registerListChangedSubscriber dedupe note.
-            // Required here too: tools discovered only via dynamic-find
-            // never hit the `originalListToolsHandler` `getSession`, so
-            // without this they'd never get a subscriber attached.
-            registerListChangedSubscriber(session, mcpServerUuid);
-
-            const capabilities = session.client.getServerCapabilities();
-            if (!capabilities?.tools) continue;
-
-            // Use name assigned by user, fallback to name from server
-            const serverName =
-              params.name || session.client.getServerVersion()?.name || "";
-
-            if (sanitizeName(serverName) === serverPrefix) {
-              // Found the server, now check if it has this tool with pagination.
-              // If the cached session is stale (backend restarted between when
-              // we last connected and now), `tools/list` returns the same
-              // -32600 / "Session not found" envelope as `tools/call`. Engage
-              // the same recovery path: invalidate the pool entry, re-acquire
-              // a fresh session, retry once. Without this the dynamic-find
-              // path silently swallows the failure (logs error, continues to
-              // next server) and the agent gets `Unknown tool` instead of
-              // either a successful tool call or a real not-found error.
-              const listToolsOnce = async (
-                activeSession: ConnectedClient,
-              ): Promise<z.infer<typeof ListToolsResultSchema>[]> => {
-                const pages: z.infer<typeof ListToolsResultSchema>[] = [];
-                let cursor: string | undefined = undefined;
-                let hasMore = true;
-                while (hasMore) {
-                  const page: z.infer<typeof ListToolsResultSchema> =
-                    await activeSession.client.request(
-                      {
-                        method: "tools/list",
-                        params: { cursor },
-                      },
-                      ListToolsResultSchema,
-                    );
-                  pages.push(page);
-                  cursor = page.nextCursor;
-                  hasMore = !!page.nextCursor;
-                }
-                return pages;
-              };
-
-              const matchOnPages = (
-                pages: z.infer<typeof ListToolsResultSchema>[],
-              ): boolean =>
-                pages.some((page) =>
-                  page.tools?.some(
-                    (tool: Tool) => tool.name === originalToolName,
-                  ),
-                );
-
-              try {
-                let activeSession = session;
-                let pages: z.infer<typeof ListToolsResultSchema>[];
-                try {
-                  pages = await listToolsOnce(activeSession);
-                } catch (error) {
-                  if (!isRecoverableBackendError(error)) {
-                    throw error;
-                  }
-                  logger.warn(
-                    `Backend connection lost for server ${mcpServerUuid} on dynamic tools/list while routing tool "${name}"; invalidating pool and retrying once. (envelope: ${
-                      error instanceof Error ? error.message : String(error)
-                    })`,
-                  );
-                  await mcpServerPool.invalidateServerConnection(
-                    sessionId,
-                    mcpServerUuid,
-                  );
-                  const fresh = await mcpServerPool.getSession(
-                    sessionId,
-                    mcpServerUuid,
-                    params,
-                    namespaceUuid,
-                  );
-                  if (!fresh) {
-                    throw new Error(
-                      `Failed to re-initialize session for server ${mcpServerUuid} after backend session loss during dynamic tool routing`,
-                    );
-                  }
-                  registerListChangedSubscriber(fresh, mcpServerUuid);
-                  activeSession = fresh;
-                  pages = await listToolsOnce(activeSession);
-                }
-
-                if (matchOnPages(pages)) {
-                  // Tool exists, populate mappings for future use and use it
-                  clientForTool = activeSession;
-                  serverUuid = mcpServerUuid;
-                  toolToClient[name] = activeSession;
-                  toolToServerUuid[name] = mcpServerUuid;
-                  break;
-                }
-              } catch (error) {
-                logger.error(
-                  `Error checking tools for server ${serverName}:`,
-                  error,
-                );
-                continue;
-              }
-            }
-          }
-        }
-
-        // Reconnect-window fallback: the loop above only reaches the
-        // name-prefix check when `mcpServerPool.getSession` already has
-        // (or can immediately mint) a live connection. During an
-        // upstream reconnect, `invalidateServerConnection` tears the
-        // pooled client down and fires `list_changed` BEFORE the
-        // replacement connection exists (mcp-server-pool.ts) — a call
-        // landing in that gap sees `getSession` return `undefined` for
-        // the owning server too, so the loop never even checks its name
-        // and this would otherwise fall straight to "Unknown tool"
-        // despite the tool being real (observed as a tools/call 404
-        // during an upstream reconnect).
-        //
-        // Use the DB `toolsTable` (populated by the last successful
-        // tools/list sync) as last-known-good routing to find the
-        // owning server WITHOUT needing a live session, then give that
-        // one server a short, bounded chance to come back. Skip
-        // entirely — no wait — when the DB has no record of this tool:
-        // that's a genuinely unknown tool, not a reconnect race, and it
-        // must still 404 immediately.
-        //
-        // The candidates are ACTIVE mapping rows only
-        // (findServersForNamespaceToolName), so this never warms or routes
-        // a server whose row for the tool is switched off, nor, under the
-        // `allowlist` tool policy, one with no row. The filter middleware
-        // already refused those by name; the query keeps the server this
-        // picks inside the same rule rather than relying on that.
-        if (!clientForTool) {
-          const candidates =
-            await namespacesRepository.findServersForNamespaceToolName(
-              namespaceUuid,
-              originalToolName,
-            );
-          const match = candidates.find(
-            (candidate) =>
-              isAllowedServer(candidate.serverUuid) &&
-              sanitizeName(candidate.serverName || "") === serverPrefix,
-          );
-          const paramsForMatch = match
-            ? serverParams[match.serverUuid]
-            : undefined;
-
-          // No `paramsForMatch` means the server isn't in the
-          // active/non-error namespace set right now (getMcpServers
-          // already filtered it out above) — it was removed or
-          // disabled, not mid-reconnect. Don't wait for something that
-          // isn't coming back.
-          if (match && paramsForMatch) {
-            const warmupTimeoutMs =
-              await configService.getMcpToolCallReconnectWarmupTimeout();
-            const warmedSession = await acquireSessionWithBoundedWarmup({
-              pool: mcpServerPool,
-              sessionId,
-              serverUuid: match.serverUuid,
-              params: paramsForMatch,
-              namespaceUuid,
-              timeoutMs: warmupTimeoutMs,
-            });
-
-            if (
-              warmedSession &&
-              warmedSession.client.getServerCapabilities()?.tools
-            ) {
-              registerListChangedSubscriber(warmedSession, match.serverUuid);
-              clientForTool = warmedSession;
-              serverUuid = match.serverUuid;
-              toolToClient[name] = warmedSession;
-              toolToServerUuid[name] = match.serverUuid;
-            }
-          }
-        }
-      } catch (error) {
-        logger.error(`Error dynamically finding tool ${name}:`, error);
-      }
-    }
-
-    if (!clientForTool) {
-      throw new Error(`Unknown tool: ${name}`);
-    }
-
-    if (!serverUuid) {
-      throw new Error(`Server UUID not found for tool: ${name}`);
+      const serverParams = await getMcpServers(
+        namespaceUuid,
+        includeInactiveServers,
+      );
+      const route = await routeUnmappedToolCall({
+        namespaceUuid,
+        sessionId,
+        toolName: name,
+        serverPrefix,
+        originalToolName,
+        serverParams,
+        isAllowedServer,
+        toolPolicy: (context as ToolFilterCallContext).toolPolicy,
+        includeInactiveServers,
+        unknownToolMessage: `Unknown tool: ${name}`,
+        pool: mcpServerPool,
+        probe: (session, candidate) =>
+          probeServerForTool(
+            session,
+            candidate,
+            name,
+            serverPrefix,
+            originalToolName,
+          ),
+      });
+      // Idempotent; a session reached only through the fallback warm-up has
+      // not had its subscriber attached yet.
+      registerListChangedSubscriber(route.session, route.serverUuid);
+      clientForTool = route.session;
+      serverUuid = route.serverUuid;
+      toolToClient[name] = route.session;
+      toolToServerUuid[name] = route.serverUuid;
     }
 
     const abortController = new AbortController();
@@ -797,38 +768,66 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; invalidating pool and retrying once. (envelope: ${
+        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; recovering the session and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
 
-      await mcpServerPool.invalidateServerConnection(sessionId, serverUuid);
-      delete toolToClient[name];
-
-      const serverParamsMap = await getMcpServers(
-        namespaceUuid,
-        includeInactiveServers,
-      );
-      const params = serverParamsMap[serverUuid];
-      if (!params) {
-        throw new Error(
-          `Cannot re-initialize session: server ${serverUuid} no longer present in namespace ${namespaceUuid}`,
-        );
+      // One recovery per failed client, shared by every call that fails on
+      // it, and no invalidation when that client was already retired by
+      // another recovery (session-recovery.ts). Parallel calls on a stale
+      // client used to each invalidate the server, retiring the replacement a
+      // sibling had just built and cutting calls already running on it.
+      const failedClient = clientForTool;
+      const routedServerUuid = serverUuid;
+      let freshSession: ConnectedClient | undefined;
+      try {
+        freshSession = await recoverFailedSession({
+          pool: mcpServerPool,
+          recoveries,
+          sessionId,
+          serverUuid: routedServerUuid,
+          failedClient,
+          reacquire: async () => {
+            const serverParamsMap = await getMcpServers(
+              namespaceUuid,
+              includeInactiveServers,
+            );
+            const params = serverParamsMap[routedServerUuid];
+            if (!params) {
+              throw new Error(
+                `Cannot re-initialize session: server ${routedServerUuid} no longer present in namespace ${namespaceUuid}`,
+              );
+            }
+            return await mcpServerPool.getSession(
+              sessionId,
+              routedServerUuid,
+              params,
+              namespaceUuid,
+            );
+          },
+        });
+      } catch (recoveryError) {
+        forgetRoutesTo(failedClient);
+        throw recoveryError;
       }
-
-      const freshSession = await mcpServerPool.getSession(
-        sessionId,
-        serverUuid,
-        params,
-        namespaceUuid,
-      );
       if (!freshSession) {
+        forgetRoutesTo(failedClient);
         throw new Error(
-          `Failed to re-initialize session for server ${serverUuid} after backend session loss`,
+          `Failed to re-initialize session for server ${routedServerUuid} after backend session loss`,
         );
       }
 
-      registerListChangedSubscriber(freshSession, serverUuid);
+      registerListChangedSubscriber(freshSession, routedServerUuid);
+      // Replace, never delete-then-set: a call arriving while the recovery
+      // ran found the old route, failed on the dead client and joined this
+      // same recovery, instead of finding no route and taking the dynamic
+      // lookup. Every route that pointed at the dead client moves over.
+      for (const [routedName, routedClient] of Object.entries(toolToClient)) {
+        if (routedClient === failedClient) {
+          toolToClient[routedName] = freshSession;
+        }
+      }
       toolToClient[name] = freshSession;
 
       try {

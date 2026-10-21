@@ -32,10 +32,11 @@ import { sanitizeName } from "./utils";
  * the latched failure belongs to a DIFFERENT server than the tool being
  * called — in both cases the caller should re-throw its original error.
  *
- * Gated on ownership: routing an unrelated tool can inadvertently
- * probe-connect the m365 backend (dynamic-find walks every server in the
- * namespace) and latch a failure that must not hijack the real tool's
- * error. Only the injected m365 server can ever latch here today.
+ * Gated on ownership: a latched failure from any server other than the
+ * one the tool's prefix names must not hijack the real tool's error.
+ * Routing now connects only the prefix's own servers (tool-call-routing.ts;
+ * it used to walk every server in the namespace), so a foreign latch is
+ * unlikely, and the gate keeps it harmless if one ever occurs. Only the injected m365 server can ever latch here today.
  *
  * ALWAYS drains via `takeConnectBrokerFailure` — even on a non-match —
  * so a stale failure from probing an unrelated server during dynamic

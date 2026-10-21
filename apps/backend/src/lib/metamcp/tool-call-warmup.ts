@@ -44,8 +44,8 @@ export interface AcquireSessionWithBoundedWarmupOptions {
  * `tools/call` landing in that gap sees `getSession` return `undefined`
  * even though the owning server is real and just mid-reconnect
  * (`createNewConnection` returns `undefined` on a failed/backing-off
- * attempt) — without this helper, callers fall straight through to
- * "Unknown tool", which the OpenAPI bridge maps to a literal HTTP 404.
+ * attempt). Without this helper, callers fall straight through to a
+ * routing failure (tool-call-routing.ts), which used to read "Unknown tool".
  *
  * Each attempt races `pool.getSession` against `timeoutMs` rather than
  * waiting out the full connect, which can itself take 30s+ per hop
@@ -61,11 +61,12 @@ export interface AcquireSessionWithBoundedWarmupOptions {
  * for concurrent request races.
  *
  * Bounded on purpose: a genuinely-dead upstream must fail within
- * `attempts * timeoutMs`, never hang. Callers are expected to fall
- * through to their existing "Unknown tool" error when this resolves
- * `undefined`, and to skip calling this entirely when they have no
- * last-known-good server to warm up (a tool that truly doesn't exist
- * anywhere must still 404 without paying this wait).
+ * `attempts * timeoutMs`, never hang. When this resolves `undefined` the
+ * caller answers "backend unavailable" (the server is mounted, the tool was
+ * not run), and it calls this only for a server that may own the tool: one
+ * with an ACTIVE mapping row for it, or, under the `allow_all` tool policy,
+ * the prefix's own server. A name no mounted server carries must still fail
+ * at once without paying this wait (tool-call-routing.ts).
  */
 export async function acquireSessionWithBoundedWarmup(
   opts: AcquireSessionWithBoundedWarmupOptions,

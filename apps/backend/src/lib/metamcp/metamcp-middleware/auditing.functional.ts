@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 
 import logger from "@/utils/logger";
 
+import {
+  BACKEND_UNAVAILABLE,
+  isBackendUnavailableError,
+} from "../backend-unavailable";
 import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import type { ToolArgSchema } from "../tool-arg-keys";
@@ -227,6 +231,9 @@ function errorCode(error: unknown): string {
   // serves. Record it as the class `unknown_tool` instead of the JS class name
   // `Error`, so unmapped or mistyped tool names are measurable too.
   if (isUnknownToolError(error)) return "unknown_tool";
+  // A mounted server that could not be used: the tool was not run. Its own
+  // class, so a transient routing failure is never counted as a missing tool.
+  if (isBackendUnavailableError(error)) return BACKEND_UNAVAILABLE;
   if (error && typeof error === "object") {
     const code = (error as { code?: unknown }).code;
     if (typeof code === "number" || typeof code === "string") {

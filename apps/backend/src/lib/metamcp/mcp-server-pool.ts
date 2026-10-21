@@ -1640,6 +1640,25 @@ export class McpServerPool {
   }
 
   /**
+   * True while `client` still holds a pool slot for `serverUuid`: an active
+   * slot in any session, or the server's idle slot.
+   *
+   * A tools/call recovery asks this before invalidating. An invalidation
+   * retires EVERY client of the server, so a caller whose client was already
+   * retired by someone else's invalidation (another session, or a parallel
+   * call in the same one) must not invalidate again: that second cascade would
+   * retire the fresh connection the first one just built, and cut calls
+   * already running on it. Such a caller only needs a new session.
+   */
+  isPooledClient(serverUuid: string, client: ConnectedClient): boolean {
+    if (this.idleSessions[serverUuid] === client) return true;
+    for (const servers of Object.values(this.activeSessions)) {
+      if (servers[serverUuid] === client) return true;
+    }
+    return false;
+  }
+
+  /**
    * Drop the pooled backend connection(s) for a given (sessionId, serverUuid).
    *
    * Used when the backend MCP server reports our Mcp-Session-Id is unknown
