@@ -698,8 +698,8 @@ describe("in-band classification (migration 0039 error_detail)", () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
     const unavailable = new BackendUnavailableError(
-      "cipp__graph_query",
-      "cipp",
+      "gamma__run_report",
+      "gamma",
       "no_session",
     );
 

@@ -338,9 +338,11 @@ export async function routeUnmappedToolCall(
  * answers unavailable. A named candidate that was reached and did not serve
  * the tool answers `Unknown tool`. With no candidate at all, the namespace's
  * mounted servers are read once more, error-gated ones included: a gated
- * server under the prefix answers unavailable (`error_gated`), anything else
- * `Unknown tool`. A failed read answers unavailable (`routing_lookup_failed`)
- * rather than calling a possibly real tool unknown.
+ * server under the prefix answers unavailable (`error_gated`); a routable,
+ * ungated one the first read missed answers unavailable
+ * (`routing_lookup_failed`); anything else `Unknown tool`. A failed read also
+ * answers `routing_lookup_failed` rather than calling a possibly real tool
+ * unknown.
  */
 async function unroutedToolError(options: {
   namespaceUuid: string;
@@ -381,16 +383,32 @@ async function unroutedToolError(options: {
     );
   }
 
-  const gated = states.find(
+  const owners = states.filter(
     (state) =>
       options.isAllowedServer(state.uuid) &&
       sanitizeName(state.name) === serverPrefix &&
       (options.includeInactiveServers ||
-        state.mountStatus === McpServerStatusEnum.enum.ACTIVE) &&
-      state.errorStatus !== McpServerErrorStatusEnum.enum.NONE,
+        state.mountStatus === McpServerStatusEnum.enum.ACTIVE),
+  );
+  const gated = owners.find(
+    (state) => state.errorStatus !== McpServerErrorStatusEnum.enum.NONE,
   );
   if (gated) {
     return new BackendUnavailableError(toolName, gated.name, "error_gated");
+  }
+  // Mounted, routable and not gated, yet absent from the routable set this
+  // call read moments ago: that read failed (getMcpServers answers an empty
+  // set on a database error, it does not throw) or the server was mounted in
+  // between. Either way the name is not unknown, so it must not read as one.
+  // (getMcpServers also skips an SSE or Streamable-HTTP server stored with no
+  // url, a database-only edge the API refuses; that one lands here too.)
+  const unread = owners[0];
+  if (unread) {
+    return new BackendUnavailableError(
+      toolName,
+      unread.name,
+      "routing_lookup_failed",
+    );
   }
   return new Error(options.unknownToolMessage);
 }

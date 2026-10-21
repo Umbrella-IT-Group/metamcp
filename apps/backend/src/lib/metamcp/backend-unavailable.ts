@@ -40,7 +40,9 @@ export const BACKEND_UNAVAILABLE = "backend_unavailable" as const;
  *   - `tool_lookup_failed`: a session existed but the server did not answer
  *     the tool list the gateway uses to confirm the tool.
  *   - `routing_lookup_failed`: the gateway could not read the namespace's
- *     servers, so it could not tell an unknown name from an unavailable one.
+ *     servers, so it could not tell an unknown name from an unavailable one,
+ *     or its read of the routable servers missed one that is mounted under
+ *     the prefix, active and not gated (a failed or racing read).
  */
 export type BackendUnavailableReason =
   | "error_gated"

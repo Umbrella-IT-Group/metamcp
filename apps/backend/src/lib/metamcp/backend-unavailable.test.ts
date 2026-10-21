@@ -9,14 +9,14 @@ import { isUnknownToolError, looksLikeUnknownTool } from "./unknown-tool";
 
 describe("BackendUnavailableError", () => {
   const error = new BackendUnavailableError(
-    "cipp__graph_query",
-    "cipp",
+    "gamma__run_report",
+    "gamma",
     "no_session",
   );
 
   it("says the server was unavailable and the tool did not run", () => {
     expect(error.message).toBe(
-      'Backend "cipp" is unavailable (no_session): tool "cipp__graph_query" was not run. Retry the call.',
+      'Backend "gamma" is unavailable (no_session): tool "gamma__run_report" was not run. Retry the call.',
     );
     expect(error.name).toBe("BackendUnavailableError");
   });
@@ -25,8 +25,8 @@ describe("BackendUnavailableError", () => {
     expect(error.code).toBe(BACKEND_UNAVAILABLE);
     expect(error.data).toEqual({
       code: "backend_unavailable",
-      server: "cipp",
-      tool: "cipp__graph_query",
+      server: "gamma",
+      tool: "gamma__run_report",
       reason: "no_session",
       executed: false,
       retryable: true,
@@ -35,7 +35,7 @@ describe("BackendUnavailableError", () => {
 
   it("is never read as an unknown tool, bare or SDK-wrapped", () => {
     expect(isUnknownToolError(error)).toBe(false);
-    expect(isUnknownToolError(error, "cipp__graph_query")).toBe(false);
+    expect(isUnknownToolError(error, "gamma__run_report")).toBe(false);
     expect(looksLikeUnknownTool(error.message)).toBe(false);
     expect(looksLikeUnknownTool(`MCP error -32603: ${error.message}`)).toBe(
       false,
@@ -44,8 +44,8 @@ describe("BackendUnavailableError", () => {
 
   it("quotes caller-controlled names so a CR/LF cannot forge a log line", () => {
     const forged = new BackendUnavailableError(
-      "cipp__x\r\n[fake] line",
-      "cipp",
+      "gamma__x\r\n[fake] line",
+      "gamma",
       "error_gated",
     );
     expect(forged.message).not.toMatch(/[\r\n]/);

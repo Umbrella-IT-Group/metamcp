@@ -36,7 +36,8 @@ import { sanitizeName } from "./utils";
  * one the tool's prefix names must not hijack the real tool's error.
  * Routing now connects only the prefix's own servers (tool-call-routing.ts;
  * it used to walk every server in the namespace), so a foreign latch is
- * unlikely, and the gate keeps it harmless if one ever occurs. Only the injected m365 server can ever latch here today.
+ * unlikely, and the gate keeps it harmless if one ever occurs. Only the
+ * injected m365 server can ever latch here today.
  *
  * ALWAYS drains via `takeConnectBrokerFailure` — even on a non-match —
  * so a stale failure from probing an unrelated server during dynamic

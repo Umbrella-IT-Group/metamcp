@@ -121,9 +121,9 @@ const NS = "ns-1";
 const SERVERS = {
   alpha: { uuid: "server-alpha", name: "alpha" },
   beta: { uuid: "server-beta", name: "beta" },
-  cipp: { uuid: "server-cipp", name: "cipp" },
+  gamma: { uuid: "server-gamma", name: "gamma" },
 };
-const TOOL = "cipp__graph_query";
+const TOOL = "gamma__run_report";
 
 interface FakeBackend {
   session: ConnectedClient;
@@ -145,7 +145,7 @@ function fakeBackend(
     failList?: Error;
   } = {},
 ): FakeBackend {
-  const tools = options.tools ?? ["graph_query", "user_investigate"];
+  const tools = options.tools ?? ["run_report", "inspect_user"];
   const ran: string[] = [];
   let lists = 0;
   const request = vi.fn(
@@ -173,7 +173,7 @@ function fakeBackend(
   const client = {
     request,
     getServerCapabilities: () => ({ tools: {} }),
-    getServerVersion: () => ({ name: "cipp", version: "1.0.0" }),
+    getServerVersion: () => ({ name: "gamma", version: "1.0.0" }),
   } as unknown as Client;
   return {
     session: {
@@ -214,7 +214,7 @@ async function rejectionOf(promise: Promise<unknown>): Promise<McpError> {
   throw new Error("expected the tools/call to reject");
 }
 
-const unavailableText = (reason: string, server = "cipp", tool = TOOL) =>
+const unavailableText = (reason: string, server = "gamma", tool = TOOL) =>
   `Backend "${server}" is unavailable (${reason}): tool "${tool}" was not run. Retry the call.`;
 
 /** The routable servers getMcpServers returns, by key. */
@@ -245,7 +245,7 @@ beforeEach(() => {
   serverStatesMock.mockResolvedValue([]);
   filterState.toolPolicy = "allow_all";
   filterState.allowed = undefined;
-  mount("alpha", "beta", "cipp");
+  mount("alpha", "beta", "gamma");
 });
 
 afterEach(async () => {
@@ -258,24 +258,24 @@ afterEach(async () => {
 
 describe("prefix-first routing: only the prefix's server is touched", () => {
   it("opens one session, for the prefix's server, in a three-server namespace", async () => {
-    const cipp = fakeBackend();
-    getSessionMock.mockResolvedValue(cipp.session);
+    const gamma = fakeBackend();
+    getSessionMock.mockResolvedValue(gamma.session);
 
     const result = await call(await connectConsumer());
 
-    expect(result.content).toEqual([{ type: "text", text: "ran graph_query" }]);
+    expect(result.content).toEqual([{ type: "text", text: "ran run_report" }]);
     // The other two servers were never asked for a session. Before the fix
     // the lookup opened (or waited on) one for every server listed first.
-    expect(serversAskedFor()).toEqual([SERVERS.cipp.uuid]);
+    expect(serversAskedFor()).toEqual([SERVERS.gamma.uuid]);
   });
 
   it("answers Unknown tool at once for a prefix no mounted server carries", async () => {
     const error = await rejectionOf(
-      call(await connectConsumer(), "nosuch__graph_query"),
+      call(await connectConsumer(), "nosuch__run_report"),
     );
 
     expect(error.message).toBe(
-      "MCP error -32603: Unknown tool: nosuch__graph_query",
+      "MCP error -32603: Unknown tool: nosuch__run_report",
     );
     expect(getSessionMock).not.toHaveBeenCalled();
     expect(findServersMock).toHaveBeenCalledTimes(1);
@@ -283,13 +283,13 @@ describe("prefix-first routing: only the prefix's server is touched", () => {
   });
 
   it("answers Unknown tool when the server listed its tools without this one", async () => {
-    const cipp = fakeBackend({ tools: ["user_investigate"] });
-    getSessionMock.mockResolvedValue(cipp.session);
+    const gamma = fakeBackend({ tools: ["inspect_user"] });
+    getSessionMock.mockResolvedValue(gamma.session);
 
     const error = await rejectionOf(call(await connectConsumer()));
 
     expect(error.message).toBe(`MCP error -32603: Unknown tool: ${TOOL}`);
-    expect(cipp.ran).toEqual([]);
+    expect(gamma.ran).toEqual([]);
     // An authoritative listing is not a reason to wait: no warm-up retry.
     expect(getSessionMock).toHaveBeenCalledTimes(1);
   });
@@ -297,27 +297,27 @@ describe("prefix-first routing: only the prefix's server is touched", () => {
 
 describe("zero mapping rows under allow_all: the prefix's server is warmed", () => {
   it("succeeds when the pool has no session once, then a live one", async () => {
-    const cipp = fakeBackend();
+    const gamma = fakeBackend();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
 
     const result = await call(await connectConsumer());
 
-    expect(result.content).toEqual([{ type: "text", text: "ran graph_query" }]);
-    expect(cipp.ran).toEqual(["graph_query"]);
+    expect(result.content).toEqual([{ type: "text", text: "ran run_report" }]);
+    expect(gamma.ran).toEqual(["run_report"]);
     // No row resolved the tool; the bounded warm-up on the prefix's server did.
-    expect(findServersMock).toHaveBeenCalledWith(NS, "graph_query");
-    expect(serversAskedFor()).toEqual([SERVERS.cipp.uuid, SERVERS.cipp.uuid]);
+    expect(findServersMock).toHaveBeenCalledWith(NS, "run_report");
+    expect(serversAskedFor()).toEqual([SERVERS.gamma.uuid, SERVERS.gamma.uuid]);
     // The warmed session was listed before routing: the tool is confirmed.
-    expect(cipp.lists()).toBe(1);
+    expect(gamma.lists()).toBe(1);
   });
 
   it("8 parallel calls from a fresh session all succeed when the first acquisition fails", async () => {
-    const cipp = fakeBackend();
+    const gamma = fakeBackend();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
     const consumer = await connectConsumer();
 
     const results = await Promise.allSettled(
@@ -327,7 +327,7 @@ describe("zero mapping rows under allow_all: the prefix's server is warmed", () 
     expect(results.map((r) => r.status)).toEqual(
       Array.from({ length: 8 }, () => "fulfilled"),
     );
-    expect(cipp.ran).toHaveLength(8);
+    expect(gamma.ran).toHaveLength(8);
   });
 
   it("answers backend unavailable, never Unknown tool, when the warm-up is exhausted", async () => {
@@ -340,7 +340,7 @@ describe("zero mapping rows under allow_all: the prefix's server is warmed", () 
     );
     expect(error.data).toEqual({
       code: "backend_unavailable",
-      server: "cipp",
+      server: "gamma",
       tool: TOOL,
       reason: "no_session",
       executed: false,
@@ -348,9 +348,9 @@ describe("zero mapping rows under allow_all: the prefix's server is warmed", () 
     });
     // One primary attempt plus the warm-up's two.
     expect(serversAskedFor()).toEqual([
-      SERVERS.cipp.uuid,
-      SERVERS.cipp.uuid,
-      SERVERS.cipp.uuid,
+      SERVERS.gamma.uuid,
+      SERVERS.gamma.uuid,
+      SERVERS.gamma.uuid,
     ]);
   });
 });
@@ -361,10 +361,10 @@ describe("allowlist policy: nothing is routed without an ACTIVE row", () => {
   });
 
   it("does not warm the prefix's server for a tool with no row", async () => {
-    const cipp = fakeBackend();
+    const gamma = fakeBackend();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
 
     const error = await rejectionOf(call(await connectConsumer()));
 
@@ -374,34 +374,34 @@ describe("allowlist policy: nothing is routed without an ACTIVE row", () => {
       `MCP error -32603: ${unavailableText("no_session")}`,
     );
     expect(getSessionMock).toHaveBeenCalledTimes(1);
-    expect(cipp.ran).toEqual([]);
+    expect(gamma.ran).toEqual([]);
   });
 
   it("still recovers through an ACTIVE row in the reconnect window", async () => {
-    const cipp = fakeBackend();
+    const gamma = fakeBackend();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
     findServersMock.mockResolvedValue([
-      { serverUuid: SERVERS.cipp.uuid, serverName: "cipp" },
+      { serverUuid: SERVERS.gamma.uuid, serverName: "gamma" },
     ]);
 
     const result = await call(await connectConsumer());
 
-    expect(result.content).toEqual([{ type: "text", text: "ran graph_query" }]);
+    expect(result.content).toEqual([{ type: "text", text: "ran run_report" }]);
   });
 
   it("never widens when no filter judged the call (no policy on the context)", async () => {
     filterState.toolPolicy = undefined;
-    const cipp = fakeBackend();
+    const gamma = fakeBackend();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
 
     const error = await rejectionOf(call(await connectConsumer()));
 
     expect(error.message).toContain("(no_session)");
-    expect(cipp.ran).toEqual([]);
+    expect(gamma.ran).toEqual([]);
   });
 });
 
@@ -411,8 +411,8 @@ describe("a mounted server that cannot be used is never reported as an unknown t
     mount("alpha", "beta");
     serverStatesMock.mockResolvedValue([
       {
-        uuid: SERVERS.cipp.uuid,
-        name: "cipp",
+        uuid: SERVERS.gamma.uuid,
+        name: "gamma",
         mountStatus: "ACTIVE",
         errorStatus: "ERROR",
       },
@@ -430,8 +430,8 @@ describe("a mounted server that cannot be used is never reported as an unknown t
     mount("alpha", "beta");
     serverStatesMock.mockResolvedValue([
       {
-        uuid: SERVERS.cipp.uuid,
-        name: "cipp",
+        uuid: SERVERS.gamma.uuid,
+        name: "gamma",
         mountStatus: "INACTIVE",
         errorStatus: "NONE",
       },
@@ -447,8 +447,8 @@ describe("a mounted server that cannot be used is never reported as an unknown t
     filterState.allowed = ["server-other"];
     serverStatesMock.mockResolvedValue([
       {
-        uuid: SERVERS.cipp.uuid,
-        name: "cipp",
+        uuid: SERVERS.gamma.uuid,
+        name: "gamma",
         mountStatus: "ACTIVE",
         errorStatus: "ERROR",
       },
@@ -457,6 +457,27 @@ describe("a mounted server that cannot be used is never reported as an unknown t
     const error = await rejectionOf(call(await connectConsumer()));
 
     expect(error.message).toBe(`MCP error -32603: Unknown tool: ${TOOL}`);
+  });
+
+  it("a routable server the first read missed answers backend unavailable (routing_lookup_failed)", async () => {
+    // getMcpServers answers an empty set on a database error rather than
+    // throwing; the second read finds the server mounted, ACTIVE, not gated.
+    vi.mocked(getMcpServers).mockResolvedValue({});
+    serverStatesMock.mockResolvedValue([
+      {
+        uuid: SERVERS.gamma.uuid,
+        name: "gamma",
+        mountStatus: "ACTIVE",
+        errorStatus: "NONE",
+      },
+    ]);
+
+    const error = await rejectionOf(call(await connectConsumer()));
+
+    expect(error.message).toBe(
+      `MCP error -32603: ${unavailableText("routing_lookup_failed")}`,
+    );
+    expect(getSessionMock).not.toHaveBeenCalled();
   });
 
   it("a failed server read answers backend unavailable (routing_lookup_failed)", async () => {
@@ -471,15 +492,15 @@ describe("a mounted server that cannot be used is never reported as an unknown t
   });
 
   it("a tool lookup that keeps failing answers backend unavailable (tool_lookup_failed)", async () => {
-    const cipp = fakeBackend({ failList: new Error("socket hang up") });
-    getSessionMock.mockResolvedValue(cipp.session);
+    const gamma = fakeBackend({ failList: new Error("socket hang up") });
+    getSessionMock.mockResolvedValue(gamma.session);
 
     const error = await rejectionOf(call(await connectConsumer()));
 
     expect(error.message).toBe(
       `MCP error -32603: ${unavailableText("tool_lookup_failed")}`,
     );
-    expect(cipp.ran).toEqual([]);
+    expect(gamma.ran).toEqual([]);
   });
 });
 
@@ -543,7 +564,7 @@ describe("replay recovery is shared by parallel calls on one dead client", () =>
 
     const result = await call(consumer);
 
-    expect(result.content).toEqual([{ type: "text", text: "ran graph_query" }]);
+    expect(result.content).toEqual([{ type: "text", text: "ran run_report" }]);
     expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
   });
 

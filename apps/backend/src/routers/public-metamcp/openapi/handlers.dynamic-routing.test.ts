@@ -104,9 +104,9 @@ import { executeToolWithMiddleware } from "./tool-execution";
 const SERVERS = {
   "server-alpha": { uuid: "server-alpha", name: "alpha" },
   "server-beta": { uuid: "server-beta", name: "beta" },
-  "server-cipp": { uuid: "server-cipp", name: "cipp" },
+  "server-gamma": { uuid: "server-gamma", name: "gamma" },
 };
-const TOOL = "cipp__graph_query";
+const TOOL = "gamma__run_report";
 
 interface FakeSession {
   session: unknown;
@@ -129,7 +129,7 @@ function fakeSession(failCall?: () => Error | undefined): FakeSession {
           };
         }),
         getServerCapabilities: () => ({ tools: {} }),
-        getServerVersion: () => ({ name: "cipp", version: "1.0.0" }),
+        getServerVersion: () => ({ name: "gamma", version: "1.0.0" }),
       },
       listChangedSubscribers: new Set(),
     },
@@ -166,7 +166,7 @@ const recorder = vi.fn();
 // Flush the fire-and-forget persist() chain the audit middleware detaches.
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-const unavailableBody = (reason: string, server = "cipp") => ({
+const unavailableBody = (reason: string, server = "gamma") => ({
   error: "Backend unavailable",
   message: `Backend "${server}" is unavailable (${reason}): tool "${TOOL}" was not run. Retry the call.`,
   retryable: true,
@@ -196,20 +196,20 @@ afterEach(() => {
 
 describe("OpenAPI bridge: prefix-first routing", () => {
   it("asks only the prefix's server for a session", async () => {
-    const cipp = fakeSession();
-    getSessionMock.mockResolvedValue(cipp.session);
+    const gamma = fakeSession();
+    getSessionMock.mockResolvedValue(gamma.session);
 
     const res = await run();
 
     expect(res.statusCode).toBe(200);
-    expect(cipp.ran).toEqual(["graph_query"]);
+    expect(gamma.ran).toEqual(["run_report"]);
     expect(getSessionMock.mock.calls.map(([, uuid]) => uuid)).toEqual([
-      "server-cipp",
+      "server-gamma",
     ]);
   });
 
   it("keeps 404 'Tool not found' and the unknown_tool class for a prefix nobody carries", async () => {
-    const res = await run("nosuch__graph_query");
+    const res = await run("nosuch__run_report");
     await flush();
 
     expect(res.statusCode).toBe(404);
@@ -224,29 +224,29 @@ describe("OpenAPI bridge: prefix-first routing", () => {
 
 describe("OpenAPI bridge: zero mapping rows", () => {
   it("allow_all warms the prefix's server and runs the tool", async () => {
-    const cipp = fakeSession();
+    const gamma = fakeSession();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
 
     const res = await run();
 
     expect(res.statusCode).toBe(200);
-    expect(cipp.ran).toEqual(["graph_query"]);
+    expect(gamma.ran).toEqual(["run_report"]);
   });
 
   it("allowlist does not route without an ACTIVE row", async () => {
     filterState.toolPolicy = "allowlist";
-    const cipp = fakeSession();
+    const gamma = fakeSession();
     getSessionMock
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValue(cipp.session);
+      .mockResolvedValue(gamma.session);
 
     const res = await run();
 
     expect(res.statusCode).toBe(404);
     expect(res.body).toMatchObject(unavailableBody("no_session"));
-    expect(cipp.ran).toEqual([]);
+    expect(gamma.ran).toEqual([]);
     expect(getSessionMock).toHaveBeenCalledTimes(1);
   });
 });
@@ -263,8 +263,8 @@ describe("OpenAPI bridge: a mounted server that cannot be used", () => {
     expect(res.body).toMatchObject(unavailableBody("no_session"));
     expect(recorder).toHaveBeenCalledTimes(1);
     expect(recorder.mock.calls[0][0]).toMatchObject({
-      server_name: "cipp",
-      tool_name: "graph_query",
+      server_name: "gamma",
+      tool_name: "run_report",
       success: false,
       error_code: "backend_unavailable",
     });
@@ -276,8 +276,8 @@ describe("OpenAPI bridge: a mounted server that cannot be used", () => {
     });
     serverStatesMock.mockResolvedValue([
       {
-        uuid: "server-cipp",
-        name: "cipp",
+        uuid: "server-gamma",
+        name: "gamma",
         mountStatus: "ACTIVE",
         errorStatus: "ERROR",
       },
