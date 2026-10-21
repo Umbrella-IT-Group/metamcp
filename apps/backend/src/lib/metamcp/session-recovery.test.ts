@@ -15,11 +15,15 @@ const client = (label: string) =>
   ({ label, listChangedSubscribers: new Set() }) as unknown as ConnectedClient;
 
 function fakePool(pooled = true) {
-  let isPooled = pooled;
+  const retired = new Set<ConnectedClient>();
+  let inspected: ConnectedClient | undefined;
   const pool = {
-    isPooledClient: vi.fn(() => isPooled),
+    isPooledClient: vi.fn((_uuid: string, candidate: ConnectedClient) => {
+      inspected = candidate;
+      return pooled && !retired.has(candidate);
+    }),
     invalidateServerConnection: vi.fn(async () => {
-      isPooled = false;
+      if (inspected) retired.add(inspected);
     }),
   } satisfies SessionRecoveryPool;
   return pool;
@@ -99,6 +103,49 @@ describe("recoverFailedSession", () => {
     expect(late).toBe(fresh);
     expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
     expect(reacquire).toHaveBeenCalledTimes(1);
+  });
+
+  it("reacquires instead of handing a late failure a replacement that was already retired", async () => {
+    const stale = client("stale");
+    const firstReplacement = client("first replacement");
+    const current = client("current");
+    const pooled = new Set([stale]);
+    const pool = {
+      isPooledClient: vi.fn((_uuid: string, candidate: ConnectedClient) =>
+        pooled.has(candidate),
+      ),
+      invalidateServerConnection: vi.fn(async () => {
+        pooled.clear();
+      }),
+    } satisfies SessionRecoveryPool;
+    const reacquire = vi.fn(async () => {
+      const replacement =
+        reacquire.mock.calls.length === 1 ? firstReplacement : current;
+      pooled.add(replacement);
+      return replacement;
+    });
+    const options = {
+      pool,
+      recoveries: new WeakMap() as SessionRecoveries,
+      sessionId: "s",
+      serverUuid: "u",
+      failedClient: stale,
+      reacquire,
+    };
+
+    expect(await recoverFailedSession(options)).toBe(firstReplacement);
+    // Another session's recovery, a health sweep, or TTL cleanup can retire
+    // the cached replacement before an older request reports its failure.
+    pooled.delete(firstReplacement);
+    pooled.add(current);
+
+    expect(
+      await Promise.all(
+        Array.from({ length: 8 }, () => recoverFailedSession(options)),
+      ),
+    ).toEqual(Array.from({ length: 8 }, () => current));
+    expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+    expect(reacquire).toHaveBeenCalledTimes(2);
   });
 
   it("forgets a recovery that produced no session, so the next failure tries again", async () => {

@@ -175,22 +175,23 @@ export async function routeUnmappedToolCall(
     serverPrefix,
     isAllowedServer,
   );
-  // The first named candidate found unusable. Only a named candidate can be
-  // reported: a nameless one may not be the prefix's server at all.
-  let unavailable: UnavailableOwner | undefined = undefined;
-  const firstUnavailable = (
-    current: UnavailableOwner | undefined,
+  // Two mounted servers can share a name (for example, a public server and
+  // the namespace owner's server). A negative listing from one does not rule
+  // out the other: retain every failed owner until that owner answers.
+  // A nameless candidate may not own the prefix, so it cannot be reported.
+  const unavailableOwners = new Map<string, UnavailableOwner>();
+  const noteUnavailable = (
     candidate: PrefixCandidate,
     reason: BackendUnavailableReason,
-  ): UnavailableOwner | undefined =>
-    current ??
-    (candidate.named
-      ? {
-          candidate,
-          serverName: candidate.params.name || serverPrefix,
-          reason,
-        }
-      : undefined);
+  ): void => {
+    if (candidate.named) {
+      unavailableOwners.set(candidate.uuid, {
+        candidate,
+        serverName: candidate.params.name || serverPrefix,
+        reason,
+      });
+    }
+  };
 
   const safeProbe = async (
     session: ConnectedClient,
@@ -225,7 +226,7 @@ export async function routeUnmappedToolCall(
       );
     }
     if (!session) {
-      unavailable = firstUnavailable(unavailable, candidate, "no_session");
+      noteUnavailable(candidate, "no_session");
       continue;
     }
     const outcome = await safeProbe(session, candidate);
@@ -233,11 +234,7 @@ export async function routeUnmappedToolCall(
       return { session: outcome.session, serverUuid: candidate.uuid };
     }
     if (outcome.kind !== "absent") {
-      unavailable = firstUnavailable(
-        unavailable,
-        candidate,
-        reasonFor(outcome),
-      );
+      noteUnavailable(candidate, reasonFor(outcome));
     }
   }
 
@@ -273,42 +270,44 @@ export async function routeUnmappedToolCall(
       if (warmed && warmed.client.getServerCapabilities()?.tools) {
         return { session: warmed, serverUuid: match.serverUuid };
       }
-      if (!warmed) {
-        unavailable = firstUnavailable(
-          unavailable,
+      if (warmed) {
+        unavailableOwners.delete(match.serverUuid);
+      } else {
+        noteUnavailable(
           { uuid: match.serverUuid, params: paramsForMatch, named: true },
           "no_session",
         );
       }
-    } else if (
-      options.toolPolicy === "allow_all" &&
-      unavailable?.reason === "no_session"
-    ) {
+    } else if (options.toolPolicy === "allow_all") {
       // The zero-mapping-rows gap: no row resolved the tool, so the fallback
       // above had nothing to warm, and the owner by prefix had no session.
       // Under `allow_all` a tool with no row is served, so warm that server the
       // same bounded way and probe it again. Only `allow_all`: under
       // `allowlist` a tool is routed only on an ACTIVE row.
-      const owner: UnavailableOwner = unavailable;
-      const warmed = await acquireSessionWithBoundedWarmup({
-        pool,
-        sessionId,
-        serverUuid: owner.candidate.uuid,
-        params: owner.candidate.params,
-        namespaceUuid,
-        timeoutMs: await configService.getMcpToolCallReconnectWarmupTimeout(),
-      });
-      if (warmed) {
-        const outcome = await safeProbe(warmed, owner.candidate);
-        if (outcome.kind === "found") {
-          return { session: outcome.session, serverUuid: owner.candidate.uuid };
+      for (const owner of unavailableOwners.values()) {
+        if (owner.reason !== "no_session") continue;
+        const warmed = await acquireSessionWithBoundedWarmup({
+          pool,
+          sessionId,
+          serverUuid: owner.candidate.uuid,
+          params: owner.candidate.params,
+          namespaceUuid,
+          timeoutMs: await configService.getMcpToolCallReconnectWarmupTimeout(),
+        });
+        if (warmed) {
+          const outcome = await safeProbe(warmed, owner.candidate);
+          if (outcome.kind === "found") {
+            return {
+              session: outcome.session,
+              serverUuid: owner.candidate.uuid,
+            };
+          }
+          if (outcome.kind === "absent") {
+            unavailableOwners.delete(owner.candidate.uuid);
+          } else {
+            noteUnavailable(owner.candidate, reasonFor(outcome));
+          }
         }
-        // The server is back and answered without the tool: that is an
-        // unknown tool, not an unavailable server.
-        unavailable =
-          outcome.kind === "absent"
-            ? undefined
-            : { ...owner, reason: reasonFor(outcome) };
       }
     }
   } catch (error) {
@@ -328,21 +327,21 @@ export async function routeUnmappedToolCall(
     includeInactiveServers: options.includeInactiveServers,
     unknownToolMessage: options.unknownToolMessage,
     candidates,
-    unavailable,
+    unavailable: unavailableOwners.values().next().value,
     logPrefix,
   });
 }
 
 /**
  * The error for a call that could not be routed. A noted unavailable owner
- * answers unavailable. A named candidate that was reached and did not serve
- * the tool answers `Unknown tool`. With no candidate at all, the namespace's
+ * answers unavailable. Before answering `Unknown tool`, the namespace's
  * mounted servers are read once more, error-gated ones included: a gated
  * server under the prefix answers unavailable (`error_gated`); a routable,
  * ungated one the first read missed answers unavailable
  * (`routing_lookup_failed`); anything else `Unknown tool`. A failed read also
  * answers `routing_lookup_failed` rather than calling a possibly real tool
- * unknown.
+ * unknown. A successful negative listing rules out only its own server, not
+ * another mounted server with the same name that the routable read omitted.
  */
 async function unroutedToolError(options: {
   namespaceUuid: string;
@@ -364,10 +363,6 @@ async function unroutedToolError(options: {
       unavailable.reason,
     );
   }
-  if (options.candidates.some((candidate) => candidate.named)) {
-    return new Error(options.unknownToolMessage);
-  }
-
   let states;
   try {
     states = await getNamespaceServerStates(options.namespaceUuid);
@@ -387,6 +382,7 @@ async function unroutedToolError(options: {
     (state) =>
       options.isAllowedServer(state.uuid) &&
       sanitizeName(state.name) === serverPrefix &&
+      !options.candidates.some((candidate) => candidate.uuid === state.uuid) &&
       (options.includeInactiveServers ||
         state.mountStatus === McpServerStatusEnum.enum.ACTIVE),
   );

@@ -83,6 +83,8 @@ vi.mock("../config.service", () => ({
 
 vi.mock("./fetch-metamcp", () => ({
   getMcpServers: vi.fn(async () => ({ "server-ninja": { name: "ninja" } })),
+  // No additional mounted owner was omitted from the routable set.
+  getNamespaceServerStates: vi.fn(async () => []),
 }));
 
 vi.mock("./mcp-server-pool", () => ({

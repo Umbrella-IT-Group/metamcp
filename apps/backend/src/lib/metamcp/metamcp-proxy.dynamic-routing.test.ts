@@ -391,6 +391,22 @@ describe("allowlist policy: nothing is routed without an ACTIVE row", () => {
     expect(result.content).toEqual([{ type: "text", text: "ran run_report" }]);
   });
 
+  it("keeps Unknown tool when the warmed ACTIVE-row server has no tools capability", async () => {
+    const gamma = fakeBackend();
+    vi.spyOn(gamma.session.client, "getServerCapabilities").mockReturnValue({});
+    getSessionMock
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValue(gamma.session);
+    findServersMock.mockResolvedValue([
+      { serverUuid: SERVERS.gamma.uuid, serverName: "gamma" },
+    ]);
+
+    const error = await rejectionOf(call(await connectConsumer()));
+
+    expect(error.message).toBe(`MCP error -32603: Unknown tool: ${TOOL}`);
+    expect(gamma.ran).toEqual([]);
+  });
+
   it("never widens when no filter judged the call (no policy on the context)", async () => {
     filterState.toolPolicy = undefined;
     const gamma = fakeBackend();
@@ -502,6 +518,117 @@ describe("a mounted server that cannot be used is never reported as an unknown t
     );
     expect(gamma.ran).toEqual([]);
   });
+});
+
+describe("same-named mounted servers: every possible owner must be accounted for", () => {
+  const peerUuid = "server-gamma-peer";
+
+  beforeEach(() => {
+    vi.mocked(getMcpServers).mockResolvedValue({
+      [SERVERS.gamma.uuid]: { uuid: SERVERS.gamma.uuid, name: "gamma" },
+      [peerUuid]: { uuid: peerUuid, name: "gamma" },
+    } as never);
+    filterState.allowed = [SERVERS.gamma.uuid, peerUuid];
+  });
+
+  it("keeps Unknown tool when every owner answers without the tool", async () => {
+    const first = fakeBackend({ tools: ["inspect_user"] });
+    const second = fakeBackend({ tools: ["inspect_user"] });
+    getSessionMock.mockImplementation(async (_sessionId, uuid: string) =>
+      uuid === peerUuid ? second.session : first.session,
+    );
+    serverStatesMock.mockResolvedValue(
+      [SERVERS.gamma.uuid, peerUuid].map((uuid) => ({
+        uuid,
+        name: "gamma",
+        mountStatus: "ACTIVE",
+        errorStatus: "NONE",
+      })),
+    );
+
+    const error = await rejectionOf(call(await connectConsumer()));
+
+    expect(error.message).toBe(`MCP error -32603: Unknown tool: ${TOOL}`);
+    expect(getSessionMock).toHaveBeenCalledTimes(2);
+    expect(first.ran).toEqual([]);
+    expect(second.ran).toEqual([]);
+  });
+
+  it("warms the second owner when the first comes back without the tool", async () => {
+    const first = fakeBackend({ tools: ["inspect_user"] });
+    const second = fakeBackend();
+    const attempts = new Map<string, number>();
+    getSessionMock.mockImplementation(async (_sessionId, uuid: string) => {
+      const count = (attempts.get(uuid) ?? 0) + 1;
+      attempts.set(uuid, count);
+      if (count === 1) return undefined;
+      return uuid === peerUuid ? second.session : first.session;
+    });
+
+    const result = await call(await connectConsumer());
+
+    expect(result.content).toEqual([{ type: "text", text: "ran run_report" }]);
+    expect(first.ran).toEqual([]);
+    expect(second.ran).toEqual(["run_report"]);
+    expect(serversAskedFor()).toEqual([
+      SERVERS.gamma.uuid,
+      peerUuid,
+      SERVERS.gamma.uuid,
+      peerUuid,
+    ]);
+  });
+
+  it("keeps a peer's failed lookup when the first owner warms without the tool", async () => {
+    const first = fakeBackend({ tools: ["inspect_user"] });
+    const second = fakeBackend({ failList: new Error("socket hang up") });
+    let firstAttempts = 0;
+    getSessionMock.mockImplementation(async (_sessionId, uuid: string) => {
+      if (uuid === peerUuid) return second.session;
+      firstAttempts += 1;
+      return firstAttempts === 1 ? undefined : first.session;
+    });
+
+    const error = await rejectionOf(call(await connectConsumer()));
+
+    expect(error.message).toBe(
+      `MCP error -32603: ${unavailableText("tool_lookup_failed")}`,
+    );
+    expect(first.ran).toEqual([]);
+    expect(second.ran).toEqual([]);
+  });
+
+  it.each([
+    ["ERROR", "error_gated"],
+    ["NONE", "routing_lookup_failed"],
+  ])(
+    "checks an omitted peer (%s) after the reachable owner lists without the tool",
+    async (errorStatus, reason) => {
+      mount("gamma");
+      const first = fakeBackend({ tools: ["inspect_user"] });
+      getSessionMock.mockResolvedValue(first.session);
+      serverStatesMock.mockResolvedValue([
+        {
+          uuid: SERVERS.gamma.uuid,
+          name: "gamma",
+          mountStatus: "ACTIVE",
+          errorStatus: "NONE",
+        },
+        {
+          uuid: peerUuid,
+          name: "gamma",
+          mountStatus: "ACTIVE",
+          errorStatus,
+        },
+      ]);
+
+      const error = await rejectionOf(call(await connectConsumer()));
+
+      expect(error.message).toBe(
+        `MCP error -32603: ${unavailableText(reason)}`,
+      );
+      expect(first.ran).toEqual([]);
+    },
+  );
 });
 
 describe("replay recovery is shared by parallel calls on one dead client", () => {

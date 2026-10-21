@@ -11,15 +11,17 @@ export interface SessionRecoveryPool {
   ): Promise<void>;
 }
 
+interface SessionRecovery {
+  promise: Promise<ConnectedClient | undefined>;
+  replacement?: ConnectedClient;
+}
+
 /**
  * The recoveries started from one routing scope (one MCP session's proxy, or
  * one OpenAPI session id), keyed by the client that failed. A WeakMap, so an
  * entry lives exactly as long as something still holds the dead client.
  */
-export type SessionRecoveries = WeakMap<
-  ConnectedClient,
-  Promise<ConnectedClient | undefined>
->;
+export type SessionRecoveries = WeakMap<ConnectedClient, SessionRecovery>;
 
 export interface RecoverFailedSessionOptions {
   pool: SessionRecoveryPool;
@@ -29,8 +31,8 @@ export interface RecoverFailedSessionOptions {
   /** The pooled client whose request just failed with a session-lost error. */
   failedClient: ConnectedClient;
   /**
-   * Obtain the replacement session. Runs once per failed client, in the call
-   * that started the recovery; normally `pool.getSession` with the server's
+   * Obtain the replacement session. Runs once per recovery, shared by calls
+   * failing on the same client; normally `pool.getSession` with the server's
    * current parameters. May throw (for example when the server left the
    * namespace); every call waiting on this recovery then sees that error.
    */
@@ -56,10 +58,13 @@ export interface RecoverFailedSessionOptions {
  * already retired it, and a second cascade would only retire the replacement.
  * The caller then just needs a new session.
  *
- * A successful recovery stays recorded while the dead client is reachable, so
- * a call that fails late on that client reuses the replacement instead of
- * starting a second cascade. A recovery that produced no session, or threw,
- * is forgotten at once, so the next failure on the same client tries again.
+ * A successful recovery stays recorded while the dead client is reachable and
+ * its replacement is still pooled, so a call that fails late on that client
+ * reuses the replacement instead of starting a second cascade. If another
+ * recovery or cleanup already retired that replacement, reacquire instead:
+ * returning it would send the retry to a closed transport and could overwrite
+ * a newer live route. A recovery that produced no session, or threw, is
+ * forgotten at once, so the next failure on the same client tries again.
  */
 export function recoverFailedSession(
   options: RecoverFailedSessionOptions,
@@ -67,8 +72,12 @@ export function recoverFailedSession(
   const { pool, recoveries, sessionId, serverUuid, failedClient } = options;
 
   const existing = recoveries.get(failedClient);
-  if (existing) {
-    return existing;
+  if (
+    existing &&
+    (!existing.replacement ||
+      pool.isPooledClient(serverUuid, existing.replacement))
+  ) {
+    return existing.promise;
   }
 
   const recovery = (async () => {
@@ -82,14 +91,16 @@ export function recoverFailedSession(
     return await options.reacquire();
   })();
 
-  recoveries.set(failedClient, recovery);
+  const entry: SessionRecovery = { promise: recovery };
+  recoveries.set(failedClient, entry);
   const forget = () => {
-    if (recoveries.get(failedClient) === recovery) {
+    if (recoveries.get(failedClient) === entry) {
       recoveries.delete(failedClient);
     }
   };
   recovery.then((fresh) => {
-    if (!fresh) forget();
+    if (fresh) entry.replacement = fresh;
+    else forget();
   }, forget);
 
   return recovery;

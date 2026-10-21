@@ -10,9 +10,10 @@
  * knows better: the tool may well exist, the backend was just not reachable
  * for this call, and nothing was executed. This error says exactly that, so a
  * caller can tell a transient failure from a typo. `Unknown tool` stays the
- * answer when no mounted server carries the prefix, or when the server
- * answered its tool list and the tool is not on it, so a caller does not
- * retry a name that will never resolve.
+ * answer when no mounted server carries the prefix, or when every mounted
+ * server under the prefix answered its tool list without the tool, so a
+ * caller does not retry a name that will never resolve. A negative listing
+ * from one server cannot rule out another mounted server with the same name.
  *
  * The message starts with "Backend", so it never matches the anchored
  * unknown-tool patterns (unknown-tool.ts), and the retired-tool redirect,
