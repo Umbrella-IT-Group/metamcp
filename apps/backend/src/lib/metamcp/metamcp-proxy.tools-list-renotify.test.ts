@@ -43,12 +43,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectedClient } from "./client";
 
-const { getSessionMock, probeMock, listingMock, gateMock } = vi.hoisted(() => ({
-  getSessionMock: vi.fn(),
-  probeMock: vi.fn(),
-  listingMock: vi.fn(),
-  gateMock: vi.fn(),
-}));
+const { getSessionMock, probeMock, listingMock, serverStateMock } = vi.hoisted(
+  () => ({
+    getSessionMock: vi.fn(),
+    probeMock: vi.fn(),
+    listingMock: vi.fn(),
+    serverStateMock: vi.fn(),
+  }),
+);
 
 vi.mock("@/utils/logger", () => ({
   default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
@@ -62,11 +64,14 @@ vi.mock("../../db/repositories/namespaces.repo", () => ({
 vi.mock("../../db/repositories/oauth-sessions.repo", () => ({
   oauthSessionsRepository: {},
 }));
+vi.mock("../../db/repositories/mcp-servers.repo", () => ({
+  mcpServersRepository: { findByUuid: serverStateMock },
+}));
 vi.mock("../../db/repositories", () => ({
   toolsRepository: {
     syncTools: vi.fn(async () => ({ upserted: [], deleted: [] })),
   },
-  mcpServersRepository: {},
+  mcpServersRepository: { findByUuid: serverStateMock },
 }));
 vi.mock("../audit/admin-event", () => ({ emitAdminEvent: vi.fn() }));
 
@@ -93,17 +98,23 @@ vi.mock("./fetch-metamcp", () => ({
   },
 }));
 
-vi.mock("./mcp-server-pool", () => ({
-  mcpServerPool: {
-    getSession: getSessionMock,
-    probeServerTools: probeMock,
-    isServerInErrorState: gateMock,
-    invalidateServerConnection: vi.fn(),
-    cleanupSession: vi.fn(),
-    // A warm pool, so tools/list does not try to warm one up.
-    getPoolStatus: () => ({ idle: 1, active: 1 }),
-  },
-}));
+vi.mock("./mcp-server-pool", async () => {
+  const { serverErrorTracker } = await import("./server-error-tracker");
+  return {
+    mcpServerPool: {
+      getSession: getSessionMock,
+      probeServerTools: probeMock,
+      // Use the real tracker: its boolean API returns false on database errors,
+      // which must not permit the re-notify probe to use an existing client.
+      isServerInErrorState: (uuid: string) =>
+        serverErrorTracker.isServerInErrorState(uuid),
+      invalidateServerConnection: vi.fn(),
+      cleanupSession: vi.fn(),
+      // A warm pool, so tools/list does not try to warm one up.
+      getPoolStatus: () => ({ idle: 1, active: 1 }),
+    },
+  };
+});
 
 vi.mock("./metamcp-middleware/filter-tools.functional", () => ({
   createFilterCallToolMiddleware: () => (next: unknown) => next,
@@ -219,8 +230,8 @@ beforeEach(() => {
   probeMock.mockReset();
   listingMock.mockReset();
   mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
-  gateMock.mockReset();
-  gateMock.mockResolvedValue(false);
+  serverStateMock.mockReset();
+  serverStateMock.mockResolvedValue({ error_status: "NONE" });
   delete process.env.MCP_TOOLS_LIST_RENOTIFY;
 });
 
@@ -485,7 +496,7 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
   it("answers an error, not an empty list, when the only mounted server is error-gated, without connecting to it", async () => {
     mount({}, { [NINJA]: { uuid: NINJA, name: "ninja" } });
     serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
-    gateMock.mockResolvedValue(true);
+    serverStateMock.mockResolvedValue({ error_status: "ERROR" });
     probeMock.mockResolvedValue(true);
     const consumer = await connectConsumer();
 
@@ -503,14 +514,14 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
     expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
 
     // Still gated: the watch checks the gate and does not probe or tell.
-    await vi.waitFor(() => expect(gateMock).toHaveBeenCalledWith(NINJA));
+    await vi.waitFor(() => expect(serverStateMock).toHaveBeenCalledWith(NINJA));
     await sleep(100);
     expect(probeMock).not.toHaveBeenCalled();
     expect(consumer.listChanged).not.toHaveBeenCalled();
 
     // The gate is reset and the server answers: told once, tools back.
     mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
-    gateMock.mockResolvedValue(false);
+    serverStateMock.mockResolvedValue({ error_status: "NONE" });
     await vi.waitFor(() =>
       expect(consumer.listChanged).toHaveBeenCalledTimes(1),
     );
@@ -518,6 +529,38 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
     expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
     expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
   });
+
+  it.each(["failed read", "deleted server"])(
+    "keeps an owed watch without probing when its gate cannot be cleared (%s)",
+    async (condition) => {
+      mount({}, { [NINJA]: { uuid: NINJA, name: "ninja" } });
+      if (condition === "failed read") {
+        serverStateMock.mockRejectedValue(new Error("connection terminated"));
+      } else {
+        serverStateMock.mockResolvedValue(undefined);
+      }
+      probeMock.mockResolvedValue(true);
+      serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
+      const consumer = await connectConsumer();
+
+      await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+      await vi.waitFor(() =>
+        expect(serverStateMock).toHaveBeenCalledWith(NINJA),
+      );
+      await sleep(140);
+      expect(probeMock).not.toHaveBeenCalled();
+      expect(consumer.listChanged).not.toHaveBeenCalled();
+      expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+      serverStateMock.mockResolvedValue({ error_status: "NONE" });
+      mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
+      await vi.waitFor(() =>
+        expect(consumer.listChanged).toHaveBeenCalledTimes(1),
+      );
+      expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+      expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+    },
+  );
 
   it("keeps the owed re-notify when an unreachable server becomes error-gated", async () => {
     const watchSpy = vi.spyOn(toolsListRenotifyWatch, "watch");
@@ -529,6 +572,7 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
 
     // The crash counter trips the gate; the session lists again meanwhile.
     mount({}, { [NINJA]: { uuid: NINJA, name: "ninja" } });
+    serverStateMock.mockResolvedValue({ error_status: "ERROR" });
     const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
     expect(failure).toBeInstanceOf(McpError);
     expect(failure.data).toMatchObject({
@@ -541,6 +585,7 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
     expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
 
     mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
+    serverStateMock.mockResolvedValue({ error_status: "NONE" });
     serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
     probeMock.mockResolvedValue(true);
     await vi.waitFor(() =>
@@ -554,6 +599,9 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
       { [ITGLUE]: { uuid: ITGLUE, name: "itglue" } },
       { [NINJA]: { uuid: NINJA, name: "ninja" } },
     );
+    serverStateMock.mockImplementation(async (uuid: string) => ({
+      error_status: uuid === NINJA ? "ERROR" : "NONE",
+    }));
     serve({ [ITGLUE]: await backend("itglue", [tool("search")]) });
     const consumer = await connectConsumer();
 

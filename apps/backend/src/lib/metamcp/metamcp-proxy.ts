@@ -21,11 +21,12 @@ import {
   ResourceTemplate,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { ServerParameters } from "@repo/zod-types";
+import { McpServerErrorStatusEnum, ServerParameters } from "@repo/zod-types";
 import { z } from "zod";
 
 import logger from "@/utils/logger";
 
+import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
@@ -211,9 +212,20 @@ export const createServer = async (
   // a gated server is not sent a request at all (and the pool's connect path
   // refuses a gated server anyway). It is reset by the pool's half-open
   // probe or by an operator; the probe after that decides.
-  const probeOwedServer = async (params: ServerParameters): Promise<boolean> =>
-    !(await mcpServerPool.isServerInErrorState(params.uuid)) &&
-    (await mcpServerPool.probeServerTools(params, namespaceUuid));
+  const probeOwedServer = async (
+    params: ServerParameters,
+  ): Promise<boolean> => {
+    // The pool's isServerInErrorState returns false on a failed read. That
+    // cannot establish that the gate is clear: an existing pooled client
+    // could answer and discharge this watch while the backend stays gated.
+    // Let a read failure reach the watch's retry path, and require a current
+    // row with NONE before any backend request (a deleted server is not up).
+    const current = await mcpServersRepository.findByUuid(params.uuid);
+    return (
+      current?.error_status === McpServerErrorStatusEnum.enum.NONE &&
+      (await mcpServerPool.probeServerTools(params, namespaceUuid))
+    );
+  };
 
   const onOwedServerAnswers = (mcpServerUuid: string, serverName: string) => {
     if (proxyClosed || !owedServers.delete(mcpServerUuid)) return;
