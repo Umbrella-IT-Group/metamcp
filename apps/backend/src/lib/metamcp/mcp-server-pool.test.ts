@@ -1645,3 +1645,109 @@ describe("health checks: a -32601 answer to ping is alive (upstream #337)", () =
     });
   });
 });
+
+// -------------------------------------------------------------------
+// tools/list re-notify probe (tools-list-renotify.ts)
+//
+// A session whose tools/list left a backend out is owed a list_changed once
+// that backend lists again. The pool answers "does it list now" over a real
+// pooled connection (never a session's active slot), and every successful
+// connect tells the watch to probe at once.
+// -------------------------------------------------------------------
+describe("McpServerPool.probeServerTools — the re-notify probe", () => {
+  type ProbeInternals = {
+    idleSessions: Record<string, unknown>;
+    activeSessions: Record<string, Record<string, unknown>>;
+    cleanupAllPromise: Promise<void> | null;
+    markServerSuccess: (serverUuid: string) => void;
+  };
+
+  const params = { uuid: "server-1", name: "ninja" } as never;
+
+  let pool: McpServerPool;
+  let internals: ProbeInternals;
+  let connectMock: ReturnType<typeof vi.fn>;
+
+  const fakeConnected = (request: ReturnType<typeof vi.fn>) => ({
+    client: { request },
+    cleanup: vi.fn(async () => undefined),
+    listChangedSubscribers: new Set(),
+  });
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    connectMock = (await import("./client"))
+      .connectMetaMcpClient as unknown as ReturnType<typeof vi.fn>;
+    connectMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    void pool.cleanupAll();
+  });
+
+  it("connects an idle session when the slot is empty and answers true once tools/list answers", async () => {
+    const request = vi.fn().mockResolvedValue({ tools: [] });
+    connectMock.mockResolvedValue(fakeConnected(request));
+
+    await expect(pool.probeServerTools(params, "ns-1")).resolves.toBe(true);
+
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0][0]).toEqual({
+      method: "tools/list",
+      params: {},
+    });
+    // Bounded, so a slow backend cannot hold the probe loop.
+    expect(request.mock.calls[0][2]).toEqual({ timeout: 10000 });
+    // The connection stays pooled as the idle slot for the re-list to use.
+    expect(internals.idleSessions["server-1"]).toBeDefined();
+    expect(internals.activeSessions).toEqual({});
+  });
+
+  it("reuses an existing idle connection without connecting", async () => {
+    const request = vi.fn().mockResolvedValue({ tools: [] });
+    internals.idleSessions["server-1"] = fakeConnected(request);
+
+    await expect(pool.probeServerTools(params)).resolves.toBe(true);
+    expect(connectMock).not.toHaveBeenCalled();
+  });
+
+  it("answers false, without throwing, when the connect fails", async () => {
+    connectMock.mockResolvedValue(undefined);
+    await expect(pool.probeServerTools(params)).resolves.toBe(false);
+  });
+
+  it("answers false when tools/list fails over a connection from before a restart", async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValue(new McpError(-32000, "Connection closed"));
+    internals.idleSessions["server-1"] = fakeConnected(request);
+    await expect(pool.probeServerTools(params)).resolves.toBe(false);
+  });
+
+  it("counts a -32601 answer (a backend with no tools) as answering", async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValue(
+        new McpError(ErrorCode.MethodNotFound, "Method not found"),
+      );
+    internals.idleSessions["server-1"] = fakeConnected(request);
+    await expect(pool.probeServerTools(params)).resolves.toBe(true);
+  });
+
+  it("answers false while the pool is shutting down", async () => {
+    internals.cleanupAllPromise = Promise.resolve();
+    await expect(pool.probeServerTools(params)).resolves.toBe(false);
+    expect(connectMock).not.toHaveBeenCalled();
+    internals.cleanupAllPromise = null;
+  });
+
+  it("tells the re-notify watch on every successful connect", async () => {
+    const { toolsListRenotifyWatch } = await import("./tools-list-renotify");
+    const notify = vi.spyOn(toolsListRenotifyWatch, "notifyConnected");
+    internals.markServerSuccess("server-9");
+    expect(notify).toHaveBeenCalledWith("server-9");
+  });
+});

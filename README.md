@@ -113,6 +113,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 - **`tools/list_changed` propagation** — the gateway advertises `listChanged: true` and forwards backend tool-list changes to clients, instead of requiring a reconnect to learn about new/removed tools.
 - **Full-definition tool hashing + periodic sweep** — tool-list drift is detected on the full `{name, description, inputSchema}` (not just names), and a periodic pull sweep catches updates that arrive as container replacements (where no push notification survives).
 - **Per-server "Reconnect Server"** — a UI action that flushes a single backend's pooled connection without restarting the gateway.
+- **Re-notify after a backend restart**: a session whose `tools/list` could not reach a backend (typically one mid-restart, right after the gateway announced `list_changed` for it) is sent `notifications/tools/list_changed` again once that backend answers `tools/list`, so a client that re-listed into the restart gets the tools back without reconnecting. A listing in which no server listed any tool while one could not be reached is a JSON-RPC error (`data.code: "backend_unavailable"`, `retryable: true`), never an empty tool list. `MCP_TOOLS_LIST_RENOTIFY` turns the re-notify off.
 
 ## Security
 
@@ -361,6 +362,7 @@ Lazy recovery takes part in the ceiling under the rule "evict, never refuse" (ru
 | `MCP_AUTO_NUKE_ON_CAPABILITY_CHANGE` | `true` | Delete capability-stale sessions on first boot after a capability change. |
 | `MCP_ACTIVE_HEALTH_CHECK` | on | Health-check active pooled connections, not just idle ones. |
 | `MCP_ERROR_PROBE_INTERVAL_MS` | `300000` (5m) | Half-open probe interval for error-gated backends. |
+| `MCP_TOOLS_LIST_RENOTIFY` | on | Re-send `notifications/tools/list_changed` to a session whose `tools/list` left out a backend it could not reach, once that backend answers `tools/list` again (one shared probe per backend: 2 s, 4 s, 8 s, 15 s, 30 s, then every 60 s, and at once after any successful connect to it). `off`, `false` or `0` disables it; the error answer for a listing with no tools while a backend was unreachable stays either way. |
 | `MCP_RECONNECT_BACKOFF_INITIAL_MS` / `_MAX_MS` / `_MULTIPLIER` | `1000` / `30000` / `2` | Exponential reconnect backoff schedule (with jitter). |
 | `MCP_RECOVERY_RESET_THRESHOLD_MS` | `300000` (5m) | Recent-success window within which a transport drop resets the circuit breaker. |
 

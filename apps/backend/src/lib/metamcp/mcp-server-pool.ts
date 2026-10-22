@@ -16,6 +16,7 @@ import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverErrorTracker } from "./server-error-tracker";
+import { toolsListRenotifyWatch } from "./tools-list-renotify";
 import { toolsSyncCache } from "./tools-sync-cache";
 
 // Per-server tools/list timeout for the periodic sweep. Bounds a single
@@ -31,6 +32,11 @@ const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
 // sweepToolDefinitions's `finally`, so every future tick would be skipped
 // by the in-flight guard forever.
 const TOOLS_SWEEP_MAX_PAGES = 50;
+
+// Bound on the re-notify probe's tools/list (probeServerTools). A backend
+// that takes longer than this to list is not ready to be re-listed by every
+// owed session at once; the watch probes again on its backoff.
+const TOOLS_LIST_PROBE_TIMEOUT_MS = 10000;
 
 /**
  * Whether a rejected health-check ping was in fact ANSWERED by the backend
@@ -819,6 +825,10 @@ export class McpServerPool {
     this.serverLastSuccessAt[serverUuid] = Date.now();
     delete this.lastConnectFailureAt[serverUuid];
     serverErrorTracker.markSuccess(serverUuid);
+    // A session whose tools/list left this server out is owed a
+    // list_changed once it answers again: probe it now rather than on the
+    // watch's backoff. A no-op when nobody is owed.
+    toolsListRenotifyWatch.notifyConnected(serverUuid);
   }
 
   /**
@@ -1659,6 +1669,59 @@ export class McpServerPool {
   }
 
   /**
+   * Whether `params`' backend lists its tools right now: the probe of the
+   * tools/list re-notify watch (tools-list-renotify.ts).
+   *
+   * Uses the server's idle connection, creating one when the slot is empty
+   * (the same connect the idle refill in the health timer makes every 60 s,
+   * under the same caps), then lists the first page with a bounded timeout.
+   * It never takes or touches a session's active slot. A listing over a
+   * connection that predates a restart fails, so a stale idle client cannot
+   * read as recovered; the idle health check retires it on its next tick.
+   *
+   * False, never a throw, when the pool is shutting down, another creation
+   * for the server is in flight (the watch probes again when that connect
+   * lands), the connect fails, or the listing fails or times out.
+   */
+  async probeServerTools(
+    params: ServerParameters,
+    namespaceUuid?: string,
+  ): Promise<boolean> {
+    if (this.cleanupAllPromise) return false;
+    const serverUuid = params.uuid;
+    if (!this.idleSessions[serverUuid]) {
+      try {
+        await this.createIdleSession(serverUuid, params, namespaceUuid);
+      } catch (error) {
+        logger.info(
+          `tools/list re-notify probe: connect to server ${params.name} (${serverUuid}) failed:`,
+          error,
+        );
+        return false;
+      }
+    }
+    const client = this.idleSessions[serverUuid];
+    if (!client) return false;
+    try {
+      await client.client.request(
+        { method: "tools/list", params: {} },
+        ListToolsResultSchema,
+        { timeout: TOOLS_LIST_PROBE_TIMEOUT_MS },
+      );
+      return true;
+    } catch (error) {
+      // -32601 is an answer over a working connection from a backend that
+      // serves no tools: it is up, and there is nothing more to wait for.
+      if (isPingAnsweredError(error)) return true;
+      logger.info(
+        `tools/list re-notify probe: server ${params.name} (${serverUuid}) did not answer tools/list yet:`,
+        error,
+      );
+      return false;
+    }
+  }
+
+  /**
    * Drop the pooled backend connection(s) for a given (sessionId, serverUuid).
    *
    * Used when the backend MCP server reports our Mcp-Session-Id is unknown
@@ -1702,8 +1765,14 @@ export class McpServerPool {
     // (Claude Code, Claude.ai) learns the tool list is suspect and
     // re-fetches on next interaction. Without this, a fresh
     // ConnectedClient appears in the pool but no upstream notification
-    // is ever emitted (backend FastMCP doesn't emit on its own startup;
-    // that's a separate, future PR).
+    // is ever emitted (a backend has no session to notify on its own
+    // startup, so it cannot do this itself).
+    //
+    // This fan-out fires while the backend is usually still DOWN, so a
+    // consumer that re-lists at once can get a listing without this
+    // server. That session is then owed a second list_changed once the
+    // server answers again: the proxy arms tools-list-renotify.ts for it,
+    // and markServerSuccess triggers its probe on the next connect.
     const doomedClients = this.detachServerClients(serverUuid);
 
     // Fire `list_changed` subscribers on every doomed client BEFORE we
