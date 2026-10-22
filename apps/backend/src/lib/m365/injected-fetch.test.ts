@@ -59,7 +59,10 @@ function rpc(method: string, id?: number): string {
 function post(body: unknown, headers?: RequestInit["headers"]): RequestInit {
   return {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: {
+      "content-type": "application/json",
+      ...Object.fromEntries(new Headers(headers)),
+    },
     body: body as RequestInit["body"],
   };
 }
@@ -131,6 +134,7 @@ describe("m365 injected fetch — the injection invariant", () => {
           new Headers({
             authorization: "Bearer mcp_token_SHOULD_DIE",
             [USER_ID_HEADER]: "spoofed-user",
+            "x-test-header": "preserved",
           }),
         ),
       ),
@@ -140,6 +144,7 @@ describe("m365 injected fetch — the injection invariant", () => {
     expect(auth).toBe("Bearer minted-token");
     expect(auth).not.toContain("mcp_token_");
     expect(seen[0].headers.get(USER_ID_HEADER)).toBe("u1");
+    expect(seen[0].headers.get("x-test-header")).toBe("preserved");
   });
 
   it("context propagates through async hops (awaits between wrap and dispatch)", async () => {

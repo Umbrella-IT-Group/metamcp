@@ -471,8 +471,9 @@ export const createMetaMcpClient = (
 
     // M365 delegated broker: servers configured for per-user Graph token
     // injection get a fetch that stamps a freshly minted per-user
-    // Authorization onto EVERY outgoing request (and strips any
-    // connection-level credential), request-scoped so it survives pool
+    // Authorization onto requests that can execute backend code, while
+    // the handshake, listings, stream and teardown stay token-free. It
+    // strips any connection-level credential, request-scoped so it survives pool
     // idle-handoff/cap-reuse without cross-user token leakage. It wraps the
     // guarded fetch: injection sets the header, then the guarded fetch
     // validates + pins + caps the actual connection. See
