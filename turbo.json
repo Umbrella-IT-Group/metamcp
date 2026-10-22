@@ -113,8 +113,16 @@
     "check-types": {
       "dependsOn": ["^check-types"]
     },
+    // `^build` is what makes a local `pnpm test` trustworthy. apps/backend and
+    // apps/frontend import @repo/trpc and @repo/zod-types through their
+    // gitignored `dist/`, so with only `^test` a fresh checkout, or a stale
+    // dist after pulling a change to either package, fails as dozens of
+    // unresolvable imports that read like a code break. turbo caches `build`,
+    // so an unchanged package is not rebuilt. This only reaches turbo-driven
+    // runs (root `pnpm test`); a direct `pnpm -C apps/backend test` still
+    // needs the packages built first (umbrella-ci.yml does it explicitly).
     "test": {
-      "dependsOn": ["^test"],
+      "dependsOn": ["^build", "^test"],
       "env": ["TEST_DATABASE_URL"]
     },
     "dev": {

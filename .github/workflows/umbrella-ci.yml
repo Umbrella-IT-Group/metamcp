@@ -60,11 +60,14 @@ jobs:
       # MANDATORY before anything typechecks or imports, and the reason is
       # not obvious: `@repo/zod-types` and `@repo/trpc` are consumed through
       # their `dist/`, which is gitignored and therefore never present on a
-      # fresh checkout, and turbo's `check-types`/`test` tasks do not depend
-      # on `^build`. Skipping this doesn't fail as "missing build" — it fails
-      # as ~30 test files that can't resolve their imports plus a wall of
-      # TS2307, which reads like a code break and sends the reader hunting in
-      # the wrong place. zod-types first: trpc's types are built against it.
+      # fresh checkout, and turbo's `check-types` task does not depend on
+      # `^build`. (turbo's `test` task does since 2026-10-22, but the test
+      # steps below call vitest directly through `pnpm -C <app> test`,
+      # bypassing turbo, so they still need these builds.) Skipping this
+      # doesn't fail as "missing build" — it fails as ~30 test files that
+      # can't resolve their imports plus a wall of TS2307, which reads like a
+      # code break and sends the reader hunting in the wrong place. zod-types
+      # first: trpc's types are built against it.
       - run: pnpm --filter @repo/zod-types build
       - run: pnpm --filter @repo/trpc build
 
