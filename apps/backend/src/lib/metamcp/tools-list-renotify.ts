@@ -51,6 +51,41 @@ export const DEFAULT_RENOTIFY_PROBE_DELAYS_MS: readonly number[] = [
   2_000, 4_000, 8_000, 15_000, 30_000, 60_000,
 ];
 
+/**
+ * How many times one session is re-notified for one server, in a row, before
+ * the proxy stops arming a watch for it. A "round" is one notification that
+ * the session answered by listing again and being left without the server
+ * again; a listing that reaches the server resets the count.
+ *
+ * WHY A COUNT AND NOT THE BACKOFF. The probe delays above bound how often a
+ * watch probes, not how many watches a session arms: `startAttempt` is
+ * honoured only when a brand-new per-server watch state is created (with
+ * several sessions owed for one server a state nearly always exists), and
+ * `notifyConnected` re-probes at delay 0 after every successful pool connect.
+ * A backend that answers the probe but fails every listing therefore got a
+ * notification, a re-list and a failure on a loop with no ceiling (86 to 122
+ * notifications per idle session in 20 minutes was measured). A flapping
+ * backend that recovers between rounds resets the count, so only a persistent
+ * failure is cut off.
+ */
+export const DEFAULT_RENOTIFY_MAX_ROUNDS = 5;
+
+/**
+ * `MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS`: a positive integer, else the default.
+ * Read per call, so a test or an operator change is honoured without a
+ * restart of anything but the process env.
+ */
+export function renotifyMaxRounds(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = (env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS ?? "").trim();
+  if (!/^[0-9]+$/.test(raw)) return DEFAULT_RENOTIFY_MAX_ROUNDS;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 1
+    ? value
+    : DEFAULT_RENOTIFY_MAX_ROUNDS;
+}
+
 /** `MCP_TOOLS_LIST_RENOTIFY=false` (or `off`, `0`) disables arming new watches. */
 export function toolsListRenotifyEnabled(
   env: NodeJS.ProcessEnv = process.env,

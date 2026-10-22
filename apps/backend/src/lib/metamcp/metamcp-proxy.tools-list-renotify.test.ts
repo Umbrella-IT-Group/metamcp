@@ -41,6 +41,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import logger from "@/utils/logger";
+
 import type { ConnectedClient } from "./client";
 
 const { getSessionMock, probeMock, listingMock, serverStateMock } = vi.hoisted(
@@ -233,6 +235,8 @@ beforeEach(() => {
   serverStateMock.mockReset();
   serverStateMock.mockResolvedValue({ error_status: "NONE" });
   delete process.env.MCP_TOOLS_LIST_RENOTIFY;
+  delete process.env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS;
+  vi.mocked(logger.warn).mockClear();
 });
 
 afterEach(async () => {
@@ -242,6 +246,7 @@ afterEach(async () => {
       .catch(() => undefined);
   }
   delete process.env.MCP_TOOLS_LIST_RENOTIFY;
+  delete process.env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS;
   vi.restoreAllMocks();
 });
 
@@ -673,5 +678,163 @@ describe("tools/list with an error-gated server or a failed namespace read", () 
       expect(consumer.listChanged).toHaveBeenCalledTimes(1),
     );
     expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+  });
+});
+
+// A server that answers the probe but fails every listing the session makes
+// after it is told (so each round re-lists into a failure) used to be
+// re-notified without end: the backoff cannot bound it, because it only
+// applies when a brand-new per-server watch state is created, and a pool
+// connect to that server re-probes at once. A count per (session, server)
+// bounds it.
+describe("the re-notify is bounded per session and server", () => {
+  const capWarnings = () =>
+    vi
+      .mocked(logger.warn)
+      .mock.calls.map((call) => String(call[0]))
+      .filter((message) => message.includes("stopped re-notifying"));
+
+  /** A consumer that re-lists, and fails, every time it is told. */
+  async function loopingConsumer(sessionId = "sess-1") {
+    const consumer = await connectConsumer(sessionId);
+    const notified = vi.fn();
+    // Count the notification the way the session sees it, then re-list as a
+    // spec-conformant client does.
+    consumer.client.setNotificationHandler(
+      ToolListChangedNotificationSchema,
+      () => {
+        notified();
+        void list(consumer).catch(() => undefined);
+      },
+    );
+    return { consumer, notified };
+  }
+
+  it("sends at most the default of 5 notifications, then stops with one WARN", async () => {
+    probeMock.mockResolvedValue(true);
+    serve({ [NINJA]: undefined });
+    const { consumer, notified } = await loopingConsumer();
+
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(notified).toHaveBeenCalledTimes(5), {
+      timeout: 5_000,
+    });
+    // Give a sixth every chance to arrive: three of the longest delays.
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(1), {
+      timeout: 5_000,
+    });
+    await sleep(450);
+
+    expect(notified).toHaveBeenCalledTimes(5);
+    expect(capWarnings()).toHaveLength(1);
+    expect(capWarnings()[0]).toContain("after 5 rounds");
+    expect(capWarnings()[0]).toContain("session sess-1");
+    expect(capWarnings()[0]).toContain("ninja");
+    expect(capWarnings()[0]).toContain(
+      "keeps the reduced listing until it reconnects or a listing reaches the server",
+    );
+    // Nothing left armed for the session.
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+
+    // Further failing listings do not re-arm it or repeat the WARN.
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await sleep(200);
+    expect(notified).toHaveBeenCalledTimes(5);
+    expect(capWarnings()).toHaveLength(1);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+  });
+
+  it("honours MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS", async () => {
+    process.env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS = "2";
+    probeMock.mockResolvedValue(true);
+    serve({ [NINJA]: undefined });
+    const { consumer, notified } = await loopingConsumer();
+
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(1), {
+      timeout: 5_000,
+    });
+    await sleep(300);
+
+    expect(notified).toHaveBeenCalledTimes(2);
+    expect(capWarnings()).toHaveLength(1);
+    expect(capWarnings()[0]).toContain("after 2 rounds");
+  });
+
+  it("starts the count over after a listing that reaches the server", async () => {
+    process.env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS = "2";
+    probeMock.mockResolvedValue(true);
+    serve({ [NINJA]: undefined });
+    const { consumer, notified } = await loopingConsumer();
+
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(1), {
+      timeout: 5_000,
+    });
+    expect(notified).toHaveBeenCalledTimes(2);
+
+    // The server is reachable for one listing: the count and the WARN's
+    // once-only flag reset.
+    serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
+    expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+
+    // It fails again: a fresh run of notifications, a fresh WARN.
+    serve({ [NINJA]: undefined });
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(2), {
+      timeout: 5_000,
+    });
+    await sleep(300);
+
+    expect(notified).toHaveBeenCalledTimes(4);
+    expect(capWarnings()).toHaveLength(2);
+  });
+
+  it("is per session: one session at its cap does not stop another being told", async () => {
+    process.env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS = "1";
+    probeMock.mockResolvedValue(true);
+    serve({ [NINJA]: undefined });
+    const first = await loopingConsumer("sess-1");
+
+    await expect(list(first.consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(1), {
+      timeout: 5_000,
+    });
+    expect(first.notified).toHaveBeenCalledTimes(1);
+
+    const second = await loopingConsumer("sess-2");
+    await expect(list(second.consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(second.notified).toHaveBeenCalledTimes(1), {
+      timeout: 5_000,
+    });
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(2), {
+      timeout: 5_000,
+    });
+    expect(capWarnings()[1]).toContain("session sess-2");
+    expect(first.notified).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgets the count for a server removed from the namespace", async () => {
+    process.env.MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS = "1";
+    probeMock.mockResolvedValue(true);
+    serve({ [NINJA]: undefined });
+    const { consumer, notified } = await loopingConsumer();
+
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(capWarnings()).toHaveLength(1), {
+      timeout: 5_000,
+    });
+    expect(notified).toHaveBeenCalledTimes(1);
+
+    // The server leaves the namespace, then comes back unreachable: it is a
+    // new server for this session, so it is owed notifications again.
+    mount({});
+    expect((await list(consumer)).tools).toEqual([]);
+    mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    await vi.waitFor(() => expect(notified).toHaveBeenCalledTimes(2), {
+      timeout: 5_000,
+    });
   });
 });

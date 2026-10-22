@@ -19,7 +19,9 @@ vi.mock("@/utils/logger", () => ({
 }));
 
 import {
+  DEFAULT_RENOTIFY_MAX_ROUNDS,
   DEFAULT_RENOTIFY_PROBE_DELAYS_MS,
+  renotifyMaxRounds,
   toolsListRenotifyEnabled,
   ToolsListRenotifyWatch,
 } from "./tools-list-renotify";
@@ -241,4 +243,29 @@ describe("toolsListRenotifyEnabled", () => {
       );
     }
   });
+});
+
+describe("renotifyMaxRounds", () => {
+  it("defaults to 5 when unset", () => {
+    expect(DEFAULT_RENOTIFY_MAX_ROUNDS).toBe(5);
+    expect(renotifyMaxRounds({})).toBe(5);
+  });
+
+  it("reads a positive integer from MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS", () => {
+    expect(renotifyMaxRounds({ MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS: "1" })).toBe(
+      1,
+    );
+    expect(
+      renotifyMaxRounds({ MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS: " 12 " }),
+    ).toBe(12);
+  });
+
+  it.each(["0", "-3", "2.5", "abc", "", "  ", "1e3", "5 rounds"])(
+    "falls back to the default for %j",
+    (raw) => {
+      expect(
+        renotifyMaxRounds({ MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS: raw }),
+      ).toBe(DEFAULT_RENOTIFY_MAX_ROUNDS);
+    },
+  );
 });

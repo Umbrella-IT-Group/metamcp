@@ -76,6 +76,7 @@ import {
   ToolRouteOwner,
 } from "./tool-name-parser";
 import {
+  renotifyMaxRounds,
   toolsListRenotifyEnabled,
   toolsListRenotifyWatch,
 } from "./tools-list-renotify";
@@ -202,8 +203,14 @@ export const createServer = async (
   // How many times each server was re-notified and then failed this
   // session's re-list again. Starts that server's next watch further along
   // the backoff, so a flapping backend cannot drive a re-list every two
-  // seconds. Cleared by a listing that reaches the server.
+  // seconds, and, at `renotifyMaxRounds()`, stops the session arming another
+  // (the backoff alone bounds the probe cadence, not the number of rounds).
+  // Cleared by a listing that reaches the server, or when the server leaves
+  // the namespace.
   const renotifyRounds = new Map<string, number>();
+  // Servers whose cap was reached and already logged for this session, so
+  // the WARN is once per (session, server) until the count is reset.
+  const renotifyCapLogged = new Set<string>();
   let proxyClosed = false;
 
   // Does an owed server answer for a listing again? Not while its error gate
@@ -263,16 +270,38 @@ export const createServer = async (
     }
     for (const mcpServerUuid of settledServerUuids) {
       renotifyRounds.delete(mcpServerUuid);
+      renotifyCapLogged.delete(mcpServerUuid);
+    }
+    // A server that left the namespace is a new server if it returns.
+    for (const mcpServerUuid of Array.from(renotifyRounds.keys())) {
+      if (!mountedServerUuids.has(mcpServerUuid)) {
+        renotifyRounds.delete(mcpServerUuid);
+        renotifyCapLogged.delete(mcpServerUuid);
+      }
     }
     if (proxyClosed || !toolsListRenotifyEnabled()) return;
     for (const [mcpServerUuid, params] of unreachableServers) {
       if (owedServers.has(mcpServerUuid)) continue;
       const serverName = params.name || mcpServerUuid;
+      const rounds = renotifyRounds.get(mcpServerUuid) ?? 0;
+      const maxRounds = renotifyMaxRounds();
+      if (rounds >= maxRounds) {
+        // This session was told `rounds` times and each time re-listed into
+        // a failure: more notifications would only repeat that. It keeps the
+        // reduced listing it has. Said once per (session, server).
+        if (!renotifyCapLogged.has(mcpServerUuid)) {
+          renotifyCapLogged.add(mcpServerUuid);
+          logger.warn(
+            `tools/list re-notify: session ${sessionId} stopped re-notifying server ${serverName} (${mcpServerUuid}) after ${rounds} rounds that each re-listed into a failure; it keeps the reduced listing until it reconnects or a listing reaches the server`,
+          );
+        }
+        continue;
+      }
       const cancel = toolsListRenotifyWatch.watch(
         mcpServerUuid,
         () => probeOwedServer(params),
         () => onOwedServerAnswers(mcpServerUuid, serverName),
-        renotifyRounds.get(mcpServerUuid) ?? 0,
+        rounds,
       );
       owedServers.set(mcpServerUuid, cancel);
       logger.info(
@@ -286,6 +315,7 @@ export const createServer = async (
     for (const cancel of owedServers.values()) cancel();
     owedServers.clear();
     renotifyRounds.clear();
+    renotifyCapLogged.clear();
   };
 
   // Detach all subscribers when this upstream Server closes — otherwise
