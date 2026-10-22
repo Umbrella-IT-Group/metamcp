@@ -1,11 +1,14 @@
 /**
  * COLD-connect broker-failure fallback for the `tools/call` handler
- * (Track A5). The mint can fail on the backend `initialize` handshake
- * during a fresh connect — that throw is swallowed by the pool's connect
- * path (resolves `undefined`) and by the proxy's dynamic-find
- * catch-and-continue, so it reaches the outer `tools/call` catch as a
- * generic error rather than the typed `M365BrokerError` the WARM path
- * gets. `client.ts`'s connect catch latches the broker failure into the
+ * (Track A5). BACKSTOP for `m365`: its `initialize` handshake mints no
+ * token any more (`m365/injected-fetch.ts`, invariant 5), so a connect to
+ * it cannot fail on a broker error and nothing is latched for it. This is
+ * kept for any other injected server and for a future handshake that mints:
+ * a mint that fails on the backend `initialize` handshake during a fresh
+ * connect throws into the pool's connect path (resolves `undefined`) and
+ * the proxy's dynamic-find catch-and-continue, so it reaches the outer
+ * `tools/call` catch as a generic error rather than the typed
+ * `M365BrokerError` the WARM path gets. `client.ts`'s connect catch latches the broker failure into the
  * request-scoped sink (`m365/request-context.ts`) for exactly this
  * reason; this module is the drain + ownership-gate glue that turns the
  * latch back into the same enrollment result the WARM path returns

@@ -19,7 +19,10 @@
  * Fail-closed contract: when no context is present (idle warmup, health
  * pings, API-key consumers, OpenAPI bridge), the injected fetch sends
  * NO Authorization header at all — never a cached or foreign user's
- * token. See `injected-fetch.ts` for the invariant tests.
+ * token. Even WITH a context, only a request that can execute a tool
+ * (a tools/call) carries the user's token; the handshake, the listings,
+ * the GET stream and the session DELETE never do. See `injected-fetch.ts`
+ * for the invariants and their tests.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -38,8 +41,11 @@ export interface M365UserContext {
   userId: string;
   /**
    * Mutable per-request sink for a broker error caught during a COLD
-   * backend connect — the token mint on the `initialize` handshake. That
-   * throw is swallowed by the pool's connect path (it resolves
+   * backend connect. BACKSTOP for `m365`: its `initialize` handshake mints
+   * nothing any more (`injected-fetch.ts`, invariant 5), so a connect to it
+   * cannot latch one; this stays for any other injected server and for a
+   * future handshake that mints. Such a throw is swallowed by the pool's
+   * connect path (it resolves
    * `undefined`, never re-throwing) and by the proxy's dynamic-find
    * catch-and-continue, so it can't reach the tools/call handler's catch
    * on its own the way a WARM-path mint failure does. Connect latches it

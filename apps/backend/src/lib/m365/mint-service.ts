@@ -2,8 +2,10 @@
  * Per-user Graph access-token mint service for the M365 broker.
  *
  * Per-call path: `injected-fetch.ts` asks for the calling user's access
- * token; this service answers from a per-user in-memory cache (60s
- * expiry buffer) or mints a fresh one via the Entra v2 refresh grant.
+ * token, only for a request that can execute a tool (a tools/call; the
+ * handshake, listings, GET stream and session DELETE never ask); this
+ * service answers from a per-user in-memory cache (60s expiry buffer) or
+ * mints a fresh one via the Entra v2 refresh grant.
  *
  * Hard requirements (design doc §5.3):
  *  - Per-user SINGLE-FLIGHT: Entra rotates the refresh token on every
