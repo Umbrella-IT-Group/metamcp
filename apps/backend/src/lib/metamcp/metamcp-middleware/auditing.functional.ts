@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import logger from "@/utils/logger";
 
+import { isPerUserBrokerError } from "../../m365/errors";
 import {
   BACKEND_UNAVAILABLE,
   isBackendUnavailableError,
@@ -339,15 +340,24 @@ export function createAuditingMiddleware(
       return result;
     } catch (error) {
       const durationMs = Math.round(performance.now() - start);
+      // A caller whose own Microsoft 365 enrollment is missing, expired,
+      // revoked or MFA-gated gets the enroll-URL result from the proxy one
+      // level up; that is an expected user state, not a tool fault, so it is
+      // a WARN without a stack here. The audit row below still records the
+      // call as failed with the broker code. Operator-actionable broker
+      // errors (not_configured, mint_failed) and everything else stay ERROR.
+      const enrollmentRefusal = isPerUserBrokerError(error);
       metamcpLogStore.record({
         category: "tool_call",
         serverName,
-        level: "error",
-        message: `${toolName} failed (${durationMs}ms)`,
+        level: enrollmentRefusal ? "warn" : "error",
+        message: enrollmentRefusal
+          ? `${toolName} refused: the caller's Microsoft 365 enrollment is needed (${errorCode(error)}, ${durationMs}ms)`
+          : `${toolName} failed (${durationMs}ms)`,
         toolName,
         durationMs,
         clientName,
-        error,
+        ...(enrollmentRefusal ? {} : { error }),
       });
       persist({
         client_name: clientName ?? null,

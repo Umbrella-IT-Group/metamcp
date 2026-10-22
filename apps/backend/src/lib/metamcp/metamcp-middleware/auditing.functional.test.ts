@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import logger from "@/utils/logger";
 
+import { M365BrokerError } from "../../m365/errors";
 import { BackendUnavailableError } from "../backend-unavailable";
 import { runWithCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
@@ -899,6 +900,85 @@ describe("in-band classification (migration 0039 error_detail)", () => {
       expect(second.message).toContain("is retired; no replacement");
       expect(DASHBOARD_ERROR_WORDS.test(first.message)).toBe(false);
       expect(DASHBOARD_ERROR_WORDS.test(second.message)).toBe(false);
+    });
+
+    it("a caller's own m365 enrollment refusal logs at warn, no stack, still audited and rethrown", async () => {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      for (const code of [
+        "credential_missing",
+        "credential_expired",
+        "credential_revoked",
+        "mfa_required",
+      ] as const) {
+        const refusal = new M365BrokerError(
+          code,
+          "No Microsoft 365 account is connected for your user yet.",
+          "https://enroll.example/m365/enroll",
+        );
+        await expect(
+          auditing()(vi.fn().mockRejectedValue(refusal))(
+            makeRequest({ a: 1 }),
+            context,
+          ),
+        ).rejects.toBe(refusal);
+      }
+      await flush();
+
+      const logged = spy.mock.calls.map((call) => call[0]);
+      expect(logged).toHaveLength(4);
+      for (const line of logged) {
+        expect(line.level).toBe("warn");
+        expect(line.error).toBeUndefined();
+        expect(line.message).toMatch(
+          /^search refused: the caller's Microsoft 365 enrollment is needed \((credential_missing|credential_expired|credential_revoked|mfa_required), \d+ms\)$/,
+        );
+        expect(DASHBOARD_ERROR_WORDS.test(line.message)).toBe(false);
+      }
+      const rows = recorder.mock.calls.map((call) => call[0]);
+      expect(rows.map((row) => [row.success, row.error_code])).toEqual([
+        [false, "credential_missing"],
+        [false, "credential_expired"],
+        [false, "credential_revoked"],
+        [false, "mfa_required"],
+      ]);
+    });
+
+    it("an operator-actionable broker error and any other throw stay at error with the error attached", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const notConfigured = new M365BrokerError(
+        "not_configured",
+        "broker not configured",
+      );
+      const mintFailed = new M365BrokerError("mint_failed", "mint failed");
+      const plain = new Error("terminated");
+
+      for (const thrown of [notConfigured, mintFailed, plain]) {
+        await expect(
+          auditing()(vi.fn().mockRejectedValue(thrown))(
+            makeRequest({ a: 1 }),
+            context,
+          ),
+        ).rejects.toBe(thrown);
+      }
+
+      const logged = spy.mock.calls.map((call) => call[0]);
+      expect(logged.map((line) => line.level)).toEqual([
+        "error",
+        "error",
+        "error",
+      ]);
+      expect(logged.map((line) => line.error)).toEqual([
+        notConfigured,
+        mintFailed,
+        plain,
+      ]);
+      for (const line of logged) {
+        expect(line.message).toMatch(/^search failed \(\d+ms\)$/);
+      }
     });
 
     it("isError results keep the original error level and text", async () => {
