@@ -53,3 +53,17 @@ export function isM365BrokerError(error: unknown): error is M365BrokerError {
     (error instanceof Error && error.name === "M365BrokerError")
   );
 }
+
+/**
+ * A broker error that is the connecting user's own enrollment state
+ * (no grant, expired, revoked, MFA challenge), as opposed to an
+ * operator-actionable fault (`not_configured`, `mint_failed`). A fresh
+ * enrollment round-trip by that user resolves it; nothing is wrong with
+ * the backend or the gateway, so it must never be read as a backend fault.
+ *
+ * A plain boolean, not a type predicate: a predicate's false branch would
+ * tell the compiler that `not_configured` is not an `M365BrokerError`.
+ */
+export function isPerUserBrokerError(error: unknown): boolean {
+  return isM365BrokerError(error) && REAUTH_RESOLVABLE.has(error.code);
+}

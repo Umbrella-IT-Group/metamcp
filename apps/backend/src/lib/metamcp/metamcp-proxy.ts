@@ -677,6 +677,14 @@ export const createServer = async (
 
           allTools.push(...toolsWithSource);
         } catch (error) {
+          // NO special case for a typed M365 broker error, on purpose. The
+          // injected fetch mints no token for a listing (m365/injected-fetch.ts,
+          // invariant 5), so a per-user broker error can no longer occur here.
+          // One that does reach this catch means that gate regressed, and it
+          // must stay exactly what it is today: an ERROR line, a failed server
+          // and the DEGRADED line. Classing it as info or keeping it out of
+          // `failedServers` would hide the one signal that catches that
+          // regression.
           logger.error(`Error fetching tools from: ${serverName}`, error);
           failedServers.push(serverName || mcpServerUuid);
           settledServerUuids.delete(mcpServerUuid);
@@ -1020,6 +1028,14 @@ export const createServer = async (
       // The 2026-09-30 client-side duplicate prompted finding this separate
       // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
       // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
+      // A typed M365 broker refusal (no grant, expired, revoked, MFA, broker
+      // not configured, mint failed) is the answer to this user's call, not a
+      // tool failure: the outer catch below turns it into the enrollment
+      // result and logs the one `m365_broker_refusal` line. No ERROR line for
+      // a per-user state.
+      if (isM365BrokerError(error)) {
+        throw error;
+      }
       if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
@@ -1096,12 +1112,16 @@ export const createServer = async (
       try {
         return (await callOnce(freshSession)) as CallToolResult;
       } catch (retryError) {
-        logger.error(
-          `Error calling tool "${name}" through ${
-            freshSession.client.getServerVersion()?.name || "unknown"
-          } after session re-initialize:`,
-          retryError,
-        );
+        // Same as above: a broker refusal on the retry is the user's own
+        // state, answered by the outer catch, not an ERROR here.
+        if (!isM365BrokerError(retryError)) {
+          logger.error(
+            `Error calling tool "${name}" through ${
+              freshSession.client.getServerVersion()?.name || "unknown"
+            } after session re-initialize:`,
+            retryError,
+          );
+        }
         throw retryError;
       }
     }
@@ -1172,7 +1192,9 @@ export const createServer = async (
     } catch (error) {
       // WARM path: a mint failure inside the injected fetch on the
       // tools/call request itself (no enrollment, expired grant, CA
-      // challenge, ...) propagates here as a typed error. Answer with a
+      // challenge, ...) propagates here as a typed error. This is where it
+      // surfaces for m365 now: the handshake and the listings mint nothing
+      // (m365/injected-fetch.ts, invariant 5). Answer with a
       // structured isError tool result carrying the enrollment URL (+
       // best-effort SEP-1036 URL elicitation) instead of an opaque
       // -32603 so the consumer can actually resolve it. Design doc §4.3.
@@ -1184,7 +1206,9 @@ export const createServer = async (
       // full rationale — drains any broker failure client.ts latched
       // during this request's cold connect and, if it belongs to the
       // server that owns the requested tool, answers with the same
-      // enrollment result the WARM path above returns.
+      // enrollment result the WARM path above returns. A BACKSTOP for m365
+      // (its handshake mints nothing, so its connect cannot latch one);
+      // kept for any other injected server.
       const coldFallback = resolveColdConnectBrokerFallback(
         request.params.name,
         server,

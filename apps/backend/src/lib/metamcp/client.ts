@@ -13,6 +13,7 @@ import logger from "@/utils/logger";
 
 import {
   isM365BrokerError,
+  isPerUserBrokerError,
   M365BrokerError,
   M365BrokerErrorCode,
 } from "../m365/errors";
@@ -166,6 +167,14 @@ export const TRANSPORT_START_TIMEOUT_MS = 30_000;
  * The SDK ships `terminateSession()` for exactly this, but its only call
  * site was the admin-only Inspector DELETE route — never the production
  * pool.
+ *
+ * THE DELETE CARRIES NO USER TOKEN. For an injected server (`m365`) the
+ * DELETE goes through the same per-user fetch as every request, and that
+ * fetch mints a token only for a request that can execute a tool
+ * (`m365/injected-fetch.ts`, invariant 5). So a user with no usable grant
+ * cannot make this DELETE throw: it used to, which left the backend session
+ * behind (the leak above) once per failed connect. Any OTHER failure here
+ * (a hung or gone backend, an error status) is still the one WARN below.
  *
  * FAIL-OPEN BY DESIGN: a backend that is unreachable, hung, or answers
  * the DELETE with an error must never block or abort pool eviction, so
@@ -520,7 +529,11 @@ export interface ConnectMetaMcpClientDeps {
 
 /**
  * Whether a connect whose connect-time mint failed with each M365 broker
- * code is retried. `false` marks a DETERMINISTIC per-user identity
+ * code is retried. BACKSTOP for `m365`: its `initialize` no longer mints
+ * (`m365/injected-fetch.ts`, invariant 5), so a connect to it cannot fail on
+ * a broker error today. This stays for any other injected server, and so
+ * that a mint on the handshake can never come back as a retry storm.
+ * `false` marks a DETERMINISTIC per-user identity
  * rejection — retrying can never change this user's outcome, so a connect
  * that hits one short-circuits to a single attempt (see the catch block
  * below). Deliberately every code EXCEPT `mint_failed`: mint-service throws
@@ -709,6 +722,35 @@ export const connectMetaMcpClient = async (
           if (closing || connectedAt === undefined) {
             return;
           }
+          // A typed M365 broker refusal is the answer to ONE request (the
+          // injected fetch throws it before any byte leaves, for a tools/call
+          // whose user has no usable grant), not a fault of the backend. The
+          // SDK still reports every failed send here (`send()`,
+          // `terminateSession()` and the GET stream all call `onerror` and
+          // then rethrow), so without this return a refusal ran the whole
+          // drop path below: a WARN, `onTransportDrop`, invalidation of every
+          // session's pooled connection for the server and a list_changed
+          // fan-out, all because one user had not enrolled. The caller still
+          // gets the typed error, so the proxy answers the consumer with the
+          // enrollment prompt and logs the one refusal line. A genuine drop
+          // (a plain "terminated", ECONNREFUSED, a 5xx, "Connection closed")
+          // is not a broker error and falls through unchanged.
+          if (isM365BrokerError(transportError)) {
+            if (isPerUserBrokerError(transportError)) {
+              // The user's own enrollment state; the proxy's refusal line is
+              // the single INFO signal for it.
+              logger.debug(
+                `M365 broker refused a request for server ${serverParams.name} (${serverParams.uuid}) (${transportError.code}); the user's own enrollment state, not a backend drop`,
+              );
+            } else {
+              // not_configured / mint_failed: an operator-actionable fault.
+              logger.warn(
+                `M365 broker refused a request (${transportError.code}); not a backend drop. Server ${serverParams.name} (${serverParams.uuid}):`,
+                transportError,
+              );
+            }
+            return;
+          }
           const age = formatConnectionAge(connectedAt);
           const detail = describeConnectError(transportError);
           logger.warn(
@@ -844,6 +886,10 @@ export const connectMetaMcpClient = async (
       if (nonRetryableBroker) {
         // brokerError is narrowed non-undefined by nonRetryableBroker.
         const deterministicError = brokerError as M365BrokerError;
+        // BACKSTOP: for `m365` the handshake mints nothing, so a connect
+        // cannot reach this branch for it any more (the refusal now arrives
+        // on the tools/call itself). It is kept for any other injected
+        // server and for a future handshake that mints.
         // A DETERMINISTIC per-user identity state, not a backend fault.
         // Retrying can never resolve it and only produces the
         // "Connect attempt N/N failed" storm the operator saw, so

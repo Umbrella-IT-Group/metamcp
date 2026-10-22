@@ -13,7 +13,15 @@
  *  2. Always return a structured `isError` tool result whose text is a
  *     machine-readable JSON payload (code + human message + enroll
  *     URL). This is the guaranteed fallback path on every client.
+ *
+ * Every refusal also logs ONE structured INFO line (`m365_broker_refusal`:
+ * code, a short hash of the user id, whether an elicitation was sent). A
+ * user who has not enrolled is an expected, user-resolvable state, so it is
+ * deliberately not an error line and not an alert; this line is how an
+ * operator answers "who has not enrolled" without one.
  */
+import { createHash } from "node:crypto";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -21,6 +29,7 @@ import { z } from "zod";
 import logger from "@/utils/logger";
 
 import { M365BrokerError } from "./errors";
+import { getM365UserContext } from "./request-context";
 
 const ACTION_HINT: Record<string, string> = {
   credential_missing:
@@ -37,6 +46,20 @@ const ACTION_HINT: Record<string, string> = {
     "Token mint failed for an operational reason — retry shortly; if it persists, contact the operator.",
 };
 
+/**
+ * A short, stable, non-reversible tag for the requesting user: the first 12
+ * hex characters of sha256(user id). The raw id never reaches this line. The
+ * mint audit line (`m365_mint`) carries the raw opaque id, so an operator
+ * joins the two by hashing a known id. `none` when the call has no user
+ * context (it cannot, on a path that mints, but the line must never throw).
+ */
+function userHash(): string {
+  const userId = getM365UserContext()?.userId;
+  return userId
+    ? createHash("sha256").update(userId).digest("hex").slice(0, 12)
+    : "none";
+}
+
 export function buildM365BrokerErrorResult(
   error: M365BrokerError,
   server: Server,
@@ -44,6 +67,7 @@ export function buildM365BrokerErrorResult(
   // Path 1: best-effort URL-mode elicitation. Never await the user's
   // response — the elicitation is a side-channel prompt; the tool call
   // itself resolves immediately with the typed error result below.
+  let elicitation = false;
   if (error.enrollUrl) {
     try {
       const capabilities = server.getClientCapabilities();
@@ -67,6 +91,8 @@ export function buildM365BrokerErrorResult(
             // Client rejected/ignored the elicitation — fallback text
             // path already carries the URL.
           });
+        // Set only once the request was handed off without throwing.
+        elicitation = true;
       }
     } catch (elicitError) {
       logger.debug(
@@ -75,6 +101,17 @@ export function buildM365BrokerErrorResult(
       );
     }
   }
+
+  // One INFO line per refusal, whichever path built it (warm tools/call,
+  // cold-connect fallback). No raw id, no email, no enrollment URL.
+  logger.info(
+    JSON.stringify({
+      event: "m365_broker_refusal",
+      code: error.code,
+      user_hash: userHash(),
+      elicitation,
+    }),
+  );
 
   // Path 2: guaranteed structured isError result.
   const payload = {

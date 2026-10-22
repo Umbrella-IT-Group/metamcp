@@ -375,6 +375,144 @@ describe("connectMetaMcpClient — closing guard on established connections", ()
   });
 });
 
+describe("connectMetaMcpClient: a broker refusal on an established connection is not a backend drop", () => {
+  // The SDK transport calls `onerror` for any request it fails to send and
+  // then rethrows, so the typed refusal the injected fetch throws for a
+  // tools/call whose user has no usable grant also arrives here. It says
+  // nothing about the backend: running the drop cascade for it invalidated
+  // every session's pooled connection for the server (and fanned out
+  // list_changed) each time one user without a grant made a call.
+  let recordSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let debugSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    recordSpy = vi
+      .spyOn(metamcpLogStore, "record")
+      .mockImplementation(() => {});
+    warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function connectEstablished(onTransportDrop: () => void) {
+    const client = makeFakeClient(async () => {});
+    const transport = makeRealHttpTransport();
+    const createClient = vi.fn(() => ({ client, transport }));
+    const result = (await connectMetaMcpClient(
+      params,
+      undefined,
+      onTransportDrop,
+      { createClient },
+    )) as ConnectedClient;
+    expect(result).toBeDefined();
+    recordSpy.mockClear();
+    warnSpy.mockClear();
+    return transport;
+  }
+
+  it.each([
+    "credential_missing",
+    "credential_expired",
+    "credential_revoked",
+    "mfa_required",
+  ] as const)(
+    "%s: no drop callback, no backend-drop record, no WARN",
+    async (code) => {
+      const onTransportDrop = vi.fn();
+      const transport = await connectEstablished(onTransportDrop);
+
+      transport.onerror?.(new M365BrokerError(code, "refused", ENROLL));
+
+      expect(onTransportDrop).not.toHaveBeenCalled();
+      expect(recordedMessages(recordSpy)).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+      // The per-user state stays visible at DEBUG; the one INFO signal
+      // for it is the proxy's refusal line.
+      expect(debugSpy).toHaveBeenCalled();
+    },
+  );
+
+  it.each(["not_configured", "mint_failed"] as const)(
+    "%s: no drop callback, one operator-actionable WARN that says it is not a backend drop",
+    async (code) => {
+      const onTransportDrop = vi.fn();
+      const transport = await connectEstablished(onTransportDrop);
+
+      transport.onerror?.(new M365BrokerError(code, "broker fault"));
+
+      expect(onTransportDrop).not.toHaveBeenCalled();
+      expect(recordedMessages(recordSpy)).toEqual([]);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [message] = warnSpy.mock.calls[0] as [string];
+      expect(message).toContain(
+        `M365 broker refused a request (${code}); not a backend drop`,
+      );
+    },
+  );
+
+  it("a real drop still runs the whole drop path (plain error)", async () => {
+    const onTransportDrop = vi.fn();
+    const transport = await connectEstablished(onTransportDrop);
+
+    transport.onerror?.(new Error("terminated"));
+
+    expect(onTransportDrop).toHaveBeenCalledTimes(1);
+    expect(onTransportDrop).toHaveBeenCalledWith("error", expect.any(Error));
+    expect(
+      recordedMessages(recordSpy).some((m) => m.includes("backend drop")),
+    ).toBe(true);
+    expect(
+      warnSpy.mock.calls.some(([m]: unknown[]) =>
+        String(m).includes("Transport error"),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    new Error("connect ECONNREFUSED 172.18.0.3:3000"),
+    new Error("Connection closed"),
+    Object.assign(new Error("Error POSTing to endpoint: bad gateway"), {
+      code: 502,
+    }),
+  ])("a genuine transport failure (%s) still drops", async (failure) => {
+    const onTransportDrop = vi.fn();
+    const transport = await connectEstablished(onTransportDrop);
+
+    transport.onerror?.(failure);
+
+    expect(onTransportDrop).toHaveBeenCalledTimes(1);
+  });
+
+  it("a broker error that surfaces while the connect is still in flight keeps its own path (no drop callback)", async () => {
+    const onTransportDrop = vi.fn();
+    const client = makeFakeClient(async (transport) => {
+      // The connect-time guard (`connectedAt === undefined`) swallows this
+      // before the broker check, and the connect failure reports it.
+      transport.onerror?.(
+        new M365BrokerError("credential_missing", "x", ENROLL),
+      );
+    });
+    const transport = makeRealHttpTransport();
+    const createClient = vi.fn(() => ({ client, transport }));
+
+    const result = await connectMetaMcpClient(
+      params,
+      undefined,
+      onTransportDrop,
+      {
+        createClient,
+      },
+    );
+
+    expect(result).toBeDefined();
+    expect(onTransportDrop).not.toHaveBeenCalled();
+  });
+});
+
 // -------------------------------------------------------------------
 // Transport start deadline
 //
