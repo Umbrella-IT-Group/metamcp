@@ -155,17 +155,26 @@ export class ToolsListRenotifyWatch {
     }
   }
 
-  private schedule(serverUuid: string, state: ServerWatch, delay: number) {
+  private schedule(
+    serverUuid: string,
+    state: ServerWatch,
+    delay: number,
+    connectRetry = false,
+  ) {
     if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => {
       state.timer = undefined;
-      void this.runProbe(serverUuid, state);
+      void this.runProbe(serverUuid, state, connectRetry);
     }, delay);
     // A pending probe must never keep the process alive on shutdown.
     state.timer.unref?.();
   }
 
-  private async runProbe(serverUuid: string, state: ServerWatch) {
+  private async runProbe(
+    serverUuid: string,
+    state: ServerWatch,
+    connectRetry: boolean,
+  ) {
     // A cancelled watch (every watcher gone) or one replaced by a newer
     // watch for the same server never probes.
     if (this.watches.get(serverUuid) !== state) return;
@@ -206,9 +215,14 @@ export class ToolsListRenotifyWatch {
       return;
     }
 
-    if (state.probeAgain) {
-      state.probeAgain = false;
-      this.schedule(serverUuid, state, 0);
+    const probeAgain = state.probeAgain;
+    state.probeAgain = false;
+    // A probe can establish its own idle connection, triggering
+    // notifyConnected before that connection's tools/list fails. Permit one
+    // immediate retry for a connect during an older probe, then back off:
+    // repeating that self-generated signal would otherwise spin forever.
+    if (probeAgain && !connectRetry) {
+      this.schedule(serverUuid, state, 0, true);
       return;
     }
     state.attempt += 1;

@@ -125,6 +125,32 @@ describe("ToolsListRenotifyWatch", () => {
     expect(told).toHaveBeenCalledTimes(1);
   });
 
+  it("backs off when each probe connects but fails to list", async () => {
+    const watch = new ToolsListRenotifyWatch({ delaysMs: DELAYS });
+    const probe = vi.fn(async () => {
+      // probeServerTools can create an idle connection, which calls
+      // markServerSuccess before its tools/list fails on a flapping backend.
+      watch.notifyConnected("srv");
+      return false;
+    });
+    const told = vi.fn();
+    const cancel = watch.watch("srv", probe, told);
+
+    try {
+      await vi.advanceTimersByTimeAsync(110);
+      expect(probe).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(190);
+      expect(probe).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(probe).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(390);
+      expect(probe).toHaveBeenCalledTimes(4);
+      expect(told).not.toHaveBeenCalled();
+    } finally {
+      cancel();
+    }
+  });
+
   it("never tells a cancelled watcher, and stops when nobody is owed", async () => {
     const watch = new ToolsListRenotifyWatch({ delaysMs: DELAYS });
     let up = false;

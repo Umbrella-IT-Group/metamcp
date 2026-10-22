@@ -250,6 +250,50 @@ describe("tools/list across a backend restart", () => {
     expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
   });
 
+  it("treats a rejected session acquisition as unavailable and re-notifies", async () => {
+    const consumer = await connectConsumer();
+    getSessionMock.mockRejectedValue(new Error("connect failed"));
+    probeMock.mockResolvedValue(false);
+
+    const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
+    expect(failure).toBeInstanceOf(McpError);
+    expect(failure.data).toEqual({
+      code: "backend_unavailable",
+      servers: ["ninja"],
+      retryable: true,
+    });
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
+    probeMock.mockResolvedValue(true);
+    await vi.waitFor(() =>
+      expect(consumer.listChanged).toHaveBeenCalledTimes(1),
+    );
+    expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+  });
+
+  it("re-notifies when tools/list fails over an acquired backend session", async () => {
+    const session = await backend("ninja", [tool("device_search")]);
+    const request = vi
+      .spyOn(session.client, "request")
+      .mockRejectedValue(new McpError(-32603, "backend not ready"));
+    serve({ [NINJA]: session });
+    probeMock.mockResolvedValue(false);
+    const consumer = await connectConsumer();
+
+    const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
+    expect(failure).toBeInstanceOf(McpError);
+    expect(failure.data).toMatchObject({ code: "backend_unavailable" });
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    request.mockRestore();
+    probeMock.mockResolvedValue(true);
+    await vi.waitFor(() =>
+      expect(consumer.listChanged).toHaveBeenCalledTimes(1),
+    );
+    expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+  });
+
   it("returns a partial listing when another server answered, and still re-notifies", async () => {
     getMcpServersMock.mockResolvedValue({
       [NINJA]: { uuid: NINJA, name: "ninja" },
@@ -308,6 +352,19 @@ describe("tools/list across a backend restart", () => {
     expect(probeMock).not.toHaveBeenCalled();
   });
 
+  it("stops watching when the consumer transport closes", async () => {
+    probeMock.mockResolvedValue(false);
+    const consumer = await connectConsumer();
+    serve({ [NINJA]: undefined });
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    await consumer.client.close();
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+    await sleep(100);
+    expect(probeMock).not.toHaveBeenCalled();
+  });
+
   it("arms nothing when MCP_TOOLS_LIST_RENOTIFY=false, and does not promise a notification", async () => {
     process.env.MCP_TOOLS_LIST_RENOTIFY = "false";
     probeMock.mockResolvedValue(true);
@@ -340,25 +397,30 @@ describe("tools/list across a backend restart", () => {
     expect(watchSpy.mock.calls[1][3]).toBe(1);
   });
 
-  it("lists the rest when a server is excluded for a misconfigured name, and never probes it", async () => {
-    // No retry fixes a stored name containing the tool-name separator, so it
-    // is neither an error nor owed a re-notify; it stays in the DEGRADED log.
-    getMcpServersMock.mockResolvedValue({
-      [NINJA]: { uuid: NINJA, name: "bad__name" },
-      [ITGLUE]: { uuid: ITGLUE, name: "itglue" },
-    });
-    serve({
-      [NINJA]: await backend("bad", [tool("device_search")]),
-      [ITGLUE]: await backend("itglue", []),
-    });
-    probeMock.mockResolvedValue(true);
-    const consumer = await connectConsumer();
+  it.each([true, false])(
+    "excludes a misconfigured name without probing it (reachable: %s)",
+    async (reachable) => {
+      // No retry fixes a stored name containing the tool-name separator, so it
+      // is neither an error nor owed a re-notify; it stays in the DEGRADED log.
+      getMcpServersMock.mockResolvedValue({
+        [NINJA]: { uuid: NINJA, name: "bad__name" },
+        [ITGLUE]: { uuid: ITGLUE, name: "itglue" },
+      });
+      serve({
+        [NINJA]: reachable
+          ? await backend("bad", [tool("device_search")])
+          : undefined,
+        [ITGLUE]: await backend("itglue", []),
+      });
+      probeMock.mockResolvedValue(true);
+      const consumer = await connectConsumer();
 
-    expect((await list(consumer)).tools).toEqual([]);
-    await sleep(100);
-    expect(probeMock).not.toHaveBeenCalled();
-    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
-  });
+      expect((await list(consumer)).tools).toEqual([]);
+      await sleep(100);
+      expect(probeMock).not.toHaveBeenCalled();
+      expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+    },
+  );
 
   it("answers an error naming only the unreachable server when another is misconfigured", async () => {
     getMcpServersMock.mockResolvedValue({

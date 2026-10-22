@@ -352,7 +352,7 @@ export const createServer = async (
       );
     }
 
-    await Promise.allSettled(
+    const listingOutcomes = await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
         logger.debug(
           `[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`,
@@ -363,6 +363,17 @@ export const createServer = async (
           logger.debug(
             `[DEBUG-TOOLS] ⏭️  Skipping already visited: ${params.name}`,
           );
+          return;
+        }
+        // A stored separator is a configuration exclusion even while the
+        // backend is down. Check it before connecting so retryable recovery
+        // is reserved for servers a reconnect can actually make listable.
+        if (params.name && sanitizeName(params.name).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
+          );
+          failedServers.push(params.name);
+          settledServerUuids.add(mcpServerUuid);
           return;
         }
         const session = await mcpServerPool.getSession(
@@ -591,6 +602,22 @@ export const createServer = async (
         }
       }),
     );
+
+    // Session acquisition and capability reads can reject before the
+    // per-listing catch. Promise.allSettled isolates those failures, but
+    // ignoring its rejected outcomes would still turn them into a successful
+    // empty list and leave the session without a recovery notification.
+    for (const [index, [mcpServerUuid, params]] of allServerEntries.entries()) {
+      const outcome = listingOutcomes[index];
+      if (outcome?.status !== "rejected") continue;
+      logger.error(
+        `Error preparing tools listing for: ${params.name || mcpServerUuid}`,
+        outcome.reason,
+      );
+      failedServers.push(params.name || mcpServerUuid);
+      settledServerUuids.delete(mcpServerUuid);
+      unreachableServers.set(mcpServerUuid, params);
+    }
 
     settleOwedServers(serverParams, settledServerUuids, unreachableServers);
 

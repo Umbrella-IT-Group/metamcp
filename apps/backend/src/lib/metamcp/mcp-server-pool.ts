@@ -1672,12 +1672,16 @@ export class McpServerPool {
    * Whether `params`' backend lists its tools right now: the probe of the
    * tools/list re-notify watch (tools-list-renotify.ts).
    *
-   * Uses the server's idle connection, creating one when the slot is empty
-   * (the same connect the idle refill in the health timer makes every 60 s,
-   * under the same caps), then lists the first page with a bounded timeout.
-   * It never takes or touches a session's active slot. A listing over a
-   * connection that predates a restart fails, so a stale idle client cannot
-   * read as recovered; the idle health check retires it on its next tick.
+   * Uses an existing pooled connection, preferring the idle slot, or creates
+   * an idle connection if none exists (the same connect the health timer's
+   * idle refill makes every 60 s, under the same caps). Lists the first page
+   * with a bounded timeout, without moving any session's active slot. An
+   * active connection must be usable here too: at the per-server cap there
+   * may never be room for an idle slot, even after the backend recovers.
+   * This read-only request shares a client just as the tool drift sweep does.
+   * A listing over a connection that predates a restart fails, so a stale
+   * idle client cannot read as recovered; the idle health check retires it
+   * on its next tick.
    *
    * False, never a throw, when the pool is shutting down, another creation
    * for the server is in flight (the watch probes again when that connect
@@ -1689,7 +1693,10 @@ export class McpServerPool {
   ): Promise<boolean> {
     if (this.cleanupAllPromise) return false;
     const serverUuid = params.uuid;
-    if (!this.idleSessions[serverUuid]) {
+    let client =
+      this.idleSessions[serverUuid] ??
+      this.findOldestActiveConnectionForServer(serverUuid);
+    if (!client) {
       try {
         await this.createIdleSession(serverUuid, params, namespaceUuid);
       } catch (error) {
@@ -1699,20 +1706,31 @@ export class McpServerPool {
         );
         return false;
       }
+      client =
+        this.idleSessions[serverUuid] ??
+        this.findOldestActiveConnectionForServer(serverUuid);
     }
-    const client = this.idleSessions[serverUuid];
     if (!client) return false;
+    const probeClient = client;
+    const generation = this.idleSessionGenerations[serverUuid] ?? 0;
+    // Invalidation can detach this client while its reply is in flight.
+    // Such a reply proves nothing about the replacement backend. Adoption
+    // into an active slot is fine, provided it still belongs to this pool.
+    const stillCurrent = () =>
+      !this.cleanupAllPromise &&
+      (this.idleSessionGenerations[serverUuid] ?? 0) === generation &&
+      this.isPooledClient(serverUuid, probeClient);
     try {
-      await client.client.request(
+      await probeClient.client.request(
         { method: "tools/list", params: {} },
         ListToolsResultSchema,
         { timeout: TOOLS_LIST_PROBE_TIMEOUT_MS },
       );
-      return true;
+      return stillCurrent();
     } catch (error) {
       // -32601 is an answer over a working connection from a backend that
       // serves no tools: it is up, and there is nothing more to wait for.
-      if (isPingAnsweredError(error)) return true;
+      if (isPingAnsweredError(error)) return stillCurrent();
       logger.info(
         `tools/list re-notify probe: server ${params.name} (${serverUuid}) did not answer tools/list yet:`,
         error,

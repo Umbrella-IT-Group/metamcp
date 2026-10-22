@@ -1651,13 +1651,15 @@ describe("health checks: a -32601 answer to ping is alive (upstream #337)", () =
 //
 // A session whose tools/list left a backend out is owed a list_changed once
 // that backend lists again. The pool answers "does it list now" over a real
-// pooled connection (never a session's active slot), and every successful
+// pooled connection (without moving its ownership), and every successful
 // connect tells the watch to probe at once.
 // -------------------------------------------------------------------
 describe("McpServerPool.probeServerTools — the re-notify probe", () => {
   type ProbeInternals = {
     idleSessions: Record<string, unknown>;
     activeSessions: Record<string, Record<string, unknown>>;
+    sessionTimestamps: Record<string, number>;
+    maxConnectionsPerServer: number;
     cleanupAllPromise: Promise<void> | null;
     markServerSuccess: (serverUuid: string) => void;
   };
@@ -1714,6 +1716,34 @@ describe("McpServerPool.probeServerTools — the re-notify probe", () => {
     expect(connectMock).not.toHaveBeenCalled();
   });
 
+  it("probes an existing active connection when the per-server cap leaves no idle slot", async () => {
+    const request = vi.fn().mockResolvedValue({ tools: [] });
+    const active = fakeConnected(request);
+    internals.activeSessions["sess-1"] = { "server-1": active };
+    internals.sessionTimestamps["sess-1"] = Date.now();
+    internals.maxConnectionsPerServer = 1;
+
+    await expect(pool.probeServerTools(params)).resolves.toBe(true);
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(internals.activeSessions["sess-1"]["server-1"]).toBe(active);
+    expect(internals.idleSessions["server-1"]).toBeUndefined();
+  });
+
+  it("accepts a reply if its idle connection was adopted by a session during the probe", async () => {
+    let resolve!: (value: { tools: [] }) => void;
+    const request = vi.fn(
+      () => new Promise<{ tools: [] }>((res) => (resolve = res)),
+    );
+    const active = fakeConnected(request);
+    internals.idleSessions["server-1"] = active;
+    const probing = pool.probeServerTools(params);
+    delete internals.idleSessions["server-1"];
+    internals.activeSessions["sess-1"] = { "server-1": active };
+    resolve({ tools: [] });
+    await expect(probing).resolves.toBe(true);
+  });
+
   it("answers false, without throwing, when the connect fails", async () => {
     connectMock.mockResolvedValue(undefined);
     await expect(pool.probeServerTools(params)).resolves.toBe(false);
@@ -1726,6 +1756,34 @@ describe("McpServerPool.probeServerTools — the re-notify probe", () => {
     internals.idleSessions["server-1"] = fakeConnected(request);
     await expect(pool.probeServerTools(params)).resolves.toBe(false);
   });
+
+  it.each(["result", "method-not-found"])(
+    "does not report recovery from an invalidated connection's late %s",
+    async (answer) => {
+      let resolve!: (value: { tools: [] }) => void;
+      let reject!: (error: unknown) => void;
+      const request = vi.fn(
+        () =>
+          new Promise<{ tools: [] }>((res, rej) => {
+            resolve = res;
+            reject = rej;
+          }),
+      );
+      internals.idleSessions["server-1"] = fakeConnected(request);
+      const probing = pool.probeServerTools(params);
+      expect(request).toHaveBeenCalledTimes(1);
+
+      // The backend drops while tools/list is pending. Its old reply must
+      // not discharge watchers waiting for the replacement to answer.
+      await pool.invalidateServerConnection("sess-1", "server-1");
+      if (answer === "result") {
+        resolve({ tools: [] });
+      } else {
+        reject(new McpError(ErrorCode.MethodNotFound, "Method not found"));
+      }
+      await expect(probing).resolves.toBe(false);
+    },
+  );
 
   it("counts a -32601 answer (a backend with no tools) as answering", async () => {
     const request = vi
