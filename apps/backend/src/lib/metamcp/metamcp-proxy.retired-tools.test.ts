@@ -81,11 +81,23 @@ vi.mock("../config.service", () => ({
   },
 }));
 
-vi.mock("./fetch-metamcp", () => ({
-  getMcpServers: vi.fn(async () => ({ "server-ninja": { name: "ninja" } })),
-  // No additional mounted owner was omitted from the routable set.
-  getNamespaceServerStates: vi.fn(async () => []),
-}));
+vi.mock("./fetch-metamcp", () => {
+  const getMcpServers = vi.fn(async () => ({
+    "server-ninja": { name: "ninja" },
+  }));
+  return {
+    getMcpServers,
+    // tools/list reads the routable set (and the error-gated servers, none
+    // here) through getNamespaceListingServers. Derived from getMcpServers so
+    // a case that sets the routable set drives the listing too.
+    getNamespaceListingServers: vi.fn(async () => ({
+      routable: await getMcpServers(),
+      errorGated: {},
+    })),
+    // No additional mounted owner was omitted from the routable set.
+    getNamespaceServerStates: vi.fn(async () => []),
+  };
+});
 
 vi.mock("./mcp-server-pool", () => ({
   mcpServerPool: {

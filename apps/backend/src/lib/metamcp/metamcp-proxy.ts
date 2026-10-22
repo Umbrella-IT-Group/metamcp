@@ -32,7 +32,11 @@ import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
 import { isM365BrokerError } from "../m365/errors";
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
-import { getMcpServers } from "./fetch-metamcp";
+import {
+  getMcpServers,
+  getNamespaceListingServers,
+  type NamespaceListingServers,
+} from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { requestWithSessionRecovery } from "./list-handler-recovery";
 import { mcpServerPool } from "./mcp-server-pool";
@@ -201,6 +205,16 @@ export const createServer = async (
   const renotifyRounds = new Map<string, number>();
   let proxyClosed = false;
 
+  // Does an owed server answer for a listing again? Not while its error gate
+  // is set: the listing would leave it out again, so telling the session to
+  // re-list would only earn it another error. The gate is checked first, so
+  // a gated server is not sent a request at all (and the pool's connect path
+  // refuses a gated server anyway). It is reset by the pool's half-open
+  // probe or by an operator; the probe after that decides.
+  const probeOwedServer = async (params: ServerParameters): Promise<boolean> =>
+    !(await mcpServerPool.isServerInErrorState(params.uuid)) &&
+    (await mcpServerPool.probeServerTools(params, namespaceUuid));
+
   const onOwedServerAnswers = (mcpServerUuid: string, serverName: string) => {
     if (proxyClosed || !owedServers.delete(mcpServerUuid)) return;
     renotifyRounds.set(
@@ -217,17 +231,19 @@ export const createServer = async (
    * After a listing: settle what this session is owed. A server the listing
    * reached, or that left the namespace, is owed nothing; a server it could
    * not reach gets a watch (one per server, kept until it answers or the
-   * session closes).
+   * session closes). `mountedServerUuids` includes the error-gated servers:
+   * a gated server is still mounted, so its watch must not be cancelled as
+   * if it had left.
    */
   const settleOwedServers = (
-    currentServers: Record<string, ServerParameters>,
+    mountedServerUuids: ReadonlySet<string>,
     settledServerUuids: ReadonlySet<string>,
     unreachableServers: ReadonlyMap<string, ServerParameters>,
   ): void => {
     for (const [mcpServerUuid, cancel] of owedServers) {
       if (
         settledServerUuids.has(mcpServerUuid) ||
-        !currentServers[mcpServerUuid]
+        !mountedServerUuids.has(mcpServerUuid)
       ) {
         cancel();
         owedServers.delete(mcpServerUuid);
@@ -242,7 +258,7 @@ export const createServer = async (
       const serverName = params.name || mcpServerUuid;
       const cancel = toolsListRenotifyWatch.watch(
         mcpServerUuid,
-        () => mcpServerPool.probeServerTools(params, namespaceUuid),
+        () => probeOwedServer(params),
         () => onOwedServerAnswers(mcpServerUuid, serverName),
         renotifyRounds.get(mcpServerUuid) ?? 0,
       );
@@ -291,10 +307,36 @@ export const createServer = async (
       namespaceUuid,
     );
     const startTime = performance.now();
-    const serverParams = await getMcpServers(
-      context.namespaceUuid,
-      includeInactiveServers,
-    );
+    // Not getMcpServers: it hides an error-gated server and answers {} when
+    // the read fails, and this listing read either as "the namespace mounts
+    // nothing", a successful empty answer that also cancelled the session's
+    // owed re-notifies. A failed read is a retryable error here, thrown
+    // before anything below prunes routes or settles what is owed.
+    let listing: NamespaceListingServers;
+    try {
+      listing = await getNamespaceListingServers(
+        context.namespaceUuid,
+        includeInactiveServers,
+      );
+    } catch (error) {
+      logger.error(
+        `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
+        error,
+      );
+      throw new McpError(
+        ErrorCode.InternalError,
+        "tools/list could not read this namespace's servers: no tools were listed, which is not the same as an empty tool list. Retry shortly.",
+        {
+          code: "backend_unavailable",
+          reason: "namespace_lookup_failed",
+          servers: [],
+          retryable: true,
+        },
+      );
+    }
+    // The routable servers, the same set getMcpServers answers: the only ones
+    // this listing connects to, warms or keeps routes for.
+    const serverParams = listing.routable;
     // A live proxy outlasts namespace edits. Drop removed owners before the
     // collision guard so a same-named replacement can list its own tools.
     for (const [toolName, owner] of toolNameOwner) {
@@ -319,6 +361,34 @@ export const createServer = async (
     // failed after recovery; owed a list_changed once it answers.
     const settledServerUuids = new Set<string>();
     const unreachableServers = new Map<string, ServerParameters>();
+    // The unreachable servers that are error-gated, named as such in the error.
+    const errorGatedUuids = new Set<string>();
+
+    // Error-gated servers are mounted but never connected to (the pool's
+    // connect path refuses them too). They are unreachable for this listing:
+    // owed a re-notify, and part of the error when nothing else lists tools.
+    // A misconfigured name stays excluded exactly as below, since resetting
+    // the gate would not make it listable.
+    for (const [mcpServerUuid, params] of Object.entries(listing.errorGated)) {
+      if (isSameServerInstance(params, mcpServerUuid)) {
+        settledServerUuids.add(mcpServerUuid);
+        continue;
+      }
+      if (params.name && sanitizeName(params.name).includes("__")) {
+        logger.error(
+          `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
+        );
+        failedServers.push(params.name);
+        settledServerUuids.add(mcpServerUuid);
+        continue;
+      }
+      logger.error(
+        `tools/list: server ${params.name || mcpServerUuid} is error-gated; excluded from namespace response until its error state is reset`,
+      );
+      failedServers.push(params.name || mcpServerUuid);
+      unreachableServers.set(mcpServerUuid, params);
+      errorGatedUuids.add(mcpServerUuid);
+    }
 
     // Track visited servers to detect circular references - reset on each call
     const visitedServers = new Set<string>();
@@ -619,7 +689,16 @@ export const createServer = async (
       unreachableServers.set(mcpServerUuid, params);
     }
 
-    settleOwedServers(serverParams, settledServerUuids, unreachableServers);
+    // Mounted means routable or error-gated: a gated server's watch stays.
+    const mountedServerUuids = new Set([
+      ...Object.keys(serverParams),
+      ...Object.keys(listing.errorGated),
+    ]);
+    settleOwedServers(
+      mountedServerUuids,
+      settledServerUuids,
+      unreachableServers,
+    );
 
     const totalTime = performance.now() - startTime;
     logger.debug(
@@ -634,7 +713,7 @@ export const createServer = async (
     // weeks before the zero-tool outage.
     if (failedServers.length > 0) {
       logger.error(
-        `tools/list DEGRADED for namespace ${namespaceUuid}: ${failedServers.length}/${allServerEntries.length} backend server(s) failed (${failedServers.join(", ")}); returning ${allTools.length} tools`,
+        `tools/list DEGRADED for namespace ${namespaceUuid}: ${failedServers.length}/${mountedServerUuids.size} backend server(s) failed (${failedServers.join(", ")}); returning ${allTools.length} tools`,
       );
     }
 
@@ -648,20 +727,30 @@ export const createServer = async (
     // told to list again once the server answers. A partial listing (some
     // server listed tools) is still returned: partial truth beats a hard
     // error for the servers that work, and the unreachable ones are owed a
-    // re-notify. A server excluded for a misconfigured name is not part of
-    // this: no retry fixes it, and an error would only make every listing of
-    // the namespace fail until it is renamed (it stays in the DEGRADED line).
+    // re-notify. An error-gated server counts as unreachable: its gate is
+    // reset by the pool's half-open probe or by an operator, so the error is
+    // retryable and the session is owed the same re-notify. A server excluded
+    // for a misconfigured name is not part of this: no retry fixes it, and
+    // an error would only make every listing of the namespace fail until it
+    // is renamed (it stays in the DEGRADED line).
     if (allTools.length === 0 && unreachableServers.size > 0) {
       const unreachableNames = Array.from(
         unreachableServers,
         ([mcpServerUuid, params]) => params.name || mcpServerUuid,
+      );
+      const described = Array.from(
+        unreachableServers,
+        ([mcpServerUuid, params]) =>
+          `${JSON.stringify(params.name || mcpServerUuid)}${
+            errorGatedUuids.has(mcpServerUuid) ? " (error-gated)" : ""
+          }`,
       );
       const renotify = toolsListRenotifyEnabled()
         ? " This session gets notifications/tools/list_changed when the server answers again."
         : "";
       throw new McpError(
         ErrorCode.InternalError,
-        `tools/list could not reach ${unreachableNames.map((name) => JSON.stringify(name)).join(", ")}: no tools were listed, which is not the same as an empty tool list. Retry shortly.${renotify}`,
+        `tools/list could not reach ${described.join(", ")}: no tools were listed, which is not the same as an empty tool list. Retry shortly.${renotify}`,
         {
           code: "backend_unavailable",
           servers: unreachableNames,

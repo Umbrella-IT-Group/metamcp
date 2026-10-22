@@ -22,7 +22,12 @@
  *   - closing the session stops it; the kill switch disables it;
  *   - a server re-notified and then failing again waits longer next time;
  *   - a server excluded for a misconfigured name is neither an error nor
- *     probed: no retry fixes it.
+ *     probed: no retry fixes it;
+ *   - an error-gated mounted server is unreachable, not absent: never
+ *     connected to, part of the error, owed a re-notify that waits for its
+ *     gate to be reset, and its watch kept across listings;
+ *   - a failed read of the namespace's servers is a retryable error, never an
+ *     empty list, and cancels nothing the session is owed.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -38,10 +43,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectedClient } from "./client";
 
-const { getSessionMock, probeMock, getMcpServersMock } = vi.hoisted(() => ({
+const { getSessionMock, probeMock, listingMock, gateMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   probeMock: vi.fn(),
-  getMcpServersMock: vi.fn(),
+  listingMock: vi.fn(),
+  gateMock: vi.fn(),
 }));
 
 vi.mock("@/utils/logger", () => ({
@@ -73,12 +79,25 @@ vi.mock("../config.service", () => ({
   },
 }));
 
-vi.mock("./fetch-metamcp", () => ({ getMcpServers: getMcpServersMock }));
+// One source of truth for what the namespace mounts, related the way
+// fetch-metamcp.ts relates them: getMcpServers is the listing's routable set
+// (the error gate filtered out), and answers {} when the read fails.
+vi.mock("./fetch-metamcp", () => ({
+  getNamespaceListingServers: listingMock,
+  getMcpServers: async (namespaceUuid: string, includeInactive?: boolean) => {
+    try {
+      return (await listingMock(namespaceUuid, includeInactive)).routable;
+    } catch {
+      return {};
+    }
+  },
+}));
 
 vi.mock("./mcp-server-pool", () => ({
   mcpServerPool: {
     getSession: getSessionMock,
     probeServerTools: probeMock,
+    isServerInErrorState: gateMock,
     invalidateServerConnection: vi.fn(),
     cleanupSession: vi.fn(),
     // A warm pool, so tools/list does not try to warm one up.
@@ -179,6 +198,14 @@ const names = (result: { tools: Tool[] }) =>
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** What the namespace mounts: routable servers, and error-gated ones. */
+function mount(
+  routable: Record<string, { uuid: string; name: string }>,
+  errorGated: Record<string, { uuid: string; name: string }> = {},
+) {
+  listingMock.mockResolvedValue({ routable, errorGated });
+}
+
 /** getSession answers per server: a session when up, undefined when down. */
 function serve(sessions: Record<string, ConnectedClient | undefined>) {
   getSessionMock.mockImplementation(
@@ -190,10 +217,10 @@ beforeEach(() => {
   toolsSyncCache.clear();
   getSessionMock.mockReset();
   probeMock.mockReset();
-  getMcpServersMock.mockReset();
-  getMcpServersMock.mockResolvedValue({
-    [NINJA]: { uuid: NINJA, name: "ninja" },
-  });
+  listingMock.mockReset();
+  mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
+  gateMock.mockReset();
+  gateMock.mockResolvedValue(false);
   delete process.env.MCP_TOOLS_LIST_RENOTIFY;
 });
 
@@ -295,7 +322,7 @@ describe("tools/list across a backend restart", () => {
   });
 
   it("returns a partial listing when another server answered, and still re-notifies", async () => {
-    getMcpServersMock.mockResolvedValue({
+    mount({
       [NINJA]: { uuid: NINJA, name: "ninja" },
       [ITGLUE]: { uuid: ITGLUE, name: "itglue" },
     });
@@ -402,7 +429,7 @@ describe("tools/list across a backend restart", () => {
     async (reachable) => {
       // No retry fixes a stored name containing the tool-name separator, so it
       // is neither an error nor owed a re-notify; it stays in the DEGRADED log.
-      getMcpServersMock.mockResolvedValue({
+      mount({
         [NINJA]: { uuid: NINJA, name: "bad__name" },
         [ITGLUE]: { uuid: ITGLUE, name: "itglue" },
       });
@@ -423,7 +450,7 @@ describe("tools/list across a backend restart", () => {
   );
 
   it("answers an error naming only the unreachable server when another is misconfigured", async () => {
-    getMcpServersMock.mockResolvedValue({
+    mount({
       [NINJA]: { uuid: NINJA, name: "ninja" },
       [ITGLUE]: { uuid: ITGLUE, name: "bad__name" },
     });
@@ -444,8 +471,159 @@ describe("tools/list across a backend restart", () => {
   });
 
   it("still answers an empty list for a namespace with no servers", async () => {
-    getMcpServersMock.mockResolvedValue({});
+    mount({});
     const consumer = await connectConsumer();
     expect((await list(consumer)).tools).toEqual([]);
+  });
+});
+
+// The read of what the namespace mounts used to come from getMcpServers,
+// which leaves error-gated servers out and answers {} on a database error.
+// Either way the listing saw "nothing mounted": a successful empty answer,
+// and every owed re-notify cancelled as if its server had left the namespace.
+describe("tools/list with an error-gated server or a failed namespace read", () => {
+  it("answers an error, not an empty list, when the only mounted server is error-gated, without connecting to it", async () => {
+    mount({}, { [NINJA]: { uuid: NINJA, name: "ninja" } });
+    serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
+    gateMock.mockResolvedValue(true);
+    probeMock.mockResolvedValue(true);
+    const consumer = await connectConsumer();
+
+    const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
+    expect(failure).toBeInstanceOf(McpError);
+    expect(failure.code).toBe(-32603);
+    expect(failure.data).toEqual({
+      code: "backend_unavailable",
+      servers: ["ninja"],
+      retryable: true,
+    });
+    expect(failure.message).toContain("error-gated");
+    // The gate keeps the listing from connecting to it, as before.
+    expect(getSessionMock).not.toHaveBeenCalled();
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    // Still gated: the watch checks the gate and does not probe or tell.
+    await vi.waitFor(() => expect(gateMock).toHaveBeenCalledWith(NINJA));
+    await sleep(100);
+    expect(probeMock).not.toHaveBeenCalled();
+    expect(consumer.listChanged).not.toHaveBeenCalled();
+
+    // The gate is reset and the server answers: told once, tools back.
+    mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
+    gateMock.mockResolvedValue(false);
+    await vi.waitFor(() =>
+      expect(consumer.listChanged).toHaveBeenCalledTimes(1),
+    );
+    expect(probeMock.mock.calls[0][0]).toMatchObject({ uuid: NINJA });
+    expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+  });
+
+  it("keeps the owed re-notify when an unreachable server becomes error-gated", async () => {
+    const watchSpy = vi.spyOn(toolsListRenotifyWatch, "watch");
+    probeMock.mockResolvedValue(false);
+    const consumer = await connectConsumer();
+    serve({ [NINJA]: undefined });
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    // The crash counter trips the gate; the session lists again meanwhile.
+    mount({}, { [NINJA]: { uuid: NINJA, name: "ninja" } });
+    const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
+    expect(failure).toBeInstanceOf(McpError);
+    expect(failure.data).toMatchObject({
+      code: "backend_unavailable",
+      servers: ["ninja"],
+    });
+    // The same watch, kept: not cancelled as if the server had left and
+    // re-armed, which would restart its backoff on every listing.
+    expect(watchSpy).toHaveBeenCalledTimes(1);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    mount({ [NINJA]: { uuid: NINJA, name: "ninja" } });
+    serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
+    probeMock.mockResolvedValue(true);
+    await vi.waitFor(() =>
+      expect(consumer.listChanged).toHaveBeenCalledTimes(1),
+    );
+    expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
+  });
+
+  it("returns a partial listing when another server answered, and owes the error-gated one a re-notify", async () => {
+    mount(
+      { [ITGLUE]: { uuid: ITGLUE, name: "itglue" } },
+      { [NINJA]: { uuid: NINJA, name: "ninja" } },
+    );
+    serve({ [ITGLUE]: await backend("itglue", [tool("search")]) });
+    const consumer = await connectConsumer();
+
+    expect(names(await list(consumer))).toEqual(["itglue__search"]);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+    expect(getSessionMock).not.toHaveBeenCalledWith(
+      expect.anything(),
+      NINJA,
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it.each([
+    ["alone", {}],
+    ["beside a server with no tools", { [ITGLUE]: "itglue" }],
+  ])(
+    "still answers an empty list for an error-gated misconfigured name (%s)",
+    async (_label, others) => {
+      const routable = Object.fromEntries(
+        Object.entries(others).map(([uuid, name]) => [uuid, { uuid, name }]),
+      );
+      mount(routable, { [NINJA]: { uuid: NINJA, name: "bad__name" } });
+      serve({ [ITGLUE]: await backend("itglue", []) });
+      probeMock.mockResolvedValue(true);
+      const consumer = await connectConsumer();
+
+      expect((await list(consumer)).tools).toEqual([]);
+      await sleep(100);
+      expect(probeMock).not.toHaveBeenCalled();
+      expect(toolsListRenotifyWatch.watchedServerCount()).toBe(0);
+    },
+  );
+
+  it("answers a retryable error, not an empty list, when the namespace read fails", async () => {
+    listingMock.mockRejectedValue(new Error("connection terminated"));
+    const consumer = await connectConsumer();
+
+    const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
+    expect(failure).toBeInstanceOf(McpError);
+    expect(failure.code).toBe(-32603);
+    expect(failure.data).toEqual({
+      code: "backend_unavailable",
+      reason: "namespace_lookup_failed",
+      servers: [],
+      retryable: true,
+    });
+    expect(failure.message).toContain("not the same as an empty tool list");
+    expect(getSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps an owed re-notify when a later listing cannot read the namespace", async () => {
+    const watchSpy = vi.spyOn(toolsListRenotifyWatch, "watch");
+    probeMock.mockResolvedValue(false);
+    const consumer = await connectConsumer();
+    serve({ [NINJA]: undefined });
+    await expect(list(consumer)).rejects.toBeInstanceOf(McpError);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    listingMock.mockRejectedValueOnce(new Error("connection terminated"));
+    const failure = (await list(consumer).catch((e: unknown) => e)) as McpError;
+    expect(failure.data).toMatchObject({ reason: "namespace_lookup_failed" });
+    expect(watchSpy).toHaveBeenCalledTimes(1);
+    expect(toolsListRenotifyWatch.watchedServerCount()).toBe(1);
+
+    serve({ [NINJA]: await backend("ninja", [tool("device_search")]) });
+    probeMock.mockResolvedValue(true);
+    await vi.waitFor(() =>
+      expect(consumer.listChanged).toHaveBeenCalledTimes(1),
+    );
+    expect(names(await list(consumer))).toEqual(["ninja__device_search"]);
   });
 });
