@@ -664,6 +664,94 @@ describe("POST initialize at the ceiling — an idle session is evicted and the 
   });
 });
 
+describe("a session-less request that is not an initialize, at the ceiling", () => {
+  // It can never open a session, so it is answered before admission: it must
+  // not evict another session of its credential to make room for nothing.
+  const NOT_INITIALIZED = {
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Bad Request: Server not initialized" },
+    id: null,
+  };
+
+  function listToolsWithoutSession(): Promise<Response> {
+    return fetch(`${baseUrl}/metamcp/ep-1/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "x-api-key": rawKey,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+  }
+
+  /** Forget what opening the sessions logged and recorded. */
+  function clearObservations(): void {
+    h.logger.info.mockClear();
+    h.logger.warn.mockClear();
+    h.record.mockClear();
+  }
+
+  it("evicts nothing and takes no slot, even with idle sessions to evict", async () => {
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    const first = await openSession();
+    const second = await openSession();
+    advanceSeconds(3600);
+    const getServerCalls = h.getServer.mock.calls.length;
+    const evictionsBefore = (
+      buildSessionsHealthPayload(true).ceilingEvictions as { total: number }
+    ).total;
+    clearObservations();
+
+    const response = await listToolsWithoutSession();
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(NOT_INITIALIZED);
+    expect(isResident(first)).toBe(true);
+    expect(isResident(second)).toBe(true);
+    expect(countLiveSessionsForIdentity(identity())).toBe(2);
+    expect(h.cleanupSession).not.toHaveBeenCalled();
+    expect(h.getServer.mock.calls.length).toBe(getServerCalls);
+    expect(ceilingLines()).toEqual([]);
+    expect(h.record).not.toHaveBeenCalled();
+    expect(
+      (buildSessionsHealthPayload(true).ceilingEvictions as { total: number })
+        .total,
+    ).toBe(evictionsBefore);
+
+    // The ceiling is as it was: an initialize still evicts one idle session.
+    const admitted = await initialize();
+    expect(admitted.status).toBe(200);
+    await admitted.text();
+    expect(evictionLines()).toHaveLength(1);
+    expect(countLiveSessionsForIdentity(identity())).toBe(2);
+  });
+
+  it("gets the transport's 400, not the ceiling's 429, when nothing can be evicted", async () => {
+    // The one answer that changed: the 429 came from admission, which a
+    // request that cannot open a session no longer goes through. Its WARN and
+    // "session refused" event no longer fire for such a request either.
+    process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "2";
+    await openSession();
+    await openSession();
+    advanceSeconds(119);
+    clearObservations();
+
+    const response = await listToolsWithoutSession();
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(NOT_INITIALIZED);
+    expect(ceilingLines()).toEqual([]);
+    expect(h.record).not.toHaveBeenCalled();
+
+    // An initialize in the same state is refused exactly as before.
+    const refused = await initialize();
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toEqual(refusalBody(2, 2));
+    expect(refusalLines()).toHaveLength(1);
+  });
+});
+
 describe("admission races before the first dispatch", () => {
   it("reserves the final free slot while a pool acquisition is pending", async () => {
     process.env.MCP_MAX_SESSIONS_PER_CREDENTIAL = "1";

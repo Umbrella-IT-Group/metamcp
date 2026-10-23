@@ -655,6 +655,54 @@ describe("dispatchTracked — in-flight guard around a long-lived dispatch (item
 
     expect(publicSessionSweeper.getInFlight(sessionId)).toBe(0);
   });
+
+  it("hands the transport a body the route already read, and nothing otherwise", async () => {
+    // A session-less initialize is read by the route to decide it may open a
+    // session; the transport must get that body rather than read a spent
+    // stream. Every other dispatch leaves the read to the transport.
+    const sessionId = "sess-parsed-body";
+    publicSessionSweeper.beginTracking(sessionId);
+    const handleRequest = vi.fn().mockResolvedValue(undefined);
+    const fakeTransport = {
+      handleRequest,
+    } as unknown as StreamableHTTPServerTransport;
+    const fakeReq = {} as express.Request;
+    const fakeRes = {} as express.Response;
+    const body = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "parsed-body-client", version: "0.0.0" },
+      },
+    };
+
+    await dispatchTracked(
+      fakeAuthReq(),
+      fakeTransport,
+      fakeReq,
+      fakeRes,
+      sessionId,
+      "test-consumer",
+      body,
+    );
+    await dispatchTracked(
+      fakeAuthReq(),
+      fakeTransport,
+      fakeReq,
+      fakeRes,
+      sessionId,
+    );
+
+    expect(handleRequest.mock.calls).toEqual([
+      [fakeReq, fakeRes, body],
+      [fakeReq, fakeRes, undefined],
+    ]);
+    expect(publicSessionSweeper.getInFlight(sessionId)).toBe(0);
+    publicSessionSweeper.forget(sessionId);
+  });
 });
 
 /**
@@ -1928,10 +1976,15 @@ describe("caller binding — the POST route stamps the instance it serves", () =
 
   /**
    * Drive one POST through the real router. The transport's own answer is
-   * irrelevant here (no MCP handshake is performed, so it refuses the body) —
-   * what is under test is the stamp the route applies before dispatching.
+   * irrelevant here (the pooled server is a stub, so nothing answers the
+   * JSON-RPC); what is under test is the stamp the route applies before
+   * dispatching.
    */
-  const post = (headers: Record<string, string> = {}) =>
+  const post = (
+    headers: Record<string, string> = {},
+    body: unknown = { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    signal?: AbortSignal,
+  ) =>
     fetch(`${baseUrl}/metamcp/ep-1/mcp`, {
       method: "POST",
       headers: {
@@ -1939,7 +1992,8 @@ describe("caller binding — the POST route stamps the instance it serves", () =
         accept: "application/json, text/event-stream",
         ...headers,
       },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      body: JSON.stringify(body),
+      signal,
     });
 
   it("stamps the instance it acquires for a NEW session", async () => {
@@ -1947,7 +2001,23 @@ describe("caller binding — the POST route stamps the instance it serves", () =
       metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
     ).mockResolvedValueOnce(instance);
 
-    await post();
+    // An initialize: only a request that can open a session acquires an
+    // instance; anything else is answered before admission.
+    const abort = new AbortController();
+    const response = await post(
+      {},
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "stamp-client", version: "0.0.0" },
+        },
+      },
+      abort.signal,
+    );
 
     expect(instance.handlerContext).toMatchObject({
       clientName: "test-consumer",
@@ -1957,6 +2027,12 @@ describe("caller binding — the POST route stamps the instance it serves", () =
       callerIp: "203.0.113.7",
       requestId: "req-route",
     });
+    // The stub server never answers the initialize stream: drop it and the
+    // session it opened.
+    abort.abort();
+    const sessionId = response.headers.get("mcp-session-id");
+    expect(sessionId).toBeTruthy();
+    await cleanupSession(sessionId as string);
   });
 
   it("re-stamps the pooled instance on a subsequent POST rather than leaving the initialize request's values", async () => {
@@ -2261,9 +2337,10 @@ describe("POST /:endpoint/mcp -- a forced 500 answers the constant body, not the
   });
 
   it("returns the constant internal-error body with no error text, session id or endpoint name", async () => {
-    // New-session POST (no Mcp-Session-Id): pool acquisition returns nothing,
-    // so the route throws before writing a header and the terminal handler
-    // answers the constant body.
+    // New-session POST (no Mcp-Session-Id) carrying an initialize, the only
+    // request that is admitted: pool acquisition returns nothing, so the
+    // route throws before writing a header and the terminal handler answers
+    // the constant body.
     (
       metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
     ).mockResolvedValueOnce(undefined);
@@ -2278,7 +2355,11 @@ describe("POST /:endpoint/mcp -- a forced 500 answers the constant body, not the
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
-        params: {},
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "forced-500-client", version: "0.0.0" },
+        },
       }),
     });
     const body = await response.text();
