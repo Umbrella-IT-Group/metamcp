@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { MAX_BATCH_SIZE } from "@modelcontextprotocol/sdk/server/requestBody.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isJsonContentType } from "@modelcontextprotocol/sdk/shared/mediaType.js";
 import {
@@ -1484,11 +1485,12 @@ type SessionlessPostPreread =
  * here (`parsedBody`), so status, headers and JSON-RPC error come from the
  * SDK's own `handlePostRequest` with its order of checks intact (Accept 406,
  * Content-Type 415, batch size and message shape 400, then "Server not
- * initialized" 400). That transport only ever gets a body that holds no
- * `initialize` by the SDK's own predicate (`mayInitialize`), so it never
- * initializes; its `sessionIdGenerator` throws if it ever tried. A body that
- * does hold one goes on to admission with `parsedBody`, so it is read once.
- * Three cases are not the throwaway's:
+ * initialized" 400). That transport only gets a body that cannot initialize:
+ * an oversized batch is refused before any message is validated; otherwise
+ * no message is an `initialize` by the SDK's own predicate (`mayInitialize`).
+ * Its `sessionIdGenerator` throws if it ever tried. A body that may initialize
+ * goes on to admission with `parsedBody`, so it is read once.
+ * Two cases stay on the admission path:
  *
  *  - Accept or Content-Type the transport would refuse: it refuses them
  *    before reading the body, so the body is left unread and the request
@@ -1500,10 +1502,11 @@ type SessionlessPostPreread =
  *    bytes read are pushed back with `unshift` and the request goes on to
  *    admission exactly as before, so the transport answers its own 413 and
  *    its HTTP adapter drains the rest of the upload as it does today.
- *  - A body that is not JSON, or could not be read: answered here with the
- *    transport's 400 -32700 "Parse error: Invalid JSON". The body is spent, so
- *    nothing else can answer it, and the header checks above have passed, so
- *    it is the answer the transport gives.
+ *
+ * A body that is not JSON, or could not be read, also gets a throwaway
+ * transport, with no parsed body: the spent or errored stream yields the
+ * SDK's own 400 -32700 "Parse error: Invalid JSON". The adapter still runs
+ * first, preserving its refusal for an invalid Host or URL too.
  *
  * WHAT A CALLER CAN STILL SEE CHANGE: only answers that admission itself
  * produced. A non-initialize request from a credential at its ceiling with
@@ -1537,7 +1540,7 @@ async function prereadSessionlessPost(
     return { answered: false };
   }
   if (read.outcome === "failed") {
-    respondLikeTransport(res, 400, -32700, "Parse error: Invalid JSON");
+    await answerWithoutSession(req, res, undefined);
     logAnsweredWithoutSession(req, endpointName, 400, "body could not be read");
     return { answered: true };
   }
@@ -1546,7 +1549,7 @@ async function prereadSessionlessPost(
     // Decoded as the SDK decodes it: UTF-8, lenient, leading BOM dropped.
     body = JSON.parse(new TextDecoder().decode(read.bytes));
   } catch {
-    respondLikeTransport(res, 400, -32700, "Parse error: Invalid JSON");
+    await answerWithoutSession(req, res, undefined);
     logAnsweredWithoutSession(req, endpointName, 400, "body is not JSON");
     return { answered: true };
   }
@@ -1643,10 +1646,15 @@ function readBodyWithin(
  * in it is an `initialize` by the SDK's own predicate, applied as
  * `handlePostRequest` applies it (to each message parsed with
  * `JSONRPCMessageSchema`, batches included) and, as a margin, to each raw
- * message too. Only a body for which this is false is answered without a
- * session.
+ * message too. An oversized batch cannot initialize because the SDK refuses
+ * it before checking messages. Only a body for which this is false is
+ * answered without a session.
  */
 function mayInitialize(body: unknown): boolean {
+  // The SDK refuses an oversized batch before validating any message. Keep
+  // that bound here too: otherwise a few kilobytes of tiny invalid messages
+  // can spend seconds in schema validation before reaching its cheap refusal.
+  if (Array.isArray(body) && body.length > MAX_BATCH_SIZE) return false;
   const messages: unknown[] = Array.isArray(body) ? body : [body];
   return messages.some((message) => {
     if (isInitializeRequest(message)) return true;
@@ -1656,17 +1664,20 @@ function mayInitialize(body: unknown): boolean {
 }
 
 /**
- * Let the SDK answer a session-less request that holds no `initialize`, on a
+ * Let the SDK answer a session-less request that cannot initialize, on a
  * transport that is never connected, registered or persisted: it gives the
  * answer the route's own transport gave ("Server not initialized", or an
  * earlier check's refusal) and allocates nothing. It holds no stream once it
- * has answered, so it is left to the garbage collector.
+ * has answered, so it is left to the garbage collector. With no parsed body,
+ * the spent or errored request stream yields its own parse-error response,
+ * after the adapter's URL and header checks have run.
  */
 async function answerWithoutSession(
   req: express.Request,
   res: express.Response,
   parsedBody: unknown,
 ): Promise<void> {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
   const transport = new StreamableHTTPServerTransport({
     // Called only to initialize, which `mayInitialize` rules out for every
     // body this transport is given. Should a later SDK initialize anyway,
@@ -1683,27 +1694,6 @@ async function answerWithoutSession(
     maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
   });
   await transport.handleRequest(req, res, parsedBody);
-}
-
-/**
- * The JSON-RPC error a transport writes (`createJsonErrorResponse`): this
- * status, `Content-Type: application/json` and `{jsonrpc, error: {code,
- * message}, id: null}`. For a request whose body the route has spent, so no
- * transport can read it. Skipped when the client is already gone.
- */
-function respondLikeTransport(
-  res: express.Response,
-  status: number,
-  code: number,
-  message: string,
-): void {
-  if (res.headersSent || res.writableEnded || res.destroyed) return;
-  res
-    .status(status)
-    .setHeader("Content-Type", "application/json")
-    .end(
-      JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }),
-    );
 }
 
 /** A method name logged as sent; anything else is replaced. */
@@ -1741,6 +1731,11 @@ function logAnsweredWithoutSession(
 
 /** `tools/list`, or `batch of 3: tools/list, ping x2` for a batch. */
 function describeJsonRpcMethods(body: unknown): string {
+  // Match the SDK's cheap batch refusal in logging too: never walk an
+  // unbounded number of messages just to summarize a rejected request.
+  if (Array.isArray(body) && body.length > MAX_BATCH_SIZE) {
+    return `batch of ${body.length}: (over SDK batch limit)`;
+  }
   const messages: unknown[] = Array.isArray(body) ? body : [body];
   const counts = new Map<string, number>();
   for (const message of messages) {

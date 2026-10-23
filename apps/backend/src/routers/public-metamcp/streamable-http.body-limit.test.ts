@@ -39,7 +39,12 @@ import { randomUUID } from "node:crypto";
 import http, { type Server as HttpServer } from "node:http";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { MAX_BATCH_SIZE } from "@modelcontextprotocol/sdk/server/requestBody.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  InitializeRequestSchema,
+  JSONRPCMessageSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import {
   afterAll,
@@ -691,6 +696,42 @@ describe("a session-less request that cannot open a session", () => {
     },
   );
 
+  it("refuses an oversized batch before validating any of its messages", async () => {
+    // The SDK caps batches before schema validation. Walking an arbitrary
+    // array here defeats that CPU bound, even for a small byte-sized body.
+    // An initialize at the end cannot make an oversized batch admissible.
+    const residentBefore = residentSessions();
+    const initializeValidation = vi.spyOn(InitializeRequestSchema, "safeParse");
+    const messageValidation = vi.spyOn(JSONRPCMessageSchema, "safeParse");
+    try {
+      const response = await postWithout(
+        JSON.stringify([
+          ...Array.from({ length: MAX_BATCH_SIZE }, () => null),
+          JSON.parse(initializeBody(1024)),
+        ]),
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        jsonrpc: "2.0",
+        error: {
+          code: -32600,
+          message: `Invalid Request: Batch must not exceed ${MAX_BATCH_SIZE} messages`,
+        },
+        id: null,
+      });
+      expect(initializeValidation).not.toHaveBeenCalled();
+      expect(messageValidation).not.toHaveBeenCalled();
+      expectNothingAllocated(residentBefore);
+      expect(answeredLines()).toEqual([
+        `Public endpoint ep-1: answered a POST without an Mcp-Session-Id (HTTP 400) without opening a session; methods: batch of ${MAX_BATCH_SIZE + 1}: (over SDK batch limit); Mcp-Protocol-Version: absent.`,
+      ]);
+    } finally {
+      initializeValidation.mockRestore();
+      messageValidation.mockRestore();
+    }
+  });
+
   it("answers a body that is not JSON with the transport's 400 -32700 and allocates nothing", async () => {
     const residentBefore = residentSessions();
 
@@ -701,8 +742,10 @@ describe("a session-less request that cannot open a session", () => {
     expect(await response.json()).toEqual(INVALID_JSON);
     await settle();
     expectNothingAllocated(residentBefore);
-    // The body is spent, so the route answers this one itself.
-    expect(handleRequest).not.toHaveBeenCalled();
+    // The adapter still runs first. The transport sees a spent stream and
+    // emits its own parse error without opening a session.
+    expect(handleRequest).toHaveBeenCalledTimes(1);
+    expect(handleRequest.mock.calls[0]?.[2]).toBeUndefined();
     expect(answeredLines()).toEqual([
       "Public endpoint ep-1: answered a POST without an Mcp-Session-Id (HTTP 400) without opening a session; body is not JSON; Mcp-Protocol-Version: absent.",
     ]);
@@ -790,6 +833,100 @@ describe("a session-less request that cannot open a session", () => {
     expect(await resultOf(ping)).toEqual({});
   });
 
+  it("waits for a chunked initialize, preserving split UTF-8 and BOM bytes", async () => {
+    const message = JSON.parse(initializeBody(1024));
+    message.params.clientInfo.name = "utf8-☃";
+    const body = `\uFEFF${JSON.stringify(message)}`;
+    const bytes = new TextEncoder().encode(body);
+    const snowman = bytes.indexOf(0xe2);
+    let upload!: ReadableStreamDefaultController<Uint8Array>;
+    let uploadClosed = false;
+    const pending = postWithout(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          upload = controller;
+          // Break the BOM across chunks; the remainder arrives after routing.
+          controller.enqueue(bytes.subarray(0, 1));
+        },
+      }),
+    );
+    try {
+      await vi.waitFor(() => {
+        expect(h.logger.info).toHaveBeenCalledWith(
+          "POST /mcp request for endpoint: ep-1",
+        );
+      });
+      expect(h.getServer).not.toHaveBeenCalled();
+      const incoming = vi.mocked(authenticateApiKey).mock.calls[0]?.[0];
+      if (!incoming) throw new Error("upload never reached authentication");
+      const partialReceived = new Promise<void>((resolve) => {
+        incoming.once("data", () => resolve());
+      });
+      upload.enqueue(bytes.subarray(1, snowman + 1));
+      // Wait for this partial UTF-8 sequence to reach Node, so the last
+      // bytes cannot be coalesced into the same incoming data chunk.
+      await partialReceived;
+      expect(h.getServer).not.toHaveBeenCalled();
+      upload.enqueue(bytes.subarray(snowman + 1));
+      upload.close();
+      uploadClosed = true;
+
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(await resultOf(response)).toMatchObject({
+        serverInfo: { name: "body-limit-gateway" },
+      });
+      expect(handleRequest.mock.calls[0]?.[2]).toEqual(message);
+      const sessionId = response.headers.get("mcp-session-id");
+      expect(sessionId).toBeTruthy();
+      await cleanupSession(sessionId as string);
+    } finally {
+      // Also end the upload if an assertion fails before it was closed.
+      if (!uploadClosed) upload.close();
+    }
+  });
+
+  it("releases an aborted partial upload without admitting a session", async () => {
+    const residentBefore = residentSessions();
+    const abort = new AbortController();
+    const upload = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0",'));
+      },
+    });
+    const pending = fetch(`${baseUrl}/metamcp/ep-1/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "x-api-key": rawKey,
+      },
+      body: upload,
+      duplex: "half",
+      signal: abort.signal,
+    } as RequestInit).catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => {
+        expect(h.logger.info).toHaveBeenCalledWith(
+          "POST /mcp request for endpoint: ep-1",
+        );
+      });
+      abort.abort();
+      await pending;
+      await vi.waitFor(() => {
+        expect(answeredLines()).toHaveLength(1);
+      });
+      expect(answeredLines()[0]).toContain("body could not be read");
+      expectNothingAllocated(residentBefore);
+      const incoming = vi.mocked(authenticateApiKey).mock.calls[0]?.[0];
+      expect(incoming?.listenerCount("data")).toBe(0);
+      expect(incoming?.listenerCount("error")).toBe(0);
+    } finally {
+      abort.abort();
+      await pending;
+    }
+  });
+
   it("still opens a session for a batch holding only an initialize", async () => {
     const response = await postWithout(
       JSON.stringify([JSON.parse(initializeBody(1024))]),
@@ -836,8 +973,16 @@ describe("a session-less request that cannot open a session", () => {
 function rawPost(
   agent: http.Agent,
   body: string,
-): Promise<{ status: number; reused: boolean; sessionId?: string }> {
-  const url = new URL(`${baseUrl}/metamcp/ep-1/mcp`);
+  headers: Record<string, string | string[]> = {},
+  targetUrl = `${baseUrl}/metamcp/ep-1/mcp`,
+): Promise<{
+  status: number;
+  reused: boolean;
+  sessionId?: string;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}> {
+  const url = new URL(targetUrl);
   return new Promise((resolve, reject) => {
     const request = http.request(
       {
@@ -851,15 +996,23 @@ function rawPost(
           accept: "application/json, text/event-stream",
           "x-api-key": rawKey,
           "content-length": Buffer.byteLength(body),
+          ...headers,
         },
       },
       (response) => {
-        response.resume();
+        let text = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        response.on("error", reject);
         response.on("end", () =>
           resolve({
             status: response.statusCode ?? 0,
             reused: request.reusedSocket,
             sessionId: response.headers["mcp-session-id"] as string | undefined,
+            headers: response.headers,
+            body: text,
           }),
         );
       },
@@ -921,6 +1074,56 @@ describe("a session-less POST gets the SDK transport's own answer", () => {
       body: await response.text(),
     };
   }
+
+  it.each<{
+    label: string;
+    body: string;
+    headers: Record<string, string | string[]>;
+    status: number;
+  }>([
+    {
+      label: "the adapter's invalid-Host refusal for a non-JSON body",
+      body: "{not json",
+      headers: { host: "invalid host" },
+      status: 400,
+    },
+    {
+      label: "Accept repeated across two header lines",
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+      headers: { accept: ["application/json", "text/event-stream"] },
+      status: 400,
+    },
+    {
+      label: "a repeated Content-Type with JSON first",
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+      headers: { "content-type": ["application/json", "text/plain"] },
+      status: 415,
+    },
+    {
+      label: "a repeated Content-Type with JSON second",
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+      headers: { "content-type": ["text/plain", "application/json"] },
+      status: 415,
+    },
+  ])("keeps $label", async ({ body, headers, status }) => {
+    const agent = new http.Agent({ keepAlive: true });
+    const answer = (response: Awaited<ReturnType<typeof rawPost>>) => ({
+      status: response.status,
+      headers: Object.entries(response.headers).filter(
+        ([name]) => !["date", "connection", "keep-alive"].includes(name),
+      ),
+      body: response.body,
+    });
+    try {
+      const route = await rawPost(agent, body, headers);
+      const sdk = await rawPost(agent, body, headers, referenceUrl);
+
+      expect(route.status).toBe(status);
+      expect(answer(route)).toEqual(answer(sdk));
+    } finally {
+      agent.destroy();
+    }
+  });
 
   const toolsList = () => JSON.stringify(rpc("tools/list"));
 

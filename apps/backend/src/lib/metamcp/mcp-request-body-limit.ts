@@ -9,8 +9,12 @@ import logger from "@/utils/logger";
  * Passed as `maxRequestBodySize` at every place this gateway constructs a
  * `StreamableHTTPServerTransport`: the public `/metamcp/:endpoint/mcp` route
  * (a fresh session and a lazily recovered one) and the Inspector's
- * `/mcp-proxy/server/mcp` and `/mcp-proxy/metamcp/:uuid/mcp`. None of those
- * routes parses the body first (`globalBodyParser` leaves `/metamcp/` and
+ * `/mcp-proxy/server/mcp` and `/mcp-proxy/metamcp/:uuid/mcp`. The public
+ * route's session-less POST is the one exception that reads the body before
+ * the transport does (`prereadSessionlessPost` in
+ * routers/public-metamcp/streamable-http.ts), and it applies this same limit
+ * and hands an over-limit body back to the transport to refuse. Otherwise no
+ * route parses the body first (`globalBodyParser` leaves `/metamcp/` and
  * `/mcp-proxy/` raw, see lib/global-body-parser), so this is the backend's
  * only ceiling on what an authenticated caller can make it buffer and parse.
  * A body over it is answered 413 with a JSON-RPC error (-32000, "Payload Too
