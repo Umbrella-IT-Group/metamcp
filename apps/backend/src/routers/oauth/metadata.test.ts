@@ -163,9 +163,8 @@ describe("discovery IS served where OAuth is in use", () => {
   it.each(BOTH_DOCUMENTS)(
     "serves the unscoped %s while any endpoint has OAuth enabled",
     async (document) => {
-      // The live Claude.ai connectors reach discovery this way: the 401
-      // challenge advertises the BARE resource_metadata URL, so a 404 here
-      // would break them.
+      // Keep unscoped discovery for clients that use the fallback path,
+      // although 401 challenges now advertise path-scoped metadata URLs.
       const res = await dispatch(document);
 
       expect(res.statusCode).toBe(200);
@@ -180,7 +179,7 @@ describe("discovery IS served where OAuth is in use", () => {
     const resource = await dispatch(PROTECTED_RESOURCE);
     expect(resource.body).toMatchObject({
       resource: "https://mcp.example.test/",
-      authorization_servers: ["https://mcp.example.test"],
+      authorization_servers: ["https://mcp.example.test/"],
     });
 
     const server = await dispatch(AUTHORIZATION_SERVER);
@@ -197,6 +196,78 @@ describe("discovery IS served where OAuth is in use", () => {
     expect((server.body as { issuer: string }).issuer).toBe(
       getIssuerIdentifier({ headers: {} } as unknown as express.Request),
     );
+  });
+
+  it.each(["mcp", "sse", "api"])(
+    "advertises the full endpoint resource for %s",
+    async (transport) => {
+      const suffix = `/metamcp/${OAUTH_ENDPOINT}/${transport}`;
+      const resource = await dispatch(`${PROTECTED_RESOURCE}${suffix}`);
+      const server = await dispatch(AUTHORIZATION_SERVER);
+
+      expect(resource.statusCode).toBe(200);
+      expect(resource.body).toMatchObject({
+        resource: `https://mcp.example.test${suffix}`,
+        authorization_servers: [(server.body as { issuer: string }).issuer],
+      });
+    },
+  );
+
+  it("preserves URL-encoded endpoint names in resource metadata", async () => {
+    endpointsRepositoryMock.findByName.mockResolvedValue({
+      uuid: "ep-spaced",
+      name: "my endpoint",
+      enable_oauth: true,
+    });
+
+    const resource = await dispatch(
+      `${PROTECTED_RESOURCE}/metamcp/my%20endpoint/mcp`,
+    );
+    expect(resource.body).toMatchObject({
+      resource: "https://mcp.example.test/metamcp/my%20endpoint/mcp",
+    });
+  });
+
+  it.each([
+    "https://mcp.example.test/",
+    "https://mcp.example.test///",
+  ])("normalizes APP_URL %s across discovery documents", async (appUrl) => {
+    const previousAppUrl = process.env.APP_URL;
+    process.env.APP_URL = appUrl;
+    try {
+      const resource = await dispatch(
+        `${PROTECTED_RESOURCE}/metamcp/${OAUTH_ENDPOINT}/mcp`,
+      );
+      const unscopedResource = await dispatch(PROTECTED_RESOURCE);
+      const server = await dispatch(AUTHORIZATION_SERVER);
+
+      expect(resource.body).toMatchObject({
+        resource: "https://mcp.example.test/metamcp/claude-connector/mcp",
+        authorization_servers: ["https://mcp.example.test/"],
+        resource_server_capabilities: {
+          introspection_endpoint: "https://mcp.example.test/oauth/introspect",
+          revocation_endpoint: "https://mcp.example.test/oauth/revoke",
+        },
+      });
+      expect(unscopedResource.body).toMatchObject({
+        resource: "https://mcp.example.test/",
+      });
+      expect(server.body).toMatchObject({
+        issuer: "https://mcp.example.test/",
+        authorization_endpoint: "https://mcp.example.test/oauth/authorize",
+        token_endpoint: "https://mcp.example.test/oauth/token",
+        registration_endpoint: "https://mcp.example.test/oauth/register",
+      });
+      expect(getIssuerIdentifier({ headers: {} } as unknown as express.Request)).toBe(
+        (server.body as { issuer: string }).issuer,
+      );
+    } finally {
+      if (previousAppUrl === undefined) {
+        delete process.env.APP_URL;
+      } else {
+        process.env.APP_URL = previousAppUrl;
+      }
+    }
   });
 
   it("advertises RFC 9207 iss support and S256-only PKCE", async () => {
