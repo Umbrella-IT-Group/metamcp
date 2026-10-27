@@ -41,7 +41,7 @@
     "pg": "^8.16.0",
     "spawn-rx": "^5.1.2",
     "undici": "^7",
-    "zod": "^4.4.3"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@repo/eslint-config": "workspace:*",
