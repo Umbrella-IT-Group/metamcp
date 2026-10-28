@@ -445,7 +445,7 @@ describe("the /api/auth relay", () => {
 
   it("does not copy a CORS grant out of better-auth's response", async () => {
     // better-auth emits no `Access-Control-*` header today (verified against
-    // 1.6.23). This pins what happens if a future release starts: an upstream
+    // 1.7.8). This pins what happens if a future release starts: an upstream
     // default must not be able to overwrite the policy chosen for the one
     // route in this app whose responses carry the session.
     h.authHandler.mockResolvedValue(

@@ -53,7 +53,7 @@ if (!process.env.APP_URL) {
 const BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET;
 const BETTER_AUTH_URL = process.env.APP_URL;
 
-// The credential paths better-auth 1.6.23 registers for email/password auth,
+// The credential paths better-auth 1.7.8 registers for email/password auth,
 // as they appear in `ctx.path` (the endpoint path with the `/api/auth` base
 // already stripped). `/reset-password` is matched by prefix so the
 // `/reset-password/:token` callback endpoint is covered by the same rule.
@@ -61,10 +61,11 @@ const BETTER_AUTH_URL = process.env.APP_URL;
 // Verified against the installed better-auth routes (sign-in.mjs, sign-up.mjs,
 // password.mjs): `/request-password-reset` is this version's name for
 // forgot-password, and `/forget-password` is not a registered server endpoint
-// here. SSO stays reachable ON PURPOSE. `/sign-in/social`, the OIDC callbacks
-// (`/oauth2/callback/:id`, `/callback/:id`), `/oauth/*`, `/sign-out` and the
-// session reads are all absent from this set, so disabling password login
-// never strands an SSO user or breaks an in-flight OAuth authorize.
+// here. SSO stays reachable ON PURPOSE. `/sign-in/social`, the OIDC callback
+// (`/callback/:id`; 1.7 removed the plugin's own `/oauth2/callback/:id`),
+// `/oauth/*`, `/sign-out` and the session reads are all absent from this set,
+// so disabling password login never strands an SSO user or breaks an in-flight
+// OAuth authorize.
 const isBasicAuthCredentialPath = (path: string): boolean =>
   path === "/sign-in/email" ||
   path === "/sign-up/email" ||
@@ -74,26 +75,63 @@ const isBasicAuthCredentialPath = (path: string): boolean =>
 
 // Enforce the DISABLE_BASIC_AUTH setting on the credential paths.
 //
-// WHY A HOOK, NOT A `middleware` OPTION. better-auth 1.6.23's options type has
-// no top-level `middleware` field: an array passed there is silently dropped,
-// so the previous wiring never ran and a stored DISABLE_BASIC_AUTH=true still
-// let password sign-in through. `hooks.before` is the request middleware this
-// version documents and actually consumes: its dispatcher reads
-// `options.hooks.before` and registers it with `matcher: () => true`, so it
-// runs ahead of every endpoint and the path match belongs here in the handler.
+// WHY A HOOK, NOT A `middleware` OPTION. better-auth's options type has no
+// top-level `middleware` field (true of 1.6.23 and of 1.7.8): an array passed
+// there is silently dropped, so the previous wiring never ran and a stored
+// DISABLE_BASIC_AUTH=true still let password sign-in through. `hooks.before`
+// is the request middleware this version documents and actually consumes: its
+// dispatcher reads `options.hooks.before` and registers it with
+// `matcher: () => true`, so it runs ahead of every endpoint and the path match
+// belongs here in the handler.
 //
 // The flag is read LIVE per request: it is DB-backed and toggled from Settings
 // at runtime, so a flip must take effect on the next request with no restart.
 // Throwing an APIError('FORBIDDEN') yields an honest 403 the login page can
 // show, and no session is created because the endpoint handler never runs.
-const basicAuthEnforcementHook = createAuthMiddleware(async (ctx) => {
-  if (!isBasicAuthCredentialPath(ctx.path)) return;
+async function enforceBasicAuthSetting(path: string): Promise<void> {
+  if (!isBasicAuthCredentialPath(path)) return;
   if (await configService.isBasicAuthDisabled()) {
     throw new APIError("FORBIDDEN", {
       message:
         "Basic email/password authentication is disabled. Sign in with SSO/OIDC instead.",
     });
   }
+}
+
+// The endpoints that accept a client-submitted id_token in the request body.
+const ID_TOKEN_BODY_PATHS = new Set(["/sign-in/social", "/link-social"]);
+
+// Refuse a bare id_token on those endpoints, as better-auth 1.6.23 did.
+//
+// WHY. In 1.6.23 the generic OAuth provider had no `verifyIdToken`, so
+// `POST /sign-in/social` (and `/link-social`) with an `idToken` body answered
+// 404 ID_TOKEN_NOT_SUPPORTED, and the redirect flow was the only way in. 1.7
+// builds an id_token verifier from the discovery JWKS, which switches that
+// branch on: a caller holding any unexpired id_token issued to our client id
+// gets a session with no state, no PKCE and, unless the caller chooses to send
+// one, no nonce. That is a replay path the redirect flow does not have, and the
+// generic plugin has no option to turn it off. Nothing here uses it: the login
+// page sends `signIn.social({ provider })` with no idToken and nothing calls
+// `linkSocial`. So the branch is refused before its endpoint runs, with the
+// same status, code and message 1.6.23 returned. `/link-social` is covered
+// because 1.7 opened it the same way.
+//
+// The test is the endpoint's own (`if (c.body.idToken)`), so the refusal
+// covers exactly the requests that would have taken the id_token branch.
+function refuseBareIdToken(path: string, body: unknown): void {
+  if (!ID_TOKEN_BODY_PATHS.has(path)) return;
+  if (typeof body !== "object" || body === null) return;
+  if (!(body as { idToken?: unknown }).idToken) return;
+  throw new APIError("NOT_FOUND", {
+    message: "id_token not supported",
+    code: "ID_TOKEN_NOT_SUPPORTED",
+  });
+}
+
+// better-auth takes ONE `hooks.before`, so both request checks run from it.
+const authBeforeHook = createAuthMiddleware(async (ctx) => {
+  refuseBareIdToken(ctx.path, ctx.body);
+  await enforceBasicAuthSetting(ctx.path);
 });
 
 // One boot-time signal for the effective DISABLE_BASIC_AUTH state, called from
@@ -125,6 +163,27 @@ export async function logBasicAuthEnforcementState(): Promise<void> {
 const oidcProviders: GenericOAuthConfig[] = [];
 
 // Add OIDC provider if configured
+//
+// Under better-auth 1.7 the generic OAuth plugin registers this provider as a
+// core social provider, which changes four things an operator can see:
+//
+//  - The redirect URI is `${APP_URL}/api/auth/callback/<providerId>`, built by
+//    the core `/sign-in/social` and `/callback/:id` endpoints. The 1.6 plugin
+//    route `/api/auth/oauth2/callback/<providerId>` no longer exists, so the
+//    IdP app registration must list the new URI. auth-oidc-callback.test.ts
+//    pins it.
+//  - `discoveryUrl` is fetched once, when the auth instance initializes at
+//    boot, not per sign-in. If that fetch fails the provider is skipped and
+//    logged ("Discovery fetch failed" / "Provider skipped"). From 1.7.8 the
+//    next sign-in or callback request naming the provider retries discovery
+//    (10 s timeout), so SSO comes back without a restart once the IdP answers.
+//  - Because discovery publishes `jwks_uri`, the id_token is verified against
+//    the discovery issuer, the JWKS and `aud` = clientId, and must echo the
+//    `nonce` the sign-in request sent, with 30 s of clock tolerance (1.7.8;
+//    1.7.7 had none, so a host clock lagging the IdP's failed sign-in).
+//  - For the same reason better-auth would sign a user in from a bare id_token
+//    posted to `/sign-in/social` (1.6 answered ID_TOKEN_NOT_SUPPORTED).
+//    `refuseBareIdToken` above restores the 1.6 answer.
 if (process.env.OIDC_CLIENT_ID && process.env.OIDC_CLIENT_SECRET) {
   const oidcConfig: GenericOAuthConfig = {
     providerId: process.env.OIDC_PROVIDER_ID || "oidc",
@@ -293,7 +352,7 @@ export const auth = betterAuth({
   },
   advanced: {
     // Host-only session cookie. With crossSubDomainCookies enabled,
-    // better-auth 1.6.23 sets the cookie Domain to the APP_URL hostname, so the
+    // better-auth 1.7.8 sets the cookie Domain to the APP_URL hostname, so the
     // authenticated session cookie is sent to that host AND every subdomain of
     // it. The frontend proxies the backend on localhost within one container
     // (apps/frontend/next.config.js rewrites all of /api/auth, /trpc and
@@ -434,7 +493,7 @@ export const auth = betterAuth({
 
       delete: {
         // Fires once per deleted row for single deletes (sign-out) and for
-        // bulk deletes alike — verified against better-auth 1.6.23's
+        // bulk deletes alike, verified against better-auth 1.7.8's
         // `deleteWithHooks` / `deleteManyWithHooks`, which loop the `after`
         // hook over every entity they removed.
         //
@@ -451,11 +510,12 @@ export const auth = betterAuth({
       },
     },
   },
-  // Enforce DISABLE_BASIC_AUTH on the credential paths. `hooks.before` is the
-  // request middleware better-auth 1.6.23 actually runs; the removed top-level
+  // Enforce DISABLE_BASIC_AUTH on the credential paths and refuse a bare
+  // id_token on /sign-in/social and /link-social. `hooks.before` is the request
+  // middleware better-auth 1.7.8 actually runs; the removed top-level
   // `middleware` array was never a supported option and did nothing.
   hooks: {
-    before: basicAuthEnforcementHook,
+    before: authBeforeHook,
   },
 });
 

@@ -14,7 +14,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@better-fetch/fetch": "^1.3.1",
+    "@better-fetch/fetch": "1.3.2",
     "@hookform/resolvers": "^5.1.1",
     "@modelcontextprotocol/sdk": "1.32.0",
     "@radix-ui/react-alert-dialog": "^1.1.15",
@@ -39,7 +39,7 @@
     "@trpc/server": "^11.18.0",
     "@types/react-syntax-highlighter": "^15.5.13",
     "ahooks": "^3.9.0",
-    "better-auth": "^1.6.23",
+    "better-auth": "1.7.8",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
