@@ -5,7 +5,7 @@
  * The hook is better-auth's `databaseHooks.session.create.before`, which every
  * sign-in path funnels through — email/password, the OIDC callback, account
  * linking — so one guard covers all of them without enumerating endpoints.
- * Verified in better-auth 1.6.23's own `getWithHooks`: a `create.before` hook
+ * Verified in better-auth 1.7.7's own `getWithHooks`: a `create.before` hook
  * that returns `false` aborts the create, and a throw propagates. This fork
  * throws an APIError instead of returning false, so the user sees an honest
  * 403 rather than an opaque broken sign-in.

@@ -5,8 +5,9 @@
  *
  * The regression this guards is specific. The setting used to be wired through
  * a top-level `middleware: [...]` array passed to betterAuth(), which
- * better-auth 1.6.23 has no such option for and silently ignored, so a stored
- * DISABLE_BASIC_AUTH=true still handed out sessions for a valid password. The
+ * better-auth has no such option for (1.6.23 then, 1.7.7 now) and silently
+ * ignored, so a stored DISABLE_BASIC_AUTH=true still handed out sessions for a
+ * valid password. The
  * fix moves the check to `hooks.before` (the request middleware this version
  * actually runs), so this file asserts two things the old wiring could not:
  *
@@ -76,7 +77,9 @@ const RESET_PASSWORD_TOKEN = { path: "/reset-password/:token" };
 
 // SSO / non-credential paths the hook must leave alone.
 const SIGN_IN_SOCIAL = { path: "/sign-in/social" };
-const OIDC_CALLBACK = { path: "/oauth2/callback/oidc" };
+// better-auth 1.7 serves the OIDC callback from the core `/callback/:id`
+// route; the 1.6 plugin path `/oauth2/callback/:id` is gone.
+const OIDC_CALLBACK = { path: "/callback/oidc" };
 const SIGN_OUT = { path: "/sign-out" };
 const GET_SESSION = { path: "/get-session" };
 
@@ -153,7 +156,7 @@ describe("hooks.before: leaves SSO and non-credential paths alone", () => {
 
   it.each([
     ["sign-in/social", SIGN_IN_SOCIAL],
-    ["oauth2/callback/oidc", OIDC_CALLBACK],
+    ["callback/oidc", OIDC_CALLBACK],
     ["sign-out", SIGN_OUT],
     ["get-session", GET_SESSION],
   ])("passes %s through without throwing", async (_label, ctx) => {
