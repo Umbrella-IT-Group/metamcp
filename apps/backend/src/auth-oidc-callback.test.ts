@@ -10,7 +10,8 @@
  *     only to a registered URI, so a silent change here locks every SSO user
  *     out of the admin UI; the 1.6 plugin route `/oauth2/callback/:providerId`
  *     must be gone, not shadowing the new one;
- *  3. the authorization request carries a PKCE S256 challenge and a nonce;
+ *  3. the authorization request carries a PKCE S256 challenge and a nonce,
+ *     and its state is single-use and bound to the initiating browser;
  *  4. the code exchange sends the same redirect URI and the PKCE verifier;
  *  5. the id_token is verified against discovery (issuer, JWKS, `aud`) and
  *     must echo the nonce, with an Entra-shaped JWKS whose keys carry no
@@ -21,7 +22,8 @@
  *     every auth request on a mismatch;
  *  8. a bare id_token posted to `/sign-in/social` or `/link-social` is refused
  *     the way 1.6.23 refused it (our `hooks.before`), while the redirect flow
- *     and the callback are untouched;
+ *     and the callback are untouched, including alternate body encodings
+ *     and URL spellings;
  *  9. the two 1.7.8 fixes the version pin exists for: 30 s of clock tolerance
  *     on the id_token, and a discovery retry after a failed boot fetch.
  *
@@ -243,8 +245,12 @@ function spyStateStore(adapter: InternalAdapter): Map<string, string> {
       updatedAt: new Date(),
     };
   }) as never);
-  vi.spyOn(adapter, "deleteVerificationByIdentifier").mockResolvedValue(
-    undefined as never,
+  // State consumption must behave like the database, or a callback replay
+  // could pass in this harness even though the real row has been deleted.
+  vi.spyOn(adapter, "deleteVerificationByIdentifier").mockImplementation(
+    (async (identifier: string) => {
+      rows.delete(identifier);
+    }) as never,
   );
   return rows;
 }
@@ -400,6 +406,35 @@ describe("OIDC sign-in round trip", () => {
       (nonce: string) =>
         signIdToken(entraIdTokenClaims(nonce), foreignKey.privateKey),
     ],
+    [
+      "omits the sign-in nonce",
+      (nonce: string) => {
+        const claims = entraIdTokenClaims(nonce);
+        delete claims.nonce;
+        return signIdToken(claims);
+      },
+    ],
+    [
+      "belongs to a different issuer",
+      (nonce: string) =>
+        signIdToken({
+          ...entraIdTokenClaims(nonce),
+          iss: "https://other.example",
+        }),
+    ],
+    [
+      "belongs to a different client",
+      (nonce: string) =>
+        signIdToken({ ...entraIdTokenClaims(nonce), aud: "another-client" }),
+    ],
+    [
+      "expired beyond the clock tolerance",
+      (nonce: string) =>
+        signIdToken({
+          ...entraIdTokenClaims(nonce),
+          exp: Math.floor(Date.now() / 1000) - 60,
+        }),
+    ],
   ])("refuses an id_token that %s", async (_label, makeToken) => {
     const { auth, adapter, state, stored, stateCookie } = await startSignIn();
     network.idToken = makeToken(stored.idTokenNonce ?? "");
@@ -411,6 +446,58 @@ describe("OIDC sign-in round trip", () => {
     expect(res.headers.get("location")).toContain(
       "error=unable_to_get_user_info",
     );
+    expect(ownerLookup).not.toHaveBeenCalled();
+  });
+});
+
+describe("OIDC callback state binding", () => {
+  it.each(["missing cookie", "tampered cookie", "unknown state"])(
+    "refuses a callback with %s before exchanging its code",
+    async (variant) => {
+      const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+      network.idToken = signIdToken(
+        entraIdTokenClaims(stored.idTokenNonce ?? ""),
+      );
+      const ownerLookup = vi.spyOn(adapter, "findAccountOwnerByKey");
+
+      const res = await auth.handler(
+        callbackRequest(
+          variant === "unknown state" ? `${state}-unknown` : state,
+          variant === "missing cookie"
+            ? ""
+            : variant === "tampered cookie"
+              ? `${stateCookie}tampered`
+              : stateCookie,
+        ),
+      );
+
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toContain("error=state_mismatch");
+      expect(network.tokenRequests).toHaveLength(0);
+      expect(ownerLookup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("consumes the state even when a later identity lookup fails", async () => {
+    const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+    network.idToken = signIdToken(
+      entraIdTokenClaims(stored.idTokenNonce ?? ""),
+    );
+    const ownerLookup = vi
+      .spyOn(adapter, "findAccountOwnerByKey")
+      .mockRejectedValue(new Error("stop after identity resolution") as never);
+
+    await auth.handler(callbackRequest(state, stateCookie));
+    expect(network.tokenRequests).toHaveLength(1);
+    expect(ownerLookup).toHaveBeenCalledTimes(1);
+    ownerLookup.mockClear();
+    network.tokenRequests = [];
+
+    const replay = await auth.handler(callbackRequest(state, stateCookie));
+
+    expect(replay.status).toBe(302);
+    expect(replay.headers.get("location")).toContain("error=state_mismatch");
+    expect(network.tokenRequests).toHaveLength(0);
     expect(ownerLookup).not.toHaveBeenCalled();
   });
 });
@@ -431,29 +518,101 @@ const ID_TOKEN_NOT_SUPPORTED = {
 };
 
 describe("bare id_token sign-in: refused, as better-auth 1.6.23 refused it", () => {
-  it("answers POST /sign-in/social with an idToken 404 ID_TOKEN_NOT_SUPPORTED and no session", async () => {
+  it.each([
+    ["/sign-in/social", "application/json", "literal"],
+    ["/link-social", "application/json", "literal"],
+    ["/sign-in/social", "APPLICATION/JSON; charset=UTF-8", "literal"],
+    ["/sign-in/social", "application/json", "escaped"],
+    ["/link-social", "application/json; charset=UTF-8", "escaped"],
+    ["/sign-in/social", "application/json", "duplicate"],
+    ["/unused/%2e%2e/sign-in/social", "application/json", "literal"],
+    ["/unused/../link-social", "application/json", "literal"],
+    ["/sign-in\\social", "application/json", "literal"],
+    ["/unused\\..\\link-social", "application/json", "literal"],
+  ])(
+    "refuses POST %s (%s, %s field) with no session",
+    async (path, contentType, field) => {
+      const { auth, adapter } = await loadAuth();
+      const ownerLookup = vi.spyOn(adapter, "findAccountOwnerByKey");
+      // A token that would pass every 1.7 check: right issuer, key, audience,
+      // unexpired. The caller sends no nonce, so 1.7 would not check one.
+      const claims = entraIdTokenClaims("unused");
+      delete claims.nonce;
+      let body = JSON.stringify({
+        provider: "oidc",
+        callbackURL: "/",
+        idToken: { token: signIdToken(claims) },
+      });
+      if (field === "escaped")
+        body = body.replace('"idToken"', '"id\\u0054oken"');
+      if (field === "duplicate") {
+        body = body.replace('"idToken":', '"idToken":null,"idToken":');
+      }
+
+      const res = await auth.handler(
+        new Request(`${APP_URL}/api/auth${path}`, {
+          method: "POST",
+          headers: { "content-type": contentType, origin: APP_URL },
+          body,
+        }),
+      );
+
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject(ID_TOKEN_NOT_SUPPORTED);
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(ownerLookup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["/sign-in/social", "/link-social"])(
+    "refuses form-encoded tokens on %s before any identity lookup",
+    async (path) => {
+      const { auth, adapter } = await loadAuth();
+      const ownerLookup = vi.spyOn(adapter, "findAccountOwnerByKey");
+      const res = await auth.handler(
+        new Request(`${APP_URL}/api/auth${path}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: APP_URL,
+          },
+          body: new URLSearchParams({
+            provider: "oidc",
+            idToken: JSON.stringify({ token: "a.b.c" }),
+            "idToken[token]": "a.b.c",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(415);
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(ownerLookup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["different case", { IdToken: { token: "a.b.c" } }],
+    ["nested object", { extra: { idToken: { token: "a.b.c" } } }],
+    ["bracketed field", { "idToken[token]": "a.b.c" }],
+  ])("treats a token in a %s as a redirect request", async (_label, extra) => {
     const { auth, adapter } = await loadAuth();
+    spyStateStore(adapter);
     const ownerLookup = vi.spyOn(adapter, "findAccountOwnerByKey");
-    // A token that would pass every 1.7 check: right issuer, key, audience,
-    // unexpired. The caller sends no nonce, so 1.7 would not check one.
-    const claims = entraIdTokenClaims("unused");
-    delete claims.nonce;
 
     const res = await auth.handler(
       new Request(`${APP_URL}/api/auth/sign-in/social`, {
         method: "POST",
         headers: { "content-type": "application/json", origin: APP_URL },
-        body: JSON.stringify({
-          provider: "oidc",
-          callbackURL: "/",
-          idToken: { token: signIdToken(claims) },
-        }),
+        body: JSON.stringify({ provider: "oidc", callbackURL: "/", ...extra }),
       }),
     );
 
-    expect(res.status).toBe(404);
-    expect(await res.json()).toMatchObject(ID_TOKEN_NOT_SUPPORTED);
-    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(res.status).toBe(200);
+    const authorize = new URL(((await res.json()) as { url: string }).url);
+    expect(authorize.searchParams.get("state")).toBeTruthy();
+    expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorize.searchParams.get("nonce")).toBeTruthy();
+    expect(network.tokenRequests).toHaveLength(0);
     expect(ownerLookup).not.toHaveBeenCalled();
   });
 
