@@ -10,7 +10,7 @@
  *  - `account.encryptOAuthTokens` must be on, so the provider tokens stored for
  *    SSO accounts are encrypted at rest instead of written in plaintext.
  *  - `advanced.crossSubDomainCookies.enabled` must be off, so the session
- *    cookie is host-only. With it on, better-auth 1.7.7 sets the cookie Domain
+ *    cookie is host-only. With it on, better-auth 1.7.8 sets the cookie Domain
  *    to the APP_URL hostname and the session is sent to every subdomain of the
  *    gateway host; the frontend proxies the backend on localhost in one
  *    container, so nothing needs it shared.

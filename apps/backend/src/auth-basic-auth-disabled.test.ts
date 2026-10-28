@@ -5,7 +5,7 @@
  *
  * The regression this guards is specific. The setting used to be wired through
  * a top-level `middleware: [...]` array passed to betterAuth(), which
- * better-auth has no such option for (1.6.23 then, 1.7.7 now) and silently
+ * better-auth has no such option for (1.6.23 then, 1.7.8 now) and silently
  * ignored, so a stored DISABLE_BASIC_AUTH=true still handed out sessions for a
  * valid password. The
  * fix moves the check to `hooks.before` (the request middleware this version

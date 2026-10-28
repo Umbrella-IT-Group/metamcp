@@ -18,7 +18,12 @@
  *  6. the account key is the token's `sub`, the key 1.6 stored, so existing
  *     `accounts` rows keep matching;
  *  7. the drizzle schema passes the init-time check 1.7.3 added, which fails
- *     every auth request on a mismatch.
+ *     every auth request on a mismatch;
+ *  8. a bare id_token posted to `/sign-in/social` or `/link-social` is refused
+ *     the way 1.6.23 refused it (our `hooks.before`), while the redirect flow
+ *     and the callback are untouched;
+ *  9. the two 1.7.8 fixes the version pin exists for: 30 s of clock tolerance
+ *     on the id_token, and a discovery retry after a failed boot fetch.
  *
  * Harness as in auth-basic-auth-disabled.test.ts: configService, the users
  * repo, audit and logger are mocked and `db/index` is a stub. The flow's few
@@ -149,6 +154,8 @@ function entraIdTokenClaims(nonce: string): Record<string, unknown> {
 const network = {
   tokenRequests: [] as URLSearchParams[],
   idToken: "",
+  // How many discovery fetches to fail before answering (discovery retry).
+  discoveryFailures: 0,
 };
 
 vi.stubGlobal(
@@ -160,7 +167,13 @@ vi.stubGlobal(
         : input instanceof URL
           ? input.href
           : input.url;
-    if (url === DISCOVERY_URL) return Response.json(DISCOVERY);
+    if (url === DISCOVERY_URL) {
+      if (network.discoveryFailures > 0) {
+        network.discoveryFailures -= 1;
+        return new Response("service unavailable", { status: 503 });
+      }
+      return Response.json(DISCOVERY);
+    }
     if (url === JWKS_URL) return Response.json(JWKS);
     if (url === TOKEN_URL) {
       network.tokenRequests.push(new URLSearchParams(String(init?.body ?? "")));
@@ -180,6 +193,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   network.tokenRequests = [];
   network.idToken = "";
+  network.discoveryFailures = 0;
 });
 
 afterAll(() => {
@@ -398,5 +412,139 @@ describe("OIDC sign-in round trip", () => {
       "error=unable_to_get_user_info",
     );
     expect(ownerLookup).not.toHaveBeenCalled();
+  });
+});
+
+type BeforeHook = (ctx: { path: string; body?: unknown }) => Promise<unknown>;
+
+async function getBeforeHook(): Promise<BeforeHook> {
+  const { auth } = await loadAuth();
+  const hook = (auth.options as unknown as { hooks?: { before?: BeforeHook } })
+    .hooks?.before;
+  if (!hook) throw new Error("auth.options.hooks.before is not configured");
+  return hook;
+}
+
+const ID_TOKEN_NOT_SUPPORTED = {
+  code: "ID_TOKEN_NOT_SUPPORTED",
+  message: "id_token not supported",
+};
+
+describe("bare id_token sign-in: refused, as better-auth 1.6.23 refused it", () => {
+  it("answers POST /sign-in/social with an idToken 404 ID_TOKEN_NOT_SUPPORTED and no session", async () => {
+    const { auth, adapter } = await loadAuth();
+    const ownerLookup = vi.spyOn(adapter, "findAccountOwnerByKey");
+    // A token that would pass every 1.7 check: right issuer, key, audience,
+    // unexpired. The caller sends no nonce, so 1.7 would not check one.
+    const claims = entraIdTokenClaims("unused");
+    delete claims.nonce;
+
+    const res = await auth.handler(
+      new Request(`${APP_URL}/api/auth/sign-in/social`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: APP_URL },
+        body: JSON.stringify({
+          provider: "oidc",
+          callbackURL: "/",
+          idToken: { token: signIdToken(claims) },
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject(ID_TOKEN_NOT_SUPPORTED);
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(ownerLookup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["/sign-in/social", { provider: "oidc", idToken: { token: "a.b.c" } }],
+    ["/link-social", { provider: "oidc", idToken: { token: "a.b.c" } }],
+  ])("refuses %s with an idToken at the hook", async (path, body) => {
+    const hook = await getBeforeHook();
+
+    await expect(hook({ path, body })).rejects.toMatchObject({
+      statusCode: 404,
+      body: ID_TOKEN_NOT_SUPPORTED,
+    });
+  });
+
+  it.each([
+    [
+      "/sign-in/social without an idToken",
+      "/sign-in/social",
+      { provider: "oidc", callbackURL: "/" },
+    ],
+    ["/link-social without an idToken", "/link-social", { provider: "oidc" }],
+    ["/callback/:id", "/callback/:id", { code: "x", state: "y", idToken: "z" }],
+    ["a request with no body", "/sign-in/social", undefined],
+  ])("passes %s through", async (_label, path, body) => {
+    const hook = await getBeforeHook();
+
+    await expect(hook({ path, body })).resolves.toBeUndefined();
+  });
+
+  it("still starts the redirect flow when no idToken is sent", async () => {
+    const { authorize } = await startSignIn();
+
+    expect(`${authorize.origin}${authorize.pathname}`).toBe(AUTHORIZE_URL);
+    expect(authorize.searchParams.get("redirect_uri")).toBe(CALLBACK_URI);
+  });
+
+  it("still completes the callback", async () => {
+    const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+    network.idToken = signIdToken(
+      entraIdTokenClaims(stored.idTokenNonce ?? ""),
+    );
+    const ownerLookup = vi
+      .spyOn(adapter, "findAccountOwnerByKey")
+      .mockRejectedValue(new Error("stop after identity resolution") as never);
+
+    await auth.handler(callbackRequest(state, stateCookie));
+
+    expect(ownerLookup).toHaveBeenCalledWith({
+      providerId: "oidc",
+      accountId: SUBJECT,
+    });
+  });
+});
+
+describe("the 1.7.8 fixes the version pin exists for", () => {
+  it("accepts an id_token whose nbf is a few seconds ahead of this host's clock", async () => {
+    // Upstream #11749. 1.7.7 had no clock tolerance, so a host clock lagging
+    // Entra's by more than the round trip failed every sign-in.
+    const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+    const claims = entraIdTokenClaims(stored.idTokenNonce ?? "");
+    const now = Math.floor(Date.now() / 1000);
+    claims.iat = now + 5;
+    claims.nbf = now + 5;
+    network.idToken = signIdToken(claims);
+    const ownerLookup = vi
+      .spyOn(adapter, "findAccountOwnerByKey")
+      .mockRejectedValue(new Error("stop after identity resolution") as never);
+
+    await auth.handler(callbackRequest(state, stateCookie));
+
+    expect(ownerLookup).toHaveBeenCalledWith({
+      providerId: "oidc",
+      accountId: SUBJECT,
+    });
+  });
+
+  it("retries discovery on a later sign-in after the boot fetch failed", async () => {
+    // Upstream #11750. 1.7.7 skipped the provider for the life of the process.
+    // A fresh auth instance whose boot-time discovery fetch fails:
+    vi.resetModules();
+    network.discoveryFailures = 1;
+    const { ctx } = await loadAuth();
+    expect(ctx.socialProviders.map((provider) => provider.id)).not.toContain(
+      "oidc",
+    );
+
+    // The next sign-in naming the provider fetches discovery again and
+    // proceeds to Entra.
+    const { authorize } = await startSignIn();
+    expect(`${authorize.origin}${authorize.pathname}`).toBe(AUTHORIZE_URL);
+    expect(authorize.searchParams.get("redirect_uri")).toBe(CALLBACK_URI);
   });
 });
