@@ -14,7 +14,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@better-fetch/fetch": "^1.3.2",
+    "@better-fetch/fetch": "1.3.2",
     "@hookform/resolvers": "^5.1.1",
     "@modelcontextprotocol/sdk": "1.32.0",
     "@radix-ui/react-alert-dialog": "^1.1.15",
@@ -57,7 +57,7 @@
     "swr": "^2.3.3",
     "tailwind-merge": "^3.3.1",
     "tailwindcss": "^4.1.18",
-    "zod": "^4.4.3",
+    "zod": "^4.6.6",
     "zustand": "^5.0.6"
   },
   "devDependencies": {
@@ -69,6 +69,6 @@
     "eslint": "^9.28.0",
     "tw-animate-css": "^1.3.4",
     "typescript": "5.8.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   }
 }
