@@ -46,7 +46,7 @@ vi.mock("../../db/repositories", () => ({
 process.env.APP_URL = "https://mcp.example.test";
 
 const { default: metadataRouter } = await import("./metadata");
-const { getIssuerIdentifier } = await import("./utils");
+const { getBaseUrl, getIssuerIdentifier } = await import("./utils");
 
 const PROTECTED_RESOURCE = "/.well-known/oauth-protected-resource";
 const AUTHORIZATION_SERVER = "/.well-known/oauth-authorization-server";
@@ -228,47 +228,47 @@ describe("discovery IS served where OAuth is in use", () => {
     });
   });
 
-  it.each([
-    "https://mcp.example.test/",
-    "https://mcp.example.test///",
-  ])("normalizes APP_URL %s across discovery documents", async (appUrl) => {
-    const previousAppUrl = process.env.APP_URL;
-    process.env.APP_URL = appUrl;
-    try {
-      const resource = await dispatch(
-        `${PROTECTED_RESOURCE}/metamcp/${OAUTH_ENDPOINT}/mcp`,
-      );
-      const unscopedResource = await dispatch(PROTECTED_RESOURCE);
-      const server = await dispatch(AUTHORIZATION_SERVER);
+  it.each(["https://mcp.example.test/", "https://mcp.example.test///"])(
+    "normalizes APP_URL %s across discovery documents",
+    async (appUrl) => {
+      const previousAppUrl = process.env.APP_URL;
+      process.env.APP_URL = appUrl;
+      try {
+        const resource = await dispatch(
+          `${PROTECTED_RESOURCE}/metamcp/${OAUTH_ENDPOINT}/mcp`,
+        );
+        const unscopedResource = await dispatch(PROTECTED_RESOURCE);
+        const server = await dispatch(AUTHORIZATION_SERVER);
 
-      expect(resource.body).toMatchObject({
-        resource: "https://mcp.example.test/metamcp/claude-connector/mcp",
-        authorization_servers: ["https://mcp.example.test/"],
-        resource_server_capabilities: {
-          introspection_endpoint: "https://mcp.example.test/oauth/introspect",
-          revocation_endpoint: "https://mcp.example.test/oauth/revoke",
-        },
-      });
-      expect(unscopedResource.body).toMatchObject({
-        resource: "https://mcp.example.test/",
-      });
-      expect(server.body).toMatchObject({
-        issuer: "https://mcp.example.test/",
-        authorization_endpoint: "https://mcp.example.test/oauth/authorize",
-        token_endpoint: "https://mcp.example.test/oauth/token",
-        registration_endpoint: "https://mcp.example.test/oauth/register",
-      });
-      expect(getIssuerIdentifier({ headers: {} } as unknown as express.Request)).toBe(
-        (server.body as { issuer: string }).issuer,
-      );
-    } finally {
-      if (previousAppUrl === undefined) {
-        delete process.env.APP_URL;
-      } else {
-        process.env.APP_URL = previousAppUrl;
+        expect(resource.body).toMatchObject({
+          resource: "https://mcp.example.test/metamcp/claude-connector/mcp",
+          authorization_servers: ["https://mcp.example.test/"],
+          resource_server_capabilities: {
+            introspection_endpoint: "https://mcp.example.test/oauth/introspect",
+            revocation_endpoint: "https://mcp.example.test/oauth/revoke",
+          },
+        });
+        expect(unscopedResource.body).toMatchObject({
+          resource: "https://mcp.example.test/",
+        });
+        expect(server.body).toMatchObject({
+          issuer: "https://mcp.example.test/",
+          authorization_endpoint: "https://mcp.example.test/oauth/authorize",
+          token_endpoint: "https://mcp.example.test/oauth/token",
+          registration_endpoint: "https://mcp.example.test/oauth/register",
+        });
+        expect(
+          getIssuerIdentifier({ headers: {} } as unknown as express.Request),
+        ).toBe((server.body as { issuer: string }).issuer);
+      } finally {
+        if (previousAppUrl === undefined) {
+          delete process.env.APP_URL;
+        } else {
+          process.env.APP_URL = previousAppUrl;
+        }
       }
-    }
-  });
+    },
+  );
 
   it("advertises RFC 9207 iss support and S256-only PKCE", async () => {
     // The authorization response now carries `iss`; the metadata must say so,
@@ -415,5 +415,109 @@ describe("discovery is NOT served where OAuth is off", () => {
     expect(
       endpointsRepositoryMock.hasOAuthEnabledEndpoint,
     ).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Never reflected
+// ---------------------------------------------------------------------------
+
+describe("a path suffix is never reflected into the served resource", () => {
+  // Every path here names a REAL OAuth-enabled endpoint, so a 404 can only
+  // come from the grammar. The protected-resource document serves its suffix
+  // back as `resource`, so a prefix match would have answered 200 for each of
+  // these with the attacker's suffix inside the identifier a strict client
+  // trusts and presents to the authorization server.
+  const NEAR_MISSES = [
+    `/metamcp/${OAUTH_ENDPOINT}/mcp/extra`,
+    `/metamcp/${OAUTH_ENDPOINT}/mcp/a/b/c`,
+    `/metamcp/${OAUTH_ENDPOINT}/mcp/`,
+    `/metamcp/${OAUTH_ENDPOINT}`,
+    `/metamcp/${OAUTH_ENDPOINT}/message`,
+    `/metamcp/${OAUTH_ENDPOINT}/api/some_tool`,
+    `/metamcp/${OAUTH_ENDPOINT}/admin/error-status`,
+    `/metamcp/${OAUTH_ENDPOINT}/MCP`,
+    `/metamcp/${OAUTH_ENDPOINT}/mcp%2Fextra`,
+    `//metamcp/${OAUTH_ENDPOINT}/mcp`,
+    `/metamcp//${OAUTH_ENDPOINT}/mcp`,
+  ];
+
+  it.each(
+    BOTH_DOCUMENTS.flatMap((document) =>
+      NEAR_MISSES.map((suffix) => [document, suffix] as const),
+    ),
+  )("404s %s%s without a lookup", async (document, suffix) => {
+    const res = await dispatch(`${document}${suffix}`);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toMatchObject({ error: "not_found" });
+    expect(JSON.stringify(res.body)).not.toContain(OAUTH_ENDPOINT);
+    expect(endpointsRepositoryMock.findByName).not.toHaveBeenCalled();
+    expect(
+      endpointsRepositoryMock.hasOAuthEnabledEndpoint,
+    ).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a raw double quote", '/metamcp/a"b/mcp'],
+    ["a backslash", "/metamcp/a\\b/mcp"],
+    ["a comma", "/metamcp/a,b/mcp"],
+    ["a dot segment", "/metamcp/../mcp"],
+    ["an encoded dot segment", "/metamcp/%2e%2e/mcp"],
+  ])(
+    "refuses a name with %s even when a lookup would match",
+    async (_label, suffix) => {
+      // A mock that answers yes to ANY name, so only the grammar can refuse.
+      endpointsRepositoryMock.findByName.mockResolvedValue({
+        uuid: "ep-any",
+        name: "any",
+        enable_oauth: true,
+      });
+
+      const res = await dispatch(`${PROTECTED_RESOURCE}${suffix}`);
+
+      expect(res.statusCode).toBe(404);
+      expect(endpointsRepositoryMock.findByName).not.toHaveBeenCalled();
+    },
+  );
+
+  it("builds the served resource from the matched path, not from req.path", async () => {
+    // An accepted path is served back exactly as the grammar rebuilt it: the
+    // base, the mount, the name as requested and the transport literal.
+    // Nothing after the transport can exist to be kept (previous cases).
+    const res = await dispatch(
+      `${PROTECTED_RESOURCE}/metamcp/${OAUTH_ENDPOINT}/sse`,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { resource: string }).resource).toBe(
+      `https://mcp.example.test/metamcp/${OAUTH_ENDPOINT}/sse`,
+    );
+  });
+});
+
+describe("getBaseUrl normalizes APP_URL", () => {
+  const noHeaders = { headers: {} } as unknown as express.Request;
+
+  it.each([
+    ["https://mcp.example.test", "https://mcp.example.test"],
+    ["https://mcp.example.test/", "https://mcp.example.test"],
+    ["https://mcp.example.test///", "https://mcp.example.test"],
+    ["https://mcp.example.test/gateway/", "https://mcp.example.test/gateway"],
+  ])("returns %s as %s", (appUrl, expected) => {
+    const previousAppUrl = process.env.APP_URL;
+    process.env.APP_URL = appUrl;
+    try {
+      expect(getBaseUrl(noHeaders)).toBe(expected);
+      // The issuer keeps exactly one trailing slash whatever APP_URL carries,
+      // so `authorization_servers` and `issuer` stay byte-identical.
+      expect(getIssuerIdentifier(noHeaders)).toBe(`${expected}/`);
+    } finally {
+      if (previousAppUrl === undefined) {
+        delete process.env.APP_URL;
+      } else {
+        process.env.APP_URL = previousAppUrl;
+      }
+    }
   });
 });

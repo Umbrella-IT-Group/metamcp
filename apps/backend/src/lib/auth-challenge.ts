@@ -2,6 +2,7 @@ import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 
 import { getBaseUrl, GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
+import { matchPublicMcpResourcePath } from "./public-mcp-resource";
 
 /**
  * The 401 challenge shapes for the `/metamcp/<name>/*` data plane, extracted
@@ -33,11 +34,17 @@ import { getBaseUrl, GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
  * `lookup-endpoint-middleware`), that is a map of the estate and of its
  * weakest doors, assembled by a scanner.
  *
- * Path-scoped resource metadata is included in OAuth challenges. Its URL is
- * derived solely from the request path: a guessed name and a real endpoint
- * requested at the same URL must have identical no-credential responses.
- * API-key-only endpoints still omit the WWW-Authenticate header and keep
- * the legacy unscoped metadata URL in their response body.
+ * Nothing consumed the removed fields: `supported_methods` had no reader
+ * anywhere in this repo, and the varying `error_description` was prose. What a
+ * client actually needs in order to authenticate is the `WWW-Authenticate`
+ * challenge and `resource_metadata`.
+ *
+ * `resource_metadata` is included on EVERY path, including the ones with no
+ * OAuth configured, and it is the same URL on every path for a given request
+ * URL (see `resourceMetadataUrl`). It is derived from the request path alone,
+ * never from the endpoint row, so it discloses nothing about the endpoint
+ * being challenged; giving API-key-only endpoints a different value would
+ * reintroduce the differential this body exists to remove.
  */
 function buildAuthenticationRequiredBody(
   resourceMetadata: string,
@@ -50,20 +57,37 @@ function buildAuthenticationRequiredBody(
   };
 }
 
-function resourceMetadataUrl(
-  req: express.Request,
-  endpointScoped: boolean,
-): string {
+/**
+ * The RFC 9728 metadata URL a 401 points at: the path-scoped document for the
+ * resource that was requested (RFC 9728 §5.1, and the MCP authorization spec,
+ * whose clients fetch exactly this URL), or the unscoped document when the
+ * request path is not exactly a public MCP resource.
+ *
+ * Built only from operator configuration and checked parts. The base is
+ * `getBaseUrl`, which returns the normalized `APP_URL` (required at boot by
+ * `auth.ts`, so its header-derived fallback is not reached by the running
+ * server). The path is `matchPublicMcpResourcePath`'s rebuild of
+ * `/metamcp/<name>/(mcp|sse|api)`: a name in the RFC 3986 unreserved alphabet
+ * (or percent-encoded) and a literal transport. Raw request text is never
+ * interpolated, because this value lands inside the quoted `resource_metadata`
+ * parameter of `WWW-Authenticate`, where a `"` from a request path would end
+ * the parameter early, and because a suffix after the transport would point
+ * the client at a document that discovery refuses.
+ *
+ * Depends on the request URL only, never on whether that endpoint exists or
+ * which auth toggles it has: a guessed name and a real endpoint requested at
+ * the same URL get the same value. A path that does not match (a trailing
+ * slash, `/message`, `/api/<tool>`, an extra segment) keeps the unscoped URL
+ * every challenge advertised before, so those clients see no change.
+ */
+function resourceMetadataUrl(req: express.Request): string {
   const discoveryUrl = `${getBaseUrl(req)}/.well-known/oauth-protected-resource`;
-  if (!endpointScoped) return discoveryUrl;
-
-  // Express retains the public /metamcp mount in baseUrl and the encoded
-  // resource suffix in path (without query parameters). Depend only on the
-  // requested URL, never on whether that endpoint exists or permits OAuth.
-  const resourcePath = `${req.baseUrl ?? ""}${req.path ?? ""}`;
-  return resourcePath.startsWith("/metamcp/")
-    ? `${discoveryUrl}${resourcePath}`
-    : discoveryUrl;
+  // Express keeps the public mount in `baseUrl` and the still-encoded rest of
+  // the path, without the query string, in `path`.
+  const resource = matchPublicMcpResourcePath(
+    `${req.baseUrl ?? ""}${req.path ?? ""}`,
+  );
+  return resource ? `${discoveryUrl}${resource.path}` : discoveryUrl;
 }
 
 /**
@@ -91,7 +115,7 @@ export function sendAuthenticationRequiredChallenge(
   req: express.Request,
   res: express.Response,
 ): express.Response {
-  const metadata = resourceMetadataUrl(req, true);
+  const metadata = resourceMetadataUrl(req);
 
   res.set(
     "WWW-Authenticate",
@@ -111,7 +135,11 @@ export function sendAuthenticationRequiredChallenge(
 /**
  * Send API key required response (no WWW-Authenticate header, to prevent the
  * OAuth flow being started against an endpoint that does not accept OAuth
- * tokens). The body is now the shared one; see the RESIDUAL note on
+ * tokens). The body is the shared one, `resource_metadata` included. On a
+ * public MCP resource path that is the scoped document, which answers 404 for
+ * an endpoint with OAuth off: the honest answer for this endpoint, where the
+ * unscoped document this body used to name answers 200 whenever any other
+ * endpoint runs OAuth. See the RESIDUAL note on
  * `sendAuthenticationRequiredChallenge` for why the header asymmetry survives.
  */
 export function sendApiKeyRequiredResponse(
@@ -120,14 +148,18 @@ export function sendApiKeyRequiredResponse(
 ): express.Response {
   return res
     .status(401)
-    .json(buildAuthenticationRequiredBody(resourceMetadataUrl(req, false)));
+    .json(buildAuthenticationRequiredBody(resourceMetadataUrl(req)));
 }
 
 /**
  * Send OAuth challenge response with proper WWW-Authenticate header.
  *
- * The endpoint argument remains unused: known OAuth-enabled endpoints and
- * unknown names deliberately get the same path-scoped challenge shape.
+ * The endpoint argument is not read. The challenge used to be assembled from
+ * that endpoint's toggles, which is precisely the fingerprint removed above,
+ * and the scoped `resource_metadata` comes from the request path, not the row,
+ * so a known OAuth endpoint and an unknown name get the same challenge. It
+ * stays in the signature so both call sites keep recording which endpoint
+ * they are challenging on behalf of.
  */
 export function sendOAuthChallengeResponse(
   req: express.Request,
