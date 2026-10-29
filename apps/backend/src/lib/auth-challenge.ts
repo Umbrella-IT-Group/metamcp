@@ -1,7 +1,7 @@
 import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 
-import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
+import { getBaseUrl, GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
 
 /**
  * The 401 challenge shapes for the `/metamcp/<name>/*` data plane, extracted
@@ -19,29 +19,6 @@ import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
  */
 
 /**
- * Helper function to get the correct base URL from request
- * Prioritizes APP_URL environment variable, then checks proxy headers
- */
-function getBaseUrl(req: express.Request): string {
-  // Prioritize APP_URL environment variable
-  if (process.env.APP_URL) {
-    return process.env.APP_URL;
-  }
-
-  // Check for forwarded headers from Next.js proxy
-  const forwardedHost = req.headers["x-forwarded-host"] as string;
-  const forwardedProto = req.headers["x-forwarded-proto"] as string;
-
-  if (forwardedHost) {
-    const protocol = forwardedProto || "http";
-    return `${protocol}://${forwardedHost}`;
-  }
-
-  // Fallback to request host
-  return `${req.protocol}://${req.get("host")}`;
-}
-
-/**
  * The ONE body every unauthenticated caller of `/metamcp/<name>/*` gets, no
  * matter which of the three no-credential paths produced it.
  *
@@ -56,17 +33,11 @@ function getBaseUrl(req: express.Request): string {
  * `lookup-endpoint-middleware`), that is a map of the estate and of its
  * weakest doors, assembled by a scanner.
  *
- * Nothing consumed the removed fields: `supported_methods` had no reader
- * anywhere in this repo, and the varying `error_description` was prose. What a
- * client actually needs in order to authenticate is the `WWW-Authenticate`
- * challenge and `resource_metadata`, and both are unchanged, so the OAuth
- * discovery handshake every MCP connector performs on its first request still
- * behaves exactly as it did.
- *
- * `resource_metadata` is now included on EVERY path, including the ones with
- * no OAuth configured. It is a gateway-level URL, not an endpoint-level one,
- * so it discloses nothing about the endpoint being challenged, and omitting it
- * on some paths would reintroduce the differential this exists to remove.
+ * Path-scoped resource metadata is included in OAuth challenges. Its URL is
+ * derived solely from the request path: a guessed name and a real endpoint
+ * requested at the same URL must have identical no-credential responses.
+ * API-key-only endpoints still omit the WWW-Authenticate header and keep
+ * the legacy unscoped metadata URL in their response body.
  */
 function buildAuthenticationRequiredBody(
   resourceMetadata: string,
@@ -79,8 +50,20 @@ function buildAuthenticationRequiredBody(
   };
 }
 
-function resourceMetadataUrl(req: express.Request): string {
-  return `${getBaseUrl(req)}/.well-known/oauth-protected-resource`;
+function resourceMetadataUrl(
+  req: express.Request,
+  endpointScoped: boolean,
+): string {
+  const discoveryUrl = `${getBaseUrl(req)}/.well-known/oauth-protected-resource`;
+  if (!endpointScoped) return discoveryUrl;
+
+  // Express retains the public /metamcp mount in baseUrl and the encoded
+  // resource suffix in path (without query parameters). Depend only on the
+  // requested URL, never on whether that endpoint exists or permits OAuth.
+  const resourcePath = `${req.baseUrl ?? ""}${req.path ?? ""}`;
+  return resourcePath.startsWith("/metamcp/")
+    ? `${discoveryUrl}${resourcePath}`
+    : discoveryUrl;
 }
 
 /**
@@ -89,10 +72,9 @@ function resourceMetadataUrl(req: express.Request): string {
  * `lookup-endpoint-middleware`), and an endpoint whose authentication is
  * entirely off and therefore refused (CONDITION 1).
  *
- * Deliberately BYTE-IDENTICAL, header included, to what a real OAuth-enabled
- * endpoint answers an unauthenticated request with. That identity is the whole
- * mechanism: it is the only way a probe for a name that does not exist cannot
- * be told apart from a probe for one that does.
+ * Deliberately BYTE-IDENTICAL, header included, to what an OAuth-enabled
+ * endpoint answers for the same request URL. The URL-specific metadata
+ * pointer cannot reveal whether the endpoint exists.
  *
  * RESIDUAL, recorded because it is the honest limit of this fix rather than an
  * oversight. An endpoint with `enable_oauth` OFF still answers without the
@@ -109,7 +91,7 @@ export function sendAuthenticationRequiredChallenge(
   req: express.Request,
   res: express.Response,
 ): express.Response {
-  const metadata = resourceMetadataUrl(req);
+  const metadata = resourceMetadataUrl(req, true);
 
   res.set(
     "WWW-Authenticate",
@@ -138,17 +120,14 @@ export function sendApiKeyRequiredResponse(
 ): express.Response {
   return res
     .status(401)
-    .json(buildAuthenticationRequiredBody(resourceMetadataUrl(req)));
+    .json(buildAuthenticationRequiredBody(resourceMetadataUrl(req, false)));
 }
 
 /**
  * Send OAuth challenge response with proper WWW-Authenticate header.
  *
- * The endpoint argument is no longer read. The challenge used to be assembled
- * from that endpoint's toggles, which is precisely the fingerprint removed
- * above. It stays in the signature so both call sites keep recording which
- * endpoint they are challenging on behalf of, and so an endpoint-specific
- * challenge, if one is ever justified, has an obvious place to land.
+ * The endpoint argument remains unused: known OAuth-enabled endpoints and
+ * unknown names deliberately get the same path-scoped challenge shape.
  */
 export function sendOAuthChallengeResponse(
   req: express.Request,

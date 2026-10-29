@@ -479,7 +479,8 @@ export const GRANTED_OAUTH_SCOPE = "mcp";
 export function getBaseUrl(req: express.Request): string {
   // Prioritize APP_URL environment variable
   if (process.env.APP_URL) {
-    return process.env.APP_URL;
+    // Normalize the operator-configured origin before appending OAuth paths.
+    return process.env.APP_URL.replace(/\/+$/, "");
   }
 
   // Check for forwarded headers from Next.js proxy
