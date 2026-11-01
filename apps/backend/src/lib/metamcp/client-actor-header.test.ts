@@ -4,9 +4,9 @@
  * The defect this pins: fork #139 forwarded the header only on the admin
  * Inspector proxy (`routers/mcp-proxy/server.ts`). Operator clients connect to
  * the public endpoints, whose tool calls go through the pooled client built by
- * `createMetaMcpClient`, and that path forwarded no inbound header, so every
- * backend audit row recorded its service default although the client sent the
- * header on every request.
+ * `createMetaMcpClient`, and that path forwarded no inbound header, so a
+ * backend reading it could record fallback attribution although the client
+ * sent the header on every request.
  *
  * Driven through the production wiring: `createMetaMcpClient` builds the
  * transports, undici is mocked as the network, and every URL is an IP literal
@@ -266,5 +266,60 @@ describe("X-MCP-Actor on the pooled transports", () => {
     expect(init?.actor).toBeNull();
 
     await client.close();
+  });
+
+  it("a cold connection's stream reconnect keeps its opening scope without labelling later tool calls", async () => {
+    const { client, transport } = createMetaMcpClient(
+      asParams({ name: "s7", type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+    );
+    if (!client || !transport) throw new Error("no client built");
+    const network = undiciFetch.getMockImplementation();
+    if (!network) throw new Error("no fake network");
+    let getCount = 0;
+    let resolveReconnect!: () => void;
+    const reconnected = new Promise<void>((resolve) => {
+      resolveReconnect = resolve;
+    });
+    undiciFetch.mockImplementation(async (url, init) => {
+      const response = await network(url, init);
+      if (init?.method === "GET") {
+        getCount += 1;
+        if (getCount === 1) {
+          // A closed standalone stream makes the real SDK schedule a retry.
+          return new Response("retry: 1\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        resolveReconnect();
+      }
+      return response;
+    });
+
+    try {
+      await runWithCallerContext({ assertedActor: ACTOR }, () =>
+        client.connect(transport),
+      );
+      await reconnected;
+      await runWithCallerContext(
+        { assertedActor: "tech.two@example.com" },
+        () => client.callTool({ name: "for-tech-two", arguments: {} }),
+      );
+      await runWithCallerContext({}, () =>
+        client.callTool({ name: "for-nobody", arguments: {} }),
+      );
+
+      // Protocol traffic may retain the opening scope, so its actor must
+      // never be cached by a backend as the owner of this pooled session.
+      expect(seen.find((r) => r.rpcMethod === "initialize")?.actor).toBe(ACTOR);
+      expect(
+        seen.filter((r) => r.httpMethod === "GET").map((r) => r.actor),
+      ).toEqual([ACTOR, ACTOR]);
+      expect(
+        seen.filter((r) => r.rpcMethod === "tools/call").map((r) => r.actor),
+      ).toEqual(["tech.two@example.com", null]);
+    } finally {
+      await client.close();
+      undiciFetch.mockImplementation(network);
+    }
   });
 });

@@ -20,8 +20,10 @@ import { getCallerContext } from "./caller-context-store";
  * do not use that route: they connect to the public endpoints
  * (`/metamcp/<endpoint>/mcp`), whose tool calls reach the backend through the
  * pooled client built in `client.ts`, and that path copied no inbound header.
- * So every backend audit row fell back to its service default while the client
- * sent the header on every request.
+ * A caller relying on that header could therefore receive the backend's
+ * fallback attribution even when its client sent the header. The reported
+ * live evidence is fallback attribution in inventory and disclosure audit
+ * rows; effects on the other consumers follow from the shared code path.
  *
  * WHY PER REQUEST, NOT PER CONNECTION. One pooled backend connection serves
  * many callers (idle handoff, per-server cap reuse), so a header fixed at
@@ -36,6 +38,14 @@ import { getCallerContext } from "./caller-context-store";
  * when the request carried one. A connection-level value would label every
  * caller's call with one name, and an audit row that names the wrong person is
  * worse than one that names nobody.
+ *
+ * CONNECTION CONTROL TRAFFIC. This wrapper also covers initialization, the
+ * standalone stream GET and teardown. A cold connect inside a request carries
+ * that request's label, and SDK reconnect timers retain their opening async
+ * scope. Backends must read the actor on the CURRENT tool-call request, never
+ * cache a handshake or stream's label as the pooled session's actor. Later
+ * tool calls independently replace or clear the header; the real-SDK cold
+ * connect/reconnect test in `client-actor-header.test.ts` pins that boundary.
  *
  * INTERNAL DESTINATIONS ONLY. The pool's guarded fetch drops this header on
  * any hop whose destination is not internal (`internalOnlyHeaders` in
