@@ -1835,6 +1835,31 @@ describe("caller binding — request-scoped store (the audited source)", () => {
     expect(second?.callerIp).toBe("198.51.100.4");
   });
 
+  it("carries this request's X-MCP-Actor into the dispatch, where the pooled client reads it", async () => {
+    // Operator clients send the header on every request to the public
+    // endpoint; before this the binding dropped it and no backend saw it.
+    const first = await dispatchAndCaptureCaller(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000001",
+        headers: { "x-mcp-actor": " tech.one@example.com " },
+      }),
+      "sess-binding-actor",
+    );
+    const second = await dispatchAndCaptureCaller(
+      fakeAuthReq({
+        authMethod: "api_key",
+        apiKeyUuid: "3f7f8a1e-0000-4000-8000-000000000001",
+        headers: {},
+      }),
+      "sess-binding-actor",
+    );
+
+    expect(first?.assertedActor).toBe("tech.one@example.com");
+    // The next request on the same session asserted nothing and gets nothing.
+    expect(second?.assertedActor).toBeUndefined();
+  });
+
   it("leaves the store empty outside a dispatch", async () => {
     // "No store" must stay distinguishable from "a store that resolved
     // nothing" — the auditing middleware falls back to the handler context on

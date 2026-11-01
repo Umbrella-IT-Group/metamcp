@@ -1237,6 +1237,77 @@ describe("createGuardedFetch: the gateway backend trust header", () => {
   });
 });
 
+describe("createGuardedFetch: internal-only headers (the pooled X-MCP-Actor)", () => {
+  const ok = () => new Response("ok", { status: 200 });
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+  const ACTOR = "tech.one@example.com";
+  const sentHeaders = (baseFetch: { mock: { calls: unknown[][] } }, call = 0) =>
+    (baseFetch.mock.calls[call][1] as { headers: Headers }).headers;
+
+  // The posture createPoolGuardedFetch builds for both pooled transports.
+  const poolGuard = (
+    baseFetch: (url: string | URL, init?: RequestInit) => Promise<Response>,
+    lookup: (hostname: string) => Promise<string[]>,
+  ) =>
+    createGuardedFetch({
+      baseFetch,
+      lookup,
+      allowPrivateAddresses: true,
+      refuseCrossOriginRedirect: true,
+      internalOnlyHeaders: ["x-mcp-actor"],
+    });
+
+  it("keeps the header for an internal destination", async () => {
+    const baseFetch = vi.fn(async () => ok());
+    await poolGuard(baseFetch, resolvesTo("10.0.0.5"))(
+      "http://backend.internal/mcp",
+      { headers: { "x-mcp-actor": ACTOR } },
+    );
+    expect(sentHeaders(baseFetch).get("x-mcp-actor")).toBe(ACTOR);
+  });
+
+  it("deletes the header for a public destination and leaves the rest", async () => {
+    const baseFetch = vi.fn(async () => ok());
+    await poolGuard(baseFetch, resolvesTo(PUBLIC_V4))(
+      "https://mcp.example.com/mcp",
+      { headers: { "x-mcp-actor": ACTOR, authorization: "Bearer row" } },
+    );
+    expect(sentHeaders(baseFetch).get("x-mcp-actor")).toBeNull();
+    expect(sentHeaders(baseFetch).get("authorization")).toBe("Bearer row");
+  });
+
+  it("re-checks on a same-origin redirect hop", async () => {
+    // Same origin, re-resolved to a public address on the second lookup: the
+    // destination's status can change between hops, so the check runs per hop.
+    // A same-origin hop reuses (and mutates) one Headers object, so each hop's
+    // value is copied at send time rather than read back afterwards.
+    const actorPerHop: (string | null)[] = [];
+    const responses = [redirect(307, "/next"), ok()];
+    const baseFetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      actorPerHop.push(new Headers(init?.headers).get("x-mcp-actor"));
+      return responses.shift() ?? ok();
+    });
+    const lookup = vi
+      .fn()
+      .mockResolvedValueOnce(["10.0.0.5"])
+      .mockResolvedValueOnce([PUBLIC_V4]);
+    await poolGuard(baseFetch, lookup)("http://backend.internal/mcp", {
+      headers: { "x-mcp-actor": ACTOR },
+    });
+    expect(actorPerHop).toEqual([ACTOR, null]);
+  });
+
+  it("changes nothing for a caller that names no internal-only headers (the Inspector)", async () => {
+    const baseFetch = vi.fn(async () => ok());
+    await createGuardedFetch({ baseFetch, lookup: resolvesTo(PUBLIC_V4) })(
+      "https://mcp.example.com/mcp",
+      { headers: { "x-mcp-actor": ACTOR } },
+    );
+    expect(sentHeaders(baseFetch).get("x-mcp-actor")).toBe(ACTOR);
+  });
+});
+
 describe("warnIfGatewayBackendSecretUnset", () => {
   const ORIGINAL_SECRET = process.env.GATEWAY_BACKEND_SECRET;
 

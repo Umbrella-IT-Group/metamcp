@@ -220,6 +220,30 @@ describe("SSE /message leg — tool calls are attributable", () => {
 
     abort.abort();
   });
+
+  it("carries the message request's X-MCP-Actor, which the pooled client forwards", async () => {
+    const { sessionId, abort } = await openStream();
+
+    const response = await fetch(
+      `${baseUrl}/metamcp/ep-1/message?sessionId=${sessionId}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-MCP-Actor": " tech.one@example.com ",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      },
+    );
+    expect(response.status).toBe(202);
+    expect(seen?.assertedActor).toBe("tech.one@example.com");
+
+    // The next message on the same stream asserted nothing and gets nothing.
+    await postMessage(sessionId);
+    expect(seen?.assertedActor).toBeUndefined();
+
+    abort.abort();
+  });
 });
 
 describe("SSE /sse leg — the acquired instance carries the fallback binding", () => {

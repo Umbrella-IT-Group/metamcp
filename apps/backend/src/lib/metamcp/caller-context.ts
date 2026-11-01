@@ -6,6 +6,10 @@ import type { AuditRequestFields } from "@/lib/audit/audit-emitter";
 // `middleware/` is the shape that becomes an import cycle.
 import { resolveClientIp } from "@/lib/client-ip";
 
+import {
+  ASSERTED_ACTOR_HEADER,
+  normalizeAssertedActor,
+} from "./asserted-actor";
 import type { CallerContext } from "./caller-context-store";
 import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middleware";
 
@@ -50,6 +54,11 @@ import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middlewar
  *                   joins to whatever `audit_log` rows the same request
  *                   produced — an auth denial and the call it preceded become
  *                   one queryable sequence instead of two timestamps.
+ *   assertedActor <- the inbound `X-MCP-Actor` header, trimmed and capped. The
+ *                   one field here the caller simply ASSERTS: it is not part
+ *                   of the audit row and is never treated as identity. It is
+ *                   carried so the pooled client can forward it to the backend
+ *                   for that backend's own audit trail (`asserted-actor.ts`).
  */
 
 /**
@@ -111,6 +120,11 @@ export function resolveCallerContext(req: CallerContextSource): CallerContext {
     // exactly like a real one; NULL is the honest "not known" — the same call
     // `resolveClientIp` makes about a missing IP.
     requestId: req.auditRequestId,
+    // Caller-asserted, never verified: carried only so the pooled client can
+    // forward it to the backend on THIS request's calls (`asserted-actor.ts`).
+    // Every path that enters the store builds its binding here, so the public
+    // Streamable-HTTP and SSE legs and the Inspector all get it from one place.
+    assertedActor: normalizeAssertedActor(req.headers?.[ASSERTED_ACTOR_HEADER]),
   };
 }
 

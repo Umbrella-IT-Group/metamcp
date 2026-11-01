@@ -20,6 +20,7 @@ import {
 import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { recordConnectBrokerFailure } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
+import { ASSERTED_ACTOR_HEADER, withAssertedActor } from "./asserted-actor";
 import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { resolveServerBearerToken } from "./server-bearer-crypto";
@@ -355,11 +356,16 @@ export const transformDockerUrl = (url: string): string => {
  * SSRF vector this closes. The response byte ceiling and idle timeout come
  * from the guard defaults (MCP_PROXY_MAX_RESPONSE_BYTES,
  * MCP_PROXY_REQUEST_TIMEOUT_MS).
+ *
+ * `internalOnlyHeaders` keeps the caller-asserted `x-mcp-actor`, which
+ * `withAssertedActor` puts on each pooled request, off any destination that is
+ * not internal (see `asserted-actor.ts`).
  */
 const createPoolGuardedFetch = (): FetchLike =>
   createGuardedFetch({
     allowPrivateAddresses: true,
     refuseCrossOriginRedirect: true,
+    internalOnlyHeaders: [ASSERTED_ACTOR_HEADER],
   });
 
 export const createMetaMcpClient = (
@@ -432,15 +438,17 @@ export const createMetaMcpClient = (
     // remote-controlled input the pool never sees otherwise. eventSourceInit
     // .fetch takes precedence over the `fetch` option inside the SDK, so both
     // are set for the stream GET and the back-channel POSTs to be covered.
-    const guardedFetch = createPoolGuardedFetch();
+    // `withAssertedActor` stamps each request with the X-MCP-Actor of the
+    // inbound request it serves (the back-channel POST carries the tool call).
+    const poolFetch = withAssertedActor(createPoolGuardedFetch());
     transport = new SSEClientTransport(new URL(transformedUrl), {
       eventSourceInit: {
-        fetch: (url, init) => guardedFetch(url, { ...init, headers }),
+        fetch: (url, init) => poolFetch(url, { ...init, headers }),
       },
       requestInit: {
         headers,
       },
-      fetch: guardedFetch,
+      fetch: poolFetch,
     });
   } else if (serverParams.type === "STREAMABLE_HTTP" && serverParams.url) {
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
@@ -483,11 +491,15 @@ export const createMetaMcpClient = (
       guardedFetch,
     );
 
+    // Outermost: the caller-asserted X-MCP-Actor of the inbound request this
+    // request serves, read at send time from the request-scoped binding so a
+    // pooled connection never carries one caller's label on another's call.
+    // See `asserted-actor.ts`.
     transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
       requestInit: {
         headers,
       },
-      fetch: injectedFetch ?? guardedFetch,
+      fetch: withAssertedActor(injectedFetch ?? guardedFetch),
     });
   } else {
     metamcpLogStore.addLog(
