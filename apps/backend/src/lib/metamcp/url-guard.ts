@@ -543,6 +543,16 @@ export interface McpUrlGuardOptions {
    * bounds a hung or stalled upstream without that regression.
    */
   requestTimeoutMs?: number;
+  /**
+   * Header names (lowercase) this fetch sends only to an INTERNAL destination,
+   * by the same `isInternalTarget` classification that gates the gateway trust
+   * header, and deletes on every other hop. The pooled data plane passes the
+   * caller-asserted `x-mcp-actor` (`asserted-actor.ts`): an operator's address
+   * belongs on our own backends' audit rows, not with a third-party MCP server
+   * someone configured. Unset by default, so the Inspector's #139 passthrough
+   * is unchanged.
+   */
+  internalOnlyHeaders?: readonly string[];
 }
 
 /**
@@ -689,6 +699,20 @@ const applyGatewayTrustHeader = (
   if (secret && isInternalTarget(target)) {
     headers.set(GATEWAY_BACKEND_AUTH_HEADER, secret);
   }
+};
+
+/**
+ * Delete the caller's internal-only headers (`internalOnlyHeaders`) when the
+ * hop's destination is not internal. Re-run per hop beside the trust header,
+ * for the same reason: a redirect can change the destination's status.
+ */
+const dropInternalOnlyHeaders = (
+  headers: Headers,
+  target: ValidatedMcpTarget,
+  names: readonly string[] | undefined,
+): void => {
+  if (!names || names.length === 0 || isInternalTarget(target)) return;
+  for (const name of names) headers.delete(name);
 };
 
 /**
@@ -1092,6 +1116,7 @@ export const createGuardedFetch = (
     // it is dialled; re-evaluated per hop below because a redirect can change
     // the destination's internal/external status.
     applyGatewayTrustHeader(headers, target);
+    dropInternalOnlyHeaders(headers, target, options.internalOnlyHeaders);
 
     for (let hop = 0; ; hop += 1) {
       const response = await baseFetch(
@@ -1192,6 +1217,7 @@ export const createGuardedFetch = (
       // (idempotent), and a cross-origin redirect just dropped it above, so it
       // is re-added only if the new destination is itself internal.
       applyGatewayTrustHeader(headers, next);
+      dropInternalOnlyHeaders(headers, next, options.internalOnlyHeaders);
       target = next;
     }
   };

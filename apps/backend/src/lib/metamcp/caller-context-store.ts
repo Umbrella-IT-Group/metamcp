@@ -54,6 +54,14 @@ export interface CallerContext {
   actsAsUserId?: string;
   callerIp?: string;
   requestId?: string;
+  /**
+   * The inbound `X-MCP-Actor` value, normalized (`asserted-actor.ts`). The
+   * caller ASSERTS it and nothing verifies it: it is forwarded to the backend
+   * on this request's pooled calls for the backend's own audit rows and is
+   * never an identity. Not a `tool_call_audit` column; the auditing
+   * middleware maps its columns explicitly and does not read it.
+   */
+  assertedActor?: string;
 }
 
 const storage = new AsyncLocalStorage<CallerContext>();

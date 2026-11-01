@@ -156,6 +156,34 @@ describe("resolveCallerContext — delegated identity and address provenance", (
   });
 });
 
+describe("resolveCallerContext: the caller-asserted X-MCP-Actor", () => {
+  it("carries the header, trimmed, so the pooled client can forward it", () => {
+    const caller = resolveCallerContext({
+      ...apiKeyRequest,
+      headers: { "x-mcp-actor": "  tech.one@example.com " },
+    });
+
+    expect(caller.assertedActor).toBe("tech.one@example.com");
+    // Asserted, not identity: the credential fields are untouched by it.
+    expect(caller.userId).toBe("user-owner-1");
+  });
+
+  it("caps the header so one request cannot push an unbounded value upstream", () => {
+    const caller = resolveCallerContext({
+      headers: { "x-mcp-actor": "a".repeat(1000) },
+    });
+
+    expect(caller.assertedActor).toHaveLength(256);
+  });
+
+  it.each([
+    ["absent", {}],
+    ["blank", { "x-mcp-actor": "   " }],
+  ])("leaves it unset when the header is %s", (_label, headers) => {
+    expect(resolveCallerContext({ headers }).assertedActor).toBeUndefined();
+  });
+});
+
 describe("stampCallerContext — the consumer label travels with the binding", () => {
   it("stamps the label and clears it for a caller that resolved none", () => {
     const context: MetaMCPHandlerContext = {
