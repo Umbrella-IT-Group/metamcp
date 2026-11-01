@@ -1,7 +1,8 @@
 import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 
-import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
+import { getBaseUrl, GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
+import { matchPublicMcpResourcePath } from "./public-mcp-resource";
 
 /**
  * The 401 challenge shapes for the `/metamcp/<name>/*` data plane, extracted
@@ -17,29 +18,6 @@ import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
  * connection string to render a 401. Nothing in this file touches the
  * database, and nothing in it should.
  */
-
-/**
- * Helper function to get the correct base URL from request
- * Prioritizes APP_URL environment variable, then checks proxy headers
- */
-function getBaseUrl(req: express.Request): string {
-  // Prioritize APP_URL environment variable
-  if (process.env.APP_URL) {
-    return process.env.APP_URL;
-  }
-
-  // Check for forwarded headers from Next.js proxy
-  const forwardedHost = req.headers["x-forwarded-host"] as string;
-  const forwardedProto = req.headers["x-forwarded-proto"] as string;
-
-  if (forwardedHost) {
-    const protocol = forwardedProto || "http";
-    return `${protocol}://${forwardedHost}`;
-  }
-
-  // Fallback to request host
-  return `${req.protocol}://${req.get("host")}`;
-}
 
 /**
  * The ONE body every unauthenticated caller of `/metamcp/<name>/*` gets, no
@@ -59,14 +37,14 @@ function getBaseUrl(req: express.Request): string {
  * Nothing consumed the removed fields: `supported_methods` had no reader
  * anywhere in this repo, and the varying `error_description` was prose. What a
  * client actually needs in order to authenticate is the `WWW-Authenticate`
- * challenge and `resource_metadata`, and both are unchanged, so the OAuth
- * discovery handshake every MCP connector performs on its first request still
- * behaves exactly as it did.
+ * challenge and `resource_metadata`.
  *
- * `resource_metadata` is now included on EVERY path, including the ones with
- * no OAuth configured. It is a gateway-level URL, not an endpoint-level one,
- * so it discloses nothing about the endpoint being challenged, and omitting it
- * on some paths would reintroduce the differential this exists to remove.
+ * `resource_metadata` is included on EVERY path, including the ones with no
+ * OAuth configured, and it is the same URL on every path for a given request
+ * URL (see `resourceMetadataUrl`). It is derived from the request path alone,
+ * never from the endpoint row, so it discloses nothing about the endpoint
+ * being challenged; giving API-key-only endpoints a different value would
+ * reintroduce the differential this body exists to remove.
  */
 function buildAuthenticationRequiredBody(
   resourceMetadata: string,
@@ -79,8 +57,37 @@ function buildAuthenticationRequiredBody(
   };
 }
 
+/**
+ * The RFC 9728 metadata URL a 401 points at: the path-scoped document for the
+ * resource that was requested (RFC 9728 §5.1, and the MCP authorization spec,
+ * whose clients fetch exactly this URL), or the unscoped document when the
+ * request path is not exactly a public MCP resource.
+ *
+ * Built only from operator configuration and checked parts. The base is
+ * `getBaseUrl`, which returns the normalized `APP_URL` (required at boot by
+ * `auth.ts`, so its header-derived fallback is not reached by the running
+ * server). The path is `matchPublicMcpResourcePath`'s rebuild of
+ * `/metamcp/<name>/(mcp|sse|api)`: a name in the RFC 3986 unreserved alphabet
+ * (or percent-encoded) and a literal transport. Raw request text is never
+ * interpolated, because this value lands inside the quoted `resource_metadata`
+ * parameter of `WWW-Authenticate`, where a `"` from a request path would end
+ * the parameter early, and because a suffix after the transport would point
+ * the client at a document that discovery refuses.
+ *
+ * Depends on the request URL only, never on whether that endpoint exists or
+ * which auth toggles it has: a guessed name and a real endpoint requested at
+ * the same URL get the same value. A path that does not match (a trailing
+ * slash, `/message`, `/api/<tool>`, an extra segment) keeps the unscoped URL
+ * every challenge advertised before, so those clients see no change.
+ */
 function resourceMetadataUrl(req: express.Request): string {
-  return `${getBaseUrl(req)}/.well-known/oauth-protected-resource`;
+  const discoveryUrl = `${getBaseUrl(req)}/.well-known/oauth-protected-resource`;
+  // Express keeps the public mount in `baseUrl` and the still-encoded rest of
+  // the path, without the query string, in `path`.
+  const resource = matchPublicMcpResourcePath(
+    `${req.baseUrl ?? ""}${req.path ?? ""}`,
+  );
+  return resource ? `${discoveryUrl}${resource.path}` : discoveryUrl;
 }
 
 /**
@@ -89,10 +96,9 @@ function resourceMetadataUrl(req: express.Request): string {
  * `lookup-endpoint-middleware`), and an endpoint whose authentication is
  * entirely off and therefore refused (CONDITION 1).
  *
- * Deliberately BYTE-IDENTICAL, header included, to what a real OAuth-enabled
- * endpoint answers an unauthenticated request with. That identity is the whole
- * mechanism: it is the only way a probe for a name that does not exist cannot
- * be told apart from a probe for one that does.
+ * Deliberately BYTE-IDENTICAL, header included, to what an OAuth-enabled
+ * endpoint answers for the same request URL. The URL-specific metadata
+ * pointer cannot reveal whether the endpoint exists.
  *
  * RESIDUAL, recorded because it is the honest limit of this fix rather than an
  * oversight. An endpoint with `enable_oauth` OFF still answers without the
@@ -129,7 +135,11 @@ export function sendAuthenticationRequiredChallenge(
 /**
  * Send API key required response (no WWW-Authenticate header, to prevent the
  * OAuth flow being started against an endpoint that does not accept OAuth
- * tokens). The body is now the shared one; see the RESIDUAL note on
+ * tokens). The body is the shared one, `resource_metadata` included. On a
+ * public MCP resource path that is the scoped document, which answers 404 for
+ * an endpoint with OAuth off: the honest answer for this endpoint, where the
+ * unscoped document this body used to name answers 200 whenever any other
+ * endpoint runs OAuth. See the RESIDUAL note on
  * `sendAuthenticationRequiredChallenge` for why the header asymmetry survives.
  */
 export function sendApiKeyRequiredResponse(
@@ -144,11 +154,12 @@ export function sendApiKeyRequiredResponse(
 /**
  * Send OAuth challenge response with proper WWW-Authenticate header.
  *
- * The endpoint argument is no longer read. The challenge used to be assembled
- * from that endpoint's toggles, which is precisely the fingerprint removed
- * above. It stays in the signature so both call sites keep recording which
- * endpoint they are challenging on behalf of, and so an endpoint-specific
- * challenge, if one is ever justified, has an obvious place to land.
+ * The endpoint argument is not read. The challenge used to be assembled from
+ * that endpoint's toggles, which is precisely the fingerprint removed above,
+ * and the scoped `resource_metadata` comes from the request path, not the row,
+ * so a known OAuth endpoint and an unknown name get the same challenge. It
+ * stays in the signature so both call sites keep recording which endpoint
+ * they are challenging on behalf of.
  */
 export function sendOAuthChallengeResponse(
   req: express.Request,

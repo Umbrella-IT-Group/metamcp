@@ -479,7 +479,12 @@ export const GRANTED_OAUTH_SCOPE = "mcp";
 export function getBaseUrl(req: express.Request): string {
   // Prioritize APP_URL environment variable
   if (process.env.APP_URL) {
-    return process.env.APP_URL;
+    // Normalize the operator-configured origin before appending OAuth paths:
+    // every caller joins `${base}/<path>`, so an APP_URL ending in "/"
+    // advertised `https://host//oauth/authorize`. getIssuerIdentifier adds
+    // back exactly one slash, so the issuer is the same whichever way the
+    // operator wrote APP_URL. (lib/m365/config.ts normalizes the same way.)
+    return process.env.APP_URL.replace(/\/+$/, "");
   }
 
   // Check for forwarded headers from Next.js proxy

@@ -3,19 +3,13 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../../db/repositories";
+import { matchPublicMcpResourcePath } from "../../lib/public-mcp-resource";
 import { getBaseUrl, getIssuerIdentifier, GRANTED_OAUTH_SCOPE } from "./utils";
 
 const metadataRouter = express.Router();
 
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
 const AUTHORIZATION_SERVER_PATH = "/.well-known/oauth-authorization-server";
-
-/**
- * The mount `apps/backend/src/index.ts` gives the public MCP router, i.e. the
- * first path segment of every protected resource this gateway serves
- * (`/metamcp/<endpoint_name>/mcp`, `/sse`, `/api`).
- */
-const PUBLIC_MCP_MOUNT = "metamcp";
 
 /**
  * What a `/.well-known/oauth-*` request is asking about.
@@ -26,9 +20,13 @@ const PUBLIC_MCP_MOUNT = "metamcp";
  * `/.well-known/oauth-protected-resource/metamcp/foo/mcp` — that suffix is the
  * only thing that says WHICH endpoint the caller means. A bare request names
  * no endpoint at all.
+ *
+ * `resourcePath` is the suffix as `matchPublicMcpResourcePath` rebuilt it from
+ * checked parts, never the raw request text; it is what the protected-resource
+ * document serves back as `resource`.
  */
 type DiscoveryTarget =
-  | { kind: "endpoint"; name: string }
+  | { kind: "endpoint"; name: string; resourcePath: string }
   | { kind: "unscoped" }
   | { kind: "unknown" };
 
@@ -40,35 +38,27 @@ function classifyDiscoveryRequest(
     return { kind: "unknown" };
   }
 
-  const segments = reqPath
-    .slice(wellKnownPath.length)
-    .split("/")
-    .filter((segment) => segment.length > 0);
+  const suffix = reqPath.slice(wellKnownPath.length);
 
-  if (segments.length === 0) {
+  // The bare document, with or without trailing slashes.
+  if (/^\/*$/.test(suffix)) {
     return { kind: "unscoped" };
   }
 
-  // Anything that is not a public MCP resource path is not a resource this
-  // server can answer for. Treated as unknown rather than falling back to the
-  // unscoped document, so a junk suffix cannot be used to fish the metadata
-  // out of a deployment whose real endpoints are all OAuth-disabled.
-  const rawName = segments[1];
-  if (segments[0] !== PUBLIC_MCP_MOUNT || rawName === undefined) {
+  // A suffix that is not EXACTLY `/metamcp/<name>/(mcp|sse|api)` names no
+  // resource this server can answer for. Treated as unknown rather than
+  // falling back to the unscoped document, so a junk suffix cannot be used to
+  // fish the metadata out of a deployment whose real endpoints are all
+  // OAuth-disabled, and rather than matching on a prefix, because the
+  // protected-resource document serves the suffix back as `resource`: a
+  // prefix match would reflect `/metamcp/<real>/mcp/<anything>` into it. See
+  // lib/public-mcp-resource for the full grammar.
+  const resource = matchPublicMcpResourcePath(suffix);
+  if (!resource) {
     return { kind: "unknown" };
   }
 
-  let name: string;
-  try {
-    // `req.path` is still percent-encoded; `lookupEndpoint` matches against
-    // the DECODED `req.params.endpoint_name`, so decode to ask the same
-    // question of the same table.
-    name = decodeURIComponent(rawName);
-  } catch {
-    return { kind: "unknown" };
-  }
-
-  return { kind: "endpoint", name };
+  return { kind: "endpoint", name: resource.name, resourcePath: resource.path };
 }
 
 /**
@@ -138,13 +128,23 @@ const protectedResourceHandler: express.RequestHandler = async (req, res) => {
 
     const baseUrl = getBaseUrl(req);
 
-    // For MCP implementation, we point to our better-auth OAuth server
-    // The authorization server is hosted at the same base URL
-    const authServerUrl = baseUrl;
+    // RFC 9728 lists authorization servers by their RFC 8414 issuer
+    // identifier, and a client that fetches the authorization server metadata
+    // compares the `issuer` it gets back with this string exactly (RFC 8414
+    // §3.3). getIssuerIdentifier is what that document advertises, trailing
+    // slash included, so the two cannot differ.
+    const authServerUrl = getIssuerIdentifier(req);
 
-    // Ensure the resource URL has a trailing slash for OAuth validation
-    // This is required by RFC 9728 for exact resource matching
-    const resourceUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+    // Path-scoped discovery describes the resource that was asked about (RFC
+    // 9728 §3.3: the `resource` must be the one whose metadata URL was
+    // built), so a strict client that compares it with the URL it connected
+    // to accepts it. Built from the classifier's rebuilt path, never from
+    // `req.path`. The unscoped document keeps the origin it always served, for
+    // clients that still fall back to it.
+    const resourceUrl =
+      target.kind === "endpoint"
+        ? `${baseUrl}${target.resourcePath}`
+        : `${baseUrl}/`;
 
     const metadata = {
       // Resource identifier - the protected resource's canonical URI

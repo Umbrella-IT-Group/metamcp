@@ -157,12 +157,20 @@ function makeReq(options: {
   auditClientIp?: string;
 }): express.Request {
   ipCounter += 1;
+  const endpointName =
+    options.endpointName ?? options.endpoint?.name ?? "autotask";
   return {
     method: "POST",
     url: "/mcp",
+    // What Express hands a route under `app.use("/metamcp", ...)`. The 401's
+    // `resource_metadata` is built from these two, so without them every
+    // challenge here would take the unscoped fallback and the comparisons
+    // below would never see the path-scoped URL a real request gets.
+    baseUrl: "/metamcp",
+    path: `/${endpointName}/mcp`,
     headers: options.headers ?? {},
     query: {},
-    params: { endpoint_name: options.endpointName ?? "autotask" },
+    params: { endpoint_name: endpointName },
     protocol: "https",
     get: () => "mcp.example.com",
     ip: `10.0.0.${ipCounter}`,
@@ -299,6 +307,12 @@ describe("CONDITION 1: an endpoint with both auth toggles off", () => {
 
 describe("endpoint-name enumeration: every anonymous answer is the same answer", () => {
   it("answers an unknown name exactly as it answers an unauthenticated real one", async () => {
+    // Compared at the SAME request URL, with only the database's answer
+    // changed, because that is the oracle: the 401's `resource_metadata` is
+    // the path-scoped discovery URL (RFC 9728 §5.1), built from the request
+    // path, so two different names differ by the name they asked for and
+    // nothing else, whether or not either exists.
+    //
     // The real endpoint, unauthenticated. This is what a connector sees on its
     // first request, and it is the shape everything else must match.
     findByNameMock.mockResolvedValue(makeEndpoint({ enable_oauth: true }));
@@ -308,25 +322,44 @@ describe("endpoint-name enumeration: every anonymous answer is the same answer",
       endpoint: makeEndpoint({ enable_oauth: true }),
     });
 
-    // A name that does not exist.
+    // The same name, now absent from the table.
     findByNameMock.mockResolvedValue(undefined);
-    const invented = await lookup({ endpointName: "does-not-exist" });
+    const invented = await lookup({ endpointName: "autotask" });
 
     expect(invented.served).toBe(false);
     expect(comparable(invented.res)).toEqual(comparable(real.res));
     expect(invented.res.body?.timestamp).toEqual(expect.any(String));
     expect(real.res.body?.timestamp).toEqual(expect.any(String));
+    expect(real.res.body?.resource_metadata).toBe(
+      "https://mcp.example.com/.well-known/oauth-protected-resource/metamcp/autotask/mcp",
+    );
   });
 
-  it("does not echo the name asked for, or admit the name is unknown", async () => {
+  it("does not admit the name is unknown; the name appears only as the path the caller asked for", async () => {
+    // Before path-scoped challenges this asserted the name never appeared at
+    // all. It now appears in exactly one place, the scoped discovery URL,
+    // which is built from the request path and is the same for a real
+    // endpoint at that URL (previous case), so it says nothing the caller did
+    // not send. What must still never appear is anything that depends on the
+    // lookup: a "not found", the name in prose, an extra field.
     findByNameMock.mockResolvedValue(undefined);
 
     const { res } = await lookup({ endpointName: "secret-client-endpoint" });
 
-    const serialized = JSON.stringify(res.body);
+    expect(Object.keys(res.body ?? {}).sort()).toEqual([
+      "error",
+      "error_description",
+      "resource_metadata",
+      "timestamp",
+    ]);
+    expect(res.body?.resource_metadata).toBe(
+      "https://mcp.example.com/.well-known/oauth-protected-resource/metamcp/secret-client-endpoint/mcp",
+    );
+    const { resource_metadata: _pointer, ...rest } = res.body ?? {};
+    const serialized = JSON.stringify(rest);
     expect(serialized).not.toContain("secret-client-endpoint");
-    expect(serialized).not.toContain("not found");
-    expect(serialized).not.toContain("No endpoint found");
+    expect(JSON.stringify(res.body)).not.toContain("not found");
+    expect(JSON.stringify(res.body)).not.toContain("No endpoint found");
   });
 
   it("keeps the real reason in the log, where the caller cannot read it", async () => {
