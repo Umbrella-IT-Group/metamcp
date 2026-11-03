@@ -35,6 +35,7 @@ import {
   ListToolsResultSchema,
   McpError,
   Tool,
+  ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -179,6 +180,9 @@ vi.mock("./tool-call-warmup", () => ({
   ),
 }));
 
+import logger from "@/utils/logger";
+
+import { getMcpServers, getNamespaceListingServers } from "./fetch-metamcp";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { createServer } from "./metamcp-proxy";
 import {
@@ -580,16 +584,18 @@ describe("argument schemas through real SDK transports", () => {
     },
   );
 
-  it("a call before a listing stores counts, and a rename discards the old schema", async () => {
+  it("a call before any listing is shaped from the proxy's own listing, and a rename discards the old schema", async () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
     const target = await backend();
     getSessionMock.mockResolvedValue(target.session);
     const consumer = await connectConsumer();
+    // The client never listed: the proxy listed for its own audit. The name is
+    // declared; the value is not one of the enum's members.
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
     expect(await shapeOfRow(recorder, 1)).toEqual({
-      keys: [],
-      unverified_keys: 1,
+      keys: ["mode"],
+      sel: { mode: "?" },
     });
 
     await list(consumer);
@@ -620,13 +626,21 @@ describe("argument schemas through real SDK transports", () => {
     getSessionMock.mockResolvedValue(target.session);
     const consumer = await connectConsumer();
     await list(consumer);
+    // The backend drops `mode`, then says so. The listed schema declared it.
+    target.setTools([
+      {
+        name: "list_things",
+        inputSchema: { type: "object", properties: { query: {} } },
+      },
+    ]);
     await Promise.all(
       [...target.session.listChangedSubscribers].map((notify) => notify()),
     );
-    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await call(consumer, REAL_TOOL, { mode: "list" });
+    // Shaped from a fresh listing: the old schema would store `mode`.
     expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
-      unverified_keys: 1,
+      unknown_keys: 1,
     });
   });
 
@@ -640,15 +654,23 @@ describe("argument schemas through real SDK transports", () => {
     const pause = target.pauseNextListing();
     const pending = list(consumer);
     await pause.started;
+    // The paused response already holds the schema that declares `mode`.
+    target.setTools([
+      {
+        name: "list_things",
+        inputSchema: { type: "object", properties: { query: {} } },
+      },
+    ]);
     await Promise.all(
       [...target.session.listChangedSubscribers].map((notify) => notify()),
     );
     pause.release();
     await pending;
-    await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    await call(consumer, REAL_TOOL, { mode: "list" });
+    // Restored, the old response would store `mode` and its value.
     expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
-      unverified_keys: 1,
+      unknown_keys: 1,
     });
   });
 
@@ -672,10 +694,381 @@ describe("argument schemas through real SDK transports", () => {
     pause.release();
     await older;
     await call(consumer, REAL_TOOL, { mode: "Alice_Smith" });
+    // Restored, the obsolete schema would store `mode` (as "?"); the current
+    // one does not declare it.
     expect(await shapeOfRow(recorder, 1)).toEqual({
       keys: [],
-      unverified_keys: 1,
+      unknown_keys: 1,
     });
+  });
+});
+
+describe("argument schemas for a caller that never lists on its proxy", () => {
+  // n8n-style sessions, lazily recovered sessions and long sessions whose
+  // snapshot a list_changed cleared all call without a listing on that proxy.
+  // The proxy lists for its own audit after the call; only the row waits.
+  const listings = vi.mocked(getNamespaceListingServers);
+  const servers = vi.mocked(getMcpServers);
+
+  const rowsAfter = async (recorder: ReturnType<typeof vi.fn>, n: number) => {
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(n));
+    return recorder.mock.calls.map((callArgs) => callArgs[0]);
+  };
+
+  const declaring = (properties: Record<string, object>): Tool[] => [
+    { name: "list_things", inputSchema: { type: "object", properties } },
+  ];
+
+  async function connectWithCleanup(namespace = "ns-1", session = "sess-1") {
+    const { server, cleanup } = await createServer(namespace, session);
+    const [consumerSide, gatewaySide] = InMemoryTransport.createLinkedPair();
+    await server.connect(gatewaySide);
+    const consumer = new Client({ name: "consumer", version: "1.0.0" });
+    await consumer.connect(consumerSide);
+    cleanups.push(() => consumer.close());
+    return { consumer, cleanup };
+  }
+
+  /** The next namespace read hangs until released (the audit listing's first step). */
+  function holdNextListing() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    listings.mockImplementationOnce(async () => {
+      await gate;
+      return {
+        routable: await getMcpServers("ns-1", false),
+        errorGated: {},
+      };
+    });
+    return release;
+  }
+
+  beforeEach(() => {
+    listings.mockClear();
+    servers.mockClear();
+  });
+
+  afterEach(() => {
+    delete process.env.TOOL_AUDIT_ARGS_SHAPE;
+  });
+
+  it("(1) a call on a proxy that never listed stores the declared keys and the enum selector value", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    target.setTools(
+      declaring({ mode: { type: "string", enum: ["list", "x1"] }, ticket: {} }),
+    );
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+
+    const result = await call(consumer, REAL_TOOL, { mode: "list", ticket: 5 });
+
+    expect(result.content).toEqual(real.content);
+    const [row] = await rowsAfter(recorder, 1);
+    expect(row.args_shape).toEqual({
+      keys: ["mode", "ticket"],
+      sel: { mode: "list" },
+    });
+    // A deferred row keeps the time the call settled.
+    expect(row.called_at).toBeInstanceOf(Date);
+    expect(listings).toHaveBeenCalledTimes(1);
+    expect(target.executions()).toBe(1);
+  });
+
+  it("(2) a caller-chosen key or selector value never reaches the row", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    target.setTools(declaring({ mode: { enum: ["list"] }, ticket: {} }));
+    getSessionMock.mockResolvedValue(target.session);
+
+    await call(await connectConsumer(), REAL_TOOL, {
+      mode: "Alice_Smith",
+      Alice_Smith: 1,
+      client_secret_x: 2,
+      "bad key": 3,
+    });
+
+    const [row] = await rowsAfter(recorder, 1);
+    expect(row.args_shape).toEqual({
+      keys: ["mode"],
+      sel: { mode: "?" },
+      unknown_keys: 2,
+      invalid_keys: 1,
+    });
+    const stored = JSON.stringify(row.args_shape);
+    expect(stored).not.toContain("Alice_Smith");
+    expect(stored).not.toContain("client_secret_x");
+  });
+
+  it("(3) a listing that fails leaves the count-only shape and the call still succeeds", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    listings.mockRejectedValueOnce(new Error("namespace read failed"));
+
+    const result = await call(await connectConsumer(), REAL_TOOL, {
+      mode: "list",
+      ticket: 1,
+    });
+
+    expect(result.content).toEqual(real.content);
+    expect(result.isError).toBeFalsy();
+    const [row] = await rowsAfter(recorder, 1);
+    expect(row).toMatchObject({
+      success: true,
+      args_shape: { keys: [], unverified_keys: 2 },
+    });
+    expect(listings).toHaveBeenCalledTimes(1);
+    expect(target.executions()).toBe(1);
+  });
+
+  it("(4) concurrent misses on one proxy share one listing, and the calls do not wait for it", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const release = holdNextListing();
+    const consumer = await connectConsumer();
+
+    const results = await Promise.all(
+      ["list", "x1", "list", "x1", "list"].map((mode) =>
+        call(consumer, REAL_TOOL, { mode }),
+      ),
+    );
+
+    // Every call answered while the listing is still held: only rows wait.
+    expect(
+      results.every(
+        (r) =>
+          r.content[0].type === "text" && r.content[0].text === "a real answer",
+      ),
+    ).toBe(true);
+    await vi.waitFor(() => expect(listings).toHaveBeenCalledTimes(1));
+    expect(recorder).not.toHaveBeenCalled();
+    release();
+    const rows = await rowsAfter(recorder, 5);
+    expect(rows.map((row) => row.args_shape.sel.mode).sort()).toEqual([
+      "list",
+      "list",
+      "list",
+      "x1",
+      "x1",
+    ]);
+    expect(listings).toHaveBeenCalledTimes(1);
+  });
+
+  it("(5) two proxies in one namespace with different routing winners each use their own schema", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const first = await backend();
+    first.setTools(declaring({ mode: { enum: ["list"] }, ticket: {} }));
+    const second = await backend();
+    second.setTools(
+      declaring({ mode: { enum: ["Alice_Smith"] }, Alice_Smith: {} }),
+    );
+    // Same namespace, same exposed name; each session's pool routes it to a
+    // different backend.
+    getSessionMock.mockImplementation(async (sessionId: string) =>
+      sessionId === "sess-1" ? first.session : second.session,
+    );
+    const firstConsumer = await connectConsumer("ns-1", "sess-1");
+    const secondConsumer = await connectConsumer("ns-1", "sess-2");
+    const args = { mode: "Alice_Smith", Alice_Smith: 1, ticket: 1 };
+
+    await call(firstConsumer, REAL_TOOL, args);
+    const [firstRow] = await rowsAfter(recorder, 1);
+    await call(secondConsumer, REAL_TOOL, args);
+    const secondRow = (await rowsAfter(recorder, 2))[1];
+
+    expect(firstRow).toMatchObject({ session_id: "sess-1" });
+    expect(firstRow.args_shape).toEqual({
+      keys: ["mode", "ticket"],
+      sel: { mode: "?" },
+      unknown_keys: 1,
+    });
+    expect(secondRow).toMatchObject({ session_id: "sess-2" });
+    expect(secondRow.args_shape).toEqual({
+      keys: ["Alice_Smith", "mode"],
+      sel: { mode: "Alice_Smith" },
+      unknown_keys: 1,
+    });
+    expect(first.executions()).toBe(1);
+    expect(second.executions()).toBe(1);
+  });
+
+  it("a name two servers expose stays count-only instead of guessing which one routes", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const first = await backend();
+    first.setTools(declaring({ mode: { enum: ["list"] }, ticket: {} }));
+    const second = await backend();
+    second.setTools(declaring({ mode: { enum: ["list"] }, Alice_Smith: {} }));
+    // Both names sanitize to the prefix `ninja`, so both expose
+    // `ninja__list_things`; the client-facing listing would keep one.
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-ninja-2": { name: "ninja!" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-ninja-2" ? second.session : first.session,
+    );
+
+    try {
+      await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+      const [row] = await rowsAfter(recorder, 1);
+      expect(row.args_shape).toEqual({ keys: [], unverified_keys: 1 });
+      expect(listings).toHaveBeenCalledTimes(1);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("a second miss inside the interval does not list again", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const consumer = await connectConsumer();
+
+    await call(consumer, REAL_TOOL, { mode: "list" });
+    await rowsAfter(recorder, 1);
+    // A name the listing does not hold misses again; the interval holds.
+    await call(consumer, "ninja__add_note", { mode: "x1" });
+    const rows = await rowsAfter(recorder, 2);
+
+    expect(rows[1].args_shape).toEqual({ keys: [], unverified_keys: 1 });
+    expect(listings).toHaveBeenCalledTimes(1);
+  });
+
+  it("the audit listing attaches no list_changed subscriber and sends the client nothing", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ninja = await backend();
+    const other = await backend();
+    other.setTools([
+      { name: "other_thing", inputSchema: { type: "object", properties: {} } },
+    ]);
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-other": { name: "other" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-other" ? other.session : ninja.session,
+    );
+    const consumer = await connectConsumer();
+    const notified = vi.fn();
+    consumer.setNotificationHandler(
+      ToolListChangedNotificationSchema,
+      notified,
+    );
+    try {
+      await call(consumer, REAL_TOOL, { mode: "list" });
+      const [row] = await rowsAfter(recorder, 1);
+      expect(row.args_shape).toEqual({ keys: ["mode"], sel: { mode: "list" } });
+      // The audit listing reached the other server but did not subscribe the
+      // client to it.
+      expect(getSessionMock).toHaveBeenCalledWith(
+        "sess-1",
+        "server-other",
+        expect.anything(),
+        "ns-1",
+      );
+      expect(other.session.listChangedSubscribers.size).toBe(0);
+      expect(notified).not.toHaveBeenCalled();
+      // Control: the route the call itself took does notify, so the silence
+      // above is the audit listing's, not a deaf handler.
+      await Promise.all(
+        [...ninja.session.listChangedSubscribers].map((notify) => notify()),
+      );
+      await vi.waitFor(() => expect(notified).toHaveBeenCalledTimes(1));
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("an audit listing that cannot reach a server logs one warning, no DEGRADED line, and owes the client nothing", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ninja = await backend();
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-down": { name: "down" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-down" ? undefined : ninja.session,
+    );
+    vi.mocked(logger.error).mockClear();
+    vi.mocked(logger.warn).mockClear();
+    vi.mocked(logger.info).mockClear();
+
+    try {
+      await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+      const [row] = await rowsAfter(recorder, 1);
+      expect(row.args_shape).toEqual({ keys: ["mode"], sel: { mode: "list" } });
+      // The harness's tools.impl mock has no syncFromListing, so every
+      // listing in this file (client ones too) logs the catalog-sync line.
+      // What must be absent is the listing's own failure reporting.
+      const errors = vi
+        .mocked(logger.error)
+        .mock.calls.map(([line]) => String(line))
+        .filter((line) => !line.startsWith("Error syncing tools to database"));
+      expect(errors).toEqual([]);
+      const warned = vi
+        .mocked(logger.warn)
+        .mock.calls.map(([line]) => String(line));
+      expect(warned).toEqual([
+        expect.stringContaining("Audit listing for session sess-1"),
+      ]);
+      expect(warned[0]).not.toMatch(/\b(error|fatal|panic|exception)\b/i);
+      const info = vi
+        .mocked(logger.info)
+        .mock.calls.map(([line]) => String(line));
+      expect(info.some((line) => line.includes("is owed"))).toBe(false);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("a session closed while its audit listing runs acquires no backend session", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+    const release = holdNextListing();
+    const { consumer, cleanup } = await connectWithCleanup();
+
+    await call(consumer, REAL_TOOL, { mode: "list" });
+    await vi.waitFor(() => expect(listings).toHaveBeenCalledTimes(1));
+    const acquiredBeforeClose = getSessionMock.mock.calls.length;
+    await cleanup();
+    release();
+
+    const [row] = await rowsAfter(recorder, 1);
+    expect(row.args_shape).toEqual({ keys: [], unverified_keys: 1 });
+    expect(getSessionMock).toHaveBeenCalledTimes(acquiredBeforeClose);
+  });
+
+  it("the kill switch stores NULL and lists nothing", async () => {
+    process.env.TOOL_AUDIT_ARGS_SHAPE = "off";
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const target = await backend();
+    getSessionMock.mockResolvedValue(target.session);
+
+    await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+
+    const [row] = await rowsAfter(recorder, 1);
+    expect(row.args_shape).toBeNull();
+    expect(row.called_at).toBeUndefined();
+    expect(listings).not.toHaveBeenCalled();
   });
 });
 
