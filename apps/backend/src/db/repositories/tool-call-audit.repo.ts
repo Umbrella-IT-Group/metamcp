@@ -29,6 +29,10 @@ export interface ToolCallAuditEntry {
   // tool's own failure code token. See audit-args-shape and audit-classify.
   args_shape?: ArgsShape | null;
   error_detail?: string | null;
+  // Omitted, the column default (insert time) applies. Set only by a row the
+  // auditing middleware wrote after waiting for a schema listing, to the time
+  // the call settled (auditing.functional.ts, DEFERRED SHAPE).
+  called_at?: Date;
 }
 
 /**

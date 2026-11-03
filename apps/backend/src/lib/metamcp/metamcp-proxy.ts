@@ -39,7 +39,10 @@ import {
   type NamespaceListingServers,
 } from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
-import { requestWithSessionRecovery } from "./list-handler-recovery";
+import {
+  RecoverySessionPool,
+  requestWithSessionRecovery,
+} from "./list-handler-recovery";
 import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditingMiddleware } from "./metamcp-middleware/auditing.functional";
 import {
@@ -64,7 +67,11 @@ import {
   isToolCallReplaySafeError,
 } from "./session-error";
 import { recoverFailedSession, SessionRecoveries } from "./session-recovery";
-import { ToolArgSchemaRegistry } from "./tool-arg-keys";
+import {
+  AuditSchemaRefresher,
+  ToolArgSchemaRegistry,
+  unambiguousAuditTools,
+} from "./tool-arg-keys";
 import {
   PrefixCandidate,
   ProbeOutcome,
@@ -82,6 +89,22 @@ import {
 } from "./tools-list-renotify";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
+
+/**
+ * Marks a listing this proxy runs for its own audit (tool-arg-keys.ts,
+ * AuditSchemaRefresher) rather than for its client. It rides the handler
+ * context, which both list middleware pass through unchanged, so the audit
+ * listing runs the very chain the client's tools/list runs and gets the same
+ * names and schemas. A module-private symbol: nothing outside this file can set
+ * it. Such a listing never changes what the client receives: no route is
+ * written, no list_changed subscriber attached (a client that never listed
+ * would otherwise start getting notifications), no owed re-notify settled, no
+ * cold-start warmup or error-gate reset, and no backend session acquired once
+ * the proxy is closed. A name two servers expose stays a duplicate, so the
+ * registry treats it as unknown instead of guessing which one routes.
+ */
+const AUDIT_LISTING: unique symbol = Symbol("auditListing");
+type ListingContext = MetaMCPHandlerContext & { [AUDIT_LISTING]?: true };
 
 export const createServer = async (
   namespaceUuid: string,
@@ -339,11 +362,27 @@ export const createServer = async (
   const toolArgSchemas = new ToolArgSchemaRegistry();
   let toolSchemaGeneration = 0;
 
+  // The pool an audit listing uses: it acquires nothing for a closed proxy.
+  // Checked synchronously right before each acquisition, and the pool
+  // detaches a session synchronously when cleanup starts, so a listing still
+  // running when the session ends cannot re-create pooled backend sessions
+  // under the dead session id. Re-running cleanup afterwards instead would be
+  // unsafe: lazy recovery can rebuild a session with the same id.
+  const auditListingPool: Pick<RecoverySessionPool, "getSession"> = {
+    getSession: async (sid, serverUuid, params, ns) =>
+      proxyClosed
+        ? undefined
+        : mcpServerPool.getSession(sid, serverUuid, params, ns),
+  };
+
   // Original List Tools Handler
   const originalListToolsHandler: ListToolsHandler = async (
     request,
     context,
   ) => {
+    // See AUDIT_LISTING: same chain, none of the client-facing side effects.
+    const audit = (context as ListingContext)[AUDIT_LISTING] === true;
+    const pool = audit ? auditListingPool : mcpServerPool;
     logger.debug(
       "[DEBUG-TOOLS] 🔍 tools/list called for namespace:",
       namespaceUuid,
@@ -361,10 +400,12 @@ export const createServer = async (
         includeInactiveServers,
       );
     } catch (error) {
-      logger.error(
-        `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
-        error,
-      );
+      if (!audit) {
+        logger.error(
+          `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
+          error,
+        );
+      }
       throw new McpError(
         ErrorCode.InternalError,
         "tools/list could not read this namespace's servers: no tools were listed, which is not the same as an empty tool list. Retry shortly.",
@@ -379,13 +420,28 @@ export const createServer = async (
     // The routable servers, the same set getMcpServers answers: the only ones
     // this listing connects to, warms or keeps routes for.
     const serverParams = listing.routable;
+    const auditServerPrefixes = new Map<string, string | undefined>();
+    if (audit) {
+      for (const [uuid, params] of Object.entries({
+        ...listing.errorGated,
+        ...serverParams,
+      })) {
+        auditServerPrefixes.set(
+          uuid,
+          params.name ? sanitizeName(params.name) : undefined,
+        );
+      }
+    }
     // A live proxy outlasts namespace edits. Drop removed owners before the
     // collision guard so a same-named replacement can list its own tools.
-    for (const [toolName, owner] of toolNameOwner) {
-      if (!serverParams[owner.uuid]) {
-        toolNameOwner.delete(toolName);
-        delete toolToClient[toolName];
-        delete toolToServerUuid[toolName];
+    // Routing state belongs to client listings; an audit listing leaves it.
+    if (!audit) {
+      for (const [toolName, owner] of toolNameOwner) {
+        if (!serverParams[owner.uuid]) {
+          toolNameOwner.delete(toolName);
+          delete toolToClient[toolName];
+          delete toolToServerUuid[toolName];
+        }
       }
     }
     const allTools: Tool[] = [];
@@ -410,8 +466,11 @@ export const createServer = async (
     // connect path refuses them too). They are unreachable for this listing:
     // owed a re-notify, and part of the error when nothing else lists tools.
     // A misconfigured name stays excluded exactly as below, since resetting
-    // the gate would not make it listable.
-    for (const [mcpServerUuid, params] of Object.entries(listing.errorGated)) {
+    // the gate would not make it listable. An audit listing skips this
+    // bookkeeping: it owes nothing and reports no degradation to a client.
+    for (const [mcpServerUuid, params] of audit
+      ? []
+      : Object.entries(listing.errorGated)) {
       if (isSameServerInstance(params, mcpServerUuid)) {
         settledServerUuids.add(mcpServerUuid);
         continue;
@@ -445,8 +504,10 @@ export const createServer = async (
     // Cold-start warmup: if pool has 0 idle + 0 active sessions but servers
     // exist in DB, trigger a blocking warmup before tools/list responds.
     // This prevents 0-tool responses after idle timeout expires all connections.
-    const poolStatus = mcpServerPool.getPoolStatus();
+    // Not for an audit listing: the warmup resets every server's error gate.
+    const poolStatus = audit ? undefined : mcpServerPool.getPoolStatus();
     if (
+      poolStatus &&
       poolStatus.idle === 0 &&
       poolStatus.active === 0 &&
       allServerEntries.length > 0
@@ -481,14 +542,16 @@ export const createServer = async (
         // backend is down. Check it before connecting so retryable recovery
         // is reserved for servers a reconnect can actually make listable.
         if (params.name && sanitizeName(params.name).includes("__")) {
-          logger.error(
-            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
-          );
+          if (!audit) {
+            logger.error(
+              `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
+            );
+          }
           failedServers.push(params.name);
           settledServerUuids.add(mcpServerUuid);
           return;
         }
-        const session = await mcpServerPool.getSession(
+        const session = await pool.getSession(
           context.sessionId,
           mcpServerUuid,
           params,
@@ -499,9 +562,11 @@ export const createServer = async (
           // ERROR-gated, connection-capped, or unreachable. Error level, not
           // debug: this server is silently missing from the namespace's
           // tool surface until the pool recovers.
-          logger.error(
-            `tools/list: no session available for server ${params.name || mcpServerUuid} — excluded from namespace response (error state, connection cap, or backend unreachable)`,
-          );
+          if (!audit) {
+            logger.error(
+              `tools/list: no session available for server ${params.name || mcpServerUuid} — excluded from namespace response (error state, connection cap, or backend unreachable)`,
+            );
+          }
           failedServers.push(params.name || mcpServerUuid);
           unreachableServers.set(mcpServerUuid, params);
           return;
@@ -513,7 +578,9 @@ export const createServer = async (
         //   - First contact with this backend (no subscriber yet).
         //   - Backend restart cycle: pool invalidation hands us a fresh
         //     ConnectedClient whose subscriber set is empty.
-        registerListChangedSubscriber(session, mcpServerUuid);
+        // Not for an audit listing: a client that never listed would start
+        // receiving list_changed for servers it never used.
+        if (!audit) registerListChangedSubscriber(session, mcpServerUuid);
         settledServerUuids.add(mcpServerUuid);
 
         // Now check for self-referencing using the actual MCP server name
@@ -542,14 +609,19 @@ export const createServer = async (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+        if (audit) {
+          auditServerPrefixes.set(mcpServerUuid, sanitizeName(serverName));
+        }
 
         // The first '__' separates the server from the backend tool. A stored
         // server name containing it cannot round-trip and could borrow an
         // ACTIVE row on the parent prefix while listing an unreviewed tool.
         if (sanitizeName(serverName).includes("__")) {
-          logger.error(
-            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
-          );
+          if (!audit) {
+            logger.error(
+              `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+            );
+          }
           failedServers.push(serverName || mcpServerUuid);
           return;
         }
@@ -594,21 +666,27 @@ export const createServer = async (
           // it a dead pooled session is never evicted from here and the
           // namespace serves 0 tools as "success" until a manual restart.
           let activeSession = session;
-          const allServerTools = await requestWithSessionRecovery({
-            pool: mcpServerPool,
-            sessionId: context.sessionId,
-            serverUuid: mcpServerUuid,
-            params,
-            namespaceUuid,
-            operation: "tools/list",
-            serverName,
-            session,
-            attempt: fetchAllToolPages,
-            onFreshSession: (fresh) => {
-              registerListChangedSubscriber(fresh, mcpServerUuid);
-              activeSession = fresh;
-            },
-          });
+          const allServerTools = audit
+            ? // A background audit must not retire pooled connections or
+              // notify other clients. A late failure may belong to an old
+              // session after a live call has already recovered its backend.
+              // Leave recovery to client-facing paths and keep counts here.
+              await fetchAllToolPages(session)
+            : await requestWithSessionRecovery({
+                pool: mcpServerPool,
+                sessionId: context.sessionId,
+                serverUuid: mcpServerUuid,
+                params,
+                namespaceUuid,
+                operation: "tools/list",
+                serverName,
+                session,
+                attempt: fetchAllToolPages,
+                onFreshSession: (fresh) => {
+                  registerListChangedSubscriber(fresh, mcpServerUuid);
+                  activeSession = fresh;
+                },
+              });
 
           logger.debug(
             `[DEBUG-TOOLS] ⏱️  Fetched ${allServerTools.length} tools from ${serverName} in ${(performance.now() - toolFetchStart).toFixed(2)}ms`,
@@ -684,6 +762,14 @@ export const createServer = async (
           const toolsWithSource: Tool[] = [];
           for (const tool of allServerTools) {
             const toolName = `${sanitizeName(serverName)}__${tool.name}`;
+            if (audit) {
+              // No route, and no collision guard: two servers exposing one
+              // name leave it listed twice, the registry drops a duplicate,
+              // and a call by it is recorded count-only rather than with a
+              // schema from a server that may not be the one it routes to.
+              toolsWithSource.push({ ...tool, name: toolName });
+              continue;
+            }
             const outcome = registerToolRoute(
               toolName,
               { uuid: mcpServerUuid, name: serverName },
@@ -715,7 +801,9 @@ export const createServer = async (
           // and the DEGRADED line. Classing it as info or keeping it out of
           // `failedServers` would hide the one signal that catches that
           // regression.
-          logger.error(`Error fetching tools from: ${serverName}`, error);
+          if (!audit) {
+            logger.error(`Error fetching tools from: ${serverName}`, error);
+          }
           failedServers.push(serverName || mcpServerUuid);
           settledServerUuids.delete(mcpServerUuid);
           unreachableServers.set(mcpServerUuid, params);
@@ -730,10 +818,12 @@ export const createServer = async (
     for (const [index, [mcpServerUuid, params]] of allServerEntries.entries()) {
       const outcome = listingOutcomes[index];
       if (outcome?.status !== "rejected") continue;
-      logger.error(
-        `Error preparing tools listing for: ${params.name || mcpServerUuid}`,
-        outcome.reason,
-      );
+      if (!audit) {
+        logger.error(
+          `Error preparing tools listing for: ${params.name || mcpServerUuid}`,
+          outcome.reason,
+        );
+      }
       failedServers.push(params.name || mcpServerUuid);
       settledServerUuids.delete(mcpServerUuid);
       unreachableServers.set(mcpServerUuid, params);
@@ -744,6 +834,19 @@ export const createServer = async (
       ...Object.keys(serverParams),
       ...Object.keys(listing.errorGated),
     ]);
+    if (audit) {
+      // One line, and no DEGRADED: no client was served this listing, and
+      // the client-facing paths already report the same backends. Worded
+      // without the words the log-based panels count as failures.
+      if (failedServers.length > 0) {
+        logger.warn(
+          `Audit listing for session ${sessionId} in namespace ${namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
+        );
+      }
+      return {
+        tools: unambiguousAuditTools(allTools, auditServerPrefixes.values()),
+      };
+    }
     settleOwedServers(
       mountedServerUuids,
       settledServerUuids,
@@ -1169,9 +1272,47 @@ export const createServer = async (
     // createRateLimitingMiddleware(),
   )(originalListToolsHandler);
 
+  // A client tools/list still running, settled only after it has recorded
+  // its snapshot, so an audit lookup that joins it reads the result.
+  let clientListing: Promise<unknown> | undefined;
+  // Fills toolArgSchemas from this proxy's own listing when a call names a
+  // tool it holds no schema for: a client that never lists here (lazy
+  // recovery, a caller that calls without listing) or whose snapshot a
+  // list_changed cleared. Bounded and never touches the call (tool-arg-keys.ts).
+  const auditSchemas = new AuditSchemaRefresher(toolArgSchemas, {
+    list: async () => {
+      const auditContext: ListingContext = {
+        namespaceUuid: handlerContext.namespaceUuid,
+        sessionId: handlerContext.sessionId,
+        [AUDIT_LISTING]: true,
+      };
+      const result = await listToolsWithMiddleware(
+        { method: "tools/list", params: {} },
+        auditContext,
+      );
+      return result.tools;
+    },
+    generation: () => toolSchemaGeneration,
+    pendingClientListing: () => clientListing,
+    isOpen: () => !proxyClosed,
+    onFailure: (failure) => {
+      // The reason stays at debug: an SDK failure's text carries words the
+      // log-based panels count, and the backends' own paths report them.
+      logger.warn(
+        `Audit listing for session ${sessionId} in namespace ${namespaceUuid} did not complete; calls it would describe keep the count-only args_shape`,
+      );
+      logger.debug("Audit listing failure detail:", failure);
+    },
+  });
+
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
-    createAuditingMiddleware((name) => toolArgSchemas.get(name)),
+    // A name this proxy holds no schema for is shaped after the call from its
+    // own listing (auditSchemas); the call itself is untouched.
+    createAuditingMiddleware(
+      (name) => toolArgSchemas.get(name),
+      (name) => auditSchemas.resolve(name),
+    ),
     // Second, OUTSIDE the filter so it also sees the filter's fail-closed
     // denial for a deleted server: answers a call that already failed as an
     // unknown tool with the replacement from the retired-tool map. Consulted
@@ -1205,15 +1346,24 @@ export const createServer = async (
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
     const generation = ++toolSchemaGeneration;
     toolArgSchemas.replace([]);
-    const result = await listToolsWithMiddleware(request, handlerContext);
-    // Use final names after filters and overrides, and discard removed names.
-    // Another proxy's listing cannot teach this routing instance a schema.
-    // A notification or overlapping listing makes an older response unsafe to
-    // retain. Counts-only is honest until a fresh uncontested listing arrives.
-    toolArgSchemas.replace(
-      generation === toolSchemaGeneration ? result.tools : [],
-    );
-    return result;
+    const recorded = (async () => {
+      const result = await listToolsWithMiddleware(request, handlerContext);
+      // Use final names after filters and overrides, and discard removed names.
+      // Another proxy's listing cannot teach this routing instance a schema.
+      // A notification or overlapping listing makes an older response unsafe
+      // to retain. Counts-only is honest until a fresh uncontested listing
+      // arrives.
+      toolArgSchemas.replace(
+        generation === toolSchemaGeneration ? result.tools : [],
+      );
+      return result;
+    })();
+    clientListing = recorded;
+    try {
+      return await recorded;
+    } finally {
+      if (clientListing === recorded) clientListing = undefined;
+    }
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

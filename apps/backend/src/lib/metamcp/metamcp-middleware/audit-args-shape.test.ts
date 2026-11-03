@@ -1,12 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ToolArgSchema } from "../tool-arg-keys";
+import type { AuditListingSource, ToolArgSchema } from "../tool-arg-keys";
 import {
+  AUDIT_LISTING_INTERVAL_MS,
+  AUDIT_SNAPSHOT_MAX_AGE_MS,
+  AuditSchemaRefresher,
+  MAX_CONCURRENT_AUDIT_LISTINGS,
   MAX_ENUM_VALUES,
   MAX_SCHEMA_KEYS,
   MAX_TOOLS,
   schemaFromInputSchema,
   ToolArgSchemaRegistry,
+  unambiguousAuditTools,
 } from "../tool-arg-keys";
 import {
   argsShapeEnabled,
@@ -16,6 +21,7 @@ import {
   SELECTOR_KEYS,
   SELECTOR_UNENUMERATED_MARKER,
   SELECTOR_VALUE_MAX,
+  snapshotArgsForShape,
 } from "./audit-args-shape";
 
 // The syntax rules below are exercised with a schema that declares every key the
@@ -531,5 +537,261 @@ describe("buildArgsShape: a selector with no enum stores only that it was sent (
       mode: "list",
     });
     expect(buildArgsShape({ mode: "lst" }, schema).sel).toEqual({ mode: "?" });
+  });
+});
+
+describe("snapshotArgsForShape: a shape built later equals the entry shape", () => {
+  const declared = (props: Record<string, unknown>) =>
+    schemaFromInputSchema({ type: "object", properties: props });
+  const schemas: Array<ToolArgSchema | undefined> = [
+    undefined,
+    declared({ mode: { enum: ["list"] }, ticket: {}, note: {} }),
+    declared({
+      mode: {},
+      action: { enum: ["run"] },
+      method: { const: "GET" },
+      profile: { enum: ["p".repeat(40)] },
+    }),
+    // A schema that declares an own `__proto__` property, as JSON can.
+    schemaFromInputSchema(
+      JSON.parse(
+        '{"properties": {"__proto__": {}, "mode": {"enum": ["list"]}}}',
+      ),
+    ),
+  ];
+  const argsCases: unknown[] = [
+    undefined,
+    null,
+    {},
+    "text",
+    7,
+    [1, 2],
+    new Date(0),
+    { mode: "list", ticket: 5, note: { nested: "secret" } },
+    { mode: 3, action: ["run"], method: null },
+    { mode: "Alice_Smith", Alice_Smith: 1, "bad key": 2, ["k".repeat(41)]: 1 },
+    JSON.parse('{"__proto__": 1, "mode": "list"}'),
+    { action: "run", method: "GET", profile: "p".repeat(40) },
+    Object.assign(Object.create(null), { mode: "list", ticket: 1 }),
+    Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, i])),
+  ];
+
+  it.each(argsCases.flatMap((args) => schemas.map((schema) => [args, schema])))(
+    "case %#",
+    (args, schema) => {
+      expect(
+        buildArgsShape(snapshotArgsForShape(args), schema as ToolArgSchema),
+      ).toEqual(buildArgsShape(args, schema as ToolArgSchema));
+    },
+  );
+
+  it("keeps no argument value except a selector's string", () => {
+    const snapshot = snapshotArgsForShape({
+      mode: "list",
+      note: "secret-note",
+      ticket: { deep: "secret-deep" },
+      action: 5,
+    });
+    expect(Object.getPrototypeOf(snapshot)).toBeNull();
+    expect({ ...(snapshot as object) }).toEqual({
+      mode: "list",
+      note: null,
+      ticket: null,
+      action: null,
+    });
+  });
+});
+
+describe("tool-arg-keys: audit listing source identities", () => {
+  const tools = [{ name: "a__t" }, { name: "b__t" }];
+
+  it("excludes a colliding prefix even when only one backend returned tools", () => {
+    expect(unambiguousAuditTools(tools, ["a", "a", "b"])).toEqual([
+      { name: "b__t" },
+    ]);
+  });
+
+  it("an unresolved backend prefix cannot be ruled out as a collision", () => {
+    expect(unambiguousAuditTools(tools, ["a", undefined])).toEqual([]);
+    // Once the acquired backend identifies itself, distinct prefixes work.
+    expect(unambiguousAuditTools(tools, ["a", "b"])).toEqual(tools);
+  });
+});
+
+describe("tool-arg-keys: an audit snapshot's age", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("a snapshot with an expiry is unknown once it passes; one without never expires", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const tools = [{ name: "a__t", inputSchema: { properties: { q: {} } } }];
+    const audited = new ToolArgSchemaRegistry();
+    audited.replace(tools, 1_000 + AUDIT_SNAPSHOT_MAX_AGE_MS);
+    const listed = new ToolArgSchemaRegistry();
+    listed.replace(tools);
+    now.mockReturnValue(1_000 + AUDIT_SNAPSHOT_MAX_AGE_MS - 1);
+    expect(audited.get("a__t")).toBeDefined();
+    now.mockReturnValue(1_000 + AUDIT_SNAPSHOT_MAX_AGE_MS);
+    expect(audited.get("a__t")).toBeUndefined();
+    expect(listed.get("a__t")).toBeDefined();
+    // A later replace without an expiry is trusted again.
+    audited.replace(tools);
+    now.mockReturnValue(Number.MAX_SAFE_INTEGER);
+    expect(audited.get("a__t")).toBeDefined();
+  });
+});
+
+describe("tool-arg-keys: AuditSchemaRefresher bounds", () => {
+  const TOOLS = [
+    {
+      name: "a__t",
+      inputSchema: { properties: { mode: { enum: ["list"] }, q: {} } },
+    },
+  ];
+  let clock: number;
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function make(overrides: Partial<AuditListingSource> = {}) {
+    const registry = new ToolArgSchemaRegistry();
+    const source = {
+      list: vi.fn(async () => TOOLS),
+      generation: vi.fn(() => 0),
+      onFailure: vi.fn(),
+      ...overrides,
+    };
+    return {
+      registry,
+      source,
+      refresher: new AuditSchemaRefresher(registry, source),
+    };
+  }
+
+  beforeEach(() => {
+    clock = 10_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("concurrent misses share one listing", async () => {
+    const gate = deferred<typeof TOOLS>();
+    const { refresher, source } = make({ list: vi.fn(() => gate.promise) });
+    const pending = [1, 2, 3].map(() => refresher.resolve("a__t"));
+    // Released before asserting, so a failure cannot hold a process-wide slot.
+    gate.resolve(TOOLS);
+    const schemas = await Promise.all(pending);
+    expect(schemas.every((s) => s?.keys.has("q"))).toBe(true);
+    expect(source.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("a known name needs no listing, and a miss inside the interval starts none", async () => {
+    const { refresher, source } = make();
+    expect(await refresher.resolve("a__t")).toBeDefined();
+    expect(await refresher.resolve("a__t")).toBeDefined();
+    expect(refresher.resolve("a__other")).toBeUndefined();
+    expect(source.list).toHaveBeenCalledTimes(1);
+    clock += AUDIT_LISTING_INTERVAL_MS;
+    expect(await refresher.resolve("a__other")).toBeUndefined();
+    expect(source.list).toHaveBeenCalledTimes(2);
+  });
+
+  it("at the process cap a miss records counts and does not use up its interval", async () => {
+    const gates = Array.from({ length: MAX_CONCURRENT_AUDIT_LISTINGS }, () =>
+      deferred<typeof TOOLS>(),
+    );
+    const busy = gates.map((gate) => make({ list: vi.fn(() => gate.promise) }));
+    const running = busy.map(({ refresher }) => refresher.resolve("a__t"));
+    expect(running.every((p) => p !== undefined)).toBe(true);
+
+    const extra = make();
+    expect(extra.refresher.resolve("a__t")).toBeUndefined();
+    expect(extra.source.list).not.toHaveBeenCalled();
+
+    gates[0].resolve(TOOLS);
+    await running[0];
+    // Same instant: the earlier refusal did not start its interval.
+    expect(await extra.refresher.resolve("a__t")).toBeDefined();
+    gates.slice(1).forEach((gate) => gate.resolve(TOOLS));
+    await Promise.all(running);
+  });
+
+  it("a listing that started before a generation change is discarded", async () => {
+    let generation = 0;
+    const gate = deferred<typeof TOOLS>();
+    const { refresher, registry } = make({
+      list: vi.fn(() => gate.promise),
+      generation: () => generation,
+    });
+    const pending = refresher.resolve("a__t");
+    generation += 1;
+    gate.resolve(TOOLS);
+    expect(await pending).toBeUndefined();
+    expect(registry.get("a__t")).toBeUndefined();
+  });
+
+  it("a failed listing resolves to undefined, reports once, and frees the slot", async () => {
+    const failure = new Error("backend unreachable");
+    const { refresher, source } = make({
+      list: vi.fn(async () => {
+        throw failure;
+      }),
+    });
+    expect(await refresher.resolve("a__t")).toBeUndefined();
+    expect(source.onFailure).toHaveBeenCalledWith(failure);
+    clock += AUDIT_LISTING_INTERVAL_MS;
+    expect(await refresher.resolve("a__t")).toBeUndefined();
+    expect(source.list).toHaveBeenCalledTimes(2);
+  });
+
+  it("a listing that throws synchronously still clears its in-flight slot", async () => {
+    const list = vi
+      .fn<AuditListingSource["list"]>()
+      .mockImplementationOnce(() => {
+        throw new Error("sync");
+      })
+      .mockImplementation(async () => TOOLS);
+    const onFailure = vi.fn(() => {
+      throw new Error("reporter fault");
+    });
+    const { refresher } = make({ list, onFailure });
+    expect(await refresher.resolve("a__t")).toBeUndefined();
+    clock += AUDIT_LISTING_INTERVAL_MS;
+    expect(await refresher.resolve("a__t")).toBeDefined();
+  });
+
+  it("a closed instance starts no listing", () => {
+    const { refresher, source } = make({ isOpen: () => false });
+    expect(refresher.resolve("a__t")).toBeUndefined();
+    expect(source.list).not.toHaveBeenCalled();
+  });
+
+  it("a client listing in flight is joined instead of repeated", async () => {
+    const client = deferred<void>();
+    const { refresher, source, registry } = make({
+      pendingClientListing: () => client.promise,
+    });
+    const pending = refresher.resolve("a__t");
+    registry.replace(TOOLS);
+    client.resolve();
+    expect((await pending)?.keys.has("q")).toBe(true);
+    expect(source.list).not.toHaveBeenCalled();
+  });
+
+  it("the audit snapshot carries the bounded age", async () => {
+    const { refresher, registry } = make();
+    expect(await refresher.resolve("a__t")).toBeDefined();
+    clock += AUDIT_SNAPSHOT_MAX_AGE_MS;
+    expect(registry.get("a__t")).toBeUndefined();
   });
 });

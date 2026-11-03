@@ -13,11 +13,23 @@
  * A process-global name map is unsafe: namespaces can have different servers
  * with the same name, and even two proxies in one namespace can have different
  * routing winners. Each proxy owns a complete post-middleware listing snapshot.
- * Unlisted paths (including the OpenAPI bridge) store counts only.
  *
- * PURE apart from the registry map, never throws, and bounded: past MAX_TOOLS the
- * oldest entry is evicted (Map keeps insertion order; a re-record moves a tool to
- * the end).
+ * A CALLER THAT NEVER LISTS. A snapshot used to come only from a client's own
+ * tools/list on that proxy, so n8n on the OpenAPI bridge, a session rebuilt by
+ * lazy recovery and a long session whose snapshot a list_changed cleared all
+ * stored counts only (2026-11-02: about 22k n8n rows a week and most of an
+ * always-on agent's rows had no key names, which hid an authorless note from an
+ * audit query). `AuditSchemaRefresher` closes that: on a miss the routing
+ * instance runs its OWN listing (the same chain its tools/list serves) and
+ * records it, so every stored name still comes from the tool's own published
+ * schema as that instance exposes it. The cost is bounded per instance (one
+ * listing per AUDIT_LISTING_INTERVAL_MS, in-flight listings shared) and per
+ * process (MAX_CONCURRENT_AUDIT_LISTINGS); past either bound the row keeps
+ * the count-only shape.
+ *
+ * PURE apart from the registry map and the refresher's in-flight counter, never
+ * throws, and bounded: past MAX_TOOLS the oldest entry is evicted (Map keeps
+ * insertion order; a re-record moves a tool to the end).
  */
 
 import {
@@ -135,6 +147,9 @@ export function schemaFromInputSchema(
 /** One routing instance's bounded schema snapshot. Never shared with another proxy. */
 export class ToolArgSchemaRegistry {
   private readonly schemas = new Map<string, ToolArgSchema>();
+  // Set only by a snapshot an audit listing took (see AuditSchemaRefresher):
+  // nothing re-lists for the client on that path, so its age is bounded.
+  private expiresAt: number | undefined;
 
   /** Record (or refresh) one exposed tool's schema. Never throws. */
   record(exposedName: string, inputSchema: unknown): void {
@@ -154,9 +169,18 @@ export class ToolArgSchemaRegistry {
     }
   }
 
-  /** Replace after a complete final listing; removed names and duplicates are unknown. */
-  replace(tools: ReadonlyArray<{ name: string; inputSchema: unknown }>): void {
+  /**
+   * Replace after a complete final listing; removed names and duplicates are
+   * unknown. `expiresAt` (epoch ms) bounds how long this snapshot is trusted;
+   * omitted, it is trusted until the next replace (a client listing, whose
+   * servers' list_changed subscribers invalidate it).
+   */
+  replace(
+    tools: ReadonlyArray<{ name: string; inputSchema: unknown }>,
+    expiresAt?: number,
+  ): void {
     this.schemas.clear();
+    this.expiresAt = expiresAt;
     try {
       if (tools.length > MAX_TOOLS) return;
       const seen = new Set<string>();
@@ -177,6 +201,141 @@ export class ToolArgSchemaRegistry {
   }
 
   get(exposedName: string): ToolArgSchema | undefined {
+    if (this.expiresAt !== undefined && Date.now() >= this.expiresAt) {
+      // An expired audit snapshot is unknown, not stale-but-verified.
+      this.schemas.clear();
+      this.expiresAt = undefined;
+      return undefined;
+    }
     return this.schemas.get(exposedName);
+  }
+}
+
+/** Per routing instance: a new audit listing starts at most once per this interval. */
+export const AUDIT_LISTING_INTERVAL_MS = 60_000;
+/** Per process: audit listings running at once, across every proxy and the bridge. */
+export const MAX_CONCURRENT_AUDIT_LISTINGS = 4;
+/** How long a snapshot an audit listing took is trusted. */
+export const AUDIT_SNAPSHOT_MAX_AGE_MS = 10 * 60_000;
+
+/**
+ * An audit has no authority to choose a routing winner. Counting duplicate
+ * tool names alone is insufficient: if one of two prefix-matched servers
+ * cannot list, the other's schema must not describe a call to the missing
+ * winner. Exclude every ambiguous mounted prefix, even if only one lists.
+ * An unresolved backend-reported prefix could collide with any listed one,
+ * so it leaves the entire snapshot unknown. Callers fill such prefixes from
+ * the acquired backend's version before passing them here.
+ */
+export function unambiguousAuditTools<T extends { name: string }>(
+  tools: ReadonlyArray<T>,
+  mountedPrefixes: Iterable<string | undefined>,
+): T[] {
+  const owners = new Map<string, number>();
+  for (const prefix of mountedPrefixes) {
+    if (prefix === undefined) return [];
+    owners.set(prefix, (owners.get(prefix) ?? 0) + 1);
+  }
+  return tools.filter((tool) => {
+    const separator = tool.name.indexOf("__");
+    return separator >= 0 && owners.get(tool.name.slice(0, separator)) === 1;
+  });
+}
+
+// Process-wide, because the storm this bounds is many instances missing at
+// once (every lazily recovered session after a gateway restart, or a burst of
+// short sessions), each of which would fan a listing out to every backend.
+let auditListingsRunning = 0;
+
+/** What a routing instance gives the refresher. */
+export interface AuditListingSource {
+  /**
+   * The instance's own final listing: the chain its tools/list runs (overrides
+   * and filter included), so names and schemas are the ones it exposes. Must
+   * not change what the instance's client receives.
+   */
+  list: () => Promise<ReadonlyArray<{ name: string; inputSchema: unknown }>>;
+  /**
+   * The instance's snapshot generation. A client listing or a list_changed
+   * bumps it; an audit listing that started under an older generation is
+   * discarded, as an overlapping client listing is.
+   */
+  generation: () => number;
+  /** A client tools/list on this instance still running; joined, not repeated. */
+  pendingClientListing?: () => Promise<unknown> | undefined;
+  /** False once the instance is closed: a closed session starts no listing. */
+  isOpen?: () => boolean;
+  /** Told why an audit listing failed. The row keeps the count-only shape. */
+  onFailure: (error: unknown) => void;
+}
+
+/**
+ * Fills one instance's registry from the instance's own listing when a call
+ * names a tool the registry does not hold. Bounded (see the module header) and
+ * never rejects: every failure resolves to `undefined`, which the auditing
+ * middleware records as the count-only shape. It never touches the call.
+ */
+export class AuditSchemaRefresher {
+  private inFlight: Promise<void> | undefined;
+  private lastStartedAt = Number.NEGATIVE_INFINITY;
+
+  constructor(
+    private readonly registry: ToolArgSchemaRegistry,
+    private readonly source: AuditListingSource,
+  ) {}
+
+  /**
+   * The schema for `exposedName` once this instance's listing settles, or
+   * undefined when no listing may start now (closed, inside the interval, or at
+   * the process cap). The promise never rejects.
+   */
+  resolve(exposedName: string): Promise<ToolArgSchema | undefined> | undefined {
+    try {
+      const known = this.registry.get(exposedName);
+      if (known) return Promise.resolve(known);
+      if (this.source.isOpen && !this.source.isOpen()) return undefined;
+      const lookUp = () => this.registry.get(exposedName);
+      const client = this.source.pendingClientListing?.();
+      if (client) return client.then(lookUp, () => undefined);
+      return (this.inFlight ?? this.start())?.then(lookUp, () => undefined);
+    } catch (error) {
+      this.report(error);
+      return undefined;
+    }
+  }
+
+  private start(): Promise<void> | undefined {
+    const now = Date.now();
+    if (now - this.lastStartedAt < AUDIT_LISTING_INTERVAL_MS) return undefined;
+    // At the cap the interval is not consumed: the next miss may try again.
+    if (auditListingsRunning >= MAX_CONCURRENT_AUDIT_LISTINGS) return undefined;
+    this.lastStartedAt = now;
+    auditListingsRunning += 1;
+    const generation = this.source.generation();
+    // Deferred one microtask so `inFlight` is set before the body runs: a
+    // listing that throws synchronously must still clear it in `finally`.
+    const run: Promise<void> = Promise.resolve().then(async () => {
+      try {
+        const tools = await this.source.list();
+        if (generation === this.source.generation()) {
+          this.registry.replace(tools, Date.now() + AUDIT_SNAPSHOT_MAX_AGE_MS);
+        }
+      } catch (error) {
+        this.report(error);
+      } finally {
+        auditListingsRunning -= 1;
+        if (this.inFlight === run) this.inFlight = undefined;
+      }
+    });
+    this.inFlight = run;
+    return run;
+  }
+
+  private report(error: unknown): void {
+    try {
+      this.source.onFailure(error);
+    } catch {
+      // A throwing reporter must not turn a count-only row into a lost row.
+    }
   }
 }

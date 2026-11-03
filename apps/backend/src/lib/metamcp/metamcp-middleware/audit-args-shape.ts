@@ -23,9 +23,10 @@
  *                   not from a closed set, so not stored).
  *   unknown_keys    count of identifier-shaped keys the schema does not declare.
  *   invalid_keys    count of key names that are not identifier-shaped.
- *   unverified_keys when the tool's schema is not known to this process yet
- *                   (never listed, or a retired name): the count of keys, and
- *                   NO names and NO selector values at all.
+ *   unverified_keys when the routing instance has no schema for the tool (a
+ *                   retired or unknown name, or its own listing failed or was
+ *                   skipped by the bounds in `tool-arg-keys.ts`): the count of
+ *                   keys, and NO names and NO selector values at all.
  * Argument VALUES outside `sel` are never stored, nested key names are never
  * stored, and no caller-chosen name is ever echoed.
  *
@@ -120,6 +121,31 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 export function argsShapeEnabled(): boolean {
   const raw = process.env.TOOL_AUDIT_ARGS_SHAPE?.trim().toLowerCase();
   return raw !== "off" && raw !== "false" && raw !== "0";
+}
+
+/**
+ * What `buildArgsShape` reads from `args`, captured at call entry so a shape
+ * built later (once the routing instance has listed) describes the arguments as
+ * the caller sent them. Keeps every own key name and only a selector key's
+ * string value; every other value becomes null, which `buildArgsShape` treats
+ * exactly as it treats the original (it reads no other value). So
+ * `buildArgsShape(snapshotArgsForShape(a), s)` equals `buildArgsShape(a, s)`,
+ * without holding argument values until the row is written. Throws only where
+ * `buildArgsShape` would (a throwing getter), so call it under the same guard.
+ */
+export function snapshotArgsForShape(args: unknown): unknown {
+  if (args === undefined || args === null) return args;
+  // Any non-plain value shapes as `non_object`, whatever it held.
+  if (!isPlainObject(args)) return [];
+  // Null prototype: a JSON.parse'd own `__proto__` key stays an own key here.
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const key of Object.keys(args)) {
+    const value = (SELECTOR_KEYS as readonly string[]).includes(key)
+      ? args[key]
+      : null;
+    copy[key] = typeof value === "string" ? value : null;
+  }
+  return copy;
 }
 
 export function buildArgsShape(

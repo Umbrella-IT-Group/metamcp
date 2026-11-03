@@ -53,19 +53,24 @@ vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn().mockImplementation(async () => fakeServerParams),
 }));
 
-const { invalidateServerConnectionMock, getSessionMock, loggerErrorMock } =
-  vi.hoisted(() => ({
-    invalidateServerConnectionMock: vi.fn(),
-    getSessionMock: vi.fn(),
-    loggerErrorMock: vi.fn(),
-  }));
+const {
+  invalidateServerConnectionMock,
+  getSessionMock,
+  loggerErrorMock,
+  loggerWarnMock,
+} = vi.hoisted(() => ({
+  invalidateServerConnectionMock: vi.fn(),
+  getSessionMock: vi.fn(),
+  loggerErrorMock: vi.fn(),
+  loggerWarnMock: vi.fn(),
+}));
 
 // Real logger writes to console; mock it so the DEGRADED-tripwire
 // tests can assert on the emitted lines.
 vi.mock("@/utils/logger", () => ({
   default: {
     error: loggerErrorMock,
-    warn: vi.fn(),
+    warn: loggerWarnMock,
     info: vi.fn(),
     debug: vi.fn(),
   },
@@ -103,9 +108,12 @@ vi.mock(
 // purposes — we test originalCallToolHandler / createOriginalListToolsHandler
 // directly, so the middleware composition isn't exercised here.
 
+import { setAuditRecorderForTesting } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
+  createMiddlewareEnabledHandlers,
   createOriginalCallToolHandler,
   createOriginalListToolsHandler,
+  resetBridgeAuditSchemasForTesting,
 } from "./handlers";
 
 type FakeClient = {
@@ -404,5 +412,197 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
     expect(result.tools[0].name).toBe("autotask__resolve_id");
     const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
     expect(messages.some((m) => m.includes("DEGRADED"))).toBe(false);
+  });
+});
+
+describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () => {
+  // n8n posts to <namespace>/api/<tool> and never reads openapi.json in the
+  // same breath, so before this the bridge recorded counts only for every
+  // call. The bridge now lists for its own audit after the call.
+  const backendTools = (properties: Record<string, object>) => ({
+    tools: [{ name: "search", inputSchema: { type: "object", properties } }],
+  });
+  const answer: CallToolResult = { content: [{ type: "text", text: "found" }] };
+
+  function backend(
+    listing: () => Promise<unknown>,
+  ): ReturnType<typeof makeFakeSession> {
+    return makeFakeSession(
+      vi.fn(async (req: { method: string }) =>
+        req.method === "tools/list" ? listing() : answer,
+      ),
+    );
+  }
+
+  const callThroughBridge = (namespace: string, args: unknown) => {
+    const { callToolWithMiddleware, handlerContext } =
+      createMiddlewareEnabledHandlers(`openapi_${namespace}`, namespace, "n8n");
+    return callToolWithMiddleware(
+      {
+        method: "tools/call",
+        params: {
+          name: "autotask__search",
+          arguments: args as Record<string, unknown>,
+        },
+      },
+      handlerContext,
+    );
+  };
+
+  let recorder: ReturnType<typeof vi.fn<(entry: any) => Promise<void>>>;
+  beforeEach(() => {
+    resetBridgeAuditSchemasForTesting();
+    invalidateServerConnectionMock.mockReset();
+    getSessionMock.mockReset();
+    loggerErrorMock.mockReset();
+    loggerWarnMock.mockReset();
+    recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+  });
+  afterEach(() => {
+    setAuditRecorderForTesting(null);
+  });
+
+  it("stores the declared keys and the enum selector value, never a caller-chosen key", async () => {
+    getSessionMock.mockResolvedValue(
+      backend(async () =>
+        backendTools({ mode: { enum: ["list"] }, q: {}, limit: {} }),
+      ),
+    );
+
+    const result = await callThroughBridge("ns-a", {
+      mode: "list",
+      q: "printer",
+      Alice_Smith: 1,
+    });
+
+    expect(result).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0]).toMatchObject({
+      session_id: "openapi_ns-a",
+      client_name: "n8n",
+      success: true,
+      args_shape: {
+        keys: ["mode", "q"],
+        sel: { mode: "list" },
+        unknown_keys: 1,
+      },
+    });
+    expect(JSON.stringify(recorder.mock.calls[0][0].args_shape)).not.toContain(
+      "Alice_Smith",
+    );
+  });
+
+  it("a failed bridge listing keeps the count-only shape, the call succeeds, and no DEGRADED line is logged", async () => {
+    getSessionMock.mockResolvedValue(
+      backend(async () => {
+        throw new Error("listing unavailable");
+      }),
+    );
+
+    const result = await callThroughBridge("ns-a", { mode: "list", q: "x" });
+
+    expect(result).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 2,
+    });
+    expect(loggerErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("an audit listing's lost session cannot invalidate concurrent calls' connections", async () => {
+    getSessionMock.mockResolvedValue(
+      backend(async () => {
+        throw new Error(sessionLostEnvelope);
+      }),
+    );
+
+    expect(await callThroughBridge("ns-a", { mode: "list" })).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+
+  it("a failed audit session acquisition emits one warning and preserves the call", async () => {
+    getSessionMock
+      .mockResolvedValueOnce(backend(async () => backendTools({ q: {} })))
+      .mockRejectedValueOnce(new Error("session acquisition unavailable"));
+
+    expect(await callThroughBridge("ns-a", { q: "x" })).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+    expect(loggerErrorMock).not.toHaveBeenCalled();
+    expect(loggerWarnMock).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("could not list 1 server(s) (autotask)"),
+    );
+  });
+
+  it("a failed listing of the routing winner cannot verify keys from a colliding server", async () => {
+    const first = backend(async () => {
+      throw new Error("listing unavailable");
+    });
+    const second = backend(async () => backendTools({ Alice_Smith: {} }));
+    fakeServerParams["server-autotask-2"] = { name: "autotask!" };
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-autotask-2" ? second : first,
+    );
+
+    try {
+      expect(await callThroughBridge("ns-a", { Alice_Smith: 1 })).toBe(answer);
+      await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+      expect(recorder.mock.calls[0][0].args_shape).toEqual({
+        keys: [],
+        unverified_keys: 1,
+      });
+    } finally {
+      delete fakeServerParams["server-autotask-2"];
+    }
+  });
+
+  it("each namespace's bridge session keeps its own snapshot, and a namespace lists once per interval", async () => {
+    const first = backend(async () =>
+      backendTools({ mode: { enum: ["list"] }, q: {} }),
+    );
+    const second = backend(async () =>
+      backendTools({ mode: { enum: ["Alice_Smith"] }, Alice_Smith: {} }),
+    );
+    getSessionMock.mockImplementation(async (sessionId: string) =>
+      sessionId === "openapi_ns-a" ? first : second,
+    );
+    const args = { mode: "Alice_Smith", Alice_Smith: 1, q: "x" };
+
+    await callThroughBridge("ns-a", args);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    await callThroughBridge("ns-b", args);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(2));
+    await callThroughBridge("ns-a", { mode: "list" });
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(3));
+
+    const shapes = recorder.mock.calls.map((c) => c[0].args_shape);
+    expect(shapes[0]).toEqual({
+      keys: ["mode", "q"],
+      sel: { mode: "?" },
+      unknown_keys: 1,
+    });
+    expect(shapes[1]).toEqual({
+      keys: ["Alice_Smith", "mode"],
+      sel: { mode: "Alice_Smith" },
+      unknown_keys: 1,
+    });
+    expect(shapes[2]).toEqual({ keys: ["mode"], sel: { mode: "list" } });
+    const listingsOn = (session: ReturnType<typeof backend>) =>
+      session.client.request.mock.calls.filter(
+        ([req]) => (req as { method: string }).method === "tools/list",
+      ).length;
+    expect(listingsOn(first)).toBe(1);
+    expect(listingsOn(second)).toBe(1);
   });
 });

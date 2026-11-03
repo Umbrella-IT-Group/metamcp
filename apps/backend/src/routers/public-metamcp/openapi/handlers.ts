@@ -40,13 +40,30 @@ import {
   recoverFailedSession,
   SessionRecoveries,
 } from "../../../lib/metamcp/session-recovery";
+import {
+  AuditSchemaRefresher,
+  ToolArgSchemaRegistry,
+  unambiguousAuditTools,
+} from "../../../lib/metamcp/tool-arg-keys";
 import { routeUnmappedToolCall } from "../../../lib/metamcp/tool-call-routing";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
 // Original List Tools Handler (adapted from metamcp-proxy.ts)
+//
+// `audit`: the listing runs for the bridge's own audit (tool-arg-keys.ts,
+// AuditSchemaRefresher), not for an openapi.json reader. Same servers, same
+// backend listing, same middleware. It never invalidates backend connections:
+// a delayed audit failure must not interrupt calls or retire their recovered
+// sessions. Failures produce one WARN instead of per-server ERROR lines and
+// the DEGRADED line, because no reader was served this listing.
 export const createOriginalListToolsHandler = (
   includeInactiveServers: boolean = false,
+  { audit = false }: { audit?: boolean } = {},
 ): ListToolsHandler => {
+  // Failure lines for a served listing only (see `audit` above).
+  const reportFailure = (...line: unknown[]) => {
+    if (!audit) logger.error(...line);
+  };
   return async (request, context) => {
     const serverParams = await getMcpServers(
       context.namespaceUuid,
@@ -61,8 +78,17 @@ export const createOriginalListToolsHandler = (
     // "DEGRADED for namespace".
     const failedServers: string[] = [];
     const allServerEntries = Object.entries(serverParams);
+    const auditServerPrefixes = new Map<string, string | undefined>();
+    if (audit) {
+      for (const [uuid, params] of allServerEntries) {
+        auditServerPrefixes.set(
+          uuid,
+          params.name ? sanitizeName(params.name) : undefined,
+        );
+      }
+    }
 
-    await Promise.allSettled(
+    const listingOutcomes = await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
         const session = await mcpServerPool.getSession(
           context.sessionId,
@@ -71,7 +97,7 @@ export const createOriginalListToolsHandler = (
           context.namespaceUuid,
         );
         if (!session) {
-          logger.error(
+          reportFailure(
             `OpenAPI bridge: No session for server ${params.name || mcpServerUuid} (${mcpServerUuid}) during tools/list — pool returned null (ERROR-gated, at cap, or connect failed); server excluded from namespace response`,
           );
           failedServers.push(params.name || mcpServerUuid);
@@ -84,11 +110,14 @@ export const createOriginalListToolsHandler = (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+        if (audit) {
+          auditServerPrefixes.set(mcpServerUuid, sanitizeName(serverName));
+        }
 
         // This prefix must round-trip through the first-'__' call parser,
         // otherwise curation would judge a different server and backend name.
         if (sanitizeName(serverName).includes("__")) {
-          logger.error(
+          reportFailure(
             `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
           );
           failedServers.push(serverName || mcpServerUuid);
@@ -123,7 +152,7 @@ export const createOriginalListToolsHandler = (
           try {
             result = await listOnce(activeSession);
           } catch (error) {
-            if (!isRecoverableBackendError(error)) {
+            if (audit || !isRecoverableBackendError(error)) {
               throw error;
             }
             // Regression mirror — the OpenAPI tools/list
@@ -168,11 +197,31 @@ export const createOriginalListToolsHandler = (
 
           allTools.push(...toolsWithSource);
         } catch (error) {
-          logger.error(`Error fetching tools from: ${serverName}`, error);
+          reportFailure(`Error fetching tools from: ${serverName}`, error);
           failedServers.push(serverName || mcpServerUuid);
         }
       }),
     );
+
+    if (audit) {
+      // Acquiring a session and reading capabilities/configuration happen
+      // before the backend-request catch. They can reject too; do not let
+      // allSettled turn those failures into a silently empty audit snapshot.
+      for (const [index, [uuid, params]] of allServerEntries.entries()) {
+        if (listingOutcomes[index]?.status === "rejected") {
+          failedServers.push(params.name || uuid);
+        }
+      }
+      // Worded without the words the log-based panels count as failures.
+      if (failedServers.length > 0) {
+        logger.warn(
+          `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
+        );
+      }
+      return {
+        tools: unambiguousAuditTools(allTools, auditServerPrefixes.values()),
+      };
+    }
 
     if (failedServers.length > 0) {
       // Same log shape as metamcp-proxy.ts so the Grafana alert rule
@@ -199,6 +248,71 @@ const recoveriesFor = (sessionId: string): SessionRecoveries => {
     openApiRecoveries.set(sessionId, recoveries);
   }
   return recoveries;
+};
+
+// The bridge's audit schema snapshot, per bridge session id. The bridge is the
+// routing instance here: one `openapi_<namespace uuid>` session shared by every
+// consumer of the namespace, routing by prefix with no per-consumer state, and
+// its listing (the openapi.json chain) depends on the namespace alone. So one
+// snapshot per bridge session is the per-proxy snapshot tool-arg-keys.ts
+// requires, never a name map shared across namespaces. It must outlive the
+// per-request handlers, like `openApiRecoveries`. Before this the bridge
+// passed no schema source and every bridge row (all of n8n's) stored counts
+// only. Nothing on the bridge sends list_changed, so the snapshot's age is
+// bounded by the refresher (AUDIT_SNAPSHOT_MAX_AGE_MS).
+interface BridgeAuditSchemas {
+  registry: ToolArgSchemaRegistry;
+  refresher: AuditSchemaRefresher;
+}
+// One entry per namespace the bridge has served; capped so a long-lived
+// process cannot grow it without bound (the oldest entry is dropped).
+const MAX_BRIDGE_AUDIT_SESSIONS = 256;
+const bridgeAuditSchemas = new Map<string, BridgeAuditSchemas>();
+
+const bridgeAuditSchemasFor = (
+  sessionId: string,
+  namespaceUuid: string,
+): BridgeAuditSchemas => {
+  const existing = bridgeAuditSchemas.get(sessionId);
+  if (existing) return existing;
+  const registry = new ToolArgSchemaRegistry();
+  // The openapi.json chain, with the audit flag on the inner handler.
+  const listTools = compose(
+    createToolOverridesListToolsMiddleware({ cacheEnabled: true }),
+    createFilterListToolsMiddleware({ cacheEnabled: true }),
+  )(createOriginalListToolsHandler(false, { audit: true }));
+  const refresher = new AuditSchemaRefresher(registry, {
+    list: async () =>
+      (
+        await listTools(
+          { method: "tools/list", params: {} },
+          { namespaceUuid, sessionId },
+        )
+      ).tools,
+    // Nothing on the bridge invalidates a listing while it runs.
+    generation: () => 0,
+    onFailure: (failure) => {
+      // The reason stays at debug: an SDK failure's text carries words the
+      // log-based panels count, and the call path reports the backends.
+      logger.warn(
+        `OpenAPI bridge: audit listing for namespace ${namespaceUuid} did not complete; calls it would describe keep the count-only args_shape`,
+      );
+      logger.debug("OpenAPI bridge audit listing failure detail:", failure);
+    },
+  });
+  const created = { registry, refresher };
+  bridgeAuditSchemas.set(sessionId, created);
+  while (bridgeAuditSchemas.size > MAX_BRIDGE_AUDIT_SESSIONS) {
+    const oldest = bridgeAuditSchemas.keys().next().value;
+    if (oldest === undefined) break;
+    bridgeAuditSchemas.delete(oldest);
+  }
+  return created;
+};
+
+/** Test seam: forget every bridge audit snapshot and its listing interval. */
+export const resetBridgeAuditSchemasForTesting = (): void => {
+  bridgeAuditSchemas.clear();
 };
 
 // Original Call Tool Handler (adapted from metamcp-proxy.ts)
@@ -407,6 +521,7 @@ export const createMiddlewareEnabledHandlers = (
   // Create original handlers
   const originalListToolsHandler = createOriginalListToolsHandler();
   const originalCallToolHandler = createOriginalCallToolHandler();
+  const auditSchemas = bridgeAuditSchemasFor(sessionId, namespaceUuid);
 
   // Compose middleware with handlers
   const listToolsWithMiddleware = compose(
@@ -429,7 +544,13 @@ export const createMiddlewareEnabledHandlers = (
     // consumers are not recorded". Both entry points reach the same backend
     // servers with the same credentials, so both have to be recorded the same
     // way for retention on this table to mean anything.
-    createAuditingMiddleware(),
+    //
+    // A name the bridge holds no schema for is shaped after the call from the
+    // bridge's own listing (bridgeAuditSchemasFor); the call is untouched.
+    createAuditingMiddleware(
+      (name) => auditSchemas.registry.get(name),
+      (name) => auditSchemas.refresher.resolve(name),
+    ),
     // Second, outside the filter, as in the Streamable-HTTP chain: a call that
     // already failed as an unknown tool gets the retired-tool map's answer.
     // The bridge routes by server prefix only, so a retired name on a live
