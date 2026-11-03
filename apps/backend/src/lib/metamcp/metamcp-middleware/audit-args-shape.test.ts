@@ -11,6 +11,7 @@ import {
   MAX_TOOLS,
   schemaFromInputSchema,
   ToolArgSchemaRegistry,
+  unambiguousAuditTools,
 } from "../tool-arg-keys";
 import {
   argsShapeEnabled,
@@ -598,6 +599,22 @@ describe("snapshotArgsForShape: a shape built later equals the entry shape", () 
       ticket: null,
       action: null,
     });
+  });
+});
+
+describe("tool-arg-keys: audit listing source identities", () => {
+  const tools = [{ name: "a__t" }, { name: "b__t" }];
+
+  it("excludes a colliding prefix even when only one backend returned tools", () => {
+    expect(unambiguousAuditTools(tools, ["a", "a", "b"])).toEqual([
+      { name: "b__t" },
+    ]);
+  });
+
+  it("an unresolved backend prefix cannot be ruled out as a collision", () => {
+    expect(unambiguousAuditTools(tools, ["a", undefined])).toEqual([]);
+    // Once the acquired backend identifies itself, distinct prefixes work.
+    expect(unambiguousAuditTools(tools, ["a", "b"])).toEqual(tools);
   });
 });
 

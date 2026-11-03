@@ -53,19 +53,24 @@ vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn().mockImplementation(async () => fakeServerParams),
 }));
 
-const { invalidateServerConnectionMock, getSessionMock, loggerErrorMock } =
-  vi.hoisted(() => ({
-    invalidateServerConnectionMock: vi.fn(),
-    getSessionMock: vi.fn(),
-    loggerErrorMock: vi.fn(),
-  }));
+const {
+  invalidateServerConnectionMock,
+  getSessionMock,
+  loggerErrorMock,
+  loggerWarnMock,
+} = vi.hoisted(() => ({
+  invalidateServerConnectionMock: vi.fn(),
+  getSessionMock: vi.fn(),
+  loggerErrorMock: vi.fn(),
+  loggerWarnMock: vi.fn(),
+}));
 
 // Real logger writes to console; mock it so the DEGRADED-tripwire
 // tests can assert on the emitted lines.
 vi.mock("@/utils/logger", () => ({
   default: {
     error: loggerErrorMock,
-    warn: vi.fn(),
+    warn: loggerWarnMock,
     info: vi.fn(),
     debug: vi.fn(),
   },
@@ -447,8 +452,10 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
   let recorder: ReturnType<typeof vi.fn<(entry: any) => Promise<void>>>;
   beforeEach(() => {
     resetBridgeAuditSchemasForTesting();
+    invalidateServerConnectionMock.mockReset();
     getSessionMock.mockReset();
     loggerErrorMock.mockReset();
+    loggerWarnMock.mockReset();
     recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
   });
@@ -502,6 +509,62 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
       unverified_keys: 2,
     });
     expect(loggerErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("an audit listing's lost session cannot invalidate concurrent calls' connections", async () => {
+    getSessionMock.mockResolvedValue(
+      backend(async () => {
+        throw new Error(sessionLostEnvelope);
+      }),
+    );
+
+    expect(await callThroughBridge("ns-a", { mode: "list" })).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+
+  it("a failed audit session acquisition emits one warning and preserves the call", async () => {
+    getSessionMock
+      .mockResolvedValueOnce(backend(async () => backendTools({ q: {} })))
+      .mockRejectedValueOnce(new Error("session acquisition unavailable"));
+
+    expect(await callThroughBridge("ns-a", { q: "x" })).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+    expect(loggerErrorMock).not.toHaveBeenCalled();
+    expect(loggerWarnMock).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("could not list 1 server(s) (autotask)"),
+    );
+  });
+
+  it("a failed listing of the routing winner cannot verify keys from a colliding server", async () => {
+    const first = backend(async () => {
+      throw new Error("listing unavailable");
+    });
+    const second = backend(async () => backendTools({ Alice_Smith: {} }));
+    fakeServerParams["server-autotask-2"] = { name: "autotask!" };
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-autotask-2" ? second : first,
+    );
+
+    try {
+      expect(await callThroughBridge("ns-a", { Alice_Smith: 1 })).toBe(answer);
+      await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+      expect(recorder.mock.calls[0][0].args_shape).toEqual({
+        keys: [],
+        unverified_keys: 1,
+      });
+    } finally {
+      delete fakeServerParams["server-autotask-2"];
+    }
   });
 
   it("each namespace's bridge session keeps its own snapshot, and a namespace lists once per interval", async () => {

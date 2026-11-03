@@ -67,7 +67,11 @@ import {
   isToolCallReplaySafeError,
 } from "./session-error";
 import { recoverFailedSession, SessionRecoveries } from "./session-recovery";
-import { AuditSchemaRefresher, ToolArgSchemaRegistry } from "./tool-arg-keys";
+import {
+  AuditSchemaRefresher,
+  ToolArgSchemaRegistry,
+  unambiguousAuditTools,
+} from "./tool-arg-keys";
 import {
   PrefixCandidate,
   ProbeOutcome,
@@ -364,9 +368,7 @@ export const createServer = async (
   // running when the session ends cannot re-create pooled backend sessions
   // under the dead session id. Re-running cleanup afterwards instead would be
   // unsafe: lazy recovery can rebuild a session with the same id.
-  const auditListingPool: RecoverySessionPool = {
-    invalidateServerConnection: (sid, serverUuid) =>
-      mcpServerPool.invalidateServerConnection(sid, serverUuid),
+  const auditListingPool: Pick<RecoverySessionPool, "getSession"> = {
     getSession: async (sid, serverUuid, params, ns) =>
       proxyClosed
         ? undefined
@@ -380,7 +382,7 @@ export const createServer = async (
   ) => {
     // See AUDIT_LISTING: same chain, none of the client-facing side effects.
     const audit = (context as ListingContext)[AUDIT_LISTING] === true;
-    const pool: RecoverySessionPool = audit ? auditListingPool : mcpServerPool;
+    const pool = audit ? auditListingPool : mcpServerPool;
     logger.debug(
       "[DEBUG-TOOLS] 🔍 tools/list called for namespace:",
       namespaceUuid,
@@ -398,10 +400,12 @@ export const createServer = async (
         includeInactiveServers,
       );
     } catch (error) {
-      logger.error(
-        `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
-        error,
-      );
+      if (!audit) {
+        logger.error(
+          `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
+          error,
+        );
+      }
       throw new McpError(
         ErrorCode.InternalError,
         "tools/list could not read this namespace's servers: no tools were listed, which is not the same as an empty tool list. Retry shortly.",
@@ -416,6 +420,18 @@ export const createServer = async (
     // The routable servers, the same set getMcpServers answers: the only ones
     // this listing connects to, warms or keeps routes for.
     const serverParams = listing.routable;
+    const auditServerPrefixes = new Map<string, string | undefined>();
+    if (audit) {
+      for (const [uuid, params] of Object.entries({
+        ...listing.errorGated,
+        ...serverParams,
+      })) {
+        auditServerPrefixes.set(
+          uuid,
+          params.name ? sanitizeName(params.name) : undefined,
+        );
+      }
+    }
     // A live proxy outlasts namespace edits. Drop removed owners before the
     // collision guard so a same-named replacement can list its own tools.
     // Routing state belongs to client listings; an audit listing leaves it.
@@ -593,6 +609,9 @@ export const createServer = async (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+        if (audit) {
+          auditServerPrefixes.set(mcpServerUuid, sanitizeName(serverName));
+        }
 
         // The first '__' separates the server from the backend tool. A stored
         // server name containing it cannot round-trip and could borrow an
@@ -647,21 +666,27 @@ export const createServer = async (
           // it a dead pooled session is never evicted from here and the
           // namespace serves 0 tools as "success" until a manual restart.
           let activeSession = session;
-          const allServerTools = await requestWithSessionRecovery({
-            pool,
-            sessionId: context.sessionId,
-            serverUuid: mcpServerUuid,
-            params,
-            namespaceUuid,
-            operation: "tools/list",
-            serverName,
-            session,
-            attempt: fetchAllToolPages,
-            onFreshSession: (fresh) => {
-              if (!audit) registerListChangedSubscriber(fresh, mcpServerUuid);
-              activeSession = fresh;
-            },
-          });
+          const allServerTools = audit
+            ? // A background audit must not retire pooled connections or
+              // notify other clients. A late failure may belong to an old
+              // session after a live call has already recovered its backend.
+              // Leave recovery to client-facing paths and keep counts here.
+              await fetchAllToolPages(session)
+            : await requestWithSessionRecovery({
+                pool: mcpServerPool,
+                sessionId: context.sessionId,
+                serverUuid: mcpServerUuid,
+                params,
+                namespaceUuid,
+                operation: "tools/list",
+                serverName,
+                session,
+                attempt: fetchAllToolPages,
+                onFreshSession: (fresh) => {
+                  registerListChangedSubscriber(fresh, mcpServerUuid);
+                  activeSession = fresh;
+                },
+              });
 
           logger.debug(
             `[DEBUG-TOOLS] ⏱️  Fetched ${allServerTools.length} tools from ${serverName} in ${(performance.now() - toolFetchStart).toFixed(2)}ms`,
@@ -818,7 +843,9 @@ export const createServer = async (
           `Audit listing for session ${sessionId} in namespace ${namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
         );
       }
-      return { tools: allTools };
+      return {
+        tools: unambiguousAuditTools(allTools, auditServerPrefixes.values()),
+      };
     }
     settleOwedServers(
       mountedServerUuids,

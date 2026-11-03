@@ -218,6 +218,30 @@ export const MAX_CONCURRENT_AUDIT_LISTINGS = 4;
 /** How long a snapshot an audit listing took is trusted. */
 export const AUDIT_SNAPSHOT_MAX_AGE_MS = 10 * 60_000;
 
+/**
+ * An audit has no authority to choose a routing winner. Counting duplicate
+ * tool names alone is insufficient: if one of two prefix-matched servers
+ * cannot list, the other's schema must not describe a call to the missing
+ * winner. Exclude every ambiguous mounted prefix, even if only one lists.
+ * An unresolved backend-reported prefix could collide with any listed one,
+ * so it leaves the entire snapshot unknown. Callers fill such prefixes from
+ * the acquired backend's version before passing them here.
+ */
+export function unambiguousAuditTools<T extends { name: string }>(
+  tools: ReadonlyArray<T>,
+  mountedPrefixes: Iterable<string | undefined>,
+): T[] {
+  const owners = new Map<string, number>();
+  for (const prefix of mountedPrefixes) {
+    if (prefix === undefined) return [];
+    owners.set(prefix, (owners.get(prefix) ?? 0) + 1);
+  }
+  return tools.filter((tool) => {
+    const separator = tool.name.indexOf("__");
+    return separator >= 0 && owners.get(tool.name.slice(0, separator)) === 1;
+  });
+}
+
 // Process-wide, because the storm this bounds is many instances missing at
 // once (every lazily recovered session after a gateway restart, or a burst of
 // short sessions), each of which would fan a listing out to every backend.

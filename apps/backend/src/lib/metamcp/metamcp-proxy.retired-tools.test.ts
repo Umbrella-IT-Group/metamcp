@@ -810,6 +810,8 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     const target = await backend();
     getSessionMock.mockResolvedValue(target.session);
     listings.mockRejectedValueOnce(new Error("namespace read failed"));
+    vi.mocked(logger.error).mockClear();
+    vi.mocked(logger.warn).mockClear();
 
     const result = await call(await connectConsumer(), REAL_TOOL, {
       mode: "list",
@@ -825,6 +827,10 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     });
     expect(listings).toHaveBeenCalledTimes(1);
     expect(target.executions()).toBe(1);
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("Audit listing for session sess-1"),
+    );
   });
 
   it("(4) concurrent misses on one proxy share one listing, and the calls do not wait for it", async () => {
@@ -929,6 +935,39 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     }
   });
 
+  it("a failed listing of the routing winner cannot verify keys from a colliding server", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const first = await backend(async () => {
+      // Dynamic routing reached this backend and the call succeeded, but
+      // its subsequent audit listing fails. Only its competitor lists.
+      vi.spyOn(first.session.client, "request").mockRejectedValueOnce(
+        new Error("listing unavailable"),
+      );
+      return real;
+    });
+    const second = await backend();
+    second.setTools(declaring({ Alice_Smith: {} }));
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-ninja-2": { name: "ninja!" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-ninja-2" ? second.session : first.session,
+    );
+
+    try {
+      await call(await connectConsumer(), REAL_TOOL, { Alice_Smith: 1 });
+      const [row] = await rowsAfter(recorder, 1);
+      expect(first.executions()).toBe(1);
+      expect(second.executions()).toBe(0);
+      expect(row.args_shape).toEqual({ keys: [], unverified_keys: 1 });
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
   it("a second miss inside the interval does not list again", async () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
@@ -945,6 +984,39 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     expect(rows[1].args_shape).toEqual({ keys: [], unverified_keys: 1 });
     expect(listings).toHaveBeenCalledTimes(1);
   });
+
+  it.each([false, true])(
+    "an audit listing cannot invalidate backend connections (proxy closed: %s)",
+    async (closeProxy) => {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      let failListing!: (error: Error) => void;
+      const pendingListing = new Promise<never>((_resolve, reject) => {
+        failListing = reject;
+      });
+      const target = await backend(async () => {
+        // The call's routing probe has finished. Hold only the subsequent
+        // audit listing, which can outlive this proxy and its backend client.
+        vi.spyOn(target.session.client, "request").mockReturnValueOnce(
+          pendingListing,
+        );
+        return real;
+      });
+      getSessionMock.mockResolvedValue(target.session);
+      const { consumer, cleanup } = await connectWithCleanup();
+
+      expect(
+        (await call(consumer, REAL_TOOL, { mode: "list" })).content,
+      ).toEqual(real.content);
+      await vi.waitFor(() => expect(listings).toHaveBeenCalledTimes(1));
+      if (closeProxy) await cleanup();
+      failListing(new Error("Not connected"));
+
+      const [row] = await rowsAfter(recorder, 1);
+      expect(invalidateServerConnectionMock).not.toHaveBeenCalled();
+      expect(row.args_shape).toEqual({ keys: [], unverified_keys: 1 });
+    },
+  );
 
   it("the audit listing attaches no list_changed subscriber and sends the client nothing", async () => {
     const recorder = vi.fn().mockResolvedValue(undefined);

@@ -43,6 +43,7 @@ import {
 import {
   AuditSchemaRefresher,
   ToolArgSchemaRegistry,
+  unambiguousAuditTools,
 } from "../../../lib/metamcp/tool-arg-keys";
 import { routeUnmappedToolCall } from "../../../lib/metamcp/tool-call-routing";
 import { sanitizeName } from "../../../lib/metamcp/utils";
@@ -51,9 +52,10 @@ import { sanitizeName } from "../../../lib/metamcp/utils";
 //
 // `audit`: the listing runs for the bridge's own audit (tool-arg-keys.ts,
 // AuditSchemaRefresher), not for an openapi.json reader. Same servers, same
-// backend listing, same middleware; only its failure lines differ: one WARN
-// instead of per-server ERROR lines and the DEGRADED line, because no reader
-// was served this listing and the call path already reports those backends.
+// backend listing, same middleware. It never invalidates backend connections:
+// a delayed audit failure must not interrupt calls or retire their recovered
+// sessions. Failures produce one WARN instead of per-server ERROR lines and
+// the DEGRADED line, because no reader was served this listing.
 export const createOriginalListToolsHandler = (
   includeInactiveServers: boolean = false,
   { audit = false }: { audit?: boolean } = {},
@@ -76,8 +78,17 @@ export const createOriginalListToolsHandler = (
     // "DEGRADED for namespace".
     const failedServers: string[] = [];
     const allServerEntries = Object.entries(serverParams);
+    const auditServerPrefixes = new Map<string, string | undefined>();
+    if (audit) {
+      for (const [uuid, params] of allServerEntries) {
+        auditServerPrefixes.set(
+          uuid,
+          params.name ? sanitizeName(params.name) : undefined,
+        );
+      }
+    }
 
-    await Promise.allSettled(
+    const listingOutcomes = await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
         const session = await mcpServerPool.getSession(
           context.sessionId,
@@ -99,6 +110,9 @@ export const createOriginalListToolsHandler = (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+        if (audit) {
+          auditServerPrefixes.set(mcpServerUuid, sanitizeName(serverName));
+        }
 
         // This prefix must round-trip through the first-'__' call parser,
         // otherwise curation would judge a different server and backend name.
@@ -138,7 +152,7 @@ export const createOriginalListToolsHandler = (
           try {
             result = await listOnce(activeSession);
           } catch (error) {
-            if (!isRecoverableBackendError(error)) {
+            if (audit || !isRecoverableBackendError(error)) {
               throw error;
             }
             // Regression mirror — the OpenAPI tools/list
@@ -190,13 +204,23 @@ export const createOriginalListToolsHandler = (
     );
 
     if (audit) {
+      // Acquiring a session and reading capabilities/configuration happen
+      // before the backend-request catch. They can reject too; do not let
+      // allSettled turn those failures into a silently empty audit snapshot.
+      for (const [index, [uuid, params]] of allServerEntries.entries()) {
+        if (listingOutcomes[index]?.status === "rejected") {
+          failedServers.push(params.name || uuid);
+        }
+      }
       // Worded without the words the log-based panels count as failures.
       if (failedServers.length > 0) {
         logger.warn(
           `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
         );
       }
-      return { tools: allTools };
+      return {
+        tools: unambiguousAuditTools(allTools, auditServerPrefixes.values()),
+      };
     }
 
     if (failedServers.length > 0) {
