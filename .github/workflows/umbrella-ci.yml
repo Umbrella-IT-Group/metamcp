@@ -30,6 +30,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job declares its own permissions; this default
+# covers any job added later without a block.
+permissions:
+  contents: read
+
 jobs:
   test-and-typecheck:
     runs-on: ubuntu-latest
