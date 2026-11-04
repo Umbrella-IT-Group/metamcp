@@ -34,6 +34,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Least privilege: every job declares its own permissions; this default
+# covers any job added later without a block.
+permissions:
+  contents: read
+
 jobs:
   build-and-push:
     if: inputs.confirm_overwrite_latest == 'yes'
