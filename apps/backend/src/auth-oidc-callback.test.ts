@@ -13,24 +13,26 @@
  *  3. the authorization request carries a PKCE S256 challenge and a nonce,
  *     and its state is single-use and bound to the initiating browser;
  *  4. the code exchange sends the same redirect URI and the PKCE verifier;
- *  5. the id_token is verified against discovery (issuer, JWKS, `aud`) and
- *     must echo the nonce, with an Entra-shaped JWKS whose keys carry no
- *     `alg` member (true of the live tenant JWKS, checked 2026-10-28);
+ *  5. the id_token is verified against discovery (issuer, JWKS, `aud`), must
+ *     echo the nonce and, from 1.7.12, must carry `exp` and `iat`, with an
+ *     Entra-shaped JWKS whose keys carry no `alg` member (true of the live
+ *     tenant JWKS, checked 2026-10-28);
  *  6. the account key is the token's `sub`, the key 1.6 stored, so existing
- *     `accounts` rows keep matching;
+ *     `accounts` rows keep matching, and from 1.7.16 a userinfo profile
+ *     fetched for a token without `email` must name that same `sub`;
  *  7. the drizzle schema passes the init-time check 1.7.3 added, which fails
  *     every auth request on a mismatch;
  *  8. a bare id_token posted to `/sign-in/social` or `/link-social` is refused
  *     the way 1.6.23 refused it (our `hooks.before`), while the redirect flow
  *     and the callback are untouched, including alternate body encodings
  *     and URL spellings;
- *  9. the two 1.7.8 fixes the version pin exists for: 30 s of clock tolerance
+ *  9. the two 1.7.8 fixes every later pin keeps: 30 s of clock tolerance
  *     on the id_token, and a discovery retry after a failed boot fetch.
  *
  * Harness as in auth-basic-auth-disabled.test.ts: configService, the users
  * repo, audit and logger are mocked and `db/index` is a stub. The flow's few
  * internal-adapter calls are spied on the live auth context, and a fetch stub
- * plays Entra's discovery, JWKS and token endpoints.
+ * plays Entra's discovery, JWKS, token and userinfo endpoints.
  */
 
 import { createHash, generateKeyPairSync, KeyObject, sign } from "node:crypto";
@@ -152,12 +154,18 @@ function entraIdTokenClaims(nonce: string): Record<string, unknown> {
   };
 }
 
-// Network stub standing in for login.microsoftonline.com.
+const USERINFO_URL = DISCOVERY.userinfo_endpoint;
+
+// Network stub standing in for login.microsoftonline.com (and Graph's OIDC
+// userinfo endpoint, which discovery names).
 const network = {
   tokenRequests: [] as URLSearchParams[],
   idToken: "",
   // How many discovery fetches to fail before answering (discovery retry).
   discoveryFailures: 0,
+  // The userinfo response; null answers 404, as an unexpected request would.
+  userinfo: null as Record<string, unknown> | null,
+  userinfoRequests: [] as (string | null)[],
 };
 
 vi.stubGlobal(
@@ -187,6 +195,12 @@ vi.stubGlobal(
         id_token: network.idToken,
       });
     }
+    if (url === USERINFO_URL && network.userinfo) {
+      network.userinfoRequests.push(
+        new Headers(init?.headers).get("authorization"),
+      );
+      return Response.json(network.userinfo);
+    }
     return new Response(`unexpected request in test: ${url}`, { status: 404 });
   }),
 );
@@ -196,6 +210,8 @@ afterEach(() => {
   network.tokenRequests = [];
   network.idToken = "";
   network.discoveryFailures = 0;
+  network.userinfo = null;
+  network.userinfoRequests = [];
 });
 
 afterAll(() => {
@@ -435,6 +451,24 @@ describe("OIDC sign-in round trip", () => {
           exp: Math.floor(Date.now() / 1000) - 60,
         }),
     ],
+    // 1.7.12 (upstream #11919, #11935) requires iss, sub, aud, exp and iat on
+    // every id_token; 1.7.8 checked exp and iat only when present.
+    [
+      "omits exp",
+      (nonce: string) => {
+        const claims = entraIdTokenClaims(nonce);
+        delete claims.exp;
+        return signIdToken(claims);
+      },
+    ],
+    [
+      "omits iat",
+      (nonce: string) => {
+        const claims = entraIdTokenClaims(nonce);
+        delete claims.iat;
+        return signIdToken(claims);
+      },
+    ],
   ])("refuses an id_token that %s", async (_label, makeToken) => {
     const { auth, adapter, state, stored, stateCookie } = await startSignIn();
     network.idToken = makeToken(stored.idTokenNonce ?? "");
@@ -668,7 +702,7 @@ describe("bare id_token sign-in: refused, as better-auth 1.6.23 refused it", () 
   });
 });
 
-describe("the 1.7.8 fixes the version pin exists for", () => {
+describe("the 1.7.8 fixes every later pin keeps", () => {
   it("accepts an id_token whose nbf is a few seconds ahead of this host's clock", async () => {
     // Upstream #11749. 1.7.7 had no clock tolerance, so a host clock lagging
     // Entra's by more than the round trip failed every sign-in.
@@ -705,5 +739,78 @@ describe("the 1.7.8 fixes the version pin exists for", () => {
     const { authorize } = await startSignIn();
     expect(`${authorize.origin}${authorize.pathname}`).toBe(AUTHORIZE_URL);
     expect(authorize.searchParams.get("redirect_uri")).toBe(CALLBACK_URI);
+  });
+});
+
+describe("1.7.16: the profile is bound to the id_token subject", () => {
+  // Upstream #12198 (GHSA-9hm7-xhfp-cx58). When the id_token carries no
+  // `email`, the generic provider fetches the profile from the discovery
+  // userinfo endpoint with the access token. 1.7.8 took that profile as it
+  // came and keyed the account on its `sub`; from 1.7.16 a profile whose
+  // `sub` differs from the verified id_token's is refused. Entra documents
+  // the userinfo values as the ID token's own, so a real tenant answers with
+  // the same `sub` and keeps working.
+  function idTokenWithoutEmail(nonce: string): string {
+    const claims = entraIdTokenClaims(nonce);
+    delete claims.email;
+    return signIdToken(claims);
+  }
+
+  it("keys the account on sub when the userinfo profile names the same subject", async () => {
+    const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+    network.idToken = idTokenWithoutEmail(stored.idTokenNonce ?? "");
+    network.userinfo = { sub: SUBJECT, email: "test.user@example.com" };
+    const ownerLookup = vi
+      .spyOn(adapter, "findAccountOwnerByKey")
+      .mockRejectedValue(new Error("stop after identity resolution") as never);
+
+    await auth.handler(callbackRequest(state, stateCookie));
+
+    expect(network.userinfoRequests).toEqual(["Bearer entra-access-token"]);
+    expect(ownerLookup).toHaveBeenCalledWith({
+      providerId: "oidc",
+      accountId: SUBJECT,
+    });
+  });
+
+  it("refuses a userinfo profile for a different subject", async () => {
+    const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+    network.idToken = idTokenWithoutEmail(stored.idTokenNonce ?? "");
+    network.userinfo = {
+      sub: "entra-pairwise-subject-0002",
+      email: "someone.else@example.com",
+    };
+    const ownerLookup = vi.spyOn(adapter, "findAccountOwnerByKey");
+
+    const res = await auth.handler(callbackRequest(state, stateCookie));
+
+    expect(network.userinfoRequests).toHaveLength(1);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toContain(
+      "error=unable_to_get_user_info",
+    );
+    expect(ownerLookup).not.toHaveBeenCalled();
+  });
+
+  it("never fetches userinfo when the id_token carries the email", async () => {
+    const { auth, adapter, state, stored, stateCookie } = await startSignIn();
+    network.idToken = signIdToken(
+      entraIdTokenClaims(stored.idTokenNonce ?? ""),
+    );
+    network.userinfo = {
+      sub: "entra-pairwise-subject-0002",
+      email: "someone.else@example.com",
+    };
+    const ownerLookup = vi
+      .spyOn(adapter, "findAccountOwnerByKey")
+      .mockRejectedValue(new Error("stop after identity resolution") as never);
+
+    await auth.handler(callbackRequest(state, stateCookie));
+
+    expect(network.userinfoRequests).toHaveLength(0);
+    expect(ownerLookup).toHaveBeenCalledWith({
+      providerId: "oidc",
+      accountId: SUBJECT,
+    });
   });
 });

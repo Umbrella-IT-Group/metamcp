@@ -53,7 +53,7 @@ if (!process.env.APP_URL) {
 const BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET;
 const BETTER_AUTH_URL = process.env.APP_URL;
 
-// The credential paths better-auth 1.7.8 registers for email/password auth,
+// The credential paths better-auth 1.7.17 registers for email/password auth,
 // as they appear in `ctx.path` (the endpoint path with the `/api/auth` base
 // already stripped). `/reset-password` is matched by prefix so the
 // `/reset-password/:token` callback endpoint is covered by the same rule.
@@ -76,13 +76,13 @@ const isBasicAuthCredentialPath = (path: string): boolean =>
 // Enforce the DISABLE_BASIC_AUTH setting on the credential paths.
 //
 // WHY A HOOK, NOT A `middleware` OPTION. better-auth's options type has no
-// top-level `middleware` field (true of 1.6.23 and of 1.7.8): an array passed
-// there is silently dropped, so the previous wiring never ran and a stored
-// DISABLE_BASIC_AUTH=true still let password sign-in through. `hooks.before`
-// is the request middleware this version documents and actually consumes: its
-// dispatcher reads `options.hooks.before` and registers it with
-// `matcher: () => true`, so it runs ahead of every endpoint and the path match
-// belongs here in the handler.
+// top-level `middleware` field (true of 1.6.23 and of 1.7.8 to 1.7.17): an
+// array passed there is silently dropped, so the previous wiring never ran
+// and a stored DISABLE_BASIC_AUTH=true still let password sign-in through.
+// `hooks.before` is the request middleware this version documents and
+// actually consumes: its dispatcher reads `options.hooks.before` and
+// registers it with `matcher: () => true`, so it runs ahead of every endpoint
+// and the path match belongs here in the handler.
 //
 // The flag is read LIVE per request: it is DB-backed and toggled from Settings
 // at runtime, so a flip must take effect on the next request with no restart.
@@ -165,7 +165,7 @@ const oidcProviders: GenericOAuthConfig[] = [];
 // Add OIDC provider if configured
 //
 // Under better-auth 1.7 the generic OAuth plugin registers this provider as a
-// core social provider, which changes four things an operator can see:
+// core social provider, which changes five things an operator can see:
 //
 //  - The redirect URI is `${APP_URL}/api/auth/callback/<providerId>`, built by
 //    the core `/sign-in/social` and `/callback/:id` endpoints. The 1.6 plugin
@@ -180,10 +180,16 @@ const oidcProviders: GenericOAuthConfig[] = [];
 //  - Because discovery publishes `jwks_uri`, the id_token is verified against
 //    the discovery issuer, the JWKS and `aud` = clientId, and must echo the
 //    `nonce` the sign-in request sent, with 30 s of clock tolerance (1.7.8;
-//    1.7.7 had none, so a host clock lagging the IdP's failed sign-in).
+//    1.7.7 had none, so a host clock lagging the IdP's failed sign-in). From
+//    1.7.12 it must also carry `exp` and `iat`.
 //  - For the same reason better-auth would sign a user in from a bare id_token
 //    posted to `/sign-in/social` (1.6 answered ID_TOKEN_NOT_SUPPORTED).
 //    `refuseBareIdToken` above restores the 1.6 answer.
+//  - The profile comes from the verified id_token when it carries `email`,
+//    otherwise from the discovery `userinfo_endpoint` with the access token.
+//    From 1.7.16 a userinfo profile whose `sub` differs from the id_token's
+//    fails the sign-in (`unable_to_get_user_info`). Entra documents its
+//    userinfo values as the ID token's own, so the tenant passes this check.
 if (process.env.OIDC_CLIENT_ID && process.env.OIDC_CLIENT_SECRET) {
   const oidcConfig: GenericOAuthConfig = {
     providerId: process.env.OIDC_PROVIDER_ID || "oidc",
@@ -352,7 +358,7 @@ export const auth = betterAuth({
   },
   advanced: {
     // Host-only session cookie. With crossSubDomainCookies enabled,
-    // better-auth 1.7.8 sets the cookie Domain to the APP_URL hostname, so the
+    // better-auth 1.7.17 sets the cookie Domain to the APP_URL hostname, so the
     // authenticated session cookie is sent to that host AND every subdomain of
     // it. The frontend proxies the backend on localhost within one container
     // (apps/frontend/next.config.js rewrites all of /api/auth, /trpc and
@@ -493,7 +499,7 @@ export const auth = betterAuth({
 
       delete: {
         // Fires once per deleted row for single deletes (sign-out) and for
-        // bulk deletes alike, verified against better-auth 1.7.8's
+        // bulk deletes alike, verified against better-auth 1.7.17's
         // `deleteWithHooks` / `deleteManyWithHooks`, which loop the `after`
         // hook over every entity they removed.
         //
@@ -512,7 +518,7 @@ export const auth = betterAuth({
   },
   // Enforce DISABLE_BASIC_AUTH on the credential paths and refuse a bare
   // id_token on /sign-in/social and /link-social. `hooks.before` is the request
-  // middleware better-auth 1.7.8 actually runs; the removed top-level
+  // middleware better-auth 1.7.17 actually runs; the removed top-level
   // `middleware` array was never a supported option and did nothing.
   hooks: {
     before: authBeforeHook,
