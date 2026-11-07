@@ -37,6 +37,18 @@ vi.mock("../../../db/schema", () => ({}));
 // Heavy-import stubs — `handlers.ts` pulls in the full mcpServerPool
 // + config service + fetch-metamcp chain. Stub them so the test runs
 // in <1s without a postgres or live backend.
+// A pass-through spy: the tests read whether an audit cause was built at all.
+vi.mock("../../../lib/metamcp/audit-listing-log", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../../../lib/metamcp/audit-listing-log")
+    >();
+  return {
+    ...actual,
+    describeListingFailure: vi.fn(actual.describeListingFailure),
+  };
+});
+
 vi.mock("../../../lib/config.service", () => ({
   configService: {
     getMcpResetTimeoutOnProgress: vi.fn().mockResolvedValue(true),
@@ -111,6 +123,7 @@ vi.mock(
 // directly, so the middleware composition isn't exercised here.
 
 import { configService } from "../../../lib/config.service";
+import { describeListingFailure } from "../../../lib/metamcp/audit-listing-log";
 import { setAuditRecorderForTesting } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
   createMiddlewareEnabledHandlers,
@@ -484,6 +497,44 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
     });
   });
 
+  it("never builds an audit cause for a client-facing listing", async () => {
+    // Four failures on the client-facing path: the pool answers null, the
+    // acquisition rejects, a config read rejects, and the backend request
+    // throws. Each site's cause is lazy, so none reaches the formatter an
+    // audit listing pays for (it is the one that scrubs and bounds a message).
+    const spy = vi.mocked(describeListingFailure);
+    spy.mockClear();
+    const handler = createOriginalListToolsHandler();
+    const list = () =>
+      handler(
+        { method: "tools/list", params: {} },
+        { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+      );
+
+    getSessionMock.mockResolvedValue(null);
+    await list();
+    getSessionMock.mockRejectedValue(new Error("pool refused"));
+    await list();
+    getSessionMock.mockResolvedValue(
+      makeFakeSession(vi.fn().mockResolvedValue({ tools: [] })),
+    );
+    vi.mocked(configService.getMcpTimeout).mockRejectedValueOnce(
+      new Error("config store unreachable"),
+    );
+    await list();
+    getSessionMock.mockResolvedValue(
+      makeFakeSession(vi.fn().mockRejectedValue(new Error("boom"))),
+    );
+    await list();
+
+    const degraded = loggerErrorMock.mock.calls.filter((c) =>
+      String(c[0]).includes("DEGRADED"),
+    );
+    expect(degraded).toHaveLength(4);
+    expect(spy).not.toHaveBeenCalled();
+    expect(loggerInfoMock).not.toHaveBeenCalled();
+  });
+
   it("stays silent when every backend answers", async () => {
     const healthy = makeFakeSession(
       vi.fn().mockResolvedValue({
@@ -555,6 +606,7 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
     loggerErrorMock.mockReset();
     loggerWarnMock.mockReset();
     loggerInfoMock.mockReset();
+    vi.mocked(describeListingFailure).mockClear();
     recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
   });
@@ -613,6 +665,7 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
     expect(auditCauses()).toEqual([
       "OpenAPI bridge: audit listing for namespace ns-a did not list server autotask: Err*: listing unavailable",
     ]);
+    expect(describeListingFailure).toHaveBeenCalledTimes(1);
     expect(auditCauses()[0]).not.toMatch(PANEL_WORDS);
   });
 

@@ -61,6 +61,15 @@ vi.mock("@/utils/logger", () => ({
   default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
+// A pass-through spy: the tests read whether an audit cause was built at all.
+vi.mock("./audit-listing-log", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./audit-listing-log")>();
+  return {
+    ...actual,
+    describeListingFailure: vi.fn(actual.describeListingFailure),
+  };
+});
+
 vi.mock("../../db", () => ({ db: {} }));
 vi.mock("../../db/schema", () => ({}));
 vi.mock("../../db/repositories/namespaces.repo", () => ({
@@ -182,6 +191,7 @@ vi.mock("./tool-call-warmup", () => ({
 
 import logger from "@/utils/logger";
 
+import { describeListingFailure } from "./audit-listing-log";
 import { getMcpServers, getNamespaceListingServers } from "./fetch-metamcp";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { createServer } from "./metamcp-proxy";
@@ -1261,6 +1271,122 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     }
   });
 
+  it("reports a closed session as a cause only when the proxy knew it was closed", async () => {
+    // The pool answers nothing for its own reasons (here a gate), and the
+    // session closes while that acquisition is in flight. The line says what
+    // the pool said and notes the session state beside it. It must not claim
+    // the closure was the cause, or the #233 re-measure would count every
+    // pool refusal that coincided with a close as the closed-session path.
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ninja = await backend();
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-down": { name: "down" },
+    } as never);
+    const release = holdNextListing();
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let gateArmed = false;
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        if (serverUuid !== "server-down") return ninja.session;
+        if (gateArmed) await gate;
+        return undefined;
+      },
+    );
+    const { consumer, cleanup } = await connectWithCleanup();
+    vi.mocked(logger.info).mockClear();
+
+    try {
+      await call(consumer, REAL_TOOL, { mode: "list" });
+      // The call's own acquisitions are done; the listing is still held at
+      // its namespace read, so only its acquisitions meet the gate.
+      await vi.waitFor(() => expect(listings).toHaveBeenCalledTimes(1));
+      gateArmed = true;
+      const before = getSessionMock.mock.calls.length;
+      release();
+      await vi.waitFor(() =>
+        expect(getSessionMock.mock.calls.length).toBeGreaterThan(before + 1),
+      );
+      await cleanup();
+      openGate();
+      await rowsAfter(recorder, 1);
+      const lines = causesOf(
+        vi.mocked(logger.info).mock.calls.map(([l]) => String(l)),
+      ).filter((line) => line.includes("server down:"));
+      expect(lines).toEqual([
+        "Audit listing for session sess-1 in namespace ns-1 did not list server down: the pool returned no session (server gated, at the connection cap, or backend unreachable) (the session was closed when this was logged)",
+      ]);
+      expect(lines[0]).not.toContain("had closed before");
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("a client listing never builds an audit cause", async () => {
+    // Three failures on the client-facing path: the pool answers nothing, the
+    // acquisition rejects, and the backend request throws. Each site's cause
+    // is lazy, so none of them reaches the formatter that an audit listing
+    // pays for.
+    const spy = vi.mocked(describeListingFailure);
+    const ninja = await backend();
+    const request = ninja.session.client.request.bind(ninja.session.client);
+    vi.spyOn(ninja.session.client, "request").mockImplementation(((
+      req: { method: string },
+      ...rest: unknown[]
+    ) =>
+      req.method === "tools/list"
+        ? Promise.reject(new Error("listing refused"))
+        : (request as (...args: unknown[]) => Promise<unknown>)(
+            req,
+            ...rest,
+          )) as never);
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-empty": { name: "empty" },
+      "server-throws": { name: "throws" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        if (serverUuid === "server-empty") return undefined;
+        if (serverUuid === "server-throws") throw new Error("pool refused");
+        return ninja.session;
+      },
+    );
+    spy.mockClear();
+    vi.mocked(logger.info).mockClear();
+    vi.mocked(logger.error).mockClear();
+
+    try {
+      // Nothing lists, so the proxy answers a retryable error; that is fine.
+      await list(await connectConsumer()).catch(() => undefined);
+      // The client path did log its own failures, so the sites were reached.
+      const errors = vi
+        .mocked(logger.error)
+        .mock.calls.map(([line]) => String(line));
+      expect(
+        errors.some((line) => line.startsWith("Error fetching tools from")),
+      ).toBe(true);
+      expect(
+        errors.some((line) =>
+          line.startsWith("Error preparing tools listing for"),
+        ),
+      ).toBe(true);
+      expect(errors.some((line) => line.includes("no session available"))).toBe(
+        true,
+      );
+      expect(spy).not.toHaveBeenCalled();
+      expect(
+        causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
+      ).toEqual([]);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
   it("a client listing writes no audit cause line", async () => {
     const ninja = await backend();
     servers.mockResolvedValue({
@@ -1305,7 +1431,7 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     expect(
       causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
     ).toEqual([
-      "Audit listing for session sess-1 in namespace ns-1 did not list server ninja: the session closed before the listing acquired a backend session",
+      "Audit listing for session sess-1 in namespace ns-1 did not list server ninja: the session had closed before the listing asked the pool for a backend session",
     ]);
   });
 

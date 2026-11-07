@@ -76,11 +76,12 @@ export const createOriginalListToolsHandler = (
     );
     // An audit listing's cause for each server it could not list, one INFO
     // line each (audit-listing-log.ts). The WARN below names the servers;
-    // this says why.
-    const noteAuditSkip = (server: string, cause: string) => {
+    // this says why. The cause is a function so a client-facing listing, which
+    // discards it, never builds it.
+    const noteAuditSkip = (server: string, cause: () => string) => {
       if (audit) {
         logger.info(
-          `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} did not list server ${server}: ${cause}`,
+          `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} did not list server ${server}: ${cause()}`,
         );
       }
     };
@@ -115,7 +116,7 @@ export const createOriginalListToolsHandler = (
           reportFailure(
             `OpenAPI bridge: No session for server ${params.name || mcpServerUuid} (${mcpServerUuid}) during tools/list — pool returned null (ERROR-gated, at cap, or connect failed); server excluded from namespace response`,
           );
-          noteAuditSkip(params.name || mcpServerUuid, NO_SESSION_CAUSE);
+          noteAuditSkip(params.name || mcpServerUuid, () => NO_SESSION_CAUSE);
           failedServers.push(params.name || mcpServerUuid);
           return;
         }
@@ -136,7 +137,7 @@ export const createOriginalListToolsHandler = (
           reportFailure(
             `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
           );
-          noteAuditSkip(serverName || mcpServerUuid, SEPARATOR_CAUSE);
+          noteAuditSkip(serverName || mcpServerUuid, () => SEPARATOR_CAUSE);
           failedServers.push(serverName || mcpServerUuid);
           return;
         }
@@ -215,8 +216,7 @@ export const createOriginalListToolsHandler = (
           allTools.push(...toolsWithSource);
         } catch (error) {
           reportFailure(`Error fetching tools from: ${serverName}`, error);
-          noteAuditSkip(
-            serverName || mcpServerUuid,
+          noteAuditSkip(serverName || mcpServerUuid, () =>
             describeListingFailure(error),
           );
           failedServers.push(serverName || mcpServerUuid);
@@ -238,7 +238,7 @@ export const createOriginalListToolsHandler = (
         `Error preparing tools listing for: ${name}`,
         outcome.reason,
       );
-      noteAuditSkip(name, describeListingFailure(outcome.reason));
+      noteAuditSkip(name, () => describeListingFailure(outcome.reason));
       failedServers.push(name);
     }
 
