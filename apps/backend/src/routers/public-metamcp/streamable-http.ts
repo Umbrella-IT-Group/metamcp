@@ -1777,10 +1777,10 @@ function adapterWouldBuildRequest(req: express.Request): boolean {
  * `initialize` on it, and the stdio binding names `-32601` as the usual
  * legacy answer. The TypeScript (2.4.0), Python, Go and Rust (rmcp 3.9.0)
  * SDK clients and Claude Code 2.1.319's bundled client all fall back on it
- * (source read 2026-11-07). The SDK's
- * generic "Server not initialized" did the same job, but says nothing about
- * the method; this answer is the true one, and its own log line separates the
- * probes from requests that really lost their session.
+ * (source read 2026-11-07). The SDK's generic "Server not initialized" did
+ * the same job, but says nothing about the method; this answer is the true
+ * one, and its own log line separates the probes from requests that really
+ * lost their session.
  *
  * WHY NOT A DiscoverResult LISTING THE LEGACY VERSIONS, or an
  * UnsupportedProtocolVersionError (-32022) whose `supported` list holds only
@@ -1789,8 +1789,9 @@ function adapterWouldBuildRequest(req: express.Request): boolean {
  * "retry using the advertised supported versions ... rather than falling
  * back", Streamable HTTP Backward Compatibility). The Rust SDK's client
  * (rmcp 3.9.0, `discover_startup`) follows that and fails the connect with
- * `NoCompatibleProtocolVersion` on either one, where today it falls back. A
- * reply that some clients read as modern can break every connector at once.
+ * `NoCompatibleProtocolVersion` on either one, where it falls back on a
+ * -32601 or on the SDK's generic 400. A reply that some clients read as
+ * modern can break every connector at once.
  *
  * WHY 400, NOT 404. Revision 2025-11-25, the one this gateway serves, says a
  * server that requires a session SHOULD answer a session-less request other
