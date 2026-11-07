@@ -179,6 +179,25 @@ const INVALID_JSON = {
   error: { code: -32700, message: "Parse error: Invalid JSON" },
   id: null,
 };
+/**
+ * The answer to a session-less `server/discover`: the method is not found,
+ * and the message names the versions the SDK negotiates through initialize.
+ */
+const discoverNotFound = (id: string | number) => ({
+  jsonrpc: "2.0",
+  id,
+  error: {
+    code: -32601,
+    message:
+      "Method not found: server/discover. This server speaks MCP 2025-11-25, " +
+      "2025-06-18, 2025-03-26, 2024-11-05, 2024-10-07 and opens a session with initialize.",
+  },
+});
+/** The headers a revision 2026-07-28 client puts on its discover probe. */
+const MODERN_PROBE_HEADERS = {
+  "mcp-protocol-version": "2026-07-28",
+  "mcp-method": "server/discover",
+};
 const ONLY_ONE_INITIALIZE = {
   jsonrpc: "2.0",
   error: {
@@ -282,6 +301,29 @@ const rpc = (method: string, extra: Record<string, unknown> = {}) => ({
   id: (rpcId += 1),
   method,
   ...extra,
+});
+
+/**
+ * The era probe a revision 2026-07-28 client opens with (the shape the
+ * TypeScript SDK v2 client and Claude Code send): `server/discover` with the
+ * per-request `_meta` envelope.
+ */
+const discoverProbe = (
+  id: string | number = `server-discover-probe-${(rpcId += 1)}`,
+) => ({
+  jsonrpc: "2.0",
+  id,
+  method: "server/discover",
+  params: {
+    _meta: {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": {
+        name: "claude-code",
+        version: "2.1.319",
+      },
+      "io.modelcontextprotocol/clientCapabilities": {},
+    },
+  },
 });
 
 /**
@@ -967,6 +1009,155 @@ describe("a session-less request that cannot open a session", () => {
       agent.destroy();
     }
   });
+
+  /** The one line a discover probe is logged with. */
+  const discoverLine = (version: string) =>
+    "Public endpoint ep-1: answered server/discover as a session-era server " +
+    `(HTTP 400, JSON-RPC -32601) without opening a session; Mcp-Protocol-Version: ${version}.`;
+
+  it.each([
+    [
+      "the live probe (Mcp-Protocol-Version 2026-07-28)",
+      MODERN_PROBE_HEADERS,
+      "2026-07-28",
+    ],
+    ["no Mcp-Protocol-Version", {}, "absent"],
+    [
+      "Mcp-Protocol-Version 2025-11-25",
+      { "mcp-protocol-version": "2025-11-25" },
+      "2025-11-25",
+    ],
+  ])(
+    "answers server/discover with %s as method-not-found, with its id, and allocates nothing",
+    async (_label, headers, logged) => {
+      const residentBefore = residentSessions();
+      const beginTracking = vi.spyOn(publicSessionSweeper, "beginTracking");
+      const probe = discoverProbe("do-not-log-this-id");
+      probe.params._meta["io.modelcontextprotocol/clientInfo"].name =
+        "do-not-log-this-client";
+
+      try {
+        const response = await postWithout(JSON.stringify(probe), headers);
+
+        expect(response.status).toBe(400);
+        expect(response.headers.get("content-type")).toBe("application/json");
+        expect(response.headers.get("mcp-session-id")).toBeNull();
+        expect(await response.json()).toEqual(
+          discoverNotFound("do-not-log-this-id"),
+        );
+        await settle();
+        expectNothingAllocated(residentBefore);
+        expect(beginTracking).not.toHaveBeenCalled();
+        // Answered by the route: no transport, connected or not, was built.
+        expect(handleRequest).not.toHaveBeenCalled();
+        const lines = answeredLines();
+        expect(lines).toEqual([discoverLine(logged)]);
+        expect(lines[0]).not.toContain("do-not-log-this");
+        expect(lines[0]).not.toContain(rawKey);
+      } finally {
+        beginTracking.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    ["a numeric id", 7],
+    ["the id 0", 0],
+    ["an empty string id", ""],
+  ])("echoes %s in the discover answer", async (_label, id) => {
+    const response = await postWithout(
+      JSON.stringify(discoverProbe(id)),
+      MODERN_PROBE_HEADERS,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(discoverNotFound(id));
+  });
+
+  it.each([
+    [
+      "a tools/list carrying the 2026-07-28 headers",
+      () => rpc("tools/list"),
+      "tools/list",
+    ],
+    [
+      "a batch holding only server/discover",
+      () => [discoverProbe()],
+      "batch of 1: server/discover",
+    ],
+    [
+      "a batch holding server/discover and tools/list",
+      () => [discoverProbe(), rpc("tools/list")],
+      "batch of 2: server/discover, tools/list",
+    ],
+    [
+      "server/discover sent as a notification",
+      () => {
+        const { id: _id, ...notification } = discoverProbe();
+        return notification;
+      },
+      "server/discover",
+    ],
+  ])("keeps the transport's 400 for %s", async (_label, message, logged) => {
+    const residentBefore = residentSessions();
+    const body = message();
+
+    const response = await postWithout(
+      JSON.stringify(body),
+      MODERN_PROBE_HEADERS,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(NOT_INITIALIZED);
+    await settle();
+    expectNothingAllocated(residentBefore);
+    expect(handleRequest).toHaveBeenCalledTimes(1);
+    expect(handleRequest.mock.calls[0]?.[2]).toEqual(body);
+    expect(answeredLines()).toEqual([
+      `Public endpoint ep-1: answered a POST without an Mcp-Session-Id (HTTP 400) without opening a session; methods: ${logged}; Mcp-Protocol-Version: 2026-07-28.`,
+    ]);
+  });
+
+  it("lets a 2026-07-28 client fall back to initialize on the same connection", async () => {
+    // What a dual-era client does with the answer: probe, read a legacy
+    // server, then the 2025 handshake on the connection it already holds.
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      const probe = discoverProbe();
+      const discovered = await rawPost(
+        agent,
+        JSON.stringify(probe),
+        MODERN_PROBE_HEADERS,
+      );
+      expect(discovered.status).toBe(400);
+      expect(JSON.parse(discovered.body)).toEqual(discoverNotFound(probe.id));
+
+      const initialized = await rawPost(
+        agent,
+        JSON.stringify(
+          rpc("initialize", {
+            params: {
+              protocolVersion: "2025-11-25",
+              capabilities: {},
+              clientInfo: { name: "claude-code", version: "2.1.319" },
+            },
+          }),
+        ),
+      );
+      expect(initialized.status).toBe(200);
+      expect(initialized.reused).toBe(true);
+      const sessionId = initialized.sessionId ?? "";
+      expect(sessionId).not.toBe("");
+      expect(h.getServer).toHaveBeenCalledTimes(1);
+
+      const ping = await post(pingBody(1024), sessionId);
+      expect(ping.status).toBe(200);
+      expect(await resultOf(ping)).toEqual({});
+      await cleanupSession(sessionId);
+    } finally {
+      agent.destroy();
+    }
+  });
 });
 
 /** One POST over a node:http agent, reporting whether it reused a socket. */
@@ -1105,6 +1296,21 @@ describe("a session-less POST gets the SDK transport's own answer", () => {
       headers: { "content-type": ["text/plain", "application/json"] },
       status: 415,
     },
+    // The discover answer is written by the route, not through the adapter,
+    // so the adapter's own refusals must still come first.
+    {
+      label: "the adapter's invalid-Host refusal for a server/discover",
+      body: JSON.stringify(discoverProbe(1)),
+      headers: { host: "invalid host", ...MODERN_PROBE_HEADERS },
+      status: 400,
+    },
+    {
+      label:
+        "the adapter's refusal of a Host with userinfo for a server/discover",
+      body: JSON.stringify(discoverProbe(1)),
+      headers: { host: "user@127.0.0.1", ...MODERN_PROBE_HEADERS },
+      status: 400,
+    },
   ])("keeps $label", async ({ body, headers, status }) => {
     const agent = new http.Agent({ keepAlive: true });
     const answer = (response: Awaited<ReturnType<typeof rawPost>>) => ({
@@ -1220,6 +1426,59 @@ describe("a session-less POST gets the SDK transport's own answer", () => {
       body: () => chunked(pingBody(LIMIT + 1)),
       status: 413,
     },
+    // Every server/discover the route does not answer itself gets the SDK's
+    // answer: malformed, refused on its headers, batched or a notification.
+    {
+      label: "a server/discover with a member JSON-RPC does not define",
+      body: () => JSON.stringify({ ...discoverProbe(), extra: true }),
+      headers: MODERN_PROBE_HEADERS,
+      status: 400,
+    },
+    {
+      label: "a server/discover with jsonrpc 1.0",
+      body: () => JSON.stringify({ ...discoverProbe(), jsonrpc: "1.0" }),
+      headers: MODERN_PROBE_HEADERS,
+      status: 400,
+    },
+    {
+      label: "a server/discover whose id is an object",
+      body: () => JSON.stringify(discoverProbe({ n: 1 } as never)),
+      headers: MODERN_PROBE_HEADERS,
+      status: 400,
+    },
+    {
+      label: "a server/discover with an Accept without text/event-stream",
+      body: () => JSON.stringify(discoverProbe()),
+      headers: { ...MODERN_PROBE_HEADERS, accept: "application/json" },
+      status: 406,
+    },
+    {
+      label: "a server/discover with a Content-Type that is not JSON",
+      body: () => JSON.stringify(discoverProbe()),
+      headers: { ...MODERN_PROBE_HEADERS, "content-type": "text/plain" },
+      status: 415,
+    },
+    {
+      label: "a server/discover in a batch",
+      body: () => JSON.stringify([discoverProbe()]),
+      headers: MODERN_PROBE_HEADERS,
+      status: 400,
+    },
+    {
+      label: "a server/discover notification",
+      body: () => {
+        const { id: _id, ...notification } = discoverProbe();
+        return JSON.stringify(notification);
+      },
+      headers: MODERN_PROBE_HEADERS,
+      status: 400,
+    },
+    {
+      label: "a server/discover over the limit without a Content-Length",
+      body: () => chunked(paddedRequest("server/discover", {}, LIMIT + 1)),
+      headers: MODERN_PROBE_HEADERS,
+      status: 413,
+    },
   ])("$label", async ({ body, headers, status }) => {
     const route = await answerOf(await postWithout(body(), headers));
     const sdk = await answerOf(
@@ -1229,5 +1488,31 @@ describe("a session-less POST gets the SDK transport's own answer", () => {
     expect(route).toEqual(sdk);
     expect(route.status).toBe(status);
     expect(route.headers.map(([name]) => name)).not.toContain("mcp-session-id");
+  });
+
+  it("answers the live server/discover probe with the SDK's status and headers, and its own body", async () => {
+    // The one answer the route writes itself. Only the body may differ from
+    // the SDK's "Server not initialized": same status, same headers (the
+    // content length aside, which follows the body).
+    const probe = JSON.stringify(discoverProbe("server-discover-probe-1"));
+    const route = await answerOf(
+      await postWithout(probe, MODERN_PROBE_HEADERS),
+    );
+    const sdk = await answerOf(
+      await postWithout(probe, MODERN_PROBE_HEADERS, referenceUrl),
+    );
+    const withoutLength = (headers: [string, string][]) =>
+      headers.filter(([name]) => name !== "content-length");
+
+    expect(route.status).toBe(400);
+    expect(sdk.status).toBe(400);
+    expect(withoutLength(route.headers)).toEqual(withoutLength(sdk.headers));
+    expect(JSON.parse(sdk.body)).toEqual(NOT_INITIALIZED);
+    expect(JSON.parse(route.body)).toEqual(
+      discoverNotFound("server-discover-probe-1"),
+    );
+    expect(route.headers.find(([name]) => name === "content-length")?.[1]).toBe(
+      String(Buffer.byteLength(route.body)),
+    );
   });
 });

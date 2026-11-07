@@ -4,8 +4,12 @@ import { MAX_BATCH_SIZE } from "@modelcontextprotocol/sdk/server/requestBody.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isJsonContentType } from "@modelcontextprotocol/sdk/shared/mediaType.js";
 import {
+  ErrorCode,
   isInitializeRequest,
+  isJSONRPCRequest,
   JSONRPCMessageSchema,
+  type RequestId,
+  SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
@@ -1514,6 +1518,9 @@ type SessionlessPostPreread =
  * failure got a 500; both now get the transport's 400, the answer every
  * other non-initialize request gets. Neither could ever have opened a
  * session.
+ *
+ * ONE ANSWER IS THE GATEWAY'S OWN: `server/discover`, the era probe of MCP
+ * revision 2026-07-28 (see `answerDiscoverAsLegacy` for why this reply).
  */
 async function prereadSessionlessPost(
   req: express.Request,
@@ -1556,6 +1563,12 @@ async function prereadSessionlessPost(
 
   if (mayInitialize(body)) {
     return { answered: false, parsedBody: body };
+  }
+  const discover = discoverRequest(body);
+  if (discover && adapterWouldBuildRequest(req)) {
+    answerDiscoverAsLegacy(res, discover.id);
+    logAnsweredDiscover(req, endpointName, res.statusCode);
+    return { answered: true };
   }
   await answerWithoutSession(req, res, body);
   logAnsweredWithoutSession(
@@ -1696,6 +1709,119 @@ async function answerWithoutSession(
   await transport.handleRequest(req, res, parsedBody);
 }
 
+/** The method MCP revision 2026-07-28 clients probe a server's era with. */
+const DISCOVER_METHOD = "server/discover";
+
+/**
+ * The reply's message names the versions this gateway negotiates, the SDK's
+ * own list that `Server` answers `initialize` from, so a client that can only
+ * surface the message still tells its user what to use.
+ */
+const DISCOVER_NOT_FOUND_MESSAGE =
+  `Method not found: ${DISCOVER_METHOD}. This server speaks MCP ` +
+  `${SUPPORTED_PROTOCOL_VERSIONS.join(", ")} and opens a session with initialize.`;
+
+/**
+ * The id of the body when it is a single `server/discover` request, parsed
+ * with the schema `handlePostRequest` parses messages with. Anything else
+ * keeps the transport's own answer: a batch (revision 2026-07-28 sends none),
+ * a notification, or a message the SDK would refuse as malformed.
+ */
+function discoverRequest(body: unknown): { id: RequestId } | undefined {
+  if (Array.isArray(body)) return undefined;
+  const parsed = JSONRPCMessageSchema.safeParse(body);
+  if (!parsed.success || !isJSONRPCRequest(parsed.data)) return undefined;
+  return parsed.data.method === DISCOVER_METHOD
+    ? { id: parsed.data.id }
+    : undefined;
+}
+
+/**
+ * Whether the SDK transport's HTTP adapter (`@hono/node-server`, `newRequest`)
+ * would build a request from this one. It refuses one whose absolute target
+ * does not parse, or whose Host header is missing or does not make a URL with
+ * that host name, with a bodiless 400 before the transport reads anything.
+ * The discover answer is written here, not through the adapter, so such a
+ * request is left to the transport to keep that refusal. The route's tests
+ * compare both cases with a bare SDK transport, so an adapter change shows.
+ */
+function adapterWouldBuildRequest(req: express.Request): boolean {
+  const target = req.url ?? "";
+  if (target.startsWith("http://") || target.startsWith("https://")) {
+    return URL.canParse(target);
+  }
+  const host = req.headers.host;
+  if (!host) return false;
+  try {
+    const url = new URL(`http://${host}${target}`);
+    return (
+      url.hostname.length === host.length ||
+      url.hostname === host.replace(/:\d+$/, "")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Answer a session-less `server/discover` with `400 {-32601 Method not
+ * found}` and the request's id, without a transport or a session.
+ *
+ * WHY. Claude Code (2.1.309 and later) opens every HTTP server with this
+ * probe, carrying `MCP-Protocol-Version: 2026-07-28`. The gateway serves only
+ * the session era (SDK 1.32.0 negotiates up to 2025-11-25 through
+ * `initialize`), so the answer has to say "legacy, use initialize", and
+ * nothing else. Specification revision 2026-07-28 makes `server/discover` a
+ * method every modern server MUST implement, so method-not-found on it can
+ * only mean a legacy server: SEP-2575 tells the client to fall back to
+ * `initialize` on it, and the stdio binding names `-32601` as the usual
+ * legacy answer. The TypeScript (2.4.0), Python, Go and Rust (rmcp 3.9.0)
+ * SDK clients and Claude Code 2.1.319's bundled client all fall back on it
+ * (source read 2026-11-07). The SDK's
+ * generic "Server not initialized" did the same job, but says nothing about
+ * the method; this answer is the true one, and its own log line separates the
+ * probes from requests that really lost their session.
+ *
+ * WHY NOT A DiscoverResult LISTING THE LEGACY VERSIONS, or an
+ * UnsupportedProtocolVersionError (-32022) whose `supported` list holds only
+ * them. The specification reads both as a modern server ("the server is
+ * modern ... Do not fall back to initialize", stdio Backward Compatibility;
+ * "retry using the advertised supported versions ... rather than falling
+ * back", Streamable HTTP Backward Compatibility). The Rust SDK's client
+ * (rmcp 3.9.0, `discover_startup`) follows that and fails the connect with
+ * `NoCompatibleProtocolVersion` on either one, where today it falls back. A
+ * reply that some clients read as modern can break every connector at once.
+ *
+ * WHY 400, NOT 404. Revision 2025-11-25, the one this gateway serves, says a
+ * server that requires a session SHOULD answer a session-less request other
+ * than `initialize` with 400, the status these probes have always had. 404
+ * with -32601 is the 2026-07-28 answer for an unknown method on a modern
+ * server, and a 4xx is where every client's fallback is most lenient (a 2xx
+ * reply the TypeScript client cannot use is a connect error, not a fallback).
+ *
+ * WHAT IT DOES NOT SAVE. The probe is itself the extra round trip; no reply
+ * removes it. Claude Code 2.1.319 remembers era verdicts for stdio and
+ * claude.ai-proxied servers, not for a plain HTTP server like this one, so it
+ * probes on every connect whatever the answer.
+ */
+function answerDiscoverAsLegacy(res: express.Response, id: RequestId): void {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: ErrorCode.MethodNotFound,
+      message: DISCOVER_NOT_FOUND_MESSAGE,
+    },
+  });
+  // The headers the SDK's own JSON error answers carry.
+  res.writeHead(400, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
 /** A method name logged as sent; anything else is replaced. */
 const LOGGABLE_METHOD = /^[A-Za-z0-9_$./:-]{1,100}$/;
 /** Distinct method labels named in one line; the rest are counted. */
@@ -1715,18 +1841,40 @@ function logAnsweredWithoutSession(
   status: number,
   what: string,
 ): void {
-  const version = req.headers["mcp-protocol-version"];
-  const versionLabel =
-    version === undefined
-      ? "absent"
-      : typeof version === "string" && /^[A-Za-z0-9.-]{1,32}$/.test(version)
-        ? version
-        : "(unloggable)";
   logger.info(
     `Public endpoint ${endpointName}: answered a POST without an Mcp-Session-Id ` +
       `(HTTP ${status}) without opening a session; ${what}; ` +
-      `Mcp-Protocol-Version: ${versionLabel}.`,
+      `Mcp-Protocol-Version: ${protocolVersionLabel(req)}.`,
   );
+}
+
+/**
+ * The one INFO line for a `server/discover` answered as a legacy server, in
+ * place of the line above: these probes arrive on every client connect, so a
+ * line of their own keeps them apart from requests that really lost or never
+ * had a session. Same rules: no params, ids or credential material.
+ */
+function logAnsweredDiscover(
+  req: express.Request,
+  endpointName: string,
+  status: number,
+): void {
+  logger.info(
+    `Public endpoint ${endpointName}: answered ${DISCOVER_METHOD} as a ` +
+      `session-era server (HTTP ${status}, JSON-RPC ${ErrorCode.MethodNotFound}) ` +
+      `without opening a session; Mcp-Protocol-Version: ` +
+      `${protocolVersionLabel(req)}.`,
+  );
+}
+
+/** The request's `Mcp-Protocol-Version`, only when it looks like a version. */
+function protocolVersionLabel(req: express.Request): string {
+  const version = req.headers["mcp-protocol-version"];
+  return version === undefined
+    ? "absent"
+    : typeof version === "string" && /^[A-Za-z0-9.-]{1,32}$/.test(version)
+      ? version
+      : "(unloggable)";
 }
 
 /** `tools/list`, or `batch of 3: tools/list, ping x2` for a batch. */
