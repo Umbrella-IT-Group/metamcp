@@ -35,6 +35,11 @@ import {
   getDefaultEnvironment,
   resolveEnvVariables,
 } from "../../lib/metamcp/utils";
+import {
+  getVerifiedCallerServerNames,
+  isVerifiedCallerHeaderName,
+  withoutVerifiedCallerHeader,
+} from "../../lib/metamcp/verified-caller";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
 
 // `x-mcp-actor` is best-effort, client-asserted attribution: it names who an
@@ -305,6 +310,31 @@ const NO_REMOTE_SERVER_CONTEXT =
   "Unable to establish who is making this request. Sign in again and retry.";
 
 /**
+ * Refusal for an `x-custom-auth-header` that names the gateway-set identity
+ * header. See getHttpHeaders.
+ */
+const INSPECTOR_RESERVED_HEADER =
+  "X-Umbrella-User-Id is set by the gateway from the signed-in caller and cannot be supplied as a custom header.";
+
+/**
+ * A matched row's stored headers, for merging into an Inspector connection.
+ *
+ * For a backend named in VERIFIED_CALLER_SERVER_NAMES a stored
+ * X-Umbrella-User-Id is dropped: on the pooled path `withVerifiedCaller`
+ * strips it from every request, and the Inspector's direct transports do not
+ * go through that wrapper, so without this the row would supply a fixed
+ * identity here. Every other row's headers are returned exactly as stored.
+ */
+const storedHeadersFor = (
+  server: DatabaseMcpServer | undefined,
+): Record<string, string> => {
+  const stored = server?.headers || {};
+  return server && getVerifiedCallerServerNames().has(server.name)
+    ? withoutVerifiedCallerHeader(stored)
+    : stored;
+};
+
+/**
  * Find the registered `mcp_servers` row that describes a REMOTE (SSE or
  * STREAMABLE_HTTP) destination, SCOPED TO WHAT THE CALLER MAY SEE, or
  * undefined when nothing they can see matches.
@@ -385,6 +415,14 @@ const getHttpHeaders = (
   // If the header "x-custom-auth-header" is present, use its value as the custom header name.
   if (req.headers["x-custom-auth-header"] !== undefined) {
     const customHeaderName = req.headers["x-custom-auth-header"] as string;
+    // X-Umbrella-User-Id is set by the gateway from the verified caller for
+    // the backends that act on it (VERIFIED_CALLER_SERVER_NAMES, and the m365
+    // injection). Copying a caller-chosen value onto it would hand such a
+    // backend someone else's identity, so the Inspector refuses the name
+    // outright, for every destination, rather than drop it silently.
+    if (isVerifiedCallerHeaderName(customHeaderName)) {
+      throw new Error(INSPECTOR_RESERVED_HEADER);
+    }
     const lowerCaseHeaderName = customHeaderName.toLowerCase();
     if (req.headers[lowerCaseHeaderName] !== undefined) {
       const value = req.headers[lowerCaseHeaderName];
@@ -587,7 +625,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
 
     // Merge custom headers from database with passthrough headers from request
     const headers = {
-      ...(matchingServer?.headers || {}),
+      ...storedHeadersFor(matchingServer),
       ...getHttpHeaders(req, transportType),
     };
 
@@ -662,7 +700,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
 
     // Merge custom headers from database with passthrough headers from request
     const headers = {
-      ...(matchingServer?.headers || {}),
+      ...storedHeadersFor(matchingServer),
       ...getHttpHeaders(req, transportType),
     };
 

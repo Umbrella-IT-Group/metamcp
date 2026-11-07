@@ -88,7 +88,8 @@
     "M365_TOKEN_KEK",
     "M365_KEK_ID",
     "M365_SCOPES",
-    "M365_INJECTED_SERVER_NAMES"
+    "M365_INJECTED_SERVER_NAMES",
+    "VERIFIED_CALLER_SERVER_NAMES"
   ],
   // Passed THROUGH to tasks without entering the hash. A secret in
   // `globalEnv` mixes its VALUE into every task's cache key, so each

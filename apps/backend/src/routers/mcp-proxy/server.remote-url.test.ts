@@ -20,7 +20,7 @@
  */
 
 import express from "express";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { loggerInfo } = vi.hoisted(() => ({ loggerInfo: vi.fn() }));
 
@@ -627,5 +627,124 @@ describe("X-MCP-Actor passthrough — best-effort audit attribution", () => {
     );
 
     expect(sseHeaders()["x-not-whitelisted"]).toBeUndefined();
+  });
+});
+
+/**
+ * `X-Umbrella-User-Id` is set by the gateway, from the verified caller, for
+ * the backends named in VERIFIED_CALLER_SERVER_NAMES (`verified-caller.ts`).
+ * The Inspector's `x-custom-auth-header` lets the caller name ANY header to
+ * copy from the request onto the backend connection, so without a refusal it
+ * is a path to hand a backend that trusts this header someone else's id. The
+ * refusal applies whatever the destination: the m365 backend reads the same
+ * header.
+ */
+describe("X-Umbrella-User-Id cannot be supplied through the Inspector", () => {
+  const ORIGINAL_NAMES = process.env.VERIFIED_CALLER_SERVER_NAMES;
+  afterEach(() => {
+    if (ORIGINAL_NAMES === undefined) {
+      delete process.env.VERIFIED_CALLER_SERVER_NAMES;
+    } else {
+      process.env.VERIFIED_CALLER_SERVER_NAMES = ORIGINAL_NAMES;
+    }
+  });
+
+  it.each(["X-Umbrella-User-Id", "x-umbrella-user-id", "X-UMBRELLA-USER-ID"])(
+    "refuses a custom auth header named %s on SSE, and opens nothing",
+    async (name) => {
+      const status = await getSse(
+        { transportType: "SSE", url: "https://mcp.example.com/sse" },
+        CALLER,
+        { "x-custom-auth-header": name, "x-umbrella-user-id": "user-victim" },
+      );
+
+      expect(sseClientConstructions).toEqual([]);
+      expect(status).toBe(500);
+    },
+  );
+
+  it("refuses a custom auth header naming it on STREAMABLE_HTTP, and opens nothing", async () => {
+    const status = await postMcp(
+      { transportType: "STREAMABLE_HTTP", url: "https://mcp.example.com/mcp" },
+      CALLER,
+      {
+        "x-custom-auth-header": "X-Umbrella-User-Id",
+        "x-umbrella-user-id": "user-victim",
+      },
+    );
+
+    expect(streamableClientConstructions).toEqual([]);
+    expect(status).toBe(500);
+  });
+
+  it("refuses it even when the request carries no value for it", async () => {
+    await getSse(
+      { transportType: "SSE", url: "https://mcp.example.com/sse" },
+      CALLER,
+      { "x-custom-auth-header": "X-Umbrella-User-Id" },
+    );
+
+    expect(sseClientConstructions).toEqual([]);
+  });
+
+  it("STILL forwards any other custom auth header", async () => {
+    await getSse(
+      { transportType: "SSE", url: "https://mcp.example.com/sse" },
+      CALLER,
+      { "x-custom-auth-header": "X-Api-Key", "x-api-key": "vendor-key" },
+    );
+
+    expect(sseClientConstructions).toHaveLength(1);
+    expect(sseHeaders()["X-Api-Key"]).toBe("vendor-key");
+  });
+
+  it("drops a value stored on a named backend's row and keeps the rest of the row", async () => {
+    process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
+    findAllAccessibleToUserMock.mockResolvedValue([
+      {
+        uuid: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+        name: "team",
+        type: "STREAMABLE_HTTP",
+        url: "https://team.example.com/mcp",
+        headers: {
+          "X-Umbrella-User-Id": "user-stored",
+          "x-vendor-api-key": "team-key",
+        },
+        user_id: null,
+        error_status: null,
+      },
+    ]);
+
+    await postMcp({
+      transportType: "STREAMABLE_HTTP",
+      url: "https://team.example.com/mcp",
+    });
+
+    expect(streamableClientConstructions).toHaveLength(1);
+    const headers = streamableClientConstructions[0].opts.requestInit.headers;
+    expect(JSON.stringify(headers)).not.toContain("user-stored");
+    expect(headers["x-vendor-api-key"]).toBe("team-key");
+  });
+
+  it("leaves a value stored on a backend that is not named exactly as it was", async () => {
+    process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
+    findAllAccessibleToUserMock.mockResolvedValue([
+      {
+        uuid: "ffffffff-6666-4666-8666-ffffffffffff",
+        name: "other",
+        type: "SSE",
+        url: "https://other.example.com/sse",
+        headers: { "X-Umbrella-User-Id": "user-stored" },
+        user_id: null,
+        error_status: null,
+      },
+    ]);
+
+    await getSse({
+      transportType: "SSE",
+      url: "https://other.example.com/sse",
+    });
+
+    expect(sseHeaders()["X-Umbrella-User-Id"]).toBe("user-stored");
   });
 });
