@@ -37,7 +37,15 @@ import {
   Tool,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import type { ConnectedClient } from "./client";
 import type {
@@ -49,11 +57,13 @@ const {
   getSessionMock,
   invalidateServerConnectionMock,
   findServersMock,
+  auditRepoImports,
   config,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   invalidateServerConnectionMock: vi.fn(),
   findServersMock: vi.fn(),
+  auditRepoImports: { count: 0 },
   config: { mcpTimeoutMs: 5_000, listedAlias: undefined as string | undefined },
 }));
 
@@ -78,6 +88,14 @@ vi.mock("../../db/repositories/namespaces.repo", () => ({
 vi.mock("../../db/repositories/oauth-sessions.repo", () => ({
   oauthSessionsRepository: {},
 }));
+// Nothing in this file should import the real audit repository: it needs the
+// database mocked away above. The audit sink is pinned in beforeEach so the
+// lazy import never starts, and the afterAll below fails the file if anything
+// started it anyway.
+vi.mock("../../db/repositories/tool-call-audit.repo", () => {
+  auditRepoImports.count += 1;
+  return { toolCallAuditRepository: { record: vi.fn() } };
+});
 vi.mock("../../trpc/tools.impl", () => ({
   toolsImplementations: { sync: vi.fn().mockResolvedValue(undefined) },
 }));
@@ -371,6 +389,17 @@ function installMap() {
 }
 
 beforeEach(() => {
+  // Pin the audit sink before the FIRST test, not only after each one. The
+  // module starts with no sink chosen (undefined), and the first audited call
+  // then starts a lazy import of the real repository; when that import
+  // finishes it REPLACES whatever sink is installed at that moment. Under
+  // full-suite load it finished (225 to 272 ms in the traces) inside a later
+  // test, swapped that test's recorder for the real one, and the row the test
+  // was waiting on went to a database this file mocks away, where persist's
+  // catch-all swallowed the failure. The wait then expired as "called 2 times,
+  // but got 1" (#237). With a sink pinned from the first test on, the import
+  // never starts. A test that wants rows installs its own recorder after this.
+  setAuditRecorderForTesting(null);
   getSessionMock.mockReset();
   invalidateServerConnectionMock.mockReset();
   invalidateServerConnectionMock.mockResolvedValue(undefined);
@@ -391,6 +420,13 @@ afterEach(async () => {
       .pop()?.()
       .catch(() => undefined);
   }
+});
+
+afterAll(() => {
+  expect(
+    auditRepoImports.count,
+    "the real audit repository was imported: a test ran with no audit sink pinned, and that lazy import can replace a later test's recorder mid-test (#237)",
+  ).toBe(0);
 });
 
 describe("retired names through the gateway", () => {
