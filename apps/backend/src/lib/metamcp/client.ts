@@ -368,13 +368,16 @@ export const transformDockerUrl = (url: string): string => {
  * `withVerifiedCaller` sets for the backends named in
  * VERIFIED_CALLER_SERVER_NAMES and the m365 injection sets for its own
  * backends (see `verified-caller.ts`): a person's account id never reaches a
- * third-party server.
+ * third-party server. `dropOnMethodRewriteHeaders` removes that id when a
+ * same-origin 301, 302 or 303 turns a tool POST into a GET, because the GET
+ * executes nothing on the caller's behalf.
  */
 const createPoolGuardedFetch = (): FetchLike =>
   createGuardedFetch({
     allowPrivateAddresses: true,
     refuseCrossOriginRedirect: true,
     internalOnlyHeaders: [ASSERTED_ACTOR_HEADER, VERIFIED_CALLER_HEADER],
+    dropOnMethodRewriteHeaders: [VERIFIED_CALLER_HEADER],
   });
 
 export const createMetaMcpClient = (

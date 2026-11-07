@@ -302,6 +302,62 @@ describe("X-Umbrella-User-Id on a named backend", () => {
     expect(seen[0].userId).toBeNull();
   });
 
+  it.each([301, 302, 303])(
+    "drops the identity when a same-origin %i rewrites the tool POST to GET",
+    async (status) => {
+      // The wrapper classifies the original POST, but the guard owns the
+      // redirect loop. A follow-up GET must not inherit that POST's identity.
+      const record = undiciFetch.getMockImplementation();
+      if (!record) throw new Error("no recording fetch installed");
+      undiciFetch.mockImplementationOnce(async (url, init) => {
+        await record(url, init);
+        return new Response(null, {
+          status,
+          headers: { location: "/redirected" },
+        });
+      });
+      const { transport } = createMetaMcpClient(
+        asParams({ type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+      );
+      await runWithCallerContext(
+        { authMethod: "oauth", userId: "user-1" },
+        () => installedFetch(transport)(new URL(INTERNAL_URL), toolCallInit()),
+      );
+      expect(seen.map((r) => [r.httpMethod, r.userId])).toEqual([
+        ["POST", "user-1"],
+        ["GET", null],
+      ]);
+    },
+  );
+
+  it.each([307, 308])(
+    "keeps the identity when a same-origin %i replays the same tool POST",
+    async (status) => {
+      // 307 and 308 resend the same method and body, so the follow-up is the
+      // same executing request and keeps the caller it was set for.
+      const record = undiciFetch.getMockImplementation();
+      if (!record) throw new Error("no recording fetch installed");
+      undiciFetch.mockImplementationOnce(async (url, init) => {
+        await record(url, init);
+        return new Response(null, {
+          status,
+          headers: { location: "/redirected" },
+        });
+      });
+      const { transport } = createMetaMcpClient(
+        asParams({ type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+      );
+      await runWithCallerContext(
+        { authMethod: "oauth", userId: "user-1" },
+        () => installedFetch(transport)(new URL(INTERNAL_URL), toolCallInit()),
+      );
+      expect(seen.map((r) => [r.httpMethod, r.userId])).toEqual([
+        ["POST", "user-1"],
+        ["POST", "user-1"],
+      ]);
+    },
+  );
+
   it("refuses to build a transport for a server that is also in the m365 list", () => {
     process.env.VERIFIED_CALLER_SERVER_NAMES = "m365";
     expect(() =>

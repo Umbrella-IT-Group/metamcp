@@ -68,9 +68,10 @@ import { getCallerContext } from "./caller-context-store";
  * this one: the identity is only as good as the proof that the gateway sent
  * it.
  *
- * INERT BY DEFAULT. With `VERIFIED_CALLER_SERVER_NAMES` unset or empty no
- * backend is named, `getVerifiedCallerFetchForServer` returns the base fetch
- * itself, and every transport is built exactly as before.
+ * NO INJECTION BY DEFAULT. With `VERIFIED_CALLER_SERVER_NAMES` unset or empty
+ * no backend is named and `getVerifiedCallerFetchForServer` returns the base
+ * fetch itself. The Inspector still reserves this custom header, and the
+ * pool still strips it on non-internal hops, even with an empty list.
  */
 export const VERIFIED_CALLER_HEADER = "x-umbrella-user-id";
 
