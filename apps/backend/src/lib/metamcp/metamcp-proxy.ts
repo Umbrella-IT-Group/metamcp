@@ -31,6 +31,11 @@ import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
 import { isM365BrokerError } from "../m365/errors";
+import {
+  describeListingFailure,
+  NO_SESSION_CAUSE,
+  SEPARATOR_CAUSE,
+} from "./audit-listing-log";
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import {
@@ -383,6 +388,19 @@ export const createServer = async (
     // See AUDIT_LISTING: same chain, none of the client-facing side effects.
     const audit = (context as ListingContext)[AUDIT_LISTING] === true;
     const pool = audit ? auditListingPool : mcpServerPool;
+    // An audit listing's cause for each server it could not list, one INFO
+    // line each (audit-listing-log.ts). The WARN below names the servers and
+    // keeps the count-only args_shape; this says why. Whether the session had
+    // already closed is part of the cause: a one-shot client closes its
+    // session right after the call, and the audit listing runs after it.
+    const noteAuditSkip = (server: string, cause: string) => {
+      if (audit) {
+        logger.info(
+          `Audit listing for session ${sessionId} in namespace ${namespaceUuid} did not list server ${server}: ${cause}`,
+        );
+      }
+    };
+    const closedNote = () => (proxyClosed ? " (the session had closed)" : "");
     logger.debug(
       "[DEBUG-TOOLS] 🔍 tools/list called for namespace:",
       namespaceUuid,
@@ -547,6 +565,7 @@ export const createServer = async (
               `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
             );
           }
+          noteAuditSkip(params.name, SEPARATOR_CAUSE);
           failedServers.push(params.name);
           settledServerUuids.add(mcpServerUuid);
           return;
@@ -567,6 +586,16 @@ export const createServer = async (
               `tools/list: no session available for server ${params.name || mcpServerUuid} — excluded from namespace response (error state, connection cap, or backend unreachable)`,
             );
           }
+          // An audit listing's guarded pool answers nothing once the proxy
+          // has closed (auditListingPool), and a proxy never reopens, so a
+          // closed proxy here is the pool's refusal or a close during the
+          // acquisition: either way the session ended under the listing.
+          noteAuditSkip(
+            params.name || mcpServerUuid,
+            proxyClosed
+              ? "the session closed before the listing acquired a backend session"
+              : NO_SESSION_CAUSE,
+          );
           failedServers.push(params.name || mcpServerUuid);
           unreachableServers.set(mcpServerUuid, params);
           return;
@@ -622,6 +651,7 @@ export const createServer = async (
               `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
             );
           }
+          noteAuditSkip(serverName || mcpServerUuid, SEPARATOR_CAUSE);
           failedServers.push(serverName || mcpServerUuid);
           return;
         }
@@ -804,6 +834,10 @@ export const createServer = async (
           if (!audit) {
             logger.error(`Error fetching tools from: ${serverName}`, error);
           }
+          noteAuditSkip(
+            serverName || mcpServerUuid,
+            `${describeListingFailure(error)}${closedNote()}`,
+          );
           failedServers.push(serverName || mcpServerUuid);
           settledServerUuids.delete(mcpServerUuid);
           unreachableServers.set(mcpServerUuid, params);
@@ -824,6 +858,10 @@ export const createServer = async (
           outcome.reason,
         );
       }
+      noteAuditSkip(
+        params.name || mcpServerUuid,
+        `${describeListingFailure(outcome.reason)}${closedNote()}`,
+      );
       failedServers.push(params.name || mcpServerUuid);
       settledServerUuids.delete(mcpServerUuid);
       unreachableServers.set(mcpServerUuid, params);

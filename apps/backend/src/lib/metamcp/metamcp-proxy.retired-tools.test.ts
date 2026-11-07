@@ -715,6 +715,12 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     return recorder.mock.calls.map((callArgs) => callArgs[0]);
   };
 
+  // The per-server cause lines an audit listing logs at INFO.
+  const causesOf = (lines: string[]) =>
+    lines.filter((line) => line.startsWith("Audit listing for session"));
+  // What the log panels count as failures; those lines must stay out of it.
+  const PANEL_WORDS = /\b(error|fatal|panic|exception)\b/i;
+
   const declaring = (properties: Record<string, object>): Tool[] => [
     { name: "list_things", inputSchema: { type: "object", properties } },
   ];
@@ -1104,6 +1110,174 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
         .mocked(logger.info)
         .mock.calls.map(([line]) => String(line));
       expect(info.some((line) => line.includes("is owed"))).toBe(false);
+      // The cause the warning leaves out: one line for the unlistable server,
+      // saying the pool had no session for it. Nothing for the one that listed.
+      expect(causesOf(info)).toEqual([
+        "Audit listing for session sess-1 in namespace ns-1 did not list server down: the pool returned no session (server gated, at the connection cap, or backend unreachable)",
+      ]);
+      expect(causesOf(info)[0]).not.toMatch(PANEL_WORDS);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("an audit listing whose backend request throws names the server, the class and the message", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    // The call's own routing lists too, so the listing is made to throw only
+    // after the call has executed: the next request on this client is then
+    // the audit listing's.
+    const target = await backend(async () => {
+      vi.spyOn(target.session.client, "request").mockRejectedValueOnce(
+        new McpError(ErrorCode.RequestTimeout, "Request timed out"),
+      );
+      return real;
+    });
+    getSessionMock.mockResolvedValue(target.session);
+    vi.mocked(logger.warn).mockClear();
+    vi.mocked(logger.info).mockClear();
+
+    const result = await call(await connectConsumer(), REAL_TOOL, {
+      mode: "list",
+      ticket: 7,
+    });
+
+    // The call is untouched and the row stays count-only, as before.
+    expect(result.content).toEqual(real.content);
+    const [row] = await rowsAfter(recorder, 1);
+    expect(row.args_shape).toEqual({ keys: [], unverified_keys: 2 });
+    const causes = causesOf(
+      vi.mocked(logger.info).mock.calls.map(([line]) => String(line)),
+    );
+    // The SDK's own "MCP error" prefix is cut to keep the line off the
+    // error panels; the class and the rest of the message survive.
+    expect(causes).toEqual([
+      "Audit listing for session sess-1 in namespace ns-1 did not list server ninja: McpError: MCP err* -32001: Request timed out",
+    ]);
+    expect(causes[0]).not.toMatch(PANEL_WORDS);
+    // No tool argument value reaches the line.
+    expect(causes[0]).not.toContain("ticket");
+    // Still exactly the one warning, worded as before.
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("could not list 1 server(s) (ninja)"),
+    );
+  });
+
+  it("an audit listing whose session acquisition rejects names the class and the message", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ninja = await backend();
+    class PoolRefused extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "PoolRefused";
+      }
+    }
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-down": { name: "down" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        if (serverUuid === "server-down") {
+          throw new PoolRefused("connection cap reached");
+        }
+        return ninja.session;
+      },
+    );
+    vi.mocked(logger.info).mockClear();
+
+    try {
+      await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+      const [row] = await rowsAfter(recorder, 1);
+      // The server that listed still verifies its keys.
+      expect(row.args_shape).toEqual({ keys: ["mode"], sel: { mode: "list" } });
+      expect(
+        causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
+      ).toEqual([
+        "Audit listing for session sess-1 in namespace ns-1 did not list server down: PoolRefused: connection cap reached",
+      ]);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("an audit listing names a server whose name holds the tool-name separator", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ninja = await backend();
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-separator": { name: "bad__name" },
+    } as never);
+    getSessionMock.mockResolvedValue(ninja.session);
+    vi.mocked(logger.info).mockClear();
+
+    try {
+      await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+      await rowsAfter(recorder, 1);
+      expect(
+        causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
+      ).toEqual([
+        "Audit listing for session sess-1 in namespace ns-1 did not list server bad__name: the server name contains the tool-name separator",
+      ]);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("an audit listing names a nameless server whose reported name holds the separator", async () => {
+    // The stored name is checked first; a server stored without one falls back
+    // to the name its backend reports, which gets the same check after the
+    // session is acquired.
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const ninja = await backend();
+    const odd = await backend();
+    vi.spyOn(odd.session.client, "getServerVersion").mockReturnValue({
+      name: "bad__name",
+      version: "1.0.0",
+    });
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-odd": {},
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-odd" ? odd.session : ninja.session,
+    );
+    vi.mocked(logger.info).mockClear();
+
+    try {
+      await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+      await rowsAfter(recorder, 1);
+      expect(
+        causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
+      ).toEqual([
+        "Audit listing for session sess-1 in namespace ns-1 did not list server bad__name: the server name contains the tool-name separator",
+      ]);
+    } finally {
+      servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
+    }
+  });
+
+  it("a client listing writes no audit cause line", async () => {
+    const ninja = await backend();
+    servers.mockResolvedValue({
+      "server-ninja": { name: "ninja" },
+      "server-down": { name: "down" },
+    } as never);
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) =>
+        serverUuid === "server-down" ? undefined : ninja.session,
+    );
+    vi.mocked(logger.info).mockClear();
+
+    try {
+      await list(await connectConsumer());
+      expect(
+        causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
+      ).toEqual([]);
     } finally {
       servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
     }
@@ -1116,6 +1290,7 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     getSessionMock.mockResolvedValue(target.session);
     const release = holdNextListing();
     const { consumer, cleanup } = await connectWithCleanup();
+    vi.mocked(logger.info).mockClear();
 
     await call(consumer, REAL_TOOL, { mode: "list" });
     await vi.waitFor(() => expect(listings).toHaveBeenCalledTimes(1));
@@ -1126,6 +1301,12 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     const [row] = await rowsAfter(recorder, 1);
     expect(row.args_shape).toEqual({ keys: [], unverified_keys: 1 });
     expect(getSessionMock).toHaveBeenCalledTimes(acquiredBeforeClose);
+    // The silent path of the gap: the closed session is now the logged cause.
+    expect(
+      causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
+    ).toEqual([
+      "Audit listing for session sess-1 in namespace ns-1 did not list server ninja: the session closed before the listing acquired a backend session",
+    ]);
   });
 
   it("the kill switch stores NULL and lists nothing", async () => {

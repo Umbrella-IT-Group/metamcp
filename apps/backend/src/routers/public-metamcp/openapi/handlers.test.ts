@@ -58,11 +58,13 @@ const {
   getSessionMock,
   loggerErrorMock,
   loggerWarnMock,
+  loggerInfoMock,
 } = vi.hoisted(() => ({
   invalidateServerConnectionMock: vi.fn(),
   getSessionMock: vi.fn(),
   loggerErrorMock: vi.fn(),
   loggerWarnMock: vi.fn(),
+  loggerInfoMock: vi.fn(),
 }));
 
 // Real logger writes to console; mock it so the DEGRADED-tripwire
@@ -71,7 +73,7 @@ vi.mock("@/utils/logger", () => ({
   default: {
     error: loggerErrorMock,
     warn: loggerWarnMock,
-    info: vi.fn(),
+    info: loggerInfoMock,
     debug: vi.fn(),
   },
 }));
@@ -108,6 +110,7 @@ vi.mock(
 // purposes — we test originalCallToolHandler / createOriginalListToolsHandler
 // directly, so the middleware composition isn't exercised here.
 
+import { configService } from "../../../lib/config.service";
 import { setAuditRecorderForTesting } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
   createMiddlewareEnabledHandlers,
@@ -394,6 +397,93 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
     ).toBe(true);
   });
 
+  describe("a server whose listing step rejects before the per-server catch", () => {
+    // getSession and the configService reads run before the `try` in the
+    // per-server callback, so a throw there rejects the callback instead of
+    // reaching the catch that counts the server. Before this the client-facing
+    // listing dropped the server with no DEGRADED line and no cause.
+    const healthy = () =>
+      makeFakeSession(
+        vi.fn().mockResolvedValue({
+          tools: [{ name: "resolve_id", description: "d", inputSchema: {} }],
+        }),
+      );
+    const listWithTwoServers = async () => {
+      fakeServerParams["server-other"] = { name: "other" };
+      try {
+        return await createOriginalListToolsHandler()(
+          { method: "tools/list", params: {} },
+          { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+        );
+      } finally {
+        delete fakeServerParams["server-other"];
+      }
+    };
+    const errorCallsFor = (server: string) =>
+      loggerErrorMock.mock.calls.filter(
+        (c) => String(c[0]) === `Error preparing tools listing for: ${server}`,
+      );
+
+    it("counts a rejecting getSession, logs the reason, and still returns the other servers' tools", async () => {
+      const refusal = new Error("pool refused: connection cap reached");
+      getSessionMock.mockImplementation(async (_sid: string, uuid: string) => {
+        if (uuid === "server-autotask") throw refusal;
+        return healthy();
+      });
+
+      const result = await listWithTwoServers();
+
+      expect(result.tools.map((t) => t.name)).toEqual(["other__resolve_id"]);
+      const logged = errorCallsFor("autotask");
+      expect(logged).toHaveLength(1);
+      expect(logged[0][1]).toBe(refusal);
+      expect(errorCallsFor("other")).toHaveLength(0);
+      const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
+      expect(messages).toContain(
+        "tools/list DEGRADED for namespace ns-1 (OpenAPI bridge): 1/2 backend server(s) failed (autotask); returning 1 tools",
+      );
+    });
+
+    it("counts a rejecting configService read, logs the reason, and still returns the other servers' tools", async () => {
+      const unreachable = new Error("config store unreachable");
+      getSessionMock.mockImplementation(async () => healthy());
+      // One rejection: whichever server reads the timeout first fails, the
+      // other reads it normally.
+      vi.mocked(configService.getMcpTimeout).mockRejectedValueOnce(unreachable);
+
+      const result = await listWithTwoServers();
+
+      expect(result.tools).toHaveLength(1);
+      const logged = [...errorCallsFor("autotask"), ...errorCallsFor("other")];
+      expect(logged).toHaveLength(1);
+      expect(logged[0][1]).toBe(unreachable);
+      const degraded = loggerErrorMock.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes("DEGRADED"));
+      expect(degraded).toHaveLength(1);
+      expect(degraded[0]).toMatch(
+        /\(OpenAPI bridge\): 1\/2 backend server\(s\) failed \((autotask|other)\); returning 1 tools$/,
+      );
+    });
+
+    it("names a lone rejected server in the DEGRADED line, and the response is unchanged", async () => {
+      getSessionMock.mockRejectedValue(new Error("pool refused"));
+
+      const result = await createOriginalListToolsHandler()(
+        { method: "tools/list", params: {} },
+        { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+      );
+
+      expect(result).toEqual({ tools: [] });
+      const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
+      expect(messages).toContain(
+        "tools/list DEGRADED for namespace ns-1 (OpenAPI bridge): 1/1 backend server(s) failed (autotask); returning 0 tools",
+      );
+      expect(loggerInfoMock).not.toHaveBeenCalled();
+      expect(loggerWarnMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("stays silent when every backend answers", async () => {
     const healthy = makeFakeSession(
       vi.fn().mockResolvedValue({
@@ -449,6 +539,14 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
     );
   };
 
+  // The cause lines an audit listing logs, one per server it could not list.
+  const auditCauses = () =>
+    loggerInfoMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((line) => line.includes("audit listing for namespace"));
+  // What the log panels count as failures; these lines must stay out of it.
+  const PANEL_WORDS = /\b(error|fatal|panic|exception)\b/i;
+
   let recorder: ReturnType<typeof vi.fn<(entry: any) => Promise<void>>>;
   beforeEach(() => {
     resetBridgeAuditSchemasForTesting();
@@ -456,6 +554,7 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
     getSessionMock.mockReset();
     loggerErrorMock.mockReset();
     loggerWarnMock.mockReset();
+    loggerInfoMock.mockReset();
     recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
   });
@@ -509,6 +608,12 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
       unverified_keys: 2,
     });
     expect(loggerErrorMock).not.toHaveBeenCalled();
+    // The listing's cause is in the log: the server and the class and message
+    // of what the backend request threw, no tool arguments.
+    expect(auditCauses()).toEqual([
+      "OpenAPI bridge: audit listing for namespace ns-a did not list server autotask: Err*: listing unavailable",
+    ]);
+    expect(auditCauses()[0]).not.toMatch(PANEL_WORDS);
   });
 
   it("an audit listing's lost session cannot invalidate concurrent calls' connections", async () => {
@@ -542,6 +647,58 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
     expect(loggerWarnMock).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("could not list 1 server(s) (autotask)"),
     );
+    // Rejected before the per-server catch: counted, and now says why.
+    expect(auditCauses()).toEqual([
+      "OpenAPI bridge: audit listing for namespace ns-a did not list server autotask: Err*: session acquisition unavailable",
+    ]);
+    expect(auditCauses()[0]).not.toMatch(PANEL_WORDS);
+  });
+
+  it("an audit listing the pool cannot serve names the reason, and the call is unchanged", async () => {
+    getSessionMock
+      .mockResolvedValueOnce(backend(async () => backendTools({ q: {} })))
+      .mockResolvedValueOnce(null);
+
+    expect(await callThroughBridge("ns-a", { q: "x" })).toBe(answer);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+    expect(loggerErrorMock).not.toHaveBeenCalled();
+    expect(auditCauses()).toEqual([
+      "OpenAPI bridge: audit listing for namespace ns-a did not list server autotask: the pool returned no session (server gated, at the connection cap, or backend unreachable)",
+    ]);
+    expect(auditCauses()[0]).not.toMatch(PANEL_WORDS);
+  });
+
+  it("an audit listing names a server whose name holds the tool-name separator", async () => {
+    fakeServerParams["server-separator"] = { name: "a__b" };
+    getSessionMock.mockResolvedValue(
+      backend(async () => backendTools({ q: {} })),
+    );
+
+    try {
+      expect(await callThroughBridge("ns-a", { q: "x" })).toBe(answer);
+      await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+      expect(auditCauses()).toContain(
+        "OpenAPI bridge: audit listing for namespace ns-a did not list server a__b: the server name contains the tool-name separator",
+      );
+      expect(loggerErrorMock).not.toHaveBeenCalled();
+    } finally {
+      delete fakeServerParams["server-separator"];
+    }
+  });
+
+  it("a served listing writes no audit cause line", async () => {
+    getSessionMock.mockRejectedValue(new Error("pool refused"));
+
+    await createOriginalListToolsHandler()(
+      { method: "tools/list", params: {} },
+      { namespaceUuid: "ns-a", sessionId: "openapi_ns-a" },
+    );
+
+    expect(auditCauses()).toEqual([]);
   });
 
   it("a failed listing of the routing winner cannot verify keys from a colliding server", async () => {

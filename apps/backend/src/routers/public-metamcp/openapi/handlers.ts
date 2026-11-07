@@ -11,6 +11,11 @@ import logger from "@/utils/logger";
 
 import { configService } from "../../../lib/config.service";
 import { ConnectedClient } from "../../../lib/metamcp";
+import {
+  describeListingFailure,
+  NO_SESSION_CAUSE,
+  SEPARATOR_CAUSE,
+} from "../../../lib/metamcp/audit-listing-log";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
 import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
@@ -69,6 +74,16 @@ export const createOriginalListToolsHandler = (
       context.namespaceUuid,
       includeInactiveServers,
     );
+    // An audit listing's cause for each server it could not list, one INFO
+    // line each (audit-listing-log.ts). The WARN below names the servers;
+    // this says why.
+    const noteAuditSkip = (server: string, cause: string) => {
+      if (audit) {
+        logger.info(
+          `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} did not list server ${server}: ${cause}`,
+        );
+      }
+    };
     const allTools: Tool[] = [];
     // Mirrors metamcp-proxy.ts's PR #28 tripwire: every backend that
     // contributes zero tools because of a failure (not because it has
@@ -100,6 +115,7 @@ export const createOriginalListToolsHandler = (
           reportFailure(
             `OpenAPI bridge: No session for server ${params.name || mcpServerUuid} (${mcpServerUuid}) during tools/list — pool returned null (ERROR-gated, at cap, or connect failed); server excluded from namespace response`,
           );
+          noteAuditSkip(params.name || mcpServerUuid, NO_SESSION_CAUSE);
           failedServers.push(params.name || mcpServerUuid);
           return;
         }
@@ -120,6 +136,7 @@ export const createOriginalListToolsHandler = (
           reportFailure(
             `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
           );
+          noteAuditSkip(serverName || mcpServerUuid, SEPARATOR_CAUSE);
           failedServers.push(serverName || mcpServerUuid);
           return;
         }
@@ -198,20 +215,34 @@ export const createOriginalListToolsHandler = (
           allTools.push(...toolsWithSource);
         } catch (error) {
           reportFailure(`Error fetching tools from: ${serverName}`, error);
+          noteAuditSkip(
+            serverName || mcpServerUuid,
+            describeListingFailure(error),
+          );
           failedServers.push(serverName || mcpServerUuid);
         }
       }),
     );
 
+    // Acquiring a session and reading capabilities/configuration happen
+    // before the backend-request catch. They can reject too, and allSettled
+    // would turn that into a server that is just missing: a silently empty
+    // audit snapshot, or a client's partial openapi.json with no DEGRADED
+    // line for the alert to catch. Count each one and say why, in both modes
+    // (metamcp-proxy.ts does the same for its listing).
+    for (const [index, [uuid, params]] of allServerEntries.entries()) {
+      const outcome = listingOutcomes[index];
+      if (outcome?.status !== "rejected") continue;
+      const name = params.name || uuid;
+      reportFailure(
+        `Error preparing tools listing for: ${name}`,
+        outcome.reason,
+      );
+      noteAuditSkip(name, describeListingFailure(outcome.reason));
+      failedServers.push(name);
+    }
+
     if (audit) {
-      // Acquiring a session and reading capabilities/configuration happen
-      // before the backend-request catch. They can reject too; do not let
-      // allSettled turn those failures into a silently empty audit snapshot.
-      for (const [index, [uuid, params]] of allServerEntries.entries()) {
-        if (listingOutcomes[index]?.status === "rejected") {
-          failedServers.push(params.name || uuid);
-        }
-      }
       // Worded without the words the log-based panels count as failures.
       if (failedServers.length > 0) {
         logger.warn(
