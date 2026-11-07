@@ -393,12 +393,12 @@ beforeEach(() => {
   // module starts with no sink chosen (undefined), and the first audited call
   // then starts a lazy import of the real repository; when that import
   // finishes it REPLACES whatever sink is installed at that moment. Under
-  // full-suite load it finished (about 270 ms) inside a later test, swapped
-  // that test's recorder for the real one, and the row the test was waiting
-  // on went to a database this file mocks away, where persist's catch-all
-  // swallowed the failure. The wait then expired as "called 2 times, but got
-  // 1" (#237). With a sink pinned from the first test on, the import never
-  // starts. A test that wants rows installs its own recorder after this.
+  // full-suite load it finished (225 to 272 ms in the traces) inside a later
+  // test, swapped that test's recorder for the real one, and the row the test
+  // was waiting on went to a database this file mocks away, where persist's
+  // catch-all swallowed the failure. The wait then expired as "called 2 times,
+  // but got 1" (#237). With a sink pinned from the first test on, the import
+  // never starts. A test that wants rows installs its own recorder after this.
   setAuditRecorderForTesting(null);
   getSessionMock.mockReset();
   invalidateServerConnectionMock.mockReset();
