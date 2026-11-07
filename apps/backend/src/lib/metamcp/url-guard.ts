@@ -527,6 +527,17 @@ export interface McpUrlGuardOptions {
    */
   refuseCrossOriginRedirect?: boolean;
   /**
+   * Headers that speak for the caller of ONE executing request, deleted when a
+   * redirect rewrites that request into a bodyless GET (a 303, or a 301 or 302
+   * after a POST). The pooled data plane passes `x-umbrella-user-id`: the
+   * verified caller is set only on a POST that executes backend code
+   * (`verified-caller.ts`), and the GET a same-origin redirect produces
+   * executes nothing on that caller's behalf, so it must not carry their
+   * identity. 307 and 308 replay the same method and body, so the header
+   * stays. Found by the Sol review of PR #238 (2026-11-07).
+   */
+  dropOnMethodRewriteHeaders?: readonly string[];
+  /**
    * Hard ceiling on the bytes read from a single response body before the
    * request is aborted, guarding the gateway against a hostile or misbehaving
    * upstream that streams an unbounded response. Defaults to
@@ -1187,6 +1198,9 @@ export const createGuardedFetch = (
         method = "GET";
         body = undefined;
         for (const name of BODY_HEADERS) headers.delete(name);
+        // The GET is not the request the caller's identity was set for.
+        for (const name of options.dropOnMethodRewriteHeaders ?? [])
+          headers.delete(name);
       } else if (
         body !== undefined &&
         body !== null &&
