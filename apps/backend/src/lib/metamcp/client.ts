@@ -27,6 +27,10 @@ import { resolveServerBearerToken } from "./server-bearer-crypto";
 import { serverErrorTracker } from "./server-error-tracker";
 import { createGuardedFetch } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
+import {
+  getVerifiedCallerFetchForServer,
+  VERIFIED_CALLER_HEADER,
+} from "./verified-caller";
 
 const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
@@ -359,13 +363,21 @@ export const transformDockerUrl = (url: string): string => {
  *
  * `internalOnlyHeaders` keeps the caller-asserted `x-mcp-actor`, which
  * `withAssertedActor` puts on each pooled request, off any destination that is
- * not internal (see `asserted-actor.ts`).
+ * not internal (see `asserted-actor.ts`). The same holds for
+ * `x-umbrella-user-id`, the verified caller's user id that
+ * `withVerifiedCaller` sets for the backends named in
+ * VERIFIED_CALLER_SERVER_NAMES and the m365 injection sets for its own
+ * backends (see `verified-caller.ts`): a person's account id never reaches a
+ * third-party server. `dropOnMethodRewriteHeaders` removes that id when a
+ * same-origin 301, 302 or 303 turns a tool POST into a GET, because the GET
+ * executes nothing on the caller's behalf.
  */
 const createPoolGuardedFetch = (): FetchLike =>
   createGuardedFetch({
     allowPrivateAddresses: true,
     refuseCrossOriginRedirect: true,
-    internalOnlyHeaders: [ASSERTED_ACTOR_HEADER],
+    internalOnlyHeaders: [ASSERTED_ACTOR_HEADER, VERIFIED_CALLER_HEADER],
+    dropOnMethodRewriteHeaders: [VERIFIED_CALLER_HEADER],
   });
 
 export const createMetaMcpClient = (
@@ -440,7 +452,16 @@ export const createMetaMcpClient = (
     // are set for the stream GET and the back-channel POSTs to be covered.
     // `withAssertedActor` stamps each request with the X-MCP-Actor of the
     // inbound request it serves (the back-channel POST carries the tool call).
-    const poolFetch = withAssertedActor(createPoolGuardedFetch());
+    // For a server named in VERIFIED_CALLER_SERVER_NAMES the verified-caller
+    // wrapper strips any X-Umbrella-User-Id and sets the authenticated
+    // caller's id on tool calls; every other server gets the guarded fetch
+    // itself. See `verified-caller.ts`.
+    const poolFetch = withAssertedActor(
+      getVerifiedCallerFetchForServer(
+        serverParams.name,
+        createPoolGuardedFetch(),
+      ),
+    );
     transport = new SSEClientTransport(new URL(transformedUrl), {
       eventSourceInit: {
         fetch: (url, init) => poolFetch(url, { ...init, headers }),
@@ -491,6 +512,13 @@ export const createMetaMcpClient = (
       guardedFetch,
     );
 
+    // Verified caller: for a server named in VERIFIED_CALLER_SERVER_NAMES,
+    // strip any X-Umbrella-User-Id (a stored row header included) and set the
+    // authenticated caller's user id on requests that can execute a tool.
+    // Every other server gets its fetch back untouched. For a named server
+    // `injectedFetch` is always undefined, because a server in both lists is
+    // refused at boot and again here. See `verified-caller.ts`.
+    //
     // Outermost: the caller-asserted X-MCP-Actor of the inbound request this
     // request serves, read at send time from the request-scoped binding so a
     // pooled connection never carries one caller's label on another's call.
@@ -499,7 +527,12 @@ export const createMetaMcpClient = (
       requestInit: {
         headers,
       },
-      fetch: withAssertedActor(injectedFetch ?? guardedFetch),
+      fetch: withAssertedActor(
+        getVerifiedCallerFetchForServer(
+          serverParams.name,
+          injectedFetch ?? guardedFetch,
+        ),
+      ),
     });
   } else {
     metamcpLogStore.addLog(

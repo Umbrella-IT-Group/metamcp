@@ -18,6 +18,7 @@ import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
+import { assertVerifiedCallerConfig } from "./lib/metamcp/verified-caller";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
@@ -29,6 +30,15 @@ import oauthRouter from "./routers/oauth";
 import publicEndpointsRouter from "./routers/public-metamcp";
 import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
+
+// Refuse to start when one backend is named in both VERIFIED_CALLER_SERVER_NAMES
+// and M365_INJECTED_SERVER_NAMES: that backend would have two writers for its
+// X-Umbrella-User-Id, the header it trusts to say who is calling. At module
+// scope, before any route is registered, so the throw exits the process with
+// the reason instead of reaching start(), whose catch only logs. Logs which
+// backends receive the verified caller when any are named. See
+// ./lib/metamcp/verified-caller.
+assertVerifiedCallerConfig();
 
 const app = express();
 
