@@ -31,6 +31,13 @@ import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
 import { isM365BrokerError } from "../m365/errors";
+import {
+  CLOSED_BEFORE_ACQUIRE_CAUSE,
+  describeListingFailure,
+  describeListingLabel,
+  NO_SESSION_CAUSE,
+  SEPARATOR_CAUSE,
+} from "./audit-listing-log";
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import {
@@ -383,6 +390,23 @@ export const createServer = async (
     // See AUDIT_LISTING: same chain, none of the client-facing side effects.
     const audit = (context as ListingContext)[AUDIT_LISTING] === true;
     const pool = audit ? auditListingPool : mcpServerPool;
+    // An audit listing's cause for each server it could not list, one INFO
+    // line each (audit-listing-log.ts). The WARN below names the servers and
+    // keeps the count-only args_shape; this says why. The cause is a function
+    // so a client-facing listing, which discards it, never builds it.
+    const noteAuditSkip = (server: string, cause: () => string) => {
+      if (audit) {
+        logger.info(
+          `Audit listing for session ${describeListingLabel(sessionId)} in namespace ${describeListingLabel(namespaceUuid)} did not list server ${describeListingLabel(server)}: ${cause()}`,
+        );
+      }
+    };
+    // The session's state when the line is written, never the cause: a failure
+    // can come first and the close after it, and a one-shot client closes its
+    // session right after its call, so the #233 re-measure needs to see the
+    // state apart from what the pool or the backend said.
+    const closedNote = () =>
+      proxyClosed ? " (the session was closed when this was logged)" : "";
     logger.debug(
       "[DEBUG-TOOLS] 🔍 tools/list called for namespace:",
       namespaceUuid,
@@ -547,10 +571,15 @@ export const createServer = async (
               `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
             );
           }
+          noteAuditSkip(params.name, () => SEPARATOR_CAUSE);
           failedServers.push(params.name);
           settledServerUuids.add(mcpServerUuid);
           return;
         }
+        // The audit pool checks `proxyClosed` synchronously as it is called
+        // (auditListingPool), so this read, with no await before the call,
+        // is exactly what it will see: true means it refuses to acquire.
+        const closedBeforeAcquire = proxyClosed;
         const session = await pool.getSession(
           context.sessionId,
           mcpServerUuid,
@@ -567,6 +596,16 @@ export const createServer = async (
               `tools/list: no session available for server ${params.name || mcpServerUuid} — excluded from namespace response (error state, connection cap, or backend unreachable)`,
             );
           }
+          // "The session had closed" only where that is known: the guarded
+          // audit pool refused because the proxy was already closed. Any
+          // other empty answer is the pool's own (gated, at its cap,
+          // unreachable), and the session state is reported beside it, not
+          // as its cause.
+          noteAuditSkip(params.name || mcpServerUuid, () =>
+            closedBeforeAcquire
+              ? CLOSED_BEFORE_ACQUIRE_CAUSE
+              : `${NO_SESSION_CAUSE}${closedNote()}`,
+          );
           failedServers.push(params.name || mcpServerUuid);
           unreachableServers.set(mcpServerUuid, params);
           return;
@@ -622,6 +661,7 @@ export const createServer = async (
               `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
             );
           }
+          noteAuditSkip(serverName || mcpServerUuid, () => SEPARATOR_CAUSE);
           failedServers.push(serverName || mcpServerUuid);
           return;
         }
@@ -804,6 +844,10 @@ export const createServer = async (
           if (!audit) {
             logger.error(`Error fetching tools from: ${serverName}`, error);
           }
+          noteAuditSkip(
+            serverName || mcpServerUuid,
+            () => `${describeListingFailure(error)}${closedNote()}`,
+          );
           failedServers.push(serverName || mcpServerUuid);
           settledServerUuids.delete(mcpServerUuid);
           unreachableServers.set(mcpServerUuid, params);
@@ -824,6 +868,10 @@ export const createServer = async (
           outcome.reason,
         );
       }
+      noteAuditSkip(
+        params.name || mcpServerUuid,
+        () => `${describeListingFailure(outcome.reason)}${closedNote()}`,
+      );
       failedServers.push(params.name || mcpServerUuid);
       settledServerUuids.delete(mcpServerUuid);
       unreachableServers.set(mcpServerUuid, params);
@@ -840,7 +888,7 @@ export const createServer = async (
       // without the words the log-based panels count as failures.
       if (failedServers.length > 0) {
         logger.warn(
-          `Audit listing for session ${sessionId} in namespace ${namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
+          `Audit listing for session ${describeListingLabel(sessionId)} in namespace ${describeListingLabel(namespaceUuid)} could not list ${failedServers.length} server(s) (${failedServers.map(describeListingLabel).join(", ")}); calls to their tools keep the count-only args_shape`,
         );
       }
       return {
