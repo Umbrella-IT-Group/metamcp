@@ -13,6 +13,7 @@ import { configService } from "../../../lib/config.service";
 import { ConnectedClient } from "../../../lib/metamcp";
 import {
   describeListingFailure,
+  describeListingLabel,
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "../../../lib/metamcp/audit-listing-log";
@@ -81,7 +82,7 @@ export const createOriginalListToolsHandler = (
     const noteAuditSkip = (server: string, cause: () => string) => {
       if (audit) {
         logger.info(
-          `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} did not list server ${server}: ${cause()}`,
+          `OpenAPI bridge: audit listing for namespace ${describeListingLabel(context.namespaceUuid)} did not list server ${describeListingLabel(server)}: ${cause()}`,
         );
       }
     };
@@ -234,10 +235,10 @@ export const createOriginalListToolsHandler = (
       const outcome = listingOutcomes[index];
       if (outcome?.status !== "rejected") continue;
       const name = params.name || uuid;
-      reportFailure(
-        `Error preparing tools listing for: ${name}`,
-        outcome.reason,
-      );
+      // The raw rejection can contain credentials. The audit-only line below
+      // provides its scrubbed cause; the served path needs the failure count
+      // and marker, without inspecting or serializing an untrusted error.
+      reportFailure(`Error preparing tools listing for: ${name}`);
       noteAuditSkip(name, () => describeListingFailure(outcome.reason));
       failedServers.push(name);
     }
@@ -246,7 +247,7 @@ export const createOriginalListToolsHandler = (
       // Worded without the words the log-based panels count as failures.
       if (failedServers.length > 0) {
         logger.warn(
-          `OpenAPI bridge: audit listing for namespace ${context.namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
+          `OpenAPI bridge: audit listing for namespace ${describeListingLabel(context.namespaceUuid)} could not list ${failedServers.length} server(s) (${failedServers.map(describeListingLabel).join(", ")}); calls to their tools keep the count-only args_shape`,
         );
       }
       return {

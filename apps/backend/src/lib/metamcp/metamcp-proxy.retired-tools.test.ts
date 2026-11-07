@@ -1245,7 +1245,7 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     const ninja = await backend();
     const odd = await backend();
     vi.spyOn(odd.session.client, "getServerVersion").mockReturnValue({
-      name: "bad__name",
+      name: "bad__name\npassword=SECRET",
       version: "1.0.0",
     });
     servers.mockResolvedValue({
@@ -1264,8 +1264,11 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
       expect(
         causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l))),
       ).toEqual([
-        "Audit listing for session sess-1 in namespace ns-1 did not list server bad__name: the server name contains the tool-name separator",
+        "Audit listing for session sess-1 in namespace ns-1 did not list server bad__namepassword=[redacted]: the server name contains the tool-name separator",
       ]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Audit listing for session sess-1 in namespace ns-1 could not list 1 server(s) (bad__namepassword=[redacted]); calls to their tools keep the count-only args_shape",
+      );
     } finally {
       servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
     }

@@ -34,6 +34,7 @@ import { isM365BrokerError } from "../m365/errors";
 import {
   CLOSED_BEFORE_ACQUIRE_CAUSE,
   describeListingFailure,
+  describeListingLabel,
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "./audit-listing-log";
@@ -396,7 +397,7 @@ export const createServer = async (
     const noteAuditSkip = (server: string, cause: () => string) => {
       if (audit) {
         logger.info(
-          `Audit listing for session ${sessionId} in namespace ${namespaceUuid} did not list server ${server}: ${cause()}`,
+          `Audit listing for session ${describeListingLabel(sessionId)} in namespace ${describeListingLabel(namespaceUuid)} did not list server ${describeListingLabel(server)}: ${cause()}`,
         );
       }
     };
@@ -887,7 +888,7 @@ export const createServer = async (
       // without the words the log-based panels count as failures.
       if (failedServers.length > 0) {
         logger.warn(
-          `Audit listing for session ${sessionId} in namespace ${namespaceUuid} could not list ${failedServers.length} server(s) (${failedServers.join(", ")}); calls to their tools keep the count-only args_shape`,
+          `Audit listing for session ${describeListingLabel(sessionId)} in namespace ${describeListingLabel(namespaceUuid)} could not list ${failedServers.length} server(s) (${failedServers.map(describeListingLabel).join(", ")}); calls to their tools keep the count-only args_shape`,
         );
       }
       return {

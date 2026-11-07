@@ -437,8 +437,8 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
         (c) => String(c[0]) === `Error preparing tools listing for: ${server}`,
       );
 
-    it("counts a rejecting getSession, logs the reason, and still returns the other servers' tools", async () => {
-      const refusal = new Error("pool refused: connection cap reached");
+    it("counts a rejecting getSession without logging its raw reason, and still returns the other servers' tools", async () => {
+      const refusal = new Error("pool refused: password=SECRET");
       getSessionMock.mockImplementation(async (_sid: string, uuid: string) => {
         if (uuid === "server-autotask") throw refusal;
         return healthy();
@@ -449,7 +449,12 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
       expect(result.tools.map((t) => t.name)).toEqual(["other__resolve_id"]);
       const logged = errorCallsFor("autotask");
       expect(logged).toHaveLength(1);
-      expect(logged[0][1]).toBe(refusal);
+      expect(logged[0]).toEqual([
+        "Error preparing tools listing for: autotask",
+      ]);
+      expect(JSON.stringify(loggerErrorMock.mock.calls)).not.toContain(
+        "SECRET",
+      );
       expect(errorCallsFor("other")).toHaveLength(0);
       const messages = loggerErrorMock.mock.calls.map((c) => String(c[0]));
       expect(messages).toContain(
@@ -457,7 +462,7 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
       );
     });
 
-    it("counts a rejecting configService read, logs the reason, and still returns the other servers' tools", async () => {
+    it("counts a rejecting configService read without logging its raw reason, and still returns the other servers' tools", async () => {
       const unreachable = new Error("config store unreachable");
       getSessionMock.mockImplementation(async () => healthy());
       // One rejection: whichever server reads the timeout first fails, the
@@ -469,7 +474,7 @@ describe("OpenAPI bridge — tools/list DEGRADED tripwire", () => {
       expect(result.tools).toHaveLength(1);
       const logged = [...errorCallsFor("autotask"), ...errorCallsFor("other")];
       expect(logged).toHaveLength(1);
-      expect(logged[0][1]).toBe(unreachable);
+      expect(logged[0]).toHaveLength(1);
       const degraded = loggerErrorMock.mock.calls
         .map((c) => String(c[0]))
         .filter((m) => m.includes("DEGRADED"));
@@ -726,7 +731,7 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
   });
 
   it("an audit listing names a server whose name holds the tool-name separator", async () => {
-    fakeServerParams["server-separator"] = { name: "a__b" };
+    fakeServerParams["server-separator"] = { name: "a__b\npassword=SECRET" };
     getSessionMock.mockResolvedValue(
       backend(async () => backendTools({ q: {} })),
     );
@@ -735,7 +740,10 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
       expect(await callThroughBridge("ns-a", { q: "x" })).toBe(answer);
       await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
       expect(auditCauses()).toContain(
-        "OpenAPI bridge: audit listing for namespace ns-a did not list server a__b: the server name contains the tool-name separator",
+        "OpenAPI bridge: audit listing for namespace ns-a did not list server a__bpassword=[redacted]: the server name contains the tool-name separator",
+      );
+      expect(loggerWarnMock).toHaveBeenCalledWith(
+        "OpenAPI bridge: audit listing for namespace ns-a could not list 1 server(s) (a__bpassword=[redacted]); calls to their tools keep the count-only args_shape",
       );
       expect(loggerErrorMock).not.toHaveBeenCalled();
     } finally {

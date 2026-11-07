@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 /**
  * The cause text an audit listing logs for a server it could not list.
  *
@@ -64,7 +66,7 @@ export const CLOSED_BEFORE_ACQUIRE_CAUSE =
 // Linear patterns. A regex backtracks quadratically when an unanchored prefix
 // is scanned from every start position, as `https?://[^\s?#]+\?` is on a long
 // run of back-to-back "http://". So no pattern here scans a variable-length
-// prefix: each one starts at a literal ("://", "?", "Bearer", "eyJ"), or at
+// prefix: each one starts at a literal ("//", "?", "Bearer"), or at
 // the start of an identifier run (the lookbehind makes every other start fail
 // in one step), and each class it scans stops at the next delimiter. The test
 // runs 200 KB of adversarial shapes through scrub() against a time bound.
@@ -73,65 +75,89 @@ const ID = "A-Za-z0-9_.-";
 // characters) and lone surrogates (Cs). Deleted, not replaced by a space: a
 // control character inside a credential must not split it into a redacted half
 // and a visible half.
-const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cs}]/gu;
-// \s covers CR, LF, U+2028 and U+2029; NEL (U+0085) is a C1 control that
-// still means a line break, so it joins them.
-const WHITESPACE = /[\s\u0085]+/g;
-// scheme://userinfo@host for any scheme. The authority ends at the first "/",
-// "?" or "#" (a password holding one must be percent-encoded, per RFC 3986),
-// and the greedy class runs to the LAST "@" in it, so "pa@ss" is not left
-// half visible.
-const USERINFO = /:\/\/[^\s/?#]*@/g;
-const OPEN_AUTHORITY = /:\/\/[^\s/?#]*$/;
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/gu;
+// Collapse the remaining visible whitespace only after deleting controls and
+// format characters. Replacing a tab or BOM first would split "pass<tab>word"
+// into two harmless names and leave its credential visible.
+const WHITESPACE = /\s+/g;
+// scheme://userinfo@host for any scheme. Stop at the first path separator.
+// Also cover protocol-relative URLs and malformed userinfo containing
+// "?" or "#": an invalid URL can be echoed in the very error we are logging.
+// The greedy class runs to the LAST "@", so "pa@ss" is not left half
+// visible. Whitespace is allowed here too: malformed URLs can echo a raw
+// password containing spaces rather than its percent-encoded form.
+const USERINFO = /(:?\/\/)[^/]*@/g;
+const OPEN_AUTHORITY = /(:?\/\/)[^/]*$/;
 // Any query string, absolute or relative: keys travel there. The whole string
 // goes, not its values, so no key list is needed.
-const QUERY = /\?[^\s"'<>)\]}]+/g;
-// Cookie and authorization headers: everything after the name to the closing
-// quote, or to the end of the text when bare. A header value has no delimiter
-// a one-line message could show, so the rest of the line is the value.
-const HEADER_VALUE = new RegExp(
-  `(?<![${ID}])([${ID}]*(?:cookie|authorization)[${ID}]*)(["']?\\s*[:=]\\s*)(?:"(?:[^"\\\\]|\\\\.)*(?:"|$)|'(?:[^'\\\\]|\\\\.)*(?:'|$)|.*$)`,
-  "gi",
-);
+// A raw query value may itself contain whitespace or punctuation. Like a
+// sensitive name/value pair, no suffix after it is safe to retain.
+const QUERY = /\?.*/;
 const BEARER = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
-// A JWT, even without its header name. Prefix-closed: the header segment alone
-// matches, so a cut inside the payload still redacts.
-const JWT = /\beyJ[\w-]+(?:\.[\w-]*){0,2}/g;
-// name=value and "name": "value". The name is matched alone, so the value is
-// consumed only for a sensitive name and a pair nested in another's value is
-// still seen.
+// A JWT header is JSON, but need not start with "eyJ": legal whitespace or a
+// newline after its opening brace changes that prefix. Inspect each base64url
+// run's decoded prefix instead. A partial header still matches, so cutting a
+// long token cannot leave its prefix visible. Runs are visited only once.
+const TOKEN_RUN = /(?<![\w-])[\w-]+(?:\.[\w-]*){0,2}/g;
+// Error messages can embed another JSON string, including escaped field names.
+// Decode syntax before finding credentials. The lookbehind avoids retrying
+// the whole backslash run at every position when no escape follows it.
+const ESCAPED_SYNTAX =
+  /(?<!\\)\\+(?:u([\da-fA-F]{4})|x([\da-fA-F]{2})|(["'/])|([bfnrtv]))/g;
+const ESCAPED_CONTROL: Record<string, string> = {
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+};
+// name=value, "name": "value", and header tuples ('name', 'value'). Match the
+// name alone so a credential nested in an ordinary value is still seen.
 const NAME_SEPARATOR = new RegExp(
-  `(?<![${ID}])([${ID}]+)["']?\\s*[:=]\\s*`,
+  `(?<![${ID}])([${ID}]+)["']?\\s*[:=,]\\s*`,
   "g",
 );
-const VALUE =
-  /"(?:[^"\\]|\\.)*(?:"|$)|'(?:[^'\\]|\\.)*(?:'|$)|[^\s,;&}\])"']*/y;
+// A failed stdio launch can echo its command and arguments, and remote
+// failures can carry XML bodies. Neither uses a name=value separator.
+const FLAG_VALUE = new RegExp(`(?<![${ID}])(--?[${ID}]+)\\s+`, "g");
+const XML_TAG = /<([A-Za-z0-9_:.-]+)(?=[\s/>])/g;
 // A sensitive word anywhere in the identifier, in any case or separator style
 // (client_secret, AUTOTASK_API_KEY, oauth-access-token, clientSecret, apiKey).
 // "key" and "session" are broad on purpose: a miss leaks and a false match
 // only hides one value. "auth" is matched as a word of its own so that
 // "Unauthorized: invalid token" keeps its reason.
 const SENSITIVE_NAME =
-  /secret|token|passw|pwd|credential|signature|bearer|jwt|session|key/i;
+  /secret|token|pass|pwd|credential|signature|bearer|jwt|session|key|cookie|authorization|authentication/i;
 const AUTH_WORD = /(?:^|[^a-z])auth(?![a-z])/i;
-const AUTH_CAMEL = /[a-z]Auth(?![A-Za-z])/;
+const AUTH_CAMEL = /(?:^auth|Auth)(?=[A-Z]|$)/;
 const isSensitiveName = (name: string): boolean =>
   SENSITIVE_NAME.test(name) || AUTH_WORD.test(name) || AUTH_CAMEL.test(name);
 
 function redactPairs(text: string): string {
-  let out = "";
-  let copied = 0;
-  for (const match of text.matchAll(NAME_SEPARATOR)) {
-    // Inside a value already redacted.
-    if (match.index < copied) continue;
-    if (!isSensitiveName(match[1])) continue;
-    const valueStart = match.index + match[0].length;
-    VALUE.lastIndex = valueStart;
-    const valueEnd = valueStart + (VALUE.exec(text)?.[0].length ?? 0);
-    out += `${text.slice(copied, valueStart)}${REDACTED}`;
-    copied = valueEnd;
+  let redactAt: number | undefined;
+  for (const pattern of [NAME_SEPARATOR, FLAG_VALUE, XML_TAG]) {
+    for (const match of text.matchAll(pattern)) {
+      const name = match[1];
+      if (
+        !isSensitiveName(name) &&
+        !(pattern === FLAG_VALUE && /^-[pu]$/i.test(name))
+      ) {
+        continue;
+      }
+      const valueStart = match.index + match[0].length;
+      redactAt = Math.min(redactAt ?? valueStart, valueStart);
+      break;
+    }
   }
-  return out + text.slice(copied);
+  // There is no safe value delimiter in free-form diagnostic text. A bare
+  // password can contain punctuation or whitespace, and a JSON value can
+  // be an object or an array. Drop the rest rather than expose its suffix.
+  // Scan the name once, then test it in code: putting a sensitive word
+  // between two greedy identifier classes made repeated "cookie" quadratic.
+  return redactAt === undefined
+    ? text
+    : `${text.slice(0, redactAt)}${REDACTED}`;
 }
 
 /**
@@ -139,14 +165,38 @@ function redactPairs(text: string): string {
  * true when `text` is a prefix of a longer message.
  */
 function scrub(text: string, cut: boolean): string {
-  let line = text.replace(WHITESPACE, " ").replace(INVISIBLE, "");
-  line = line.replace(USERINFO, `://${REDACTED}@`);
-  if (cut) line = line.replace(OPEN_AUTHORITY, `://${REDACTED}`);
+  let line = text.replace(
+    ESCAPED_SYNTAX,
+    (_match, unicode, hex, quote, control) =>
+      quote ??
+      ESCAPED_CONTROL[control] ??
+      String.fromCharCode(parseInt(unicode ?? hex, 16)),
+  );
+  // A nested escape can reveal another encoded delimiter. Do not repeatedly
+  // decode arbitrary nesting; retain only the prefix before the ambiguity.
+  const unresolvedEscape = line.search(ESCAPED_SYNTAX);
+  if (unresolvedEscape >= 0) {
+    line = `${line.slice(0, unresolvedEscape)}${REDACTED}`;
+  }
+  // Inspect both forms: a control can be the separator after a secret flag,
+  // or sit inside a sensitive name. Deleting it first alone misses the first
+  // case; preserving it alone misses the second.
+  line = redactPairs(
+    redactPairs(line).replace(INVISIBLE, "").replace(WHITESPACE, " "),
+  );
+  line = line.replace(USERINFO, `$1${REDACTED}@`);
+  if (cut || unresolvedEscape >= 0) {
+    line = line.replace(OPEN_AUTHORITY, `$1${REDACTED}`);
+  }
   line = line.replace(QUERY, `?${REDACTED}`);
-  line = line.replace(HEADER_VALUE, `$1$2${REDACTED}`);
   line = line.replace(BEARER, `$1 ${REDACTED}`);
-  line = line.replace(JWT, REDACTED);
-  return redactPairs(line);
+  line = line.replace(TOKEN_RUN, (token) => {
+    const header = token.split(".", 1)[0];
+    return /^\s*\{/.test(Buffer.from(header, "base64url").toString("utf8"))
+      ? REDACTED
+      : token;
+  });
+  return line;
 }
 
 /** scrub() on its own, for the test that runs it over adversarial input. */
@@ -154,6 +204,30 @@ export const scrubForTesting = scrub;
 
 const maskPanelWords = (text: string): string =>
   text.replace(PANEL_WORDS, (word) => `${word.slice(0, 3)}*`);
+
+function formatListingText(raw: string): string {
+  const cut = raw.length > MAX_INPUT_CHARS;
+  const text = scrub(cut ? raw.slice(0, MAX_INPUT_CHARS) : raw, cut);
+  const clipped =
+    cut || text.length > MAX_REASON_CHARS
+      ? // The ellipsis counts toward the bound. A cut can split a surrogate
+        // pair, so the invisible pass runs again on what is left.
+        `${text.slice(0, MAX_REASON_CHARS - ELLIPSIS.length)}${ELLIPSIS}`.replace(
+          INVISIBLE,
+          "",
+        )
+      : text;
+  return maskPanelWords(clipped);
+}
+
+/** Backend-reported names are untrusted log text just like the cause. */
+export function describeListingLabel(label: string): string {
+  try {
+    return formatListingText(label);
+  } catch {
+    return UNREADABLE;
+  }
+}
 
 /** "<class>: <message>" for a rejected listing step, safe to put in one log line. */
 export function describeListingFailure(reason: unknown): string {
@@ -166,18 +240,7 @@ export function describeListingFailure(reason: unknown): string {
           ? reason
           : "";
     const raw = message ? `${cls}: ${message}` : cls;
-    const cut = raw.length > MAX_INPUT_CHARS;
-    const text = scrub(cut ? raw.slice(0, MAX_INPUT_CHARS) : raw, cut);
-    const clipped =
-      cut || text.length > MAX_REASON_CHARS
-        ? // The ellipsis counts toward the bound. A cut can split a surrogate
-          // pair, so the invisible pass runs again on what is left.
-          `${text.slice(0, MAX_REASON_CHARS - ELLIPSIS.length)}${ELLIPSIS}`.replace(
-            INVISIBLE,
-            "",
-          )
-        : text;
-    return maskPanelWords(clipped);
+    return formatListingText(raw);
   } catch {
     // A getter on the reason threw. Say so rather than drop the line.
     return UNREADABLE;

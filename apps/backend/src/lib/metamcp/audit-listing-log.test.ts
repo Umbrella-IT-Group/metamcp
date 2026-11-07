@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   describeListingFailure,
+  describeListingLabel,
   MAX_REASON_CHARS,
   scrubForTesting,
 } from "./audit-listing-log";
@@ -92,33 +93,42 @@ describe("one line, no control characters", () => {
       const text = describeListingFailure(err);
       expect(text).not.toMatch(UNSAFE);
       expect(text).not.toMatch(/[\r\n]/);
-      // A deleted control joins its neighbours; a line break becomes a space.
-      expect(text).toMatch(/^Cls(Name| Name): first(second| second)$/);
+      // Every deleted control joins its neighbours, including line breaks.
+      expect(text).toBe("ClsName: firstsecond");
     },
   );
 
   it("neutralizes the separators, terminal escapes and format characters a message can carry", () => {
     expect(describeMessage("a\nb\rc\u0085d\u2028e\u2029f")).toBe(
-      "Err*: a b c d e f",
+      "Err*: abcdef",
     );
     expect(describeMessage("\u001b[31mred\u001b[0m\u0000end")).toBe(
       "Err*: [31mred[0mend",
     );
-    // Right-to-left override and zero-width space are deleted; the BOM is
-    // whitespace to JavaScript, so it becomes a space.
-    expect(describeMessage("a\u202Eb\u200Bc\uFEFFd")).toBe("Err*: abc d");
+    // The BOM is whitespace to JavaScript, but must be deleted like the other
+    // format characters before whitespace folding can split a field name.
+    expect(describeMessage("a\u202Eb\u200Bc\uFEFFd")).toBe("Err*: abcd");
     // A forged line must not survive as a second line.
     const forged = describeMessage(
       "first\n[ERROR] 2026/11/07 | forged\r\nline",
     );
     expect(forged).not.toMatch(/[\r\n]/);
-    expect(forged).toContain("first [ERR*]");
+    expect(forged).toContain("first[ERR*]");
   });
 
   it("does not split a credential at a control character", () => {
     const text = describeMessage("password=abc\u0000def\u001bghi");
     expect(text).not.toMatch(/abc|def|ghi/);
   });
+
+  it.each(["\t", "\n", "\r", "\u0085", "\u2028", "\u2029", "\uFEFF"])(
+    "does not split a credential's field name at %j",
+    (separator) => {
+      const text = describeMessage(`pass${separator}word=SECRET`);
+      expect(text).not.toContain("SECRET");
+      expect(text).toContain("password=[redacted]");
+    },
+  );
 
   it("leaves no lone surrogate when the cut lands inside an emoji", () => {
     // 2-unit characters at every alignment of the cut.
@@ -195,7 +205,34 @@ describe("credentials", () => {
     ["kebab x-gateway-auth:", "headers x-gateway-auth: SECRET sent", "SECRET"],
     ["camel apiKey:", "config apiKey: SECRET loaded", "SECRET"],
     ["upper AUTH=", "AUTH=SECRET given", "SECRET"],
+    ["a passphrase", "passphrase=SECRET", "SECRET"],
+    ["a short password name", "db_pass=SECRET", "SECRET"],
+    ["authentication", "authentication=SECRET", "SECRET"],
+    ["a name with a JWT-like prefix", "eyJkey=SECRET", "SECRET"],
+    [
+      "a command-line secret",
+      "spawn backend --api-key SECRET --verbose",
+      "SECRET",
+    ],
+    ["a short password flag", "spawn backend -p SECRET", "SECRET"],
+    ["a flag separated by a tab", "spawn backend --token\tSECRET", "SECRET"],
+    [
+      "a flag separated by an escaped tab",
+      String.raw`spawn backend --token\tSECRET`,
+      "SECRET",
+    ],
+    [
+      "an escaped line break inside a field name",
+      String.raw`pass\nword=SECRET`,
+      "SECRET",
+    ],
+    ["curl user credentials", "curl -u user:SECRET http://host/mcp", "SECRET"],
+    ["an XML password", '<Password type="text">SECRET</Password>', "SECRET"],
+    ["a namespaced XML token", "<auth:Token>SECRET</auth:Token>", "SECRET"],
+    ["a header tuple", "headers [('x-api-key', 'SECRET')]", "SECRET"],
     ["camel gatewayAuth=", "gatewayAuth=SECRET given", "SECRET"],
+    ["camel authHeader=", "authHeader=SECRET given", "SECRET"],
+    ["camel gatewayAuthHeader=", "gatewayAuthHeader=SECRET given", "SECRET"],
     ["a JSON field, camel", 'body {"clientSecret":"SECRET","ok":1}', "SECRET"],
     [
       "a JSON field, single quotes",
@@ -229,6 +266,45 @@ describe("credentials", () => {
       'outer="password=SECRET8" after',
       "SECRET8",
     ],
+    ["a structured value", '{"password":{"value":"SECRET"}}', "SECRET"],
+    ["an array value", '{"apiKey":["SECRET"]}', "SECRET"],
+    ["escaped JSON", String.raw`body {\"client_secret\":\"SECRET\"}`, "SECRET"],
+    [
+      "a Unicode-escaped field name",
+      String.raw`body {"pass\u0077ord":"SECRET"}`,
+      "SECRET",
+    ],
+    [
+      "nested Unicode escapes",
+      String.raw`body {"pass\u005cu0077ord":"SECRET"}`,
+      "SECRET",
+    ],
+    ["userinfo without a scheme", "request //user:SECRET@host/mcp", "SECRET"],
+    [
+      "userinfo in a malformed URL with a question mark",
+      "request http://user:SECRET?tail@host",
+      "SECRET",
+    ],
+    [
+      "userinfo in a malformed URL with a fragment marker",
+      "request http://user:SECRET#tail@host",
+      "SECRET",
+    ],
+    [
+      "userinfo containing whitespace",
+      "request http://user:SECRET WITH SPACES@host",
+      "SECRET",
+    ],
+    [
+      "userinfo with JSON-escaped slashes",
+      String.raw`request http:\/\/user:SECRET@host/mcp`,
+      "SECRET",
+    ],
+    [
+      "userinfo with a nested escaped delimiter",
+      String.raw`request http://user:SECRET\u005cu0040host`,
+      "SECRET",
+    ],
     // query strings, absolute and relative
     [
       "a relative query, sessionId",
@@ -248,6 +324,7 @@ describe("credentials", () => {
       "SECRET",
     ],
     ["a query with a single parameter", "POST /cb?code=SECRET", "SECRET"],
+    ["a query value with punctuation", "GET /mcp?c=prefix)SECRET", "SECRET"],
     [
       "an absolute query, ordinary name",
       "GET http://backend:3000/sse?sid=SECRET",
@@ -299,6 +376,35 @@ describe("credentials", () => {
     expect(text).toContain("[redacted]");
   });
 
+  it.each([",", ";", "&", ")", "]", "}", '"', "'", " ", "\t", "\n"])(
+    "does not expose a bare password's suffix after %j",
+    (separator) => {
+      const text = describeMessage(`password=FIRST${separator}SECRET_SUFFIX`);
+      expect(text).not.toMatch(/FIRST|SECRET_SUFFIX/);
+      expect(text).toContain("[redacted]");
+    },
+  );
+
+  it.each([' {"alg":"HS256"}', '\n{"alg":"HS256"}', '{\n"alg":"HS256"}'])(
+    "redacts JWTs whose JSON header starts with %j",
+    (header) => {
+      const jwt = `${Buffer.from(header).toString("base64url")}.PAYLOAD.SIGNATURE1`;
+      const text = describeMessage(`upstream rejected ${jwt}`);
+      expect(text).not.toContain("SIGNATURE1");
+      expect(text).not.toContain(Buffer.from(header).toString("base64url"));
+      expect(text).toContain("[redacted]");
+    },
+  );
+
+  it("scrubs and bounds a backend-reported label too", () => {
+    expect(describeListingLabel("bad__name\npassword=SECRET")).toBe(
+      "bad__namepassword=[redacted]",
+    );
+    expect(describeListingLabel("x".repeat(10_000))).toHaveLength(
+      MAX_REASON_CHARS,
+    );
+  });
+
   it("redacts to the last @ of the authority, and only the authority", () => {
     expect(describeMessage("http://svc:pa@SECRET11@host/mcp")).toBe(
       "Err*: http://[redacted]@host/mcp",
@@ -333,6 +439,8 @@ describe("a message longer than the read bound", () => {
   it.each([
     ["userinfo whose @ is past the cut", "x://user:"],
     ["a bare value", "token="],
+    ["a command-line flag", "spawn backend --token "],
+    ["an XML password", "<Password>"],
     ["a quoted value", 'password="'],
     ["a query string", "GET /mcp?key="],
     ["a bearer token", "Authorization: Bearer "],
@@ -386,6 +494,8 @@ describe("cost", () => {
     bearer: "Bearer ".repeat(28_572),
     cookie: "cookie=".repeat(28_572),
     authorization: "authorization: ".repeat(13_334),
+    "cookie in one identifier": "cookie".repeat(33_334),
+    "authorization in one identifier": "authorization".repeat(15_385),
     "jwt prefix": "eyJ".repeat(66_667),
     escapes: "\u001b".repeat(200_000),
     backslashes: "\\".repeat(200_000),
