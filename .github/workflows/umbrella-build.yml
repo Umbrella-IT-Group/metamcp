@@ -3,7 +3,11 @@ name: Umbrella — Build & Push (umbrella branch)
 # Umbrella IT Group fork — see UMBRELLA_FORK.md.
 # Builds and publishes the deployable line on every push to `umbrella`.
 # Image lands at ghcr.io/umbrella-it-group/metamcp:<sha> + :latest.
-# Watchtower on the deploy host (scope=umbrella) picks up :latest within ~5 min.
+# Publishing does not deploy. Watchtower is off for the gateway, and the deploy
+# host runs an image digest pinned in Umbrella-MCP-Server
+# (metamcp/compose.fragment.yml). That repo's metamcp-image-bump.yml resolves
+# the current :latest digest and opens a bump PR; nothing running changes until
+# that PR is reviewed and merged.
 #
 # Also runs build-only (no login, no push, no tags) on PRs targeting
 # `umbrella` — this is the only build check a PR gets before merge. Until
@@ -154,8 +158,34 @@ jobs:
           cache-from: type=gha,scope=metamcp-umbrella
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=metamcp-umbrella' || '' }}
 
-      - uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
+      # Attestation talks to Sigstore (Fulcio and the Rekor transparency log),
+      # which answers an occasional transient 500. Run 578 failed only here with
+      # `error creating tlog entry - (500) unexpected result from transparency
+      # log` after the image was built and pushed, and the next run passed. The
+      # first attempt therefore must not fail the job on its own: it is
+      # `continue-on-error`, and the step after it retries once, only if this one
+      # failed. A persistent failure still fails the job (the retry has no
+      # `continue-on-error`). Nothing in the deploy verifies attestations (the
+      # gateway is digest-pinned), so a lost attestation costs provenance, not
+      # availability, which is why one retry is the bound. Same action pin on both.
+      - id: attest
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
         if: github.event_name == 'push'
+        continue-on-error: true
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Wait before retrying attestation
+        if: github.event_name == 'push' && steps.attest.outcome == 'failure'
+        run: |
+          echo "::warning::attest-build-provenance failed (Sigstore transient?); retrying once in 30s"
+          sleep 30
+
+      - name: Attest build provenance (retry)
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
+        if: github.event_name == 'push' && steps.attest.outcome == 'failure'
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
