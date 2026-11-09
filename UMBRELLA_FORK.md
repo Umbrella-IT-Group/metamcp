@@ -221,14 +221,18 @@ Cadence: monthly minimum, or whenever a real upstream commit lands that we want.
 
 ## Build + deploy
 
-`umbrella` is built by `.github/workflows/umbrella-build.yml`. Push events to `umbrella` build **and publish** — login, tag `ghcr.io/umbrella-it-group/metamcp:<sha>` + `:latest`, push, and attest all run. Pull-request events into `umbrella` run the same job as a **check only**: `docker/login-action`, `docker/metadata-action`, and `attest-build-provenance` are skipped, `build-push-action` runs with `push: true` only on the push path (`push: false` on PRs), proving the Dockerfile still builds without publishing or touching the registry. (This PR-check path only exists as of PR #63, 2026-07-13 — before that fix the job's `if` matched `push` only, so the `pull_request` trigger existed but silently never fired; see the cherry-pick log below.) Pinned in the deploy host's compose fragment. Watchtower (with `scope=umbrella` label) auto-updates the running container within ~5 min of an image push.
+`umbrella` is built by `.github/workflows/umbrella-build.yml`. Push events to `umbrella` build **and publish** — login, tag `ghcr.io/umbrella-it-group/metamcp:<sha>` + `:latest`, push, and attest all run. Pull-request events into `umbrella` run the same job as a **check only**: `docker/login-action`, `docker/metadata-action`, and `attest-build-provenance` are skipped, `build-push-action` runs with `push: true` only on the push path (`push: false` on PRs), proving the Dockerfile still builds without publishing or touching the registry. (This PR-check path only exists as of PR #63, 2026-07-13 — before that fix the job's `if` matched `push` only, so the `pull_request` trigger existed but silently never fired; see the cherry-pick log below.) Publishing does not deploy. The gateway is not on Watchtower (its compose service carries `com.centurylinklabs.watchtower.enable=false`), and the deploy host runs an image pinned by digest (`ghcr.io/umbrella-it-group/metamcp@sha256:...`) in the Umbrella-MCP-Server repo's `metamcp/compose.fragment.yml`. A newly published `:latest` changes nothing that is running until a reviewed PR in that repo bumps the pin.
 
-To deploy a hotfix:
+To deploy a hotfix (or any gateway change):
 
 1. Branch off `umbrella`, commit, push, open PR against `umbrella`, get review, squash-merge.
-2. CI builds `:latest` automatically.
-3. Watchtower polls every 5 min; container restart picks up the new image.
-4. If you need it instantly, run `docker compose up -d --no-deps metamcp` on the deploy host.
+2. CI builds and publishes `:<sha>` and `:latest` when the merge touches a path the build workflow watches (a docs-only merge builds nothing). The running gateway does not change.
+3. In Umbrella-MCP-Server, `.github/workflows/metamcp-image-bump.yml` runs every 30 minutes (and on demand via `workflow_dispatch`), sees that `:latest` differs from the digest pinned in `metamcp/compose.fragment.yml`, and opens or updates a single bump PR (`bump/metamcp-image`) against `main` with the new digest and the fork commit it was built from.
+4. Review and merge the bump PR. Its required `detect-mcps` check must be green before it can merge.
+5. The deploy host applies the merge through `umbrella-sync`, a pull-only timer (about every 2 minutes) that resets the host's checkout to `main` and runs `docker compose up -d`, recreating the gateway on the new digest. There is no hand `docker compose up` step: nothing is pushed to the host, and the next sync resets any manual change to what `main` says.
+6. To roll back, revert the bump PR; the same path applies the revert.
+
+The Umbrella-MCP-Server docs (`docs/architecture.md`, "Gateway image deploy path") hold the host side of this.
 
 ### Repo visibility (operator standing decision, 2026-07-21)
 
