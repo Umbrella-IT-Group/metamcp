@@ -456,7 +456,7 @@ describe(
     timeout: 15_000,
   },
   () => {
-    it("answers a ping and an unsupported request on the standing stream with no token while another user's call is in flight, and that call completes", async () => {
+    it("answers a ping and an unsupported request on the standing stream with no token while a tool call is in flight on a handed-off connection, and that call completes", async () => {
       const { client, sessionId } = await connectAs("user-a");
 
       const result = await runWithM365UserContext({ userId: "user-b" }, () =>

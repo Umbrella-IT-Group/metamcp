@@ -876,7 +876,7 @@ describe("api-keys update — admin ownership bypass", () => {
 // member's session. Every member request with `is_active: true` is refused
 // before any write, without reading the key's current state first, so a stale
 // form or a race with an administrator's deactivation cannot slip through.
-describe("api-keys update — re-activation is administrator-only", () => {
+describe("api-keys update: re-activation is administrator-only", () => {
   const row = (isActive: boolean) => ({
     uuid: "k",
     name: "renamed",
