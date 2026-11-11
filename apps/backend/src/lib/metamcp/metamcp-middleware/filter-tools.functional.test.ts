@@ -407,7 +407,7 @@ describe("#364: a server prefix means a server MOUNTED in this namespace", () =>
     );
   });
 
-  it("every server lookup is scoped by this namespace", async () => {
+  it("every server lookup is scoped by this namespace and its ACTIVE mounts", async () => {
     twoGithubs("allow_all");
     await listNames(["github__delete_repo"]);
     await callTool("github__delete_repo");
@@ -418,6 +418,7 @@ describe("#364: a server prefix means a server MOUNTED in this namespace", () =>
       expect(lookup.where).toEqual({
         "nsm.namespace_uuid": NS,
         "servers.name": "github",
+        "nsm.status": "ACTIVE",
       });
     }
   });
@@ -468,5 +469,113 @@ describe("#364: a server prefix means a server MOUNTED in this namespace", () =>
     ]);
     expect((await callTool("github__read")).handler).toHaveBeenCalledTimes(1);
     expect((await callTool("github__write")).handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("the mount status is part of the verdict", () => {
+  /** SRV mounted in NS with the given mount status, its tool curated ACTIVE. */
+  function mounted(status: "ACTIVE" | "INACTIVE") {
+    curate("allow_all", [{ tool: "mytool", status: "ACTIVE" }]);
+    state.mounts = [{ namespaceUuid: NS, serverUuid: SRV.uuid, status }];
+  }
+
+  const callWithScope = async (includeInactiveMounts?: boolean) => {
+    const handler = vi.fn(async () => ({
+      content: [{ type: "text" as const, text: "ok" }],
+    }));
+    const result = await createFilterCallToolMiddleware({
+      cacheEnabled: false,
+      includeInactiveMounts,
+      customErrorMessage: (toolName, reason) =>
+        `Access denied to tool "${toolName}": ${reason}`,
+    })(handler)(
+      {
+        method: "tools/call" as const,
+        params: { name: TOOL_NAME, arguments: {} },
+      },
+      context,
+    );
+    return {
+      handler,
+      text: (result.content as Array<{ text?: string }>)[0]?.text,
+    };
+  };
+
+  it("an INACTIVE mount is neither listed nor callable, even with an ACTIVE tool row", async () => {
+    mounted("INACTIVE");
+    expect(await listNames()).toEqual([]);
+    const { handler, text } = await callTool();
+    expect(handler).not.toHaveBeenCalled();
+    expect(text).toBe(
+      `Access denied to tool "${TOOL_NAME}": server could not be resolved`,
+    );
+  });
+
+  it("the same server's mount switched back to ACTIVE is served again on the next call", async () => {
+    mounted("INACTIVE");
+    expect((await callTool()).handler).not.toHaveBeenCalled();
+    mounted("ACTIVE");
+    expect((await callTool()).handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("a status change applies to the very next call with the caches enabled", async () => {
+    mounted("ACTIVE");
+    expect((await callTool(TOOL_NAME, true)).handler).toHaveBeenCalledTimes(1);
+    // No cache is cleared here: the mount read is not cached.
+    state.mounts = [
+      { namespaceUuid: NS, serverUuid: SRV.uuid, status: "INACTIVE" },
+    ];
+    expect((await callTool(TOOL_NAME, true)).handler).not.toHaveBeenCalled();
+  });
+
+  it("the verdict binds only the ACTIVE one of two same-named mounts", async () => {
+    const OTHER = { uuid: "srv-other", name: SRV.name };
+    curate("allow_all");
+    state.servers = [SRV, OTHER];
+    state.mounts = [
+      { namespaceUuid: NS, serverUuid: SRV.uuid, status: "INACTIVE" },
+      { namespaceUuid: NS, serverUuid: OTHER.uuid, status: "ACTIVE" },
+    ];
+    let bound: readonly string[] | undefined;
+    await createFilterCallToolMiddleware({ cacheEnabled: false })(
+      async (_request, callContext) => {
+        bound = (callContext as { allowedToolServerUuids?: readonly string[] })
+          .allowedToolServerUuids;
+        return { content: [] };
+      },
+    )(
+      {
+        method: "tools/call" as const,
+        params: { name: TOOL_NAME, arguments: {} },
+      },
+      context,
+    );
+    expect(bound).toEqual([OTHER.uuid]);
+  });
+
+  it("the admin include-inactive scope judges an INACTIVE mount by its tool rows", async () => {
+    mounted("INACTIVE");
+    expect((await callWithScope(true)).handler).toHaveBeenCalledTimes(1);
+    const listed = await createFilterListToolsMiddleware({
+      cacheEnabled: false,
+      includeInactiveMounts: true,
+    })(async () => ({ tools: [toolNamed(TOOL_NAME)] }))(listRequest, context);
+    expect(listed.tools.map((tool) => tool.name)).toEqual([TOOL_NAME]);
+  });
+
+  it("the default scope is the public one", async () => {
+    mounted("INACTIVE");
+    expect((await callWithScope(undefined)).handler).not.toHaveBeenCalled();
+    expect((await callWithScope(false)).handler).not.toHaveBeenCalled();
+  });
+
+  it("a failed mount read refuses the call and reaches no handler", async () => {
+    mounted("ACTIVE");
+    state.failOn = { servers: true };
+    const { handler, text } = await callTool();
+    expect(handler).not.toHaveBeenCalled();
+    expect(text).toBe(
+      `Access denied to tool "${TOOL_NAME}": tool status could not be verified`,
+    );
   });
 });

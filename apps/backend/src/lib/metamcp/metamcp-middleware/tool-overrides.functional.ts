@@ -225,9 +225,13 @@ async function getToolOverrides(
     // metatool-ai/metamcp#364, see namespace-server-lookup.ts). Resolved by
     // name alone, the lookup could land on another owner's same-named server,
     // find no mapping row there, and silently drop this namespace's override.
+    // Every mount, whatever its status: this only maps an alias to its tool.
+    // The filter, composed inside this middleware, decides whether an INACTIVE
+    // mount may serve it.
     const serverUuids = await findNamespaceServerUuidsByName(
       namespaceUuid,
       serverName,
+      "any",
     );
 
     if (serverUuids.length !== 1) {

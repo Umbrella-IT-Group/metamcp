@@ -69,6 +69,7 @@ import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
 } from "./metamcp-middleware/tool-overrides.functional";
+import { onNamespaceMountChange } from "./namespace-mount-events";
 import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
@@ -359,7 +360,37 @@ export const createServer = async (
     }
     registeredSubscriptions.clear();
     stopOwedServerWatches();
+    stopMountChangeListener();
   };
+
+  /**
+   * A server's mount status changed in this namespace (namespace-mount-events
+   * .ts). Drop every route this session holds to that server and tell the
+   * client to re-list. The per-call filter already refuses an INACTIVE mount
+   * (namespace-server-lookup.ts), so this is not what enforces the change; it
+   * keeps the session from holding a route to a disabled mount and its client
+   * from offering tools that are now refused. The pooled backend client is
+   * left alone: another namespace may still mount the server ACTIVE.
+   * A proxy with no connected client (an idle or OpenAPI instance) has no one
+   * to notify, so it only drops its routes.
+   */
+  const stopMountChangeListener = onNamespaceMountChange(
+    namespaceUuid,
+    (mcpServerUuid) => {
+      for (const [toolName, routedUuid] of Object.entries(toolToServerUuid)) {
+        if (routedUuid === mcpServerUuid) {
+          delete toolToServerUuid[toolName];
+          delete toolToClient[toolName];
+        }
+      }
+      for (const [toolName, owner] of toolNameOwner) {
+        if (owner.uuid === mcpServerUuid) toolNameOwner.delete(toolName);
+      }
+      if (!proxyClosed && server.transport !== undefined) {
+        void emitToolListChanged(mcpServerUuid);
+      }
+    },
+  );
 
   // Create the handler context
   const handlerContext: MetaMCPHandlerContext = {
@@ -1314,7 +1345,12 @@ export const createServer = async (
       cacheEnabled: true,
       persistentCacheOnListTools: true,
     }),
-    createFilterListToolsMiddleware({ cacheEnabled: true }),
+    // Same mount scope as the listing above: public sessions judge ACTIVE
+    // mounts only, the admin Inspector's include-inactive mode judges all.
+    createFilterListToolsMiddleware({
+      cacheEnabled: true,
+      includeInactiveMounts: includeInactiveServers,
+    }),
     // Add more middleware here as needed
     // createLoggingMiddleware(),
     // createRateLimitingMiddleware(),
@@ -1377,8 +1413,15 @@ export const createServer = async (
     // so the filter sees exactly the name it saw before; an alias call is
     // refused with the same text its real name gets (it names the real tool).
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // The mount status is part of this verdict: a public session's call to a
+    // server whose mount is INACTIVE is refused here even when the session
+    // still holds a route to it from an earlier listing, and the handler then
+    // drops that route (allowedToolServerUuids). Only the admin Inspector's
+    // explicit include-inactive mode judges INACTIVE mounts; a public request
+    // has no way to select it (createServer's caller decides).
     createFilterCallToolMiddleware({
       cacheEnabled: true,
+      includeInactiveMounts: includeInactiveServers,
       customErrorMessage: (toolName, reason) =>
         `Access denied to tool "${toolName}": ${reason}`,
     }),
