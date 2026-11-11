@@ -2,16 +2,19 @@
  * /oauth/introspect and /oauth/revoke — failure-only rate limiting, and the
  * RFC 7009 client match on revocation.
  *
- * THE REGRESSION TEST IS THE POINT OF THIS FILE. Both endpoints are
- * unauthenticated, so the obvious hardening is a per-IP limiter — and on this
- * deployment that would be a self-inflicted outage rather than a control:
- * `trust proxy` is deliberately off, so every caller arriving through the
- * tunnel shares ONE `req.ip` bucket, and throttling that bucket throttles the
- * whole organisation at once. The limiter added here counts only tokens that
- * resolve to nothing, so a caller holding a real token can hammer either
+ * THE REGRESSION TEST IS THE POINT OF THIS FILE. Revocation takes no
+ * credential and introspection's credential check runs after the limiter, so
+ * the limiter is what bounds unresolvable tokens. It counts only tokens that
+ * resolve to nothing, so a caller holding a real token can call either
  * endpoint indefinitely and must never see a 429. That is asserted first, from
- * a SINGLE ip, because sharing one bucket is exactly the condition under which
- * a naive limiter fails.
+ * a SINGLE address, because many requests sharing one bucket is exactly the
+ * condition under which a request-counting limiter fails.
+ *
+ * The budget is keyed per edge client address (CF-Connecting-IP), falling back
+ * to `req.ip` when that header is absent or blank; see
+ * getPublicOAuthRateLimitIdentifier in lib/auth-rate-limiter. Most blocks below
+ * send no edge header, so the fallback `req.ip` is the bucket under test; the
+ * keying block at the end drives the edge header itself.
  *
  * The handlers are module-private, so the router is driven directly as express
  * middleware against fake req/res — same harness as token.test.ts, with one
@@ -66,6 +69,7 @@ vi.mock("./introspection-auth", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+const { requireIntrospectionCredential } = await import("./introspection-auth");
 
 const CLIENT_ID = "mcp_client_test";
 const OTHER_CLIENT_ID = "mcp_client_someone_else";
@@ -127,16 +131,18 @@ function makeRes(): FakeRes {
 async function post(
   body: Record<string, unknown>,
   path: string,
+  options: { headers?: Record<string, string>; ip?: string } = {},
 ): Promise<FakeRes> {
+  const ip = options.ip ?? currentIp;
   const req = {
     method: "POST",
     url: path,
     originalUrl: path,
     baseUrl: "",
     body,
-    headers: {},
-    ip: currentIp,
-    socket: { remoteAddress: currentIp },
+    headers: options.headers ?? {},
+    ip,
+    socket: { remoteAddress: ip },
   } as unknown as express.Request;
   const res = makeRes();
 
@@ -173,14 +179,15 @@ beforeEach(() => {
   oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
 });
 
-// 20 failures per minute is the shared limiter's budget; well past it.
+// 20 failures per minute per (address, route) is the limiter's budget; well
+// past it.
 const OVER_THE_LIMIT = 25;
 
 describe("POST /oauth/introspect — a real token is never throttled", () => {
   it("answers 200 active:true to the SAME token from the SAME ip 25 times", async () => {
-    // The whole-organisation outage guard. Every OAuth-authenticated MCP
-    // request used to introspect, all of them from one shared `req.ip`, so a
-    // limiter that counted successes would have taken the gateway down.
+    // The success-path guard. Every OAuth-authenticated MCP request used to
+    // introspect, many of them from one address, so a limiter that counted
+    // successes would have refused the gateway's own traffic.
     oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
 
     const statuses: number[] = [];
@@ -197,9 +204,9 @@ describe("POST /oauth/introspect — a real token is never throttled", () => {
   it("leaves the bucket empty, so a later wrong guess is not already refused", async () => {
     // The success path must not merely avoid 429 for itself — it must leave
     // NOTHING behind. A limiter whose successes accumulated silently would
-    // pass the assertion above and still refuse the next caller on the shared
-    // ip. Proved by spending only ONE failure afterwards and expecting it to
-    // be answered normally.
+    // pass the assertion above and still refuse the next caller on the same
+    // address. Proved by spending only ONE failure afterwards and expecting it
+    // to be answered normally.
     oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
     for (let i = 0; i < OVER_THE_LIMIT; i += 1) {
       await post({ token: LIVE_TOKEN }, "/oauth/introspect");
@@ -214,9 +221,9 @@ describe("POST /oauth/introspect — a real token is never throttled", () => {
 
   it("ACCEPTED TRADEOFF: a real token IS refused from an ip already over budget", async () => {
     // Stated as a test rather than left implicit, because it is the one way
-    // this limiter can hurt a legitimate caller: the bucket is per-ip and
-    // `trust proxy` is off, so an abuser sharing the address takes the
-    // endpoint down for everyone on it. It is tolerable only because the
+    // this limiter can refuse a legitimate token: the bucket is per address,
+    // so once an address has spent its budget, every request from it is
+    // refused for the rest of the window. It is tolerable because the
     // gateway's own traffic no longer arrives here at all — the middleware
     // reads the token row in-process (api-key-oauth.middleware.ts) — so
     // nothing on the MCP data plane depends on this endpoint answering.
@@ -234,7 +241,7 @@ describe("POST /oauth/introspect — a real token is never throttled", () => {
   it("does not count a DISABLED account's token against the budget", async () => {
     // A real credential, refused for a reason that is not the caller's doing.
     // Counting it would let one locked-out account's still-running client
-    // spend the shared bucket and refuse everybody else.
+    // spend the budget of everyone sharing its address.
     oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
     usersRepositoryMock.isDisabled.mockResolvedValue(true);
 
@@ -414,5 +421,221 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
     expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
       LIVE_TOKEN,
     );
+  });
+});
+
+/**
+ * Keying on the edge client address.
+ *
+ * Behind the tunnel every request reaches this router with the same `req.ip`
+ * (`trust proxy` is off), so these cases put several edge addresses on ONE
+ * `req.ip` and check that each gets its own budget. The budget arithmetic is
+ * pinned exactly (twenty failures answered, the twenty-first refused) because
+ * re-keying is only useful if the per-client allowance stays where it was.
+ */
+describe("POST /oauth/introspect and /oauth/revoke: budgets keyed on the edge client address", () => {
+  /** The in-container address every tunnelled request arrives from. */
+  const TUNNEL_IP = "127.0.0.1";
+  const BUDGET = 20;
+
+  // Distinct per call, so no case starts on a bucket another case spent: the
+  // limiter is module-scoped and its window is a minute.
+  let edgeCounter = 0;
+  const freshEdgeIp = () => {
+    edgeCounter += 1;
+    return `2001:db8::${edgeCounter.toString(16)}`;
+  };
+  const fromEdge = (edgeIp: string) => ({
+    headers: { "cf-connecting-ip": edgeIp },
+    ip: TUNNEL_IP,
+  });
+
+  /** One failed lookup on `route` from `edgeIp`; returns the status. */
+  const failOnce = async (
+    route: "/oauth/introspect" | "/oauth/revoke",
+    options: { headers?: Record<string, string>; ip?: string },
+    n: number,
+  ): Promise<number> => {
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
+    return (await post({ token: `mcp_token_unknown_${n}` }, route, options))
+      .statusCode;
+  };
+
+  it("gives two edge addresses sharing one req.ip separate introspect budgets", async () => {
+    const first = fromEdge(freshEdgeIp());
+    const second = fromEdge(freshEdgeIp());
+
+    for (let i = 0; i < BUDGET; i += 1) {
+      expect(await failOnce("/oauth/introspect", first, i)).toBe(200);
+    }
+    expect(await failOnce("/oauth/introspect", first, BUDGET)).toBe(429);
+
+    // The other client on the same req.ip is untouched: its first failure is
+    // answered normally and its real token is served.
+    expect(await failOnce("/oauth/introspect", second, 0)).toBe(200);
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
+    const live = await post({ token: LIVE_TOKEN }, "/oauth/introspect", second);
+    expect(live.statusCode).toBe(200);
+    expect(live.body).toMatchObject({ active: true, sub: USER_ID });
+  });
+
+  it("gives two edge addresses sharing one req.ip separate revoke budgets", async () => {
+    const first = fromEdge(freshEdgeIp());
+    const second = fromEdge(freshEdgeIp());
+
+    for (let i = 0; i < BUDGET; i += 1) {
+      expect(await failOnce("/oauth/revoke", first, i)).toBe(200);
+    }
+    expect(await failOnce("/oauth/revoke", first, BUDGET)).toBe(429);
+
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
+    const live = await post({ token: LIVE_TOKEN }, "/oauth/revoke", second);
+    expect(live.statusCode).toBe(200);
+    expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
+      LIVE_TOKEN,
+    );
+  });
+
+  it.each(["/oauth/introspect", "/oauth/revoke"] as const)(
+    "%s answers the 20th failure from one edge address and refuses the 21st",
+    async (route) => {
+      const client = fromEdge(freshEdgeIp());
+
+      for (let i = 0; i < BUDGET - 1; i += 1) {
+        expect(await failOnce(route, client, i)).toBe(200);
+      }
+      // The 20th is still inside the budget; refusing it would be the
+      // double-count off-by-one the limiter's read-only check exists to avoid.
+      expect(await failOnce(route, client, BUDGET - 1)).toBe(200);
+      expect(await failOnce(route, client, BUDGET)).toBe(429);
+      // And it stays refused for the rest of the window.
+      expect(await failOnce(route, client, BUDGET + 1)).toBe(429);
+    },
+  );
+
+  it("does no credential or database work for a refused introspect", async () => {
+    const client = fromEdge(freshEdgeIp());
+    for (let i = 0; i < BUDGET; i += 1) {
+      await failOnce("/oauth/introspect", client, i);
+    }
+    vi.mocked(requireIntrospectionCredential).mockClear();
+    oauthRepositoryMock.getAccessToken.mockClear();
+    usersRepositoryMock.isDisabled.mockClear();
+
+    const refused = await post(
+      { token: "mcp_token_after_budget" },
+      "/oauth/introspect",
+      client,
+    );
+
+    expect(refused.statusCode).toBe(429);
+    expect(refused.body).toMatchObject({ error: "too_many_requests" });
+    expect(requireIntrospectionCredential).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.getAccessToken).not.toHaveBeenCalled();
+    expect(usersRepositoryMock.isDisabled).not.toHaveBeenCalled();
+  });
+
+  it("does no database work for a refused revoke", async () => {
+    const client = fromEdge(freshEdgeIp());
+    for (let i = 0; i < BUDGET; i += 1) {
+      await failOnce("/oauth/revoke", client, i);
+    }
+    oauthRepositoryMock.getAccessToken.mockClear();
+    oauthRepositoryMock.getByRefreshToken.mockClear();
+
+    const refused = await post(
+      { token: "mcp_token_after_budget" },
+      "/oauth/revoke",
+      client,
+    );
+
+    expect(refused.statusCode).toBe(429);
+    expect(oauthRepositoryMock.getAccessToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.getByRefreshToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+  });
+
+  it("keeps introspect and revoke on separate budgets for one edge address", async () => {
+    const client = fromEdge(freshEdgeIp());
+    for (let i = 0; i < BUDGET; i += 1) {
+      await failOnce("/oauth/introspect", client, i);
+    }
+    expect(await failOnce("/oauth/introspect", client, BUDGET)).toBe(429);
+
+    // The same client's revoke budget is untouched, in both directions.
+    for (let i = 0; i < BUDGET; i += 1) {
+      expect(await failOnce("/oauth/revoke", client, i)).toBe(200);
+    }
+    expect(await failOnce("/oauth/revoke", client, BUDGET)).toBe(429);
+  });
+
+  it("does not count successes: a client's real tokens leave its whole budget intact", async () => {
+    const client = fromEdge(freshEdgeIp());
+    oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
+    for (let i = 0; i < OVER_THE_LIMIT; i += 1) {
+      const res = await post(
+        { token: LIVE_TOKEN },
+        "/oauth/introspect",
+        client,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toMatchObject({ active: true });
+    }
+
+    // All twenty failures are still available after the successes.
+    for (let i = 0; i < BUDGET; i += 1) {
+      expect(await failOnce("/oauth/introspect", client, i)).toBe(200);
+    }
+    expect(await failOnce("/oauth/introspect", client, BUDGET)).toBe(429);
+  });
+
+  it("falls back to req.ip when the edge header is absent", async () => {
+    // Direct-to-origin and local development carry no edge header. The key
+    // is then req.ip, so two such callers on different addresses still get
+    // separate budgets, and a request on the same req.ip shares the spent one.
+    const spentIp = currentIp;
+    for (let i = 0; i < BUDGET; i += 1) {
+      await failOnce("/oauth/introspect", { ip: spentIp }, i);
+    }
+    expect(await failOnce("/oauth/introspect", { ip: spentIp }, BUDGET)).toBe(
+      429,
+    );
+
+    expect(await failOnce("/oauth/introspect", { ip: "192.0.2.200" }, 0)).toBe(
+      200,
+    );
+    // An edge-attributed request on the spent req.ip keys on its edge
+    // address, not on req.ip, so it is not refused.
+    expect(
+      await failOnce(
+        "/oauth/introspect",
+        { headers: { "cf-connecting-ip": freshEdgeIp() }, ip: spentIp },
+        0,
+      ),
+    ).toBe(200);
+  });
+
+  it("treats a blank edge header as absent and keys on req.ip", async () => {
+    const spentIp = currentIp;
+    for (let i = 0; i < BUDGET; i += 1) {
+      await failOnce(
+        "/oauth/revoke",
+        { headers: { "cf-connecting-ip": "   " }, ip: spentIp },
+        i,
+      );
+    }
+
+    // The blank-header failures landed in the req.ip bucket: a header-less
+    // request on the same req.ip is now refused with them.
+    expect(await failOnce("/oauth/revoke", { ip: spentIp }, BUDGET)).toBe(429);
+    expect(
+      await failOnce(
+        "/oauth/revoke",
+        { headers: { "cf-connecting-ip": "" }, ip: spentIp },
+        BUDGET + 1,
+      ),
+    ).toBe(429);
   });
 });

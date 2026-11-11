@@ -12,11 +12,7 @@ import {
   declaredLengthGuard,
   globalBodyParser,
 } from "./lib/global-body-parser";
-import {
-  buildUpstreamHealthBody,
-  buildUpstreamHealthErrorBody,
-  isAdminHealthRequest,
-} from "./lib/health-upstream";
+import { createUpstreamHealthHandler } from "./lib/health-upstream-handler";
 import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
@@ -228,10 +224,11 @@ async function start(): Promise<void> {
   // than auto-migrated.
   await warnOnUnpairedRestrictedEndpoints();
 
-  // One boot-time signal for the staged rollout of the gateway backend trust
-  // header: absent secret means backends receive no X-Gateway-Auth yet. Kept
-  // near the other boot warnings so the gateway's posture is legible from the
-  // boot log rather than something to prove by hand.
+  // One boot-time signal for the gateway backend trust header: an absent or
+  // short secret means backends receive no X-Gateway-Auth, and backends that
+  // require it refuse every request but their health check. Kept near the
+  // other boot warnings so the gateway's posture is legible from the boot log
+  // rather than something to prove by hand.
   warnIfGatewayBackendSecretUnset();
 
   // One boot-time signal when the admin-plane (control-plane) bearer path has
@@ -322,7 +319,8 @@ app.get("/health", (req, res) => {
 // not just whether the gateway process is alive. Docker healthcheck
 // keeps using the cheap /health above; this is the operational view.
 //
-// Returns 200 always. The aggregate `healthy` boolean tells the prober
+// Returns 200 on every computed rollup (a constant 500 only when the rollup
+// itself fails). The aggregate `healthy` boolean tells the prober
 // whether to alarm; the per-server detail tells the operator where to
 // look when it flips. Status returns 200 not 503 because liveness is
 // distinct from rollup health — Kubernetes-style probes can map both.
@@ -331,104 +329,11 @@ app.get("/health", (req, res) => {
 // that decision (and is tested). The liveness rollup stays unauthenticated
 // because that is what external probes consume and gating it would break
 // them; `servers` and `pool` are admin-only.
-app.get("/health/upstream", async (req, res) => {
-  try {
-    const { mcpServersRepository } = await import("./db/repositories");
-    const { mcpServerPool } = await import("./lib/metamcp/mcp-server-pool");
-    const { serverErrorTracker } = await import(
-      "./lib/metamcp/server-error-tracker"
-    );
-
-    const servers = await mcpServersRepository.findAll();
-    const pool = mcpServerPool.getPoolStatus();
-    const poolConfig = mcpServerPool.getPoolConfig();
-    const perServer = pool.perServerCounts ?? {};
-    const lastFailureAt = pool.lastConnectFailureAt ?? {};
-    const lastSuccessAt = pool.lastConnectSuccessAt ?? {};
-    const pingFailures = pool.pingFailures ?? {};
-
-    const details = await Promise.all(
-      servers.map(async (s) => {
-        const inError = await serverErrorTracker.isServerInErrorState(s.uuid);
-        const connectionCount = perServer[s.uuid] ?? 0;
-        const failedAt = lastFailureAt[s.uuid];
-        const succeededAt = lastSuccessAt[s.uuid];
-        // A server is "reachable" unless (a) the ERROR circuit breaker
-        // tripped, or (b) it holds zero live connections AND its most
-        // recent connect attempt failed (the pool clears the failure
-        // stamp on every successful connect). Case (b) is how a
-        // hard-down HTTP/SSE backend looks — those never trip ERROR
-        // because crash counting is STDIO-only. Zero connections with
-        // NO failure stamp is just lazy cold-start: not unhealthy.
-        const reachable =
-          !inError && !(connectionCount === 0 && failedAt !== undefined);
-        return {
-          uuid: s.uuid,
-          name: s.name,
-          in_error: inError,
-          connection_count: connectionCount,
-          reachable,
-          last_connect_failure_at: failedAt
-            ? new Date(failedAt).toISOString()
-            : null,
-          last_connect_success_at: succeededAt
-            ? new Date(succeededAt).toISOString()
-            : null,
-          ping_failures: pingFailures[s.uuid] ?? 0,
-        };
-      }),
-    );
-
-    const totalServers = details.length;
-    const errored = details.filter((d) => d.in_error).length;
-    const unreachable = details.filter((d) => !d.reachable).length;
-    const healthy = unreachable === 0;
-
-    const isAdmin = await isAdminHealthRequest(req);
-
-    res.json(
-      buildUpstreamHealthBody(
-        {
-          healthy,
-          total_servers: totalServers,
-          errored_servers: errored,
-          unreachable_servers: unreachable,
-        },
-        isAdmin
-          ? {
-              pool: {
-                idle: pool.idle,
-                active: pool.active,
-                pending: pool.pending ?? 0,
-                // pending-inclusive so `total` matches what
-                // canCreateConnection's MAX_TOTAL_CONNECTIONS check actually
-                // compares against (getTotalConnectionCount =
-                // idle+active+pending) — a total that silently dropped
-                // in-flight idle creations would read below the cap while the
-                // pool itself refuses new connections at it (2026-07-14 audit
-                // finding).
-                total: pool.idle + pool.active + (pool.pending ?? 0),
-                // Effective caps the pool actually enforces (from
-                // getPoolConfig, the single source of truth), NOT a re-parse
-                // of env with local defaults. The prior payload reported only
-                // the per-server cap and never the global cap, so an operator
-                // debugging saturation could not see it.
-                max_connections_per_server: poolConfig.maxConnectionsPerServer,
-                max_total_connections: poolConfig.maxTotalConnections,
-              },
-              servers: details,
-            }
-          : null,
-      ),
-    );
-  } catch (error) {
-    // Logged here, never serialised: the body is the constant from
-    // ./lib/health-upstream, because this endpoint answers unauthenticated
-    // callers and a driver error's message names internal hosts and SQL.
-    logger.error("/health/upstream failed:", error);
-    res.status(500).json(buildUpstreamHealthErrorBody());
-  }
-});
+//
+// The handler, its rollup arithmetic and the ten-second cache of the
+// anonymous rollup live in ./lib/health-upstream-handler, which is tested;
+// this file cannot be imported by a test because it listens at load.
+app.get("/health/upstream", createUpstreamHealthHandler());
 
 // LAST registration in this file, and it has to stay last. Express dispatches
 // error middleware in registration order, so one mounted above a router never

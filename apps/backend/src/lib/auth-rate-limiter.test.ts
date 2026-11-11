@@ -8,6 +8,7 @@ import {
   AuthRateLimiter,
   authRateLimiter,
   getAuthRateLimitIdentifier,
+  getPublicOAuthRateLimitIdentifier,
 } from "./auth-rate-limiter";
 
 /**
@@ -234,6 +235,82 @@ describe("getAuthRateLimitIdentifier", () => {
         makeEndpoint(null, ""),
       ),
     ).toBe("198.51.100.4:unknown");
+  });
+});
+
+/**
+ * The public OAuth token routes (/oauth/introspect, /oauth/revoke) key on the
+ * same edge client address as getAuthRateLimitIdentifier, with the same
+ * fallback chain, and keep one namespace per route. The routes' own handlers
+ * are driven end to end in routers/oauth/token-public-endpoint.test.ts; this
+ * pins the identifier itself.
+ */
+describe("getPublicOAuthRateLimitIdentifier", () => {
+  it("gives two edge addresses sharing one tunnel address separate budgets", () => {
+    const first = getPublicOAuthRateLimitIdentifier(
+      makeReq({
+        headers: { "cf-connecting-ip": "198.51.100.4" },
+        ip: TUNNEL_IP,
+      }),
+      "introspect",
+    );
+    const second = getPublicOAuthRateLimitIdentifier(
+      makeReq({
+        headers: { "cf-connecting-ip": "203.0.113.7" },
+        ip: TUNNEL_IP,
+      }),
+      "introspect",
+    );
+
+    expect(first).toBe("oauth-public:introspect:198.51.100.4");
+    expect(second).toBe("oauth-public:introspect:203.0.113.7");
+
+    const limiter = new AuthRateLimiter(2, 60 * 1000);
+    limiter.recordFailedAttempt(first);
+    limiter.recordFailedAttempt(first);
+
+    expect(limiter.isCurrentlyLimited(first)).toBe(true);
+    expect(limiter.isCurrentlyLimited(second)).toBe(false);
+  });
+
+  it("keeps one budget per route for the same edge address", () => {
+    const req = makeReq({
+      headers: { "cf-connecting-ip": "198.51.100.4" },
+      ip: TUNNEL_IP,
+    });
+
+    expect(getPublicOAuthRateLimitIdentifier(req, "introspect")).toBe(
+      "oauth-public:introspect:198.51.100.4",
+    );
+    expect(getPublicOAuthRateLimitIdentifier(req, "revoke")).toBe(
+      "oauth-public:revoke:198.51.100.4",
+    );
+  });
+
+  it("walks req.ip then the socket address then the literal when the edge header is absent", () => {
+    expect(
+      getPublicOAuthRateLimitIdentifier(makeReq({ ip: "10.0.0.5" }), "revoke"),
+    ).toBe("oauth-public:revoke:10.0.0.5");
+    expect(
+      getPublicOAuthRateLimitIdentifier(
+        makeReq({ remoteAddress: "192.0.2.11" }),
+        "revoke",
+      ),
+    ).toBe("oauth-public:revoke:192.0.2.11");
+    expect(getPublicOAuthRateLimitIdentifier(makeReq({}), "revoke")).toBe(
+      "oauth-public:revoke:unknown",
+    );
+  });
+
+  it("ignores a blank edge header and keys on req.ip", () => {
+    for (const blank of ["", "   "]) {
+      expect(
+        getPublicOAuthRateLimitIdentifier(
+          makeReq({ headers: { "cf-connecting-ip": blank }, ip: "10.0.0.5" }),
+          "introspect",
+        ),
+      ).toBe("oauth-public:introspect:10.0.0.5");
+    }
   });
 });
 

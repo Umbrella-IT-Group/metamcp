@@ -14,8 +14,8 @@ import logger from "../utils/logger";
  * "does a non-admin still get the detail half?" is exactly the question that
  * has to stay pinned by a test rather than by review memory.
  *
- * `index.ts` keeps the express wiring and the rollup arithmetic; this module
- * owns who-sees-what.
+ * ./health-upstream-handler holds the handler, the rollup arithmetic and the
+ * anonymous cache, and `index.ts` mounts it; this module owns who-sees-what.
  */
 
 /** Fields every caller gets, authenticated or not. */
