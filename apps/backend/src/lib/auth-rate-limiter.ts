@@ -200,10 +200,10 @@ setInterval(
  * The second part is new and runs the other way: wherever CF-Connecting-IP is
  * caller-settable, a caller mints a FRESH bucket per request and the
  * failed-auth bound disappears entirely — where the old shared bucket, for all
- * its faults, still capped them. That is not hypothetical at the artifact
- * level: the shipped docker-compose publishes 12008 host-wide rather than
- * binding loopback, so an origin reachable beside the tunnel is a deployment
- * away. Same property, same re-check, as the header's trust assumption itself:
+ * its faults, still capped them. The shipped docker-compose binds 12008 to
+ * loopback, but a deployment that publishes it more widely puts an origin
+ * beside the tunnel. Same property, same re-check, as the header's trust
+ * assumption itself:
  * it must be revisited before any change to how this service is published.
  */
 export function getAuthRateLimitIdentifier(
@@ -243,10 +243,10 @@ export function getAuthRateLimitIdentifier(
  * a token this server previously issued and never scores; only invented,
  * expired or wrong-client tokens accumulate. Counting successes would let a
  * busy client behind a shared egress address (an office NAT) refuse its
- * neighbours. It is the workable substitute for RFC 7662 §2.1's "MUST require
- * authorization" on revoke: the clients here are secretless public PKCE
- * clients, so there is no credential to require. A client that has spent its
- * own budget is refused for the rest of the window even when it then presents
+ * neighbours. Revocation remains unauthenticated for secretless public PKCE
+ * clients; introspection separately requires a credential (see
+ * routers/oauth/introspection-auth). A client that has spent its own budget
+ * is refused for the rest of the window even when it then presents
  * a valid token; that is accepted, and it is now confined to that client's
  * address.
  *
