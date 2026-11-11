@@ -82,9 +82,11 @@ trpcRouter.use(trpcRateLimitMiddleware);
 // Failure-only 429 gate for the admin-plane (control-plane) bearer path
 // (migration 0038). AFTER the request cap above so total volume is already
 // bounded and this refusal carries the CORS headers, and it CHECKS only,
-// lib/admin-plane-auth records a failed verification. It skips cookie-carrying
-// requests so a stale bearer on a cookie user is never refused (cookie
-// precedence). See ../middleware/trpc-admin-key-rate-limit.middleware.
+// lib/admin-plane-auth records a failed verification. It passes
+// cookie-carrying requests on to createContext, which runs the same check once
+// the cookie has resolved no session, so a stale bearer on a signed-in user is
+// never refused (cookie precedence). See
+// ../middleware/trpc-admin-key-rate-limit.middleware.
 trpcRouter.use(trpcAdminKeyRateLimitMiddleware);
 
 // Better-auth integration now handled in tRPC context

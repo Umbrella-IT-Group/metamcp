@@ -5,6 +5,14 @@ import type { Request, Response } from "express";
 import { auth, type Session, type User } from "./auth";
 import { CREDENTIAL_NOT_PERMITTED_MESSAGE } from "./lib/api-key-ip-policy";
 import { auditRequestContext } from "./lib/audit/audit-emitter";
+import {
+  getAdminKeyRateLimitIdentifier,
+  trpcAdminKeyRateLimiter,
+} from "./lib/auth-rate-limiter";
+import {
+  ADMIN_KEY_RATE_LIMIT_MESSAGE,
+  ADMIN_KEY_RATE_LIMIT_WINDOW_MS,
+} from "./middleware/trpc-admin-key-rate-limit.middleware";
 import logger from "./utils/logger";
 
 /**
@@ -61,6 +69,11 @@ export const createContext = async ({
   // Set when an admin-plane bearer was refused by its IP policy (migration
   // 0041). Thrown AFTER the try/catch below, which swallows everything.
   let adminPlaneIpDenied = false;
+  // Set when the bearer path is reached while this caller's admin-key failure
+  // budget is spent. Thrown AFTER the try/catch for the same reason: a throw
+  // inside it would be logged and turned into an ordinary unauthenticated
+  // request.
+  let adminKeyBudgetSpent = false;
 
   try {
     // Check if we have cookies in the request
@@ -130,16 +143,36 @@ export const createContext = async ({
     // the disabled-account branch above leaves it. The resolver is DB-backed, so
     // it is a lazy import (see resolveAdminPlaneBearer) to keep this module
     // loadable without a database.
+    //
+    // The admin-key failure budget is checked here, before the resolver, as
+    // well as in middleware/trpc-admin-key-rate-limit.middleware. That
+    // middleware checks only requests with no Cookie header, because it cannot
+    // tell whether a cookie will resolve a session without duplicating the
+    // session lookup above. This is the first point where that is known, so a
+    // request whose cookie resolved no usable session gets the same check, on
+    // the same per-client identifier, as a request with no cookie. The check
+    // is read-only (`isCurrentlyLimited`): the resolver records one count per
+    // failed verification, so a refused request costs nothing and a failed
+    // one costs exactly one. A cookie that resolved a valid, enabled session
+    // never reaches this block, so a signed-in user is never refused by it.
     if (!user && !session) {
       const authHeader = req.headers.authorization;
       if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.substring(7);
-        const resolved = await resolveAdminPlaneBearer(token, req);
-        if (resolved && "ipDenied" in resolved) {
-          adminPlaneIpDenied = true;
-        } else if (resolved) {
-          user = resolved.user;
-          session = resolved.session;
+        if (
+          trpcAdminKeyRateLimiter.isCurrentlyLimited(
+            getAdminKeyRateLimitIdentifier(req),
+          )
+        ) {
+          adminKeyBudgetSpent = true;
+        } else {
+          const token = authHeader.substring(7);
+          const resolved = await resolveAdminPlaneBearer(token, req);
+          if (resolved && "ipDenied" in resolved) {
+            adminPlaneIpDenied = true;
+          } else if (resolved) {
+            user = resolved.user;
+            session = resolved.session;
+          }
         }
       }
     }
@@ -157,6 +190,21 @@ export const createContext = async ({
     throw new TRPCError({
       code: "FORBIDDEN",
       message: CREDENTIAL_NOT_PERMITTED_MESSAGE,
+    });
+  }
+
+  // The admin-key failure budget was spent: HTTP 429 through the same tRPC
+  // capture as the 403 above, with the Retry-After and sentence the
+  // middleware's own refusal carries, so a client sees one refusal whichever
+  // of the two checks answered it.
+  if (adminKeyBudgetSpent) {
+    res.set(
+      "Retry-After",
+      String(Math.ceil(ADMIN_KEY_RATE_LIMIT_WINDOW_MS / 1000)),
+    );
+    throw new TRPCError({
+      code: "TOO_MANY_REQUESTS",
+      message: ADMIN_KEY_RATE_LIMIT_MESSAGE,
     });
   }
 

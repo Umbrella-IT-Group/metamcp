@@ -150,9 +150,13 @@ function emitDenied(
  * leaves the request unauthenticated, protectedProcedure returns its normal
  * UNAUTHORIZED. Fail-closed throughout.
  *
- * The rate-limit RECORD lives here (one count per failed verification); the
- * CHECK (the 429) lives in the middleware ahead of createContext, which skips it
- * for cookie-carrying requests so a valid cookie user is never refused.
+ * The rate-limit RECORD lives here (one count per failed verification). The
+ * read-only CHECK (the 429) runs before this resolver in two places: the
+ * middleware ahead of createContext, for requests with no Cookie header, and
+ * createContext itself, for requests whose cookie resolved no usable session.
+ * A request refused by either never reaches this function, so it neither
+ * queries the key nor writes an audit row. A valid cookie user never reaches
+ * the bearer path, so is never refused.
  */
 /**
  * The admin-plane key's IP policy refused the request (migration 0041).

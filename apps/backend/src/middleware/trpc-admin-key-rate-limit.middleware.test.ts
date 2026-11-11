@@ -9,6 +9,11 @@
  * CHECKS; the record happens in admin-plane-auth on a failed verification, so a
  * request passing through here must not move the counter. Each is pinned below.
  *
+ * A cookie-carrying request is DEFERRED by this middleware, not authenticated
+ * by it: createContext checks the same budget once the cookie has resolved no
+ * session. That half, and the HTTP 429 it answers, is pinned through the real
+ * tRPC handler in trpc/admin-plane-context.test.ts.
+ *
  * The limiter is INJECTED with a small budget rather than driving the real 20,
  * same pattern as trpc-rate-limit.middleware.test.ts.
  */
@@ -120,13 +125,18 @@ describe("admin-key rate limit — what it must NOT refuse", () => {
     }
   });
 
-  it("skips a request carrying a session cookie even when over budget (precedence)", () => {
+  it("defers a cookie-carrying request to createContext even when over budget", () => {
     const bearerCookie = () =>
       request({ bearer: true, cookie: true, cfIp: "203.0.113.22" });
     // Fill the budget for this IP first...
     fillBudget(request({ bearer: true, cfIp: "203.0.113.22" }), 3);
-    // ...a cookie-carrying request from it is still served.
-    expect(call(middleware, bearerCookie()).passed).toBe(true);
+    // ...a cookie-carrying request from it is passed on, not answered here.
+    // Passing on is not acceptance: whether the cookie authenticates is
+    // decided in createContext, which applies this same budget when it does
+    // not (trpc/admin-plane-context.test.ts).
+    const deferred = call(middleware, bearerCookie());
+    expect(deferred.passed).toBe(true);
+    expect(deferred.statusCode).toBeUndefined();
   });
 
   it("ignores a request with no Bearer header", () => {
