@@ -25,6 +25,11 @@ import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { resolveServerBearerToken } from "./server-bearer-crypto";
 import { serverErrorTracker } from "./server-error-tracker";
+import {
+  isStdioServerType,
+  stdioServersAllowed,
+  warnStdioServerSkipped,
+} from "./stdio-policy";
 import { createGuardedFetch } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
 import {
@@ -387,7 +392,17 @@ export const createMetaMcpClient = (
 
   // Create the appropriate transport based on server type
   // Default to "STDIO" if type is undefined
-  if (!serverParams.type || serverParams.type === "STDIO") {
+  if (isStdioServerType(serverParams.type)) {
+    // The stdio policy gate (see ./stdio-policy), checked before the child
+    // env is resolved or a transport exists. Every pooled connection is built
+    // here, so this is the backstop for the namespace, reconnect and lazy
+    // paths that never pass through startup's filter. The caller treats the
+    // skip shape as "no connection", like an unsupported type below.
+    if (!stdioServersAllowed()) {
+      warnStdioServerSkipped(serverParams);
+      return { client: undefined, transport: undefined };
+    }
+
     // Resolve environment variable placeholders
     const resolvedEnv = serverParams.env
       ? resolveEnvVariables(serverParams.env)

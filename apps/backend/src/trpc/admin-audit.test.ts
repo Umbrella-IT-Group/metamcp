@@ -1024,9 +1024,18 @@ describe("mcpserver.create / .update — vendor credentials must never land", ()
   it("bulk_import writes NOTHING when every entry was rejected", async () => {
     // Guarded on the write having happened, like every other emit here: an
     // invalid server name never reaches `bulkCreate`, so a row would claim an
-    // import that did not occur.
+    // import that did not occur. A Streamable HTTP entry, so the rejection is
+    // the name check's: a stdio entry is refused before that by default
+    // (mcp-servers.stdio-policy.test.ts).
     await mcpServersImplementations.bulkImport(
-      { mcpServers: { "bad name with spaces": { type: "STDIO" } } } as never,
+      {
+        mcpServers: {
+          "bad name with spaces": {
+            type: "STREAMABLE_HTTP",
+            url: "https://vendor.example.invalid/mcp",
+          },
+        },
+      } as never,
       "admin-1",
       {
         actor_id: "admin-1",
