@@ -735,13 +735,18 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     // wins cleanly. Fresh sign-in after a revoke creates a new session and
     // approves normally.
     const sessionId = session?.sessionId ?? null;
-    const stored = await oauthRepository.withUserLock(userId, async (tx) => {
+    const refusal = await oauthRepository.withUserLock(userId, async (tx) => {
+      // The signed request can expire while queued just as the session can.
+      // Approval must still be within its lifetime when a code is minted.
+      if (Date.now() >= consentRequest.exp) {
+        return "request_expired";
+      }
       if (
         !sessionId ||
         !(await usersRepository.hasLiveSession(sessionId, userId, tx)) ||
         (await usersRepository.isDisabled(userId, tx))
       ) {
-        return false;
+        return "session_revoked";
       }
       await oauthRepository.setAuthCode(
         code,
@@ -757,12 +762,12 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
         },
         tx,
       );
-      return true;
+      return null;
     });
 
-    if (!stored) {
+    if (refusal) {
       logger.warn(
-        `[oauth] consent rejected reason=session_revoked client=${consentRequest.client_id} user=${userId}`,
+        `[oauth] consent rejected reason=${refusal} client=${consentRequest.client_id} user=${userId}`,
       );
       emitConsentDecision(req, {
         granted: false,
@@ -770,7 +775,7 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
         clientId: consentRequest.client_id,
         redirectUri: consentRequest.redirect_uri,
         httpStatus: 403,
-        reason: "session_revoked",
+        reason: refusal,
       });
       return res.status(403).json({
         error: "access_denied",

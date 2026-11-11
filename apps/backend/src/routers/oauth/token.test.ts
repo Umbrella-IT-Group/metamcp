@@ -267,6 +267,45 @@ describe("POST /oauth/token — authorization_code success logging", () => {
     expect(issuedLine()).not.toContain("rotated");
   });
 
+  it("refuses a code that expires while waiting for the credential lock", async () => {
+    const afterExpiry = Date.now() + 11 * 60 * 1000;
+    oauthRepositoryMock.withUserLock.mockImplementationOnce(
+      async (_userId: string, fn: (tx: unknown) => Promise<unknown>) => {
+        vi.spyOn(Date, "now").mockReturnValue(afterExpiry);
+        return fn(FAKE_OAUTH_TX);
+      },
+    );
+    try {
+      const res = await exchange();
+
+      expect(res.statusCode).toBe(400);
+      expect(grantBody(res).error).toBe("invalid_grant");
+      expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+      expect(loggerMock.info).not.toHaveBeenCalledWith(
+        expect.stringContaining("[oauth] token issued"),
+      );
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("refuses a code when its account is disabled while waiting for the lock", async () => {
+    usersRepositoryMock.isDisabled
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+
+    const res = await exchange();
+
+    expect(res.statusCode).toBe(400);
+    expect(grantBody(res).error).toBe("invalid_grant");
+    expect(usersRepositoryMock.isDisabled).toHaveBeenLastCalledWith(
+      USER_ID,
+      FAKE_OAUTH_TX,
+    );
+    expect(oauthRepositoryMock.consumeAuthCode).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+  });
+
   it("logs the last 4 characters of the access token and no whole secret", async () => {
     const body = grantBody(await exchange());
     const logged = allLoggedText();

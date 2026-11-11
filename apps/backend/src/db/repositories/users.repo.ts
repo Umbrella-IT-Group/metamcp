@@ -350,7 +350,9 @@ export class UsersRepository {
         and(
           eq(sessionsTable.id, sessionId),
           eq(sessionsTable.userId, userId),
-          gt(sessionsTable.expiresAt, sql`now()`),
+          // now() is fixed at BEGIN, before an advisory-lock wait. A session
+          // that expired during that wait must not authorize a new code.
+          gt(sessionsTable.expiresAt, sql`clock_timestamp()`),
         ),
       )
       .limit(1);

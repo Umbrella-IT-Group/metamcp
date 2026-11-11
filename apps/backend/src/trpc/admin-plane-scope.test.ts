@@ -323,6 +323,25 @@ describe("an admin-plane key", () => {
       admin_plane: { key_uuid: KEY_UUID, owner_user_id: OWNER_ID },
     });
   });
+
+  it("attributes a role refusal on an allowed procedure to the key after its owner is demoted", async () => {
+    const result = await call(
+      { ...adminPlaneCtx, user: { ...owner, role: "member" } },
+      "frontend.mcpServers.create",
+      VALID_INPUTS["frontend.mcpServers.create"],
+    );
+
+    expect(result.reached).toBe(false);
+    expect(result.error?.code).toBe("FORBIDDEN");
+    expect(denials).toEqual([
+      expect.objectContaining({
+        action: "rbac.denied",
+        actor_type: "api_key",
+        actor_id: KEY_UUID,
+        admin_plane: { key_uuid: KEY_UUID, owner_user_id: OWNER_ID },
+      }),
+    ]);
+  });
 });
 
 describe("a human administrator's session is unchanged", () => {

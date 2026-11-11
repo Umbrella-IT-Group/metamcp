@@ -1528,6 +1528,26 @@ describe("users.disabled closes both code-minting paths", () => {
 // ---------------------------------------------------------------------------
 
 describe("POST /oauth/authorize/decision — re-checked under the credential lock", () => {
+  it("mints nothing when the consent request expires while waiting for the lock", async () => {
+    const { areq, csrf } = makeAreq();
+    const afterExpiry = Date.now() + 11 * 60 * 1000;
+    oauthRepositoryMock.withUserLock.mockImplementationOnce(
+      async (_userId: string, fn: (tx: unknown) => Promise<unknown>) => {
+        vi.spyOn(Date, "now").mockReturnValue(afterExpiry);
+        return fn(FAKE_OAUTH_TX);
+      },
+    );
+    try {
+      const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+      expect(res.statusCode).toBe(403);
+      expect(jsonBody(res)).toMatchObject({ error: "access_denied" });
+      expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it("inserts the code through the locked transaction after re-checking the session and account", async () => {
     const { areq, csrf } = makeAreq();
     await decide({ areq, decision: "approve", csrfCookie: csrf });

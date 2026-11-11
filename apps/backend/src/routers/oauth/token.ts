@@ -597,15 +597,10 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Check if code has expired (the lifetime is set when it is minted, see
-  // authorizationCodeTtlMs in ./authorization)
-  if (Date.now() > codeData.expires_at.getTime()) {
-    // Emitted before the delete for the reason given on the refresh-expiry
-    // branch below: this is a rejection that destroys the row it just read, so
-    // the row here is the only surviving evidence the code ever existed. The
-    // client is UNAUTHENTICATED at this point — auth-method validation happens
-    // further down — but the branch is still bounded, because reaching it
-    // requires a real, currently-stored authorization code and consumes it.
+  // Both expiry checks use the same event, before deleting the expired code:
+  // it is the surviving evidence that the credential existed. The first
+  // check precedes client authentication but is bounded by a real stored code.
+  const emitCodeExpired = () => {
     emitTokenLifecycle(req, {
       action: "oauth.token.issue",
       clientId: codeData.client_id,
@@ -621,6 +616,12 @@ async function handleAuthorizationCodeGrant(
         expires_at: isoOrNull(codeData.expires_at),
       },
     });
+  };
+
+  // Check if code has expired (the lifetime is set when it is minted, see
+  // authorizationCodeTtlMs in ./authorization).
+  if (Date.now() > codeData.expires_at.getTime()) {
+    emitCodeExpired();
     await oauthRepository.deleteAuthCode(code);
     return res.status(400).json({
       error: "invalid_grant",
@@ -743,6 +744,20 @@ async function handleAuthorizationCodeGrant(
   const issued = await oauthRepository.withUserLock(
     codeData.user_id,
     async (tx) => {
+      // Waiting for the user lock can outlast the code or an administrator's
+      // disable. Re-check both here before consuming it; a disabled account
+      // keeps its code so re-enabling it within the TTL restores the flow.
+      if (Date.now() > codeData.expires_at.getTime()) {
+        emitCodeExpired();
+        await oauthRepository.consumeAuthCode(code, tx);
+        return null;
+      }
+      if (await usersRepository.isDisabled(codeData.user_id, tx)) {
+        logger.warn(
+          `[oauth] token rejected reason=disabled grant=authorization_code client=${codeData.client_id} user=${codeData.user_id}`,
+        );
+        return null;
+      }
       const consumed = await oauthRepository.consumeAuthCode(code, tx);
       if (!consumed) {
         return null;

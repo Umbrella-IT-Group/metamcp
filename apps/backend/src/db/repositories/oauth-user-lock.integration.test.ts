@@ -832,6 +832,43 @@ describeIfDb("per-user OAuth credential lock (real Postgres)", () => {
   // ------------------------------------------------ consent vs revoke
 
   describe("consent approval against users.revokeAccess", () => {
+    it("refuses a session that expires while approval waits for the user lock", async () => {
+      const flow = await signUpAndAuthorize();
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const holder = oauthRepository.withUserLock(USER_ID, async () => {
+        entered();
+        await released;
+      });
+      await held;
+      const approving = approve(flow);
+      let queued: boolean;
+      try {
+        queued = await queuedBehind([approving], 1);
+        // The approval transaction has started and is waiting. Expire its
+        // session after that start, so SQL now() would still see it as live.
+        await observer.query(
+          `UPDATE sessions SET expires_at = clock_timestamp() WHERE user_id = $1`,
+          [USER_ID],
+        );
+      } finally {
+        release();
+        await holder;
+      }
+      const decision = await approving;
+
+      expect(queued).toBe(true);
+      expect(decision.status).toBe(403);
+      expect(decision.code).toBeUndefined();
+      expect(await codesForUser()).toEqual([]);
+    });
+
     it("approval holds the lock first: the revoke deletes the code it stored", async () => {
       const flow = await signUpAndAuthorize();
       // Paused at the code insert, after every consent check passed.

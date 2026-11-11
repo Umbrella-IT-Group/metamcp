@@ -456,15 +456,26 @@ export const adminProcedure = protectedProcedure.use(
       // thing it must never do.
       emitDenial(() => {
         const actor = actorFields(ctx.user);
+        // An allowlisted call can still fail RBAC after its owner is demoted.
+        // Attribute that refusal to the credential, as the scope gate does.
+        const origin = adminPlaneOrigin(ctx);
         return {
           action: "rbac.denied",
-          actor_type: "user",
-          actor_id: actor.id,
+          actor_type: origin ? "api_key" : "user",
+          actor_id: origin?.key_uuid ?? actor.id,
           actor_label: actor.label,
           path,
           type,
           http_status: 403,
           audit: ctx.audit,
+          ...(origin
+            ? {
+                admin_plane: {
+                  key_uuid: origin.key_uuid,
+                  owner_user_id: origin.owner_user_id,
+                },
+              }
+            : {}),
         };
       });
       throw error;
