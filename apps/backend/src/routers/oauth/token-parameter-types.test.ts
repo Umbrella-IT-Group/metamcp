@@ -217,7 +217,8 @@ describe("/oauth/revoke", () => {
   it.each(["token", "client_id", "client_secret"])(
     "refuses a non-string %s with 400 before any lookup",
     async (name) => {
-      const baseBody = name === "token" ? {} : { token: "mcp_token_x" };
+      const baseBody: Record<string, string> =
+        name === "token" ? {} : { token: "mcp_token_x" };
       for (const [label, body, encoding] of malformedBodies(name, baseBody)) {
         vi.clearAllMocks();
         const res = await post("/oauth/revoke", body, encoding, freshIp());
