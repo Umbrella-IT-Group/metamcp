@@ -3,7 +3,7 @@ title: "MCP Servers"
 description: "Learn how to configure and manage MCP server instances in MetaMCP"
 ---
 
-A **MCP Server** is a configuration that tells MetaMCP how to start and manage a Model Context Protocol server. These servers provide tools, resources, and prompts that can be aggregated and exposed through MetaMCP endpoints.
+A **MCP Server** is a configuration that tells MetaMCP how to start and manage a Model Context Protocol server. The tools these servers provide are aggregated and exposed through MetaMCP endpoints. This gateway relays tools only: it does not advertise or forward MCP prompts or resources, so a client's `prompts/*` and `resources/*` requests are answered "Method not found".
 
 ## What is a MCP Server?
 
@@ -200,6 +200,15 @@ Useful when your server requires:
 - Gateway or proxy authentication
 - Organization-specific headers
 </Tip>
+
+### Changing a server's URL
+
+A stored bearer token and stored headers belong to the address they were set up for, so an update that changes the URL must say what happens to them:
+
+- **Bearer token:** send a new `bearerToken`, or `"clearBearerToken": true` to remove the stored one. In the edit dialog, type a new token or tick "Remove the stored bearer token when saving".
+- **Headers:** send `headers` again (an empty object removes them). The edit dialog always sends them.
+
+An update that changes the URL without these is refused with a message naming what is missing, and nothing in the server is changed. While the URL stays the same, a blank or omitted `bearerToken` keeps the stored token and omitted `headers` keep the stored headers, as before. An accepted change of the URL, type, bearer token or headers closes the server's open connections so the next request uses the new values.
 
 ## Managing MCP Servers
 
