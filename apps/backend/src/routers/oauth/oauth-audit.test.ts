@@ -40,9 +40,12 @@ const oauthRepositoryMock = {
   getAuthCode: vi.fn(),
   deleteAuthCode: vi.fn(),
   upsertClient: vi.fn(),
+  // The per-user credential lock the decision inserts its code under; armed
+  // in beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
 };
 
-const usersRepositoryMock = { isDisabled: vi.fn() };
+const usersRepositoryMock = { isDisabled: vi.fn(), hasLiveSession: vi.fn() };
 
 vi.mock("../../db/repositories", () => ({
   oauthRepository: oauthRepositoryMock,
@@ -57,6 +60,7 @@ process.env.BETTER_AUTH_SECRET = "test-secret-for-consent-request-signing";
 
 const { default: authorizationRouter } = await import("./authorization");
 const { default: registrationRouter } = await import("./registration");
+const { armUserLockFakes } = await import("./user-lock-test-fakes");
 const { CONSENT_CSRF_COOKIE_HOST_PREFIXED, signConsentRequest } = await import(
   "./consent-token"
 );
@@ -203,10 +207,17 @@ async function dispatch(
 function sessionFor(userId: string | null) {
   authMock.handler.mockImplementation(
     async () =>
-      new Response(JSON.stringify(userId ? { user: { id: userId } } : null), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify(
+          userId
+            ? { user: { id: userId }, session: { id: `session-of-${userId}` } }
+            : null,
+        ),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
   );
 }
 
@@ -276,6 +287,8 @@ beforeEach(() => {
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
   oauthRepositoryMock.upsertClient.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  usersRepositoryMock.hasLiveSession.mockResolvedValue(true);
+  armUserLockFakes(oauthRepositoryMock);
   sessionFor(USER_ID);
 });
 
@@ -524,6 +537,24 @@ describe("oauth.authorize.denied — the three refusal paths", () => {
       http_status: 403,
     });
     expect(rows[0].detail).toMatchObject({ reason: "csrf" });
+  });
+
+  it("records an approval whose session was revoked before the code could be stored", async () => {
+    // users.revokeAccess committed between the unlocked checks and the lock.
+    usersRepositoryMock.hasLiveSession.mockResolvedValue(false);
+    const { areq, csrf, cid } = makeAreq();
+
+    await decide({ areq, decision: "approve", csrfCookie: csrf, cid });
+    await flush();
+
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "oauth.authorize.denied",
+      outcome: "denied",
+      http_status: 403,
+    });
+    expect(rows[0].detail).toMatchObject({ reason: "session_revoked" });
   });
 
   it("records a disabled account completing a pre-lock consent", async () => {

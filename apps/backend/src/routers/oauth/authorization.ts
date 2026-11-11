@@ -41,8 +41,31 @@ const authorizationRouter = express.Router();
  */
 const CONSENT_PAGE_PATH = "/consent";
 
-/** Authorization codes live 10 minutes, matching the consent request TTL. */
-const AUTH_CODE_TTL_MS = 10 * 60 * 1000;
+/** Authorization code lifetime for a non-loopback redirect_uri. */
+export const AUTH_CODE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Authorization code lifetime for a loopback redirect_uri (RFC 8252 section
+ * 7.3). On a loopback flow the gateway shows the code on its own page so a
+ * person can copy it into a client on another machine (the headless
+ * `claude mcp login --no-browser` path), which also makes the code something a
+ * person can be talked into sending to someone else. A shorter life narrows
+ * how long such a code stays redeemable; five minutes still leaves time to
+ * copy and paste. A non-loopback redirect delivers the code by browser
+ * redirect and keeps the standard ten minutes.
+ */
+export const LOOPBACK_AUTH_CODE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * The lifetime of a code minted for `redirectUri`, counted from approval.
+ * Separate from CONSENT_REQUEST_TTL_MS (./consent-token), which bounds how
+ * long the consent request itself may wait for a decision.
+ */
+export function authorizationCodeTtlMs(redirectUri: string): number {
+  return isLoopbackRedirectUri(redirectUri)
+    ? LOOPBACK_AUTH_CODE_TTL_MS
+    : AUTH_CODE_TTL_MS;
+}
 
 /**
  * Longest client_name echoed to the consent screen. `client_name` is
@@ -62,6 +85,18 @@ const MAX_DISPLAYED_CLIENT_NAME = 100;
 async function resolveSessionUserId(
   req: express.Request,
 ): Promise<string | null> {
+  return (await resolveSession(req))?.userId ?? null;
+}
+
+/**
+ * The better-auth session behind a request: its user id and session id, or
+ * null. The consent decision needs the session id as well, to re-check that
+ * this exact session still exists once it holds the user's OAuth credential
+ * lock (see the decision handler).
+ */
+async function resolveSession(
+  req: express.Request,
+): Promise<{ userId: string; sessionId: string | null } | null> {
   if (!req.headers.cookie) return null;
 
   try {
@@ -77,9 +112,16 @@ async function resolveSessionUserId(
 
     const sessionData = (await sessionResponse.json()) as {
       user?: { id: string };
+      session?: { id?: unknown };
     };
 
-    return sessionData?.user?.id ?? null;
+    const userId = sessionData?.user?.id;
+    if (!userId) return null;
+    const sessionId = sessionData?.session?.id;
+    return {
+      userId,
+      sessionId: typeof sessionId === "string" ? sessionId : null,
+    };
   } catch (error) {
     logger.info("OAuth session verification failed:", error);
     return null;
@@ -550,7 +592,8 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
       });
     }
 
-    const userId = await resolveSessionUserId(req);
+    const session = await resolveSession(req);
+    const userId = session?.userId ?? null;
 
     if (!userId || !safeEquals(userId, consentRequest.user_id)) {
       return res.status(403).json({
@@ -683,15 +726,58 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
 
     const code = generateSecureAuthCode();
 
-    await oauthRepository.setAuthCode(code, {
-      client_id: consentRequest.client_id,
-      redirect_uri: consentRequest.redirect_uri,
-      scope: GRANTED_OAUTH_SCOPE,
-      user_id: userId,
-      code_challenge: consentRequest.code_challenge || null,
-      code_challenge_method: consentRequest.code_challenge_method || null,
-      expires_at: Date.now() + AUTH_CODE_TTL_MS,
+    // The session and the account were checked above, before the user's OAuth
+    // credential lock. users.revokeAccess deletes sessions and codes under
+    // that lock, so an approval that raced it could insert a code after the
+    // revoke committed and the code would mint tokens later. Under the lock,
+    // this exact session must still exist and the account must still be
+    // enabled before the code is inserted; whichever of the two commits first
+    // wins cleanly. Fresh sign-in after a revoke creates a new session and
+    // approves normally.
+    const sessionId = session?.sessionId ?? null;
+    const stored = await oauthRepository.withUserLock(userId, async (tx) => {
+      if (
+        !sessionId ||
+        !(await usersRepository.hasLiveSession(sessionId, userId, tx)) ||
+        (await usersRepository.isDisabled(userId, tx))
+      ) {
+        return false;
+      }
+      await oauthRepository.setAuthCode(
+        code,
+        {
+          client_id: consentRequest.client_id,
+          redirect_uri: consentRequest.redirect_uri,
+          scope: GRANTED_OAUTH_SCOPE,
+          user_id: userId,
+          code_challenge: consentRequest.code_challenge || null,
+          code_challenge_method: consentRequest.code_challenge_method || null,
+          expires_at:
+            Date.now() + authorizationCodeTtlMs(consentRequest.redirect_uri),
+        },
+        tx,
+      );
+      return true;
     });
+
+    if (!stored) {
+      logger.warn(
+        `[oauth] consent rejected reason=session_revoked client=${consentRequest.client_id} user=${userId}`,
+      );
+      emitConsentDecision(req, {
+        granted: false,
+        userId,
+        clientId: consentRequest.client_id,
+        redirectUri: consentRequest.redirect_uri,
+        httpStatus: 403,
+        reason: "session_revoked",
+      });
+      return res.status(403).json({
+        error: "access_denied",
+        error_description:
+          "Consent could not be verified. Please start the connection again from your application.",
+      });
+    }
 
     redirectUrl.searchParams.set("code", code);
 
@@ -721,7 +807,13 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
     });
 
     if (loopback) {
-      return sendLoopbackConsentSuccess(res, redirectUrl);
+      return sendLoopbackConsentSuccess(res, redirectUrl, {
+        clientName: (clientData.client_name || consentRequest.client_id).slice(
+          0,
+          MAX_DISPLAYED_CLIENT_NAME,
+        ),
+        codeTtlMs: authorizationCodeTtlMs(consentRequest.redirect_uri),
+      });
     }
 
     res.redirect(redirectUrl.toString());

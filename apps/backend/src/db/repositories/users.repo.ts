@@ -12,6 +12,7 @@ import {
   sessionsTable,
   usersTable,
 } from "../schema";
+import { lockOAuthUser, type OAuthDbExecutor } from "./oauth-user-lock";
 
 /**
  * Hard ceiling on the admin user listing.
@@ -315,13 +316,45 @@ export class UsersRepository {
    * and the alternative (defaulting to "enabled") would turn a mid-cascade
    * race into an open door.
    */
-  async isDisabled(id: string): Promise<boolean> {
-    const [user] = await db
+  async isDisabled(
+    id: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<boolean> {
+    const [user] = await executor
       .select({ disabled: usersTable.disabled })
       .from(usersTable)
       .where(eq(usersTable.id, id));
 
     return user?.disabled ?? true;
+  }
+
+  /**
+   * Whether the sign-in session `sessionId` still exists for `userId` and has
+   * not expired, read from the sessions table itself.
+   *
+   * The consent decision resolves its session through better-auth before it
+   * takes the user's OAuth credential lock, so an administrator's revokeAccess
+   * can commit in between. Re-reading the row under the lock is what makes
+   * the revoke win: revokeAccess deletes sessions under the same lock, so a
+   * decision that waited for it finds no row here and mints no code.
+   */
+  async hasLiveSession(
+    sessionId: string,
+    userId: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<boolean> {
+    const [row] = await executor
+      .select({ id: sessionsTable.id })
+      .from(sessionsTable)
+      .where(
+        and(
+          eq(sessionsTable.id, sessionId),
+          eq(sessionsTable.userId, userId),
+          gt(sessionsTable.expiresAt, sql`now()`),
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
   }
 
   /**
@@ -560,6 +593,15 @@ export class UsersRepository {
     m365_tokens_revoked: number;
   }> {
     return await db.transaction(async (tx) => {
+      // The user's OAuth credential lock (./oauth-user-lock), taken before any
+      // delete. Every refresh, code redemption and consent approval for this
+      // user takes the same lock and re-reads under it, so one that was in
+      // flight when this started either committed first (and its new row is
+      // deleted below) or runs after this commits and finds nothing to
+      // rotate. Without it a refresh that read its row before these deletes
+      // inserted a fresh pair after them, and "revoke access" was undone.
+      await lockOAuthUser(tx, id);
+
       const sessions = await tx
         .delete(sessionsTable)
         .where(eq(sessionsTable.userId, id))

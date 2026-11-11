@@ -47,6 +47,12 @@ const oauthRepositoryMock = {
   getAuthCode: vi.fn(),
   deleteAuthCode: vi.fn(),
   setAccessToken: vi.fn(),
+  // /oauth/revoke deletes under the owner's credential lock; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  getRotatedRefreshToken: vi.fn(),
+  revokeFamily: vi.fn(),
+  withUserLock: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = { isDisabled: vi.fn() };
@@ -58,6 +64,9 @@ vi.mock("../../db/repositories", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 
 const VALID_API_KEY = "sk_mt_a_first_party_key";
 const LIVE_TOKEN = "mcp_token_a_real_previously_issued_token";
@@ -165,6 +174,8 @@ beforeEach(() => {
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
   oauthRepositoryMock.getAccessToken.mockResolvedValue(liveAccessTokenRow());
   oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
+  oauthRepositoryMock.getRotatedRefreshToken.mockResolvedValue(null);
+  armUserLockFakes(oauthRepositoryMock);
   validateApiKeyMock.mockImplementation(async (key: string) =>
     key === VALID_API_KEY
       ? { valid: true, user_id: USER_ID, key_uuid: "key-uuid" }
@@ -303,6 +314,7 @@ describe("POST /oauth/revoke — deliberately left public", () => {
     expect(res.statusCode).toBe(200);
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       LIVE_TOKEN,
+      FAKE_OAUTH_TX,
     );
   });
 });

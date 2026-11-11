@@ -46,6 +46,13 @@ const oauthRepositoryMock = {
   // by the row's stored access-token hash (migration 0036).
   deleteAccessTokenByHash: vi.fn(),
   getAccessToken: vi.fn(),
+  // /oauth/revoke resolves a rotated-out refresh token through its marker and
+  // deletes under the owner's credential lock; armed in beforeEach by
+  // armUserLockFakes (./user-lock-test-fakes).
+  getRotatedRefreshToken: vi.fn(),
+  revokeFamily: vi.fn(),
+  withUserLock: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -69,6 +76,9 @@ vi.mock("./introspection-auth", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 const { requireIntrospectionCredential } = await import("./introspection-auth");
 
 const CLIENT_ID = "mcp_client_test";
@@ -177,6 +187,8 @@ beforeEach(() => {
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
   oauthRepositoryMock.getAccessToken.mockResolvedValue(null);
   oauthRepositoryMock.getByRefreshToken.mockResolvedValue(null);
+  oauthRepositoryMock.getRotatedRefreshToken.mockResolvedValue(null);
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 // 20 failures per minute per (address, route) is the limiter's budget; well
@@ -304,6 +316,7 @@ describe("POST /oauth/introspect — invented tokens are bounded", () => {
     expect(res.statusCode).toBe(200);
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       LIVE_TOKEN,
+      FAKE_OAUTH_TX,
     );
   });
 });
@@ -354,6 +367,7 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
     expect(res.statusCode).toBe(200);
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       LIVE_TOKEN,
+      FAKE_OAUTH_TX,
     );
   });
 
@@ -368,6 +382,7 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
     expect(res.statusCode).toBe(200);
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       LIVE_TOKEN,
+      FAKE_OAUTH_TX,
     );
   });
 
@@ -401,6 +416,9 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
     expect(res.statusCode).toBe(400);
     expect(res.body).toMatchObject({ error: "invalid_client" });
     expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+    // The refresh branch's own delete, and the lock it would run under.
+    expect(oauthRepositoryMock.deleteByRefreshToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.withUserLock).not.toHaveBeenCalled();
   });
 
   it("revokes a REFRESH token whose client_id matches", async () => {
@@ -415,12 +433,13 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
     );
 
     expect(res.statusCode).toBe(200);
-    // The row is in hand from getByRefreshToken, so the delete goes through the
-    // by-hash path against the row's stored access-token digest (migration
-    // 0036), not the plaintext-hashing deleteAccessToken.
-    expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
-      LIVE_TOKEN,
+    // Deleted by the presented refresh token's hash, under the owner's
+    // credential lock, so a refresh of the same token cannot interleave.
+    expect(oauthRepositoryMock.deleteByRefreshToken).toHaveBeenCalledWith(
+      LIVE_REFRESH,
+      FAKE_OAUTH_TX,
     );
+    expect(oauthRepositoryMock.withUserLock.mock.calls[0][0]).toBe(USER_ID);
   });
 });
 
@@ -494,6 +513,7 @@ describe("POST /oauth/introspect and /oauth/revoke: budgets keyed on the edge cl
     expect(live.statusCode).toBe(200);
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       LIVE_TOKEN,
+      FAKE_OAUTH_TX,
     );
   });
 
@@ -543,6 +563,7 @@ describe("POST /oauth/introspect and /oauth/revoke: budgets keyed on the edge cl
     }
     oauthRepositoryMock.getAccessToken.mockClear();
     oauthRepositoryMock.getByRefreshToken.mockClear();
+    oauthRepositoryMock.getRotatedRefreshToken.mockClear();
 
     const refused = await post(
       { token: "mcp_token_after_budget" },
@@ -555,6 +576,8 @@ describe("POST /oauth/introspect and /oauth/revoke: budgets keyed on the edge cl
     expect(oauthRepositoryMock.getByRefreshToken).not.toHaveBeenCalled();
     expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
     expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.getRotatedRefreshToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.withUserLock).not.toHaveBeenCalled();
   });
 
   it("keeps introspect and revoke on separate budgets for one edge address", async () => {

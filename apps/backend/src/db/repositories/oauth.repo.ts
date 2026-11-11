@@ -19,12 +19,33 @@ import {
   oauthRotatedRefreshTokensTable,
   usersTable,
 } from "../schema";
+import {
+  lockOAuthUser,
+  type OAuthDbExecutor,
+  type OAuthTx,
+  withOAuthUserLock,
+} from "./oauth-user-lock";
 
 export class OAuthRepository {
+  // ===== Per-user credential lock =====
+
+  // See ./oauth-user-lock for why every OAuth mint and revoke for a user runs
+  // under one transaction-scoped advisory lock. Exposed on the repository so
+  // the routers reach it through the same seam their tests already mock.
+  async withUserLock<T>(
+    userId: string,
+    fn: (tx: OAuthTx) => Promise<T>,
+  ): Promise<T> {
+    return withOAuthUserLock(userId, fn);
+  }
+
   // ===== Registered Clients =====
 
-  async getClient(clientId: string): Promise<OAuthClient | null> {
-    const result = await db
+  async getClient(
+    clientId: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<OAuthClient | null> {
+    const result = await executor
       .select()
       .from(oauthClientsTable)
       .where(eq(oauthClientsTable.client_id, clientId))
@@ -181,8 +202,9 @@ export class OAuthRepository {
   async setAuthCode(
     code: string,
     data: OAuthAuthorizationCodeCreateInput,
+    executor: OAuthDbExecutor = db,
   ): Promise<void> {
-    await db.insert(oauthAuthorizationCodesTable).values({
+    await executor.insert(oauthAuthorizationCodesTable).values({
       code: hashApiKey(code),
       client_id: data.client_id,
       redirect_uri: data.redirect_uri,
@@ -208,8 +230,17 @@ export class OAuthRepository {
   // returned true, so a read-then-delete race can no longer mint two token
   // pairs for one code. `deleteAuthCode` above stays for the cleanup deletes
   // (expired codes) where no such gate is needed.
-  async consumeAuthCode(code: string): Promise<boolean> {
-    const deleted = await db
+  //
+  // The authorization_code grant calls this inside the user's credential lock
+  // (./oauth-user-lock) with the same `tx` that inserts the token pair, so a
+  // code consumed here can never mint after users.revokeAccess committed: the
+  // revoke either deleted the code first (this returns false) or runs after
+  // the pair committed and deletes the pair.
+  async consumeAuthCode(
+    code: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<boolean> {
+    const deleted = await executor
       .delete(oauthAuthorizationCodesTable)
       .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)))
       .returning({ code: oauthAuthorizationCodesTable.code });
@@ -225,8 +256,11 @@ export class OAuthRepository {
   // `access_token` is the hash; a caller holding the row (rotation) deletes it
   // through deleteAccessTokenByHash, while a caller holding the plaintext
   // (introspection, userinfo) deletes through deleteAccessToken.
-  async getAccessToken(token: string): Promise<OAuthAccessToken | null> {
-    const result = await db
+  async getAccessToken(
+    token: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<OAuthAccessToken | null> {
+    const result = await executor
       .select()
       .from(oauthAccessTokensTable)
       .where(eq(oauthAccessTokensTable.access_token, hashApiKey(token)))
@@ -250,8 +284,9 @@ export class OAuthRepository {
       // 0035's CHECK enforces the same invariant at the column level.
       refresh?: { token: string; expires_at: number };
     },
+    executor: OAuthDbExecutor = db,
   ): Promise<void> {
-    await db.insert(oauthAccessTokensTable).values({
+    await executor.insert(oauthAccessTokensTable).values({
       // Hashed at rest (migration 0036); the plaintext is returned to the
       // client by the caller and never stored. last4 keeps the readable tail
       // for the admin view.
@@ -273,18 +308,30 @@ export class OAuthRepository {
 
   // Delete by the PLAINTEXT token (introspection revoke, userinfo expiry
   // cleanup): hashes to match the stored digest, mirroring getAccessToken.
-  async deleteAccessToken(token: string): Promise<void> {
-    await db
+  //
+  // Returns how many rows it removed (0 or 1), so /oauth/revoke can tell a
+  // revoked row from one that a concurrent refresh rotated away while the
+  // revoke waited for the user lock.
+  async deleteAccessToken(
+    token: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<number> {
+    const deleted = await executor
       .delete(oauthAccessTokensTable)
-      .where(eq(oauthAccessTokensTable.access_token, hashApiKey(token)));
+      .where(eq(oauthAccessTokensTable.access_token, hashApiKey(token)))
+      .returning({ access_token: oauthAccessTokensTable.access_token });
+    return deleted.length;
   }
 
   // Delete by the STORED hash, for callers that already hold the row (refresh
   // rotation reads the row by refresh token, then deletes the old access-token
   // row). Passing the row's `access_token` (already the digest) to
   // deleteAccessToken would hash it a second time and match nothing.
-  async deleteAccessTokenByHash(accessTokenHash: string): Promise<void> {
-    await db
+  async deleteAccessTokenByHash(
+    accessTokenHash: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<void> {
+    await executor
       .delete(oauthAccessTokensTable)
       .where(eq(oauthAccessTokensTable.access_token, accessTokenHash));
   }
@@ -352,13 +399,45 @@ export class OAuthRepository {
   // Hashed lookup (migration 0036): the presented refresh token is hashed and
   // matched against the stored digest. The returned row's access_token is the
   // hash, so the refresh rotation deletes it via deleteAccessTokenByHash.
-  async getByRefreshToken(refreshToken: string) {
-    const result = await db
+  async getByRefreshToken(
+    refreshToken: string,
+    executor: OAuthDbExecutor = db,
+  ) {
+    const result = await executor
       .select()
       .from(oauthAccessTokensTable)
       .where(eq(oauthAccessTokensTable.refresh_token, hashApiKey(refreshToken)))
       .limit(1);
     return result[0] || null;
+  }
+
+  // Claim a live refresh token for rotation: DELETE ... RETURNING on the
+  // hashed `refresh_token` column (the live column; the rotated-marker table
+  // keys `refresh_token_hash`). The DELETE is the single-use gate, the same
+  // way consumeAuthCode is for codes: of two statements naming one token,
+  // postgres lets exactly one remove the row, and only that caller may mint.
+  // The refresh grant runs it inside the user's credential lock after
+  // re-reading and validating the row, so a refusal never consumes the token
+  // and the claim, the rotated marker and the new pair commit together.
+  async claimRefreshToken(refreshToken: string, tx: OAuthTx) {
+    return tx
+      .delete(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.refresh_token, hashApiKey(refreshToken)))
+      .returning();
+  }
+
+  // Delete the live row a refresh token belongs to (/oauth/revoke with a
+  // refresh token). Returns the count for the same reason deleteAccessToken
+  // does.
+  async deleteByRefreshToken(
+    refreshToken: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<number> {
+    const deleted = await executor
+      .delete(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.refresh_token, hashApiKey(refreshToken)))
+      .returning({ access_token: oauthAccessTokensTable.access_token });
+    return deleted.length;
   }
 
   // ===== Refresh-token family reuse detection (migration 0037) =====
@@ -371,14 +450,17 @@ export class OAuthRepository {
   // rotation of the same token (a concurrent refresh) is a no-op rather than a
   // primary-key crash. expires_at is the rotated token's own expiry, so
   // cleanupExpired reaps the marker with the family.
-  async recordRotatedRefreshToken(data: {
-    refreshTokenHash: string;
-    familyId: string;
-    clientId: string;
-    userId: string;
-    expiresAt: Date;
-  }): Promise<void> {
-    await db
+  async recordRotatedRefreshToken(
+    data: {
+      refreshTokenHash: string;
+      familyId: string;
+      clientId: string;
+      userId: string;
+      expiresAt: Date;
+    },
+    executor: OAuthDbExecutor = db,
+  ): Promise<void> {
+    await executor
       .insert(oauthRotatedRefreshTokensTable)
       .values({
         refresh_token_hash: data.refreshTokenHash,
@@ -395,8 +477,11 @@ export class OAuthRepository {
   // means the presented token is not a live token but WAS rotated out of this
   // family — i.e. reuse. Returns the owning family/client/user so the refresh
   // grant can revoke and attribute it; null when the token was never issued.
-  async getRotatedRefreshToken(refreshToken: string) {
-    const result = await db
+  async getRotatedRefreshToken(
+    refreshToken: string,
+    executor: OAuthDbExecutor = db,
+  ) {
+    const result = await executor
       .select({
         family_id: oauthRotatedRefreshTokensTable.family_id,
         client_id: oauthRotatedRefreshTokensTable.client_id,
@@ -421,13 +506,58 @@ export class OAuthRepository {
   // live delete runs first and returns a count, so the caller can log how many
   // tokens the compromise cost. Deleting the markers is not gated on the live
   // delete because a family can be reused after its live rows already lapsed.
-  async revokeFamily(familyId: string): Promise<number> {
-    const revoked = await db
+  //
+  // Runs under the family owner's credential lock (./oauth-user-lock), so a
+  // refresh of a family member that is waiting for the lock re-reads after
+  // this commits, finds nothing, and cannot reinsert a pair into the revoked
+  // family. A caller already holding the lock passes its `tx`; the lock is not
+  // re-entrant across transactions, so opening a second one here would wait
+  // on the caller forever. Without a `tx`, this opens its own transaction,
+  // finds the family's owner from its live rows or markers, and locks that
+  // user before deleting. A family belongs to one user: every member descends
+  // from one authorization code.
+  async revokeFamily(familyId: string, tx?: OAuthTx): Promise<number> {
+    if (tx) {
+      return this.revokeFamilyLocked(familyId, tx);
+    }
+    return db.transaction(async (ownTx) => {
+      const owner = await this.familyOwner(familyId, ownTx);
+      if (!owner) {
+        return 0;
+      }
+      await lockOAuthUser(ownTx, owner);
+      return this.revokeFamilyLocked(familyId, ownTx);
+    });
+  }
+
+  private async familyOwner(
+    familyId: string,
+    executor: OAuthDbExecutor,
+  ): Promise<string | null> {
+    const [live] = await executor
+      .select({ user_id: oauthAccessTokensTable.user_id })
+      .from(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.family_id, familyId))
+      .limit(1);
+    if (live) return live.user_id;
+    const [marker] = await executor
+      .select({ user_id: oauthRotatedRefreshTokensTable.user_id })
+      .from(oauthRotatedRefreshTokensTable)
+      .where(eq(oauthRotatedRefreshTokensTable.family_id, familyId))
+      .limit(1);
+    return marker?.user_id ?? null;
+  }
+
+  private async revokeFamilyLocked(
+    familyId: string,
+    tx: OAuthTx,
+  ): Promise<number> {
+    const revoked = await tx
       .delete(oauthAccessTokensTable)
       .where(eq(oauthAccessTokensTable.family_id, familyId))
       .returning({ access_token: oauthAccessTokensTable.access_token });
 
-    await db
+    await tx
       .delete(oauthRotatedRefreshTokensTable)
       .where(eq(oauthRotatedRefreshTokensTable.family_id, familyId));
 

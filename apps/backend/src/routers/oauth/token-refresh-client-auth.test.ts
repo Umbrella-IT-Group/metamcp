@@ -51,6 +51,11 @@ const oauthRepositoryMock = {
   recordRotatedRefreshToken: vi.fn(),
   getRotatedRefreshToken: vi.fn(),
   revokeFamily: vi.fn(),
+  // The per-user credential lock and the atomic refresh claim; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
+  claimRefreshToken: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -82,6 +87,9 @@ const {
 // Dynamic for the same reason as in token.test.ts: a static import of ./utils
 // would pull the logger in before the hoisted mock's object exists.
 const { hashClientSecret } = await import("./utils");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 
 // Taken before any beforeEach clears the mocks: the module-load log lines.
@@ -256,8 +264,10 @@ function expectIssued(res: FakeRes) {
   expect(oauthRepositoryMock.recordRotatedRefreshToken).toHaveBeenCalledTimes(
     1,
   );
-  expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
-    PRIOR_ACCESS_TOKEN_HASH,
+  // Consumed by the atomic claim, inside the user's credential lock.
+  expect(oauthRepositoryMock.claimRefreshToken).toHaveBeenCalledWith(
+    REFRESH_TOKEN,
+    FAKE_OAUTH_TX,
   );
 }
 
@@ -270,6 +280,7 @@ function expectRefusedUntouched(res: FakeRes, description: string) {
   });
   expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+  expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.recordRotatedRefreshToken).not.toHaveBeenCalled();
   expect(rows.filter((r) => r.action === "oauth.token.refresh")).toEqual([]);
 }
@@ -312,6 +323,7 @@ beforeEach(() => {
   oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   oauthRepositoryMock.recordRotatedRefreshToken.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 afterEach(() => {
@@ -403,7 +415,10 @@ describe.each(["log", "enforce"] as const)(
 
     it("loads the row of the client the token was issued to", async () => {
       await post(refreshBody());
-      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(CLIENT_ID);
+      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(
+        CLIENT_ID,
+        FAKE_OAUTH_TX,
+      );
     });
   },
 );
@@ -462,7 +477,10 @@ describe("client_secret_post", () => {
 
     it("the outcome is judged for the token's client even with no client_id sent", async () => {
       expectIssued(await post(refreshBody({ client_secret: RIGHT_SECRET })));
-      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(CLIENT_ID);
+      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(
+        CLIENT_ID,
+        FAKE_OAUTH_TX,
+      );
       expect(issuedLine()).toMatch(/ client_auth=verified$/);
     });
   });
@@ -527,13 +545,16 @@ describe.each(["log", "enforce"] as const)(
     it.each([
       ["an object that cannot be coerced", { toString: "untrusted-value" }],
       ["an array containing the right secret", [RIGHT_SECRET]],
-    ])("records %s as invalid without coercing it", async (_label, secret) => {
+    ])("refuses %s before reading the token", async (_label, secret) => {
       process.env[ENV] = mode;
       oauthRepositoryMock.getClient.mockResolvedValue(
         clientRow("client_secret_post"),
       );
-      // Express accepts JSON objects here. Coercing this one while hashing
-      // throws, which used to turn the observational mode into a refusal.
+      // Express accepts JSON objects here. A client_secret that is not a
+      // single string is refused as a malformed request in BOTH modes, before
+      // the token is looked up, so it is never coerced, never hashed and never
+      // consumes the token. (It used to be evaluated as client_auth=invalid
+      // and, in log mode, still rotate.)
       const res = await post(
         refreshBody({
           client_id: CLIENT_ID,
@@ -541,13 +562,16 @@ describe.each(["log", "enforce"] as const)(
         }),
       );
 
-      if (mode === "log") {
-        expectIssued(res);
-        expect(issuedLine()).toMatch(/ client_auth=invalid$/);
-        expect(refreshRow().detail?.client_auth).toBe("invalid");
-      } else {
-        expectRefusedUntouched(res, "Invalid client secret");
-      }
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toEqual({
+        error: "invalid_request",
+        error_description:
+          "The client_secret parameter must be a single string value",
+      });
+      expect(oauthRepositoryMock.getByRefreshToken).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.withUserLock).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
       expect(loggedText()).not.toContain("untrusted-value");
       expectNoSecretRecorded();
     });
