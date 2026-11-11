@@ -10,8 +10,9 @@ import { resolveClientIp } from "@/lib/client-ip";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import { oauthRouterOptions } from "./utils";
 
-const userinfoRouter = express.Router();
+const userinfoRouter = express.Router(oauthRouterOptions);
 
 /**
  * The failure-only rate-limit key for GET /oauth/userinfo, keyed on the edge

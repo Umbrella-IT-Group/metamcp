@@ -27,6 +27,7 @@ import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
+import { initOAuthDcrMode } from "./routers/oauth/dcr-mode";
 import publicEndpointsRouter from "./routers/public-metamcp";
 import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
@@ -39,6 +40,13 @@ import logger from "./utils/logger";
 // backends receive the verified caller when any are named. See
 // ./lib/metamcp/verified-caller.
 assertVerifiedCallerConfig();
+
+// Resolve OAUTH_DCR_MODE (pending | off | open) once, at module scope for the
+// same reason: OAUTH_DCR_MODE=open outside NODE_ENV development or test throws
+// here and stops the process with its reason, and an unknown or empty value is
+// logged as a boot warning (it resolves to off). Every registration request
+// then reads the latched value. See ./routers/oauth/dcr-mode.
+initOAuthDcrMode();
 
 const app = express();
 

@@ -21,6 +21,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // load). All tests here inject mint stubs — mock the db module away.
 vi.mock("../../db/index", () => ({ db: {} }));
 
+import type { McpUrlGuardOptions } from "../metamcp/url-guard";
 import { M365BrokerError } from "./errors";
 import {
   makeM365InjectedFetch,
@@ -51,6 +52,22 @@ function makeBaseFetch() {
   });
   return { baseFetch, seen };
 }
+
+/**
+ * The pooled data plane's guard posture over a fake transport, with a resolver
+ * that answers an internal (RFC 1918) address for every host, as Docker's
+ * resolver does for the m365 backend's service name. The injection only ever
+ * attaches the token to such a destination (invariant 7, pinned in
+ * injected-fetch.destination.test.ts); these cases pin what it attaches there.
+ */
+const overInternalBackend = (
+  baseFetch: (url: string | URL, init?: RequestInit) => Promise<Response>,
+): McpUrlGuardOptions => ({
+  allowPrivateAddresses: true,
+  refuseCrossOriginRedirect: true,
+  baseFetch,
+  lookup: async () => ["10.20.0.5"],
+});
 
 /** A JSON-RPC message body, as the SDK transport serializes one. */
 function rpc(method: string, id?: number): string {
@@ -105,7 +122,10 @@ describe("m365 injected fetch — the injection invariant", () => {
   it("invariant 3: no user context → NO Authorization header and no mint", async () => {
     const mint = makeMintStub("should-not-be-used");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await injected("http://mcp-m365:3000/mcp", toolsCall());
 
@@ -117,7 +137,10 @@ describe("m365 injected fetch — the injection invariant", () => {
   it("invariant 1: strips an inbound Authorization credential even without context", async () => {
     const mint = makeMintStub("unused");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await injected(
       "http://mcp-m365:3000/mcp",
@@ -132,7 +155,10 @@ describe("m365 injected fetch — the injection invariant", () => {
   it("invariant 2: with context, injects exactly the token minted for that user", async () => {
     const mint = makeMintStub("graph-access-token-for-alex");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await runWithM365UserContext({ userId: "user-alex" }, () =>
       injected(
@@ -151,7 +177,10 @@ describe("m365 injected fetch — the injection invariant", () => {
   it("invariant 2: the inbound consumer credential can never survive injection", async () => {
     const mint = makeMintStub("minted-token");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await runWithM365UserContext({ userId: "u1" }, () =>
       injected(
@@ -176,7 +205,10 @@ describe("m365 injected fetch — the injection invariant", () => {
   it("context propagates through async hops (awaits between wrap and dispatch)", async () => {
     const mint = makeMintStub("token-after-hops");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await runWithM365UserContext({ userId: "hop-user" }, async () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
@@ -195,7 +227,10 @@ describe("m365 injected fetch — the injection invariant", () => {
     );
     const mint = makeMintStub(error);
     const { baseFetch } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await expect(
       runWithM365UserContext({ userId: "u1" }, () =>
@@ -208,7 +243,10 @@ describe("m365 injected fetch — the injection invariant", () => {
   it("empty/partial context is treated as no context (fail-closed)", async () => {
     const mint = makeMintStub("unused");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await runWithM365UserContext({ userId: "" }, () =>
       injected("http://mcp-m365:3000/mcp", toolsCall()),
@@ -272,7 +310,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     async (_label, init) => {
       const mint = makeMintStub(credentialMissing());
       const { baseFetch, seen } = makeBaseFetch();
-      const injected = makeM365InjectedFetch(mint, baseFetch);
+      const injected = makeM365InjectedFetch(
+        mint,
+        overInternalBackend(baseFetch),
+      );
 
       await runWithM365UserContext({ userId: "user-unenrolled" }, () =>
         injected(MCP_URL, {
@@ -369,7 +410,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
       for (const mintResult of ["graph-token", credentialMissing()]) {
         const mint = makeMintStub(mintResult);
         const { baseFetch, seen } = makeBaseFetch();
-        const injected = makeM365InjectedFetch(mint, baseFetch);
+        const injected = makeM365InjectedFetch(
+          mint,
+          overInternalBackend(baseFetch),
+        );
 
         await runWithM365UserContext({ userId: "user-a" }, () =>
           injected(
@@ -414,7 +458,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     async (_label, body) => {
       const mint = makeMintStub("graph-token");
       const { baseFetch, seen } = makeBaseFetch();
-      const injected = makeM365InjectedFetch(mint, baseFetch);
+      const injected = makeM365InjectedFetch(
+        mint,
+        overInternalBackend(baseFetch),
+      );
 
       await runWithM365UserContext({ userId: "user-enrolled" }, () =>
         injected(MCP_URL, post(body)),
@@ -431,7 +478,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
   it("tools/call mints a token for exactly that user", async () => {
     const mint = makeMintStub("graph-token-for-enrolled");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await runWithM365UserContext({ userId: "user-enrolled" }, () =>
       injected(MCP_URL, post(rpc("tools/call", 9))),
@@ -449,7 +499,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     const error = credentialMissing();
     const mint = makeMintStub(error);
     const { baseFetch } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await expect(
       runWithM365UserContext({ userId: "user-unenrolled" }, () =>
@@ -462,7 +515,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
   it("a batch that contains a tools/call mints", async () => {
     const mint = makeMintStub("graph-token");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await runWithM365UserContext({ userId: "user-enrolled" }, () =>
       injected(
@@ -647,7 +703,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     async (_label, init) => {
       const mint = makeMintStub("graph-token");
       const { baseFetch, seen } = makeBaseFetch();
-      const injected = makeM365InjectedFetch(mint, baseFetch);
+      const injected = makeM365InjectedFetch(
+        mint,
+        overInternalBackend(baseFetch),
+      );
 
       await runWithM365UserContext({ userId: "user-enrolled" }, () =>
         injected(MCP_URL, init),
@@ -656,7 +715,14 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
       expect(mint.getAccessToken).toHaveBeenCalledTimes(1);
       expect(seen[0].headers.get("authorization")).toBe("Bearer graph-token");
       expect(seen[0].headers.get(USER_ID_HEADER)).toBe("user-enrolled");
-      expect(seen[0].body).toBe(init.body);
+      // The body is sent unchanged. The guarded fetch (url-guard.ts) passes an
+      // absent body on as `undefined`, so a `null` one arrives as `undefined`;
+      // both mean "no body" to fetch. Every other body is the same value.
+      if (init.body === null) {
+        expect(seen[0].body).toBeUndefined();
+      } else {
+        expect(seen[0].body).toBe(init.body);
+      }
     },
   );
 
@@ -669,7 +735,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
       }),
     } as unknown as M365MintService;
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     const asUser = (userId: string) => ({ userId });
     await Promise.all([
@@ -717,7 +786,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
   it("a request with no user context sends no credential whatever it is", async () => {
     const mint = makeMintStub("unused");
     const { baseFetch, seen } = makeBaseFetch();
-    const injected = makeM365InjectedFetch(mint, baseFetch);
+    const injected = makeM365InjectedFetch(
+      mint,
+      overInternalBackend(baseFetch),
+    );
 
     await injected(MCP_URL, post(rpc("tools/call", 1)));
     await injected(MCP_URL, post(rpc("tools/list", 2)));
@@ -768,17 +840,17 @@ describe("getInjectedFetchForServer wiring", () => {
   it("returns a fetch only for configured server names", async () => {
     vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365,m365-staging");
     const { getInjectedFetchForServer } = await import("./injected-fetch");
-    expect(getInjectedFetchForServer("m365")).toBeDefined();
-    expect(getInjectedFetchForServer("m365-staging")).toBeDefined();
-    expect(getInjectedFetchForServer("m365-assistant")).toBeUndefined();
-    expect(getInjectedFetchForServer("autotask")).toBeUndefined();
+    expect(getInjectedFetchForServer("m365", {})).toBeDefined();
+    expect(getInjectedFetchForServer("m365-staging", {})).toBeDefined();
+    expect(getInjectedFetchForServer("m365-assistant", {})).toBeUndefined();
+    expect(getInjectedFetchForServer("autotask", {})).toBeUndefined();
     vi.unstubAllEnvs();
   });
 
   it("defaults to exactly the `m365` server", async () => {
     vi.unstubAllEnvs();
     const { getInjectedFetchForServer } = await import("./injected-fetch");
-    expect(getInjectedFetchForServer("m365")).toBeDefined();
-    expect(getInjectedFetchForServer("m365-assistant")).toBeUndefined();
+    expect(getInjectedFetchForServer("m365", {})).toBeDefined();
+    expect(getInjectedFetchForServer("m365-assistant", {})).toBeUndefined();
   });
 });

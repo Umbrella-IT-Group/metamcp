@@ -32,6 +32,9 @@ const { oauthRepoMock } = vi.hoisted(() => ({
     upsertClient: vi.fn(),
     listClients: vi.fn(),
     deleteClient: vi.fn(),
+    getClient: vi.fn(),
+    approvePendingDcrClient: vi.fn(),
+    rejectPendingDcrClient: vi.fn(),
   },
 }));
 
@@ -121,6 +124,122 @@ describe("oauthClientsImplementations.create", () => {
     await expect(
       oauthClientsImplementations.create(baseCreateInput),
     ).rejects.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
+  });
+});
+
+describe("oauthClientsImplementations.create stamps the approval", () => {
+  it("writes an admin-created client approved, whatever the input says", async () => {
+    const result = await oauthClientsImplementations.create({
+      ...baseCreateInput,
+      approval_status: "pending",
+      approved_by: "someone",
+      registration_source: "dcr",
+    } as typeof baseCreateInput);
+
+    expect(result.approval_status).toBe("approved");
+    const stored = oauthRepoMock.upsertClient.mock.calls[0][0];
+    expect(stored).toMatchObject({
+      registration_source: "admin",
+      approval_status: "approved",
+    });
+    expect(stored).not.toHaveProperty("approved_by");
+  });
+});
+
+describe("oauthClientsImplementations.approve and reject", () => {
+  const adminActor = {
+    actor_id: "admin-1",
+    actor_label: "admin@example.test",
+    actor_ip: null,
+    actor_user_agent: null,
+    request_id: null,
+  };
+  const pendingRow = {
+    client_id: "mcp_client_pending",
+    client_name: "Claude Code",
+    redirect_uris: ["http://localhost:53682/callback"],
+    registration_source: "dcr",
+    approval_status: "pending",
+  };
+
+  beforeEach(() => {
+    oauthRepoMock.getClient.mockResolvedValue(pendingRow);
+  });
+
+  it.each([
+    ["no authenticated actor", undefined],
+    ["an actor with no id", { ...adminActor, actor_id: null }],
+    [
+      "an admin-plane key",
+      {
+        ...adminActor,
+        admin_plane: { key_uuid: "k-1", owner_user_id: "admin-1" },
+      },
+    ],
+  ])("refuses %s before touching the row", async (_label, actor) => {
+    for (const decide of [
+      oauthClientsImplementations.approve,
+      oauthClientsImplementations.reject,
+    ]) {
+      await expect(
+        decide({ client_id: pendingRow.client_id }, actor),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
+    expect(oauthRepoMock.approvePendingDcrClient).not.toHaveBeenCalled();
+    expect(oauthRepoMock.rejectPendingDcrClient).not.toHaveBeenCalled();
+  });
+
+  it("approves with the session's administrator and the validated callbacks", async () => {
+    oauthRepoMock.approvePendingDcrClient.mockResolvedValue({
+      ...pendingRow,
+      approval_status: "approved",
+      approved_by: "admin-1",
+      approved_at: new Date(),
+      rejected_at: null,
+    });
+    const result = await oauthClientsImplementations.approve(
+      { client_id: pendingRow.client_id },
+      adminActor,
+    );
+    expect(result).toMatchObject({
+      approval_status: "approved",
+      approved_by: "admin-1",
+    });
+    expect(oauthRepoMock.approvePendingDcrClient).toHaveBeenCalledWith(
+      pendingRow.client_id,
+      pendingRow.redirect_uris,
+      "admin-1",
+    );
+  });
+
+  it("refuses a pending row whose callback is not loopback", async () => {
+    oauthRepoMock.getClient.mockResolvedValue({
+      ...pendingRow,
+      redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+    });
+    await expect(
+      oauthClientsImplementations.approve(
+        { client_id: pendingRow.client_id },
+        adminActor,
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(oauthRepoMock.approvePendingDcrClient).not.toHaveBeenCalled();
+  });
+
+  it("reports a decision lost to a concurrent one as a conflict", async () => {
+    oauthRepoMock.approvePendingDcrClient.mockResolvedValue(null);
+    oauthRepoMock.getClient
+      .mockResolvedValueOnce(pendingRow)
+      .mockResolvedValueOnce({
+        ...pendingRow,
+        approval_status: "rejected",
+      });
+    await expect(
+      oauthClientsImplementations.approve(
+        { client_id: pendingRow.client_id },
+        adminActor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
   });
 });
 
@@ -236,10 +355,25 @@ describe("oauth-clients router RBAC", () => {
       response_types: ["code"],
       token_endpoint_auth_method: "none",
       scope: "admin",
+      approval_status: "approved" as const,
       created_at: new Date(),
     })),
     list: vi.fn(async () => ({ clients: [] })),
     delete: vi.fn(async () => ({ success: true, message: "ok" })),
+    approve: vi.fn(async () => ({
+      client_id: "mcp_client_x",
+      approval_status: "approved" as const,
+      approved_by: "u-admin",
+      approved_at: new Date(),
+      rejected_at: null,
+    })),
+    reject: vi.fn(async () => ({
+      client_id: "mcp_client_x",
+      approval_status: "rejected" as const,
+      approved_by: null,
+      approved_at: null,
+      rejected_at: new Date(),
+    })),
   });
 
   const admin = router.createCaller({
@@ -260,6 +394,12 @@ describe("oauth-clients router RBAC", () => {
     await expect(
       admin.delete({ client_id: "mcp_client_x" }),
     ).resolves.toMatchObject({ success: true });
+    await expect(
+      admin.approve({ client_id: "mcp_client_x" }),
+    ).resolves.toMatchObject({ approval_status: "approved" });
+    await expect(
+      admin.reject({ client_id: "mcp_client_x" }),
+    ).resolves.toMatchObject({ approval_status: "rejected" });
   });
 
   it("rejects a member with FORBIDDEN on every procedure", async () => {
@@ -269,6 +409,12 @@ describe("oauth-clients router RBAC", () => {
     });
     await expect(
       member.delete({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      member.approve({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      member.reject({ client_id: "mcp_client_x" }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
@@ -281,6 +427,12 @@ describe("oauth-clients router RBAC", () => {
     });
     await expect(
       anonymous.delete({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      anonymous.approve({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      anonymous.reject({ client_id: "mcp_client_x" }),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 });

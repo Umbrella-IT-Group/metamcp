@@ -91,7 +91,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 ### OAuth longevity
 
-- **OAuth `refresh_token` grant** — implements the refresh-token grant that upstream advertised in discovery metadata but rejected at the token endpoint (the root cause of connectors dropping every 60 minutes). Refresh tokens are single-use / rotate on redemption.
+- **OAuth `refresh_token` grant** — implements the refresh-token grant that upstream advertised in discovery metadata but rejected at the token endpoint (the root cause of connectors dropping every 60 minutes). Refresh tokens are single-use / rotate on redemption. Rotation is atomic: one refresh token mints at most once, and a second presentation of a rotated-out token (including a client retrying a refresh whose reply it lost) revokes that token's whole family, so the client signs in again.
 - **Env-configurable token TTLs** — access, refresh, and better-auth session lifetimes are all env-var configurable, with defaults tuned for connectors that lack revoke-friendly UX: **24h access / 365d refresh / 30d session**.
 
 ### Access control
@@ -144,8 +144,11 @@ across the management and OAuth surfaces:
   an MCP server that runs as a child process in its own container unless
   `ALLOW_STDIO_SERVERS=true`, which is meant for local development. Stored stdio servers are
   kept but not started. See `example.env`.
-- **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of
-  unused clients, and a dedicated rate-limit bucket.
+- **Dynamic Client Registration held for approval**: self-registration accepts only local
+  (loopback) callbacks, and a new self-registered client cannot be authorized until an
+  administrator approves it on the OAuth Clients page (`OAUTH_DCR_MODE`, see
+  [README-oauth.md](README-oauth.md)). Also field/size caps, a scoped body limit, a sweep of
+  unapproved registrations, and a dedicated rate-limit bucket.
 - **Per-caller rate limiting on password sign-in** — the credential sign-in endpoint is capped
   per client IP, which also bounds how fast the append-only audit log can be filled with failed
   logins. SSO, callbacks, session reads and sign-out are deliberately not capped. See
@@ -349,7 +352,7 @@ Lazy recovery takes part in the ceiling under the rule "evict, never refuse" (ru
 | Variable | Default | Purpose |
 |---|---|---|
 | `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `86400` (24h) | MCP OAuth access-token lifetime (was hardcoded 1h upstream). |
-| `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `31536000` (365d) | MCP OAuth refresh-token lifetime. Refresh tokens rotate on use. |
+| `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `31536000` (365d) | MCP OAuth refresh-token lifetime. Refresh tokens rotate on use, atomically; presenting a rotated-out token again revokes its family. |
 | `OAUTH_REFRESH_CLIENT_AUTH` | `log` | Client authentication on the refresh_token grant for a confidential client (`client_secret_post` or `client_secret_basic`; public `none` clients are never affected). `log` checks the secret the way the authorization_code grant does, records the outcome (`verified`, `missing` or `invalid`, never the value) as `client_auth=` on the `[oauth] token issued` line and in the `oauth.token.refresh` audit row, warns on anything but `verified`, and still issues. `enforce` refuses anything but `verified` with 401 `invalid_client` (RFC 6749 section 6) and leaves the refresh token unrotated. Any other value falls back to `log` with a warning; the value in effect is logged at boot. |
 | `BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS` | `2592000` (30d) | Better-auth session lifetime. |
 | `BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS` | `604800` (7d) | Better-auth session refresh age. |

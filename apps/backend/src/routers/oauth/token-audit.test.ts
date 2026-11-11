@@ -58,6 +58,11 @@ const oauthRepositoryMock = {
   recordRotatedRefreshToken: vi.fn(),
   getRotatedRefreshToken: vi.fn(),
   revokeFamily: vi.fn(),
+  // The per-user credential lock and the atomic refresh claim; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
+  claimRefreshToken: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = { isDisabled: vi.fn() };
@@ -81,6 +86,9 @@ vi.mock("./introspection-auth", () => ({
 const { default: tokenRouter } = await import("./token");
 const { default: userinfoRouter } = await import("./userinfo");
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 
 const CLIENT_ID = "mcp_client_test";
 const USER_ID = "user-abc123";
@@ -232,6 +240,7 @@ beforeEach(() => {
   oauthRepositoryMock.deleteAccessToken.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 afterEach(() => {
@@ -257,6 +266,7 @@ describe("oauth.token.issue — the authorization_code grant", () => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
     });
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: "Claude",
       token_endpoint_auth_method: "none",
@@ -503,6 +513,7 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
     // the primary key.
     expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
       sha256(priorAccessToken),
+      FAKE_OAUTH_TX,
     );
     expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
 
@@ -570,6 +581,7 @@ describe("oauth.token.refresh — an EXPIRED refresh token is destroyed, loudly"
     expect(res.body).toMatchObject({ error: "invalid_grant" });
     expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
       sha256(priorAccessToken),
+      FAKE_OAUTH_TX,
     );
   });
 
@@ -611,8 +623,10 @@ describe("oauth.token.revoke / introspect — only for tokens that exist", () =>
     await post({ token: liveToken }, "/oauth/revoke");
     await flush();
 
+    // Under the owner's credential lock, through its transaction.
     expect(oauthRepositoryMock.deleteAccessToken).toHaveBeenCalledWith(
       liveToken,
+      FAKE_OAUTH_TX,
     );
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({

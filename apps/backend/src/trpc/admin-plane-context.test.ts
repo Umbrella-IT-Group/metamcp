@@ -158,6 +158,48 @@ describe("createContext — admin-plane bearer branch", () => {
     expect(ctx.session).toBeTruthy();
   });
 
+  it("marks a resolved admin-plane request with the verified key's origin", async () => {
+    resolveMock.mockResolvedValue({
+      user: BEARER_USER,
+      session: BEARER_SESSION,
+      keyUuid: "77777777-7777-4777-8777-777777777777",
+    });
+
+    const ctx = await createContext(
+      makeCtxArgs({ authorization: "Bearer sk_mt_ci_key" }),
+    );
+
+    expect(ctx.authOrigin).toEqual({
+      kind: "admin_plane",
+      key_uuid: "77777777-7777-4777-8777-777777777777",
+      owner_user_id: "ci-user",
+    });
+  });
+
+  it("never marks a cookie session, even one that also sends a bearer", async () => {
+    authHandlerMock.mockResolvedValue(cookieSessionResponse());
+
+    const ctx = await createContext(
+      makeCtxArgs({
+        cookie: "better-auth.session_token=abc",
+        authorization: "Bearer sk_mt_some_admin_plane_key",
+      }),
+    );
+
+    expect(ctx.user?.id).toBe("cookie-user");
+    expect(ctx).not.toHaveProperty("authOrigin");
+  });
+
+  it("does not mark a request whose bearer did not resolve", async () => {
+    resolveMock.mockResolvedValue(null);
+
+    const ctx = await createContext(
+      makeCtxArgs({ authorization: "Bearer sk_mt_not_admin_plane" }),
+    );
+
+    expect(ctx).not.toHaveProperty("authOrigin");
+  });
+
   it("leaves the request unauthenticated when the resolver returns null", async () => {
     resolveMock.mockResolvedValue(null);
 

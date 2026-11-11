@@ -37,11 +37,31 @@ const updateChain = {
   where: vi.fn().mockReturnThis(),
   returning: vi.fn().mockResolvedValue([{ uuid: "srv-1" }]),
 };
+// update() reads the current row under FOR UPDATE in a transaction first
+// (mcp-servers.repo.ts); same URL here, so the bearer contract below is the
+// same-URL one.
+const currentRow = {
+  type: "STREAMABLE_HTTP",
+  url: null,
+  bearerToken: "enc:v1:stored",
+  headers: {},
+};
+const selectChain = {
+  from: vi.fn().mockReturnThis(),
+  where: vi.fn().mockReturnThis(),
+  for: vi.fn(async () => [currentRow]),
+};
 
 vi.mock("../index", () => ({
   db: {
     insert: vi.fn(() => insertChain),
     update: vi.fn(() => updateChain),
+    transaction: vi.fn(async (run: (tx: unknown) => Promise<unknown>) =>
+      run({
+        select: vi.fn(() => selectChain),
+        update: vi.fn(() => updateChain),
+      }),
+    ),
   },
 }));
 
@@ -68,6 +88,8 @@ beforeEach(() => {
   updateChain.set.mockReturnThis();
   updateChain.where.mockReturnThis();
   updateChain.returning.mockResolvedValue([{ uuid: "srv-1" }]);
+  selectChain.from.mockReturnThis();
+  selectChain.where.mockReturnThis();
   insertChain.values.mockReturnThis();
   insertChain.returning.mockResolvedValue([{ uuid: "srv-1" }]);
   process.env.M365_TOKEN_KEK = VALID_KEK;

@@ -288,6 +288,13 @@
       "when": 1787961600000,
       "tag": "0041_api_key_ip_allowlist",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1788048000000,
+      "tag": "0042_oauth_client_approval",
+      "breakpoints": true
     }
   ]
 }

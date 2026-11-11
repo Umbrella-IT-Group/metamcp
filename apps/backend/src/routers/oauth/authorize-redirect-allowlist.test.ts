@@ -160,6 +160,9 @@ async function authorize(redirectUri: string): Promise<FakeRes> {
 function clientRegisteringEverything() {
   return {
     client_id: CLIENT_ID,
+    // Approved, as the admin-created hosted client these callbacks belong to
+    // is: this file tests the authorize-time callback rules, not approval.
+    approval_status: "approved",
     client_name: "Claude",
     redirect_uris: [
       CLAUDE_AI_CALLBACK,

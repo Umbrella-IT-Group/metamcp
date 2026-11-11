@@ -49,6 +49,30 @@ export const OAuthTokensSchema = z.object({
  */
 export const OAuthClientRegistrationSourceEnum = z.enum(["dcr", "admin"]);
 
+/**
+ * Whether an `oauth_clients` row may be used to authorize anyone (migration
+ * 0042).
+ *
+ * "approved" — the only value that lets the authorize, consent, decision and
+ *              token endpoints proceed. Admin-created clients are written
+ *              approved; a self-registered client becomes approved only when
+ *              an administrator approves it (or, in local development only,
+ *              when OAUTH_DCR_MODE=open).
+ * "pending"  — a self-registered client waiting for an administrator. The
+ *              column default, so an insert that forgets the field can never
+ *              produce a usable client.
+ * "rejected" — an administrator refused it; it cannot be used and is swept a
+ *              day after rejection.
+ *
+ * Any other value (there should be none: a database CHECK enforces the set)
+ * refuses access exactly as pending does.
+ */
+export const OAuthClientApprovalStatusEnum = z.enum([
+  "approved",
+  "pending",
+  "rejected",
+]);
+
 // OAuth Client schema for registered clients
 export const OAuthClientSchema = z.object({
   client_id: z.string(),
@@ -77,9 +101,35 @@ export const OAuthClientSchema = z.object({
   // invented for them. NULL therefore means "unknown", which the sweep treats
   // as not-DCR and leaves alone.
   registration_source: OAuthClientRegistrationSourceEnum.nullable().optional(),
+  // Migration 0042. Read as a plain string, not the enum, so a value outside
+  // the set (written by hand despite the CHECK) still reads back and is then
+  // refused by isOAuthClientApproved instead of failing the whole read.
+  approval_status: z.string(),
+  // Who approved the client and when. NULL for every row approved by the
+  // migration's grandfathering, for admin-created rows (creation is the
+  // approval, and the create audit row names the administrator), and for
+  // rows approved by OAUTH_DCR_MODE=open.
+  approved_by: z.string().nullable().optional(),
+  approved_at: z.date().nullable().optional(),
+  // When an administrator rejected the client. The retention sweep counts the
+  // rejected row's age from here, not from registration.
+  rejected_at: z.date().nullable().optional(),
   created_at: z.date(),
   updated_at: z.date().optional(),
 });
+
+/**
+ * The one approval test every authorization and token path uses.
+ *
+ * Exact equality with "approved" and nothing else: a missing row, a null, an
+ * unexpected spelling or any future status all refuse. Kept beside the schema
+ * so the backend gates and the admin UI agree on what "approved" means.
+ */
+export function isOAuthClientApproved(
+  client: { approval_status?: unknown } | null | undefined,
+): boolean {
+  return client?.approval_status === "approved";
+}
 
 // OAuth Authorization Code schema
 export const OAuthAuthorizationCodeSchema = z.object({
@@ -136,6 +186,15 @@ export const OAuthClientCreateInputSchema = z.object({
   // to guess about, and the whole point of this column is that it never
   // guesses.
   registration_source: OAuthClientRegistrationSourceEnum,
+  // REQUIRED on write for the same reason as registration_source: each door
+  // states the status it writes (the DCR endpoint "pending", or "approved"
+  // only in local-development open mode; the admin create path "approved").
+  // The column default is "pending" as a backstop, so a write path that
+  // somehow omits it still cannot produce a usable client.
+  approval_status: OAuthClientApprovalStatusEnum,
+  // Set only for a row written already approved outside an administrator's
+  // decision (OAUTH_DCR_MODE=open). Never taken from a request body.
+  approved_at: z.date().nullable().optional(),
   created_at: z.date(),
   updated_at: z.date().optional(),
 });
@@ -251,19 +310,23 @@ export type OAuthClientCreateInput = z.infer<
 export type OAuthClientRegistrationSource = z.infer<
   typeof OAuthClientRegistrationSourceEnum
 >;
+export type OAuthClientApprovalStatus = z.infer<
+  typeof OAuthClientApprovalStatusEnum
+>;
 /**
  * A minted client row that does not yet know which door it came through.
  *
  * `buildClientRegistration` returns this rather than a full
  * `OAuthClientCreateInput` because it is shared by both mint paths and so is
  * the one place that genuinely cannot know the answer. Each caller stamps its
- * own `registration_source` on the way to `upsertClient`, and because that
- * field is required on the create input, a caller that forgets does not
- * compile.
+ * own `registration_source` and `approval_status` (and, in open mode only,
+ * `approved_at`) on the way to `upsertClient`, and because the first two are
+ * required on the create input, a caller that forgets does not compile. The
+ * core never reads either from its untrusted input.
  */
 export type OAuthClientRegistrationDraft = Omit<
   OAuthClientCreateInput,
-  "registration_source"
+  "registration_source" | "approval_status" | "approved_at"
 >;
 export type OAuthAuthorizationCode = z.infer<
   typeof OAuthAuthorizationCodeSchema
@@ -328,6 +391,8 @@ export const CreateOAuthClientResponseSchema = z.object({
   response_types: z.array(z.string()),
   token_endpoint_auth_method: z.string(),
   scope: z.string().nullable(),
+  // Always "approved": an administrator creating a client is the approval.
+  approval_status: OAuthClientApprovalStatusEnum,
   created_at: z.date(),
 });
 
@@ -343,8 +408,38 @@ export const OAuthClientListItemSchema = z.object({
   token_endpoint_auth_method: z.string(),
   scope: z.string().nullable(),
   has_client_secret: z.boolean(),
+  // Approval state (migration 0042). A string rather than the enum so an
+  // out-of-set value is shown as-is instead of failing the whole listing; the
+  // gates treat anything but "approved" as refused.
+  approval_status: z.string(),
+  // Which door created the row: "dcr", "admin", or null for rows that predate
+  // migration 0029.
+  registration_source: OAuthClientRegistrationSourceEnum.nullable(),
+  approved_by: z.string().nullable(),
+  approved_at: z.date().nullable(),
+  rejected_at: z.date().nullable(),
+  // The source address of the successful self-registration, read from its
+  // `oauth.dcr.register` audit row. An observed network address, not an
+  // authenticated person and not evidence the client is safe. Null for admin
+  // and legacy rows, and when the audit write did not land.
+  registered_from_ip: z.string().nullable(),
   created_at: z.date(),
   updated_at: z.date().nullable(),
+});
+
+// Approve or reject one self-registered client. Only the client id is taken
+// from the caller: the deciding administrator and the time come from the
+// authenticated session on the server.
+export const DecideOAuthClientRequestSchema = z.object({
+  client_id: z.string().min(1),
+});
+
+export const DecideOAuthClientResponseSchema = z.object({
+  client_id: z.string(),
+  approval_status: OAuthClientApprovalStatusEnum,
+  approved_by: z.string().nullable(),
+  approved_at: z.date().nullable(),
+  rejected_at: z.date().nullable(),
 });
 
 export const ListOAuthClientsResponseSchema = z.object({
@@ -394,6 +489,12 @@ export type DeleteOAuthClientRequest = z.infer<
 export type DeleteOAuthClientResponse = z.infer<
   typeof DeleteOAuthClientResponseSchema
 >;
+export type DecideOAuthClientRequest = z.infer<
+  typeof DecideOAuthClientRequestSchema
+>;
+export type DecideOAuthClientResponse = z.infer<
+  typeof DecideOAuthClientResponseSchema
+>;
 
 // ===== Active access-token administration (Access dashboard) =====
 //
@@ -418,6 +519,11 @@ export const ActiveOAuthTokenItemSchema = z.object({
   user_email: z.string().nullable(),
   client_id: z.string(),
   client_name: z.string().nullable(),
+  // The issuing client's approval state (migration 0042), LEFT JOINed like
+  // client_name, so the Access view never presents a token from a client that
+  // is not approved as ordinary approved access. Null when the client row is
+  // gone.
+  client_approval_status: z.string().nullable(),
   scope: z.string(),
   created_at: z.date(),
   expires_at: z.date(),

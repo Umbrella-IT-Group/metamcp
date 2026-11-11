@@ -49,6 +49,9 @@ const oauthRepositoryMock = {
   setAuthCode: vi.fn(),
   getAuthCode: vi.fn(),
   deleteAuthCode: vi.fn(),
+  // The per-user credential lock the decision inserts its code under; armed
+  // in beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
 };
 
 // The `users.disabled` gate (migration 0027). Left deliberately un-defaulted
@@ -58,6 +61,9 @@ const oauthRepositoryMock = {
 // explicit on every test.
 const usersRepositoryMock = {
   isDisabled: vi.fn(),
+  // Re-checked under the lock before a code is inserted: the approving
+  // session must still exist (users.revokeAccess deletes it).
+  hasLiveSession: vi.fn(),
 };
 
 vi.mock("../../db/repositories", () => ({
@@ -77,7 +83,14 @@ vi.mock("../../auth", () => ({ auth: authMock }));
 process.env.APP_URL = "https://mcp.example.test";
 process.env.BETTER_AUTH_SECRET = "test-secret-for-consent-request-signing";
 
-const { default: authorizationRouter } = await import("./authorization");
+const {
+  default: authorizationRouter,
+  AUTH_CODE_TTL_MS,
+  LOOPBACK_AUTH_CODE_TTL_MS,
+} = await import("./authorization");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 const {
   CONSENT_CSRF_COOKIE_HOST_PREFIXED,
   signConsentRequest,
@@ -255,19 +268,32 @@ async function dispatch(init: Parameters<typeof makeReq>[0]): Promise<FakeRes> {
 // make the SECOND session lookup in a request see an empty body — failing in
 // the safe-looking direction (no user => refuse) and hiding a real regression.
 // A fresh Response per call keeps that trap out of future tests.
+/** The better-auth session id the fake session endpoint reports for a user. */
+function sessionIdFor(userId: string): string {
+  return `session-of-${userId}`;
+}
+
 function sessionFor(userId: string | null) {
   authMock.handler.mockImplementation(
     async () =>
-      new Response(JSON.stringify(userId ? { user: { id: userId } } : null), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify(
+          userId
+            ? { user: { id: userId }, session: { id: sessionIdFor(userId) } }
+            : null,
+        ),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
   );
 }
 
 function registeredClient(redirectUris: string[] = [REDIRECT_URI]) {
   return {
     client_id: CLIENT_ID,
+    approval_status: "approved",
     client_name: CLIENT_NAME,
     redirect_uris: redirectUris,
   };
@@ -448,6 +474,8 @@ beforeEach(() => {
   oauthRepositoryMock.setAuthCode.mockResolvedValue(undefined);
   oauthRepositoryMock.deleteAuthCode.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  usersRepositoryMock.hasLiveSession.mockResolvedValue(true);
+  armUserLockFakes(oauthRepositoryMock);
   sessionFor(USER_ID);
 });
 
@@ -1480,8 +1508,217 @@ describe("users.disabled closes both code-minting paths", () => {
 
     expect(oauthRepositoryMock.setAuthCode).toHaveBeenCalledTimes(1);
     expect(redirectUrl(res).searchParams.get("code")).toMatch(/^mcp_code_/);
-    // Both sites consulted the flag rather than one of them being dead code.
-    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledTimes(2);
+    // Both sites consulted the flag rather than one of them being dead code:
+    // the authorize GET, the decision, and the decision again under the
+    // user's credential lock just before the code is inserted.
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledTimes(3);
+    expect(usersRepositoryMock.isDisabled).toHaveBeenLastCalledWith(
+      USER_ID,
+      FAKE_OAUTH_TX,
+    );
     expect(cookie.name).toMatch(/^__Host-oauth_consent_csrf_.+/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The decision re-checks the session and the account under the user's OAuth
+// credential lock, the lock users.revokeAccess takes before it deletes
+// sessions and codes. The races themselves run against Postgres in
+// db/repositories/oauth-user-lock.integration.test.ts; these pin the handler's
+// side of the contract.
+// ---------------------------------------------------------------------------
+
+describe("POST /oauth/authorize/decision — re-checked under the credential lock", () => {
+  it("mints nothing when the consent request expires while waiting for the lock", async () => {
+    const { areq, csrf } = makeAreq();
+    const afterExpiry = Date.now() + 11 * 60 * 1000;
+    oauthRepositoryMock.withUserLock.mockImplementationOnce(
+      async (_userId: string, fn: (tx: unknown) => Promise<unknown>) => {
+        vi.spyOn(Date, "now").mockReturnValue(afterExpiry);
+        return fn(FAKE_OAUTH_TX);
+      },
+    );
+    try {
+      const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+      expect(res.statusCode).toBe(403);
+      expect(jsonBody(res)).toMatchObject({ error: "access_denied" });
+      expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("inserts the code through the locked transaction after re-checking the session and account", async () => {
+    const { areq, csrf } = makeAreq();
+    await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(oauthRepositoryMock.withUserLock).toHaveBeenCalledTimes(1);
+    expect(oauthRepositoryMock.withUserLock.mock.calls[0]?.[0]).toBe(USER_ID);
+    expect(usersRepositoryMock.hasLiveSession).toHaveBeenCalledWith(
+      sessionIdFor(USER_ID),
+      USER_ID,
+      FAKE_OAUTH_TX,
+    );
+    expect(usersRepositoryMock.isDisabled).toHaveBeenLastCalledWith(
+      USER_ID,
+      FAKE_OAUTH_TX,
+    );
+    expect(oauthRepositoryMock.setAuthCode.mock.calls[0]?.[2]).toBe(
+      FAKE_OAUTH_TX,
+    );
+  });
+
+  it("mints nothing when the approving session was revoked before the lock was granted", async () => {
+    usersRepositoryMock.hasLiveSession.mockResolvedValue(false);
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(res.statusCode).toBe(403);
+    expect(jsonBody(res)).toMatchObject({ error: "access_denied" });
+    expect(res.redirectedTo).toBeUndefined();
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+
+  it("mints nothing when the account was disabled before the lock was granted", async () => {
+    // Enabled at the unlocked check, disabled by the time the lock is held.
+    usersRepositoryMock.isDisabled
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(res.statusCode).toBe(403);
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+
+  it("mints nothing when the session lookup names no session id", async () => {
+    authMock.handler.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ user: { id: USER_ID } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const { areq, csrf } = makeAreq();
+
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+
+    expect(res.statusCode).toBe(403);
+    expect(usersRepositoryMock.hasLiveSession).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.setAuthCode).not.toHaveBeenCalled();
+  });
+});
+
+describe("authorization code lifetime by redirect type", () => {
+  it("gives a loopback code five minutes from approval", async () => {
+    expect(LOOPBACK_AUTH_CODE_TTL_MS).toBe(5 * 60 * 1000);
+    oauthRepositoryMock.getClient.mockResolvedValue(
+      registeredClient([LOOPBACK_REDIRECT_URI]),
+    );
+    const { areq, csrf } = makeAreq({ redirect_uri: LOOPBACK_REDIRECT_URI });
+
+    const before = Date.now();
+    await decide({ areq, decision: "approve", csrfCookie: csrf });
+    const after = Date.now();
+
+    const expiresAt = mintedAuthCode().stored.expires_at as number;
+    expect(expiresAt).toBeGreaterThanOrEqual(
+      before + LOOPBACK_AUTH_CODE_TTL_MS,
+    );
+    expect(expiresAt).toBeLessThanOrEqual(after + LOOPBACK_AUTH_CODE_TTL_MS);
+  });
+
+  it("keeps ten minutes, and the 302, for a non-loopback redirect", async () => {
+    expect(AUTH_CODE_TTL_MS).toBe(10 * 60 * 1000);
+    const { areq, csrf } = makeAreq();
+
+    const before = Date.now();
+    const res = await decide({ areq, decision: "approve", csrfCookie: csrf });
+    const after = Date.now();
+
+    expect(redirectUrl(res).searchParams.get("code")).toMatch(/^mcp_code_/);
+    const expiresAt = mintedAuthCode().stored.expires_at as number;
+    expect(expiresAt).toBeGreaterThanOrEqual(before + AUTH_CODE_TTL_MS);
+    expect(expiresAt).toBeLessThanOrEqual(after + AUTH_CODE_TTL_MS);
+  });
+});
+
+describe("loopback code page — who supplied what, and who asks for the code", () => {
+  const ORG_ENV = "NEXT_PUBLIC_BRANDING_ORG_NAME";
+
+  async function approveLoopbackAs(clientName: string) {
+    oauthRepositoryMock.getClient.mockResolvedValue({
+      ...registeredClient([LOOPBACK_REDIRECT_URI]),
+      client_name: clientName,
+    });
+    const { areq, csrf } = makeAreq({ redirect_uri: LOOPBACK_REDIRECT_URI });
+    return decide({ areq, decision: "approve", csrfCookie: csrf });
+  }
+
+  it("puts the warning ABOVE the code, naming the client and the lifetime", async () => {
+    const previous = process.env[ORG_ENV];
+    delete process.env[ORG_ENV];
+    try {
+      const res = await approveLoopbackAs(CLIENT_NAME);
+      const html = res.sentBody ?? "";
+      const { code } = mintedAuthCode();
+
+      const warningAt = html.indexOf('id="code-warning"');
+      const codeAt = html.indexOf(`<code>${code}</code>`);
+      expect(warningAt).toBeGreaterThan(-1);
+      expect(codeAt).toBeGreaterThan(warningAt);
+
+      const warning = html.slice(warningAt, codeAt);
+      expect(warning).toContain(
+        `The application name <span class="name">${CLIENT_NAME}</span> and the callback address below were supplied by whoever started this request.`,
+      );
+      expect(warning).toContain(
+        "This code lets that application act as you on this gateway.",
+      );
+      expect(warning).toContain("in the next 5 minutes");
+      expect(warning).toContain(
+        "Umbrella IT never asks anyone to send or paste this code for them.",
+      );
+      // Pasting into a login you started is distinguished from sending it on.
+      expect(html).toContain(
+        "paste the code into that waiting login prompt yourself",
+      );
+      // No em dash anywhere in the page text.
+      expect(html).not.toContain("\u2014");
+    } finally {
+      if (previous === undefined) delete process.env[ORG_ENV];
+      else process.env[ORG_ENV] = previous;
+    }
+  });
+
+  it("escapes a hostile client name rather than rendering it", async () => {
+    const hostile = `"><img src=x onerror=alert(1)><script>alert('x')</script>&`;
+    const res = await approveLoopbackAs(hostile);
+    const html = res.sentBody ?? "";
+
+    expect(html).not.toContain("<img src=x");
+    expect(html).not.toContain("<script>alert");
+    expect(html).toContain(escapeHtml(hostile));
+    // The CSP still locks the page down whatever the name says.
+    expect(res.headers["Content-Security-Policy"]).toContain(
+      "default-src 'none'",
+    );
+  });
+
+  it("names the deployment's configured organization, escaped", async () => {
+    const previous = process.env[ORG_ENV];
+    process.env[ORG_ENV] = "Example <Org> & Co";
+    try {
+      const res = await approveLoopbackAs(CLIENT_NAME);
+      expect(res.sentBody ?? "").toContain(
+        "Example &lt;Org&gt; &amp; Co never asks anyone to send or paste this code for them.",
+      );
+    } finally {
+      if (previous === undefined) delete process.env[ORG_ENV];
+      else process.env[ORG_ENV] = previous;
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { McpServerStatusEnum } from "@repo/zod-types";
 import { and, eq } from "drizzle-orm";
 
 import { db } from "../../../db/index";
@@ -5,6 +6,21 @@ import {
   mcpServersTable,
   namespaceServerMappingsTable,
 } from "../../../db/schema";
+
+/**
+ * Which mounts a lookup may answer with.
+ *
+ * `active`: only mounts whose namespace_server_mappings.status is ACTIVE. The
+ * tool filter uses this on every public tools/list and tools/call, so a mount
+ * switched to INACTIVE stops serving at once, including a live session that
+ * still holds a route to the server from an earlier listing.
+ *
+ * `any`: every mount, whatever its status. The admin Inspector's explicit
+ * include-inactive mode uses it (its listing shows inactive servers, so its
+ * filter must judge them), and so does override-name resolution, which only
+ * maps an alias to its original tool and authorizes nothing.
+ */
+export type NamespaceMountScope = "active" | "any";
 
 /**
  * Resolve a tool name's server prefix to the server(s) MOUNTED in this
@@ -23,10 +39,14 @@ import {
  * candidates. A prefix that matches no mounted server resolves to nothing and
  * the caller fails closed.
  *
- * Mount status (ACTIVE/INACTIVE in namespace_server_mappings) is deliberately
- * not filtered here: whether an inactive server is routed at all is
- * getMcpServers' decision (`includeInactiveServers`), and this lookup only
- * answers which servers a name can mean in this namespace.
+ * WHY THE MOUNT STATUS IS READ HERE. The call path reuses a live session's
+ * cached route (metamcp-proxy.ts) and only consults the routable-server read
+ * (getMcpServers, which filters ACTIVE) when it has no route. The filter's
+ * verdict is the one check every call passes, so the mount status has to be
+ * part of it: under `active` an INACTIVE mount is not a candidate, the filter
+ * refuses the call, and the proxy drops a route that points at it. This is an
+ * uncached read on every call, so a status change takes effect for the next
+ * call with no cache to invalidate. See NamespaceMountScope.
  *
  * Returns every match. Two mounted servers sharing a name is possible (a
  * public `github` and the namespace owner's own `github`), and the routing
@@ -38,7 +58,18 @@ import {
 export async function findNamespaceServerUuidsByName(
   namespaceUuid: string,
   serverName: string,
+  mountScope: NamespaceMountScope,
 ): Promise<string[]> {
+  const conditions = [
+    eq(namespaceServerMappingsTable.namespace_uuid, namespaceUuid),
+    eq(mcpServersTable.name, serverName),
+  ];
+  if (mountScope === "active") {
+    conditions.push(
+      eq(namespaceServerMappingsTable.status, McpServerStatusEnum.enum.ACTIVE),
+    );
+  }
+
   const rows = await db
     .select({ uuid: mcpServersTable.uuid })
     .from(mcpServersTable)
@@ -46,12 +77,7 @@ export async function findNamespaceServerUuidsByName(
       namespaceServerMappingsTable,
       eq(mcpServersTable.uuid, namespaceServerMappingsTable.mcp_server_uuid),
     )
-    .where(
-      and(
-        eq(namespaceServerMappingsTable.namespace_uuid, namespaceUuid),
-        eq(mcpServersTable.name, serverName),
-      ),
-    );
+    .where(and(...conditions));
 
   return rows.map((row) => row.uuid);
 }

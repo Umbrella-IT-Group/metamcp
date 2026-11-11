@@ -84,6 +84,14 @@ vi.mock("./public-metamcp/openapi/handlers", () => ({
 vi.mock("./public-metamcp/openapi/tool-execution", () => ({
   executeToolWithMiddleware: h.execute,
 }));
+// The bridge's tool routes take the endpoint rate limit (routes.ts). Its real
+// module reaches the backend pool and the database; this file is about body
+// parsing, so the limiter passes every request through. The limiter on those
+// routes is pinned in openapi/routes.rate-limit.test.ts.
+vi.mock("../middleware/rate-limit.middleware", () => ({
+  rateLimitMiddleware: (_req: unknown, _res: unknown, next: () => void): void =>
+    next(),
+}));
 
 // The controlled first child. It answers only requests carrying the probe
 // header, and reports whether anything ahead of it parsed the body.

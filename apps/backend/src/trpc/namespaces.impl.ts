@@ -38,6 +38,7 @@ import {
   mapOverrideNameToOriginal,
 } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
+import { notifyNamespaceMountChange } from "../lib/metamcp/namespace-mount-events";
 
 export const namespacesImplementations = {
   create: async (
@@ -543,6 +544,13 @@ export const namespacesImplementations = {
           message: "Server not found in namespace",
         };
       }
+
+      // Live sessions of this namespace drop their routes to the server and
+      // are told to re-list, before this returns success. Enforcement does
+      // not wait on it: the tool filter reads the mount status on every call
+      // (namespace-server-lookup.ts). The idle and OpenAPI rebuilds below
+      // stay asynchronous; neither is what refuses a call.
+      notifyNamespaceMountChange(input.namespaceUuid, input.serverUuid);
 
       // Invalidate idle MetaMCP server for this namespace since server status changed
       // Run this asynchronously to avoid blocking the response

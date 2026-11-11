@@ -249,6 +249,35 @@ export function isLoopbackRedirectUri(uri: string): boolean {
   }
 }
 
+/**
+ * The callback rule for anonymous self-registration (`POST /oauth/register`):
+ * plain `http` on an exact loopback host (`localhost`, `127.0.0.1`, `[::1]`),
+ * any port.
+ *
+ * Applied ONLY at that door, after the shared registration core has accepted
+ * the URI, so every shared rule (userinfo, fragment, the gateway's internal
+ * port, the host allowlist) has already run. It is deliberately not folded
+ * into `isAllowedRedirectUri`: that validator also serves the admin create
+ * dialog and every existing client's authorize request, where hosted
+ * callbacks (claude.ai, claude.com) are legitimate. A hosted client is one an
+ * administrator creates.
+ *
+ * `isLoopbackRedirectUri` alone is not enough: it checks the host only and
+ * also accepts `https://localhost`, which no installed client listens on.
+ * Requiring `http:` keeps the self-registration door to the RFC 8252 section
+ * 7.3 shape and nothing else.
+ */
+export function isDcrLoopbackRedirectUri(uri: unknown): boolean {
+  if (typeof uri !== "string") {
+    return false;
+  }
+  try {
+    return new URL(uri).protocol === "http:" && isLoopbackRedirectUri(uri);
+  } catch {
+    return false;
+  }
+}
+
 /** Why a redirect_uri was refused. Machine-readable so tests can pin the rule. */
 export type RedirectUriRejectionReason =
   | "not_a_string"
@@ -528,6 +557,15 @@ export function getIssuerIdentifier(req: express.Request): string {
  * away from the global 50mb body parser (see OAUTH_BODY_LIMIT).
  */
 export const OAUTH_SERVED_PREFIXES = ["/oauth", "/.well-known"] as const;
+
+/**
+ * Options every OAuth router is created with (./index.ts and each
+ * sub-router). `caseSensitive` so only the exact lowercase paths the metadata
+ * advertises route: Express's default would also route `/OAuth/Authorize`,
+ * which a path-matching gate in front of the gateway may not recognize as the
+ * same endpoint. See the comment on the router in ./index.ts.
+ */
+export const oauthRouterOptions = Object.freeze({ caseSensitive: true });
 
 /** Whole-segment prefix test for the paths above. */
 export function isOAuthServedPath(path: string): boolean {

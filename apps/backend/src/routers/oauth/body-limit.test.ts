@@ -44,7 +44,7 @@ vi.mock("@/utils/logger", () => ({
 vi.mock("../../db/repositories", () => ({
   oauthRepository: {
     cleanupExpired: vi.fn().mockResolvedValue(undefined),
-    pruneUnusedClients: vi.fn().mockResolvedValue(0),
+    pruneUnapprovedDcrClients: vi.fn().mockResolvedValue(0),
     upsertClient: vi.fn().mockResolvedValue(undefined),
   },
   toolCallAuditRepository: { pruneOlderThan: vi.fn().mockResolvedValue(0) },
@@ -79,9 +79,12 @@ const OVERSIZED_BYTES = 300 * 1024;
 const BETWEEN_LANES_BYTES = 100 * 1024;
 
 /** The registration a real connector sends, so the cap can be shown harmless. */
+// A Claude Code registration: self-registration accepts loopback callbacks
+// only, so a local client is the flow this endpoint now exists for (hosted
+// connectors use a client an administrator creates).
 const CLAUDE_REGISTRATION = {
-  client_name: "Claude",
-  redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+  client_name: "Claude Code",
+  redirect_uris: ["http://localhost:53682/callback"],
   grant_types: ["authorization_code"],
   response_types: ["code"],
   token_endpoint_auth_method: "none",
@@ -217,7 +220,7 @@ describe("/oauth/* body limit", () => {
     expect(withoutSkip.status).not.toBe(413);
   });
 
-  it("still accepts a real Claude connector registration", async () => {
+  it("still accepts a real Claude Code registration", async () => {
     // The half that matters more than the refusal: 256kb must be invisible to
     // the flow this endpoint exists for.
     const response = await postJson(

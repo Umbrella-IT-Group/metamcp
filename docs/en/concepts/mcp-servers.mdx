@@ -3,7 +3,7 @@ title: "MCP Servers"
 description: "Learn how to configure and manage MCP server instances in MetaMCP"
 ---
 
-A **MCP Server** is a configuration that tells MetaMCP how to start and manage a Model Context Protocol server. These servers provide tools, resources, and prompts that can be aggregated and exposed through MetaMCP endpoints.
+A **MCP Server** is a configuration that tells MetaMCP how to start and manage a Model Context Protocol server. The tools these servers provide are aggregated and exposed through MetaMCP endpoints. This gateway relays tools only. It still advertises the MCP `prompts` and `resources` capabilities but answers those requests itself: `prompts/list`, `resources/list` and `resources/templates/list` return empty lists, `prompts/get` and `resources/read` return a "Method not found" error, and none of them is forwarded to a server. The capabilities stay advertised because changing them would make every connected client start a new session after an upgrade.
 
 ## What is a MCP Server?
 
@@ -200,6 +200,15 @@ Useful when your server requires:
 - Gateway or proxy authentication
 - Organization-specific headers
 </Tip>
+
+### Changing a server's URL
+
+A stored bearer token and stored headers belong to the address they were set up for, so an update that changes the URL must say what happens to them:
+
+- **Bearer token:** send a new `bearerToken`, or `"clearBearerToken": true` to remove the stored one. In the edit dialog, type a new token or tick "Remove the stored bearer token when saving".
+- **Headers:** send `headers` again (an empty object removes them). The edit dialog always sends them.
+
+An update that changes the URL without these is refused with a message naming what is missing, and nothing in the server is changed. While the URL stays the same, a blank or omitted `bearerToken` keeps the stored token and omitted `headers` keep the stored headers, as before. An accepted change of the URL, type, bearer token or headers closes the server's open connections so the next request uses the new values.
 
 ## Managing MCP Servers
 

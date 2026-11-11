@@ -670,6 +670,28 @@ export const oauthClientsTable = pgTable(
     registration_source: text(
       "registration_source",
     ).$type<OAuthClientRegistrationSource>(),
+    // Migration 0042. Whether this client may be used to authorize anyone:
+    // only "approved" lets the authorize, consent, decision and token
+    // endpoints proceed (isOAuthClientApproved in @repo/zod-types).
+    //
+    // DEFAULT 'pending', the fail-closed direction: an insert path that forgets
+    // the column produces a client nobody can use until an administrator
+    // approves it, never one that is quietly usable. Both app write paths set
+    // it explicitly anyway (the DCR door "pending", admin create "approved").
+    // Existing rows were grandfathered once by the migration: admin-created,
+    // legacy and ever-used rows approved, never-used self-registrations
+    // pending. See drizzle/0042_oauth_client_approval.sql.
+    approval_status: text("approval_status").notNull().default("pending"),
+    // The administrator (users.id) who approved a self-registered client, and
+    // when. Taken from the authenticated tRPC session, never from a request
+    // body. NULL for grandfathered and admin-created rows: no approving person
+    // is invented for them. No foreign key, so deleting the administrator's
+    // account does not erase who approved; the audit row is the full record.
+    approved_by: text("approved_by"),
+    approved_at: timestamp("approved_at", { withTimezone: true }),
+    // When an administrator rejected the client. The retention sweep deletes
+    // a rejected self-registration one day after THIS, not after creation.
+    rejected_at: timestamp("rejected_at", { withTimezone: true }),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -683,6 +705,19 @@ export const oauthClientsTable = pgTable(
     check(
       "oauth_clients_registration_source_valid",
       sql`${table.registration_source} IS NULL OR ${table.registration_source} IN ('dcr', 'admin')`,
+    ),
+    // Migration 0042. The status set, enforced by the database so a row
+    // written by hand cannot carry a value the gates have never heard of.
+    check(
+      "oauth_clients_approval_status_valid",
+      sql`${table.approval_status} IN ('approved', 'pending', 'rejected')`,
+    ),
+    // Migration 0042. Decision fields only on the matching status, and a
+    // rejected row always carries its rejection time, which the retention
+    // sweep counts from.
+    check(
+      "oauth_clients_approval_fields_consistent",
+      sql`(${table.approved_by} IS NULL OR ${table.approval_status} = 'approved') AND (${table.approved_at} IS NULL OR ${table.approval_status} = 'approved') AND ((${table.rejected_at} IS NOT NULL) = (${table.approval_status} = 'rejected'))`,
     ),
   ],
 );

@@ -56,6 +56,11 @@ const oauthRepositoryMock = {
   recordRotatedRefreshToken: vi.fn(),
   getRotatedRefreshToken: vi.fn(),
   revokeFamily: vi.fn(),
+  // The per-user credential lock and the atomic refresh claim; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
+  claimRefreshToken: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = { isDisabled: vi.fn() };
@@ -74,6 +79,9 @@ vi.mock("./introspection-auth", () => ({
 
 const { default: tokenRouter } = await import("./token");
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 
 const CLIENT_ID = "mcp_client_test";
 const USER_ID = "user-abc123";
@@ -192,6 +200,17 @@ beforeEach(() => {
   oauthRepositoryMock.recordRotatedRefreshToken.mockResolvedValue(undefined);
   oauthRepositoryMock.revokeFamily.mockResolvedValue(0);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  // The token's client, approved (migration 0042): this file is about reuse
+  // detection, and an unapproved client is refused before the claim.
+  oauthRepositoryMock.getClient.mockResolvedValue({
+    client_id: CLIENT_ID,
+    client_name: "Reuse Client",
+    approval_status: "approved",
+    token_endpoint_auth_method: "none",
+    client_secret: null,
+    client_secret_salt: null,
+  });
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 afterEach(() => {
@@ -209,14 +228,34 @@ describe("refresh_token grant — normal rotation is untouched (migration 0037)"
     expect(oauthRepositoryMock.recordRotatedRefreshToken).toHaveBeenCalledTimes(
       1,
     );
-    expect(oauthRepositoryMock.recordRotatedRefreshToken).toHaveBeenCalledWith({
-      // The stored digest is passed straight through, not re-hashed.
-      refreshTokenHash: STORED_REFRESH_HASH,
-      familyId: FAMILY_ID,
-      clientId: CLIENT_ID,
-      userId: USER_ID,
-      expiresAt: expect.any(Date),
-    });
+    expect(oauthRepositoryMock.recordRotatedRefreshToken).toHaveBeenCalledWith(
+      {
+        // The stored digest is passed straight through, not re-hashed.
+        refreshTokenHash: STORED_REFRESH_HASH,
+        familyId: FAMILY_ID,
+        clientId: CLIENT_ID,
+        userId: USER_ID,
+        expiresAt: expect.any(Date),
+      },
+      // In the same transaction as the claim and the new pair.
+      FAKE_OAUTH_TX,
+    );
+  });
+
+  it("claims the token, records the marker and mints in ONE locked transaction", async () => {
+    await postRefresh("mcp_refresh_livetoken0000");
+
+    expect(oauthRepositoryMock.withUserLock).toHaveBeenCalledTimes(1);
+    expect(oauthRepositoryMock.withUserLock.mock.calls[0][0]).toBe(USER_ID);
+    expect(oauthRepositoryMock.claimRefreshToken).toHaveBeenCalledWith(
+      "mcp_refresh_livetoken0000",
+      FAKE_OAUTH_TX,
+    );
+    expect(oauthRepositoryMock.setAccessToken.mock.calls[0][2]).toBe(
+      FAKE_OAUTH_TX,
+    );
+    // The old row-by-hash delete is no longer how rotation consumes a token.
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
   });
 
   it("mints a new pair whose family INHERITS the rotated row's family", async () => {
@@ -256,7 +295,11 @@ describe("refresh_token grant — reuse of a rotated-out token revokes the famil
     const res = await postRefresh("mcp_refresh_stolen0000");
 
     expect(oauthRepositoryMock.revokeFamily).toHaveBeenCalledTimes(1);
-    expect(oauthRepositoryMock.revokeFamily).toHaveBeenCalledWith(FAMILY_ID);
+    // Under the owner's lock, through its transaction.
+    expect(oauthRepositoryMock.revokeFamily).toHaveBeenCalledWith(
+      FAMILY_ID,
+      FAKE_OAUTH_TX,
+    );
     // The still-live token in that family dies with it: revokeFamily was called
     // with the family that the live token also belongs to, and no NEW pair was
     // minted on this path.
@@ -297,6 +340,68 @@ describe("refresh_token grant — reuse of a rotated-out token revokes the famil
   });
 });
 
+describe("refresh_token grant — a token rotated away while waiting for the lock", () => {
+  // The preliminary (unlocked) lookup still saw the live row, but by the time
+  // this request held the user's lock another request had rotated it: the
+  // re-read finds no live row and the marker says it was rotated out. Under
+  // the strict reuse policy that is reuse, so the family (including the pair
+  // the winner just received) is revoked and nothing is minted.
+  beforeEach(() => {
+    oauthRepositoryMock.getByRefreshToken
+      .mockResolvedValueOnce(liveRow())
+      .mockResolvedValue(null);
+    oauthRepositoryMock.getRotatedRefreshToken.mockResolvedValue({
+      family_id: FAMILY_ID,
+      client_id: CLIENT_ID,
+      user_id: USER_ID,
+    });
+    oauthRepositoryMock.revokeFamily.mockResolvedValue(1);
+  });
+
+  it("revokes the family and mints nothing", async () => {
+    const res = await postRefresh("mcp_refresh_lostrace0000");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({
+      error: "invalid_grant",
+      error_description: "Invalid refresh token",
+    });
+    expect(oauthRepositoryMock.revokeFamily).toHaveBeenCalledWith(
+      FAMILY_ID,
+      FAKE_OAUTH_TX,
+    );
+    expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+  });
+});
+
+describe("refresh_token grant — the claim is the single-use gate", () => {
+  // Under the lock the re-read still saw the row, but the DELETE ... RETURNING
+  // claim removed nothing: a writer that does not take the lock (the expiry
+  // sweeper, a client-delete cascade) deleted it in between. Only a caller
+  // that gets exactly one row back may mint.
+  beforeEach(() => {
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue(liveRow());
+    oauthRepositoryMock.claimRefreshToken.mockResolvedValue([]);
+    oauthRepositoryMock.getRotatedRefreshToken.mockResolvedValue(null);
+  });
+
+  it("mints nothing when the claim returns no row", async () => {
+    const res = await postRefresh("mcp_refresh_vanished0000");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({
+      error: "invalid_grant",
+      error_description: "Invalid refresh token",
+    });
+    expect(oauthRepositoryMock.claimRefreshToken).toHaveBeenCalledTimes(1);
+    expect(
+      oauthRepositoryMock.recordRotatedRefreshToken,
+    ).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+  });
+});
+
 describe("refresh_token grant — an unrelated token revokes nothing", () => {
   beforeEach(() => {
     // Never a live token, never rotated out of any family.
@@ -309,6 +414,8 @@ describe("refresh_token grant — an unrelated token revokes nothing", () => {
     await flush();
 
     expect(oauthRepositoryMock.revokeFamily).not.toHaveBeenCalled();
+    // An unknown token names no user, so no lock is taken for it.
+    expect(oauthRepositoryMock.withUserLock).not.toHaveBeenCalled();
     expect(rows.filter((r) => r.action === "oauth.token.reuse")).toHaveLength(
       0,
     );

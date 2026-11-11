@@ -56,6 +56,11 @@ const oauthRepositoryMock = {
   recordRotatedRefreshToken: vi.fn(),
   getRotatedRefreshToken: vi.fn(),
   revokeFamily: vi.fn(),
+  // The per-user credential lock and the atomic refresh claim; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
+  claimRefreshToken: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -78,6 +83,9 @@ const { default: tokenRouter } = await import("./token");
 // Dynamic for the same reason as in token.test.ts: a static import of ./utils
 // would pull the logger in before the hoisted mock's object exists.
 const { hashClientSecret } = await import("./utils");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 
 const CLIENT_ID = "mcp_client_registered0000";
 const OTHER_CLIENT_ID = "mcp_client_someoneelse000";
@@ -166,6 +174,7 @@ function clientRow(
   return method === "none"
     ? {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Public Client",
         token_endpoint_auth_method: "none",
         client_secret: null,
@@ -173,6 +182,7 @@ function clientRow(
       }
     : {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Confidential Client",
         token_endpoint_auth_method: method,
         client_secret: hashed.hash,
@@ -215,6 +225,7 @@ beforeEach(() => {
   oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   oauthRepositoryMock.recordRotatedRefreshToken.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 const codeBody = (extra: Record<string, unknown> = {}) => ({
@@ -263,6 +274,7 @@ function expectRefusedUntouched(
   expect(oauthRepositoryMock.consumeAuthCode).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.deleteAuthCode).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+  expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.recordRotatedRefreshToken).not.toHaveBeenCalled();
 }
 
@@ -434,8 +446,10 @@ describe("authorization_code: client_secret_basic", () => {
 describe("refresh_token: none and client_secret_post are unchanged", () => {
   it("none: body client_id issues a rotated pair", async () => {
     expectIssued(await post(refreshBody({ client_id: CLIENT_ID })));
-    expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
-      PRIOR_ACCESS_TOKEN_HASH,
+    // Consumed by the atomic claim inside the user's credential lock.
+    expect(oauthRepositoryMock.claimRefreshToken).toHaveBeenCalledWith(
+      REFRESH_TOKEN,
+      FAKE_OAUTH_TX,
     );
   });
 

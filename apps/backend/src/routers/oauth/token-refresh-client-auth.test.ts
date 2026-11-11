@@ -51,6 +51,11 @@ const oauthRepositoryMock = {
   recordRotatedRefreshToken: vi.fn(),
   getRotatedRefreshToken: vi.fn(),
   revokeFamily: vi.fn(),
+  // The per-user credential lock and the atomic refresh claim; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
+  claimRefreshToken: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -82,6 +87,9 @@ const {
 // Dynamic for the same reason as in token.test.ts: a static import of ./utils
 // would pull the logger in before the hoisted mock's object exists.
 const { hashClientSecret } = await import("./utils");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 
 // Taken before any beforeEach clears the mocks: the module-load log lines.
@@ -186,6 +194,7 @@ function clientRow(method: Method) {
   return method === "none"
     ? {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Public Client",
         token_endpoint_auth_method: "none",
         client_secret: null,
@@ -193,6 +202,7 @@ function clientRow(method: Method) {
       }
     : {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Confidential Client",
         token_endpoint_auth_method: method,
         client_secret: hashed.hash,
@@ -256,8 +266,10 @@ function expectIssued(res: FakeRes) {
   expect(oauthRepositoryMock.recordRotatedRefreshToken).toHaveBeenCalledTimes(
     1,
   );
-  expect(oauthRepositoryMock.deleteAccessTokenByHash).toHaveBeenCalledWith(
-    PRIOR_ACCESS_TOKEN_HASH,
+  // Consumed by the atomic claim, inside the user's credential lock.
+  expect(oauthRepositoryMock.claimRefreshToken).toHaveBeenCalledWith(
+    REFRESH_TOKEN,
+    FAKE_OAUTH_TX,
   );
 }
 
@@ -270,6 +282,7 @@ function expectRefusedUntouched(res: FakeRes, description: string) {
   });
   expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+  expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
   expect(oauthRepositoryMock.recordRotatedRefreshToken).not.toHaveBeenCalled();
   expect(rows.filter((r) => r.action === "oauth.token.refresh")).toEqual([]);
 }
@@ -312,6 +325,7 @@ beforeEach(() => {
   oauthRepositoryMock.deleteAccessTokenByHash.mockResolvedValue(undefined);
   oauthRepositoryMock.recordRotatedRefreshToken.mockResolvedValue(undefined);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 afterEach(() => {
@@ -403,7 +417,10 @@ describe.each(["log", "enforce"] as const)(
 
     it("loads the row of the client the token was issued to", async () => {
       await post(refreshBody());
-      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(CLIENT_ID);
+      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(
+        CLIENT_ID,
+        FAKE_OAUTH_TX,
+      );
     });
   },
 );
@@ -462,7 +479,10 @@ describe("client_secret_post", () => {
 
     it("the outcome is judged for the token's client even with no client_id sent", async () => {
       expectIssued(await post(refreshBody({ client_secret: RIGHT_SECRET })));
-      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(CLIENT_ID);
+      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(
+        CLIENT_ID,
+        FAKE_OAUTH_TX,
+      );
       expect(issuedLine()).toMatch(/ client_auth=verified$/);
     });
   });
@@ -527,13 +547,16 @@ describe.each(["log", "enforce"] as const)(
     it.each([
       ["an object that cannot be coerced", { toString: "untrusted-value" }],
       ["an array containing the right secret", [RIGHT_SECRET]],
-    ])("records %s as invalid without coercing it", async (_label, secret) => {
+    ])("refuses %s before reading the token", async (_label, secret) => {
       process.env[ENV] = mode;
       oauthRepositoryMock.getClient.mockResolvedValue(
         clientRow("client_secret_post"),
       );
-      // Express accepts JSON objects here. Coercing this one while hashing
-      // throws, which used to turn the observational mode into a refusal.
+      // Express accepts JSON objects here. A client_secret that is not a
+      // single string is refused as a malformed request in BOTH modes, before
+      // the token is looked up, so it is never coerced, never hashed and never
+      // consumes the token. (It used to be evaluated as client_auth=invalid
+      // and, in log mode, still rotate.)
       const res = await post(
         refreshBody({
           client_id: CLIENT_ID,
@@ -541,13 +564,16 @@ describe.each(["log", "enforce"] as const)(
         }),
       );
 
-      if (mode === "log") {
-        expectIssued(res);
-        expect(issuedLine()).toMatch(/ client_auth=invalid$/);
-        expect(refreshRow().detail?.client_auth).toBe("invalid");
-      } else {
-        expectRefusedUntouched(res, "Invalid client secret");
-      }
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toEqual({
+        error: "invalid_request",
+        error_description:
+          "The client_secret parameter must be a single string value",
+      });
+      expect(oauthRepositoryMock.getByRefreshToken).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.withUserLock).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
       expect(loggedText()).not.toContain("untrusted-value");
       expectNoSecretRecorded();
     });
@@ -642,11 +668,23 @@ describe("the client row is gone (a delete racing the refresh)", () => {
     oauthRepositoryMock.getClient.mockResolvedValue(null);
   });
 
-  it("log: proceeds as before and says so", async () => {
-    expectIssued(await post(refreshBody({ client_id: CLIENT_ID })));
-    expect(issuedLine()).not.toContain("client_auth");
+  it("log: refuses as not approved, untouched, and says so", async () => {
+    // A missing client row has no approval (migration 0042), so log mode no
+    // longer proceeds to a mint that would fail on the foreign key: it is
+    // refused before the claim, in both modes.
+    const res = await post(refreshBody({ client_id: CLIENT_ID }));
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("unauthorized_client");
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
+    expect(
+      oauthRepositoryMock.recordRotatedRefreshToken,
+    ).not.toHaveBeenCalled();
     expect(warnLines()).toEqual([
       "[oauth] refresh client auth outcome=client_not_found mode=log " +
+        `client=${CLIENT_ID} user=${USER_ID}`,
+      "[oauth] token rejected reason=client_not_approved grant=refresh_token " +
         `client=${CLIENT_ID} user=${USER_ID}`,
     ]);
   });
