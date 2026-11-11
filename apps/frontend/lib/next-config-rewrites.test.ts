@@ -81,17 +81,29 @@ describe("destinationIsApprovedBackend", () => {
     );
   });
 
-  it("refuses a same-prefix destination on another origin", () => {
-    expect(
-      destinationIsApprovedBackend("http://localhost:12009@example.invalid/x"),
-    ).toBe(false);
-    expect(destinationIsApprovedBackend("http://localhost:120090/health")).toBe(
-      false,
-    );
-    expect(destinationIsApprovedBackend("https://example.invalid/x")).toBe(
-      false,
-    );
-    expect(destinationIsApprovedBackend("/relative/path")).toBe(false);
+  it.each([
+    [
+      "userinfo disguising another origin",
+      "http://localhost:12009@example.invalid/x",
+    ],
+    ["a different hostname", "http://localhost.example.invalid:12009/health"],
+    ["a valid different port", "http://localhost:12008/health"],
+    ["an out-of-range port", "http://localhost:120090/health"],
+    ["a different scheme", "https://localhost:12009/health"],
+    ["an unrelated origin", "https://example.invalid/x"],
+    ["an IPv4 loopback origin", "http://127.0.0.1:12009/health"],
+    ["an IPv6 loopback origin", "http://[::1]:12009/health"],
+    ["a trailing-dot hostname", "http://localhost.:12009/health"],
+    // Userinfo is absent from URL.origin, so these exercise its separate gate.
+    ["a username on the approved origin", "http://user@localhost:12009/health"],
+    [
+      "a password on the approved origin",
+      "http://:pass@localhost:12009/health",
+    ],
+    ["a relative path", "/relative/path"],
+    ["a protocol-relative URL", "//localhost:12009/health"],
+  ])("refuses %s", (_label, destination) => {
+    expect(destinationIsApprovedBackend(destination)).toBe(false);
   });
 });
 
