@@ -49,6 +49,18 @@
  *     a request the backend correlates by id within its own session; it
  *     is not a new tool invocation, so no scope's identity belongs on it.
  *     Tool-call POSTs keep invariant 2 unchanged.
+ *  7. The token and the user id go only to an INTERNAL backend, proven by
+ *     address. The injection runs inside the pool's guarded fetch
+ *     (`metamcp/url-guard.ts`, `InternalOnlyCredentials`), which resolves the
+ *     server row's host, validates and pins every address, and only then
+ *     asks for the credential, for a hop whose addresses are all internal.
+ *     A public, mixed or allowlisted-by-name destination gets neither header
+ *     and causes no mint, so repointing a server named in
+ *     `M365_INJECTED_SERVER_NAMES` at an outside host cannot collect anyone's
+ *     token. The guard re-decides on every redirect hop and refuses a
+ *     cross-origin one. Before this the injection wrapped the guard from
+ *     outside, minted from the URL text alone, and the guard's internal-only
+ *     list did not cover `Authorization`.
  *
  * WHY THIS IS HERE AND NOT AT THE CALL SITES. Before invariant 5 every
  * request minted, so a user with no grant failed their own `initialize`
@@ -63,6 +75,13 @@
  */
 import { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 
+import logger from "@/utils/logger";
+
+import {
+  createGuardedFetch,
+  type InternalOnlyCredentials,
+  type McpUrlGuardOptions,
+} from "../metamcp/url-guard";
 import { getInjectedServerNames } from "./config";
 import { M365MintService, m365MintService } from "./mint-service";
 import { getM365UserContext } from "./request-context";
@@ -181,62 +200,81 @@ export function requestNeedsUserToken(init?: RequestInit): boolean {
 }
 
 /**
- * Build an injected fetch. Exported with an injectable mint service +
- * base fetch for unit tests; production callers use
- * `getInjectedFetchForServer` below.
+ * The per-user Graph credential as a guard credential source
+ * (`InternalOnlyCredentials` in `metamcp/url-guard.ts`). The guard calls
+ * `forInternalHop` only for a hop whose destination it has resolved, pinned
+ * and proven internal, so the token is minted after the destination is known
+ * and only for one of our own backends (invariant 7).
+ *
+ * The header names it owns are deleted from EVERY hop first (invariant 1, and
+ * any `X-Umbrella-User-Id` a server row or a previous hop carried), and set
+ * again only when invariants 2 and 5 hold for the request this hop sends.
  */
-export function makeM365InjectedFetch(
+export function createM365Credentials(
   mintService: M365MintService = m365MintService,
-  baseFetch: FetchLike = fetch,
-): FetchLike {
-  return async (url, init) => {
-    const headers = new Headers(init?.headers);
-    // Invariant 1: never forward whatever credential the transport (or
-    // a future server-row misconfiguration) put on this request.
-    headers.delete("authorization");
-    headers.delete(USER_ID_HEADER);
-
-    const context = getM365UserContext();
-    if (context?.userId && requestNeedsUserToken(init)) {
-      // Invariant 2: token minted for exactly the request's user.
-      // Mint failures throw typed M365BrokerError — deliberately not
-      // caught here so they surface through the SDK client call into
-      // the proxy layer's typed-error mapping. Only a request that can
-      // execute a tool gets here (invariant 5), so that error is always
-      // the answer to a tools/call, never to a connect or a listing.
+): InternalOnlyCredentials {
+  return {
+    headerNames: ["authorization", USER_ID_HEADER.toLowerCase()],
+    forInternalHop: async ({ method, body }) => {
+      const context = getM365UserContext();
+      if (!context?.userId || !requestNeedsUserToken({ method, body })) {
+        // Invariant 3: no context, no credential. Invariants 5 and 6: a
+        // token-free request or a reply to the backend carries none either.
+        return undefined;
+      }
+      // Invariant 2: token minted for exactly the request's user. Mint
+      // failures throw typed M365BrokerError, deliberately not caught here,
+      // so they surface through the SDK client call into the proxy layer's
+      // typed-error mapping. Only a request that can execute a tool gets
+      // here (invariant 5), so that error is always the answer to a
+      // tools/call, never to a connect or a listing.
       const accessToken = await mintService.getAccessToken(context.userId);
-      headers.set("authorization", `Bearer ${accessToken}`);
-      headers.set(USER_ID_HEADER, context.userId);
-    }
-    // Invariant 3: no context → request leaves with no Authorization.
-    // Invariants 5 and 6: a token-free request or a reply to the
-    // backend leaves with none either.
-
-    return baseFetch(url, { ...init, headers });
+      return {
+        authorization: `Bearer ${accessToken}`,
+        [USER_ID_HEADER]: context.userId,
+      };
+    },
+    onWithheld: ({ method, body }, reason) => {
+      if (!getM365UserContext()?.userId) return;
+      if (!requestNeedsUserToken({ method, body })) return;
+      // Value-free: no token, no user id, no URL. The operator fixes the
+      // server row (or its DNS); the request itself goes out without the
+      // credential and the backend refuses it per its own contract.
+      logger.warn(
+        `M365 user token withheld from an m365-injected server: its destination is not an internal backend proven by resolved address (${reason}). The request was sent without it.`,
+      );
+    },
   };
 }
 
-/** Singleton used for every injected server (context does the per-user work). */
-const injectedFetchSingleton: FetchLike = makeM365InjectedFetch();
+/**
+ * Build an injected fetch: the guarded, pinned fetch with the per-user Graph
+ * credential (`createM365Credentials`). `guardOptions` is the posture the
+ * guard runs under; production passes the pooled data plane's, and tests
+ * pass their transport and resolver seams (`baseFetch`, `lookup`) with it.
+ */
+export function makeM365InjectedFetch(
+  mintService: M365MintService,
+  guardOptions: McpUrlGuardOptions,
+): FetchLike {
+  return createGuardedFetch({
+    ...guardOptions,
+    internalOnlyCredentials: createM365Credentials(mintService),
+  });
+}
 
 /**
- * The `client.ts` wiring hook: returns the injected fetch when (and
- * only when) `serverName` is configured for M365 delegated injection.
- * Env is read per call — cheap, and keeps tests deterministic.
- *
- * `baseFetch` composes the injection over another fetch (the pool's guarded,
- * pinned fetch): injection sets the per-user Authorization, then delegates the
- * actual connection to `baseFetch`. Omitted, the singleton over the global
- * fetch is returned, preserving the previous behaviour.
+ * The `client.ts` wiring hook: returns the injected fetch when (and only when)
+ * `serverName` is configured for M365 delegated injection, built over the
+ * guard posture the caller passes. Env is read per call — cheap, and keeps
+ * tests deterministic.
  */
 export function getInjectedFetchForServer(
   serverName: string,
-  baseFetch?: FetchLike,
+  guardOptions: McpUrlGuardOptions,
 ): FetchLike | undefined {
   if (!getInjectedServerNames().has(serverName)) {
     return undefined;
   }
-  return baseFetch
-    ? makeM365InjectedFetch(m365MintService, baseFetch)
-    : injectedFetchSingleton;
+  return makeM365InjectedFetch(m365MintService, guardOptions);
 }

@@ -16,7 +16,10 @@ import {
   ListToolsMiddleware,
   MetaMCPHandlerContext,
 } from "./functional-middleware";
-import { findNamespaceServerUuidsByName } from "./namespace-server-lookup";
+import {
+  findNamespaceServerUuidsByName,
+  type NamespaceMountScope,
+} from "./namespace-server-lookup";
 
 /**
  * Configuration for the filter middleware
@@ -25,7 +28,19 @@ export interface FilterToolsConfig {
   cacheEnabled?: boolean;
   cacheTTL?: number; // milliseconds
   customErrorMessage?: (toolName: string, reason: string) => string;
+  /**
+   * Judge tools against INACTIVE mounts as well as ACTIVE ones. Only the admin
+   * Inspector's explicit include-inactive mode sets this (`createServer`'s
+   * `includeInactiveServers`, which its listing also honours); every public
+   * chain leaves it false, so a server whose mount is INACTIVE in the
+   * namespace is not a candidate and its tools are refused. The mount read is
+   * uncached (namespace-server-lookup.ts).
+   */
+  includeInactiveMounts?: boolean;
 }
+
+const mountScopeFor = (config: FilterToolsConfig): NamespaceMountScope =>
+  config.includeInactiveMounts === true ? "any" : "active";
 
 /** The routing handler may use only the servers this call's filter judged. */
 export interface ToolFilterCallContext extends MetaMCPHandlerContext {
@@ -328,7 +343,8 @@ async function getToolStatus(
 async function filterActiveTools(
   tools: Tool[],
   namespaceUuid: string,
-  useCache: boolean = true,
+  useCache: boolean,
+  mountScope: NamespaceMountScope,
 ): Promise<Tool[]> {
   if (!tools || tools.length === 0) {
     return tools;
@@ -354,7 +370,11 @@ async function filterActiveTools(
   const serversFor = (serverName: string): Promise<string[]> => {
     let lookup = serverLookups.get(serverName);
     if (!lookup) {
-      lookup = findNamespaceServerUuidsByName(namespaceUuid, serverName);
+      lookup = findNamespaceServerUuidsByName(
+        namespaceUuid,
+        serverName,
+        mountScope,
+      );
       serverLookups.set(serverName, lookup);
     }
     return lookup;
@@ -410,7 +430,8 @@ async function filterActiveTools(
 async function isToolAllowed(
   toolName: string,
   namespaceUuid: string,
-  useCache: boolean = true,
+  useCache: boolean,
+  mountScope: NamespaceMountScope,
 ): Promise<{
   allowed: boolean;
   reason?: string;
@@ -435,9 +456,14 @@ async function isToolAllowed(
     // check entirely and let the call through. judgeParsedTool denies
     // instead, so the call side agrees with the list side and the
     // access-group gate on failure direction.
+    // Under the public `active` scope a mount switched to INACTIVE is not a
+    // candidate, so the call is refused here and the proxy drops any route a
+    // live session still holds to that server (metamcp-proxy.ts). A failed
+    // read throws into the catch below: refused, no backend call.
     const serverUuids = await findNamespaceServerUuidsByName(
       namespaceUuid,
       parsed.serverName,
+      mountScope,
     );
     const verdict = await judgeParsedTool(
       namespaceUuid,
@@ -472,6 +498,7 @@ export function createFilterListToolsMiddleware(
   config: FilterToolsConfig = {},
 ): ListToolsMiddleware {
   const useCache = config.cacheEnabled ?? true;
+  const mountScope = mountScopeFor(config);
 
   return (handler) => {
     return async (request, context) => {
@@ -484,6 +511,7 @@ export function createFilterListToolsMiddleware(
           response.tools,
           context.namespaceUuid,
           useCache,
+          mountScope,
         );
 
         return {
@@ -511,6 +539,7 @@ export function createFilterCallToolMiddleware(
   config: FilterToolsConfig = {},
 ): CallToolMiddleware {
   const useCache = config.cacheEnabled ?? true;
+  const mountScope = mountScopeFor(config);
   const customErrorMessage =
     config.customErrorMessage ??
     ((toolName: string, reason: string) =>
@@ -527,6 +556,7 @@ export function createFilterCallToolMiddleware(
         toolName,
         context.namespaceUuid,
         useCache,
+        mountScope,
       );
 
       if (!allowed) {

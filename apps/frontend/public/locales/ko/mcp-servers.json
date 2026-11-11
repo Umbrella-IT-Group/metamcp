@@ -19,6 +19,8 @@
   "urlPlaceholder": "https://example.com/sse|mcp",
   "bearerToken": "Bearer Token",
   "bearerTokenPlaceholder": "Bearer token 입력",
+  "clearBearerToken": "저장할 때 저장된 Bearer token 삭제",
+  "bearerTokenUrlChangeHelp": "토큰을 비워 두면 저장된 토큰이 유지됩니다. URL을 변경하는 경우 새 토큰을 입력하거나 저장된 토큰을 삭제하십시오. 게이트웨이는 저장된 토큰을 새 주소로 보내지 않습니다.",
   "headers": "사용자 정의 Header",
   "headersPlaceholder": "KEY=value (한 줄에 하나씩)",
   "ownership": "소유권",

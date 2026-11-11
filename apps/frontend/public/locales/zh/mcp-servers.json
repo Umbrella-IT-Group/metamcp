@@ -19,6 +19,8 @@
   "urlPlaceholder": "https://example.com/sse|mcp",
   "bearerToken": "Bearer 令牌",
   "bearerTokenPlaceholder": "Bearer 令牌",
+  "clearBearerToken": "保存时删除已存储的 Bearer 令牌",
+  "bearerTokenUrlChangeHelp": "令牌留空将保留已存储的令牌。如果更改 URL，请输入新令牌或删除已存储的令牌：网关不会将已存储的令牌发送到新地址。",
   "headers": "自定义请求头",
   "headersPlaceholder": "KEY=value（每行一个）",
   "ownership": "所有权",

@@ -34,6 +34,8 @@ export interface FakeServerRow {
 export interface FakeMountRow {
   namespaceUuid: string;
   serverUuid: string;
+  /** namespace_server_mappings.status; ACTIVE when omitted. */
+  status?: "ACTIVE" | "INACTIVE";
 }
 
 export interface FakeNamespaceRow {
@@ -74,6 +76,7 @@ export const toolMappingSchemaStub = {
   namespaceServerMappingsTable: {
     namespace_uuid: "nsm.namespace_uuid",
     mcp_server_uuid: "nsm.mcp_server_uuid",
+    status: "nsm.status",
   },
   toolsTable: { uuid: "tools.uuid", name: "tools.name" },
   namespaceToolMappingsTable: {
@@ -139,6 +142,7 @@ const rowsFor = (
               "servers.name": server.name,
               "nsm.namespace_uuid": mount.namespaceUuid,
               "nsm.mcp_server_uuid": mount.serverUuid,
+              "nsm.status": mount.status ?? "ACTIVE",
             },
           ]
         : [];

@@ -93,6 +93,9 @@ export const EditServerFormSchema = z
     args: z.string().optional(),
     url: z.string().optional(),
     bearerToken: z.string().optional(),
+    // Remove the stored bearer token on save. Needed when the URL changes
+    // and the server should have no token at the new address.
+    clearBearerToken: z.boolean().optional(),
     headers: z.string().optional(),
     env: z.string().optional(),
     user_id: z.string().nullable().optional(),
@@ -339,9 +342,19 @@ export const UpdateMcpServerRequestSchema = z
     args: z.array(z.string()).optional(),
     env: z.record(z.string(), z.string()).optional(),
     url: z.string().optional(),
+    // A non-empty value replaces the stored bearer token; blank or omitted
+    // keeps it, unless the update changes the URL (then the update must
+    // replace or clear it, see mcp-servers.repo.ts planServerUpdate).
     bearerToken: z.string().optional(),
+    // Remove the stored bearer token. Not together with a new bearerToken.
+    clearBearerToken: z.boolean().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     user_id: z.string().nullable().optional(),
+  })
+  .refine((data) => !(data.clearBearerToken === true && data.bearerToken), {
+    message:
+      "clearBearerToken and a new bearerToken cannot be sent in the same update",
+    path: ["clearBearerToken"],
   })
   .refine(
     (data) => {
@@ -457,6 +470,7 @@ export const McpServerUpdateInputSchema = z.object({
   env: z.record(z.string(), z.string()).optional(),
   url: z.string().nullable().optional(),
   bearerToken: z.string().nullable().optional(),
+  clearBearerToken: z.boolean().optional(),
   headers: z.record(z.string(), z.string()).optional(),
   user_id: z.string().nullable().optional(),
 });
