@@ -24,7 +24,7 @@
 
 import http, { type Server } from "node:http";
 import net from "node:net";
-import { gzipSync } from "node:zlib";
+import { deflateSync, gzipSync } from "node:zlib";
 
 import express from "express";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -163,7 +163,7 @@ function rawRequest(
   options: {
     method?: string;
     path: string;
-    headers: Record<string, string | number>;
+    headers: Record<string, string | number | string[]>;
     body?: Buffer;
     waitForClose?: boolean;
   },
@@ -223,7 +223,11 @@ function rawRequest(
       const head = [
         `${method} ${path} HTTP/1.1`,
         "Host: 127.0.0.1",
-        ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+        ...Object.entries(headers).flatMap(([name, value]) =>
+          (Array.isArray(value) ? value : [value]).map(
+            (entry) => `${name}: ${entry}`,
+          ),
+        ),
         "",
         "",
       ].join("\r\n");
@@ -521,38 +525,49 @@ describe("the default JSON lane", () => {
     expect(response.body).toBe(NEUTRAL_413_BODY);
   });
 
-  it("still inflates a small gzip JSON body", async () => {
-    const response = await fetch(`${fixed.baseUrl}/other/anything`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Encoding": "gzip",
-      },
-      body: gzipSync(JSON.stringify({ blob: "abc" })),
-    });
+  const encodings = [
+    ["gzip", gzipSync],
+    ["deflate", deflateSync],
+  ] as const;
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ received: true, blobLength: 3 });
-  });
+  it.each(encodings)(
+    "still inflates a small %s JSON body",
+    async (encoding, compress) => {
+      const response = await fetch(`${fixed.baseUrl}/other/anything`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Encoding": encoding,
+        },
+        body: compress(JSON.stringify({ blob: "abc" })),
+      });
 
-  it("refuses gzip JSON whose decoded size is over 64 KiB", async () => {
-    // A few hundred bytes on the wire, so the declared length passes; the
-    // parser's decoded-size limit still binds after inflation.
-    const compressed = gzipSync(jsonOfLength(4 * DEFAULT_LANE_BYTES));
-    expect(compressed.length).toBeLessThan(DEFAULT_LANE_BYTES);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ received: true, blobLength: 3 });
+    },
+  );
 
-    const response = await fetch(`${fixed.baseUrl}/other/anything`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Encoding": "gzip",
-      },
-      body: compressed,
-    });
+  it.each(encodings)(
+    "refuses %s JSON whose decoded size is over 64 KiB",
+    async (encoding, compress) => {
+      // A few hundred bytes on the wire, so the declared length passes; the
+      // parser's decoded-size limit still binds after inflation.
+      const compressed = compress(jsonOfLength(4 * DEFAULT_LANE_BYTES));
+      expect(compressed.length).toBeLessThan(DEFAULT_LANE_BYTES);
 
-    expect(response.status).toBe(413);
-    expect(await response.text()).toBe(NEUTRAL_413_BODY);
-  });
+      const response = await fetch(`${fixed.baseUrl}/other/anything`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Encoding": encoding,
+        },
+        body: compressed,
+      });
+
+      expect(response.status).toBe(413);
+      expect(await response.text()).toBe(NEUTRAL_413_BODY);
+    },
+  );
 
   it("leaves a small non-JSON body unparsed, as before", async () => {
     for (const app of [fixed, unfixed]) {
@@ -734,6 +749,71 @@ describe("declaredLengthGuard", () => {
     expect(response.status).toBe(200);
     expect(JSON.parse(response.body)).toEqual({ reached: true });
   });
+
+  it.each([
+    ["leading zeros", "00010485761"],
+    ["HTTP whitespace", "\t10485761 \t"],
+    ["a value above Number.MAX_SAFE_INTEGER", "9007199254740993"],
+  ])("refuses an oversized length with %s", async (_label, length) => {
+    const response = await rawRequest(guarded.port, {
+      path: "/metamcp/x/probe",
+      headers: { "Content-Length": length },
+    });
+
+    expect(response.timedOut).toBe(false);
+    expect(response.status).toBe(413);
+    expect(response.body).toBe(NEUTRAL_413_BODY);
+    expect(response.headers["connection"]).toBe("close");
+    expect(response.closed).toBe(true);
+  });
+
+  it.each([
+    ["leading zeros", "00010485760"],
+    ["HTTP whitespace", "\t10485760 \t"],
+  ])("allows exactly 10 MiB with %s", async (_label, length) => {
+    const response = await rawRequest(guarded.port, {
+      path: "/metamcp/x/probe",
+      headers: { "Content-Length": length },
+      waitForClose: false,
+    });
+
+    expect(response.timedOut).toBe(false);
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({ reached: true });
+  });
+
+  const invalidFramings: Array<
+    [string, Record<string, string | number | string[]>]
+  > = [
+    ["a non-numeric length", { "Content-Length": "not-a-number" }],
+    ["a decimal length", { "Content-Length": "10485761.0" }],
+    ["a negative length", { "Content-Length": "-1" }],
+    ["an overflowing length", { "Content-Length": "18446744073709551616" }],
+    ["comma-joined lengths", { "Content-Length": "10485761, 10485761" }],
+    ["duplicate lengths", { "Content-Length": ["10485761", "10485761"] }],
+    ["conflicting lengths", { "Content-Length": ["1", "10485761"] }],
+    [
+      "both Transfer-Encoding and Content-Length",
+      { "Content-Length": "10485761", "Transfer-Encoding": "chunked" },
+    ],
+  ];
+
+  // Node rejects invalid HTTP framing before Express sees a request. Keep
+  // these on the wire: synthetic request objects would miss that boundary
+  // and suggest the guard needs to accept headers Node never supplies.
+  it.each(invalidFramings)(
+    "rejects %s before reaching the route",
+    async (_label, headers) => {
+      const response = await rawRequest(guarded.port, {
+        path: "/metamcp/x/probe",
+        headers,
+      });
+
+      expect(response.timedOut).toBe(false);
+      expect(response.status).toBe(400);
+      expect(response.closed).toBe(true);
+    },
+  );
 
   it("lets a request with no Content-Length through to the route", async () => {
     const response = await postChunked(
