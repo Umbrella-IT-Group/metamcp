@@ -588,7 +588,8 @@ export interface ValidatedMcpTarget {
 /**
  * The header the gateway stamps on an upstream request to prove the request
  * came from the gateway itself, not from something that merely reached a
- * backend's port. A backend that enforces it can refuse everything without it.
+ * backend's port. A backend that requires it refuses requests without it,
+ * apart from its own open paths such as `/health`.
  * Header names are case-insensitive on the wire and `Headers` stores them
  * lowercased, which is why the constant is lowercase and the tests read it back
  * that way; it is the `X-Gateway-Auth` header.
@@ -610,8 +611,11 @@ const MIN_GATEWAY_BACKEND_SECRET_BYTES = 32;
  * Read per call rather than captured at import, matching every other env read
  * in this module, so a value can be corrected without a rebuild and varied by a
  * test. A value shorter than the minimum FAILS CLOSED to `too_short` rather
- * than shipping a guessable credential: the staged-rollout default is to send
- * nothing, and a truncated secret must not silently opt into sending a weak one.
+ * than shipping a guessable credential: with no usable secret the gateway sends
+ * no header, and a truncated secret must not silently opt into sending a weak
+ * one. Backends that require the header refuse those requests either way, so
+ * an unusable secret shows up as refused upstream calls, which is why it is
+ * also announced at boot (`warnIfGatewayBackendSecretUnset`).
  */
 const readGatewayBackendSecret = (): {
   value?: string;
@@ -639,8 +643,10 @@ const gatewayBackendSecret = (): string | undefined =>
 
 /**
  * Log ONE warning at boot when the gateway backend secret is not usable, so a
- * staged rollout (backends deployed permissive, gateway not yet stamping) is
- * visible in the boot log rather than silent.
+ * gateway that is not stamping the header is visible in the boot log rather
+ * than silent. Backends that require the header refuse every request without
+ * it apart from their open paths, so without this line the first sign would be
+ * upstream tools failing with 401s.
  *
  * Never logs the value; there is none worth logging in either branch, and the
  * `unset` and `too_short` cases are distinguished so a truncated secret is not
@@ -655,11 +661,11 @@ export const warnIfGatewayBackendSecretUnset = (): void => {
   const { reason } = readGatewayBackendSecret();
   if (reason === "unset") {
     logger.warn(
-      "GATEWAY_BACKEND_SECRET is not set: upstream requests to internal backends carry no gateway trust header (staged rollout). Set it once the backends enforce it.",
+      "GATEWAY_BACKEND_SECRET is not set: upstream requests to internal backends carry no gateway trust header, and backends that require it refuse them. Set the same value the backends are configured with.",
     );
   } else if (reason === "too_short") {
     logger.warn(
-      `GATEWAY_BACKEND_SECRET is shorter than ${MIN_GATEWAY_BACKEND_SECRET_BYTES} bytes and is being ignored: no gateway trust header will be sent. Set a value of at least ${MIN_GATEWAY_BACKEND_SECRET_BYTES} bytes.`,
+      `GATEWAY_BACKEND_SECRET is shorter than ${MIN_GATEWAY_BACKEND_SECRET_BYTES} bytes and is being ignored: no gateway trust header will be sent, and backends that require it refuse those requests. Set a value of at least ${MIN_GATEWAY_BACKEND_SECRET_BYTES} bytes.`,
     );
   }
 };

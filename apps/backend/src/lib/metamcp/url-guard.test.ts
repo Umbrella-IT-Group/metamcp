@@ -1342,6 +1342,12 @@ describe("warnIfGatewayBackendSecretUnset", () => {
     expect(logger.warn.mock.calls[0][0]).toContain(
       "GATEWAY_BACKEND_SECRET is not set",
     );
+    // Backends require the header, so the line says requests are refused
+    // rather than describing an optional or transitional state.
+    expect(logger.warn.mock.calls[0][0]).toContain(
+      "backends that require it refuse them",
+    );
+    expect(logger.warn.mock.calls[0][0]).not.toContain("staged rollout");
   });
 
   it("warns that a too-short secret is ignored", async () => {
@@ -1350,6 +1356,9 @@ describe("warnIfGatewayBackendSecretUnset", () => {
     warn();
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(logger.warn.mock.calls[0][0]).toContain("shorter than 32 bytes");
+    expect(logger.warn.mock.calls[0][0]).toContain(
+      "backends that require it refuse those requests",
+    );
   });
 
   it("stays silent when a valid secret is set", async () => {
