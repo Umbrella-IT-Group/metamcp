@@ -69,11 +69,15 @@ const storage = new AsyncLocalStorage<CallerContext>();
 /**
  * Run `fn` with `caller` as the request-scoped binding.
  *
- * An undefined caller runs OUTSIDE any store rather than entering an empty
- * one. That difference matters to `getCallerContext`'s reader: "no store" and
- * "a store that happens to be blank" must stay distinguishable, because the
- * first is a path that was never wired and the second is a request that
- * genuinely resolved no identity.
+ * An undefined caller enters no store at all rather than an empty one: `fn`
+ * runs in the AMBIENT store, so a binding a caller already holds stays
+ * visible to it. That is not "outside every context"; it reads as "no store"
+ * only because every caller today runs this in a request handler, where no
+ * binding of this store is ambient. Not entering an empty store matters to
+ * `getCallerContext`'s reader: "no store" and "a store that happens to be
+ * blank" must stay distinguishable, because the first is a path that was
+ * never wired and the second is a request that genuinely resolved no
+ * identity.
  */
 export function runWithCallerContext<T>(
   caller: CallerContext | undefined,

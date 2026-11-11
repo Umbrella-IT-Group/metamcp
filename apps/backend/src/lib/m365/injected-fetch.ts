@@ -39,6 +39,16 @@
  *     the answer is identical for every caller and nothing
  *     user-specific is sent. Anything the gate cannot positively
  *     classify as one of those mints, as before.
+ *  6. A reply to a request the backend sent (a strictly shaped JSON-RPC
+ *     response: a ping answer, an elicitation result, a method-not-found
+ *     error) carries no user token or user-id header either. The SDK
+ *     sends such a reply from the async scope it is reading the
+ *     backend's stream in: for the standing GET stream that is the scope
+ *     that OPENED the connection, which on a pooled connection need not
+ *     be the caller whose tool call is in flight. A reply only completes
+ *     a request the backend correlates by id within its own session; it
+ *     is not a new tool invocation, so no scope's identity belongs on it.
+ *     Tool-call POSTs keep invariant 2 unchanged.
  *
  * WHY THIS IS HERE AND NOT AT THE CALL SITES. Before invariant 5 every
  * request minted, so a user with no grant failed their own `initialize`
@@ -83,17 +93,23 @@ const TOKEN_FREE_HTTP_METHODS: ReadonlySet<string> = new Set([
   "DELETE",
 ]);
 
-/**
- * Longest body that can still be one of the token-free messages (they are
- * a few hundred bytes). A larger body is never parsed and never exempt: a
- * tool call carrying a big argument must not cost the gateway an extra
- * JSON parse just to learn that it needs a token.
- */
-const TOKEN_FREE_MAX_BODY_CHARS = 64 * 1024;
+/** A JSON object that is not an array: the only shape a single message has. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
-function isTokenFreeRpcMessage(message: unknown): boolean {
-  if (typeof message !== "object" || message === null) return false;
-  const method = (message as { method?: unknown }).method;
+/**
+ * A handshake, listing or notification REQUEST (invariant 5). A message
+ * that also carries `result` or `error` is not a request, whatever its
+ * method says, so it can never pass here as one: a reply has to qualify on
+ * its own strict shape below.
+ */
+function isTokenFreeRpcRequest(message: unknown): boolean {
+  if (!isPlainObject(message)) return false;
+  if (Object.hasOwn(message, "result") || Object.hasOwn(message, "error")) {
+    return false;
+  }
+  const method = message.method;
   return (
     typeof method === "string" &&
     (TOKEN_FREE_RPC_METHODS.has(method) ||
@@ -102,14 +118,50 @@ function isTokenFreeRpcMessage(message: unknown): boolean {
 }
 
 /**
+ * A reply to a request the backend sent (invariant 6), recognized STRICTLY:
+ * a plain object with `jsonrpc: "2.0"`, an `id` that is a string or a
+ * finite number (null and a missing id are refused), exactly one of
+ * `result` and `error`, and no `method` key at all. Fields are checked by
+ * presence, never truthiness, so `id: 0`, `id: ""` and a `null`, `false` or
+ * `0` result all qualify. Anything looser falls through to the fail-closed
+ * mint.
+ */
+function isJsonRpcReply(message: unknown): boolean {
+  if (!isPlainObject(message)) return false;
+  if (message.jsonrpc !== "2.0") return false;
+  if (Object.hasOwn(message, "method")) return false;
+  if (!Object.hasOwn(message, "id")) return false;
+  const id = message.id;
+  if (
+    typeof id !== "string" &&
+    !(typeof id === "number" && Number.isFinite(id))
+  ) {
+    return false;
+  }
+  return Object.hasOwn(message, "result") !== Object.hasOwn(message, "error");
+}
+
+function isTokenFreeRpcMessage(message: unknown): boolean {
+  return isTokenFreeRpcRequest(message) || isJsonRpcReply(message);
+}
+
+/**
  * Whether this outgoing request may execute a tool, and so needs the
- * user's token (invariant 5). FAIL-CLOSED: `true` (mint, the behavior
- * before this gate) unless the request is positively one of the token-free
- * kinds. A POST is token-free only when its body is a string that parses
- * to one message, or a non-empty batch, in which EVERY message has a
- * string method that is token-free. A parse failure, a non-string body, an
- * empty batch, a response-shaped message (no method), any other method
- * and any other HTTP method (PUT and the rest) all need a token.
+ * user's token (invariants 5 and 6). FAIL-CLOSED: `true` (mint, the
+ * behavior before this gate) unless the request is positively one of the
+ * token-free kinds. A POST is token-free only when its body is a string
+ * that parses to one message, or a non-empty batch, in which EVERY message
+ * is a token-free request (a string method from the lists above, with no
+ * `result` or `error`) or a strictly shaped reply. A parse failure, a
+ * non-string body, an empty batch, a malformed reply, any other method and
+ * any other HTTP method (PUT and the rest) all need a token.
+ *
+ * Every string body is parsed, whatever its size, as `verified-caller.ts`
+ * does: a size cut-off would leave a large reply minting the token of
+ * whichever scope sent it. The cost is bounded, because only the
+ * m365-injected servers' requests come through here and the gateway caps
+ * an inbound MCP request body (`metamcp/mcp-request-body-limit.ts`), so
+ * the worst case is one extra parse of a rare large tool call.
  */
 export function requestNeedsUserToken(init?: RequestInit): boolean {
   const httpMethod = (init?.method ?? "GET").toUpperCase();
@@ -117,9 +169,7 @@ export function requestNeedsUserToken(init?: RequestInit): boolean {
   if (httpMethod !== "POST") return true;
 
   const body = init?.body;
-  if (typeof body !== "string" || body.length > TOKEN_FREE_MAX_BODY_CHARS) {
-    return true;
-  }
+  if (typeof body !== "string") return true;
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
@@ -159,7 +209,8 @@ export function makeM365InjectedFetch(
       headers.set(USER_ID_HEADER, context.userId);
     }
     // Invariant 3: no context → request leaves with no Authorization.
-    // Invariant 5: a token-free request leaves with none either.
+    // Invariants 5 and 6: a token-free request or a reply to the
+    // backend leaves with none either.
 
     return baseFetch(url, { ...init, headers });
   };

@@ -64,8 +64,11 @@ export function runWithM365UserContext<T>(
   fn: () => T,
 ): T {
   if (!context?.userId) {
-    // No identity — run outside any context so the injected fetch
-    // fail-closes. Never propagate an empty/partial context.
+    // No identity: never enter an empty/partial context. `fn` runs in the
+    // AMBIENT store, not outside every context: if a caller already holds a
+    // context, `fn` still sees it. The one caller today runs this in a
+    // request handler, where no context of this store is ambient, so the
+    // injected fetch finds none and fail-closes.
     return fn();
   }
   return storage.run(context, fn);

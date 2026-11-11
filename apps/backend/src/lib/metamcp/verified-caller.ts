@@ -45,13 +45,17 @@ import { getCallerContext } from "./caller-context-store";
  * and SDK reconnect timers and the standing GET stream keep that opening
  * scope (see `asserted-actor.ts`, CONNECTION CONTROL TRAFFIC). So the header
  * is set only on a POST whose body parses to a JSON-RPC request that is not
- * the handshake, a listing or a notification. Everything this cannot
- * classify (a response to a server-initiated request, which is sent from the
- * opening scope; an unparseable or non-string body; PUT and the rest) carries
- * NO identity. The m365 token gate (`requestNeedsUserToken`) answers the same
- * question but mints when unsure, because there a missing token only fails
- * the call; here an unsure answer could name the wrong person. The two agree
- * on every request-shaped message, which `verified-caller.test.ts` pins.
+ * the handshake, a listing or a notification. Everything else carries NO
+ * identity: a response to a server-initiated request (sent from the opening
+ * scope, and completing a request the backend already holds rather than
+ * invoking a tool), an unparseable or non-string body, PUT and the rest. The
+ * m365 token gate (`requestNeedsUserToken`) answers the same question. It
+ * also sends nothing on a strictly shaped response, but mints when it cannot
+ * classify a message, because there a missing token only fails the call;
+ * here an unsure answer could name the wrong person. The two agree on every
+ * request and every strictly shaped response, and differ only on malformed
+ * messages; `verified-caller.test.ts` pins both the agreement and the named
+ * divergences.
  *
  * WHY NOT THE M365 INJECTION. `lib/m365/injected-fetch.ts` sets the same
  * header name, but it also mints a Graph token, reads its own user context
@@ -154,10 +158,10 @@ function isExecutingRpcRequest(message: unknown): boolean {
  * a JSON-RPC message, or a batch, containing at least one request that is not
  * the handshake, a listing or a notification. Every other request is false.
  *
- * No body-size shortcut, unlike the m365 gate: that gate's unsure answer is
- * "mint", so it can skip parsing a large body; this one's unsure answer is
- * "no identity", which would refuse a legitimate long tool call. The body is
- * already in memory as a string, and only named backends pay for the parse.
+ * No body-size shortcut, as in the m365 gate: here an unparsed body would
+ * mean "no identity", which would refuse a legitimate long tool call. The
+ * body is already in memory as a string, and only named backends pay for the
+ * parse.
  */
 export function requestExecutesBackendCode(init?: RequestInit): boolean {
   if ((init?.method ?? "GET").toUpperCase() !== "POST") return false;
