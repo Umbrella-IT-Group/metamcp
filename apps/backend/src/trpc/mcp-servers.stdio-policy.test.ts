@@ -29,7 +29,7 @@ const { repo, mappings, pool, metaPool, errorTracker, convert } = vi.hoisted(
   () => ({
     repo: {
       create: vi.fn(),
-      update: vi.fn(),
+      updateReportingChange: vi.fn(),
       findByUuid: vi.fn(),
       bulkCreate: vi.fn(),
     },
@@ -37,6 +37,7 @@ const { repo, mappings, pool, metaPool, errorTracker, convert } = vi.hoisted(
     pool: {
       ensureIdleSessionForNewServer: vi.fn(),
       invalidateIdleSession: vi.fn(),
+      invalidateServerConnection: vi.fn(),
     },
     metaPool: {
       invalidateIdleServers: vi.fn(),
@@ -135,8 +136,14 @@ beforeEach(() => {
   repo.create.mockImplementation(async (input: Record<string, unknown>) =>
     row({ ...input, uuid: SERVER_UUID }),
   );
-  repo.update.mockImplementation(async (input: Record<string, unknown>) =>
-    row({ ...input }),
+  // The update path writes through updateReportingChange, which also says
+  // whether the destination or credentials changed. false keeps these cases
+  // about the stdio gate alone, with no pooled-connection retirement.
+  repo.updateReportingChange.mockImplementation(
+    async (input: Record<string, unknown>) => ({
+      server: row({ ...input }),
+      destinationOrCredentialChanged: false,
+    }),
   );
   repo.findByUuid.mockResolvedValue(row());
   repo.bulkCreate.mockImplementation(
@@ -177,7 +184,7 @@ function expectBadRequest(result: Awaited<ReturnType<typeof mutate>>) {
 async function expectNoSideEffects() {
   await flush();
   expect(repo.create).not.toHaveBeenCalled();
-  expect(repo.update).not.toHaveBeenCalled();
+  expect(repo.updateReportingChange).not.toHaveBeenCalled();
   expect(repo.findByUuid).not.toHaveBeenCalled();
   expect(repo.bulkCreate).not.toHaveBeenCalled();
   expect(convert).not.toHaveBeenCalled();
@@ -300,8 +307,8 @@ describe("mcpServers.update", () => {
 
     expect(result.status).toBe(200);
     expect(result.body.result?.data).toMatchObject({ success: true });
-    expect(repo.update).toHaveBeenCalledTimes(1);
-    expect(repo.update.mock.calls[0][0]).toMatchObject({
+    expect(repo.updateReportingChange).toHaveBeenCalledTimes(1);
+    expect(repo.updateReportingChange.mock.calls[0][0]).toMatchObject({
       type: "STREAMABLE_HTTP",
     });
   });
@@ -317,7 +324,7 @@ describe("mcpServers.update", () => {
 
     expect(result.status).toBe(200);
     expect(result.body.result?.data).toMatchObject({ success: true });
-    expect(repo.update).toHaveBeenCalledTimes(1);
+    expect(repo.updateReportingChange).toHaveBeenCalledTimes(1);
     expect(auditRows.map((r) => r.action)).toEqual(["mcpserver.update"]);
   });
 
@@ -330,7 +337,7 @@ describe("mcpServers.update", () => {
 
     expect(result.status).toBe(200);
     expect(result.body.result?.data).toMatchObject({ success: true });
-    expect(repo.update).toHaveBeenCalledTimes(1);
+    expect(repo.updateReportingChange).toHaveBeenCalledTimes(1);
   });
 });
 

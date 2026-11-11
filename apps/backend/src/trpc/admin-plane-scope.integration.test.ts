@@ -478,6 +478,48 @@ describeIfDb(
       },
     );
 
+    // mcpServers.create stays on the allowlist for the sync tooling, so the
+    // allowlist alone would let this key register a command for the gateway
+    // to run. The stdio policy is what refuses it: with ALLOW_STDIO_SERVERS
+    // unset (production), the key gets BAD_REQUEST and no row is written.
+    it("cannot register a stdio server through an allowlisted procedure", async () => {
+      const { STDIO_SERVERS_DISABLED_MESSAGE } = await import(
+        "../lib/metamcp/stdio-policy"
+      );
+      const saved = process.env.ALLOW_STDIO_SERVERS;
+      delete process.env.ALLOW_STDIO_SERVERS;
+      try {
+        const name = `itest-srv-${RUN}-stdio`;
+        // The API requires `type`, so an omitted type never reaches the
+        // policy (input validation refuses it first); STDIO is the case.
+        for (const input of [{ name, type: "STDIO", command: "/bin/true" }]) {
+          const reply = await trpc(
+            "frontend.mcpServers.create",
+            input,
+            "mutation",
+          );
+          // The policy's own message, so an input-validation 400 cannot pass.
+          expect({
+            status: reply.status,
+            code: reply.code,
+            message: reply.message,
+          }).toEqual({
+            status: 400,
+            code: "BAD_REQUEST",
+            message: STDIO_SERVERS_DISABLED_MESSAGE,
+          });
+        }
+        const { rows } = await suiteLock.query(
+          `SELECT count(*)::int AS n FROM mcp_servers WHERE name = $1`,
+          [name],
+        );
+        expect(rows[0].n).toBe(0);
+      } finally {
+        if (saved === undefined) delete process.env.ALLOW_STDIO_SERVERS;
+        else process.env.ALLOW_STDIO_SERVERS = saved;
+      }
+    });
+
     it("answers a mixed batch per procedure", async () => {
       const res = await fetch(
         `${base}/trpc/frontend/frontend.mcpServers.list,frontend.users.list?batch=1&input=${encodeURIComponent("{}")}`,
