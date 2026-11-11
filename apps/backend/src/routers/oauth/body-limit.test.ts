@@ -66,7 +66,7 @@ process.env.BETTER_AUTH_SECRET = "test-secret-for-body-limit-suite";
 
 const { default: oauthRouter } = await import("./index");
 const { isOAuthServedPath, OAUTH_BODY_LIMIT } = await import("./utils");
-const { globalBodyParser, GLOBAL_JSON_BODY_LIMIT, RAW_STREAM_PREFIXES } =
+const { globalBodyParser, DEFAULT_JSON_BODY_LIMIT_BYTES, RAW_STREAM_PREFIXES } =
   await import("../../lib/global-body-parser");
 const { errorHandler } = await import(
   "../../middleware/error-handler.middleware"
@@ -74,6 +74,9 @@ const { errorHandler } = await import(
 
 /** Comfortably over 256kb, comfortably under anything a socket struggles with. */
 const OVERSIZED_BYTES = 300 * 1024;
+
+/** Over the 64 KiB default lane, under the 256kb OAuth limit. */
+const BETWEEN_LANES_BYTES = 100 * 1024;
 
 /** The registration a real connector sends, so the cap can be shown harmless. */
 const CLAUDE_REGISTRATION = {
@@ -95,7 +98,8 @@ const CLAUDE_REGISTRATION = {
  *             from that module breaks this app.
  *  - false -> a deliberate reconstruction of the PRE-FIX wiring, kept only as
  *             the control the fixed app is compared against. It is allowed to
- *             be a copy because it is modelling code that no longer exists.
+ *             be a copy because it is modelling code that no longer exists,
+ *             which is also why its 50mb is written out rather than imported.
  */
 async function startApp(skipOAuthInGlobalParser: boolean): Promise<{
   server: Server;
@@ -113,18 +117,17 @@ async function startApp(skipOAuthInGlobalParser: boolean): Promise<{
       ) {
         next();
       } else {
-        express.json({ limit: GLOBAL_JSON_BODY_LIMIT })(req, res, next);
+        express.json({ limit: "50mb" })(req, res, next);
       }
     });
   }
 
   app.use(oauthRouter);
 
-  // Stands in for a route on the generous 50mb default lane, so the OAuth
-  // scoping is shown to be scoping rather than a global squeeze. Deliberately
-  // NOT `/trpc` or `/api/auth`: globalBodyParser now gives those their own
-  // smaller ceilings (see lib/global-body-parser lanes), so they no longer
-  // model the generous default this check is about.
+  // Stands in for a route on the default lane (64 KiB), so the OAuth limit is
+  // shown to be its own lane rather than the default applied everywhere.
+  // Deliberately NOT `/trpc` or `/api/auth`: globalBodyParser gives those
+  // their own ceilings (see lib/global-body-parser lanes).
   app.post("/other/anything", (req, res) => {
     res.status(200).json({ received: typeof req.body === "object" });
   });
@@ -229,12 +232,20 @@ describe("/oauth/* body limit", () => {
     expect(body.redirect_uris).toEqual(CLAUDE_REGISTRATION.redirect_uris);
   });
 
-  it("leaves non-OAuth routes on the generous app-level limit", async () => {
-    const response = await postJson(fixed.baseUrl, "/other/anything", {
-      blob: "x".repeat(OVERSIZED_BYTES),
+  it("keeps the OAuth limit and the default lane separate", async () => {
+    // A body between the two ceilings: the OAuth lane reads it, the default
+    // lane refuses it. Either half failing means one limit is standing in for
+    // the other.
+    const onOAuth = await postJson(fixed.baseUrl, "/oauth/register", {
+      ...CLAUDE_REGISTRATION,
+      software_statement: "x".repeat(BETWEEN_LANES_BYTES),
+    });
+    const onDefault = await postJson(fixed.baseUrl, "/other/anything", {
+      blob: "x".repeat(BETWEEN_LANES_BYTES),
     });
 
-    expect(response.status).toBe(200);
+    expect(onOAuth.status).not.toBe(413);
+    expect(onDefault.status).toBe(413);
   });
 });
 
@@ -249,35 +260,37 @@ describe("/oauth/* body limit", () => {
  * there was no way to ask the second one at all.
  */
 describe("globalBodyParser lanes", () => {
-  it("pins the global limit at 50mb", () => {
-    expect(GLOBAL_JSON_BODY_LIMIT).toBe("50mb");
+  it("pins the default limit at 64 KiB", () => {
+    expect(DEFAULT_JSON_BODY_LIMIT_BYTES).toBe(64 * 1024);
   });
 
-  it("binds the 256kb OAuth limit on an OAuth-served path", async () => {
-    // 300kb is under the 50mb global and over the 256kb OAuth limit, so a 413
-    // can only mean the OAuth parser is the one that bound. Drop the
-    // isOAuthServedPath branch from globalBodyParser and this returns 201.
-    const response = await postJson(
-      fixed.baseUrl,
-      "/oauth/register",
-      oversizedRegistration(),
-    );
+  it("binds the 256kb OAuth limit, not the default, on an OAuth-served path", async () => {
+    // 100kb is over the 64 KiB default and under the 256kb OAuth limit, so
+    // anything but a 413 means the OAuth parser is the one that bound. Drop
+    // the isOAuthServedPath branch from globalBodyParser and the default lane
+    // refuses this with a 413.
+    const response = await postJson(fixed.baseUrl, "/oauth/register", {
+      ...CLAUDE_REGISTRATION,
+      software_statement: "x".repeat(BETWEEN_LANES_BYTES),
+    });
 
-    expect(response.status).toBe(413);
+    expect(response.status).not.toBe(413);
     expect(OAUTH_BODY_LIMIT).toBe("256kb");
   });
 
-  it("binds the 50mb global limit on a non-OAuth path", async () => {
-    // The same 300kb body, one path over. If the OAuth limit had been applied
-    // globally rather than scoped, this would 413 too — which is the failure
-    // this half exists to rule out. `/other` is on the 50mb default lane (not
-    // `/trpc` or `/api/auth`, which now carry their own smaller limits).
-    const response = await postJson(fixed.baseUrl, "/other/anything", {
-      blob: "x".repeat(OVERSIZED_BYTES),
+  it("binds the 64 KiB default on a non-OAuth path", async () => {
+    // At the default ceiling the body is read; one path over from the OAuth
+    // surface, the 100kb body above is refused.
+    const atLimit = await postJson(fixed.baseUrl, "/other/anything", {
+      blob: "x".repeat(DEFAULT_JSON_BODY_LIMIT_BYTES - '{"blob":""}'.length),
+    });
+    const overLimit = await postJson(fixed.baseUrl, "/other/anything", {
+      blob: "x".repeat(BETWEEN_LANES_BYTES),
     });
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ received: true });
+    expect(atLimit.status).toBe(200);
+    expect(await atLimit.json()).toEqual({ received: true });
+    expect(overLimit.status).toBe(413);
   });
 
   it("leaves raw-stream paths with no parser at all", async () => {

@@ -20,6 +20,13 @@ import logger from "@/utils/logger";
  * A body over it is answered 413 with a JSON-RPC error (-32000, "Payload Too
  * Large: Request body must not exceed N bytes") before anything is parsed.
  *
+ * The app also applies this constant to EVERY request: `declaredLengthGuard`
+ * (lib/global-body-parser), mounted in index.ts ahead of every router, answers
+ * a declared Content-Length over it with 413 and the terminal error handler's
+ * neutral body before any route runs. So on these routes too a declared
+ * oversize is answered by that guard, and the JSON-RPC 413 is what a body
+ * found over the limit only while it is read (no Content-Length) receives.
+ *
  * WHY THE OPTION HAS TO BE SET. Up to SDK 1.30.0 the transport read the body
  * with no bound. From 1.30.1 it caps the read at a 4 MiB default when no parsed
  * body is passed, which is every leg here, and that default refused tool calls
@@ -35,7 +42,7 @@ import logger from "@/utils/logger";
  * SDK transport behind it:
  *
  * - at a 10 MiB cap, a 10485760-byte call returns 200 and a 10485761-byte or
- *   12 MiB call returns this 413 within milliseconds (the declared length is
+ *   12 MiB call returns a 413 within milliseconds (the declared length is
  *   over the cap, so nothing is read);
  * - at a higher cap, the same over-10-MiB calls do not complete: the transport
  *   waits for bytes Next dropped, and Next's 120 s proxyTimeout eventually
@@ -50,10 +57,12 @@ import logger from "@/utils/logger";
  * `middlewareClientMaxBodySize` to the same value together, and budgeting the
  * heap: a body costs several times its size while it is read, parsed and
  * re-serialized to the backend, in a container shared with the frontend.
- * `mcp-request-body-limit.test.ts` fails if the two numbers drift apart.
+ * `mcp-request-body-limit.test.ts` fails if the two numbers drift apart, and
+ * `declaredLengthGuard` reads this constant, so it moves with them.
  *
- * No environment override: the other body ceilings (GLOBAL_JSON_BODY_LIMIT,
- * AUTH_RELAY_BODY_LIMIT, TRPC_BODY_LIMIT, OAUTH_BODY_LIMIT) are constants too.
+ * No environment override: the other body ceilings
+ * (DEFAULT_JSON_BODY_LIMIT_BYTES, AUTH_RELAY_BODY_LIMIT, TRPC_BODY_LIMIT,
+ * OAUTH_BODY_LIMIT) are constants too.
  *
  * Not covered: the SSE transports (`/sse` + `/message`) read with the SDK's
  * own fixed 4mb limit, which the SDK does not expose as an option.
@@ -90,6 +99,12 @@ export const MCP_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
  * the transport would have given; the session is untouched either way, since
  * the SDK answers an oversized body on an initialized session without closing
  * it.
+ *
+ * In the running app `declaredLengthGuard` (lib/global-body-parser) makes the
+ * same comparison first, ahead of every router, and answers with the neutral
+ * 413 body instead, so this middleware's answer is the one a route gets when
+ * it is mounted without that guard. It stays on each route so a declared
+ * oversize allocates nothing there whatever is mounted in front.
  */
 export function refuseDeclaredOversize(
   req: Request,
