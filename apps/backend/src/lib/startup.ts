@@ -4,6 +4,11 @@ import { mcpServersRepository, namespacesRepository } from "../db/repositories";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
 import { metaMcpServerPool } from "./metamcp";
 import { serverErrorTracker } from "./metamcp/server-error-tracker";
+import {
+  isStdioServerType,
+  stdioServersAllowed,
+  warnStdioServerSkipped,
+} from "./metamcp/stdio-policy";
 import { convertDbServerToParams } from "./metamcp/utils";
 
 /**
@@ -76,9 +81,17 @@ export async function initializeIdleServers() {
     const allDbServers = await mcpServersRepository.findAll();
     console.log(`Found ${allDbServers.length} total MCP servers in database`);
 
-    // Convert all database servers to ServerParameters format
+    // Convert all database servers to ServerParameters format. Stored stdio
+    // rows are skipped first while stdio servers are disabled (see
+    // ./metamcp/stdio-policy): not converted, not warmed, one warning each,
+    // and the rows themselves are left as they are. This is the boot path
+    // only; the pool's transport factory refuses them on every other path.
     const allServerParams: Record<string, ServerParameters> = {};
     for (const dbServer of allDbServers) {
+      if (isStdioServerType(dbServer.type) && !stdioServersAllowed()) {
+        warnStdioServerSkipped(dbServer);
+        continue;
+      }
       const serverParams = await convertDbServerToParams(dbServer);
       if (serverParams) {
         allServerParams[dbServer.uuid] = serverParams;

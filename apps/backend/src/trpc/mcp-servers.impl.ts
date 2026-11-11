@@ -13,6 +13,7 @@ import {
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import logger from "@/utils/logger";
@@ -28,7 +29,66 @@ import { mcpServerPool } from "../lib/metamcp/mcp-server-pool";
 import { clearOverrideCache } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
 import { serverErrorTracker } from "../lib/metamcp/server-error-tracker";
+import {
+  isStdioServerType,
+  STDIO_SERVERS_DISABLED_MESSAGE,
+  stdioServersAllowed,
+} from "../lib/metamcp/stdio-policy";
 import { convertDbServerToParams } from "../lib/metamcp/utils";
+
+/**
+ * The stdio policy gate for `create` and `update` (see
+ * `lib/metamcp/stdio-policy.ts`). Called BEFORE each method's `try`: the broad
+ * catch there turns any throw into `success: false` inside an HTTP 200, and a
+ * policy refusal has to reach the client as a real BAD_REQUEST (HTTP 400).
+ */
+function refuseStdioServerUnlessAllowed(type: string | undefined): void {
+  if (isStdioServerType(type) && !stdioServersAllowed()) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: STDIO_SERVERS_DISABLED_MESSAGE,
+    });
+  }
+}
+
+/** How many refused bulk-import names the BAD_REQUEST message lists. */
+const BULK_IMPORT_REFUSED_NAMES_SHOWN = 10;
+
+/**
+ * The stdio policy gate for `bulkImport`: the WHOLE request is refused, before
+ * any row is written, when any entry is stdio or normalizes to stdio (no type,
+ * an empty type, or a schema alias such as `std`, which the request schema
+ * has already turned into "STDIO"). Refusing everything rather than importing
+ * the HTTP/SSE entries keeps an import atomic: an administrator never has to
+ * work out which half of a config landed. Called before the `try` for the
+ * same reason as the gate above.
+ */
+function refuseStdioBulkImportUnlessAllowed(
+  servers: z.infer<typeof BulkImportMcpServersRequestSchema>["mcpServers"],
+): void {
+  if (stdioServersAllowed()) return;
+  const stdioNames = Object.entries(servers)
+    .filter(([, config]) => isStdioServerType(config.type))
+    .map(([name]) => name);
+  if (stdioNames.length === 0) return;
+
+  // Names are caller-supplied object keys with no length bound, so the list
+  // is capped in count and length before it goes back in the message.
+  const shown = stdioNames
+    .slice(0, BULK_IMPORT_REFUSED_NAMES_SHOWN)
+    .map((name) => JSON.stringify(name.slice(0, 64)))
+    .join(", ");
+  const more =
+    stdioNames.length > BULK_IMPORT_REFUSED_NAMES_SHOWN
+      ? ` and ${stdioNames.length - BULK_IMPORT_REFUSED_NAMES_SHOWN} more`
+      : "";
+  throw new TRPCError({
+    code: "BAD_REQUEST",
+    message:
+      `${STDIO_SERVERS_DISABLED_MESSAGE} Nothing was imported. ` +
+      `Entries that are stdio (an entry with no type is stdio): ${shown}${more}.`,
+  });
+}
 
 export const mcpServersImplementations = {
   create: async (
@@ -36,6 +96,7 @@ export const mcpServersImplementations = {
     userId: string,
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateMcpServerResponseSchema>> => {
+    refuseStdioServerUnlessAllowed(input.type);
     try {
       // Determine user ownership based on input.user_id or default to current user
       const effectiveUserId =
@@ -167,6 +228,7 @@ export const mcpServersImplementations = {
     userId: string,
     actor?: AuditActor,
   ): Promise<z.infer<typeof BulkImportMcpServersResponseSchema>> => {
+    refuseStdioBulkImportUnlessAllowed(input.mcpServers);
     try {
       const serversToInsert = [];
       const errors: string[] = [];
@@ -436,6 +498,10 @@ export const mcpServersImplementations = {
     userId: string,
     actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateMcpServerResponseSchema>> => {
+    // Before the existence and ownership reads as well as the write: the
+    // answer does not depend on the row. An existing stdio row can still be
+    // switched to Streamable HTTP or SSE, and deleted, with the flag off.
+    refuseStdioServerUnlessAllowed(input.type);
     try {
       // Check if server exists and user has permission to update it
       const server = await mcpServersRepository.findByUuid(input.uuid);

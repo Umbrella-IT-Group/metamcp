@@ -22,7 +22,7 @@
  */
 
 import express from "express";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/logger", () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -190,6 +190,16 @@ beforeEach(() => {
   spawnCalls.length = 0;
   findAllAccessibleToUserMock.mockResolvedValue([registeredServer()]);
   findByUuidMock.mockResolvedValue(undefined);
+  // Every case here is about WHICH command reaches the transport, which only
+  // exists once stdio servers are allowed; the default refusal comes before
+  // all of it and has its own suite (server.stdio-policy.test.ts). Without
+  // the opt-in the "spawns NOTHING" cases below would pass for the wrong
+  // reason. Scoped to this file and restored after each case.
+  vi.stubEnv("ALLOW_STDIO_SERVERS", "true");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("GET /mcp-proxy/server/stdio — what reaches the transport", () => {

@@ -32,6 +32,11 @@ import {
 } from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import {
+  assertStdioServersAllowed,
+  STDIO_SERVERS_DISABLED_MESSAGE,
+  StdioServersDisabledError,
+} from "../../lib/metamcp/stdio-policy";
+import {
   getDefaultEnvironment,
   resolveEnvVariables,
 } from "../../lib/metamcp/utils";
@@ -521,6 +526,37 @@ const closeUninitializedSession = async (
   }
 };
 
+/**
+ * The answer to a request for a stdio server while stdio servers are disabled
+ * (see lib/metamcp/stdio-policy). A constant: it never echoes the request, and
+ * it is the same on POST /mcp, GET /stdio and GET /sse. JSON-RPC shaped, like
+ * the body-limit refusal, so an MCP client shows the message.
+ */
+const STDIO_DISABLED_BODY = Object.freeze({
+  jsonrpc: "2.0",
+  error: { code: -32000, message: STDIO_SERVERS_DISABLED_MESSAGE },
+  id: null,
+});
+
+/**
+ * Answer a stdio policy refusal from `createTransport` with HTTP 400 and
+ * return true; return false for any other error. Each route calls it first in
+ * the catch around `createTransport`, whose fall-through answers an ordinary
+ * throw with HTTP 500. Nothing has been started when this error is thrown, so
+ * there is nothing to close.
+ */
+const answerStdioPolicyRefusal = (
+  error: unknown,
+  res: express.Response,
+): boolean => {
+  if (!(error instanceof StdioServersDisabledError)) return false;
+  logger.warn(
+    "MCP proxy request refused: stdio servers are disabled on this gateway",
+  );
+  res.status(400).json(STDIO_DISABLED_BODY);
+  return true;
+};
+
 const createTransport = async (req: express.Request): Promise<Transport> => {
   const query = req.query;
   // Only the transport type is logged. The whole query used to be dumped here,
@@ -539,6 +575,11 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
   const transportType = query.transportType as string;
 
   if (transportType === McpServerTypeEnum.enum.STDIO) {
+    // The stdio policy gate (see lib/metamcp/stdio-policy), before the row is
+    // resolved, the cooldown is consulted or a transport exists. Each route
+    // below answers this typed error with STDIO_DISABLED_BODY and HTTP 400.
+    assertStdioServersAllowed();
+
     // Command, args and env come from the `mcp_servers` row and nowhere else.
     // `query.command` / `query.args` / `query.env` are no longer read as spawn
     // input at all — see findRegisteredStdioServer.
@@ -752,6 +793,9 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
       try {
         serverTransport = await createTransport(req);
       } catch (error) {
+        if (answerStdioPolicyRefusal(error, res)) {
+          return;
+        }
         if (error instanceof SseError && error.code === 401) {
           logger.error(
             "Received 401 Unauthorized from MCP server:",
@@ -930,6 +974,9 @@ serverRouter.get("/stdio", async (req, res) => {
       serverTransport = await createTransport(req);
       logger.info("Created server transport");
     } catch (error) {
+      if (answerStdioPolicyRefusal(error, res)) {
+        return;
+      }
       if (error instanceof SseError && error.code === 401) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
@@ -1096,6 +1143,9 @@ serverRouter.get("/sse", async (req, res) => {
     try {
       serverTransport = await createTransport(req);
     } catch (error) {
+      if (answerStdioPolicyRefusal(error, res)) {
+        return;
+      }
       if (error instanceof SseError && error.code === 401) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
