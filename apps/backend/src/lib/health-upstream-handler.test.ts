@@ -204,7 +204,7 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-describe("/health/upstream — anonymous body for a fixed snapshot", () => {
+describe("/health/upstream: anonymous body for a fixed snapshot", () => {
   it("is byte-identical for a healthy estate", async () => {
     serveSnapshot(HEALTHY_ROWS, HEALTHY_POOL);
 
@@ -272,7 +272,7 @@ describe("/health/upstream — anonymous body for a fixed snapshot", () => {
   });
 });
 
-describe("/health/upstream — one read per anonymous refresh", () => {
+describe("/health/upstream: one read per anonymous refresh", () => {
   it("shares one findAll between concurrent cold requests", async () => {
     const rows = deferred<unknown[]>();
     h.findAll.mockReturnValue(rows.promise);
@@ -371,7 +371,7 @@ describe("/health/upstream — one read per anonymous refresh", () => {
   });
 });
 
-describe("/health/upstream — a failed anonymous refresh", () => {
+describe("/health/upstream: a failed anonymous refresh", () => {
   it("shares the failure with concurrent requests, caches nothing, and recovers", async () => {
     const rows = deferred<unknown[]>();
     h.findAll.mockReturnValue(rows.promise);
@@ -419,7 +419,7 @@ describe("/health/upstream — a failed anonymous refresh", () => {
   });
 });
 
-describe("/health/upstream — admin requests", () => {
+describe("/health/upstream: admin requests", () => {
   it("compute fresh every time and never touch the anonymous cache", async () => {
     serveSnapshot(HEALTHY_ROWS, HEALTHY_POOL);
     const handler = createUpstreamHealthHandler();
@@ -553,7 +553,7 @@ describe("/health/upstream — admin requests", () => {
  * technique verified-caller.test.ts and the rate-limit mount guards use: the
  * route must be served by the handler tested above, built once.
  */
-describe("/health/upstream — mounted in index.ts", () => {
+describe("/health/upstream: mounted in index.ts", () => {
   const INDEX_SOURCE = readFileSync(
     path.resolve(import.meta.dirname, "../index.ts"),
     "utf8",

@@ -433,7 +433,7 @@ describe("POST /oauth/revoke — RFC 7009 client match", () => {
  * pinned exactly (twenty failures answered, the twenty-first refused) because
  * re-keying is only useful if the per-client allowance stays where it was.
  */
-describe("POST /oauth/introspect and /oauth/revoke — budgets keyed on the edge client address", () => {
+describe("POST /oauth/introspect and /oauth/revoke: budgets keyed on the edge client address", () => {
   /** The in-container address every tunnelled request arrives from. */
   const TUNNEL_IP = "127.0.0.1";
   const BUDGET = 20;
