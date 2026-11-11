@@ -63,6 +63,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useTranslations } from "@/hooks/useTranslations";
+import { canToggleApiKeyActive } from "@/lib/api-key-active-toggle";
 import { authClient } from "@/lib/auth-client";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
@@ -169,7 +170,9 @@ export default function ApiKeysPage() {
   // ownership and last-used audit row, unlike DELETE which destroys the only
   // record of who held the credential. The backend audits is_active=false
   // under its own apikey.revoke verb, so an incident review can answer "which
-  // keys were killed, by whom, when" from the action column.
+  // keys were killed, by whom, when" from the action column, and an
+  // administrator's re-activation under apikey.reactivate. A member cannot
+  // re-activate (FORBIDDEN); onError shows any refusal.
   const updateMutation = trpc.frontend.apiKeys.update.useMutation({
     onSuccess: (data) => {
       refetch();
@@ -224,9 +227,11 @@ export default function ApiKeysPage() {
     setDeleteDialogOpen(true);
   };
 
-  // Toggle sends the OPPOSITE of the current state so one button serves both
-  // directions. No confirm dialog: deactivate is reversible (reactivate is
-  // the same control), unlike the destructive DELETE which stays confirm-gated.
+  // Toggle sends the OPPOSITE of the current state. For an administrator one
+  // button serves both directions; a member sees it only on an active key
+  // (deactivate), because re-activation is administrator-only
+  // (`canToggleApiKeyActive`). No confirm dialog: deactivate is reversible by
+  // an administrator, unlike the destructive DELETE which stays confirm-gated.
   const handleToggleActive = (apiKey: { uuid: string; is_active: boolean }) => {
     updateMutation.mutate({ uuid: apiKey.uuid, is_active: !apiKey.is_active });
   };
@@ -699,28 +704,33 @@ export default function ApiKeysPage() {
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() =>
-                          handleToggleActive({
-                            uuid: apiKey.uuid,
-                            is_active: apiKey.is_active,
-                          })
-                        }
-                        disabled={updateMutation.isPending}
-                        title={
-                          apiKey.is_active
-                            ? t("api-keys:deactivate")
-                            : t("api-keys:reactivate")
-                        }
-                      >
-                        {apiKey.is_active ? (
-                          <Ban className="h-4 w-4" />
-                        ) : (
-                          <RotateCcw className="h-4 w-4" />
-                        )}
-                      </Button>
+                      {canToggleApiKeyActive({
+                        isActive: apiKey.is_active,
+                        isAdmin,
+                      }) && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() =>
+                            handleToggleActive({
+                              uuid: apiKey.uuid,
+                              is_active: apiKey.is_active,
+                            })
+                          }
+                          disabled={updateMutation.isPending}
+                          title={
+                            apiKey.is_active
+                              ? t("api-keys:deactivate")
+                              : t("api-keys:reactivate")
+                          }
+                        >
+                          {apiKey.is_active ? (
+                            <Ban className="h-4 w-4" />
+                          ) : (
+                            <RotateCcw className="h-4 w-4" />
+                          )}
+                        </Button>
+                      )}
                       {/* Delete stays confirm-gated (AlertDialog below) and is
                           visually demoted with destructive color: deactivate is
                           the preferred, reversible, record-preserving kill. */}
@@ -858,28 +868,35 @@ export default function ApiKeysPage() {
                             apiKey={apiKey}
                             onSaved={() => refetchAll()}
                           />
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            onClick={() =>
-                              handleToggleActive({
-                                uuid: apiKey.uuid,
-                                is_active: apiKey.is_active,
-                              })
-                            }
-                            disabled={updateMutation.isPending}
-                            title={
-                              apiKey.is_active
-                                ? t("api-keys:deactivate")
-                                : t("api-keys:reactivate")
-                            }
-                          >
-                            {apiKey.is_active ? (
-                              <Ban className="h-4 w-4" />
-                            ) : (
-                              <RotateCcw className="h-4 w-4" />
-                            )}
-                          </Button>
+                          {/* This table renders only for an administrator;
+                              the same gate keeps the rule in one place. */}
+                          {canToggleApiKeyActive({
+                            isActive: apiKey.is_active,
+                            isAdmin,
+                          }) && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() =>
+                                handleToggleActive({
+                                  uuid: apiKey.uuid,
+                                  is_active: apiKey.is_active,
+                                })
+                              }
+                              disabled={updateMutation.isPending}
+                              title={
+                                apiKey.is_active
+                                  ? t("api-keys:deactivate")
+                                  : t("api-keys:reactivate")
+                              }
+                            >
+                              {apiKey.is_active ? (
+                                <Ban className="h-4 w-4" />
+                              ) : (
+                                <RotateCcw className="h-4 w-4" />
+                              )}
+                            </Button>
+                          )}
                           {/* Delete stays confirm-gated (AlertDialog below) and
                               is visually demoted with destructive color:
                               deactivate is the preferred, reversible,

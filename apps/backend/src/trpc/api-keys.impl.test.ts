@@ -14,6 +14,8 @@
  *    owner email + last_used_at,
  *  - update/delete route to the owner-scoped repo methods for members and the
  *    ownership-bypass methods for admins,
+ *  - re-activating a key (is_active: true) is administrator-only; a member's
+ *    request is refused with FORBIDDEN before any write,
  *  - the update readback drops the full secret and carries only a prefix
  *    (security review fix), on BOTH the admin and the member branch,
  *  - `validate` refuses a key whose OWNER is disabled (migration 0027), and
@@ -865,6 +867,110 @@ describe("api-keys update — admin ownership bypass", () => {
       is_active: false,
     });
     expect(repoMock.updateAsAdmin).not.toHaveBeenCalled();
+  });
+});
+
+// A member may deactivate and rename their own keys, but re-activating a key
+// is an administrator's decision: otherwise an administrator's deactivation
+// of a member's key could be undone by that member, or by anyone holding the
+// member's session. Every member request with `is_active: true` is refused
+// before any write, without reading the key's current state first, so a stale
+// form or a race with an administrator's deactivation cannot slip through.
+describe("api-keys update — re-activation is administrator-only", () => {
+  const row = (isActive: boolean) => ({
+    uuid: "k",
+    name: "renamed",
+    last4: "keyx",
+    created_at: new Date(),
+    is_active: isActive,
+  });
+
+  it("refuses a member re-activating their own key with FORBIDDEN and no write", async () => {
+    repoMock.update.mockResolvedValue(row(true));
+
+    await expect(
+      apiKeysImplementations.update(
+        { uuid: "k", is_active: true },
+        "member-1",
+        false,
+      ),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      message: "Only an administrator can re-activate an API key",
+    });
+    expect(repoMock.update).not.toHaveBeenCalled();
+    expect(repoMock.updateAsAdmin).not.toHaveBeenCalled();
+  });
+
+  it("refuses a member rename combined with re-activation as a whole: no part of it is written", async () => {
+    repoMock.update.mockResolvedValue(row(true));
+
+    await expect(
+      apiKeysImplementations.update(
+        { uuid: "k", name: "renamed", is_active: true },
+        "member-1",
+        false,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.update).not.toHaveBeenCalled();
+    expect(repoMock.updateAsAdmin).not.toHaveBeenCalled();
+  });
+
+  it("still lets a member deactivate their own key", async () => {
+    repoMock.update.mockResolvedValue(row(false));
+
+    const result = await apiKeysImplementations.update(
+      { uuid: "k", is_active: false },
+      "member-1",
+      false,
+    );
+
+    expect(result.is_active).toBe(false);
+    expect(repoMock.update).toHaveBeenCalledWith("k", "member-1", {
+      name: undefined,
+      is_active: false,
+    });
+  });
+
+  it.each([
+    ["an active", true],
+    ["an inactive", false],
+  ])(
+    "lets a member rename %s key without touching its status",
+    async (_label, isActive) => {
+      repoMock.update.mockResolvedValue(row(isActive));
+
+      const result = await apiKeysImplementations.update(
+        { uuid: "k", name: "renamed" },
+        "member-1",
+        false,
+      );
+
+      // is_active stays undefined, so the repository sets the name only.
+      expect(repoMock.update).toHaveBeenCalledWith("k", "member-1", {
+        name: "renamed",
+        is_active: undefined,
+      });
+      expect(result.is_active).toBe(isActive);
+      expect(repoMock.updateAsAdmin).not.toHaveBeenCalled();
+    },
+  );
+
+  it("lets an administrator re-activate any key through the ownership-bypass method", async () => {
+    repoMock.updateAsAdmin.mockResolvedValue(row(true));
+
+    const result = await apiKeysImplementations.update(
+      { uuid: "k", is_active: true },
+      "admin-1",
+      true,
+    );
+
+    expect(result.is_active).toBe(true);
+    expect(repoMock.updateAsAdmin).toHaveBeenCalledWith("k", {
+      name: undefined,
+      is_active: true,
+    });
+    expect(repoMock.update).not.toHaveBeenCalled();
   });
 });
 

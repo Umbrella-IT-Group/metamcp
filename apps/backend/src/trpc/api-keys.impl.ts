@@ -382,6 +382,21 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateApiKeyResponseSchema>> => {
+    // Re-activation is an administrator's decision. A member may rename and
+    // deactivate their own keys, but if they could also re-activate one, an
+    // administrator's deactivation of it could be undone by that member, or
+    // by anyone holding the member's session. Every member request carrying
+    // `is_active: true` is refused, a combined rename included, so nothing of
+    // it is written. No read of the key's current state first: refusing
+    // every such request also covers a stale form and cannot race an
+    // administrator's deactivation. Outside the try below so the FORBIDDEN
+    // reaches the caller instead of being rewrapped as a generic error.
+    if (!isAdmin && input.is_active === true) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: "Only an administrator can re-activate an API key",
+      });
+    }
     try {
       // Admins bypass the ownership WHERE (may edit / revoke any key); members
       // stay owner-scoped.
@@ -399,8 +414,17 @@ export const apiKeysImplementations = {
       // investigation "which credentials were killed, by whom, when" is a
       // question asked directly of the action column, and burying it inside a
       // generic `apikey.update` alongside renames would make it un-greppable.
+      // Re-activating (only an administrator reaches it, see above) reverses
+      // that containment and gets its own verb for the same reason. The verb
+      // follows the REQUEST, not the returned row: a rename that omits
+      // `is_active` stays `apikey.update` even when the key is active.
       emitAdminEvent(actor, {
-        action: input.is_active === false ? "apikey.revoke" : "apikey.update",
+        action:
+          input.is_active === true
+            ? "apikey.reactivate"
+            : input.is_active === false
+              ? "apikey.revoke"
+              : "apikey.update",
         target_type: "api_key",
         target_id: input.uuid,
         detail: { name: result.name, is_active: result.is_active },
