@@ -20,6 +20,8 @@ import type { M365MintService } from "./mint-service";
 
 export const ENROLL = "https://mcp.example.com/m365/enroll";
 export const BACKEND_URL = "http://backend:3000/mcp";
+/** What the backend's service name resolves to: an RFC 1918 address. */
+export const BACKEND_ADDRESS = "10.20.0.7";
 export const SESSION_ID = "backend-session-1";
 
 export const m365ServerParams = {
@@ -155,10 +157,16 @@ export function makeCreateClient(
 ) {
   return ((_serverParams: ServerParameters) => {
     const transport = new StreamableHTTPClientTransport(new URL(BACKEND_URL), {
-      fetch: makeM365InjectedFetch(
-        mint,
-        backendFetch as unknown as Parameters<typeof makeM365InjectedFetch>[1],
-      ),
+      // The pooled data plane's guard posture over the fake backend. The
+      // backend's service name resolves to an internal address, as Docker's
+      // resolver answers it; the injection attaches the user token only to
+      // such a destination (invariant 7).
+      fetch: makeM365InjectedFetch(mint, {
+        allowPrivateAddresses: true,
+        refuseCrossOriginRedirect: true,
+        baseFetch: backendFetch,
+        lookup: async () => [BACKEND_ADDRESS],
+      }),
     });
     const client = new Client(
       { name: "metamcp-client", version: "2.0.0" },

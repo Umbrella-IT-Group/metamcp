@@ -564,6 +564,76 @@ export interface McpUrlGuardOptions {
    * is unchanged.
    */
   internalOnlyHeaders?: readonly string[];
+  /**
+   * A per-request credential this fetch mints and attaches only on a hop whose
+   * destination is PROVEN internal by its resolved, pinned addresses. See
+   * `InternalOnlyCredentials`. Setting it also refuses every cross-origin
+   * redirect, whatever `refuseCrossOriginRedirect` says. Unset by default.
+   */
+  internalOnlyCredentials?: InternalOnlyCredentials;
+}
+
+/**
+ * The request a hop is about to send, as a credential source sees it: the
+ * method and body after any redirect rewrite.
+ */
+export interface GuardedHopRequest {
+  method: string;
+  body: RequestInit["body"];
+}
+
+/**
+ * A credential that speaks for one person and may only ever reach one of our
+ * own backends: the m365 injection's per-user Graph token and the user id
+ * beside it (`lib/m365/injected-fetch.ts`).
+ *
+ * WHY IT LIVES IN THE GUARD. Only the guard knows where a hop actually goes:
+ * it resolves the host, validates every address and pins the socket to them.
+ * A wrapper outside it can only see the URL text, so it would have to mint
+ * before the destination is known, or resolve the name a second time and send
+ * through an unpinned connection, which DNS can answer differently. Here the
+ * credential is minted after the hop's destination is validated and pinned,
+ * and only when that destination is internal.
+ *
+ * THE RULE, per hop (hop 0 and every redirect):
+ *  1. Every name in `headerNames` is deleted, whatever put it there: a stored
+ *     server-row header, the transport's connection-level bearer, a previous
+ *     hop.
+ *  2. If the hop's destination is internal by ADDRESS (it resolved, every
+ *     address is an internal-service range, and the socket is pinned to those
+ *     addresses), `forInternalHop` is asked for the headers to set, and may
+ *     mint.
+ *  3. Otherwise `forInternalHop` is not called, so nothing is minted, and the
+ *     request goes out without the credential. That includes a host on the
+ *     `MCP_PROXY_URL_ALLOWED_HOSTS` allowlist: it is trusted by NAME, never
+ *     resolved or pinned here, so nothing proves where its connection lands.
+ *     `isInternalTarget` reads such a host as internal for the gateway trust
+ *     header; this rule deliberately does not.
+ * A redirect that rewrites a POST into a GET (303, or 301/302 after a POST)
+ * reaches step 2 with the GET and no body, so a credential that is only for
+ * executing requests is not set on it. A same-origin 307 or 308 replays the
+ * POST, so it is set again for the new hop if that hop is internal. A
+ * cross-origin redirect is refused before any of this runs.
+ */
+export interface InternalOnlyCredentials {
+  /** Header names (lowercase) this source owns on every hop. */
+  readonly headerNames: readonly string[];
+  /**
+   * The headers to set on an address-proven internal hop, or undefined for
+   * none. May throw to refuse the request; the error reaches the caller and
+   * nothing is sent for this hop.
+   */
+  readonly forInternalHop: (
+    request: GuardedHopRequest,
+  ) => Promise<Record<string, string> | undefined>;
+  /**
+   * Called instead of `forInternalHop` on any other hop, for diagnostics.
+   * Must not mint or throw.
+   */
+  readonly onWithheld?: (
+    request: GuardedHopRequest,
+    reason: "not_internal" | "not_pinned",
+  ) => void;
 }
 
 /**
@@ -730,6 +800,40 @@ const dropInternalOnlyHeaders = (
 ): void => {
   if (!names || names.length === 0 || isInternalTarget(target)) return;
   for (const name of names) headers.delete(name);
+};
+
+/**
+ * Whether a hop's destination is internal by its resolved, pinned addresses:
+ * at least one address, and every one an internal-service range. Stricter
+ * than `isInternalTarget`, which also accepts an allowlisted host trusted by
+ * name (no addresses, no pin). See `InternalOnlyCredentials`.
+ */
+export const isAddressProvenInternal = (target: ValidatedMcpTarget): boolean =>
+  target.addresses.length > 0 && isInternalTarget(target);
+
+/**
+ * Apply `InternalOnlyCredentials` to one hop: strip its headers, then set them
+ * only for an address-proven internal destination. Re-run per hop beside the
+ * trust header.
+ */
+const applyInternalOnlyCredentials = async (
+  headers: Headers,
+  target: ValidatedMcpTarget,
+  request: GuardedHopRequest,
+  credentials: InternalOnlyCredentials | undefined,
+): Promise<void> => {
+  if (!credentials) return;
+  for (const name of credentials.headerNames) headers.delete(name);
+  if (!isAddressProvenInternal(target)) {
+    credentials.onWithheld?.(
+      request,
+      target.addresses.length === 0 ? "not_pinned" : "not_internal",
+    );
+    return;
+  }
+  const values = await credentials.forInternalHop(request);
+  if (!values) return;
+  for (const [name, value] of Object.entries(values)) headers.set(name, value);
 };
 
 /**
@@ -1134,6 +1238,14 @@ export const createGuardedFetch = (
     // the destination's internal/external status.
     applyGatewayTrustHeader(headers, target);
     dropInternalOnlyHeaders(headers, target, options.internalOnlyHeaders);
+    // Minted only now, after hop 0's destination is validated and its pin
+    // chosen, and only when that destination is internal by address.
+    await applyInternalOnlyCredentials(
+      headers,
+      target,
+      { method, body },
+      options.internalOnlyCredentials,
+    );
 
     for (let hop = 0; ; hop += 1) {
       const response = await baseFetch(
@@ -1181,8 +1293,11 @@ export const createGuardedFetch = (
       // followed with credentials stripped. A trusted internal backend never
       // redirects the gateway elsewhere, so one that tries is the SSRF hop this
       // closes; same-origin redirects still fall through and are re-validated.
+      // A request carrying a person's credential never follows a redirect to
+      // another origin, whatever the posture says (InternalOnlyCredentials).
       if (
-        options.refuseCrossOriginRedirect &&
+        (options.refuseCrossOriginRedirect ||
+          options.internalOnlyCredentials !== undefined) &&
         nextUrl.origin !== target.url.origin
       ) {
         logger.warn(
@@ -1238,6 +1353,16 @@ export const createGuardedFetch = (
       // is re-added only if the new destination is itself internal.
       applyGatewayTrustHeader(headers, next);
       dropInternalOnlyHeaders(headers, next, options.internalOnlyHeaders);
+      // Re-decided for the new hop with its own (re-resolved, re-pinned)
+      // destination and the method and body it will actually send: a GET
+      // produced by a method rewrite carries none, a 307/308 replay of the
+      // POST carries it again only if this hop is internal.
+      await applyInternalOnlyCredentials(
+        headers,
+        next,
+        { method, body },
+        options.internalOnlyCredentials,
+      );
       target = next;
     }
   };

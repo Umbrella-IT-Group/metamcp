@@ -22,6 +22,7 @@ const {
   createGuardedFetch,
   createPinnedAgent,
   isBlockedSsrfAddress,
+  isAddressProvenInternal,
   isInternalTarget,
   GATEWAY_BACKEND_AUTH_HEADER,
   CROSS_ORIGIN_REDIRECT_REFUSED,
@@ -1056,6 +1057,34 @@ describe("isInternalTarget", () => {
   it("classifies a mixed internal + public set as external", () => {
     // One public answer in a rebinding-style set means the header must not go.
     expect(isInternalTarget(target(["10.0.0.5", PUBLIC_V4]))).toBe(false);
+  });
+});
+
+describe("isAddressProvenInternal", () => {
+  const target = (addresses: string[]) => ({
+    url: new URL("http://backend.example/mcp"),
+    addresses,
+  });
+
+  it("does not accept an allowlisted (empty-address, trusted-by-name) target", () => {
+    // The one case where it parts from isInternalTarget: nothing was resolved
+    // or pinned, so nothing proves where the connection lands.
+    expect(isAddressProvenInternal(target([]))).toBe(false);
+  });
+
+  it("accepts an all-internal-service address set", () => {
+    expect(isAddressProvenInternal(target(["10.0.0.5", "127.0.0.1"]))).toBe(
+      true,
+    );
+    expect(isAddressProvenInternal(target(["fd00::5"]))).toBe(true);
+  });
+
+  it("refuses a public, metadata or mixed address set", () => {
+    expect(isAddressProvenInternal(target([PUBLIC_V4]))).toBe(false);
+    expect(isAddressProvenInternal(target(["169.254.169.254"]))).toBe(false);
+    expect(isAddressProvenInternal(target(["10.0.0.5", PUBLIC_V4]))).toBe(
+      false,
+    );
   });
 });
 

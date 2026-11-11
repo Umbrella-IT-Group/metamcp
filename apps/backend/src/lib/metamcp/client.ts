@@ -25,7 +25,7 @@ import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { resolveServerBearerToken } from "./server-bearer-crypto";
 import { serverErrorTracker } from "./server-error-tracker";
-import { createGuardedFetch } from "./url-guard";
+import { createGuardedFetch, type McpUrlGuardOptions } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
 import {
   getVerifiedCallerFetchForServer,
@@ -371,14 +371,22 @@ export const transformDockerUrl = (url: string): string => {
  * third-party server. `dropOnMethodRewriteHeaders` removes that id when a
  * same-origin 301, 302 or 303 turns a tool POST into a GET, because the GET
  * executes nothing on the caller's behalf.
+ *
+ * The m365 injection adds one stricter rule on top of this posture
+ * (`getInjectedFetchForServer`): its per-user `Authorization` and user id are
+ * minted inside the guard and set only on a hop that is internal by resolved,
+ * pinned address, never on a host trusted by allowlist name
+ * (`InternalOnlyCredentials` in `url-guard.ts`).
  */
+const POOL_GUARD_OPTIONS: McpUrlGuardOptions = Object.freeze({
+  allowPrivateAddresses: true,
+  refuseCrossOriginRedirect: true,
+  internalOnlyHeaders: [ASSERTED_ACTOR_HEADER, VERIFIED_CALLER_HEADER],
+  dropOnMethodRewriteHeaders: [VERIFIED_CALLER_HEADER],
+});
+
 const createPoolGuardedFetch = (): FetchLike =>
-  createGuardedFetch({
-    allowPrivateAddresses: true,
-    refuseCrossOriginRedirect: true,
-    internalOnlyHeaders: [ASSERTED_ACTOR_HEADER, VERIFIED_CALLER_HEADER],
-    dropOnMethodRewriteHeaders: [VERIFIED_CALLER_HEADER],
-  });
+  createGuardedFetch(POOL_GUARD_OPTIONS);
 
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
@@ -493,24 +501,26 @@ export const createMetaMcpClient = (
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
-    // Guarded, pinned outbound fetch (see createPoolGuardedFetch), covering
-    // the transport's own reconnects and every redirect hop the one-shot
-    // connect check cannot reach.
-    const guardedFetch = createPoolGuardedFetch();
-
     // M365 delegated broker: servers configured for per-user Graph token
-    // injection get a fetch that stamps a freshly minted per-user
-    // Authorization onto requests that can execute backend code, while
-    // the handshake, listings, stream and teardown stay token-free. It
-    // strips any connection-level credential, request-scoped so it survives pool
-    // idle-handoff/cap-reuse without cross-user token leakage. It wraps the
-    // guarded fetch: injection sets the header, then the guarded fetch
-    // validates + pins + caps the actual connection. See
-    // `lib/m365/injected-fetch.ts` for the invariant.
+    // injection get the same guarded, pinned fetch with the per-user
+    // credential inside it. The guard strips any connection-level
+    // credential, validates and pins each hop's destination, and only then
+    // mints a token for the request's user, for a request that can execute
+    // backend code, when that destination is internal by address. The
+    // handshake, listings, stream and teardown stay token-free, and the
+    // token never reaches a public, mixed or name-trusted host. Request-
+    // scoped, so it survives pool idle-handoff/cap-reuse without cross-user
+    // token leakage. See `lib/m365/injected-fetch.ts` for the invariant.
     const injectedFetch = getInjectedFetchForServer(
       serverParams.name,
-      guardedFetch,
+      POOL_GUARD_OPTIONS,
     );
+    // Every other server: the guarded, pinned outbound fetch (see
+    // createPoolGuardedFetch), covering the transport's own reconnects and
+    // every redirect hop the one-shot connect check cannot reach. Its
+    // stored bearer (above) is the operator's configured credential for
+    // that server and is sent wherever the row points, as before.
+    const guardedFetch = injectedFetch ?? createPoolGuardedFetch();
 
     // Verified caller: for a server named in VERIFIED_CALLER_SERVER_NAMES,
     // strip any X-Umbrella-User-Id (a stored row header included) and set the
@@ -528,10 +538,7 @@ export const createMetaMcpClient = (
         headers,
       },
       fetch: withAssertedActor(
-        getVerifiedCallerFetchForServer(
-          serverParams.name,
-          injectedFetch ?? guardedFetch,
-        ),
+        getVerifiedCallerFetchForServer(serverParams.name, guardedFetch),
       ),
     });
   } else {
