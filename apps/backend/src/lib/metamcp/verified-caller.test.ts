@@ -258,11 +258,14 @@ describe("requestExecutesBackendCode", () => {
   });
 
   it("agrees with the m365 token gate on every request-shaped message", () => {
-    // Both gates answer "can this request execute backend code". They differ
-    // only on what neither can classify (a response, an unparseable or
-    // non-string body, PUT and the like), where m365 mints and this sends no
-    // identity. A method added to one gate's free list must be a deliberate
-    // decision for the other, so this pins them together.
+    // Both gates answer "can this request execute backend code". They agree
+    // on every request and on every strictly shaped reply to a backend
+    // request (the next tests). They differ only on what neither can
+    // classify (a malformed message, an unparseable or non-string body, PUT
+    // and the like), where m365 mints and this sends no identity; the
+    // divergence test below lists those cases by name. A method added to one
+    // gate's free list must be a deliberate decision for the other, so this
+    // pins them together.
     const methods = [
       "initialize",
       "ping",
@@ -292,6 +295,74 @@ describe("requestExecutesBackendCode", () => {
       );
     }
   });
+
+  // Replies to requests the backend sent complete a request the backend
+  // already holds; they are not tool invocations, and the SDK sends them from
+  // the async scope it reads the backend's stream in, which need not be the
+  // scope of the caller whose call is in flight. Neither gate attaches anyone
+  // to them, at any size.
+  const reply = (fields: Record<string, unknown>) =>
+    JSON.stringify({ jsonrpc: "2.0", ...fields });
+  const pureReply = reply({ id: 4, result: {} });
+  const errorReply = reply({
+    id: "srv-1",
+    error: { code: -32601, message: "Method not found" },
+  });
+  const largeReply = reply({ id: 5, result: { text: "a".repeat(70_000) } });
+
+  it.each([
+    ["a result reply", pureReply],
+    ["an error reply", errorReply],
+    ["a reply with id 0 and a null result", reply({ id: 0, result: null })],
+    ["a reply above 65,536 code units", largeReply],
+    ["a batch of replies", `[${pureReply}, ${errorReply}]`],
+    ["a reply and a ping", `[${pureReply}, ${rpc("ping")}]`],
+  ])("both gates attach nobody to %s", (_label, body) => {
+    const init = { method: "POST", body };
+    expect(requestExecutesBackendCode(init)).toBe(false);
+    expect(requestNeedsUserToken(init)).toBe(false);
+  });
+
+  it("both gates attach the caller to a reply batched with an executing request", () => {
+    const init = {
+      method: "POST",
+      body: `[${pureReply}, ${rpc("tools/call", { id: 2 })}]`,
+    };
+    expect(requestExecutesBackendCode(init)).toBe(true);
+    expect(requestNeedsUserToken(init)).toBe(true);
+  });
+
+  it.each([
+    ["an unparseable body", "{not json"],
+    ["an empty batch", "[]"],
+    ["a reply with a null id", reply({ id: null, result: {} })],
+    ["a reply with no id", reply({ result: {} })],
+    [
+      "a reply with both result and error",
+      reply({ id: 1, result: {}, error: { code: -1, message: "x" } }),
+    ],
+    ["a reply with neither result nor error", reply({ id: 1 })],
+    ["a reply with no jsonrpc", JSON.stringify({ id: 1, result: {} })],
+    [
+      "a result carrying method ping",
+      reply({ id: 1, method: "ping", result: {} }),
+    ],
+    [
+      "a result carrying a null method",
+      reply({ id: 1, method: null, result: {} }),
+    ],
+    [
+      "a batch with one malformed reply",
+      `[${pureReply}, ${reply({ id: null, result: {} })}]`,
+    ],
+  ])(
+    "diverges on purpose for %s: m365 mints when unsure, this sends no identity",
+    (_label, body) => {
+      const init = { method: "POST", body };
+      expect(requestNeedsUserToken(init)).toBe(true);
+      expect(requestExecutesBackendCode(init)).toBe(false);
+    },
+  );
 });
 
 describe("verifiedCallerUserId", () => {

@@ -196,6 +196,12 @@ const adminCtx = {
   audit: AUDIT,
 };
 
+const memberCtx = {
+  user: { id: "member-1", role: "member", email: "m@example.invalid" },
+  session: { id: "s-member" },
+  audit: AUDIT,
+};
+
 /** The full secret an API key mint returns to the caller exactly once. */
 const RAW_API_KEY = "sk_mt_live_do_not_ever_log_this_value";
 
@@ -473,14 +479,12 @@ describe("apikey.create — an admin mints a credential", () => {
     expect(serialized()).not.toContain(RAW_API_KEY);
   });
 
-  // Reactivating (is_active: true) is the reverse of the kill above and must
-  // NOT be filed under apikey.revoke: reversing containment is a distinct
-  // event, the same rule user.enabled.set follows below. This pins the other
-  // side of the verb branch so a future refactor cannot collapse the two
-  // directions into one action and make a reactivation read as a revocation
-  // in the audit trail. The admin-UI deactivate/reactivate toggle exercises
-  // exactly this update path.
-  it("apikey.update is the verb when a key is reactivated (not revoke)", async () => {
+  // Re-activating (is_active: true) is the reverse of the kill above and gets
+  // its own verb: reversing containment is a distinct event, the same rule
+  // user.enabled.set follows below, and "which keys were brought back, by
+  // whom" must be answerable from the action column alone, not mixed into
+  // renames under apikey.update. Only an administrator can re-activate.
+  it("apikey.reactivate is its own verb when an administrator re-activates a key", async () => {
     apiKeysRepositoryMock.updateAsAdmin.mockResolvedValue({
       uuid: API_KEY_UUID,
       name: "grafana-probe",
@@ -497,12 +501,115 @@ describe("apikey.create — an admin mints a credential", () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
-      action: "apikey.update",
+      action: "apikey.reactivate",
+      outcome: "success",
+      target_type: "api_key",
       target_id: API_KEY_UUID,
       actor_id: "admin-1",
     });
+    expect(rows[0].detail).toMatchObject({
+      name: "grafana-probe",
+      is_active: true,
+    });
     expect(serialized()).not.toContain(RAW_API_KEY);
   });
+
+  it("writes NOTHING when a member's re-activation is refused, and the refusal reaches the caller as FORBIDDEN", async () => {
+    // Through the real router: an impl that wrapped the refusal in a generic
+    // error would surface as INTERNAL_SERVER_ERROR here.
+    apiKeysRepositoryMock.update.mockResolvedValue({
+      uuid: API_KEY_UUID,
+      name: "member-key",
+      created_at: new Date("2026-08-14T00:00:00.000Z"),
+      is_active: true,
+    });
+
+    await expect(
+      apiKeysRouter()
+        .createCaller(memberCtx)
+        .update({ uuid: API_KEY_UUID, name: "renamed", is_active: true }),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      message: "Only an administrator can re-activate an API key",
+    });
+    await flush();
+
+    expect(apiKeysRepositoryMock.update).not.toHaveBeenCalled();
+    expect(apiKeysRepositoryMock.updateAsAdmin).not.toHaveBeenCalled();
+    expect(rows).toEqual([]);
+  });
+
+  it("writes NOTHING when the re-activation write itself fails", async () => {
+    apiKeysRepositoryMock.updateAsAdmin.mockRejectedValue(
+      new Error("Failed to update API key or API key not found"),
+    );
+
+    await expect(
+      apiKeysRouter().createCaller(adminCtx).update({
+        uuid: API_KEY_UUID,
+        is_active: true,
+      }),
+    ).rejects.toThrow();
+    await flush();
+
+    expect(rows).toEqual([]);
+  });
+
+  it("a member's own deactivation is still filed as apikey.revoke", async () => {
+    apiKeysRepositoryMock.update.mockResolvedValue({
+      uuid: API_KEY_UUID,
+      name: "member-key",
+      created_at: new Date("2026-08-14T00:00:00.000Z"),
+      is_active: false,
+    });
+
+    await apiKeysRouter().createCaller(memberCtx).update({
+      uuid: API_KEY_UUID,
+      is_active: false,
+    });
+    await flush();
+
+    expect(apiKeysRepositoryMock.update).toHaveBeenCalledWith(
+      API_KEY_UUID,
+      "member-1",
+      { name: undefined, is_active: false },
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "apikey.revoke",
+      target_id: API_KEY_UUID,
+      actor_id: "member-1",
+    });
+  });
+
+  it.each([
+    ["a member", "member-1"],
+    ["an administrator", "admin-1"],
+  ])(
+    "a rename by %s stays apikey.update, even when the key it returns is active",
+    async (_label, actorId) => {
+      const renamed = {
+        uuid: API_KEY_UUID,
+        name: "renamed",
+        created_at: new Date("2026-08-14T00:00:00.000Z"),
+        is_active: true,
+      };
+      apiKeysRepositoryMock.update.mockResolvedValue(renamed);
+      apiKeysRepositoryMock.updateAsAdmin.mockResolvedValue(renamed);
+
+      await apiKeysRouter()
+        .createCaller(actorId === "admin-1" ? adminCtx : memberCtx)
+        .update({ uuid: API_KEY_UUID, name: "renamed" });
+      await flush();
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "apikey.update",
+        target_id: API_KEY_UUID,
+        actor_id: actorId,
+      });
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

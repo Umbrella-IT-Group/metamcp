@@ -9,7 +9,10 @@
  * execute a tool. Every other protocol request (handshake, listings,
  * the standing GET stream, the session DELETE) leaves with no
  * credential and no user-id header, so a user's grant state can never
- * fail a connect, a listing or a teardown.
+ * fail a connect, a listing or a teardown. A reply to a request the
+ * backend sent (a strictly shaped JSON-RPC response) is token-free too:
+ * it completes a request the backend already holds and is not a tool
+ * invocation.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -37,9 +40,13 @@ function makeMintStub(result: string | Error) {
 }
 
 function makeBaseFetch() {
-  const seen: { url: string; headers: Headers }[] = [];
+  const seen: { url: string; headers: Headers; body: unknown }[] = [];
   const baseFetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
-    seen.push({ url: String(url), headers: new Headers(init?.headers) });
+    seen.push({
+      url: String(url),
+      headers: new Headers(init?.headers),
+      body: init?.body,
+    });
     return new Response("{}", { status: 200 });
   });
   return { baseFetch, seen };
@@ -70,6 +77,25 @@ function post(body: unknown, headers?: RequestInit["headers"]): RequestInit {
 /** The one request kind that can execute a tool. */
 const toolsCall = (headers?: RequestInit["headers"]) =>
   post(rpc("tools/call", 1), headers);
+
+/** A JSON-RPC response body, as the SDK client sends one back to the server. */
+function reply(fields: Record<string, unknown>): string {
+  return JSON.stringify({ jsonrpc: "2.0", ...fields });
+}
+
+/**
+ * A body of exactly `length` UTF-16 code units (what `string.length` counts),
+ * built by padding one string field. 65,536 is the size the gate used to stop
+ * parsing at; the cases on both sides of it pin that every size is parsed.
+ */
+function bodyOfLength(length: number, build: (pad: string) => unknown): string {
+  const overhead = JSON.stringify(build("")).length;
+  const body = JSON.stringify(build("x".repeat(length - overhead)));
+  if (body.length !== length) {
+    throw new Error(`built ${body.length} code units, wanted ${length}`);
+  }
+  return body;
+}
 
 describe("m365 injected fetch — the injection invariant", () => {
   beforeEach(() => {
@@ -224,6 +250,15 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
         ]),
       ),
     ],
+    [
+      "a tools/list of 65,537 code units (every body is parsed, whatever its size)",
+      post(
+        bodyOfLength(65_537, (pad) => ({
+          ...JSON.parse(rpc("tools/list", 8)),
+          pad,
+        })),
+      ),
+    ],
     ["the standing GET stream", { method: "GET" }],
     ["a GET with no init method", {}],
     ["HEAD", { method: "HEAD" }],
@@ -258,6 +293,138 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
       expect(seen[0].headers.has(USER_ID_HEADER)).toBe(false);
       // Everything else the transport put on the request survives.
       expect(seen[0].headers.get("mcp-session-id")).toBe("backend-session-1");
+    },
+  );
+
+  // Replies to requests the backend sent (a ping, an elicitation, anything
+  // the client answers). The SDK sends them from whatever async scope it
+  // happens to be reading the backend's stream in, which is not necessarily
+  // the scope of the caller whose tool call is in flight, and each one only
+  // completes a request the backend correlates by id within its session. A
+  // reply is token-free only when it is strictly a JSON-RPC response: a plain
+  // object, `jsonrpc: "2.0"`, a string or finite number id, exactly one of
+  // `result` and `error` (by presence, so falsy results count), and no
+  // `method` key at all.
+  const tokenFreeReplies: Array<[string, string]> = [
+    ["a result reply", reply({ id: 1, result: {} })],
+    [
+      "an error reply",
+      reply({ id: 2, error: { code: -32601, message: "Method not found" } }),
+    ],
+    ["a reply with a string id", reply({ id: "srv-7", result: {} })],
+    ["a reply with an empty string id", reply({ id: "", result: {} })],
+    ["a reply with id 0", reply({ id: 0, result: {} })],
+    ["a reply whose result is null", reply({ id: 3, result: null })],
+    ["a reply whose result is false", reply({ id: 4, result: false })],
+    ["a reply whose result is 0", reply({ id: 5, result: 0 })],
+    // Raw JSON preserves duplicate keys and treats __proto__ as an ordinary
+    // own field. Classification must not rewrite these bytes or interpret
+    // nested method names as a request.
+    [
+      "a reply with prototype-looking fields and a method inside its result",
+      '{"jsonrpc":"2.0","id":1,"result":{"method":"tools/call"},"__proto__":{"method":"tools/call"},"constructor":{"prototype":{"method":"tools/call"}},"hasOwnProperty":null}',
+    ],
+    [
+      "a reply with a duplicate result field",
+      '{"jsonrpc":"2.0","id":1,"result":{},"result":false}',
+    ],
+    [
+      "a batch of replies",
+      `[${reply({ id: 6, result: {} })}, ${reply({
+        id: "srv-8",
+        error: { code: -32601, message: "Method not found" },
+      })}]`,
+    ],
+    [
+      "a batch of a reply and a ping",
+      `[${reply({ id: 9, result: {} })}, ${rpc("ping", 10)}]`,
+    ],
+    [
+      "a reply of exactly 65,536 code units",
+      bodyOfLength(65_536, (pad) => ({
+        jsonrpc: "2.0",
+        id: 11,
+        result: { pad },
+      })),
+    ],
+    [
+      "a reply of 65,537 code units",
+      bodyOfLength(65_537, (pad) => ({
+        jsonrpc: "2.0",
+        id: 12,
+        result: { pad },
+      })),
+    ],
+    [
+      "a reply far above 65,536 code units",
+      reply({ id: 13, result: { pad: "x".repeat(200_000) } }),
+    ],
+  ];
+
+  it.each(tokenFreeReplies)(
+    "%s reaches the backend unchanged, with no credential and no user id, and never asks for a token",
+    async (_label, body) => {
+      // Once with a user whose token would mint and once with a user whose
+      // mint would throw: neither may be asked.
+      for (const mintResult of ["graph-token", credentialMissing()]) {
+        const mint = makeMintStub(mintResult);
+        const { baseFetch, seen } = makeBaseFetch();
+        const injected = makeM365InjectedFetch(mint, baseFetch);
+
+        await runWithM365UserContext({ userId: "user-a" }, () =>
+          injected(
+            MCP_URL,
+            post(body, {
+              Authorization: "Bearer mcp_token_CONSUMER_CREDENTIAL",
+              [USER_ID_HEADER]: "spoofed-user",
+              "mcp-session-id": "backend-session-1",
+            }),
+          ),
+        );
+
+        expect(mint.getAccessToken).not.toHaveBeenCalled();
+        expect(seen).toHaveLength(1);
+        expect(seen[0].headers.has("authorization")).toBe(false);
+        expect(seen[0].headers.has(USER_ID_HEADER)).toBe(false);
+        expect(seen[0].headers.get("mcp-session-id")).toBe("backend-session-1");
+        expect(seen[0].body).toBe(body);
+      }
+    },
+  );
+
+  const toolCallsOfAnySize: Array<[string, string]> = [
+    [
+      "exactly 65,536 code units",
+      bodyOfLength(65_536, (pad) => ({
+        ...JSON.parse(rpc("tools/call", 14)),
+        params: { name: "upload", arguments: { pad } },
+      })),
+    ],
+    [
+      "65,537 code units",
+      bodyOfLength(65_537, (pad) => ({
+        ...JSON.parse(rpc("tools/call", 15)),
+        params: { name: "upload", arguments: { pad } },
+      })),
+    ],
+  ];
+
+  it.each(toolCallsOfAnySize)(
+    "a tools/call of %s mints a token for exactly that user",
+    async (_label, body) => {
+      const mint = makeMintStub("graph-token");
+      const { baseFetch, seen } = makeBaseFetch();
+      const injected = makeM365InjectedFetch(mint, baseFetch);
+
+      await runWithM365UserContext({ userId: "user-enrolled" }, () =>
+        injected(MCP_URL, post(body)),
+      );
+
+      expect(mint.getAccessToken).toHaveBeenCalledTimes(1);
+      expect(mint.getAccessToken).toHaveBeenCalledWith("user-enrolled");
+      expect(seen[0].headers.get("authorization")).toBe("Bearer graph-token");
+      expect(seen[0].headers.get(USER_ID_HEADER)).toBe("user-enrolled");
+      expect(seen[0].body).toBe(body);
     },
   );
 
@@ -315,6 +482,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
 
   const failClosedRequests: Array<[string, RequestInit]> = [
     ["an unparseable body", post("{not json")],
+    [
+      "an unparseable body above 65,536 code units",
+      post(`${reply({ id: 1, result: { pad: "x".repeat(70_000) } })}{`),
+    ],
     ["a non-string body", post(new TextEncoder().encode(rpc("tools/list", 1)))],
     ["no body", { method: "POST" }],
     ["a null body", post(null)],
@@ -322,8 +493,133 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     ["a JSON number", post("42")],
     ["an empty batch", post("[]")],
     [
-      "a response-shaped message with no method",
-      post(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} })),
+      "a reply as a non-string body",
+      post(new TextEncoder().encode(reply({ id: 1, result: {} }))),
+    ],
+    ["a reply with a null id", post(reply({ id: null, result: {} }))],
+    ["a reply with no id", post(reply({ result: {} }))],
+    ["a reply with a boolean id", post(reply({ id: true, result: {} }))],
+    ["a reply with an object id", post(reply({ id: { n: 1 }, result: {} }))],
+    // Raw JSON: JSON.stringify would turn a non-finite number into null.
+    [
+      "a reply with a non-finite id",
+      post('{"jsonrpc":"2.0","id":1e400,"result":{}}'),
+    ],
+    [
+      "a reply with both result and error",
+      post(reply({ id: 1, result: {}, error: { code: -32603, message: "x" } })),
+    ],
+    ["a reply with neither result nor error", post(reply({ id: 1 }))],
+    ["a reply with no jsonrpc", post(JSON.stringify({ id: 1, result: {} }))],
+    // None of these wire shapes can hide a method or supply a reply's
+    // required fields through a prototype-looking property. Use raw JSON:
+    // constructing objects first would erase duplicates and special-case
+    // __proto__ before the gate ever saw the body.
+    [
+      "a reply with its id only inside __proto__",
+      post('{"jsonrpc":"2.0","result":{},"__proto__":{"id":1}}'),
+    ],
+    [
+      "a reply with its result only inside __proto__",
+      post('{"jsonrpc":"2.0","id":1,"__proto__":{"result":{}}}'),
+    ],
+    [
+      "a reply with its jsonrpc only inside __proto__",
+      post('{"id":1,"result":{},"__proto__":{"jsonrpc":"2.0"}}'),
+    ],
+    [
+      "a tools/call with a ping inside __proto__",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","__proto__":{"method":"ping"}}',
+      ),
+    ],
+    [
+      "a reply carrying a method and shadowing hasOwnProperty",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"ping","result":{},"hasOwnProperty":false}',
+      ),
+    ],
+    [
+      "a reply carrying an escaped method key",
+      post(
+        String.raw`{"jsonrpc":"2.0","id":1,"me\u0074hod":"tools/call","result":{}}`,
+      ),
+    ],
+    [
+      "a reply with duplicate methods ending in ping",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"ping","result":{}}',
+      ),
+    ],
+    [
+      "a reply with duplicate methods ending in tools/call",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","result":{}}',
+      ),
+    ],
+    [
+      "a reply with duplicate methods ending in null",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","method":null,"result":{}}',
+      ),
+    ],
+    [
+      "a reply with a duplicate id ending in null",
+      post('{"jsonrpc":"2.0","id":1,"id":null,"result":{}}'),
+    ],
+    [
+      "a reply with jsonrpc 1.0",
+      post(JSON.stringify({ jsonrpc: "1.0", id: 1, result: {} })),
+    ],
+    [
+      "a reply with a numeric jsonrpc",
+      post(JSON.stringify({ jsonrpc: 2, id: 1, result: {} })),
+    ],
+    // A message that carries a result or an error is never a token-free
+    // request, whatever its method says.
+    [
+      "a result carrying method ping",
+      post(reply({ id: 1, method: "ping", result: {} })),
+    ],
+    [
+      "an error carrying method ping",
+      post(
+        reply({
+          id: 1,
+          method: "ping",
+          error: { code: -32601, message: "x" },
+        }),
+      ),
+    ],
+    [
+      "a result carrying method notifications/initialized",
+      post(reply({ id: 1, method: "notifications/initialized", result: {} })),
+    ],
+    [
+      "a result carrying method tools/call",
+      post(reply({ id: 1, method: "tools/call", result: {} })),
+    ],
+    [
+      "a result carrying a null method",
+      post(reply({ id: 1, method: null, result: {} })),
+    ],
+    [
+      "a result carrying a non-string method",
+      post(reply({ id: 1, method: 7, result: {} })),
+    ],
+    [
+      "a batch of a reply and a tools/call",
+      post(`[${reply({ id: 1, result: {} })}, ${rpc("tools/call", 2)}]`),
+    ],
+    [
+      "a batch with one malformed reply",
+      post(
+        `[${reply({ id: 1, result: {} })}, ${reply({ id: null, result: {} })}]`,
+      ),
+    ],
+    [
+      "a reply nested in an array inside a batch",
+      post(`[[${reply({ id: 1, result: {} })}]]`),
     ],
     [
       "a message whose method is not a string",
@@ -344,15 +640,6 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     ["a batch holding a non-object", post(`[${rpc("ping", 1)}, 3]`)],
     ["a PUT", { method: "PUT", body: rpc("tools/list", 1) }],
     ["a PATCH", { method: "PATCH", body: rpc("tools/list", 1) }],
-    [
-      "a tools/list body too large to be one",
-      post(
-        JSON.stringify({
-          ...JSON.parse(rpc("tools/list", 1)),
-          pad: "x".repeat(70_000),
-        }),
-      ),
-    ],
   ];
 
   it.each(failClosedRequests)(
@@ -369,6 +656,7 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
       expect(mint.getAccessToken).toHaveBeenCalledTimes(1);
       expect(seen[0].headers.get("authorization")).toBe("Bearer graph-token");
       expect(seen[0].headers.get(USER_ID_HEADER)).toBe("user-enrolled");
+      expect(seen[0].body).toBe(init.body);
     },
   );
 
@@ -456,6 +744,23 @@ describe("requestNeedsUserToken", () => {
     expect(requestNeedsUserToken(post(rpc("notifications/anything")))).toBe(
       false,
     );
+  });
+
+  it("is false for a pure reply and true once the reply carries any method key", () => {
+    expect(requestNeedsUserToken(post(reply({ id: 1, result: {} })))).toBe(
+      false,
+    );
+    expect(
+      requestNeedsUserToken(
+        post(reply({ id: "a", error: { code: -32601, message: "x" } })),
+      ),
+    ).toBe(false);
+    expect(
+      requestNeedsUserToken(post(reply({ id: 1, method: "ping", result: {} }))),
+    ).toBe(true);
+    expect(
+      requestNeedsUserToken(post(reply({ id: 1, method: null, result: {} }))),
+    ).toBe(true);
   });
 });
 
