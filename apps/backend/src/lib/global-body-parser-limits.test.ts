@@ -752,7 +752,6 @@ describe("declaredLengthGuard", () => {
 
   it.each([
     ["leading zeros", "00010485761"],
-    ["HTTP whitespace", "\t10485761 \t"],
     ["a value above Number.MAX_SAFE_INTEGER", "9007199254740993"],
   ])("refuses an oversized length with %s", async (_label, length) => {
     const response = await rawRequest(guarded.port, {
@@ -767,19 +766,53 @@ describe("declaredLengthGuard", () => {
     expect(response.closed).toBe(true);
   });
 
-  it.each([
-    ["leading zeros", "00010485760"],
-    ["HTTP whitespace", "\t10485760 \t"],
-  ])("allows exactly 10 MiB with %s", async (_label, length) => {
+  it.each([["leading zeros", "00010485760"]])(
+    "allows exactly 10 MiB with %s",
+    async (_label, length) => {
+      const response = await rawRequest(guarded.port, {
+        path: "/metamcp/x/probe",
+        headers: { "Content-Length": length },
+        waitForClose: false,
+      });
+
+      expect(response.timedOut).toBe(false);
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({ reached: true });
+    },
+  );
+
+  // Node's HTTP parser treats optional whitespace around Content-Length
+  // differently across major versions: Node 20 (the runtime image and CI)
+  // refuses the request with 400 before any route runs, while later majors
+  // trim it and hand the request on. Either answer is acceptable here; what
+  // must never happen is an oversized declared length reaching a handler or
+  // waiting for its body.
+  it("never lets an oversized length padded with HTTP whitespace through", async () => {
     const response = await rawRequest(guarded.port, {
       path: "/metamcp/x/probe",
-      headers: { "Content-Length": length },
+      headers: { "Content-Length": "\t10485761 \t" },
+    });
+
+    expect(response.timedOut).toBe(false);
+    expect([400, 413]).toContain(response.status);
+    if (response.status === 413) {
+      expect(response.body).toBe(NEUTRAL_413_BODY);
+      expect(response.headers["connection"]).toBe("close");
+    }
+  });
+
+  it("treats exactly 10 MiB padded with HTTP whitespace as the parser does", async () => {
+    const response = await rawRequest(guarded.port, {
+      path: "/metamcp/x/probe",
+      headers: { "Content-Length": "\t10485760 \t" },
       waitForClose: false,
     });
 
     expect(response.timedOut).toBe(false);
-    expect(response.status).toBe(200);
-    expect(JSON.parse(response.body)).toEqual({ reached: true });
+    expect([200, 400]).toContain(response.status);
+    if (response.status === 200) {
+      expect(JSON.parse(response.body)).toEqual({ reached: true });
+    }
   });
 
   const invalidFramings: Array<
