@@ -317,6 +317,17 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     ["a reply whose result is null", reply({ id: 3, result: null })],
     ["a reply whose result is false", reply({ id: 4, result: false })],
     ["a reply whose result is 0", reply({ id: 5, result: 0 })],
+    // Raw JSON preserves duplicate keys and treats __proto__ as an ordinary
+    // own field. Classification must not rewrite these bytes or interpret
+    // nested method names as a request.
+    [
+      "a reply with prototype-looking fields and a method inside its result",
+      '{"jsonrpc":"2.0","id":1,"result":{"method":"tools/call"},"__proto__":{"method":"tools/call"},"constructor":{"prototype":{"method":"tools/call"}},"hasOwnProperty":null}',
+    ],
+    [
+      "a reply with a duplicate result field",
+      '{"jsonrpc":"2.0","id":1,"result":{},"result":false}',
+    ],
     [
       "a batch of replies",
       `[${reply({ id: 6, result: {} })}, ${reply({
@@ -471,6 +482,10 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
 
   const failClosedRequests: Array<[string, RequestInit]> = [
     ["an unparseable body", post("{not json")],
+    [
+      "an unparseable body above 65,536 code units",
+      post(`${reply({ id: 1, result: { pad: "x".repeat(70_000) } })}{`),
+    ],
     ["a non-string body", post(new TextEncoder().encode(rpc("tools/list", 1)))],
     ["no body", { method: "POST" }],
     ["a null body", post(null)],
@@ -496,6 +511,62 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
     ],
     ["a reply with neither result nor error", post(reply({ id: 1 }))],
     ["a reply with no jsonrpc", post(JSON.stringify({ id: 1, result: {} }))],
+    // None of these wire shapes can hide a method or supply a reply's
+    // required fields through a prototype-looking property. Use raw JSON:
+    // constructing objects first would erase duplicates and special-case
+    // __proto__ before the gate ever saw the body.
+    [
+      "a reply with its id only inside __proto__",
+      post('{"jsonrpc":"2.0","result":{},"__proto__":{"id":1}}'),
+    ],
+    [
+      "a reply with its result only inside __proto__",
+      post('{"jsonrpc":"2.0","id":1,"__proto__":{"result":{}}}'),
+    ],
+    [
+      "a reply with its jsonrpc only inside __proto__",
+      post('{"id":1,"result":{},"__proto__":{"jsonrpc":"2.0"}}'),
+    ],
+    [
+      "a tools/call with a ping inside __proto__",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","__proto__":{"method":"ping"}}',
+      ),
+    ],
+    [
+      "a reply carrying a method and shadowing hasOwnProperty",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"ping","result":{},"hasOwnProperty":false}',
+      ),
+    ],
+    [
+      "a reply carrying an escaped method key",
+      post(
+        String.raw`{"jsonrpc":"2.0","id":1,"me\u0074hod":"tools/call","result":{}}`,
+      ),
+    ],
+    [
+      "a reply with duplicate methods ending in ping",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"ping","result":{}}',
+      ),
+    ],
+    [
+      "a reply with duplicate methods ending in tools/call",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","result":{}}',
+      ),
+    ],
+    [
+      "a reply with duplicate methods ending in null",
+      post(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","method":null,"result":{}}',
+      ),
+    ],
+    [
+      "a reply with a duplicate id ending in null",
+      post('{"jsonrpc":"2.0","id":1,"id":null,"result":{}}'),
+    ],
     [
       "a reply with jsonrpc 1.0",
       post(JSON.stringify({ jsonrpc: "1.0", id: 1, result: {} })),
@@ -585,6 +656,7 @@ describe("m365 injected fetch, invariant 5: a token is minted only for a request
       expect(mint.getAccessToken).toHaveBeenCalledTimes(1);
       expect(seen[0].headers.get("authorization")).toBe("Bearer graph-token");
       expect(seen[0].headers.get(USER_ID_HEADER)).toBe("user-enrolled");
+      expect(seen[0].body).toBe(init.body);
     },
   );
 
