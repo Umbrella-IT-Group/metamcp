@@ -9,6 +9,7 @@ import logger from "@/utils/logger";
 
 import { metaMcpServerPool } from "../../../lib/metamcp/metamcp-server-pool";
 import { lookupEndpoint } from "../../../middleware/lookup-endpoint-middleware";
+import { rateLimitMiddleware } from "../../../middleware/rate-limit.middleware";
 import { createMiddlewareEnabledHandlers } from "./handlers";
 import { generateOpenApiSchema } from "./schema-generator";
 import {
@@ -93,12 +94,21 @@ openApiRouter.get(
   },
 );
 
+// Tool execution runs backend code, so both verbs below take the endpoint's
+// configured rate limits after authentication, exactly as the MCP routes do
+// (streamable-http.ts, sse.ts). The limiter keeps its counters per endpoint
+// namespace and caller, in one process-wide store, so a caller's bridge calls
+// and MCP requests draw on the same budget. A refused call is answered 429
+// (per-client window) or 503 (endpoint bucket) before the handler runs, so the
+// backend is never called.
+
 // Tool execution endpoint for POST requests
 openApiRouter.post(
   "/:endpoint_name/api/:tool_name",
   express.json(),
   lookupEndpoint,
   authenticateApiKey,
+  rateLimitMiddleware,
   async (req, res) => {
     await executeToolWithMiddleware(
       req as ToolExecutionRequest,
@@ -113,6 +123,7 @@ openApiRouter.get(
   "/:endpoint_name/api/:tool_name",
   lookupEndpoint,
   authenticateApiKey,
+  rateLimitMiddleware,
   async (req, res) => {
     await executeToolWithMiddleware(req as ToolExecutionRequest, res, {});
   },
