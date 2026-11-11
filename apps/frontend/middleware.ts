@@ -192,6 +192,6 @@ export const config = {
     // lockstep with shouldBypassMiddleware in ./lib/middleware-bypass. Next
     // requires config.matcher to be a statically-analyzable literal, so it
     // cannot import that list; middleware-bypass.test.ts cross-checks the two.
-    "/((?!_next(?:/|$)|api/|trpc(?:/|$)|mcp-proxy(?:/|$)|metamcp(?:/|$)|oauth(?:/|$)|fe-oauth(?:/|$)|\\.well-known(?:/|$)|service(?:/|$)|health(?:/|$)|m365(?:/|$)|.*\\..*).*)",
+    "/((?!_next(?:/|$)|api/|trpc(?:/|$)|mcp-proxy(?:/|$)|metamcp(?:/|$)|oauth(?:/|$)|fe-oauth(?:/|$)|\\.well-known(?:/|$)|health(?:/|$)|m365(?:/|$)|.*\\..*).*)",
   ],
 };
