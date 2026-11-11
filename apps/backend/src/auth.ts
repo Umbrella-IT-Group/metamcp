@@ -339,6 +339,13 @@ export const auth = betterAuth({
       emailVerified: {
         type: "boolean",
         defaultValue: false,
+        // Not settable by the user. Without `input: false` better-auth
+        // accepted a client-supplied emailVerified on sign-up and on
+        // update-user, so anyone signed in could mark their own address
+        // verified. Nothing reads the flag for authorization today; this keeps
+        // it meaningful if something ever does. Server-side writes (the SSO
+        // provider's profile mapping) are unaffected.
+        input: false,
       },
       // RBAC role surfaced into the session user so both the backend
       // (adminProcedure reads ctx.user.role) and the frontend (nav/mint
