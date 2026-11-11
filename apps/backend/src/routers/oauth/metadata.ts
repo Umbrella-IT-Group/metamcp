@@ -5,9 +5,14 @@ import logger from "@/utils/logger";
 import { endpointsRepository } from "../../db/repositories";
 import { matchPublicMcpResourcePath } from "../../lib/public-mcp-resource";
 import { getOAuthDcrMode } from "./dcr-mode";
-import { getBaseUrl, getIssuerIdentifier, GRANTED_OAUTH_SCOPE } from "./utils";
+import {
+  getBaseUrl,
+  getIssuerIdentifier,
+  GRANTED_OAUTH_SCOPE,
+  oauthRouterOptions,
+} from "./utils";
 
-const metadataRouter = express.Router();
+const metadataRouter = express.Router(oauthRouterOptions);
 
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
 const AUTHORIZATION_SERVER_PATH = "/.well-known/oauth-authorization-server";

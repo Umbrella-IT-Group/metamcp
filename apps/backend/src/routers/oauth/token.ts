@@ -24,11 +24,12 @@ import { requireIntrospectionCredential } from "./introspection-auth";
 import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
+  oauthRouterOptions,
   rateLimitToken,
   verifyClientSecret,
 } from "./utils";
 
-const tokenRouter = express.Router();
+const tokenRouter = express.Router(oauthRouterOptions);
 
 // Umbrella fork: TTLs are env-var configurable. Defaults are tuned for max
 // connectivity from clients that lack revoke-friendly UX (e.g. Claude.ai

@@ -19,11 +19,20 @@ import userinfoRouter from "./userinfo";
 import {
   isOAuthServedPath,
   jsonParsingMiddleware,
+  oauthRouterOptions,
   securityHeaders,
   urlencodedParsingMiddleware,
 } from "./utils";
 
-const oauthRouter = express.Router();
+// Every OAuth router is created case-sensitive (this one and each sub-router,
+// see oauthRouterOptions). Express matches routes case-insensitively by
+// default, so `/OAuth/Authorize` reached the same handler as
+// `/oauth/authorize`. A path-based gate in front of this gateway (for example
+// an edge access policy on `/oauth/authorize`) may compare paths exactly and
+// would not treat another spelling as the same endpoint. Only the exact
+// lowercase paths the discovery metadata advertises route; any other spelling
+// answers 404.
+const oauthRouter = express.Router(oauthRouterOptions);
 
 // Tool-call audit retention (days). The prune rides the same cleanup interval
 // below; <=0 disables pruning (retain forever), and anything between 1 and 29

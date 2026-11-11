@@ -558,6 +558,15 @@ export function getIssuerIdentifier(req: express.Request): string {
  */
 export const OAUTH_SERVED_PREFIXES = ["/oauth", "/.well-known"] as const;
 
+/**
+ * Options every OAuth router is created with (./index.ts and each
+ * sub-router). `caseSensitive` so only the exact lowercase paths the metadata
+ * advertises route: Express's default would also route `/OAuth/Authorize`,
+ * which a path-matching gate in front of the gateway may not recognize as the
+ * same endpoint. See the comment on the router in ./index.ts.
+ */
+export const oauthRouterOptions = Object.freeze({ caseSensitive: true });
+
 /** Whole-segment prefix test for the paths above. */
 export function isOAuthServedPath(path: string): boolean {
   return OAUTH_SERVED_PREFIXES.some(

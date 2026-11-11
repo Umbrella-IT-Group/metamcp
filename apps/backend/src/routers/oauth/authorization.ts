@@ -35,11 +35,12 @@ import {
   isConsentDecisionRateLimited,
   isLoopbackRedirectUri,
   type OAuthParams,
+  oauthRouterOptions,
   rateLimitAuth,
   validateRedirectUri,
 } from "./utils";
 
-const authorizationRouter = express.Router();
+const authorizationRouter = express.Router(oauthRouterOptions);
 
 /**
  * Frontend path of the consent screen.

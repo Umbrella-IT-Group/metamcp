@@ -19,10 +19,11 @@ import {
   getBaseUrl,
   GRANTED_OAUTH_SCOPE,
   isDcrLoopbackRedirectUri,
+  oauthRouterOptions,
   rateLimitRegistration,
 } from "./utils";
 
-const registrationRouter = express.Router();
+const registrationRouter = express.Router(oauthRouterOptions);
 
 /**
  * The 400 a self-registration with any non-loopback callback receives.
