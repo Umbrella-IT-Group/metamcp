@@ -98,6 +98,7 @@ const endpointsRepositoryMock = { findByUuid: vi.fn() };
 const mcpServersRepositoryMock = {
   create: vi.fn(),
   update: vi.fn(),
+  updateReportingChange: vi.fn(),
   findByUuid: vi.fn(),
   deleteByUuid: vi.fn(),
   bulkCreate: vi.fn(),
@@ -142,6 +143,7 @@ vi.mock("../lib/metamcp/mcp-server-pool", () => ({
     ensureIdleSessionForNewServer: vi.fn().mockResolvedValue(undefined),
     cleanupIdleSession: vi.fn().mockResolvedValue(undefined),
     invalidateIdleSession: vi.fn().mockResolvedValue(undefined),
+    invalidateServerConnection: vi.fn().mockResolvedValue(undefined),
   },
 }));
 vi.mock("../lib/metamcp/metamcp-server-pool", () => ({
@@ -987,7 +989,12 @@ describe("mcpserver.create / .update — vendor credentials must never land", ()
 
   it("update — the call that ROTATES a vendor token — records neither", async () => {
     mcpServersRepositoryMock.findByUuid.mockResolvedValue(serverRow);
-    mcpServersRepositoryMock.update.mockResolvedValue(serverRow);
+    // The impl writes through updateReportingChange (it reports whether the
+    // update replaced a credential, which this one does).
+    mcpServersRepositoryMock.updateReportingChange.mockResolvedValue({
+      server: serverRow,
+      destinationOrCredentialChanged: true,
+    });
     namespaceMappingsRepositoryMock.findNamespacesByServerUuid.mockResolvedValue(
       [],
     );

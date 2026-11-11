@@ -21,6 +21,7 @@ import {
   mcpServersRepository,
   namespaceMappingsRepository,
 } from "../db/repositories";
+import { ServerCredentialRetentionError } from "../db/repositories/mcp-server-update-plan";
 import { McpServersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { clampAuditTextList } from "../lib/audit/audit-emitter";
@@ -459,16 +460,48 @@ export const mcpServersImplementations = {
       const effectiveUserId =
         input.user_id !== undefined ? input.user_id : server.user_id;
 
-      const updatedServer = await mcpServersRepository.update({
-        ...input,
-        user_id: effectiveUserId,
-      });
+      // The repository judges the update against the row it locks, and
+      // refuses a URL change that does not decide what happens to the stored
+      // bearer token and headers (planServerUpdate in mcp-servers.repo.ts).
+      // A refusal writes nothing.
+      let result: Awaited<
+        ReturnType<typeof mcpServersRepository.updateReportingChange>
+      >;
+      try {
+        result = await mcpServersRepository.updateReportingChange({
+          ...input,
+          user_id: effectiveUserId,
+        });
+      } catch (error) {
+        if (error instanceof ServerCredentialRetentionError) {
+          logger.info(
+            `Refused an update of MCP server ${server.uuid}: it changes the URL without replacing or clearing the stored credentials`,
+          );
+          return { success: false as const, message: error.message };
+        }
+        throw error;
+      }
 
-      if (!updatedServer) {
+      if (!result) {
         return {
           success: false as const,
           message: "MCP server not found",
         };
+      }
+      const updatedServer = result.server;
+
+      // A changed URL, type, bearer or headers: retire every pooled
+      // connection still built from the old values (active and idle, all
+      // sessions), as `reconnect` does, before this returns. Without it a
+      // live connection keeps presenting a cleared or replaced credential, or
+      // keeps talking to the old address, until it happens to be recycled.
+      // An edit that changes none of these (the sync's routine re-save)
+      // leaves live connections alone.
+      if (result.destinationOrCredentialChanged) {
+        await mcpServerPool.invalidateServerConnection(
+          "<update-trigger>",
+          updatedServer.uuid,
+        );
       }
 
       // Reset error status for stdio servers when they are updated

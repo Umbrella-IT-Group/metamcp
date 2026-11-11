@@ -13,6 +13,7 @@ import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -29,6 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
+import { bearerFieldsForUpdate } from "@/lib/server-bearer-update";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
@@ -156,6 +158,7 @@ export function EditMcpServer({
       args: "",
       url: "",
       bearerToken: "",
+      clearBearerToken: false,
       headers: "",
       env: "",
       user_id: undefined,
@@ -196,6 +199,7 @@ export function EditMcpServer({
         args: server.args.join(" "),
         url: server.url || "",
         bearerToken: server.bearerToken || "",
+        clearBearerToken: false,
         headers: Object.entries(server.headers)
           .map(([key, value]) => `${key}=${value}`)
           .join("\n"),
@@ -263,7 +267,9 @@ export function EditMcpServer({
         args: argsArray,
         env: envObject,
         url: data.url,
-        bearerToken: data.bearerToken,
+        // Blank keeps the stored token only while the URL is unchanged; a URL
+        // change must replace or clear it (see bearerFieldsForUpdate).
+        ...bearerFieldsForUpdate(data),
         headers: headersObject,
         user_id: data.user_id,
       };
@@ -492,7 +498,28 @@ export function EditMcpServer({
                   {...editForm.register("bearerToken")}
                   placeholder={t("mcp-servers:bearerTokenPlaceholder")}
                   type="password"
+                  disabled={editForm.watch("clearBearerToken") === true}
                 />
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="edit-clearBearerToken"
+                    checked={editForm.watch("clearBearerToken") === true}
+                    onCheckedChange={(checked) => {
+                      editForm.setValue("clearBearerToken", checked === true);
+                      if (checked === true)
+                        editForm.setValue("bearerToken", "");
+                    }}
+                  />
+                  <label
+                    htmlFor="edit-clearBearerToken"
+                    className="text-sm font-medium leading-none"
+                  >
+                    {t("mcp-servers:clearBearerToken")}
+                  </label>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t("mcp-servers:bearerTokenUrlChangeHelp")}
+                </p>
               </div>
 
               <div className="flex flex-col gap-2">

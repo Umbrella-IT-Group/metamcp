@@ -16,6 +16,10 @@ import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { mcpServersTable } from "../schema";
+import {
+  planServerUpdate,
+  ServerCredentialRetentionError,
+} from "./mcp-server-update-plan";
 
 // Encrypt a bearer token at the CREATE boundary. A
 // non-empty value is stored as an `enc:v1:` envelope; empty/undefined is left
@@ -33,29 +37,6 @@ function withEncryptedBearerToken<T extends { bearerToken?: string | null }>(
     };
   }
   return input;
-}
-
-// The UPDATE variant of the choke above, and it differs on one point that is a
-// live-outage bug if it is wrong. The serializer redacts bearer_token to null
-// on every response, so the edit form cannot see the
-// stored value and re-submits an EMPTY bearerToken field on every save that did
-// not re-type the secret. Writing that empty value would blank the row's
-// credential and break the upstream connection. So a falsy bearerToken here
-// means "leave the stored value unchanged": the key is dropped from the SET so
-// drizzle never touches the column. A non-empty value replaces it, encrypted at
-// rest. This removes no capability the admin had, the value was never
-// round-tripped in cleartext for them to deliberately clear by blanking.
-function withUpdatedBearerToken<T extends { bearerToken?: string | null }>(
-  input: T,
-): Omit<T, "bearerToken"> | T {
-  if (input.bearerToken) {
-    return {
-      ...input,
-      bearerToken: encryptServerBearerToken(input.bearerToken),
-    };
-  }
-  const { bearerToken: _omitted, ...rest } = input;
-  return rest;
 }
 
 // Helper function to handle PostgreSQL errors
@@ -212,20 +193,73 @@ export class McpServersRepository {
     return deletedServer;
   }
 
+  /**
+   * Update a server, judged against the row as it is when the write happens.
+   *
+   * The current row is read under `FOR UPDATE` in the same transaction as the
+   * write, so the URL comparison in planServerUpdate cannot be overtaken by a
+   * concurrent update: a second editor whose form still shows the old URL is
+   * judged against the URL the first one committed. A refusal throws
+   * ServerCredentialRetentionError before anything is written, so the whole
+   * row is unchanged; every other database error keeps its generic message.
+   */
   async update(
     input: McpServerUpdateInput,
   ): Promise<DatabaseMcpServer | undefined> {
+    return (await this.updateReportingChange(input))?.server;
+  }
+
+  /**
+   * `update`, also reporting whether the write changed where the gateway
+   * connects or what it presents there: the type, the URL, the stored bearer
+   * (any replacement or clear) or the stored headers. Compared inside the
+   * same transaction, against the locked row, so a concurrent update cannot
+   * make the answer stale. The caller uses it to retire pooled connections
+   * still built from the old values.
+   */
+  async updateReportingChange(input: McpServerUpdateInput): Promise<
+    | {
+        server: DatabaseMcpServer;
+        destinationOrCredentialChanged: boolean;
+      }
+    | undefined
+  > {
     const { uuid, ...updateData } = input;
 
     try {
-      const [updatedServer] = await db
-        .update(mcpServersTable)
-        .set(withUpdatedBearerToken(updateData))
-        .where(eq(mcpServersTable.uuid, uuid))
-        .returning();
+      return await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select({
+            type: mcpServersTable.type,
+            url: mcpServersTable.url,
+            bearerToken: mcpServersTable.bearerToken,
+            headers: mcpServersTable.headers,
+          })
+          .from(mcpServersTable)
+          .where(eq(mcpServersTable.uuid, uuid))
+          .for("update");
+        if (!current) return undefined;
 
-      return updatedServer;
+        const [updatedServer] = await tx
+          .update(mcpServersTable)
+          .set(planServerUpdate(current, updateData))
+          .where(eq(mcpServersTable.uuid, uuid))
+          .returning();
+        if (!updatedServer) return undefined;
+
+        return {
+          server: updatedServer,
+          destinationOrCredentialChanged:
+            current.type !== updatedServer.type ||
+            (current.url ?? null) !== (updatedServer.url ?? null) ||
+            (current.bearerToken ?? null) !==
+              (updatedServer.bearerToken ?? null) ||
+            JSON.stringify(current.headers ?? {}) !==
+              JSON.stringify(updatedServer.headers ?? {}),
+        };
+      });
     } catch (error: unknown) {
+      if (error instanceof ServerCredentialRetentionError) throw error;
       handleDatabaseError(error, "update", input.name);
     }
   }
@@ -307,7 +341,9 @@ export class McpServersRepository {
       .set({
         error_status: McpServerErrorStatusEnum.enum.NONE,
       })
-      .where(eq(mcpServersTable.error_status, McpServerErrorStatusEnum.enum.ERROR))
+      .where(
+        eq(mcpServersTable.error_status, McpServerErrorStatusEnum.enum.ERROR),
+      )
       .returning();
 
     return updated.length;

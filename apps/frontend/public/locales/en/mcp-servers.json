@@ -19,6 +19,8 @@
   "urlPlaceholder": "https://example.com/sse|mcp",
   "bearerToken": "Bearer Token",
   "bearerTokenPlaceholder": "Enter bearer token",
+  "clearBearerToken": "Remove the stored bearer token when saving",
+  "bearerTokenUrlChangeHelp": "Leave the token blank to keep the stored one. If you change the URL, enter a new token or remove the stored one: the gateway does not send a stored token to a new address.",
   "headers": "Custom Headers",
   "headersPlaceholder": "KEY=value (one per line)",
   "ownership": "Ownership",
