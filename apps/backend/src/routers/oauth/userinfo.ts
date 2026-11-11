@@ -30,10 +30,8 @@ const userinfoRouter = express.Router();
  * instead; the req.ip fallback degrades to the old shared bucket only for
  * direct-to-origin and local development.
  *
- * The /oauth/introspect and /oauth/revoke siblings still share
- * getPublicOAuthRateLimitIdentifier's per-container bucket; unifying all three
- * on this keying is a follow-up, kept out of this change because those two are
- * not otherwise touched here.
+ * The /oauth/introspect and /oauth/revoke siblings use the same keying through
+ * getPublicOAuthRateLimitIdentifier in lib/auth-rate-limiter.
  *
  * Namespaced `oauth-public:userinfo:` so spam here cannot spend the endpoint
  * data plane's budget, and per route so it cannot spend introspect's or

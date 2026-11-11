@@ -1152,9 +1152,8 @@ function emitTokenLifecycle(
  * public PKCE clients, revocation already requires the token value, and
  * destroying a credential is the safe direction to fail. Bounding that traffic
  * by FAILURE is the substitute, and it has to be by failure rather than by
- * request. `rateLimitToken`, the per-IP limiter already on /oauth/token, would
- * be an outage on it: `trust proxy` is deliberately off, so every caller
- * through the tunnel shares ONE `req.ip` bucket.
+ * request: a request-count budget would refuse a busy client's legitimate
+ * revocations along with everything else from its address.
  *
  * /oauth/introspect now DOES require one (see ./introspection-auth, which
  * carries the RFC 7662 §2.1 reasoning). It keeps this limiter regardless,
@@ -1165,16 +1164,21 @@ function emitTokenLifecycle(
  * matter how often it asks. Only tokens that resolve to nothing — invented,
  * expired, or presented with a client_id they were not issued to — count.
  *
- * THE RESIDUAL, STATED PLAINLY RATHER THAN IMPLIED AWAY: the bucket is still
- * per-IP and `trust proxy` is still off, so failure-only makes legitimate
- * traffic incapable of filling the bucket — it does NOT make the bucket
- * un-fillable. Anyone who can reach these endpoints can spend it with 20
- * invented-token POSTs and hold it there indefinitely, and everyone sharing
- * that source address is refused with them. That is accepted, not solved, and
- * it is only acceptable because the gateway's own traffic no longer arrives
- * here at all: `api-key-oauth.middleware.ts` reads the token row in-process, so
- * no MCP client depends on this endpoint answering. Anything that reintroduces
- * an internal caller must revisit this decision first.
+ * KEYED PER EDGE CLIENT ADDRESS (CF-Connecting-IP), per route; see
+ * getPublicOAuthRateLimitIdentifier in lib/auth-rate-limiter for the keying,
+ * its fallback chain and the tunnel-only-ingress assumption it rests on.
+ * `trust proxy` is off, so `req.ip` alone would be one in-container address
+ * for every caller, and these routes keyed on it until that function moved to
+ * the edge address.
+ *
+ * THE RESIDUAL, STATED PLAINLY: failure-only makes legitimate traffic
+ * incapable of filling a bucket, but a bucket is per source address, so
+ * clients sharing one egress address (an office NAT) share its budget, and a
+ * client over budget is refused even when it then presents a valid token.
+ * That is accepted because the gateway's own traffic no longer arrives here at
+ * all: `api-key-oauth.middleware.ts` reads the token row in-process, so no MCP
+ * client depends on this endpoint answering. Anything that reintroduces an
+ * internal caller must revisit this decision first.
  *
  * Split into check and record on purpose: the check runs BEFORE the database
  * lookup, so refusing costs nothing, and `isCurrentlyLimited` is used rather
@@ -1228,12 +1232,11 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     // the right one, and why /oauth/revoke is deliberately left public.
     //
     // Placed AFTER the limiter check and counted as a failure, so anonymous
-    // spraying is bounded by the same budget as unresolvable tokens rather
-    // than being free. The residual is the one already documented on
-    // isPublicOAuthEndpointLimited: the bucket is per-IP with `trust proxy`
-    // off, so it can be held down by anyone who can reach the endpoint. That
-    // was accepted when no legitimate caller depended on this route, and
-    // gating it does not change who depends on it.
+    // requests are bounded by the same per-client budget as unresolvable
+    // tokens rather than being free. The residual is the one already
+    // documented on isPublicOAuthEndpointLimited (clients sharing an egress
+    // address share a budget); it was accepted when no legitimate caller
+    // depended on this route, and gating it does not change who depends on it.
     const credential = await requireIntrospectionCredential(req);
     // A real key refused by its IP policy (migration 0041): 403 with the
     // generic body, and NOT recorded against the failed-lookup limiter, ahead
@@ -1357,8 +1360,9 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
     // Deliberately NOT counted against the failure limiter: the credential is
     // real and was issued by this server, so a relying party asking about it
     // is a legitimate caller doing the right thing. Counting it would let one
-    // locked-out account's still-running client spend the shared per-IP budget
-    // and refuse everyone else — the outage this limiter is shaped to avoid.
+    // locked-out account's still-running client spend the per-address budget
+    // and refuse everyone sharing its address, which this limiter is shaped
+    // to avoid.
     if (await usersRepository.isDisabled(tokenData.user_id)) {
       logger.warn(
         `[oauth] introspect reported inactive reason=disabled client=${tokenData.client_id} user=${tokenData.user_id}`,

@@ -220,35 +220,49 @@ export function getAuthRateLimitIdentifier(
 }
 
 /**
- * Rate-limit identifier for the UNAUTHENTICATED-in-effect public OAuth token
- * endpoints /oauth/introspect and /oauth/revoke. (/oauth/userinfo carries the
- * same failure-only discipline but keys on the edge client IP instead of this
- * shared in-container req.ip; see userinfoRateLimitIdentifier in userinfo.ts.)
+ * Rate-limit identifier for the public OAuth token endpoints /oauth/introspect
+ * and /oauth/revoke, keyed per (edge client address, route).
  *
- * FAILURE-ONLY, and that is a hard requirement rather than a preference. This
+ * KEYED ON CF-Connecting-IP, with `req.ip`, then the socket address, then a
+ * literal as the fallback chain: the same keying getAuthRateLimitIdentifier
+ * above and userinfoRateLimitIdentifier in routers/oauth/userinfo use. This
  * fork deliberately does not set express `trust proxy` (see
- * middleware/audit-context.middleware for why), so `req.ip` is the same
- * in-container address for every caller arriving through the tunnel: one
- * bucket for the entire organisation. A limiter that counted SUCCESSES here
- * would therefore let any single busy client throttle everyone else's MCP
- * traffic — an outage caused by the control meant to prevent one.
+ * middleware/audit-context.middleware for why), so behind the tunnel `req.ip`
+ * is one in-container address shared by every caller. These two routes used to
+ * key on it alone, which made each route's failure budget a single bucket for
+ * the whole deployment; the edge address gives each client its own. The
+ * fallback keeps direct-to-origin and local-development traffic in one shared
+ * bucket per route, as before, and never throws on an auth-failure path.
  *
- * Counting only failures is safe against exactly that, because a legitimate
- * caller presents a token this server previously issued and never scores.
- * Only invented, expired or wrong-client tokens accumulate, which is the
- * traffic worth refusing. It is the workable substitute for RFC 7662 §2.1's
- * "MUST require authorization": the clients here are secretless public PKCE
- * clients, so there is no credential to require.
+ * The trust assumption is the one the module header on
+ * getAuthRateLimitIdentifier states: Cloudflare overwrites CF-Connecting-IP at
+ * the edge, so the key is per client only while the tunnel is the sole
+ * ingress. Re-check it before any change to how this service is published.
  *
- * Keyed per route so spam at one endpoint cannot spend the other's budget, and
- * namespaced away from the endpoint data plane's identifiers so it cannot
- * spend that budget either.
+ * FAILURE-ONLY, and that stays a hard requirement. A legitimate caller presents
+ * a token this server previously issued and never scores; only invented,
+ * expired or wrong-client tokens accumulate. Counting successes would let a
+ * busy client behind a shared egress address (an office NAT) refuse its
+ * neighbours. It is the workable substitute for RFC 7662 §2.1's "MUST require
+ * authorization" on revoke: the clients here are secretless public PKCE
+ * clients, so there is no credential to require. A client that has spent its
+ * own budget is refused for the rest of the window even when it then presents
+ * a valid token; that is accepted, and it is now confined to that client's
+ * address.
+ *
+ * Keyed per route so failures at one endpoint cannot spend the other's budget,
+ * and namespaced away from the endpoint data plane's and userinfo's
+ * identifiers so they cannot spend those either.
  */
 export function getPublicOAuthRateLimitIdentifier(
   req: express.Request,
   route: "introspect" | "revoke",
 ): string {
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  const ip =
+    resolveClientIp(req.headers) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown";
   return `oauth-public:${route}:${ip}`;
 }
 
