@@ -68,6 +68,35 @@ function emitEvent(
     detail?: Record<string, unknown>;
   },
 ): void {
+  // An admin-plane (CI) API key acted. The KEY is the actor: actor_type
+  // `api_key` and actor_id the key's uuid, the same shape the
+  // `authn.admin_key.accepted` row that authenticated the request uses, so
+  // the two join on actor_id. The owning user is kept beside it under
+  // `detail.admin_plane`, and actor_label stays the owner's email, so the row
+  // still says whose key it was without claiming that person acted in the UI.
+  const adminPlane = actor?.admin_plane;
+  if (adminPlane) {
+    emit({
+      actor_type: "api_key",
+      actor_id: adminPlane.key_uuid,
+      actor_label: actor?.actor_label ?? null,
+      actor_ip: actor?.actor_ip ?? null,
+      actor_user_agent: actor?.actor_user_agent ?? null,
+      action: event.action,
+      target_type: event.target_type,
+      target_id: event.target_id ?? null,
+      outcome: event.outcome ?? "success",
+      request_id: actor?.request_id ?? null,
+      detail: {
+        ...(event.detail ?? {}),
+        admin_plane: {
+          key_uuid: adminPlane.key_uuid,
+          owner_user_id: adminPlane.owner_user_id,
+        },
+      },
+    });
+    return;
+  }
   emit({
     // A MISSING actor bundle means there was no tRPC request behind this call
     // at all, which is a different claim from "a user whose id we could not

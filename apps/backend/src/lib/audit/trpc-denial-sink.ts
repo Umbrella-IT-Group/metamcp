@@ -34,6 +34,11 @@ export function trpcDenialSink(event: TrpcDenialEvent): void {
     outcome: "denied",
     request_id: event.audit?.request_id ?? null,
     http_status: event.http_status,
-    detail: { trpc_type: event.type },
+    detail: {
+      trpc_type: event.type,
+      // An admin-plane key refused outside its allowlist: the key is the
+      // actor (actor_id), the owner is kept here.
+      ...(event.admin_plane ? { admin_plane: event.admin_plane } : {}),
+    },
   });
 }

@@ -25,6 +25,7 @@
 
 import {
   createApiKeysRouter,
+  createAppRouter,
   createConfigRouter,
   createUsersRouter,
 } from "@repo/trpc";
@@ -1139,5 +1140,99 @@ describe("a broken audit sink cannot break an admin mutation", () => {
       actor_id: null,
       actor_label: null,
     });
+  });
+});
+
+describe("an admin-plane (CI) key's mutation is attributed to the key", () => {
+  // The admin-plane request is marked by createContext with the key that
+  // authenticated it (BaseContext.authOrigin). Routed through the full app
+  // router, so the procedure path is the real `frontend.*` one the allowlist
+  // matches.
+  const KEY_UUID = "44444444-4444-4444-8444-444444444444";
+  const adminPlaneCtx = {
+    ...adminCtx,
+    session: { id: "synthetic" },
+    authOrigin: {
+      kind: "admin_plane" as const,
+      key_uuid: KEY_UUID,
+      owner_user_id: "admin-1",
+    },
+  };
+  const serverRow = {
+    uuid: "55555555-5555-4555-8555-555555555555",
+    name: "synced-backend",
+    description: null,
+    type: "STREAMABLE_HTTP",
+    command: null,
+    args: [],
+    env: {},
+    url: "http://backend.internal:8000/mcp",
+    bearerToken: null,
+    headers: {},
+    error_status: "NONE",
+    created_at: new Date("2026-11-11T00:00:00.000Z"),
+    user_id: "admin-1",
+  };
+
+  const appRouter = () =>
+    createAppRouter({
+      frontend: {
+        mcpServers: mcpServersImplementations,
+        config: configImplementations,
+        apiKeys: apiKeysImplementations,
+        users: usersImplementations,
+        tools: toolsImplementations,
+      } as unknown as Parameters<typeof createAppRouter>[0]["frontend"],
+    });
+
+  it("records the key as the actor and keeps the owner beside it", async () => {
+    mcpServersRepositoryMock.create.mockResolvedValue(serverRow);
+
+    await appRouter()
+      .createCaller(adminPlaneCtx as never)
+      .frontend.mcpServers.create({
+        name: serverRow.name,
+        type: "STREAMABLE_HTTP",
+        url: serverRow.url,
+      });
+    await flush();
+
+    const created = rows.filter((r) => r.action === "mcpserver.create");
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({
+      outcome: "success",
+      actor_type: "api_key",
+      actor_id: KEY_UUID,
+      actor_label: "admin@example.invalid",
+      actor_ip: "203.0.113.7",
+      request_id: "req-under-test",
+      target_type: "mcp_server",
+      target_id: serverRow.uuid,
+    });
+    expect(created[0]?.detail).toMatchObject({
+      name: "synced-backend",
+      admin_plane: { key_uuid: KEY_UUID, owner_user_id: "admin-1" },
+    });
+  });
+
+  it("leaves a browser session's row exactly as it was", async () => {
+    mcpServersRepositoryMock.create.mockResolvedValue(serverRow);
+
+    await appRouter()
+      .createCaller(adminCtx as never)
+      .frontend.mcpServers.create({
+        name: serverRow.name,
+        type: "STREAMABLE_HTTP",
+        url: serverRow.url,
+      });
+    await flush();
+
+    const created = rows.filter((r) => r.action === "mcpserver.create");
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({
+      actor_type: "user",
+      actor_id: "admin-1",
+    });
+    expect(created[0]?.detail).not.toHaveProperty("admin_plane");
   });
 });

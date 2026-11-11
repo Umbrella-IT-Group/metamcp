@@ -17,6 +17,26 @@ export interface AuditRequestContext {
   request_id?: string | null;
 }
 
+/**
+ * How a request authenticated, when it did so with an admin-plane
+ * (control-plane) API key rather than a browser session.
+ *
+ * Set ONLY by the backend's `createContext`, from the value its admin-plane
+ * bearer resolver returns for a key it has just verified. Nothing a caller
+ * sends is copied into it: not a request field, not the synthetic session's
+ * id, not the presence of an Authorization header. A cookie session never
+ * carries it. `adminPlaneScope` below reads it to confine such a request to
+ * the configuration surface, and `auditActor` reads it so admin events name
+ * the key that acted.
+ */
+export interface AdminPlaneAuthOrigin {
+  kind: "admin_plane";
+  /** The api_keys row that authenticated the request. */
+  key_uuid: string;
+  /** The key's owning user, whose role the request otherwise runs with. */
+  owner_user_id: string;
+}
+
 // Create context interface that can be extended by backend
 export interface BaseContext {
   // Auth data that can be added by backend implementations
@@ -24,6 +44,63 @@ export interface BaseContext {
   user?: any;
   session?: any;
   audit?: AuditRequestContext;
+  authOrigin?: AdminPlaneAuthOrigin;
+}
+
+/**
+ * Every tRPC procedure an admin-plane API key may call: exactly what the
+ * configuration-sync tooling calls today. Provenance: the private
+ * Umbrella-MCP-Server repo's `metamcp/sync/sync_config.py`,
+ * `metamcp/sync/dump_config.py` and `metamcp/sync/admin_cli.py`, read
+ * 2026-11-11; every `trpc_query`/`trpc_mutate` name in those three files and
+ * nothing else. Full paths with the `frontend.` router prefix, the form the
+ * middleware below compares against.
+ *
+ * An admin-plane key authenticates as its owning administrator, so without
+ * this list it could call everything that administrator can: mint API keys
+ * that act as any user, mint further admin-plane keys, edit users, access
+ * groups, OAuth clients and auth settings. A key that lives in CI must not be
+ * able to do any of that. A human administrator's browser session is not
+ * affected by this list.
+ *
+ * Still reachable, on purpose, because the operator CLI uses them: the per-key
+ * and global IP policy setters, and create/update of servers, namespaces and
+ * endpoints. Adding a name here widens what a CI credential can do; it needs
+ * the same review as any other change to who can do what.
+ */
+export const ADMIN_PLANE_ALLOWED_PROCEDURES: ReadonlySet<string> = new Set([
+  "frontend.apiKeys.getGlobalIpPolicy",
+  "frontend.apiKeys.listAll",
+  "frontend.apiKeys.setGlobalIpPolicy",
+  "frontend.apiKeys.setIpPolicy",
+  "frontend.config.getMcpMaxTotalTimeout",
+  "frontend.config.getMcpTimeout",
+  "frontend.endpoints.create",
+  "frontend.endpoints.list",
+  "frontend.endpoints.update",
+  "frontend.mcpServers.create",
+  "frontend.mcpServers.list",
+  "frontend.mcpServers.update",
+  "frontend.namespaces.create",
+  "frontend.namespaces.get",
+  "frontend.namespaces.getTools",
+  "frontend.namespaces.list",
+  "frontend.namespaces.refreshTools",
+  "frontend.namespaces.update",
+  "frontend.namespaces.updateToolStatus",
+  "frontend.tools.getByMcpServerUuid",
+]);
+
+/** One constant refusal for every procedure outside the list. */
+export const ADMIN_PLANE_FORBIDDEN_MESSAGE =
+  "This procedure is not available to an admin-plane API key.";
+
+/** The admin-plane origin on a context, or null for every other request. */
+export function adminPlaneOrigin(
+  ctx: BaseContext | undefined | null,
+): AdminPlaneAuthOrigin | null {
+  const origin = ctx?.authOrigin;
+  return origin?.kind === "admin_plane" ? origin : null;
 }
 
 /**
@@ -35,7 +112,7 @@ export interface BaseContext {
  */
 export interface TrpcDenialEvent {
   action: "rbac.denied" | "authn.denied";
-  actor_type: "user" | "anonymous";
+  actor_type: "user" | "anonymous" | "api_key";
   actor_id: string | null;
   actor_label: string | null;
   path: string;
@@ -43,6 +120,8 @@ export interface TrpcDenialEvent {
   type: string;
   http_status: number;
   audit?: AuditRequestContext;
+  /** Set when an admin-plane API key was refused; see AdminPlaneAuthOrigin. */
+  admin_plane?: { key_uuid: string; owner_user_id: string };
 }
 
 /**
@@ -142,6 +221,13 @@ export interface AuditActor {
   actor_ip: string | null;
   actor_user_agent: string | null;
   request_id: string | null;
+  /**
+   * Present only when the request authenticated with an admin-plane API key.
+   * The backend's admin-event writer then records the KEY as the actor and
+   * keeps the owning user beside it, so a change made from CI is never
+   * recorded as if the owner had made it in the browser.
+   */
+  admin_plane?: { key_uuid: string; owner_user_id: string };
 }
 
 /**
@@ -158,12 +244,23 @@ export interface AuditActor {
 export function auditActor(ctx: BaseContext): AuditActor {
   try {
     const actor = actorFields(ctx?.user);
+    const adminPlane = adminPlaneOrigin(ctx);
     return {
       actor_id: actor.id,
       actor_label: actor.label,
       actor_ip: ctx?.audit?.actor_ip ?? null,
       actor_user_agent: ctx?.audit?.actor_user_agent ?? null,
       request_id: ctx?.audit?.request_id ?? null,
+      // Added only for an admin-plane request, so a browser session's actor
+      // keeps exactly the shape it had.
+      ...(adminPlane
+        ? {
+            admin_plane: {
+              key_uuid: adminPlane.key_uuid,
+              owner_user_id: adminPlane.owner_user_id,
+            },
+          }
+        : {}),
     };
   } catch {
     return {
@@ -217,14 +314,69 @@ const t = initTRPC.context<BaseContext>().create({
   },
 });
 
+/**
+ * Refuse an admin-plane request for any procedure outside
+ * ADMIN_PLANE_ALLOWED_PROCEDURES. Throws FORBIDDEN with one constant message
+ * and records the refusal; does nothing for any other request.
+ *
+ * Exported so the backend's own tRPC instance (apps/backend/src/trpc.ts) can
+ * apply the identical rule to its builders.
+ *
+ * Checked per procedure, on the procedure's full path, because that is the
+ * only place the path is known: a tRPC batch shares one context across all of
+ * its calls, so createContext cannot decide which of them are allowed.
+ */
+export function assertAdminPlaneProcedureAllowed(
+  ctx: BaseContext,
+  path: string,
+  type: string,
+): void {
+  const origin = adminPlaneOrigin(ctx);
+  if (!origin || ADMIN_PLANE_ALLOWED_PROCEDURES.has(path)) {
+    return;
+  }
+  emitDenial(() => {
+    const actor = actorFields(ctx.user);
+    return {
+      action: "rbac.denied",
+      actor_type: "api_key",
+      actor_id: origin.key_uuid,
+      actor_label: actor.label,
+      path,
+      type,
+      http_status: 403,
+      audit: ctx.audit,
+      admin_plane: {
+        key_uuid: origin.key_uuid,
+        owner_user_id: origin.owner_user_id,
+      },
+    };
+  });
+  throw new TRPCError({
+    code: "FORBIDDEN",
+    message: ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  });
+}
+
+/**
+ * The base every exported builder starts from, so no procedure in this
+ * package can be built without the admin-plane scope check. It runs before
+ * authentication and RBAC, and an ordinary request (anonymous or a browser
+ * session) passes straight through it.
+ */
+const scopedProcedure = t.procedure.use(({ ctx, next, path, type }) => {
+  assertAdminPlaneProcedureAllowed(ctx, path, type);
+  return next();
+});
+
 // Export router and procedure helpers
 export const router = t.router;
-export const publicProcedure = t.procedure;
+export const publicProcedure = scopedProcedure;
 export const createTRPCRouter = t.router;
-export const baseProcedure = t.procedure;
+export const baseProcedure = scopedProcedure;
 
 // Create a protected procedure that requires authentication
-export const protectedProcedure = t.procedure.use(
+export const protectedProcedure = scopedProcedure.use(
   ({ ctx, next, path, type }) => {
     if (!ctx.user || !ctx.session) {
       // Every unauthenticated tRPC attempt in the product funnels through this

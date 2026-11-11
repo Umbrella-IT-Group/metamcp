@@ -9,8 +9,13 @@ export {
   createTRPCRouter,
   auditActor,
   setTrpcAuditSink,
+  ADMIN_PLANE_ALLOWED_PROCEDURES,
+  ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  adminPlaneOrigin,
+  assertAdminPlaneProcedureAllowed,
 } from "./trpc";
 export type {
+  AdminPlaneAuthOrigin,
   AuditActor,
   AuditRequestContext,
   BaseContext,

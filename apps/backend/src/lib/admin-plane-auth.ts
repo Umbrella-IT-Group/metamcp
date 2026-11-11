@@ -34,6 +34,13 @@ import { resolveClientIp } from "./client-ip";
  * per request, so a demoted owner's key degrades to member on the very next
  * request and adminProcedure returns FORBIDDEN, the column, not the key, is the
  * lever.
+ *
+ * WHAT IT MAY CALL. An admin-plane key acts with its owner's role, but only
+ * on the configuration-sync procedures in ADMIN_PLANE_ALLOWED_PROCEDURES
+ * (packages/trpc/src/trpc.ts). createContext marks the request with the key's
+ * uuid, and the procedure builders refuse everything outside that list with
+ * FORBIDDEN, so a CI credential cannot mint API keys, edit users or change
+ * auth settings even though its owner can.
  */
 
 const apiKeysRepository = new ApiKeysRepository();
@@ -171,7 +178,9 @@ export interface AdminPlaneIpDenied {
 export async function resolveAdminPlaneSession(
   token: string,
   req: express.Request,
-): Promise<{ user: User; session: Session } | AdminPlaneIpDenied | null> {
+): Promise<
+  { user: User; session: Session; keyUuid: string } | AdminPlaneIpDenied | null
+> {
   // Kill switch: the whole path is off. Not a failed verification and not an
   // "admin-plane request" to record or audit, a bearer here is simply
   // unauthenticated. Returning before the DB read also means a flood while the
@@ -245,5 +254,9 @@ export async function resolveAdminPlaneSession(
     expiresAt: new Date(Date.now() + 60 * 1000),
   } as unknown as Session;
 
-  return { user, session };
+  // keyUuid is what createContext turns into the request's admin-plane
+  // auth origin (BaseContext.authOrigin in @repo/trpc), which confines the
+  // request to the configuration-sync procedures and names the key in admin
+  // audit rows. It comes from the verified key row, never from the request.
+  return { user, session, keyUuid: result.key_uuid };
 }
