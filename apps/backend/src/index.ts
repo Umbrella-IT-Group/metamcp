@@ -16,6 +16,7 @@ import { createUpstreamHealthHandler } from "./lib/health-upstream-handler";
 import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
+import { warnIfStdioServersAllowed } from "./lib/metamcp/stdio-policy";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
 import { assertVerifiedCallerConfig } from "./lib/metamcp/verified-caller";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
@@ -241,6 +242,11 @@ async function start(): Promise<void> {
   // is legible in the boot log rather than discovered when a policy that
   // looks enforced is not.
   warnIfApiKeyIpPolicyDisabled();
+
+  // One boot-time signal when stdio MCP servers have been enabled with
+  // ALLOW_STDIO_SERVERS=true, so a deployment that can start child processes
+  // in this container says so in its boot log (see lib/metamcp/stdio-policy).
+  warnIfStdioServersAllowed();
 
   // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
   // boot log records whether password login is on. Reads the DB-backed setting,

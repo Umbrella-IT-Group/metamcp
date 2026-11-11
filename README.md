@@ -140,6 +140,10 @@ across the management and OAuth surfaces:
   for an existing key name rotates that key.
 - **Fail-closed registration** — self-registration defaults to disabled and stays disabled
   across restarts; unauthenticated endpoints require an explicit opt-in.
+- **stdio servers off by default**: the gateway refuses to register, import, proxy or start
+  an MCP server that runs as a child process in its own container unless
+  `ALLOW_STDIO_SERVERS=true`, which is meant for local development. Stored stdio servers are
+  kept but not started. See `example.env`.
 - **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of
   unused clients, and a dedicated rate-limit bucket.
 - **Per-caller rate limiting on password sign-in** — the credential sign-in endpoint is capped
@@ -445,7 +449,7 @@ The figures come from `pg_class.reltuples` and `pg_total_relation_size`, never f
 
 The core model is unchanged from upstream.
 
-- **MCP Server** — a configuration telling MetaMCP how to start or connect to an MCP server (STDIO via `uvx`/`npx`, or remote SSE/StreamableHTTP). STDIO servers support raw env values, `${ENV_VAR}` references resolved from the container, and auto-matching of same-named env vars.
+- **MCP Server** — a configuration telling MetaMCP how to start or connect to an MCP server (STDIO via `uvx`/`npx`, or remote SSE/StreamableHTTP). This fork refuses STDIO servers unless `ALLOW_STDIO_SERVERS=true`, which is meant for local development (see `example.env`). STDIO servers support raw env values, `${ENV_VAR}` references resolved from the container, and auto-matching of same-named env vars.
 - **Namespace** — a group of MCP servers. Enable/disable servers or individual tools, apply middleware, and override tool names/titles/descriptions or attach annotations per namespace.
 - **Endpoint** — a public surface bound to a namespace, hosted over **SSE**, **Streamable HTTP**, or **OpenAPI**, with **API-key** or **OAuth** auth. Multiple servers in the namespace are aggregated into one endpoint.
 - **Middleware** — intercepts and transforms MCP requests/responses at the namespace level (e.g. "filter inactive tools"). This fork adds a tool-call **auditing** middleware.
