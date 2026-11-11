@@ -502,6 +502,53 @@ describeIfDb(
       expect(refreshed.status).toBe(200);
     });
 
+    it("lists a client once with its earliest successful registration address", async () => {
+      const registrationIp = "198.51.100.78";
+      const reg = await register(
+        { client_name: "Registration history", redirect_uris: [LOOPBACK] },
+        registrationIp,
+      );
+      expect(reg.status).toBe(201);
+      const clientId = reg.body.client_id as string;
+      const [registered] = await auditRows("oauth.dcr.register", clientId);
+      expect(registered).toBeDefined();
+
+      const base = {
+        actor_type: "anonymous",
+        action: "oauth.dcr.register",
+        target_type: "oauth_client",
+        target_id: clientId,
+        outcome: "success",
+      };
+      const earlier = new Date(registered.occurred_at.getTime() - 1_000);
+      await db.insert(schema.auditLogTable).values([
+        {
+          ...base,
+          actor_ip: "192.0.2.201",
+          occurred_at: new Date(registered.occurred_at.getTime() + 1_000),
+        },
+        {
+          ...base,
+          outcome: "denied",
+          actor_ip: "192.0.2.202",
+          occurred_at: earlier,
+        },
+        {
+          ...base,
+          action: "oauth.authorize.client_not_approved",
+          actor_ip: "192.0.2.203",
+          occurred_at: earlier,
+        },
+      ]);
+
+      const listed = await admin.frontend.oauthClients.list();
+      const items = listed.clients.filter(
+        (client: { client_id: string }) => client.client_id === clientId,
+      );
+      expect(items).toHaveLength(1);
+      expect(items[0].registered_from_ip).toBe(registrationIp);
+    });
+
     it("refuses a hosted-callback registration and stores nothing", async () => {
       const before = await db.select().from(schema.oauthClientsTable);
       const reg = await register({

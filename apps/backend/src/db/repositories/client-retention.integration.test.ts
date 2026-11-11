@@ -426,7 +426,14 @@ describeIfDb("pruneUnapprovedDcrClients against real postgres", () => {
       await approver.query("COMMIT");
       await expect(sweep).resolves.toBe(0);
     } finally {
-      approver.release();
+      // An assertion can fail while the sweep is waiting for this row lock.
+      // Never return an open transaction to the pool: it would keep the sweep
+      // and suite cleanup blocked instead of reporting the original failure.
+      try {
+        await approver.query("ROLLBACK");
+      } finally {
+        approver.release();
+      }
     }
 
     expect(await survivingClientIds()).toContain(RACE);

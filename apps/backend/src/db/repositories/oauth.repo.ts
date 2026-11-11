@@ -91,30 +91,41 @@ export class OAuthRepository {
   // registration, from its `oauth.dcr.register` audit row: the only
   // attribution an anonymous registration has, shown so an administrator
   // deciding on a pending client can see where it came from. Only that one
-  // column is read; the audit row's detail never leaves the database here. A
-  // correlated subquery rather than a LEFT JOIN so a client can never appear
-  // twice, and LIMIT 1 on the earliest row for the same reason. NULL for admin
-  // and legacy rows (they have no such audit row) and when the detached audit
-  // write did not land.
+  // column is read; the audit row's detail never leaves the database here.
+  // Deduplicate successful registrations once before joining, so each client
+  // appears once with its earliest address. A correlated lookup would scan
+  // the append-only audit log again for every client, making this inventory
+  // quadratic as anonymous registrations accumulate. NULL for admin and legacy
+  // rows (they have no such audit row) and when the detached audit write did
+  // not land.
   async listClients(): Promise<
     Array<OAuthClient & { registered_from_ip: string | null }>
   > {
-    const registeredFromIp = sql<string | null>`(
-      SELECT ${auditLogTable.actor_ip}
-      FROM ${auditLogTable}
-      WHERE ${auditLogTable.action} = 'oauth.dcr.register'
-        AND ${auditLogTable.outcome} = 'success'
-        AND ${auditLogTable.target_id} = ${oauthClientsTable.client_id}
-      ORDER BY ${auditLogTable.occurred_at} ASC
-      LIMIT 1
-    )`.as("registered_from_ip");
+    const registrations = db
+      .selectDistinctOn([auditLogTable.target_id], {
+        client_id: auditLogTable.target_id,
+        actor_ip: auditLogTable.actor_ip,
+      })
+      .from(auditLogTable)
+      .where(
+        and(
+          eq(auditLogTable.action, "oauth.dcr.register"),
+          eq(auditLogTable.outcome, "success"),
+        ),
+      )
+      .orderBy(auditLogTable.target_id, auditLogTable.occurred_at)
+      .as("client_registrations");
 
     const rows = await db
       .select({
         client: oauthClientsTable,
-        registered_from_ip: registeredFromIp,
+        registered_from_ip: registrations.actor_ip,
       })
       .from(oauthClientsTable)
+      .leftJoin(
+        registrations,
+        eq(registrations.client_id, oauthClientsTable.client_id),
+      )
       .orderBy(desc(oauthClientsTable.created_at));
 
     return rows.map((row) => ({
