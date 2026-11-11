@@ -224,10 +224,11 @@ async function start(): Promise<void> {
   // than auto-migrated.
   await warnOnUnpairedRestrictedEndpoints();
 
-  // One boot-time signal for the staged rollout of the gateway backend trust
-  // header: absent secret means backends receive no X-Gateway-Auth yet. Kept
-  // near the other boot warnings so the gateway's posture is legible from the
-  // boot log rather than something to prove by hand.
+  // One boot-time signal for the gateway backend trust header: an absent or
+  // short secret means backends receive no X-Gateway-Auth, and backends that
+  // require it refuse every request but their health check. Kept near the
+  // other boot warnings so the gateway's posture is legible from the boot log
+  // rather than something to prove by hand.
   warnIfGatewayBackendSecretUnset();
 
   // One boot-time signal when the admin-plane (control-plane) bearer path has
@@ -318,7 +319,8 @@ app.get("/health", (req, res) => {
 // not just whether the gateway process is alive. Docker healthcheck
 // keeps using the cheap /health above; this is the operational view.
 //
-// Returns 200 always. The aggregate `healthy` boolean tells the prober
+// Returns 200 on every computed rollup (a constant 500 only when the rollup
+// itself fails). The aggregate `healthy` boolean tells the prober
 // whether to alarm; the per-server detail tells the operator where to
 // look when it flips. Status returns 200 not 503 because liveness is
 // distinct from rollup health — Kubernetes-style probes can map both.
