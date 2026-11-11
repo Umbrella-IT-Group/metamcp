@@ -3,7 +3,7 @@ title: "MCP Servers"
 description: "Learn how to configure and manage MCP server instances in MetaMCP"
 ---
 
-A **MCP Server** is a configuration that tells MetaMCP how to start and manage a Model Context Protocol server. The tools these servers provide are aggregated and exposed through MetaMCP endpoints. This gateway relays tools only: it does not advertise or forward MCP prompts or resources, so a client's `prompts/*` and `resources/*` requests are answered "Method not found".
+A **MCP Server** is a configuration that tells MetaMCP how to start and manage a Model Context Protocol server. The tools these servers provide are aggregated and exposed through MetaMCP endpoints. This gateway relays tools only. It still advertises the MCP `prompts` and `resources` capabilities but answers those requests itself: `prompts/list`, `resources/list` and `resources/templates/list` return empty lists, `prompts/get` and `resources/read` return a "Method not found" error, and none of them is forwarded to a server. The capabilities stay advertised because changing them would make every connected client start a new session after an upgrade.
 
 ## What is a MCP Server?
 
