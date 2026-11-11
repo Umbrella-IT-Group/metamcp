@@ -37,12 +37,16 @@ const TABLE: ReadonlyArray<readonly [string, boolean]> = [
   ["/en/api-keys", false],
   ["/mcp-servers", false],
   ["/access-groups", false],
+  // A former rewrite prefix with no backend route behind it: it is an ordinary
+  // page path now, so the middleware runs (locale redirect, then auth).
+  ["/service", false],
+  ["/service/search", false],
+  ["/service/anything", false],
   // Backend / framework / rewrite routes: bypassed.
   ["/api/auth/get-session", true],
   ["/trpc/frontend/example", true],
   ["/mcp-proxy/server", true],
   ["/metamcp/x/mcp", true],
-  ["/service/anything", true],
   ["/.well-known/oauth-authorization-server", true],
   ["/m365/enroll", true],
   ["/health", true],

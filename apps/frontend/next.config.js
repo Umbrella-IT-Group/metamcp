@@ -106,10 +106,6 @@ const nextConfig = {
         source: "/metamcp/:path*",
         destination: `${backendUrl}/metamcp/:path*`,
       },
-      {
-        source: "/service/:path*",
-        destination: "https://metatool-service.jczstudio.workers.dev/:path*",
-      },
     ];
   },
 };

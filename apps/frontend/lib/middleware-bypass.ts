@@ -24,7 +24,6 @@ export const MIDDLEWARE_BYPASS_PREFIXES = [
   "/metamcp",
   "/oauth",
   "/.well-known",
-  "/service",
   "/health",
   "/fe-oauth",
   // Umbrella fork: M365 broker routes live on the backend behind a

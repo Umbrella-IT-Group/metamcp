@@ -6,7 +6,6 @@ import {
   KeyRound,
   Link as LinkIcon,
   Package,
-  Search,
   SearchCode,
   Server,
   Settings,
@@ -44,11 +43,6 @@ import { getLocalizedPath, SupportedLocale } from "@/lib/i18n";
 
 // Menu items function - now takes locale parameter
 const getMenuItems = (t: (key: string) => string, locale: SupportedLocale) => [
-  {
-    title: t("navigation:exploreMcpServers"),
-    url: getLocalizedPath("/search", locale),
-    icon: Search,
-  },
   {
     title: t("navigation:mcpServers"),
     url: getLocalizedPath("/mcp-servers", locale),
