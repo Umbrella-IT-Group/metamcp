@@ -9,6 +9,12 @@ import { toast } from "sonner";
 import { z } from "zod";
 
 import {
+  OAuthClientDecisionActions,
+  OAuthClientsListState,
+  OAuthClientStatusBadge,
+  RegisteredFrom,
+} from "@/components/oauth-client-approval";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -57,6 +63,11 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
+import {
+  decisionCallbacks,
+  type DecisionKind,
+  refreshClientInventories,
+} from "@/lib/oauth-client-approval";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
@@ -130,9 +141,43 @@ export default function OAuthClientsPage() {
 
   // `enabled: isAdmin` keeps a member from firing an adminProcedure query
   // that would only FORBIDDEN.
-  const { data: clientsResponse, isLoading } =
-    trpc.frontend.oauthClients.list.useQuery(undefined, { enabled: isAdmin });
+  const clientsQuery = trpc.frontend.oauthClients.list.useQuery(undefined, {
+    enabled: isAdmin,
+  });
+  const { data: clientsResponse, isLoading } = clientsQuery;
   const clients = clientsResponse?.clients ?? [];
+
+  // Approve / Reject for pending self-registered clients (migration 0042).
+  // One decision at a time on this page: every decision button is disabled
+  // while one runs. Every outcome refreshes both client inventories (this
+  // page and the Access dashboard), and a stale result (already decided or
+  // deleted) says so; see decisionCallbacks.
+  const [deciding, setDeciding] = useState<{
+    clientId: string;
+    kind: DecisionKind;
+  } | null>(null);
+  const decisionOptions = (kind: DecisionKind) =>
+    decisionCallbacks({
+      kind,
+      t,
+      notifySuccess: (message) => toast.success(message),
+      notifyError: (message) => toast.error(message),
+      refresh: () => refreshClientInventories(utils),
+      done: () => setDeciding(null),
+    });
+  const approveMutation = trpc.frontend.oauthClients.approve.useMutation(
+    decisionOptions("approve"),
+  );
+  const rejectMutation = trpc.frontend.oauthClients.reject.useMutation(
+    decisionOptions("reject"),
+  );
+  const decide = (kind: DecisionKind, clientId: string) => {
+    if (deciding) return;
+    setDeciding({ clientId, kind });
+    (kind === "approve" ? approveMutation : rejectMutation).mutate({
+      client_id: clientId,
+    });
+  };
 
   const form = useForm<CreateOAuthClientFormData>({
     resolver: createTranslatedZodResolver(CreateOAuthClientFormSchema, t),
@@ -500,16 +545,23 @@ export default function OAuthClientsPage() {
             </h2>
             <Badge variant="outline">Admin</Badge>
           </div>
+          <p className="text-sm text-muted-foreground">
+            {t("oauth-clients:approvalExplanation")}
+          </p>
 
           <div className="rounded-md border">
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>{t("oauth-clients:columnName")}</TableHead>
+                  <TableHead>{t("oauth-clients:columnStatus")}</TableHead>
                   <TableHead>{t("oauth-clients:columnClientId")}</TableHead>
                   <TableHead>{t("oauth-clients:columnRedirectUris")}</TableHead>
                   <TableHead>{t("oauth-clients:columnAuthMethod")}</TableHead>
                   <TableHead>{t("oauth-clients:columnSecret")}</TableHead>
+                  <TableHead title={t("oauth-clients:registeredFromHelp")}>
+                    {t("oauth-clients:columnRegisteredFrom")}
+                  </TableHead>
                   <TableHead>{t("oauth-clients:columnCreated")}</TableHead>
                   <TableHead className="w-[100px]">
                     {t("oauth-clients:columnActions")}
@@ -517,30 +569,28 @@ export default function OAuthClientsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {isLoading ? (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-center py-12">
-                      <p className="text-muted-foreground">
-                        {t("oauth-clients:loading")}
-                      </p>
-                    </TableCell>
-                  </TableRow>
-                ) : clients.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-center py-12">
-                      <p className="text-muted-foreground">
-                        {t("oauth-clients:noClients")}
-                      </p>
-                      <p className="text-sm text-muted-foreground">
-                        {t("oauth-clients:noClientsDescription")}
-                      </p>
-                    </TableCell>
-                  </TableRow>
+                {isLoading || clientsQuery.isError || clients.length === 0 ? (
+                  <OAuthClientsListState
+                    colSpan={9}
+                    isLoading={isLoading}
+                    isError={clientsQuery.isError}
+                    errorMessage={clientsQuery.error?.message}
+                    isEmpty={clients.length === 0}
+                    onRetry={() => clientsQuery.refetch()}
+                    t={t}
+                  />
                 ) : (
                   clients.map((client) => (
                     <TableRow key={client.client_id}>
                       <TableCell className="font-medium">
                         {client.client_name}
+                      </TableCell>
+                      <TableCell>
+                        <OAuthClientStatusBadge
+                          status={client.approval_status}
+                          source={client.registration_source}
+                          t={t}
+                        />
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-2">
@@ -587,22 +637,34 @@ export default function OAuthClientsPage() {
                         </Badge>
                       </TableCell>
                       <TableCell>
+                        <RegisteredFrom ip={client.registered_from_ip} t={t} />
+                      </TableCell>
+                      <TableCell>
                         {format(new Date(client.created_at), "MMM d, yyyy")}
                       </TableCell>
                       <TableCell>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => {
-                            setClientToDelete({
-                              client_id: client.client_id,
-                              client_name: client.client_name,
-                            });
-                            setDeleteDialogOpen(true);
-                          }}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
+                        <div className="flex items-center gap-1">
+                          <OAuthClientDecisionActions
+                            client={client}
+                            deciding={deciding}
+                            onApprove={(id) => decide("approve", id)}
+                            onReject={(id) => decide("reject", id)}
+                            t={t}
+                          />
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => {
+                              setClientToDelete({
+                                client_id: client.client_id,
+                                client_name: client.client_name,
+                              });
+                              setDeleteDialogOpen(true);
+                            }}
+                          >
+                            <Trash2 className="h-4 w-4 text-destructive" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))

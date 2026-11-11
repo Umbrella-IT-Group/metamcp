@@ -53,5 +53,27 @@
   "deleteConfirmDescription": "This permanently deletes \"{{name}}\" and revokes every authorization code and access token already issued to it. Applications using it will stop working immediately. This cannot be undone.",
   "deleteConfirmAction": "Delete client",
   "clientDeleted": "OAuth client deleted",
-  "deleteError": "Failed to delete OAuth client"
+  "deleteError": "Failed to delete OAuth client",
+
+  "columnStatus": "Status",
+  "columnRegisteredFrom": "Registered from",
+  "statusApproved": "Approved",
+  "statusPending": "Waiting for approval",
+  "statusRejected": "Rejected",
+  "statusUnknown": "Not approved",
+  "sourceDcr": "Self-registered",
+  "sourceAdmin": "Created by an administrator",
+  "sourceLegacy": "Created before sources were recorded",
+  "registeredFromUnavailable": "Unavailable",
+  "registeredFromHelp": "The network address the self-registration came from. It does not identify a person and does not show that the client is safe.",
+  "approve": "Approve",
+  "approving": "Approving...",
+  "reject": "Reject",
+  "rejecting": "Rejecting...",
+  "clientApproved": "Client approved. People can now authorize it; each person still approves their own access.",
+  "clientRejected": "Client rejected. It cannot be used and is removed after a day.",
+  "decisionError": "Could not record the decision",
+  "decisionStale": "This client changed since the list loaded, so the list was refreshed.",
+  "listLoadError": "Could not load OAuth clients",
+  "approvalExplanation": "Applications on a person's own computer, such as Claude Code, can register themselves, but they stay \"Waiting for approval\" until an administrator approves them here. Only local (loopback) callbacks can be approved this way; hosted applications such as claude.ai use a client created with Create OAuth Client. Approving a client grants no access by itself: each person still approves their own sign-in. Approve only clients you recognize, and check the address they registered from."
 }
