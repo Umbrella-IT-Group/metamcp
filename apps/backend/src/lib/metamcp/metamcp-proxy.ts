@@ -5,9 +5,14 @@ import {
   CallToolResult,
   CompatibilityCallToolResultSchema,
   ErrorCode,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ListToolsRequestSchema,
   ListToolsResultSchema,
   McpError,
+  ReadResourceRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpServerErrorStatusEnum, ServerParameters } from "@repo/zod-types";
@@ -102,6 +107,14 @@ import { sanitizeName } from "./utils";
  */
 const AUDIT_LISTING: unique symbol = Symbol("auditListing");
 type ListingContext = MetaMCPHandlerContext & { [AUDIT_LISTING]?: true };
+
+/**
+ * The message prompts/get and resources/read are refused with (Method not
+ * found). Constant, so the answer never echoes a prompt name or resource URI
+ * from the request. See the prompts and resources handlers in createServer.
+ */
+export const GATEWAY_SERVES_TOOLS_ONLY =
+  "This gateway serves tools only; prompts and resources are not available.";
 
 export const createServer = async (
   namespaceUuid: string,
@@ -1478,17 +1491,44 @@ export const createServer = async (
     }
   });
 
-  // No prompts or resources handlers, by design. The gateway advertises only
-  // `tools` (gateway-capabilities.ts), and with no handler registered the SDK
-  // answers prompts/list, prompts/get, resources/list, resources/read and
-  // resources/templates/list with Method not found, whatever a client sends.
-  // These surfaces were forwarded to every mounted backend with none of the
-  // tool path's curation: no mount check on a cached route, no namespace tool
-  // policy, and tool-name curation defines no policy for a prompt name or a
-  // resource URI. No backend behind the gateway registers either, so nothing
-  // is lost. Bringing them back needs a mount check and an explicit policy for
-  // those names, and a capability change (which makes persisted sessions
-  // re-initialize, see gateway-boot-id.ts).
+  // Prompts and resources: advertised, answered here, never relayed.
+  //
+  // The gateway relays tools only. These surfaces used to be forwarded to the
+  // namespace's backends with none of the tool path's curation: prompts/get
+  // and resources/read followed a session-cached route with no mount check,
+  // no namespace tool policy applied, and tool-name curation defines no
+  // policy for a prompt name or a resource URI. No backend behind the gateway
+  // registers either surface. So the three listings answer an empty list, the
+  // two reads answer Method not found with one constant message that echoes
+  // nothing from the request, and none of the five reads the namespace's
+  // servers or contacts a backend.
+  //
+  // `prompts` and `resources` stay in GATEWAY_CAPABILITIES on purpose (and
+  // the SDK refuses to register these handlers without them). That object is
+  // hashed into GATEWAY_CAPABILITY_HASH: changing it makes lazy recovery
+  // refuse, and the boot-time auto-nuke delete, every session persisted by
+  // the prior build, so every connected client would have to re-initialize
+  // and a claude.ai connector may need a manual reconnect. Answering locally
+  // keeps the advertised set, and so the hash, exactly as it was.
+  //
+  // Serving prompts or resources for real again needs a mount check on every
+  // read and an explicit namespace policy for prompt names and resource URIs.
+  // Pinned by metamcp-proxy.prompts-resources-local.test.ts.
+  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: [],
+  }));
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [],
+  }));
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    resourceTemplates: [],
+  }));
+  server.setRequestHandler(GetPromptRequestSchema, async () => {
+    throw new McpError(ErrorCode.MethodNotFound, GATEWAY_SERVES_TOOLS_ONLY);
+  });
+  server.setRequestHandler(ReadResourceRequestSchema, async () => {
+    throw new McpError(ErrorCode.MethodNotFound, GATEWAY_SERVES_TOOLS_ONLY);
+  });
 
   const cleanup = async () => {
     stopOwedServerWatches();

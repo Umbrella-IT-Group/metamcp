@@ -146,6 +146,7 @@ import type { AuditEvent } from "../../lib/audit/audit-emitter";
 import { setAuditSinkForTesting } from "../../lib/audit/audit-emitter";
 import type { M365UserContext } from "../../lib/m365/request-context";
 import { getM365UserContext } from "../../lib/m365/request-context";
+import { BASE_BUILD_CAPABILITY_HASH } from "../../lib/metamcp/base-build-capabilities.test-util";
 import type { CallerContext } from "../../lib/metamcp/caller-context-store";
 import { getCallerContext } from "../../lib/metamcp/caller-context-store";
 import {
@@ -319,6 +320,80 @@ describe("recoverPersistedSession — succeeds against a row reapIdleSession lea
 
     const result = await recoverPersistedSession(sessionId, authReq);
     expect(result.status).toBe("auth_failed");
+  });
+});
+
+describe("recoverPersistedSession: a row another process of the base build persisted (capability-hash path)", () => {
+  // A restart onto a new build always changes the boot id, so whether the
+  // sessions it persisted survive depends on the capability hash alone. The
+  // gateway kept advertising prompts and resources (answered locally, never
+  // relayed) so that rows stamped by the 8815f6b capability set still match.
+  const OTHER_BOOT = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
+  const rawToken = "test-api-key-value";
+
+  function baseBuildRow(sessionId: string, capabilityHash: string) {
+    return {
+      session_id: sessionId,
+      namespace_uuid: "ns-1",
+      endpoint_name: "ep-1",
+      auth_principal: hashAuthPrincipal(rawToken, "api_key"),
+      auth_method: "api_key",
+      init_params: {},
+      created_at: new Date(),
+      last_seen_at: new Date(),
+      gateway_boot_id: OTHER_BOOT,
+      capability_hash: capabilityHash,
+    };
+  }
+
+  const authReq = () =>
+    fakeAuthReq({
+      namespaceUuid: "ns-1",
+      endpointName: "ep-1",
+      authMethod: "api_key",
+      headers: { "x-api-key": rawToken },
+    });
+
+  // A refused recovery never consumes the queued getServer answer, and the
+  // file-wide vi.clearAllMocks() does not drop queued answers, so a failure
+  // here would otherwise hand that instance to the next describe's tests.
+  afterEach(() => {
+    (metaMcpServerPool.getServer as ReturnType<typeof vi.fn>).mockReset();
+    (mcpSessionsRepository.findById as ReturnType<typeof vi.fn>).mockReset();
+  });
+
+  it("recovers it without asking the client to re-initialize", async () => {
+    const sessionId = "sess-base-build";
+    expect(GATEWAY_BOOT_ID).not.toBe(OTHER_BOOT);
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(
+      baseBuildRow(sessionId, BASE_BUILD_CAPABILITY_HASH),
+    );
+    const fakeServerInstance = {
+      server: { connect: vi.fn().mockResolvedValue(undefined) },
+      cleanup: vi.fn().mockResolvedValue(undefined),
+      handlerContext: {} as Record<string, unknown>,
+    };
+    (
+      metaMcpServerPool.getServer as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(fakeServerInstance);
+
+    const result = await recoverPersistedSession(sessionId, authReq());
+
+    expect(result.status).toBe("recovered");
+    expect(fakeServerInstance.server.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("contrast: the same row stamped with another capability set is refused before any instance is built", async () => {
+    (
+      mcpSessionsRepository.findById as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(baseBuildRow("sess-other-caps", "0".repeat(64)));
+
+    const result = await recoverPersistedSession("sess-other-caps", authReq());
+
+    expect(result.status).toBe("not_found");
+    expect(metaMcpServerPool.getServer).not.toHaveBeenCalled();
   });
 });
 

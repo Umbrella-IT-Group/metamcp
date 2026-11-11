@@ -1,15 +1,20 @@
 /**
- * The gateway serves no prompts or resources. It advertises only `tools`
- * (gateway-capabilities.ts) and registers no prompts or resources handler, so
- * prompts/list, prompts/get, resources/list, resources/read and
- * resources/templates/list are answered Method not found even when a client
- * sends them without the capability, and nothing reaches a backend that does
- * register them. Those surfaces bypassed the namespace's mount and tool
- * curation; no backend behind the gateway registers either.
+ * The gateway answers prompts and resources itself and relays only tools.
+ * prompts/list, resources/list and resources/templates/list answer an empty
+ * list; prompts/get and resources/read answer Method not found with one
+ * constant message. None of the five reads the namespace's servers, acquires
+ * a backend session or reaches a backend, even one that registers prompts and
+ * resources and after tools/list has cached a route to it. Those surfaces
+ * bypassed the namespace's mount and tool curation; no backend behind the
+ * gateway registers either.
  *
- * Removing them changes the capability hash, so a session persisted by the
- * prior build is refused lazy recovery and the client re-initializes; a
- * restart of the same build still recovers. Both are pinned below.
+ * The advertised capabilities stay exactly as they were on 8815f6b (prompts,
+ * resources and tools with listChanged), so GATEWAY_CAPABILITY_HASH does not
+ * change and a session persisted by a build advertising that set still
+ * recovers lazily after a restart onto this one: no client is forced to
+ * re-initialize. Both are pinned below (base-build-capabilities.test-util.ts
+ * holds the base values; streamable-http.test.ts drives the same row through
+ * recoverPersistedSession).
  *
  * Harness as in metamcp-proxy.mount-status.test.ts: the real `createServer`
  * and middleware over the in-memory table stand-in, a real SDK consumer, and
@@ -161,6 +166,16 @@ vi.mock("./tool-call-warmup", () => ({
 }));
 
 import {
+  BASE_BUILD_CAPABILITIES,
+  BASE_BUILD_CAPABILITY_DIGEST,
+  BASE_BUILD_CAPABILITY_HASH,
+} from "./base-build-capabilities.test-util";
+import {
+  getMcpServers,
+  getNamespaceListingServers,
+  getNamespaceServerStates,
+} from "./fetch-metamcp";
+import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
   shouldRefuseRecovery,
@@ -169,7 +184,7 @@ import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { clearFilterCache } from "./metamcp-middleware/filter-tools.functional";
 import { clearOverrideCache } from "./metamcp-middleware/tool-overrides.functional";
-import { createServer } from "./metamcp-proxy";
+import { createServer, GATEWAY_SERVES_TOOLS_ONLY } from "./metamcp-proxy";
 
 const NS = "ns-surfaces";
 const RICH = { uuid: "server-rich", name: "rich" };
@@ -211,7 +226,9 @@ async function richBackend(): Promise<ConnectedClient> {
   });
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
     received.push("resources/templates/list");
-    return { resourceTemplates: [] };
+    return {
+      resourceTemplates: [{ uriTemplate: "mem://{name}", name: "docs" }],
+    };
   });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
@@ -238,8 +255,8 @@ async function connectConsumer(sessionId: string): Promise<Client> {
   return consumer;
 }
 
-/** The JSON-RPC error code a request is answered with, or "answered". */
-const answer = (
+/** Send a raw request; the result, or the McpError it was refused with. */
+const send = (
   consumer: Client,
   method: string,
   params: Record<string, unknown>,
@@ -247,17 +264,40 @@ const answer = (
   consumer
     .request({ method, params } as never, z.object({}).passthrough())
     .then(
-      () => "answered" as const,
-      (error: unknown) =>
-        error instanceof McpError ? error.code : `not an McpError: ${error}`,
+      (result) => ({ result }),
+      (error: unknown) => {
+        if (error instanceof McpError) return { error };
+        throw error;
+      },
     );
 
-/** sha256 of the capability set the gateway advertised before this change. */
-const PRIOR_CAPABILITIES = {
-  prompts: {},
-  resources: {},
-  tools: { listChanged: true },
-};
+/** Every seam through which one of the five could reach a backend. */
+const backendSeams = () => ({
+  backendRequests: [...received],
+  sessionAcquisitions: getSessionMock.mock.calls.length,
+  warmups: warmupMock.mock.calls.length,
+  serverReads:
+    vi.mocked(getMcpServers).mock.calls.length +
+    vi.mocked(getNamespaceListingServers).mock.calls.length +
+    vi.mocked(getNamespaceServerStates).mock.calls.length,
+  toolLookups: findServersMock.mock.calls.length,
+});
+
+const LISTINGS = [
+  ["prompts/list", { prompts: [] }],
+  ["resources/list", { resources: [] }],
+  ["resources/templates/list", { resourceTemplates: [] }],
+] as const;
+
+const READS = [
+  ["prompts/get", { name: "rich__brief", arguments: {} }],
+  ["resources/read", { uri: "mem://doc" }],
+] as const;
+
+const ALL_FIVE = [
+  ...LISTINGS.map(([method]) => [method, {}] as const),
+  ...READS,
+];
 
 beforeEach(async () => {
   clearFilterCache();
@@ -283,6 +323,9 @@ beforeEach(async () => {
   findServersMock.mockResolvedValue([]);
   warmupMock.mockReset();
   warmupMock.mockResolvedValue(undefined);
+  vi.mocked(getMcpServers).mockClear();
+  vi.mocked(getNamespaceListingServers).mockClear();
+  vi.mocked(getNamespaceServerStates).mockClear();
 });
 
 afterEach(async () => {
@@ -296,91 +339,141 @@ afterEach(async () => {
   }
 });
 
-describe("the gateway serves no prompts or resources", () => {
-  it("initialize advertises tools only", async () => {
-    const consumer = await connectConsumer("session-caps");
-    const capabilities = consumer.getServerCapabilities();
-    expect(capabilities?.tools).toEqual({ listChanged: true });
-    expect(capabilities?.prompts).toBeUndefined();
-    expect(capabilities?.resources).toBeUndefined();
+describe("the advertised capabilities are unchanged", () => {
+  it("GATEWAY_CAPABILITIES is the 8815f6b set, in its key order", () => {
+    expect(GATEWAY_CAPABILITIES).toEqual(BASE_BUILD_CAPABILITIES);
+    expect(JSON.stringify(GATEWAY_CAPABILITIES)).toBe(
+      JSON.stringify(BASE_BUILD_CAPABILITIES),
+    );
   });
 
-  it.each([
-    ["prompts/list", {}],
-    ["prompts/get", { name: "rich__brief", arguments: {} }],
-    ["resources/list", {}],
-    ["resources/read", { uri: "mem://doc" }],
-    ["resources/templates/list", {}],
-  ])(
-    "%s sent anyway is answered Method not found and reaches no backend",
+  it("GATEWAY_CAPABILITY_HASH equals the hash the 8815f6b build stamped on its sessions", () => {
+    // Computed from the base object; the digest that build printed pins the
+    // hashing too. Changing either makes every persisted session re-initialize.
+    expect(GATEWAY_CAPABILITY_HASH).toBe(BASE_BUILD_CAPABILITY_HASH);
+    expect(GATEWAY_CAPABILITY_HASH).toBe(BASE_BUILD_CAPABILITY_DIGEST);
+  });
+
+  it("initialize advertises prompts, resources and tools exactly as before", async () => {
+    const consumer = await connectConsumer("session-caps");
+    expect(consumer.getServerCapabilities()).toEqual(BASE_BUILD_CAPABILITIES);
+  });
+});
+
+describe("prompts and resources are answered by the gateway, never a backend", () => {
+  it.each(LISTINGS)("%s answers an empty list", async (method, empty) => {
+    const consumer = await connectConsumer(`session-${method}`);
+    expect(await send(consumer, method, {})).toEqual({ result: empty });
+  });
+
+  it("the SDK's typed listing calls accept the empty answers", async () => {
+    const consumer = await connectConsumer("session-typed");
+    expect(await consumer.listPrompts()).toEqual({ prompts: [] });
+    expect(await consumer.listResources()).toEqual({ resources: [] });
+    expect(await consumer.listResourceTemplates()).toEqual({
+      resourceTemplates: [],
+    });
+  });
+
+  it.each(READS)(
+    "%s is refused Method not found with the constant message",
     async (method, params) => {
       const consumer = await connectConsumer(`session-${method}`);
-      expect(await answer(consumer, method, params)).toBe(
-        ErrorCode.MethodNotFound,
-      );
+      const answer = await send(consumer, method, params);
+      expect(answer).not.toHaveProperty("result");
+      const { error } = answer as { error: McpError };
+      expect(error.code).toBe(ErrorCode.MethodNotFound);
+      expect(error.message).toContain(GATEWAY_SERVES_TOOLS_ONLY);
+    },
+  );
+
+  it("the refusal echoes nothing from the request", async () => {
+    const consumer = await connectConsumer("session-echo");
+    const messages = await Promise.all(
+      [
+        ["prompts/get", { name: "rich__brief" }],
+        ["prompts/get", { name: "rich__<other-name>" }],
+        ["resources/read", { uri: "mem://doc" }],
+        ["resources/read", { uri: "file:///etc/<other-uri>" }],
+      ].map(async ([method, params]) => {
+        const answer = await send(
+          consumer,
+          method as string,
+          params as Record<string, unknown>,
+        );
+        return (answer as { error: McpError }).error.message;
+      }),
+    );
+    expect(new Set(messages).size).toBe(1);
+    for (const fragment of ["brief", "other-name", "mem://", "other-uri"]) {
+      expect(messages[0]).not.toContain(fragment);
+    }
+  });
+
+  it.each(ALL_FIVE)(
+    "%s reads no namespace server, acquires no session and reaches no backend",
+    async (method, params) => {
+      const consumer = await connectConsumer(`session-seams-${method}`);
+      const before = backendSeams();
+      await send(consumer, method, params);
+      expect(backendSeams()).toEqual(before);
       expect(received).toEqual([]);
     },
   );
 
-  it("a resource read after the listings were tried still reaches no backend", async () => {
-    const consumer = await connectConsumer("session-sequence");
-    await answer(consumer, "resources/list", {});
-    await answer(consumer, "prompts/list", {});
-    expect(await answer(consumer, "resources/read", { uri: "mem://doc" })).toBe(
-      ErrorCode.MethodNotFound,
-    );
-    expect(await answer(consumer, "prompts/get", { name: "rich__brief" })).toBe(
-      ErrorCode.MethodNotFound,
-    );
-    expect(received).toEqual([]);
-  });
-
-  it("tools on the same backend are still listed and called", async () => {
-    const consumer = await connectConsumer("session-tools");
-    expect(await answer(consumer, "tools/list", {})).toBe("answered");
-    expect(
-      await answer(consumer, "tools/call", {
-        name: "rich__write",
-        arguments: {},
-      }),
-    ).toBe("answered");
-    expect(received).toContain("tools/list");
-    expect(received).toContain("tools/call");
-    expect(
-      received.some((method) => /^(prompts|resources)\//.test(method)),
-    ).toBe(false);
+  it("none of the five reaches the backend after tools/list cached a route to it", async () => {
+    const consumer = await connectConsumer("session-after-tools");
+    expect(await send(consumer, "tools/list", {})).toHaveProperty("result");
+    expect(received).toEqual(["tools/list"]);
+    const before = backendSeams();
+    for (const [method, params] of ALL_FIVE) {
+      await send(consumer, method, params);
+    }
+    expect(backendSeams()).toEqual(before);
+    expect(received).toEqual(["tools/list"]);
   });
 });
 
-describe("the capability change and persisted sessions", () => {
+describe("tools are still served", () => {
+  it("tools/list and tools/call reach the backend that registers them", async () => {
+    const consumer = await connectConsumer("session-tools");
+    const listed = await consumer.listTools();
+    expect(listed.tools.map((tool) => tool.name)).toEqual(["rich__write"]);
+    const called = await consumer.callTool({
+      name: "rich__write",
+      arguments: {},
+    });
+    expect(called.content).toEqual([{ type: "text", text: "ran" }]);
+    expect(received).toEqual(["tools/list", "tools/call"]);
+  });
+});
+
+describe("sessions persisted by the base build recover lazily", () => {
   const OTHER_BOOT = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
-  const priorHash = createHash("sha256")
-    .update(JSON.stringify(PRIOR_CAPABILITIES))
-    .digest("hex");
 
-  it("the advertised set is exactly tools, and hashes differently from the prior set", () => {
-    expect(GATEWAY_CAPABILITIES).toEqual({ tools: { listChanged: true } });
-    expect(GATEWAY_CAPABILITY_HASH).not.toBe(priorHash);
-  });
-
-  it("a session persisted by the prior build is refused recovery, so its client re-initializes", () => {
-    expect(
-      shouldRefuseRecovery(
-        { gateway_boot_id: OTHER_BOOT, capability_hash: priorHash },
-        { bootId: GATEWAY_BOOT_ID, capabilityHash: GATEWAY_CAPABILITY_HASH },
-      ),
-    ).toBe(true);
-  });
-
-  it("a restart of this build still recovers its sessions", () => {
+  it("a row another process of the base build stamped is recovered (the capability-hash path)", () => {
+    // Different boot id, so only the capability hash can allow it: this is
+    // the branch of shouldRefuseRecovery that a restart onto this build takes.
     expect(
       shouldRefuseRecovery(
         {
           gateway_boot_id: OTHER_BOOT,
-          capability_hash: GATEWAY_CAPABILITY_HASH,
+          capability_hash: BASE_BUILD_CAPABILITY_HASH,
         },
         { bootId: GATEWAY_BOOT_ID, capabilityHash: GATEWAY_CAPABILITY_HASH },
       ),
     ).toBe(false);
+  });
+
+  it("contrast: a row stamped with a different capability set would be refused", () => {
+    const toolsOnlyHash = createHash("sha256")
+      .update(JSON.stringify({ tools: { listChanged: true } }))
+      .digest("hex");
+    expect(
+      shouldRefuseRecovery(
+        { gateway_boot_id: OTHER_BOOT, capability_hash: toolsOnlyHash },
+        { bootId: GATEWAY_BOOT_ID, capabilityHash: GATEWAY_CAPABILITY_HASH },
+      ),
+    ).toBe(true);
   });
 });

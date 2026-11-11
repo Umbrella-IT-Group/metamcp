@@ -43,15 +43,16 @@ export interface RequestWithSessionRecoveryOptions<T> {
   attempt: (session: ConnectedClient) => Promise<T>;
   /**
    * Called when recovery swapped in a fresh session — re-register
-   * list_changed subscribers, repoint tool/prompt/resource maps, etc.
+   * list_changed subscribers, repoint tool routes, etc.
    */
   onFreshSession?: (session: ConnectedClient) => void;
 }
 
 /**
  * Invalidate-and-retry-once recovery cascade for the per-server fetch
- * inside the aggregate list handlers (tools/list, prompts/list,
- * resources/list, resources/templates/list).
+ * inside the aggregate tools/list handler. (The prompts and resources
+ * listings used it too until the gateway stopped relaying them; it now
+ * answers those itself, see metamcp-proxy.ts.)
  *
  * `tools/call` and the dynamic-find path in `metamcp-proxy.ts` have had
  * this cascade since PR #13/#16; the OpenAPI bridge since its own

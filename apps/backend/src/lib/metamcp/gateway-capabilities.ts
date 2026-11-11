@@ -18,18 +18,12 @@
  * stamped against the prior code version. Don't fork or duplicate this
  * object; mutate it here and let both consumers re-derive.
  *
- * TOOLS ONLY. `prompts` and `resources` are not advertised, and the proxy
- * registers no handler for them, so a client that sends prompts/get or
- * resources/read anyway gets Method not found. Those surfaces bypassed the
- * namespace's mount and tool curation, and no backend registers them. Removing
- * them changed this object, so the first restart onto that build refused
- * lazy recovery for every session persisted by the prior build (the client
- * re-initializes); that is the intended effect of the hash, not a defect.
- *
  * Frozen so any accidental in-place mutation throws in dev rather than
  * silently desyncing the declared capability set from the hashed one.
  */
 export const GATEWAY_CAPABILITIES = Object.freeze({
+  prompts: {},
+  resources: {},
   // Advertise `listChanged: true` so spec-conformant upstream clients
   // (Claude Code, Claude.ai connectors) actually act on
   // `notifications/tools/list_changed`. Without this capability
@@ -37,5 +31,7 @@ export const GATEWAY_CAPABILITIES = Object.freeze({
   // defeating the whole propagation chain. Introduced PR #19.
   tools: Object.freeze({ listChanged: true }),
 }) as {
+  prompts: Record<string, never>;
+  resources: Record<string, never>;
   tools: { listChanged: true };
 };
