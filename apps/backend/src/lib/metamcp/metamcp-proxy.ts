@@ -1532,6 +1532,9 @@ export const createServer = async (
 
   const cleanup = async () => {
     stopOwedServerWatches();
+    // Idle and OpenAPI instances have no transport to fire server.onclose.
+    // Unregister before awaiting backend cleanup, which can also fail.
+    stopMountChangeListener();
     // Cleanup is now handled by the pool
     await mcpServerPool.cleanupSession(sessionId);
   };

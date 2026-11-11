@@ -387,4 +387,27 @@ describe("the admin write tells live sessions to drop their routes and re-list",
     await settle();
     expect(namespaceMountListenerCount(NS)).toBe(0);
   });
+
+  it("disposing a proxy without a transport stops listening", async () => {
+    const { server, cleanup } = await createServer(NS, "idle-session");
+    cleanups.push(cleanup);
+    expect(server.transport).toBeUndefined();
+    expect(namespaceMountListenerCount(NS)).toBe(1);
+
+    // Idle and OpenAPI proxies never connect a transport, so closing one
+    // cannot fire onclose. Pool disposal calls cleanup directly instead.
+    await server.close();
+    await cleanup();
+    expect(namespaceMountListenerCount(NS)).toBe(0);
+    expect(notifyNamespaceMountChange(NS, WRITER.uuid)).toBe(0);
+  });
+
+  it("disposal stops listening even if backend cleanup fails", async () => {
+    const { cleanup } = await createServer(NS, "failed-cleanup-session");
+    cleanups.push(cleanup);
+    pool.cleanupSession.mockRejectedValueOnce(new Error("cleanup failed"));
+
+    await expect(cleanup()).rejects.toThrow("cleanup failed");
+    expect(namespaceMountListenerCount(NS)).toBe(0);
+  });
 });

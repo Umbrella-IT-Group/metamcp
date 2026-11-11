@@ -500,26 +500,6 @@ export function EditMcpServer({
                   type="password"
                   disabled={editForm.watch("clearBearerToken") === true}
                 />
-                <div className="flex items-center space-x-2">
-                  <Checkbox
-                    id="edit-clearBearerToken"
-                    checked={editForm.watch("clearBearerToken") === true}
-                    onCheckedChange={(checked) => {
-                      editForm.setValue("clearBearerToken", checked === true);
-                      if (checked === true)
-                        editForm.setValue("bearerToken", "");
-                    }}
-                  />
-                  <label
-                    htmlFor="edit-clearBearerToken"
-                    className="text-sm font-medium leading-none"
-                  >
-                    {t("mcp-servers:clearBearerToken")}
-                  </label>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {t("mcp-servers:bearerTokenUrlChangeHelp")}
-                </p>
               </div>
 
               <div className="flex flex-col gap-2">
@@ -538,6 +518,30 @@ export function EditMcpServer({
               </div>
             </>
           )}
+
+          {/* Switching to STDIO clears the URL too. Keep the explicit token
+              decision available after that switch hides the remote fields. */}
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center space-x-2">
+              <Checkbox
+                id="edit-clearBearerToken"
+                checked={editForm.watch("clearBearerToken") === true}
+                onCheckedChange={(checked) => {
+                  editForm.setValue("clearBearerToken", checked === true);
+                  if (checked === true) editForm.setValue("bearerToken", "");
+                }}
+              />
+              <label
+                htmlFor="edit-clearBearerToken"
+                className="text-sm font-medium leading-none"
+              >
+                {t("mcp-servers:clearBearerToken")}
+              </label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("mcp-servers:bearerTokenUrlChangeHelp")}
+            </p>
+          </div>
 
           <div className="flex justify-end space-x-2">
             <Button
