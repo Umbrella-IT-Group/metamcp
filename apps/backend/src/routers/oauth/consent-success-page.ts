@@ -55,13 +55,43 @@ export function escapeHtml(value: unknown): string {
  * code is written to the response body only, never to a logger, here or in the
  * caller.
  */
+/**
+ * Organization named in the "we never ask for this code" sentence. The
+ * deployment's branding name when one is configured (docker-entrypoint.sh
+ * exports NEXT_PUBLIC_BRANDING_ORG_NAME to both server processes, the same
+ * value the frontend's lib/branding.ts reads), otherwise the frontend's
+ * default. Server configuration, never request text, and escaped anyway.
+ */
+export const DEFAULT_CODE_PAGE_ORG_NAME = "Umbrella IT";
+
+function codePageOrgName(): string {
+  const configured = (process.env.NEXT_PUBLIC_BRANDING_ORG_NAME ?? "").trim();
+  return configured === "" ? DEFAULT_CODE_PAGE_ORG_NAME : configured;
+}
+
+export interface LoopbackConsentPageDetails {
+  /**
+   * The registered client's display name, from the validated client row (not
+   * from the request). Still attacker-chosen for a self-registered client, so
+   * it is escaped like every other value on the page.
+   */
+  clientName: string;
+  /** How long the displayed code stays redeemable, for the warning text. */
+  codeTtlMs: number;
+}
+
 export function sendLoopbackConsentSuccess(
   res: express.Response,
   callbackUrl: URL,
+  details: LoopbackConsentPageDetails,
 ): void {
   const nonce = randomBytes(16).toString("base64");
   const fullUrl = callbackUrl.toString();
   const code = callbackUrl.searchParams.get("code") ?? "";
+  const safeClientName = escapeHtml(details.clientName);
+  const safeOrgName = escapeHtml(codePageOrgName());
+  const minutes = Math.max(1, Math.round(details.codeTtlMs / 60_000));
+  const lifetime = `${minutes} minute${minutes === 1 ? "" : "s"}`;
 
   res.setHeader(
     "Content-Security-Policy",
@@ -87,16 +117,22 @@ export function sendLoopbackConsentSuccess(
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Authorization complete</title>
-<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#1a1a2e;line-height:1.5}h1{font-size:1.4rem}code{display:block;background:#f0f0f5;padding:.6rem .8rem;border-radius:6px;word-break:break-all;font-size:.9rem;margin:.4rem 0}.hint{color:#555}.label{font-weight:600;margin-top:1.2rem}</style>
+<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#1a1a2e;line-height:1.5}h1{font-size:1.4rem}code{display:block;background:#f0f0f5;padding:.6rem .8rem;border-radius:6px;word-break:break-all;font-size:.9rem;margin:.4rem 0}.hint{color:#555}.label{font-weight:600;margin-top:1.2rem}.warning{border:2px solid #b42318;background:#fef3f2;border-radius:6px;padding:.4rem 1rem;margin:1rem 0}.warning p{margin:.5rem 0}.name{font-weight:600;word-break:break-all}</style>
 </head><body>
 <h1>Authorization complete</h1>
 <p id="status">Handing the code to your client. If you see a connection error or nothing happens, your client is on another machine (this gateway is headless): copy the code below.</p>
-<p class="hint">If nothing happened, your client is on another machine. Copy the values below into the client that is waiting for them.</p>
+<div class="warning" id="code-warning" role="alert">
+<p><strong>Use this code only in a sign-in you started yourself.</strong></p>
+<p>The application name <span class="name">${safeClientName}</span> and the callback address below were supplied by whoever started this request. The gateway has not verified either of them.</p>
+<p>This code lets that application act as you on this gateway. Whoever redeems it in the next ${lifetime} gets that access.</p>
+<p>${safeOrgName} never asks anyone to send or paste this code for them. If someone asked you to send it, or to paste it anywhere other than a login you started, do not share it and tell your administrator.</p>
+</div>
+<p class="hint">If you started the sign-in on another machine, such as a server where you ran the login command, paste the code into that waiting login prompt yourself.</p>
 <div class="label">Authorization code</div>
 <code>${safeCode}</code>
 <div class="label">Full callback URL</div>
 <code>${safeUrl}</code>
-<p class="hint">Paste the authorization code into the client waiting for it, or open the callback URL on the machine running that client.</p>
+<p class="hint">Paste the authorization code into the login prompt you started, or open the callback URL on the machine running that client.</p>
 <script nonce="${nonce}">
   // Co-located listener: this completes the flow. Headless: it reaches nothing
   // and the copy blocks above stand in. assign (not replace) keeps a history

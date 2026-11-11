@@ -18,6 +18,9 @@
  *    state was a lie in both directions.
  *  - `revokeAccess` DEACTIVATES keys rather than deleting them, and leaves
  *    the `users` row alone: the account record is the forensic evidence.
+ *  - `revokeAccess` takes the user's OAuth credential lock as its FIRST
+ *    statement, before any delete, so a refresh, code redemption or consent
+ *    approval in flight cannot insert a credential after the revoke commits.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -34,6 +37,9 @@ vi.mock("@/utils/logger", () => ({
 const deleteCalls: unknown[] = [];
 const updateCalls: unknown[] = [];
 const setCalls: unknown[] = [];
+// Every statement the transaction ran, in order, so the lock's position is
+// observable.
+const txStatements: string[] = [];
 let transactionCount = 0;
 
 const deleteChain = {
@@ -55,11 +61,18 @@ const updateChain = {
 const tx = {
   delete: vi.fn((table: unknown) => {
     deleteCalls.push(table);
+    txStatements.push("delete");
     return deleteChain;
   }),
   update: vi.fn((table: unknown) => {
     updateCalls.push(table);
+    txStatements.push("update");
     return updateChain;
+  }),
+  // The advisory lock statement (db/repositories/oauth-user-lock).
+  execute: vi.fn(async () => {
+    txStatements.push("execute");
+    return { rows: [] };
   }),
 };
 
@@ -96,6 +109,7 @@ beforeEach(() => {
   deleteCalls.length = 0;
   updateCalls.length = 0;
   setCalls.length = 0;
+  txStatements.length = 0;
   transactionCount = 0;
   deleteChain.returning.mockResolvedValue([]);
   updateChain.returning.mockResolvedValue([]);
@@ -124,6 +138,14 @@ describe("UsersRepository.deleteById", () => {
 });
 
 describe("UsersRepository.revokeAccess", () => {
+  it("takes the user's OAuth credential lock before any delete", async () => {
+    await usersRepository.revokeAccess("user-1");
+
+    expect(tx.execute).toHaveBeenCalledTimes(1);
+    expect(txStatements[0]).toBe("execute");
+    expect(txStatements.filter((s) => s === "execute")).toHaveLength(1);
+  });
+
   it("runs every statement inside ONE transaction", async () => {
     await usersRepository.revokeAccess("user-1");
 

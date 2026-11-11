@@ -1,4 +1,8 @@
-import type { BaseContext } from "@repo/trpc";
+import {
+  type AdminPlaneAuthOrigin,
+  assertAdminPlaneProcedureAllowed,
+  type BaseContext,
+} from "@repo/trpc";
 import { initTRPC, TRPCError } from "@trpc/server";
 import type { Request, Response } from "express";
 
@@ -66,6 +70,11 @@ export const createContext = async ({
 }): Promise<Context> => {
   let user: User | undefined;
   let session: Session | undefined;
+  // Set ONLY from the admin-plane resolver's verified key below. Its presence
+  // is what confines the request to the configuration-sync procedures; it is
+  // never derived from a request field, the synthetic session's id, or the
+  // mere presence of an Authorization header.
+  let authOrigin: AdminPlaneAuthOrigin | undefined;
   // Set when an admin-plane bearer was refused by its IP policy (migration
   // 0041). Thrown AFTER the try/catch below, which swallows everything.
   let adminPlaneIpDenied = false;
@@ -172,6 +181,11 @@ export const createContext = async ({
           } else if (resolved) {
             user = resolved.user;
             session = resolved.session;
+            authOrigin = {
+              kind: "admin_plane",
+              key_uuid: resolved.keyUuid,
+              owner_user_id: resolved.user.id,
+            };
           }
         }
       }
@@ -213,6 +227,8 @@ export const createContext = async ({
     res,
     user,
     session,
+    // Absent for a cookie session and for an anonymous request.
+    ...(authOrigin ? { authOrigin } : {}),
     // Flattened request attribution for the RBAC/authn denial emitters in
     // @repo/trpc. That package holds the choke points but cannot type or
     // import the express `req` on this context, so the three fields it needs
@@ -265,10 +281,20 @@ const t = initTRPC.context<Context>().create({
 
 // Export router and procedure helpers
 export const router = t.router;
-export const publicProcedure = t.procedure;
+
+// The same admin-plane scope check the @repo/trpc builders apply, so a
+// procedure built from this instance cannot give an admin-plane key more than
+// the configuration-sync surface either. No router is built from these today;
+// the check is here so that stays true if one ever is.
+const scopedProcedure = t.procedure.use(({ ctx, next, path, type }) => {
+  assertAdminPlaneProcedureAllowed(ctx, path, type);
+  return next();
+});
+
+export const publicProcedure = scopedProcedure;
 
 // Create a protected procedure that requires authentication
-export const protectedProcedure = t.procedure.use(({ ctx, next }) => {
+export const protectedProcedure = scopedProcedure.use(({ ctx, next }) => {
   if (!ctx.user || !ctx.session) {
     throw new TRPCError({
       code: "UNAUTHORIZED",

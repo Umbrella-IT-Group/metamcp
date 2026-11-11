@@ -50,6 +50,11 @@ const oauthRepositoryMock = {
   recordRotatedRefreshToken: vi.fn(),
   getRotatedRefreshToken: vi.fn(),
   revokeFamily: vi.fn(),
+  // The per-user credential lock and the atomic refresh claim; armed in
+  // beforeEach by armUserLockFakes (./user-lock-test-fakes).
+  withUserLock: vi.fn(),
+  claimRefreshToken: vi.fn(),
+  deleteByRefreshToken: vi.fn(),
 };
 
 const usersRepositoryMock = {
@@ -73,6 +78,9 @@ vi.mock("./introspection-auth", () => ({
 }));
 
 const { default: tokenRouter } = await import("./token");
+const { armUserLockFakes, FAKE_OAUTH_TX } = await import(
+  "./user-lock-test-fakes"
+);
 // Dynamic import for the same reason the router is imported this way: a static
 // import of ./utils pulls @/utils/logger into the module graph during the
 // import phase, before the hoisted vi.mock factory's loggerMock is initialized.
@@ -204,6 +212,7 @@ beforeEach(() => {
   // disabled-enforcement test that forgot to arm the mock fails OPEN and its
   // own assertion catches it.
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  armUserLockFakes(oauthRepositoryMock);
 });
 
 describe("POST /oauth/token — authorization_code success logging", () => {
@@ -256,6 +265,45 @@ describe("POST /oauth/token — authorization_code success logging", () => {
   it("omits rotated= on the initial grant (nothing was rotated)", async () => {
     await exchange();
     expect(issuedLine()).not.toContain("rotated");
+  });
+
+  it("refuses a code that expires while waiting for the credential lock", async () => {
+    const afterExpiry = Date.now() + 11 * 60 * 1000;
+    oauthRepositoryMock.withUserLock.mockImplementationOnce(
+      async (_userId: string, fn: (tx: unknown) => Promise<unknown>) => {
+        vi.spyOn(Date, "now").mockReturnValue(afterExpiry);
+        return fn(FAKE_OAUTH_TX);
+      },
+    );
+    try {
+      const res = await exchange();
+
+      expect(res.statusCode).toBe(400);
+      expect(grantBody(res).error).toBe("invalid_grant");
+      expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+      expect(loggerMock.info).not.toHaveBeenCalledWith(
+        expect.stringContaining("[oauth] token issued"),
+      );
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("refuses a code when its account is disabled while waiting for the lock", async () => {
+    usersRepositoryMock.isDisabled
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+
+    const res = await exchange();
+
+    expect(res.statusCode).toBe(400);
+    expect(grantBody(res).error).toBe("invalid_grant");
+    expect(usersRepositoryMock.isDisabled).toHaveBeenLastCalledWith(
+      USER_ID,
+      FAKE_OAUTH_TX,
+    );
+    expect(oauthRepositoryMock.consumeAuthCode).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
   });
 
   it("logs the last 4 characters of the access token and no whole secret", async () => {
@@ -421,7 +469,11 @@ describe("POST /oauth/token — disabled account is refused on both grants", () 
 
     expect(res.statusCode).toBe(400);
     expect(res.body?.error).toBe("invalid_grant");
-    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(USER_ID);
+    // Read inside the user's credential lock, through its transaction.
+    expect(usersRepositoryMock.isDisabled).toHaveBeenCalledWith(
+      USER_ID,
+      FAKE_OAUTH_TX,
+    );
     expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
     expect(allLoggedText()).not.toContain("[oauth] token issued");
   });
@@ -436,6 +488,9 @@ describe("POST /oauth/token — disabled account is refused on both grants", () 
     await refresh();
 
     expect(oauthRepositoryMock.deleteAccessToken).not.toHaveBeenCalled();
+    // The rotation's claim is the delete that would consume the token.
+    expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
   });
 
   it("still answers a disabled account exactly like an unknown refresh token", async () => {

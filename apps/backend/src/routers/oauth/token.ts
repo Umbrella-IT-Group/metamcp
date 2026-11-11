@@ -14,6 +14,10 @@ import {
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import type {
+  OAuthDbExecutor,
+  OAuthTx,
+} from "../../db/repositories/oauth-user-lock";
 import { requireIntrospectionCredential } from "./introspection-auth";
 import {
   generateSecureAccessToken,
@@ -241,26 +245,34 @@ async function issueTokenPair(
   clientId: string,
   userId: string,
   scope: string,
-  familyId: string = randomUUID(),
+  familyId: string,
+  // Both grants pass the transaction that holds the user's credential lock,
+  // so the new pair commits or rolls back with the code or refresh token it
+  // replaces. See ../../db/repositories/oauth-user-lock.
+  executor: OAuthDbExecutor,
 ) {
   const accessToken = generateSecureAccessToken();
   const refreshToken = generateSecureRefreshToken();
 
-  await oauthRepository.setAccessToken(accessToken, {
-    client_id: clientId,
-    user_id: userId,
-    scope,
-    expires_at: Date.now() + ACCESS_TOKEN_EXPIRY * 1000,
-    family_id: familyId,
-    // The refresh token and its expiry travel as one pair, so a token can never
-    // be stored with a refresh token but no expiry — the never-reaped,
-    // never-expiring shape migration 0035's CHECK also forbids at the column
-    // level.
-    refresh: {
-      token: refreshToken,
-      expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+  await oauthRepository.setAccessToken(
+    accessToken,
+    {
+      client_id: clientId,
+      user_id: userId,
+      scope,
+      expires_at: Date.now() + ACCESS_TOKEN_EXPIRY * 1000,
+      family_id: familyId,
+      // The refresh token and its expiry travel as one pair, so a token can never
+      // be stored with a refresh token but no expiry — the never-reaped,
+      // never-expiring shape migration 0035's CHECK also forbids at the column
+      // level.
+      refresh: {
+        token: refreshToken,
+        expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+      },
     },
-  });
+    executor,
+  );
 
   return { accessToken, refreshToken };
 }
@@ -433,6 +445,60 @@ function evaluateClientCredentials(
 }
 
 /**
+ * Request parameters the token and revocation endpoints read, each defined by
+ * RFC 6749 and RFC 7009 as a single string value.
+ *
+ * Both endpoints accept JSON and form bodies, and both parsers can hand a
+ * handler something else for these names: JSON allows arrays, objects, numbers
+ * and null, and the extended form parser turns `token[]=a` or a repeated key
+ * into an array and `token[a]=b` into an object. Before this check such a
+ * value reached hashing, string comparison or a database query. Hashing an
+ * array or object throws, so /oauth/revoke answered 500 and wrote an error
+ * line on every request without counting it against its failure budget, and
+ * an array holding the right string could compare equal after coercion.
+ */
+const OAUTH_STRING_PARAMETERS = [
+  "grant_type",
+  "code",
+  "redirect_uri",
+  "code_verifier",
+  "refresh_token",
+  "client_id",
+  "client_secret",
+  "token",
+] as const;
+
+/** A parsed body the endpoints can read parameters from: a plain object. */
+function isParameterObject(body: unknown): body is Record<string, unknown> {
+  return typeof body === "object" && body !== null && !Array.isArray(body);
+}
+
+/**
+ * The first supplied parameter from OAUTH_STRING_PARAMETERS whose value is not
+ * a string, or null when every supplied one is a string. An absent parameter
+ * is fine here; each grant decides for itself which ones it requires. The
+ * returned name is one of the fixed names above, never request text, so it is
+ * safe to echo in an error description.
+ */
+function firstNonStringParameter(body: Record<string, unknown>): string | null {
+  for (const name of OAUTH_STRING_PARAMETERS) {
+    if (Object.prototype.hasOwnProperty.call(body, name)) {
+      if (typeof body[name] !== "string") {
+        return name;
+      }
+    }
+  }
+  return null;
+}
+
+function refuseNonStringParameter(res: express.Response, name: string) {
+  return res.status(400).json({
+    error: "invalid_request",
+    error_description: `The ${name} parameter must be a single string value`,
+  });
+}
+
+/**
  * OAuth 2.0 Token Endpoint
  * Handles token exchange requests from MCP clients
  * Supports authorization_code and refresh_token grant types
@@ -452,6 +518,25 @@ tokenRouter.post("/oauth/token", rateLimitToken, async (req, res) => {
         error_description:
           "Request body is missing or malformed. Ensure Content-Type is application/json or application/x-www-form-urlencoded",
       });
+    }
+
+    // A JSON array is an object to `typeof` but carries no named parameters.
+    // Refused here with the same answer as a missing body, and without
+    // logging the body, which may hold credentials.
+    if (!isParameterObject(req.body)) {
+      return res.status(400).json({
+        error: "invalid_request",
+        error_description:
+          "Request body is missing or malformed. Ensure Content-Type is application/json or application/x-www-form-urlencoded",
+      });
+    }
+
+    // Before any parameter is hashed, compared or looked up, so a malformed
+    // value can neither throw nor consume a code or refresh token. This route
+    // keeps its request limiter (rateLimitToken) for repeated refusals.
+    const nonString = firstNonStringParameter(req.body);
+    if (nonString) {
+      return refuseNonStringParameter(res, nonString);
     }
 
     const { grant_type } = req.body;
@@ -512,14 +597,10 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Check if code has expired (10 minutes)
-  if (Date.now() > codeData.expires_at.getTime()) {
-    // Emitted before the delete for the reason given on the refresh-expiry
-    // branch below: this is a rejection that destroys the row it just read, so
-    // the row here is the only surviving evidence the code ever existed. The
-    // client is UNAUTHENTICATED at this point — auth-method validation happens
-    // further down — but the branch is still bounded, because reaching it
-    // requires a real, currently-stored authorization code and consumes it.
+  // Both expiry checks use the same event, before deleting the expired code:
+  // it is the surviving evidence that the credential existed. The first
+  // check precedes client authentication but is bounded by a real stored code.
+  const emitCodeExpired = () => {
     emitTokenLifecycle(req, {
       action: "oauth.token.issue",
       clientId: codeData.client_id,
@@ -535,6 +616,12 @@ async function handleAuthorizationCodeGrant(
         expires_at: isoOrNull(codeData.expires_at),
       },
     });
+  };
+
+  // Check if code has expired (the lifetime is set when it is minted, see
+  // authorizationCodeTtlMs in ./authorization).
+  if (Date.now() > codeData.expires_at.getTime()) {
+    emitCodeExpired();
     await oauthRepository.deleteAuthCode(code);
     return res.status(400).json({
       error: "invalid_grant",
@@ -646,20 +733,51 @@ async function handleAuthorizationCodeGrant(
   // on two concurrent redemptions of the same code only one delete removes the
   // row, so exactly one caller proceeds and the loser is refused invalid_grant
   // rather than both minting a token pair for the same code.
-  const consumed = await oauthRepository.consumeAuthCode(code);
-  if (!consumed) {
+  //
+  // The consume and the insert of the new pair run in ONE transaction under
+  // the user's OAuth credential lock, the lock users.revokeAccess takes before
+  // it deletes codes and tokens. Without it a code consumed just before a
+  // revoke committed could still insert its pair after the revoke, leaving a
+  // live credential the administrator was told was gone. A failed insert rolls
+  // the consume back with it. A new authorization code grant starts a new
+  // refresh-token family.
+  const issued = await oauthRepository.withUserLock(
+    codeData.user_id,
+    async (tx) => {
+      // Waiting for the user lock can outlast the code or an administrator's
+      // disable. Re-check both here before consuming it; a disabled account
+      // keeps its code so re-enabling it within the TTL restores the flow.
+      if (Date.now() > codeData.expires_at.getTime()) {
+        emitCodeExpired();
+        await oauthRepository.consumeAuthCode(code, tx);
+        return null;
+      }
+      if (await usersRepository.isDisabled(codeData.user_id, tx)) {
+        logger.warn(
+          `[oauth] token rejected reason=disabled grant=authorization_code client=${codeData.client_id} user=${codeData.user_id}`,
+        );
+        return null;
+      }
+      const consumed = await oauthRepository.consumeAuthCode(code, tx);
+      if (!consumed) {
+        return null;
+      }
+      return issueTokenPair(
+        codeData.client_id,
+        codeData.user_id,
+        codeData.scope,
+        randomUUID(),
+        tx,
+      );
+    },
+  );
+  if (!issued) {
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Invalid or expired authorization code",
     });
   }
-
-  // Issue access token + refresh token
-  const { accessToken, refreshToken } = await issueTokenPair(
-    codeData.client_id,
-    codeData.user_id,
-    codeData.scope,
-  );
+  const { accessToken, refreshToken } = issued;
 
   logTokenIssued({
     grantType: "authorization_code",
@@ -669,8 +787,8 @@ async function handleAuthorizationCodeGrant(
     accessToken,
   });
 
-  // After issueTokenPair, i.e. after setAccessToken committed the row — a
-  // token that failed to persist must not leave a row saying it was issued.
+  // After the transaction above committed the row: a token that failed to
+  // persist must not leave a row saying it was issued.
   emitTokenIssued(req, {
     action: "oauth.token.issue",
     grantType: "authorization_code",
@@ -692,6 +810,30 @@ async function handleAuthorizationCodeGrant(
 /**
  * Handle grant_type=refresh_token
  * Issues a new access token + refresh token pair (token rotation).
+ *
+ * ATOMIC ROTATION. A refresh token is single-use, and a rotation is three
+ * writes: claim the presented token, record it as rotated out, insert the new
+ * pair. All three run in ONE transaction under the user's OAuth credential
+ * lock (../../db/repositories/oauth-user-lock), and the claim is a
+ * DELETE ... RETURNING on the presented token's hash, so of two requests
+ * presenting the same token exactly one gets a row back and only that one
+ * mints. users.revokeAccess, reuse detection's family revoke and /oauth/revoke
+ * take the same lock before deleting, so a refresh in flight can no longer
+ * insert a pair after a revoke committed: it waits, re-reads, and finds
+ * nothing to rotate.
+ *
+ * The unlocked lookup at the top only identifies whose lock to take. Every
+ * check that decides the outcome (expiry, client binding, client
+ * authentication, disabled account) runs again on the row re-read under the
+ * lock, before the claim, so a refused request never consumes the token.
+ *
+ * STRICT REUSE, KEPT ON PURPOSE. A request that loses the race for a token
+ * finds it already rotated out and takes the reuse path, which revokes the
+ * whole family, including the pair the winner just received. So a client
+ * that retries a refresh whose reply it lost must sign in again. That is the
+ * existing reuse policy (migration 0037) applied consistently: the server
+ * cannot tell a lost reply from a stolen token presented twice, and a grace
+ * window for replays would hand the thief the same window.
  */
 async function handleRefreshTokenGrant(
   req: express.Request,
@@ -716,50 +858,169 @@ async function handleRefreshTokenGrant(
     });
   }
 
-  // Look up the token row by refresh_token
-  const tokenData = await oauthRepository.getByRefreshToken(refresh_token);
-  if (!tokenData) {
-    // Not a live token — but it may be a refresh token this family already
-    // rotated OUT (migration 0037). Refresh tokens are single-use, so a
-    // rotated-out token presented again is reuse: either the legitimate client
-    // is a step behind (its rotation reply was lost) or the token was stolen
-    // and the thief rotated it. Both are handled the safe way — revoke the
-    // whole family — because the two are indistinguishable at the wire and
-    // leaving the live chain running is the failure that matters. The reuse row
-    // is emitted BEFORE the revoke, and never awaited, for the reason
-    // emitTokenLifecycle documents: the record has to survive a delete that
-    // throws, and the delete is exactly what destroys the family being
-    // investigated. Collapsing the family (live rows AND markers) makes a
-    // replay after revocation take this same branch with no marker to match, so
-    // it falls through to the unknown-token response below — one reuse row per
-    // family compromise, not one per replay.
-    const reused = await oauthRepository.getRotatedRefreshToken(refresh_token);
-    if (reused) {
-      emitTokenLifecycle(req, {
-        action: "oauth.token.reuse",
-        clientId: reused.client_id,
-        userId: reused.user_id,
-        token: refresh_token,
-        outcome: "denied",
-        httpStatus: 400,
-        detail: {
-          reason: "refresh_token_reuse",
-          family_id: reused.family_id,
-        },
+  // Whose lock to take. A live row or a rotated-out marker both name the
+  // owning user; nothing else is decided from this unlocked read.
+  const preliminary = await oauthRepository.getByRefreshToken(refresh_token);
+  const ownerId =
+    preliminary?.user_id ??
+    (await oauthRepository.getRotatedRefreshToken(refresh_token))?.user_id;
+  if (!ownerId) {
+    return refuseInvalidRefreshToken(res);
+  }
+
+  const clientAuthMode = resolveRefreshClientAuthMode();
+  const outcome = await oauthRepository.withUserLock(ownerId, (tx) =>
+    rotateRefreshTokenLocked(req, tx, refresh_token, client_id, clientAuthMode),
+  );
+
+  switch (outcome.kind) {
+    case "invalid":
+      // Byte-identical for an unknown token, a detected reuse and a disabled
+      // account: a holder of a stolen or stale refresh token learns only "this
+      // no longer works", never that they tripped detection.
+      return refuseInvalidRefreshToken(res);
+    case "expired":
+      return res.status(400).json({
+        error: "invalid_grant",
+        error_description: "Refresh token has expired",
       });
-      const revoked = await oauthRepository.revokeFamily(reused.family_id);
-      logger.warn(
-        `[oauth] refresh token reuse detected; family revoked ` +
-          `client=${reused.client_id} user=${reused.user_id} tokens_revoked=${revoked}`,
-      );
-    }
-    // Byte-identical to the reuse response above and to the disabled-account
-    // and expired branches: a holder of a stolen or stale refresh token learns
-    // only "this no longer works", never that they tripped detection.
-    return res.status(400).json({
-      error: "invalid_grant",
-      error_description: "Invalid refresh token",
-    });
+    case "client_mismatch":
+      return res.status(400).json({
+        error: "invalid_client",
+        error_description: "Client ID does not match",
+      });
+    case "client_refused":
+      return res.status(401).json({
+        error: "invalid_client",
+        error_description: outcome.refusal,
+      });
+    case "issued":
+      break;
+  }
+
+  const { tokenData, accessToken, refreshToken, clientAuth } = outcome;
+
+  // Everything below runs after the transaction committed, so a pair that
+  // failed to persist never leaves an issued line or audit row behind.
+  //
+  // `rotated=true` is unconditional here because this handler always mints a
+  // replacement refresh token and deletes the redeemed one above. It is logged
+  // anyway so the 48h traffic read can tell a rotating client from a client that
+  // is somehow reusing a refresh token, without re-reading this file.
+  logTokenIssued({
+    grantType: "refresh_token",
+    clientId: tokenData.client_id,
+    userId: tokenData.user_id,
+    accessToken,
+    rotatedRefreshToken: true,
+    clientAuth: clientAuth?.outcome,
+  });
+
+  emitTokenIssued(req, {
+    action: "oauth.token.refresh",
+    grantType: "refresh_token",
+    clientId: tokenData.client_id,
+    userId: tokenData.user_id,
+    accessToken,
+    clientAuth: clientAuth?.outcome,
+  });
+
+  res.json({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: ACCESS_TOKEN_EXPIRY,
+    refresh_token: refreshToken,
+    scope: tokenData.scope,
+  });
+}
+
+function refuseInvalidRefreshToken(res: express.Response) {
+  return res.status(400).json({
+    error: "invalid_grant",
+    error_description: "Invalid refresh token",
+  });
+}
+
+type RefreshRotationOutcome =
+  | { kind: "invalid" }
+  | { kind: "expired" }
+  | { kind: "client_mismatch" }
+  | { kind: "client_refused"; refusal: string }
+  | {
+      kind: "issued";
+      tokenData: { client_id: string; user_id: string; scope: string };
+      accessToken: string;
+      refreshToken: string;
+      clientAuth: ReturnType<typeof evaluateClientCredentials>;
+    };
+
+/**
+ * Reuse detection (migration 0037), run under the owner's credential lock.
+ *
+ * The presented token is not live, but it may be one this family already
+ * rotated OUT. Refresh tokens are single-use, so a rotated-out token presented
+ * again is reuse: either the legitimate client is a step behind (its rotation
+ * reply was lost, or it lost a race with its own duplicate request) or the
+ * token was stolen and the thief rotated it. Both are handled the safe way,
+ * revoke the whole family, because the two are indistinguishable at the wire
+ * and leaving the live chain running is the failure that matters. The reuse
+ * row is emitted BEFORE the revoke, and never awaited, for the reason
+ * emitTokenLifecycle documents: the record has to survive a delete that
+ * throws, and the delete is exactly what destroys the family being
+ * investigated. Collapsing the family (live rows AND markers) makes a replay
+ * after revocation find no marker and fall through to the unknown-token
+ * response: one reuse row per family compromise, not one per replay.
+ *
+ * The family revoke reuses the caller's `tx`; it must not open a second
+ * transaction for a user whose lock this one already holds.
+ */
+async function revokeReusedFamilyLocked(
+  req: express.Request,
+  tx: OAuthTx,
+  refreshToken: string,
+): Promise<void> {
+  const reused = await oauthRepository.getRotatedRefreshToken(refreshToken, tx);
+  if (!reused) {
+    return;
+  }
+  emitTokenLifecycle(req, {
+    action: "oauth.token.reuse",
+    clientId: reused.client_id,
+    userId: reused.user_id,
+    token: refreshToken,
+    outcome: "denied",
+    httpStatus: 400,
+    detail: {
+      reason: "refresh_token_reuse",
+      family_id: reused.family_id,
+    },
+  });
+  const revoked = await oauthRepository.revokeFamily(reused.family_id, tx);
+  logger.warn(
+    `[oauth] refresh token reuse detected; family revoked ` +
+      `client=${reused.client_id} user=${reused.user_id} tokens_revoked=${revoked}`,
+  );
+}
+
+/**
+ * The refresh grant's decisions and writes, inside the owner's credential lock.
+ * Every query goes through `tx`: a query on the shared pool from inside this
+ * callback would hold one pool connection while waiting for another, and
+ * enough concurrent refreshes doing that would exhaust the pool.
+ */
+async function rotateRefreshTokenLocked(
+  req: express.Request,
+  tx: OAuthTx,
+  refresh_token: string,
+  client_id: string | undefined,
+  clientAuthMode: RefreshClientAuthMode,
+): Promise<RefreshRotationOutcome> {
+  // Re-read under the lock: every row committed before the lock was granted
+  // is visible now, so a rotation or revoke that won the race shows here.
+  const tokenData = await oauthRepository.getByRefreshToken(refresh_token, tx);
+  if (!tokenData) {
+    await revokeReusedFamilyLocked(req, tx, refresh_token);
+    return { kind: "invalid" };
   }
 
   // Check refresh token expiry. A NULL expiry is treated as expired, NOT as
@@ -806,19 +1067,13 @@ async function handleRefreshTokenGrant(
         refresh_token_expires_at: isoOrNull(tokenData.refresh_token_expires_at),
       },
     });
-    await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
-    return res.status(400).json({
-      error: "invalid_grant",
-      error_description: "Refresh token has expired",
-    });
+    await oauthRepository.deleteAccessTokenByHash(tokenData.access_token, tx);
+    return { kind: "expired" };
   }
 
   // Validate client_id matches (if provided)
   if (client_id && tokenData.client_id !== client_id) {
-    return res.status(400).json({
-      error: "invalid_client",
-      error_description: "Client ID does not match",
-    });
+    return { kind: "client_mismatch" };
   }
 
   // Confidential-client authentication (RFC 6749 section 6), per
@@ -827,40 +1082,31 @@ async function handleRefreshTokenGrant(
   // client was refused just above, and one that named none is still the
   // token's client, so this is the row whose secret must be shown.
   //
-  // Before the disabled check and the rotation below, for the reason the
+  // Before the disabled check and the claim below, for the reason the
   // disabled check gives: a refusal here must leave the token row intact, so a
   // misconfigured client that is fixed can still refresh.
-  const clientAuthMode = resolveRefreshClientAuthMode();
-  const clientData = await oauthRepository.getClient(tokenData.client_id);
+  const clientData = await oauthRepository.getClient(tokenData.client_id, tx);
   if (!clientData) {
     // Unreachable except in a race: access tokens reference oauth_clients with
     // ON DELETE CASCADE, so a token cannot outlive its client row. Without a
     // row there is no method to judge by. `enforce` refuses (fail closed);
     // `log` proceeds as before, where the mint below fails on that same
-    // foreign key.
+    // foreign key and rolls the claim back with it.
     logger.warn(
       `[oauth] refresh client auth outcome=client_not_found mode=${clientAuthMode} client=${tokenData.client_id} user=${tokenData.user_id}`,
     );
     if (clientAuthMode === "enforce") {
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: "Client not found or not registered",
-      });
+      return {
+        kind: "client_refused",
+        refusal: "Client not found or not registered",
+      };
     }
   }
-  // A JSON body can put an object or array in client_secret. Hashing coerces
-  // it to a string, which can throw (an object with a non-callable toString)
-  // or authenticate an array containing the secret. Refresh must classify
-  // malformed credentials without breaking log mode's existing response;
-  // keep the authorization-code grant's existing evaluation unchanged.
-  const clientAuth: ReturnType<typeof evaluateClientCredentials> =
-    clientData?.token_endpoint_auth_method === "client_secret_post" &&
-    req.body.client_secret &&
-    typeof req.body.client_secret !== "string"
-      ? { outcome: "invalid", refusal: "Invalid client secret" }
-      : clientData
-        ? evaluateClientCredentials(req, clientData)
-        : null;
+  // client_secret is a string or absent here: the endpoint refuses any other
+  // type before a grant handler runs (firstNonStringParameter).
+  const clientAuth = clientData
+    ? evaluateClientCredentials(req, clientData)
+    : null;
   if (clientAuth && clientAuth.outcome !== "verified") {
     if (clientAuthMode === "enforce") {
       // Not audited, by the doctrine on emitTokenLifecycle: the refusal
@@ -871,10 +1117,7 @@ async function handleRefreshTokenGrant(
         `[oauth] token rejected reason=client_auth_${clientAuth.outcome} grant=refresh_token ` +
           `method=${clientData?.token_endpoint_auth_method} client=${tokenData.client_id} user=${tokenData.user_id}`,
       );
-      return res.status(401).json({
-        error: "invalid_client",
-        error_description: clientAuth.refusal,
-      });
+      return { kind: "client_refused", refusal: clientAuth.refusal };
     }
     // `log`: record and proceed. The issued line and the audit row below carry
     // the same outcome; this WARN is what makes an unauthenticated refresh
@@ -892,88 +1135,73 @@ async function handleRefreshTokenGrant(
   // credential it already has. Disable has to mean the NEXT request fails, and
   // this is the request it makes.
   //
-  // Deliberately placed BEFORE the rotation delete below: disable is a
-  // reversible lockout, not a revocation. Rejecting after the delete would
-  // destroy the token row and permanently break the connector even after an
-  // admin presses Enable, quietly turning Disable into Revoke. Leaving the row
-  // intact costs nothing — this check re-runs and refuses on every retry for
-  // as long as the account stays disabled.
+  // Deliberately placed BEFORE the claim below: disable is a reversible
+  // lockout, not a revocation. Rejecting after the claim would destroy the
+  // token row and permanently break the connector even after an admin presses
+  // Enable, quietly turning Disable into Revoke. Leaving the row intact costs
+  // nothing — this check re-runs and refuses on every retry for as long as the
+  // account stays disabled.
   //
-  // The response is byte-identical to the unknown-refresh-token branch above.
-  // A holder of a stolen refresh token learns only "this no longer works", not
+  // The response is byte-identical to the unknown-refresh-token branch. A
+  // holder of a stolen refresh token learns only "this no longer works", not
   // that they tripped an admin lock — the `reason=disabled` distinction lives
   // in the server log, where the operator reads it and the attacker does not.
-  if (await usersRepository.isDisabled(tokenData.user_id)) {
+  if (await usersRepository.isDisabled(tokenData.user_id, tx)) {
     logger.warn(
       `[oauth] token rejected reason=disabled grant=refresh_token client=${tokenData.client_id} user=${tokenData.user_id}`,
     );
-    return res.status(400).json({
-      error: "invalid_grant",
-      error_description: "Invalid refresh token",
-    });
+    return { kind: "invalid" };
   }
 
-  // Record the rotated-out refresh token BEFORE deleting the row, so a later
-  // presentation of it is detected as reuse (migration 0037). The marker is
-  // keyed on the stored hash — tokenData.refresh_token is already that digest,
-  // so it is passed through unchanged rather than re-hashed. The row was found
-  // BY its refresh token and passed the expiry guard above, so both the hash
-  // and its expiry are present on the real path; the guard only satisfies the
-  // nullable column types. Recorded before the delete so there is no window in
-  // which the token is neither live nor marked as rotated.
-  if (tokenData.refresh_token && tokenData.refresh_token_expires_at) {
-    await oauthRepository.recordRotatedRefreshToken({
-      refreshTokenHash: tokenData.refresh_token,
-      familyId: tokenData.family_id,
-      clientId: tokenData.client_id,
-      userId: tokenData.user_id,
-      expiresAt: tokenData.refresh_token_expires_at,
-    });
+  // The single-use gate. Only a caller that gets exactly one live row back
+  // may mint. Under the lock the row read above is still there, unless a
+  // writer that does not take the lock (the expiry sweeper, a client-delete
+  // cascade) removed it in between; that case takes the reuse path like any
+  // other missing token.
+  const claimed = await oauthRepository.claimRefreshToken(refresh_token, tx);
+  if (claimed.length !== 1) {
+    await revokeReusedFamilyLocked(req, tx, refresh_token);
+    return { kind: "invalid" };
+  }
+  const row = claimed[0];
+
+  // Record the rotated-out refresh token so a later presentation of it is
+  // detected as reuse (migration 0037). The marker is keyed on the stored hash
+  // (row.refresh_token is already that digest), so it is passed through
+  // unchanged rather than re-hashed. The row was claimed BY its refresh token
+  // and passed the expiry guard above, so both values are present; the guard
+  // only satisfies the nullable column types. Same transaction as the claim,
+  // so there is no instant at which the token is neither live nor marked.
+  if (row.refresh_token && row.refresh_token_expires_at) {
+    await oauthRepository.recordRotatedRefreshToken(
+      {
+        refreshTokenHash: row.refresh_token,
+        familyId: row.family_id,
+        clientId: row.client_id,
+        userId: row.user_id,
+        expiresAt: row.refresh_token_expires_at,
+      },
+      tx,
+    );
   }
 
-  // Delete old token row (rotation: old refresh token is single-use). The row
-  // is in hand from getByRefreshToken, so delete by its stored hash rather than
-  // re-hashing it through deleteAccessToken.
-  await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
-
-  // Issue new access token + refresh token. The new pair inherits the rotated
-  // row's family, so reuse of any rotated-out member revokes the whole chain.
+  // Issue the new pair. It inherits the rotated row's family, so reuse of any
+  // rotated-out member revokes the whole chain.
   const { accessToken, refreshToken } = await issueTokenPair(
-    tokenData.client_id,
-    tokenData.user_id,
-    tokenData.scope,
-    tokenData.family_id,
+    row.client_id,
+    row.user_id,
+    row.scope,
+    row.family_id,
+    tx,
   );
 
-  // `rotated=true` is unconditional here because this handler always mints a
-  // replacement refresh token and deletes the redeemed one above. It is logged
-  // anyway so the 48h traffic read can tell a rotating client from a client that
-  // is somehow reusing a refresh token, without re-reading this file.
-  logTokenIssued({
-    grantType: "refresh_token",
-    clientId: tokenData.client_id,
-    userId: tokenData.user_id,
+  return {
+    kind: "issued",
+    tokenData: row,
     accessToken,
-    rotatedRefreshToken: true,
-    clientAuth: clientAuth?.outcome,
-  });
-
-  emitTokenIssued(req, {
-    action: "oauth.token.refresh",
-    grantType: "refresh_token",
-    clientId: tokenData.client_id,
-    userId: tokenData.user_id,
-    accessToken,
-    clientAuth: clientAuth?.outcome,
-  });
-
-  res.json({
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: ACCESS_TOKEN_EXPIRY,
-    refresh_token: refreshToken,
-    scope: tokenData.scope,
-  });
+    refreshToken,
+    clientAuth,
+  };
 }
 
 /**
@@ -1440,8 +1668,9 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
       return sendPublicOAuthEndpointRateLimited(res, "revoke");
     }
 
-    // Check if body was parsed correctly
-    if (!req.body || typeof req.body !== "object") {
+    // Check if body was parsed correctly. A JSON array is an object to
+    // `typeof` but names no parameters, so it is refused the same way.
+    if (!isParameterObject(req.body)) {
       recordPublicOAuthEndpointFailure(req, "revoke");
       return res.status(400).json({
         error: "invalid_request",
@@ -1449,7 +1678,21 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
       });
     }
 
-    const { token, client_id } = req.body;
+    // Before any lookup: a token or client_id that is not a single string is
+    // refused with 400 and counted ONCE against this route's failure budget,
+    // like every other refusal here. It used to throw inside the hashed
+    // lookup and answer 500 without being counted, so one address could
+    // repeat it without limit, writing an error line each time.
+    const nonString = firstNonStringParameter(req.body);
+    if (nonString) {
+      recordPublicOAuthEndpointFailure(req, "revoke");
+      return refuseNonStringParameter(res, nonString);
+    }
+
+    const { token, client_id } = req.body as {
+      token?: string;
+      client_id?: string;
+    };
 
     if (!token) {
       recordPublicOAuthEndpointFailure(req, "revoke");
@@ -1524,20 +1767,43 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
       });
     };
 
+    // Every delete below runs under the token owner's OAuth credential lock
+    // (../../db/repositories/oauth-user-lock), the lock the refresh grant holds
+    // while it rotates. The unlocked lookups only identify the row and its
+    // owner, client and family; that identity is kept while waiting for the
+    // lock, because a refresh of the same row can commit in between. When the
+    // row is gone once the lock is held, the rotation won, so the family it
+    // belongs to is revoked instead, taking the pair that rotation just
+    // inserted. A row-only delete would report success and leave that pair
+    // live.
+    //
     // Try revoking as access token
     const accessTokenData = await oauthRepository.getAccessToken(token);
     if (accessTokenData) {
       if (clientMismatch(accessTokenData.client_id)) {
         return refuseClientMismatch(accessTokenData, "access_token");
       }
-      await oauthRepository.deleteAccessToken(token);
+      const familyRevoked = await oauthRepository.withUserLock(
+        accessTokenData.user_id,
+        async (tx) => {
+          if ((await oauthRepository.deleteAccessToken(token, tx)) > 0) {
+            return null;
+          }
+          return oauthRepository.revokeFamily(accessTokenData.family_id, tx);
+        },
+      );
       emitTokenLifecycle(req, {
         action: "oauth.token.revoke",
         clientId: accessTokenData.client_id,
         userId: accessTokenData.user_id,
         token,
         outcome: "success",
-        detail: { token_type: "access_token" },
+        detail: {
+          token_type: "access_token",
+          ...(familyRevoked === null
+            ? {}
+            : { family_tokens_revoked: familyRevoked }),
+        },
       });
     } else {
       // Try revoking as refresh token
@@ -1546,22 +1812,65 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
         if (clientMismatch(tokenData.client_id)) {
           return refuseClientMismatch(tokenData, "refresh_token");
         }
-        // The row is in hand from getByRefreshToken, so delete by its stored
-        // hash rather than re-hashing it through deleteAccessToken.
-        await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
+        const familyRevoked = await oauthRepository.withUserLock(
+          tokenData.user_id,
+          async (tx) => {
+            if ((await oauthRepository.deleteByRefreshToken(token, tx)) > 0) {
+              return null;
+            }
+            return oauthRepository.revokeFamily(tokenData.family_id, tx);
+          },
+        );
         emitTokenLifecycle(req, {
           action: "oauth.token.revoke",
           clientId: tokenData.client_id,
           userId: tokenData.user_id,
           token,
           outcome: "success",
-          detail: { token_type: "refresh_token" },
+          detail: {
+            token_type: "refresh_token",
+            ...(familyRevoked === null
+              ? {}
+              : { family_tokens_revoked: familyRevoked }),
+          },
         });
       } else {
-        // RFC 7009: return success even if token doesn't exist — but count it.
-        // The 200 is what makes this endpoint an unauthenticated oracle worth
-        // spraying, and a caller whose tokens never resolve is not a client.
-        recordPublicOAuthEndpointFailure(req, "revoke");
+        // Not live, but possibly a refresh token its family already rotated
+        // out: a refresh that committed before this request's first lookup
+        // leaves only the marker. Resolving it revokes the family, so a
+        // revoke racing the client's own refresh still ends the grant.
+        // revokeFamily also deletes the family's markers, so a replay of the
+        // same token finds nothing and is counted below like any unknown
+        // token: one audit row per family, not one per request. An access
+        // token that was rotated out is recorded nowhere, so it stays an
+        // unknown token here.
+        const rotated = await oauthRepository.getRotatedRefreshToken(token);
+        if (rotated) {
+          if (clientMismatch(rotated.client_id)) {
+            return refuseClientMismatch(rotated, "refresh_token");
+          }
+          const familyRevoked = await oauthRepository.withUserLock(
+            rotated.user_id,
+            (tx) => oauthRepository.revokeFamily(rotated.family_id, tx),
+          );
+          emitTokenLifecycle(req, {
+            action: "oauth.token.revoke",
+            clientId: rotated.client_id,
+            userId: rotated.user_id,
+            token,
+            outcome: "success",
+            detail: {
+              token_type: "refresh_token",
+              rotated: true,
+              family_tokens_revoked: familyRevoked,
+            },
+          });
+        } else {
+          // RFC 7009: return success even if token doesn't exist — but count it.
+          // The 200 is what makes this endpoint an unauthenticated oracle worth
+          // spraying, and a caller whose tokens never resolve is not a client.
+          recordPublicOAuthEndpointFailure(req, "revoke");
+        }
       }
     }
 

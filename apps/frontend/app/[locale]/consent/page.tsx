@@ -3,10 +3,14 @@
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
+import {
+  ConsentDecision,
+  type ConsentInfo,
+} from "@/components/consent-decision";
 import { LanguageSwitcher } from "@/components/language-switcher";
-import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useTranslations } from "@/hooks/useTranslations";
+import { getBranding } from "@/lib/branding";
 
 /**
  * OAuth consent screen.
@@ -16,20 +20,10 @@ import { useTranslations } from "@/hooks/useTranslations";
  * proxied away and never render. Outside the prefix it also gets the normal
  * middleware session check, which is a second gate on top of the backend's.
  *
- * The Approve/Deny controls are a plain HTML form, not a fetch. The backend
- * answers with a 302 to the client's redirect_uri, and only a real top-level
- * form submission lets the browser follow that redirect out to the client the
- * way an OAuth flow expects. It also means the double-submit cookie rides
- * along on a same-site POST, which is exactly the request SameSite=Lax permits
- * and a cross-site attacker cannot reproduce.
+ * The request details, the warning and the Approve/Deny form are
+ * components/consent-decision.tsx; see it for why the warning sits directly
+ * above Approve and why the form is a plain HTML POST.
  */
-
-interface ConsentInfo {
-  client_id: string;
-  client_name: string;
-  redirect_uri: string;
-  scope: string;
-}
 
 function ConsentPrompt() {
   const { t } = useTranslations();
@@ -111,63 +105,12 @@ function ConsentPrompt() {
         </p>
       </div>
 
-      <div className="space-y-3 rounded-md border p-4 text-sm">
-        <div className="space-y-1">
-          <p className="text-base font-medium break-words">
-            {info.client_name}
-          </p>
-          {/*
-            client_name is whatever the application asked to be called during
-            anonymous registration — nothing verifies it. Saying so, and
-            showing the full destination below rather than a bare host, is what
-            lets someone notice a "Claude" that sends codes somewhere else.
-          */}
-          <p className="text-xs text-muted-foreground">
-            {t("auth:consentClientNameNote")}
-          </p>
-        </div>
-        <div className="space-y-1">
-          <span className="text-muted-foreground">
-            {t("auth:consentRedirectLabel")}
-          </span>
-          <p className="font-mono text-xs break-all">{info.redirect_uri}</p>
-        </div>
-        <div className="flex justify-between gap-4">
-          <span className="text-muted-foreground">
-            {t("auth:consentScopeLabel")}
-          </span>
-          <span className="font-mono">{info.scope}</span>
-        </div>
-      </div>
-
-      <div className="rounded-md bg-muted/50 p-3 text-sm text-muted-foreground">
-        {t("auth:consentWarning")}
-      </div>
-
-      <form
-        method="POST"
-        action="/oauth/authorize/decision"
-        className="space-y-3"
-      >
-        <input type="hidden" name="areq" value={areq} />
-        <Button
-          type="submit"
-          name="decision"
-          value="approve"
-          className="w-full"
-        >
-          {t("auth:consentApprove")}
-        </Button>
-        <Button
-          type="submit"
-          name="decision"
-          value="deny"
-          variant="outline"
-          className="w-full"
-        >
-          {t("auth:consentDeny")}
-        </Button>
-      </form>
+      <ConsentDecision
+        info={info}
+        areq={areq}
+        orgName={getBranding().orgName}
+        t={t}
+      />
     </div>
   );
 }

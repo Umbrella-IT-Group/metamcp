@@ -89,9 +89,12 @@ export function consentCsrfCookieName(secure: boolean, cid: string): string {
 }
 
 /**
- * How long a pending consent request stays valid. Matches the authorization
- * code lifetime used elsewhere in this router — long enough for a human to
- * read the page, short enough that an abandoned tab stops being usable.
+ * How long a pending consent request (the signed areq and its CSRF cookie)
+ * stays valid: long enough for a human to read the page, short enough that an
+ * abandoned tab stops being usable. Deliberately independent of the
+ * authorization code's lifetime (authorizationCodeTtlMs in ./authorization),
+ * which runs from approval rather than from the request and is shorter for a
+ * loopback redirect.
  */
 export const CONSENT_REQUEST_TTL_MS = 10 * 60 * 1000;
 
