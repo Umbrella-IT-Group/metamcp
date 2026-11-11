@@ -365,6 +365,33 @@ describe("refresh_token grant — a token rotated away while waiting for the loc
   });
 });
 
+describe("refresh_token grant — the claim is the single-use gate", () => {
+  // Under the lock the re-read still saw the row, but the DELETE ... RETURNING
+  // claim removed nothing: a writer that does not take the lock (the expiry
+  // sweeper, a client-delete cascade) deleted it in between. Only a caller
+  // that gets exactly one row back may mint.
+  beforeEach(() => {
+    oauthRepositoryMock.getByRefreshToken.mockResolvedValue(liveRow());
+    oauthRepositoryMock.claimRefreshToken.mockResolvedValue([]);
+    oauthRepositoryMock.getRotatedRefreshToken.mockResolvedValue(null);
+  });
+
+  it("mints nothing when the claim returns no row", async () => {
+    const res = await postRefresh("mcp_refresh_vanished0000");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({
+      error: "invalid_grant",
+      error_description: "Invalid refresh token",
+    });
+    expect(oauthRepositoryMock.claimRefreshToken).toHaveBeenCalledTimes(1);
+    expect(
+      oauthRepositoryMock.recordRotatedRefreshToken,
+    ).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+  });
+});
+
 describe("refresh_token grant — an unrelated token revokes nothing", () => {
   beforeEach(() => {
     // Never a live token, never rotated out of any family.
