@@ -70,6 +70,9 @@ const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 const CLIENT_ID = "mcp_client_test";
 const CLIENT_NAME = "Claude";
 const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
+// Self-registration accepts loopback callbacks only, so the registration
+// cases register a local client.
+const LOOPBACK_REDIRECT_URI = "http://localhost:8765/callback";
 const USER_ID = "user-abc123";
 const STATE = "opaque-client-state";
 const CODE_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -279,6 +282,7 @@ beforeEach(() => {
     rows.push(event as AuditRow);
   });
   oauthRepositoryMock.getClient.mockResolvedValue({
+    approval_status: "approved",
     client_id: CLIENT_ID,
     client_name: CLIENT_NAME,
     redirect_uris: [REDIRECT_URI],
@@ -343,7 +347,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
       path: "/oauth/register",
       body: {
         client_name: CLIENT_NAME,
-        redirect_uris: [REDIRECT_URI],
+        redirect_uris: [LOOPBACK_REDIRECT_URI],
         token_endpoint_auth_method: "client_secret_post",
       },
     });
@@ -409,7 +413,7 @@ describe("oauth.dcr.register — anonymous dynamic client registration", () => {
     // does not get.
     const maxUris = Array.from(
       { length: 10 },
-      (_, i) => `https://claude.ai/${i}/${"p".repeat(490)}`,
+      (_, i) => `http://localhost:8765/${i}/${"p".repeat(488)}`,
     );
 
     const res = await dispatch(registrationRouter, {
@@ -610,7 +614,10 @@ describe("a broken audit sink cannot break the OAuth flow", () => {
     const res = await dispatch(registrationRouter, {
       method: "POST",
       path: "/oauth/register",
-      body: { client_name: CLIENT_NAME, redirect_uris: [REDIRECT_URI] },
+      body: {
+        client_name: CLIENT_NAME,
+        redirect_uris: [LOOPBACK_REDIRECT_URI],
+      },
     });
     await flush();
 

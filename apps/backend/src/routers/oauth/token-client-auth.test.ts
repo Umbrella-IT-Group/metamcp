@@ -174,6 +174,7 @@ function clientRow(
   return method === "none"
     ? {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Public Client",
         token_endpoint_auth_method: "none",
         client_secret: null,
@@ -181,6 +182,7 @@ function clientRow(
       }
     : {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Confidential Client",
         token_endpoint_auth_method: method,
         client_secret: hashed.hash,

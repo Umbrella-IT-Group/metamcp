@@ -429,6 +429,9 @@ describeIfDb("per-user OAuth credential lock (real Postgres)", () => {
       client_name: "itest public client",
       redirect_uris: [REDIRECT_URI],
       token_endpoint_auth_method: "none",
+      // Approved (migration 0042): this suite is about the credential lock,
+      // and only an approved client can be authorized or refreshed.
+      approval_status: "approved",
     } as typeof schema.oauthClientsTable.$inferInsert);
     const hashed = hashClientSecret(CLIENT_SECRET);
     await db.insert(schema.oauthClientsTable).values({
@@ -438,6 +441,7 @@ describeIfDb("per-user OAuth credential lock (real Postgres)", () => {
       token_endpoint_auth_method: "client_secret_post",
       client_secret: hashed.hash,
       client_secret_salt: hashed.salt,
+      approval_status: "approved",
     } as typeof schema.oauthClientsTable.$inferInsert);
 
     const app = express();

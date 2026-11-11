@@ -293,6 +293,7 @@ function sessionFor(userId: string | null) {
 function registeredClient(redirectUris: string[] = [REDIRECT_URI]) {
   return {
     client_id: CLIENT_ID,
+    approval_status: "approved",
     client_name: CLIENT_NAME,
     redirect_uris: redirectUris,
   };

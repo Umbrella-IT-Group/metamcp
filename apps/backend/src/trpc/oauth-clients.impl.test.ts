@@ -236,10 +236,25 @@ describe("oauth-clients router RBAC", () => {
       response_types: ["code"],
       token_endpoint_auth_method: "none",
       scope: "admin",
+      approval_status: "approved" as const,
       created_at: new Date(),
     })),
     list: vi.fn(async () => ({ clients: [] })),
     delete: vi.fn(async () => ({ success: true, message: "ok" })),
+    approve: vi.fn(async () => ({
+      client_id: "mcp_client_x",
+      approval_status: "approved" as const,
+      approved_by: "u-admin",
+      approved_at: new Date(),
+      rejected_at: null,
+    })),
+    reject: vi.fn(async () => ({
+      client_id: "mcp_client_x",
+      approval_status: "rejected" as const,
+      approved_by: null,
+      approved_at: null,
+      rejected_at: new Date(),
+    })),
   });
 
   const admin = router.createCaller({
@@ -260,6 +275,12 @@ describe("oauth-clients router RBAC", () => {
     await expect(
       admin.delete({ client_id: "mcp_client_x" }),
     ).resolves.toMatchObject({ success: true });
+    await expect(
+      admin.approve({ client_id: "mcp_client_x" }),
+    ).resolves.toMatchObject({ approval_status: "approved" });
+    await expect(
+      admin.reject({ client_id: "mcp_client_x" }),
+    ).resolves.toMatchObject({ approval_status: "rejected" });
   });
 
   it("rejects a member with FORBIDDEN on every procedure", async () => {
@@ -269,6 +290,12 @@ describe("oauth-clients router RBAC", () => {
     });
     await expect(
       member.delete({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      member.approve({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      member.reject({ client_id: "mcp_client_x" }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
@@ -281,6 +308,12 @@ describe("oauth-clients router RBAC", () => {
     });
     await expect(
       anonymous.delete({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      anonymous.approve({ client_id: "mcp_client_x" }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      anonymous.reject({ client_id: "mcp_client_x" }),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 });

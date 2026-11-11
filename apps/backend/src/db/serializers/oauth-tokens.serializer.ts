@@ -19,6 +19,7 @@ export class OAuthTokensSerializer {
       user_email: string | null;
       client_id: string;
       client_name: string | null;
+      client_approval_status: string | null;
       scope: string;
       created_at: Date;
       expires_at: Date;
@@ -35,6 +36,10 @@ export class OAuthTokensSerializer {
       user_email: token.user_email,
       client_id: token.client_id,
       client_name: token.client_name,
+      // The issuing client's approval state (migration 0042), so the Access
+      // view never shows a token from a client that is not approved as if it
+      // were ordinary approved access.
+      client_approval_status: token.client_approval_status,
       scope: token.scope,
       created_at: token.created_at,
       expires_at: token.expires_at,

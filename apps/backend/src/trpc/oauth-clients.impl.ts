@@ -2,9 +2,12 @@ import type { AuditActor } from "@repo/trpc";
 import {
   CreateOAuthClientRequestSchema,
   CreateOAuthClientResponseSchema,
+  DecideOAuthClientRequestSchema,
+  DecideOAuthClientResponseSchema,
   DeleteOAuthClientRequestSchema,
   DeleteOAuthClientResponseSchema,
   ListOAuthClientsResponseSchema,
+  type OAuthClient,
 } from "@repo/zod-types";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
@@ -16,6 +19,85 @@ import { OAuthClientsSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { clampAuditText, clampAuditTextList } from "../lib/audit/audit-emitter";
 import { buildClientRegistration } from "../routers/oauth/client-registration";
+import { isDcrLoopbackRedirectUri } from "../routers/oauth/utils";
+
+/**
+ * The authenticated administrator a decision is attributed to.
+ *
+ * From the tRPC context only (auditActor), never from the request body. An
+ * admin-plane (CI) key never reaches the decision procedures (they are not on
+ * ADMIN_PLANE_ALLOWED_PROCEDURES); refusing one here as well keeps a future
+ * allowlist edit from letting a CI credential approve clients unnoticed.
+ */
+function decidingAdministrator(actor: AuditActor | undefined): string {
+  if (!actor?.actor_id || actor.admin_plane) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "An administrator's own session is required for this decision.",
+    });
+  }
+  return actor.actor_id;
+}
+
+/**
+ * Refuse a decision on a row that is not a pending self-registration: gone,
+ * not self-registered, or already decided. Returns quietly when the row IS
+ * decidable. Never reported as success, and no success audit row is written.
+ */
+function assertDecidable(
+  current: OAuthClient | null,
+): asserts current is OAuthClient {
+  if (!current) {
+    throw new TRPCError({
+      code: "NOT_FOUND",
+      message: "OAuth client not found",
+    });
+  }
+  if (current.registration_source !== "dcr") {
+    throw new TRPCError({
+      code: "CONFLICT",
+      message:
+        "Only self-registered clients are approved or rejected. Administrator-created and older clients are already approved.",
+    });
+  }
+  if (current.approval_status !== "pending") {
+    throw new TRPCError({
+      code: "CONFLICT",
+      message: `This client is no longer pending (it is ${String(current.approval_status).slice(0, 32)}). Refresh the list.`,
+    });
+  }
+}
+
+/**
+ * A conditional decision UPDATE changed nothing although the row looked
+ * decidable a moment earlier: another administrator (or the sweep, or a
+ * delete) got there first. Re-read and report what happened instead.
+ */
+async function refuseLostDecision(clientId: string): Promise<never> {
+  const current = await oauthRepository.getClient(clientId);
+  assertDecidable(current);
+  // Still pending yet the UPDATE matched nothing: its callbacks changed
+  // between the check and the write. Refuse rather than retry blind.
+  throw new TRPCError({
+    code: "CONFLICT",
+    message:
+      "This client changed while it was being decided. Refresh the list.",
+  });
+}
+
+function decisionResponse(
+  row: OAuthClient,
+): z.infer<typeof DecideOAuthClientResponseSchema> {
+  return {
+    client_id: row.client_id,
+    approval_status: row.approval_status as z.infer<
+      typeof DecideOAuthClientResponseSchema
+    >["approval_status"],
+    approved_by: row.approved_by ?? null,
+    approved_at: row.approved_at ?? null,
+    rejected_at: row.rejected_at ?? null,
+  };
+}
 
 /**
  * Admin CRUD over DCR-registered OAuth clients (the `oauth_clients` table).
@@ -63,9 +145,15 @@ export const oauthClientsImplementations = {
     // anonymous DCR endpoint stamps "dcr" at its own door for the same reason:
     // the shared mint core cannot tell them apart, since both draw their
     // client_id from generateSecureClientId.
+    //
+    // `approval_status: "approved"` for the same reason: an administrator
+    // creating a client is the approval, so there is nothing to wait for. The
+    // zod contract strips any status or approver field a caller adds, and the
+    // shared core never reads one, so this line is the only source of it.
     const client = {
       ...registration.client,
       registration_source: "admin" as const,
+      approval_status: "approved" as const,
     };
 
     try {
@@ -123,8 +211,105 @@ export const oauthClientsImplementations = {
       response_types: client.response_types,
       token_endpoint_auth_method: client.token_endpoint_auth_method,
       scope: client.scope,
+      approval_status: client.approval_status,
       created_at: client.created_at,
     };
+  },
+
+  /**
+   * Approve a pending self-registered client so people can authorize it.
+   *
+   * Every stored callback is re-checked against the self-registration rule
+   * (plain-http loopback) first, so a pending row that reached the table any
+   * other way (written by hand, or before that rule existed) cannot be
+   * approved with a hosted callback. The decision itself is one conditional
+   * UPDATE (oauthRepository.approvePendingDcrClient): two administrators
+   * deciding at once produce exactly one winner, and a stale, deleted or
+   * already decided row is reported as such, never as success.
+   *
+   * Approval grants nothing by itself: each person still authorizes the
+   * client on the consent screen.
+   */
+  approve: async (
+    input: z.infer<typeof DecideOAuthClientRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof DecideOAuthClientResponseSchema>> => {
+    const approvedBy = decidingAdministrator(actor);
+
+    const current = await oauthRepository.getClient(input.client_id);
+    assertDecidable(current);
+    const nonLoopback = current.redirect_uris.filter(
+      (uri) => !isDcrLoopbackRedirectUri(uri),
+    );
+    if (nonLoopback.length > 0) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "This client has a callback that is not a local (loopback) address, so it cannot be approved. Delete it; hosted clients are created by an administrator.",
+      });
+    }
+
+    const approved = await oauthRepository.approvePendingDcrClient(
+      input.client_id,
+      current.redirect_uris,
+      approvedBy,
+    );
+    if (!approved) {
+      return refuseLostDecision(input.client_id);
+    }
+
+    logger.info(
+      `Approved OAuth client ${approved.client_id} via admin UI (approved_by=${approvedBy})`,
+    );
+    // After the UPDATE returned the changed row, so a row here means the
+    // client really moved from pending to approved.
+    emitAdminEvent(actor, {
+      action: "oauthclient.approve",
+      target_type: "oauth_client",
+      target_id: approved.client_id,
+      detail: {
+        client_name: clampAuditText(approved.client_name, 100),
+        previous_status: "pending",
+        new_status: "approved",
+      },
+    });
+
+    return decisionResponse(approved);
+  },
+
+  /**
+   * Reject a pending self-registered client. It can no longer be authorized
+   * and the retention sweep removes it a day later. Same single conditional
+   * UPDATE, one-winner and stale-row rules as approve.
+   */
+  reject: async (
+    input: z.infer<typeof DecideOAuthClientRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof DecideOAuthClientResponseSchema>> => {
+    const rejectedBy = decidingAdministrator(actor);
+
+    const rejected = await oauthRepository.rejectPendingDcrClient(
+      input.client_id,
+    );
+    if (!rejected) {
+      return refuseLostDecision(input.client_id);
+    }
+
+    logger.info(
+      `Rejected OAuth client ${rejected.client_id} via admin UI (rejected_by=${rejectedBy})`,
+    );
+    emitAdminEvent(actor, {
+      action: "oauthclient.reject",
+      target_type: "oauth_client",
+      target_id: rejected.client_id,
+      detail: {
+        client_name: clampAuditText(rejected.client_name, 100),
+        previous_status: "pending",
+        new_status: "rejected",
+      },
+    });
+
+    return decisionResponse(rejected);
   },
 
   list: async (): Promise<z.infer<typeof ListOAuthClientsResponseSchema>> => {

@@ -1,11 +1,21 @@
+import { isOAuthClientApproved } from "@repo/zod-types";
 import { randomBytes } from "crypto";
 import express from "express";
 
-import { auditRequestContext, emit } from "@/lib/audit/audit-emitter";
+import {
+  auditRequestContext,
+  clampAuditText,
+  emit,
+} from "@/lib/audit/audit-emitter";
 import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import {
+  CLIENT_NOT_APPROVED_ERROR,
+  CLIENT_NOT_APPROVED_HTTP_STATUS,
+  sendClientNotApprovedPage,
+} from "./client-not-approved-page";
 import { sendLoopbackConsentSuccess } from "./consent-success-page";
 import {
   CONSENT_REQUEST_TTL_MS,
@@ -15,6 +25,7 @@ import {
   signConsentRequest,
   verifyConsentRequest,
 } from "./consent-token";
+import { getOAuthDcrMode } from "./dcr-mode";
 import {
   generateSecureAuthCode,
   getBaseUrl,
@@ -209,6 +220,44 @@ function emitConsentDecision(
 }
 
 /**
+ * Record an authorization attempt refused because the client is not approved.
+ *
+ * Bounded fields only: the client id is the target, the registered callback
+ * and the status are clamped, and nothing from the signed request, the
+ * consent cookie, a code or a verifier is recorded (none exists on this path).
+ * The actor is the signed-in user when there is one, so an administrator can
+ * see who was trying to connect with a pending client; otherwise anonymous.
+ */
+function emitClientNotApproved(
+  req: express.Request,
+  params: {
+    userId: string | null;
+    clientId: string;
+    status: unknown;
+    redirectUri: string;
+  },
+): void {
+  const audit = auditRequestContext(req);
+  emit({
+    actor_type: params.userId ? "user" : "anonymous",
+    actor_id: params.userId,
+    actor_label: null,
+    actor_ip: audit.actor_ip,
+    actor_user_agent: audit.actor_user_agent,
+    action: "oauth.authorize.client_not_approved",
+    target_type: "oauth_client",
+    target_id: clampAuditText(params.clientId, 128),
+    outcome: "denied",
+    request_id: audit.request_id,
+    http_status: CLIENT_NOT_APPROVED_HTTP_STATUS,
+    detail: {
+      approval_status: clampAuditText(params.status, 32),
+      redirect_uri: clampAuditText(params.redirectUri, 512),
+    },
+  });
+}
+
+/**
  * OAuth 2.0 Authorization Endpoint
  * Handles authorization requests from MCP clients
  */
@@ -314,7 +363,16 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     const finalClientId = client_id as string; // Track which client_id to use
 
     if (!clientData) {
-      // Client not found - direct them to use dynamic client registration
+      // Client not found. Point at self-registration only while it is
+      // accepted (OAUTH_DCR_MODE pending or open), and say what it accepts:
+      // local callbacks, approved by an administrator before first use.
+      if (getOAuthDcrMode() === "off") {
+        return res.status(400).json({
+          error: "invalid_client",
+          error_description:
+            "Client not registered. Ask an administrator for a client.",
+        });
+      }
       const baseUrl = getBaseUrl(req);
       return res.status(400).json({
         error: "invalid_client",
@@ -322,7 +380,7 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
           "Client not registered. Please register your client first.",
         registration_endpoint: `${baseUrl}/oauth/register`,
         documentation:
-          "Use the registration endpoint to dynamically register your OAuth client before authorization.",
+          "Applications on the local machine can register with a loopback callback (http://localhost, http://127.0.0.1 or http://[::1]) at the registration endpoint; an administrator must approve the new client before it can be authorized. Hosted applications use a client an administrator creates.",
       });
     } else {
       // Validate redirect_uri against registered redirect_uris for existing clients
@@ -332,6 +390,39 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
           error_description: "redirect_uri is not registered for this client",
         });
       }
+    }
+
+    // Client approval (migration 0042). Only after the client and the exact
+    // registered callback are validated above, and before ANY consent state
+    // exists: no signed areq, no consent cookie, no redirect to consent or to
+    // the client's callback. A self-registered client waits here until an
+    // administrator approves it; reloading this same request afterwards
+    // reaches consent with the state, callback and PKCE challenge unchanged.
+    //
+    // Checked before the sign-in redirect, so the person sees why the
+    // connection cannot proceed without first signing in for nothing. The
+    // session is still resolved (when there is a cookie) only to attribute
+    // the audit row.
+    if (!isOAuthClientApproved(clientData)) {
+      const attemptingUserId = await resolveSessionUserId(req);
+      logger.warn(
+        `[oauth] authorize refused reason=client_not_approved status=${String(clientData.approval_status).slice(0, 32)} client=${finalClientId}`,
+      );
+      emitClientNotApproved(req, {
+        userId: attemptingUserId,
+        clientId: finalClientId,
+        status: clientData.approval_status,
+        redirectUri: redirect_uri as string,
+      });
+      return sendClientNotApprovedPage(res, {
+        status: String(clientData.approval_status),
+        clientName: (clientData.client_name || finalClientId).slice(
+          0,
+          MAX_DISPLAYED_CLIENT_NAME,
+        ),
+        clientId: finalClientId,
+        redirectUri: redirect_uri as string,
+      });
     }
 
     // Store OAuth parameters for later use (using the correct client_id)
@@ -525,6 +616,17 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
       });
     }
 
+    // Client approval (migration 0042), from the LIVE client row. The
+    // authorize GET never signs a request for a client that is not approved,
+    // but a request signed before a status change is still within its TTL;
+    // it must not display a usable consent screen.
+    if (!isOAuthClientApproved(clientData)) {
+      logger.warn(
+        `[oauth] consent info withheld reason=client_not_approved client=${consentRequest.client_id} user=${userId}`,
+      );
+      return res.status(403).json(CLIENT_NOT_APPROVED_ERROR);
+    }
+
     res.json({
       client_id: consentRequest.client_id,
       client_name: (clientData.client_name || consentRequest.client_id).slice(
@@ -655,6 +757,29 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
         error: "invalid_request",
         error_description: "redirect_uri is not registered for this client",
       });
+    }
+
+    // Client approval (migration 0042), from the LIVE client row, before
+    // anything is minted and before either redirect below: a refusal here
+    // never sends the browser to the client's callback. A signed request
+    // from before a status change is otherwise still valid for its TTL.
+    // Approval only ever moves pending to approved or rejected, so a row
+    // read as approved here cannot become unapproved before the code insert
+    // below; a client deleted meanwhile takes its codes with it (cascade).
+    if (!isOAuthClientApproved(clientData)) {
+      logger.warn(
+        `[oauth] consent rejected reason=client_not_approved client=${consentRequest.client_id} user=${userId}`,
+      );
+      emitConsentDecision(req, {
+        granted: false,
+        userId,
+        clientId: consentRequest.client_id,
+        redirectUri: consentRequest.redirect_uri,
+        httpStatus: 403,
+        reason: "client_not_approved",
+      });
+      clearConsentCookie(req, res, consentRequest.cid);
+      return res.status(403).json(CLIENT_NOT_APPROVED_ERROR);
     }
 
     // `users.disabled` enforcement (migration 0027), and the one that actually

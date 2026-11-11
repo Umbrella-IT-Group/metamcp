@@ -194,6 +194,7 @@ function clientRow(method: Method) {
   return method === "none"
     ? {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Public Client",
         token_endpoint_auth_method: "none",
         client_secret: null,
@@ -201,6 +202,7 @@ function clientRow(method: Method) {
       }
     : {
         client_id: CLIENT_ID,
+        approval_status: "approved",
         client_name: "Confidential Client",
         token_endpoint_auth_method: method,
         client_secret: hashed.hash,
@@ -666,11 +668,23 @@ describe("the client row is gone (a delete racing the refresh)", () => {
     oauthRepositoryMock.getClient.mockResolvedValue(null);
   });
 
-  it("log: proceeds as before and says so", async () => {
-    expectIssued(await post(refreshBody({ client_id: CLIENT_ID })));
-    expect(issuedLine()).not.toContain("client_auth");
+  it("log: refuses as not approved, untouched, and says so", async () => {
+    // A missing client row has no approval (migration 0042), so log mode no
+    // longer proceeds to a mint that would fail on the foreign key: it is
+    // refused before the claim, in both modes.
+    const res = await post(refreshBody({ client_id: CLIENT_ID }));
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.error).toBe("unauthorized_client");
+    expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.deleteAccessTokenByHash).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.claimRefreshToken).not.toHaveBeenCalled();
+    expect(
+      oauthRepositoryMock.recordRotatedRefreshToken,
+    ).not.toHaveBeenCalled();
     expect(warnLines()).toEqual([
       "[oauth] refresh client auth outcome=client_not_found mode=log " +
+        `client=${CLIENT_ID} user=${USER_ID}`,
+      "[oauth] token rejected reason=client_not_approved grant=refresh_token " +
         `client=${CLIENT_ID} user=${USER_ID}`,
     ]);
   });

@@ -247,6 +247,7 @@ describe("Access routers — .output() is a second redaction layer", () => {
             user_email: "attacker@example.invalid",
             client_id: "mcp_client_abc",
             client_name: "Claude",
+            client_approval_status: "approved",
             scope: "mcp",
             created_at: new Date("2026-08-13T12:00:00.000Z"),
             expires_at: new Date("2026-09-13T12:00:00.000Z"),
