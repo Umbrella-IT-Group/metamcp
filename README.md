@@ -140,8 +140,11 @@ across the management and OAuth surfaces:
   for an existing key name rotates that key.
 - **Fail-closed registration** — self-registration defaults to disabled and stays disabled
   across restarts; unauthenticated endpoints require an explicit opt-in.
-- **Bounded Dynamic Client Registration** — field/size caps, a scoped body limit, retention of
-  unused clients, and a dedicated rate-limit bucket.
+- **Dynamic Client Registration held for approval**: self-registration accepts only local
+  (loopback) callbacks, and a new self-registered client cannot be authorized until an
+  administrator approves it on the OAuth Clients page (`OAUTH_DCR_MODE`, see
+  [README-oauth.md](README-oauth.md)). Also field/size caps, a scoped body limit, a sweep of
+  unapproved registrations, and a dedicated rate-limit bucket.
 - **Per-caller rate limiting on password sign-in** — the credential sign-in endpoint is capped
   per client IP, which also bounds how fast the append-only audit log can be filled with failed
   logins. SSO, callbacks, session reads and sign-out are deliberately not capped. See
