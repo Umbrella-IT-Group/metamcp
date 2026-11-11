@@ -15,6 +15,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
+import { OAuthClientStatusBadge } from "@/components/oauth-client-approval";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -505,6 +506,17 @@ export default function AccessPage() {
                           <div className="text-xs text-muted-foreground font-mono break-all">
                             {token.client_id}
                           </div>
+                          {/* The issuing client's approval (migration 0042),
+                              shown only when it is not approved, so such a
+                              token is never presented as ordinary access. */}
+                          {token.client_approval_status !== "approved" ? (
+                            <div className="mt-1">
+                              <OAuthClientStatusBadge
+                                status={token.client_approval_status}
+                                t={t}
+                              />
+                            </div>
+                          ) : null}
                         </TableCell>
                         <TableCell>
                           <code className="text-xs font-mono">
@@ -637,6 +649,7 @@ export default function AccessPage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t("access:columnClientName")}</TableHead>
+                    <TableHead>{t("oauth-clients:columnStatus")}</TableHead>
                     <TableHead>{t("access:columnClientId")}</TableHead>
                     <TableHead>{t("access:columnRedirectUris")}</TableHead>
                     <TableHead>{t("access:columnSecret")}</TableHead>
@@ -645,7 +658,7 @@ export default function AccessPage() {
                 </TableHeader>
                 <TableBody>
                   <ListStateRow
-                    colSpan={5}
+                    colSpan={6}
                     isLoading={clientsQuery.isLoading}
                     isError={clientsQuery.isError}
                     isEmpty={clients.length === 0}
@@ -659,6 +672,13 @@ export default function AccessPage() {
                       <TableRow key={client.client_id}>
                         <TableCell className="font-medium">
                           {client.client_name}
+                        </TableCell>
+                        <TableCell>
+                          <OAuthClientStatusBadge
+                            status={client.approval_status}
+                            source={client.registration_source}
+                            t={t}
+                          />
                         </TableCell>
                         <TableCell>
                           <code className="text-xs font-mono break-all">

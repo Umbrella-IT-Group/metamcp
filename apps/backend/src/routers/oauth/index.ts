@@ -11,7 +11,7 @@ import {
   toolCallAuditRepository,
 } from "../../db/repositories";
 import authorizationRouter from "./authorization";
-import { sweepUnusedDcrClients } from "./client-retention";
+import { sweepUnapprovedDcrClients } from "./client-retention";
 import metadataRouter from "./metadata";
 import registrationRouter from "./registration";
 import tokenRouter from "./token";
@@ -19,11 +19,20 @@ import userinfoRouter from "./userinfo";
 import {
   isOAuthServedPath,
   jsonParsingMiddleware,
+  oauthRouterOptions,
   securityHeaders,
   urlencodedParsingMiddleware,
 } from "./utils";
 
-const oauthRouter = express.Router();
+// Every OAuth router is created case-sensitive (this one and each sub-router,
+// see oauthRouterOptions). Express matches routes case-insensitively by
+// default, so `/OAuth/Authorize` reached the same handler as
+// `/oauth/authorize`. A path-based gate in front of this gateway (for example
+// an edge access policy on `/oauth/authorize`) may compare paths exactly and
+// would not treat another spelling as the same endpoint. Only the exact
+// lowercase paths the discovery metadata advertises route; any other spelling
+// answers 404.
+const oauthRouter = express.Router(oauthRouterOptions);
 
 // Tool-call audit retention (days). The prune rides the same cleanup interval
 // below; <=0 disables pruning (retain forever), and anything between 1 and 29
@@ -59,8 +68,8 @@ setInterval(
     // tool-audit prune does: `cleanupExpired` above already runs here, the
     // work is a single bounded DELETE, and a second timer would be a second
     // thing to reason about at shutdown. Errors are logged and swallowed here
-    // deliberately — see sweepUnusedDcrClients, which never throws.
-    await sweepUnusedDcrClients();
+    // deliberately — see sweepUnapprovedDcrClients, which never throws.
+    await sweepUnapprovedDcrClients();
     // Audit-table growth tripwire. LAST on the tick, and that ordering is the
     // point: it reports what the estate looks like after the sweeps above have
     // run, not what it looked like a moment before they shrank it.

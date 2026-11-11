@@ -261,6 +261,12 @@ describe("an admin-plane key", () => {
         "frontend.config.setSignupDisabled",
         "frontend.config.getSignupDisabled",
         "frontend.oauthClients.list",
+        // Deciding which self-registered clients people may authorize, and
+        // minting an already approved client, stay with administrators'
+        // own sessions (migration 0042).
+        "frontend.oauthClients.approve",
+        "frontend.oauthClients.reject",
+        "frontend.oauthClients.create",
       ]),
     );
     for (const path of denied) {

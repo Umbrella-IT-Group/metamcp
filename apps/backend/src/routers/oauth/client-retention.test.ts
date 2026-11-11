@@ -1,12 +1,12 @@
 /**
- * The retention sweep for never-used dynamically-registered clients.
+ * The retention sweep for self-registered clients no administrator approved
+ * (pending past the window, or rejected more than a day ago).
  *
  * `POST /oauth/register` needs no credential, so `oauth_clients` is the one
- * table an anonymous caller can grow and nothing could shrink; 45 junk rows
- * had accumulated. The sweep is the prune path.
+ * table an anonymous caller can grow. The sweep is the prune path.
  *
- * The SQL anti-join itself lives in the repository and needs a real postgres
- * to exercise (see access-queries.integration.test.ts for that harness). What
+ * The SQL itself lives in the repository and needs a real postgres to
+ * exercise (see client-retention.integration.test.ts for that harness). What
  * is pinned here is everything around it that decides WHETHER and with WHAT
  * the delete runs: the window resolution, the disable switch, and the promise
  * that a sweep failure cannot take down the interval it rides on.
@@ -24,7 +24,7 @@ const loggerMock = {
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
 const oauthRepositoryMock = {
-  pruneUnusedClients: vi.fn(),
+  pruneUnapprovedDcrClients: vi.fn(),
 };
 
 vi.mock("../../db/repositories", () => ({
@@ -34,15 +34,16 @@ vi.mock("../../db/repositories", () => ({
 const {
   DCR_CLIENT_RETENTION_DAYS_ENV,
   DEFAULT_DCR_CLIENT_RETENTION_DAYS,
+  REJECTED_DCR_CLIENT_RETENTION_MS,
   resolveDcrClientRetentionDays,
-  sweepUnusedDcrClients,
+  sweepUnapprovedDcrClients,
 } = await import("./client-retention");
 
 const originalEnv = process.env[DCR_CLIENT_RETENTION_DAYS_ENV];
 
 beforeEach(() => {
   vi.clearAllMocks();
-  oauthRepositoryMock.pruneUnusedClients.mockResolvedValue(0);
+  oauthRepositoryMock.pruneUnapprovedDcrClients.mockResolvedValue(0);
   delete process.env[DCR_CLIENT_RETENTION_DAYS_ENV];
 });
 
@@ -81,27 +82,34 @@ describe("resolveDcrClientRetentionDays", () => {
   });
 });
 
-describe("sweepUnusedDcrClients", () => {
-  it("passes the resolved window to the repository", async () => {
+describe("sweepUnapprovedDcrClients", () => {
+  it("passes the resolved pending window and the one-day rejected window", async () => {
     process.env[DCR_CLIENT_RETENTION_DAYS_ENV] = "14";
-    await sweepUnusedDcrClients();
-    expect(oauthRepositoryMock.pruneUnusedClients).toHaveBeenCalledWith(14);
+    await sweepUnapprovedDcrClients();
+    expect(oauthRepositoryMock.pruneUnapprovedDcrClients).toHaveBeenCalledWith(
+      14,
+      24 * 60 * 60 * 1000,
+    );
+    expect(REJECTED_DCR_CLIENT_RETENTION_MS).toBe(24 * 60 * 60 * 1000);
   });
 
   it("does not touch the table at all when disabled", async () => {
     // The escape hatch has to be a real one: an operator who sets this to 0
     // must get zero DELETEs, not a DELETE with a zero-day cutoff — which
-    // would sweep every client registered more than an instant ago.
+    // would sweep every pending client registered more than an instant ago.
+    // It disables the rejected-row half as well: one switch, the whole sweep.
     for (const value of ["0", "-1"]) {
       process.env[DCR_CLIENT_RETENTION_DAYS_ENV] = value;
-      await expect(sweepUnusedDcrClients()).resolves.toBe(0);
+      await expect(sweepUnapprovedDcrClients()).resolves.toBe(0);
     }
-    expect(oauthRepositoryMock.pruneUnusedClients).not.toHaveBeenCalled();
+    expect(
+      oauthRepositoryMock.pruneUnapprovedDcrClients,
+    ).not.toHaveBeenCalled();
   });
 
   it("reports what it removed", async () => {
-    oauthRepositoryMock.pruneUnusedClients.mockResolvedValue(45);
-    await expect(sweepUnusedDcrClients()).resolves.toBe(45);
+    oauthRepositoryMock.pruneUnapprovedDcrClients.mockResolvedValue(45);
+    await expect(sweepUnapprovedDcrClients()).resolves.toBe(45);
     expect(loggerMock.info).toHaveBeenCalledWith(
       expect.stringContaining("swept 45"),
     );
@@ -110,7 +118,7 @@ describe("sweepUnusedDcrClients", () => {
   it("stays quiet when there was nothing to sweep", async () => {
     // Every five minutes, forever. A "removed 0" line here is what makes an
     // operator stop reading this log.
-    await sweepUnusedDcrClients();
+    await sweepUnapprovedDcrClients();
     expect(loggerMock.info).not.toHaveBeenCalled();
   });
 
@@ -118,11 +126,11 @@ describe("sweepUnusedDcrClients", () => {
     // It rides the shared 5-minute cleanup interval in ./index.ts. A rejection
     // there is an unhandled rejection in a callback nobody awaits, not a
     // failed request someone can see.
-    oauthRepositoryMock.pruneUnusedClients.mockRejectedValue(
+    oauthRepositoryMock.pruneUnapprovedDcrClients.mockRejectedValue(
       new Error("connection terminated"),
     );
 
-    await expect(sweepUnusedDcrClients()).resolves.toBe(0);
+    await expect(sweepUnapprovedDcrClients()).resolves.toBe(0);
     expect(loggerMock.error).toHaveBeenCalledTimes(1);
   });
 });

@@ -4,9 +4,15 @@ import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../../db/repositories";
 import { matchPublicMcpResourcePath } from "../../lib/public-mcp-resource";
-import { getBaseUrl, getIssuerIdentifier, GRANTED_OAUTH_SCOPE } from "./utils";
+import { getOAuthDcrMode } from "./dcr-mode";
+import {
+  getBaseUrl,
+  getIssuerIdentifier,
+  GRANTED_OAUTH_SCOPE,
+  oauthRouterOptions,
+} from "./utils";
 
-const metadataRouter = express.Router();
+const metadataRouter = express.Router(oauthRouterOptions);
 
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
 const AUTHORIZATION_SERVER_PATH = "/.well-known/oauth-authorization-server";
@@ -237,7 +243,15 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
       // MCP-compatible OAuth endpoints (proxied through frontend)
       authorization_endpoint: `${baseUrl}/oauth/authorize`,
       token_endpoint: `${baseUrl}/oauth/token`,
-      registration_endpoint: `${baseUrl}/oauth/register`,
+      // Advertised only while self-registration is accepted
+      // (OAUTH_DCR_MODE pending or open). With registration off the member is
+      // omitted, which RFC 8414 allows, so a client does not try a door that
+      // will refuse it. This document is cached for an hour (below), so a
+      // client may still see the old value for up to an hour after the mode
+      // changes; POST /oauth/register refuses immediately either way.
+      ...(getOAuthDcrMode() === "off"
+        ? {}
+        : { registration_endpoint: `${baseUrl}/oauth/register` }),
       userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
 
       // Supported response types (required by RFC 8414)

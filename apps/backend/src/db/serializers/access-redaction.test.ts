@@ -73,6 +73,7 @@ const dbToken = {
   user_email: "attacker@example.invalid",
   client_id: "mcp_client_abc",
   client_name: "Claude",
+  client_approval_status: "approved",
   scope: "mcp",
   created_at: CREATED_AT,
   expires_at: EXPIRES_AT,
@@ -230,6 +231,7 @@ describe("OAuthTokensSerializer.serializeActiveTokenList", () => {
       expect(Object.keys(serialized).sort()).toEqual(
         [
           "access_token_last4",
+          "client_approval_status",
           "client_id",
           "client_name",
           "created_at",

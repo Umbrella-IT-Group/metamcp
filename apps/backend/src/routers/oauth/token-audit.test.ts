@@ -266,6 +266,7 @@ describe("oauth.token.issue — the authorization_code grant", () => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
     });
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: "Claude",
       token_endpoint_auth_method: "none",

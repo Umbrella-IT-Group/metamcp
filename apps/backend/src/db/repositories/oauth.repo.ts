@@ -6,13 +6,14 @@ import {
   OAuthClient,
   OAuthClientCreateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, gt, isNull, lt, notExists, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 
 import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
 import { hashClientSecret } from "@/routers/oauth/utils";
 
 import { db } from "../index";
 import {
+  auditLogTable,
   oauthAccessTokensTable,
   oauthAuthorizationCodesTable,
   oauthClientsTable,
@@ -82,13 +83,109 @@ export class OAuthRepository {
 
   // Admin listing for the OAuth Clients management UI. Newest first, matching
   // how every other admin list in the app is ordered. Returns whole rows: the
-  // caller (the tRPC impl) is responsible for dropping `client_secret` before
-  // it leaves the server — see OAuthClientsSerializer.
-  async listClients(): Promise<OAuthClient[]> {
-    return db
-      .select()
+  // caller (the tRPC impl) is responsible for dropping `client_secret` and
+  // `client_secret_salt` before they leave the server — see
+  // OAuthClientsSerializer.
+  //
+  // `registered_from_ip` is the source address of the successful anonymous
+  // registration, from its `oauth.dcr.register` audit row: the only
+  // attribution an anonymous registration has, shown so an administrator
+  // deciding on a pending client can see where it came from. Only that one
+  // column is read; the audit row's detail never leaves the database here. A
+  // correlated subquery rather than a LEFT JOIN so a client can never appear
+  // twice, and LIMIT 1 on the earliest row for the same reason. NULL for admin
+  // and legacy rows (they have no such audit row) and when the detached audit
+  // write did not land.
+  async listClients(): Promise<
+    Array<OAuthClient & { registered_from_ip: string | null }>
+  > {
+    const registeredFromIp = sql<string | null>`(
+      SELECT ${auditLogTable.actor_ip}
+      FROM ${auditLogTable}
+      WHERE ${auditLogTable.action} = 'oauth.dcr.register'
+        AND ${auditLogTable.outcome} = 'success'
+        AND ${auditLogTable.target_id} = ${oauthClientsTable.client_id}
+      ORDER BY ${auditLogTable.occurred_at} ASC
+      LIMIT 1
+    )`.as("registered_from_ip");
+
+    const rows = await db
+      .select({
+        client: oauthClientsTable,
+        registered_from_ip: registeredFromIp,
+      })
       .from(oauthClientsTable)
       .orderBy(desc(oauthClientsTable.created_at));
+
+    return rows.map((row) => ({
+      ...row.client,
+      registered_from_ip: row.registered_from_ip ?? null,
+    }));
+  }
+
+  // ===== Approval decisions (migration 0042) =====
+
+  // Approve one PENDING SELF-REGISTERED client. A single conditional UPDATE is
+  // the whole decision: the row must still exist, still be `dcr`, still be
+  // `pending`, and still carry exactly the callbacks the caller validated. Two
+  // administrators deciding at once therefore produce one winner: postgres
+  // serializes the two UPDATEs on the row, and the second finds it no longer
+  // pending and changes nothing. Returns the changed row, or null when nothing
+  // matched (deleted, already decided, not self-registered, or callbacks that
+  // changed after they were checked); the caller classifies the miss.
+  //
+  // The actor and time come from the caller's authenticated context; nothing
+  // here reads a request body. Approval mints no grant or token: a user still
+  // has to authorize the client themselves.
+  async approvePendingDcrClient(
+    clientId: string,
+    validatedRedirectUris: string[],
+    approvedBy: string,
+    now: Date = new Date(),
+  ): Promise<OAuthClient | null> {
+    const updated = await db
+      .update(oauthClientsTable)
+      .set({
+        approval_status: "approved",
+        approved_by: approvedBy,
+        approved_at: now,
+        updated_at: now,
+      })
+      .where(
+        and(
+          eq(oauthClientsTable.client_id, clientId),
+          eq(oauthClientsTable.registration_source, "dcr"),
+          eq(oauthClientsTable.approval_status, "pending"),
+          eq(oauthClientsTable.redirect_uris, validatedRedirectUris),
+        ),
+      )
+      .returning();
+    return updated[0] ?? null;
+  }
+
+  // Reject one PENDING SELF-REGISTERED client, the same single conditional
+  // UPDATE as approval. rejected_at starts the one-day clock the retention
+  // sweep counts from.
+  async rejectPendingDcrClient(
+    clientId: string,
+    now: Date = new Date(),
+  ): Promise<OAuthClient | null> {
+    const updated = await db
+      .update(oauthClientsTable)
+      .set({
+        approval_status: "rejected",
+        rejected_at: now,
+        updated_at: now,
+      })
+      .where(
+        and(
+          eq(oauthClientsTable.client_id, clientId),
+          eq(oauthClientsTable.registration_source, "dcr"),
+          eq(oauthClientsTable.approval_status, "pending"),
+        ),
+      )
+      .returning();
+    return updated[0] ?? null;
   }
 
   // Hard delete — there is no is_active/soft-delete column on oauth_clients,
@@ -109,72 +206,57 @@ export class OAuthRepository {
     return deleted.length > 0;
   }
 
-  // Retention sweep for anonymous dynamic registrations: delete clients that
-  // were minted by DCR, were created longer ago than `olderThanDays`, and have
-  // NEVER produced an authorization code or an access token. All three
-  // conditions, and the first is not optional.
+  // Retention sweep for anonymous self-registrations that no administrator
+  // approved: delete DCR rows that are still PENDING and were created more
+  // than `pendingOlderThanDays` ago, and DCR rows that were REJECTED more than
+  // `rejectedOlderThanMs` ago (counted from rejected_at, not registration).
   //
-  // `/oauth/register` needs no credential, so this is the only table in the
-  // schema an unauthenticated caller can grow without bound. See
-  // ../../routers/oauth/client-retention.ts for why "no child rows" is a sound
-  // never-used test here (it rests on the 365-day refresh TTL keeping a token
-  // row alive for any client that ever paired) and for the env that tunes it.
+  // Nothing else is ever deleted, and the predicates say so positively:
+  //   - `registration_source = 'dcr'`, so admin-created rows (often unused on
+  //     purpose: pre-provisioned for someone who has not connected yet) and
+  //     legacy rows whose provenance is NULL never match. `eq` and not
+  //     `ne(..., 'admin')`, so an unknown provenance is kept;
+  //   - an approval status of exactly 'pending' or 'rejected', so an APPROVED
+  //     row survives however long it goes unused. The previous predicate
+  //     ("no code or token children") would have deleted an approved
+  //     self-registration that simply had not connected yet.
   //
-  // THE DISCRIMINATOR, and why it is a column rather than a client_id prefix.
-  // `oauth_clients` has two mint paths: this sweep's target, the anonymous DCR
-  // endpoint, and the admin UI's create-client dialog (trpc/oauth-clients.impl
-  // -> the same buildClientRegistration core). Both therefore call the same
-  // generateSecureClientId, so EVERY row from either door reads
-  // `mcp_client_<random>` — matching that prefix would delete admin-minted
-  // clients too, and an admin-minted client with no tokens is usually one that
-  // was pre-provisioned for a partner who has not paired yet. Migration 0029
-  // added `registration_source` so the two are distinguishable at all, and
-  // this equality is the only thing that reads it.
+  // The status predicates live in the DELETE itself rather than in an earlier
+  // candidate SELECT, so an administrator approving a row while a sweep runs
+  // cannot have it removed from under them: postgres re-checks the WHERE on
+  // the row it is about to delete, and an approved row no longer matches.
   //
-  // `eq(..., "dcr")` and not `ne(..., "admin")`: the column is NULL for every
-  // row written before 0029, whose provenance nobody recorded. A NULL is an
-  // unknown, an unknown might be an admin's, and the safe reading of an
-  // unknown is to keep the row. `ne` would also drop them (SQL NULL
-  // comparisons are UNKNOWN, so neither predicate MATCHES a NULL — but stating
-  // the intent positively is what stops the next edit from getting it wrong).
-  //
-  // NOT EXISTS rather than a LEFT JOIN with an IS NULL: the join form would
-  // multiply the client row by its children before filtering, and postgres can
-  // answer the anti-join directly off the two client_id indexes. `returning`
-  // gives the caller a real count, so the log line reports what happened
-  // instead of that the statement ran.
-  async pruneUnusedClients(olderThanDays: number): Promise<number> {
-    if (!Number.isFinite(olderThanDays) || olderThanDays <= 0) return 0;
+  // `/oauth/register` needs no credential, so this is still the only bound on
+  // how many rows an anonymous caller can leave behind. See
+  // ../../routers/oauth/client-retention.ts for the env that sets the window.
+  async pruneUnapprovedDcrClients(
+    pendingOlderThanDays: number,
+    rejectedOlderThanMs: number,
+    now: Date = new Date(),
+  ): Promise<number> {
+    if (!Number.isFinite(pendingOlderThanDays) || pendingOlderThanDays <= 0) {
+      return 0;
+    }
 
-    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+    const pendingCutoff = new Date(
+      now.getTime() - pendingOlderThanDays * 24 * 60 * 60 * 1000,
+    );
+    const rejectedCutoff = new Date(now.getTime() - rejectedOlderThanMs);
 
     const deleted = await db
       .delete(oauthClientsTable)
       .where(
         and(
           eq(oauthClientsTable.registration_source, "dcr"),
-          lt(oauthClientsTable.created_at, cutoff),
-          notExists(
-            db
-              .select({ one: sql`1` })
-              .from(oauthAuthorizationCodesTable)
-              .where(
-                eq(
-                  oauthAuthorizationCodesTable.client_id,
-                  oauthClientsTable.client_id,
-                ),
-              ),
-          ),
-          notExists(
-            db
-              .select({ one: sql`1` })
-              .from(oauthAccessTokensTable)
-              .where(
-                eq(
-                  oauthAccessTokensTable.client_id,
-                  oauthClientsTable.client_id,
-                ),
-              ),
+          or(
+            and(
+              eq(oauthClientsTable.approval_status, "pending"),
+              lt(oauthClientsTable.created_at, pendingCutoff),
+            ),
+            and(
+              eq(oauthClientsTable.approval_status, "rejected"),
+              lt(oauthClientsTable.rejected_at, rejectedCutoff),
+            ),
           ),
         ),
       )
@@ -364,6 +446,9 @@ export class OAuthRepository {
         user_email: usersTable.email,
         client_id: oauthAccessTokensTable.client_id,
         client_name: oauthClientsTable.client_name,
+        // The issuing client's approval state (migration 0042), so the Access
+        // view can mark a token whose client is not approved.
+        client_approval_status: oauthClientsTable.approval_status,
         scope: oauthAccessTokensTable.scope,
         created_at: oauthAccessTokensTable.created_at,
         expires_at: oauthAccessTokensTable.expires_at,

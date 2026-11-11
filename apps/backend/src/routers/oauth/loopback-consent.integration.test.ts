@@ -48,6 +48,7 @@ describeIfDb("headless loopback login (real Postgres)", () => {
   let db: typeof import("../../db/index").db;
   let schema: typeof import("../../db/schema");
   let eq: typeof import("drizzle-orm").eq;
+  let oauthRepository: typeof import("../../db/repositories").oauthRepository;
   let sessionCookie = "";
   let ipCounter = 0;
   const createdClients: string[] = [];
@@ -69,8 +70,21 @@ describeIfDb("headless loopback login (real Postgres)", () => {
       }),
     });
     expect(res.status).toBe(201);
-    const { client_id } = (await res.json()) as { client_id: string };
+    const { client_id, approval_status } = (await res.json()) as {
+      client_id: string;
+      approval_status: string;
+    };
     createdClients.push(client_id);
+    // A self-registration waits for an administrator (migration 0042); this
+    // suite is about the login after approval, so approve it the way the
+    // admin decision does (dcr-approval.integration.test.ts covers the wait).
+    expect(approval_status).toBe("pending");
+    const approved = await oauthRepository.approvePendingDcrClient(
+      client_id,
+      [LOOPBACK],
+      "itest-admin",
+    );
+    expect(approved?.approval_status).toBe("approved");
     return client_id;
   }
 
@@ -156,7 +170,7 @@ describeIfDb("headless loopback login (real Postgres)", () => {
     schema = await import("../../db/schema");
     ({ eq } = await import("drizzle-orm"));
     const { auth } = await import("../../auth");
-    const { oauthRepository } = await import("../../db/repositories");
+    ({ oauthRepository } = await import("../../db/repositories"));
     const utils = await import("./utils");
     const { default: registrationRouter } = await import("./registration");
     const { default: authorizationRouter } = await import("./authorization");
@@ -186,6 +200,9 @@ describeIfDb("headless loopback login (real Postgres)", () => {
       token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
+      // Written the way the admin create path writes a hosted client.
+      registration_source: "admin",
+      approval_status: "approved",
     } as Parameters<typeof oauthRepository.upsertClient>[0]);
     createdClients.push(WEB_CLIENT_ID);
 

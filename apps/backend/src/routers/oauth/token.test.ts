@@ -234,6 +234,7 @@ describe("POST /oauth/token — authorization_code success logging", () => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
     });
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: "Claude",
       token_endpoint_auth_method: "none",
@@ -324,6 +325,7 @@ describe("POST /oauth/token — authorization_code success logging", () => {
       'Evil"\n[oauth] token issued grant=refresh_token ' +
       "client=mcp_client_forged user=user-victim token=...dead rotated=true";
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: forged,
       token_endpoint_auth_method: "none",
@@ -430,6 +432,7 @@ describe("POST /oauth/token — disabled account is refused on both grants", () 
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
     });
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: "Claude",
       token_endpoint_auth_method: "none",
@@ -651,6 +654,7 @@ describe("POST /oauth/token — PKCE method must be S256", () => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
     });
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: "Claude",
       token_endpoint_auth_method: "none",
@@ -699,6 +703,7 @@ describe("POST /oauth/token — client secret compared in constant time", () => 
   const rightHashed = hashClientSecret(RIGHT_SECRET);
   const clientRow = (method: string) => ({
     client_id: CLIENT_ID,
+    approval_status: "approved",
     client_name: "Confidential Client",
     token_endpoint_auth_method: method,
     client_secret: rightHashed.hash,
@@ -820,6 +825,7 @@ describe("POST /oauth/token — authorization code is single-use under concurren
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
     });
     oauthRepositoryMock.getClient.mockResolvedValue({
+      approval_status: "approved",
       client_id: CLIENT_ID,
       client_name: "Claude",
       token_endpoint_auth_method: "none",

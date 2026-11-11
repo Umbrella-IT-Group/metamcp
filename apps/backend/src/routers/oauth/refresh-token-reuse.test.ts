@@ -200,6 +200,16 @@ beforeEach(() => {
   oauthRepositoryMock.recordRotatedRefreshToken.mockResolvedValue(undefined);
   oauthRepositoryMock.revokeFamily.mockResolvedValue(0);
   usersRepositoryMock.isDisabled.mockResolvedValue(false);
+  // The token's client, approved (migration 0042): this file is about reuse
+  // detection, and an unapproved client is refused before the claim.
+  oauthRepositoryMock.getClient.mockResolvedValue({
+    client_id: CLIENT_ID,
+    client_name: "Reuse Client",
+    approval_status: "approved",
+    token_endpoint_auth_method: "none",
+    client_secret: null,
+    client_secret_salt: null,
+  });
   armUserLockFakes(oauthRepositoryMock);
 });
 

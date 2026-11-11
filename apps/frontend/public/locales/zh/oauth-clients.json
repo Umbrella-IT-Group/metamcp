@@ -53,5 +53,27 @@
   "deleteConfirmDescription": "此操作将永久删除「{{name}}」，并吊销已向其签发的所有授权码和访问令牌。使用它的应用程序将立即停止工作。此操作无法撤销。",
   "deleteConfirmAction": "删除客户端",
   "clientDeleted": "OAuth 客户端已删除",
-  "deleteError": "删除 OAuth 客户端失败"
+  "deleteError": "删除 OAuth 客户端失败",
+
+  "columnStatus": "状态",
+  "columnRegisteredFrom": "注册来源",
+  "statusApproved": "已批准",
+  "statusPending": "等待批准",
+  "statusRejected": "已拒绝",
+  "statusUnknown": "未批准",
+  "sourceDcr": "自助注册",
+  "sourceAdmin": "由管理员创建",
+  "sourceLegacy": "在记录来源之前创建",
+  "registeredFromUnavailable": "不可用",
+  "registeredFromHelp": "自助注册请求来自的网络地址。它不能识别具体的人，也不表示该客户端是安全的。",
+  "approve": "批准",
+  "approving": "正在批准...",
+  "reject": "拒绝",
+  "rejecting": "正在拒绝...",
+  "clientApproved": "客户端已批准。用户现在可以授权它；每个人仍需自行批准自己的访问。",
+  "clientRejected": "客户端已拒绝。它无法使用，并将在一天后删除。",
+  "decisionError": "无法记录该决定",
+  "decisionStale": "列表加载后此客户端已发生变化，列表已刷新。",
+  "listLoadError": "无法加载 OAuth 客户端",
+  "approvalExplanation": "在用户自己电脑上运行的应用（例如 Claude Code）可以自助注册，但在管理员于此处批准之前会保持“等待批准”状态。只有本地（回环）回调可以通过这种方式批准；claude.ai 等托管应用使用通过“创建 OAuth 客户端”创建的客户端。批准客户端本身不会授予任何访问权限：每个人仍需自行批准自己的登录。请只批准您认识的客户端，并检查其注册来源地址。"
 }

@@ -1,3 +1,4 @@
+import { isOAuthClientApproved } from "@repo/zod-types";
 import { randomUUID } from "crypto";
 import express from "express";
 
@@ -18,15 +19,17 @@ import type {
   OAuthDbExecutor,
   OAuthTx,
 } from "../../db/repositories/oauth-user-lock";
+import { CLIENT_NOT_APPROVED_ERROR } from "./client-not-approved-page";
 import { requireIntrospectionCredential } from "./introspection-auth";
 import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
+  oauthRouterOptions,
   rateLimitToken,
   verifyClientSecret,
 } from "./utils";
 
-const tokenRouter = express.Router();
+const tokenRouter = express.Router(oauthRouterOptions);
 
 // Umbrella fork: TTLs are env-var configurable. Defaults are tuned for max
 // connectivity from clients that lack revoke-friendly UX (e.g. Claude.ai
@@ -653,6 +656,20 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
+  // Client approval (migration 0042), from the live row, before the code is
+  // consumed: a refused exchange leaves the code where it was. The consent
+  // decision does not mint a code for a client that is not approved, so a
+  // code reaching here for one predates a status change or was written
+  // outside that path; either way it buys nothing. Approval only moves
+  // pending to approved or rejected, so an approved row read here stays
+  // approved through the consume below.
+  if (!isOAuthClientApproved(clientData)) {
+    logger.warn(
+      `[oauth] token rejected reason=client_not_approved grant=authorization_code client=${codeData.client_id} user=${codeData.user_id}`,
+    );
+    return res.status(400).json(CLIENT_NOT_APPROVED_ERROR);
+  }
+
   // Validate client authentication based on registered auth method. The row was
   // loaded by `client_id`, which already matched the code's client above, so
   // the Basic header's id is compared against the same value it always was.
@@ -894,6 +911,8 @@ async function handleRefreshTokenGrant(
         error: "invalid_client",
         error_description: outcome.refusal,
       });
+    case "client_not_approved":
+      return res.status(400).json(CLIENT_NOT_APPROVED_ERROR);
     case "issued":
       break;
   }
@@ -946,6 +965,7 @@ type RefreshRotationOutcome =
   | { kind: "expired" }
   | { kind: "client_mismatch" }
   | { kind: "client_refused"; refusal: string }
+  | { kind: "client_not_approved" }
   | {
       kind: "issued";
       tokenData: { client_id: string; user_id: string; scope: string };
@@ -1089,9 +1109,10 @@ async function rotateRefreshTokenLocked(
   if (!clientData) {
     // Unreachable except in a race: access tokens reference oauth_clients with
     // ON DELETE CASCADE, so a token cannot outlive its client row. Without a
-    // row there is no method to judge by. `enforce` refuses (fail closed);
-    // `log` proceeds as before, where the mint below fails on that same
-    // foreign key and rolls the claim back with it.
+    // row there is no method to judge by and no approval to check. `enforce`
+    // keeps its own refusal; `log` falls through to the approval check below,
+    // which refuses a missing row in every mode (before, `log` proceeded and
+    // the mint failed on the foreign key, rolling the claim back).
     logger.warn(
       `[oauth] refresh client auth outcome=client_not_found mode=${clientAuthMode} client=${tokenData.client_id} user=${tokenData.user_id}`,
     );
@@ -1102,6 +1123,21 @@ async function rotateRefreshTokenLocked(
       };
     }
   }
+
+  // Client approval (migration 0042), from the row the TOKEN names, so a
+  // request that omits client_id is still judged against its client, and in
+  // both OAUTH_REFRESH_CLIENT_AUTH modes. Before the claim, the rotated
+  // marker and the mint, so a refusal consumes, records and deletes nothing
+  // and the row stays exactly as it was. Not audited, by the doctrine on
+  // emitTokenLifecycle: a refusal that destroys nothing would write a row
+  // per replay. The log line is the record.
+  if (!isOAuthClientApproved(clientData)) {
+    logger.warn(
+      `[oauth] token rejected reason=client_not_approved grant=refresh_token client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
+    return { kind: "client_not_approved" };
+  }
+
   // client_secret is a string or absent here: the endpoint refuses any other
   // type before a grant handler runs (firstNonStringParameter).
   const clientAuth = clientData

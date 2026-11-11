@@ -1,6 +1,8 @@
 import {
   CreateOAuthClientRequestSchema,
   CreateOAuthClientResponseSchema,
+  DecideOAuthClientRequestSchema,
+  DecideOAuthClientResponseSchema,
   DeleteOAuthClientRequestSchema,
   DeleteOAuthClientResponseSchema,
   ListOAuthClientsResponseSchema,
@@ -24,6 +26,14 @@ export const createOAuthClientsRouter = (implementations: {
     input: z.infer<typeof DeleteOAuthClientRequestSchema>,
     actor: AuditActor,
   ) => Promise<z.infer<typeof DeleteOAuthClientResponseSchema>>;
+  approve: (
+    input: z.infer<typeof DecideOAuthClientRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof DecideOAuthClientResponseSchema>>;
+  reject: (
+    input: z.infer<typeof DecideOAuthClientRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof DecideOAuthClientResponseSchema>>;
 }) => {
   return router({
     // Every procedure here is adminProcedure — unlike api-keys, which is
@@ -60,6 +70,24 @@ export const createOAuthClientsRouter = (implementations: {
       .output(DeleteOAuthClientResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return implementations.delete(input, auditActor(ctx));
+      }),
+
+    // Admin only: approve or reject a pending self-registered client. Not on
+    // ADMIN_PLANE_ALLOWED_PROCEDURES, so a CI (admin-plane) key cannot decide
+    // which clients people may authorize; only an administrator's own session
+    // can. The deciding administrator comes from the session, never the input.
+    approve: adminProcedure
+      .input(DecideOAuthClientRequestSchema)
+      .output(DecideOAuthClientResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.approve(input, auditActor(ctx));
+      }),
+
+    reject: adminProcedure
+      .input(DecideOAuthClientRequestSchema)
+      .output(DecideOAuthClientResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.reject(input, auditActor(ctx));
       }),
   });
 };

@@ -109,6 +109,7 @@ function clientRow(
   if (method === "none") {
     return {
       client_id: CLIENT_ID,
+      approval_status: "approved",
       client_name: "Public",
       token_endpoint_auth_method: "none",
       client_secret: null,
@@ -118,6 +119,7 @@ function clientRow(
   const hashed = utils.hashClientSecret(RIGHT_SECRET);
   return {
     client_id: CLIENT_ID,
+    approval_status: "approved",
     client_name: "Confidential",
     token_endpoint_auth_method: method,
     client_secret: hashed.hash,
