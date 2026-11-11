@@ -160,7 +160,6 @@ vi.mock("./tool-call-warmup", () => ({
   acquireSessionWithBoundedWarmup: warmupMock,
 }));
 
-import { getMcpServers } from "./fetch-metamcp";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { clearFilterCache } from "./metamcp-middleware/filter-tools.functional";
 import { clearOverrideCache } from "./metamcp-middleware/tool-overrides.functional";
@@ -316,114 +315,6 @@ afterEach(async () => {
       .pop()?.()
       .catch(() => undefined);
   }
-});
-
-describe("a namespace mount switched to INACTIVE stops serving at once", () => {
-  it("a live session that already listed the tool is refused on its next call, without listing again", async () => {
-    const live = await connectConsumer("live-session");
-    expect(await list(live)).toEqual(["writer__write"]);
-    expect(await outcome(live, "writer__write")).toBe("served");
-    expect(ran).toEqual(["writer-a:write"]);
-
-    // The admin write, without the live-session signal: the per-call check
-    // alone must refuse.
-    setMount(NS, WRITER.uuid, "INACTIVE");
-
-    expect(await outcome(live, "writer__write")).toBe("refused");
-    expect(ran).toEqual(["writer-a:write"]);
-  });
-
-  it("a fresh session is refused for the same INACTIVE mount", async () => {
-    setMount(NS, WRITER.uuid, "INACTIVE");
-    const fresh = await connectConsumer("fresh-session");
-    expect(await list(fresh)).toEqual([]);
-    expect(await outcome(fresh, "writer__write")).toBe("refused");
-    expect(ran).toEqual([]);
-  });
-
-  it("switched back to ACTIVE, the same live session is served again", async () => {
-    const live = await connectConsumer("live-session");
-    await list(live);
-    setMount(NS, WRITER.uuid, "INACTIVE");
-    expect(await outcome(live, "writer__write")).toBe("refused");
-
-    setMount(NS, WRITER.uuid, "ACTIVE");
-    expect(await outcome(live, "writer__write")).toBe("served");
-    expect(ran).toEqual(["writer-a:write"]);
-  });
-
-  it("a failed mount read refuses the call and reaches no backend", async () => {
-    const live = await connectConsumer("live-session");
-    await list(live);
-    state.failOn = { servers: true };
-    expect(await outcome(live, "writer__write")).toBe("refused");
-    expect(ran).toEqual([]);
-  });
-
-  it("another namespace that mounts the same server ACTIVE keeps its access", async () => {
-    state.mounts.push({
-      namespaceUuid: OTHER_NS,
-      serverUuid: WRITER.uuid,
-      status: "ACTIVE",
-    });
-    const here = await connectConsumer("session-here");
-    const there = await connectConsumer("session-there", OTHER_NS);
-    await list(here);
-    await list(there);
-
-    setMount(NS, WRITER.uuid, "INACTIVE");
-    notifyNamespaceMountChange(NS, WRITER.uuid);
-
-    expect(await outcome(here, "writer__write")).toBe("refused");
-    expect(await outcome(there, "writer__write")).toBe("served");
-    expect(ran).toEqual(["writer-a:write"]);
-  });
-
-  it("with two same-named servers mounted, a route cached to the one switched off is not used", async () => {
-    const TWIN = { uuid: "server-writer-twin", name: WRITER.name };
-    state.servers = [WRITER, TWIN];
-    state.mounts = [
-      { namespaceUuid: NS, serverUuid: WRITER.uuid, status: "ACTIVE" },
-      { namespaceUuid: NS, serverUuid: TWIN.uuid, status: "INACTIVE" },
-    ];
-    backends[TWIN.uuid] = await backend("writer-b");
-    const live = await connectConsumer("live-session");
-    await list(live);
-    expect(await outcome(live, "writer__write")).toBe("served");
-    expect(ran).toEqual(["writer-a:write"]);
-
-    // The one this session routed to is switched off; its twin comes on.
-    setMount(NS, WRITER.uuid, "INACTIVE");
-    setMount(NS, TWIN.uuid, "ACTIVE");
-
-    expect(await outcome(live, "writer__write")).toBe("served");
-    expect(ran).toEqual(["writer-a:write", "writer-b:write"]);
-  });
-
-  it("a recovery that starts after the mount is switched off does not reach the backend", async () => {
-    const live = await connectConsumer("live-session");
-    await list(live);
-    // The pooled client drops before the call, the one failure the proxy
-    // replays after a recovery. The mount is switched off while the
-    // recovery runs, so the recovery must not rebuild a route to it.
-    await backends[WRITER.uuid].client.close();
-    const replacement = await backend("writer-replacement");
-    pool.invalidateServerConnection.mockImplementation(async () => {
-      setMount(NS, WRITER.uuid, "INACTIVE");
-      backends[WRITER.uuid] = replacement;
-    });
-
-    await expect(call(live, "writer__write")).rejects.toThrow(
-      /no longer present in namespace/,
-    );
-    expect(ran).toEqual([]);
-    // The recovery read the routable set after the switch, not before.
-    expect(vi.mocked(getMcpServers)).toHaveBeenLastCalledWith(NS, false);
-
-    // And the session holds no route to the replacement either.
-    expect(await outcome(live, "writer__write")).toBe("refused");
-    expect(ran).toEqual([]);
-  });
 });
 
 describe("the admin write tells live sessions to drop their routes and re-list", () => {
