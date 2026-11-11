@@ -8,7 +8,10 @@ import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
 import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
 import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
-import { globalBodyParser } from "./lib/global-body-parser";
+import {
+  declaredLengthGuard,
+  globalBodyParser,
+} from "./lib/global-body-parser";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -59,7 +62,12 @@ app.disable("x-powered-by");
 // trust assumption and for why `trust proxy` is deliberately NOT set with it.
 app.use(auditContextMiddleware);
 
-// Global JSON middleware for non-proxy routes.
+// Request-body policy: the declared-length guard, then the per-surface JSON
+// lanes. Both ahead of every router, and the guard ahead of every body parser,
+// including each router's own: it answers 413, from the headers alone, any
+// request on any path or method whose declared Content-Length is over the
+// largest body the frontend forwards (10 MiB). Mounted after the audit context
+// above, which reads no body, so a refusal still carries its request id.
 //
 // The branches live in ./lib/global-body-parser rather than inline here for
 // one reason: this file calls `app.listen()` at module scope and so cannot be
@@ -67,6 +75,7 @@ app.use(auditContextMiddleware);
 // hand-copied these branches into a model app — which stayed green when the
 // real ones were deleted. See that module's header for what each lane does and
 // why the OAuth skip is what makes the 256kb router limit bind at all.
+app.use(declaredLengthGuard);
 app.use(globalBodyParser);
 
 // App-wide security response headers, ahead of every router. helmet was only

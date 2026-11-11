@@ -38,14 +38,11 @@ publicEndpointsRouter.use(
   }),
 );
 
-// JSON parsing middleware specifically for OpenAPI routes that need it
-publicEndpointsRouter.use((req, res, next) => {
-  // Only apply JSON parsing for OpenAPI tool execution endpoints
-  if (req.path.includes("/api/tools/") && req.method === "POST") {
-    return express.json({ limit: "50mb" })(req, res, next);
-  }
-  next();
-});
+// No body parser at this level. The MCP transports read the stream
+// themselves, and the routers that need a parsed body carry their own parser:
+// the OpenAPI bridge in front of its endpoint lookup (./public-metamcp/openapi/
+// routes.ts) and the admin router (./public-metamcp/admin.ts). A parser here
+// would run before every child and set the limit for all of them.
 
 // Use StreamableHTTP router for /mcp routes
 publicEndpointsRouter.use(streamableHttpRouter);
