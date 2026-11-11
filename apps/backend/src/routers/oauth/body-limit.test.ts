@@ -44,7 +44,7 @@ vi.mock("@/utils/logger", () => ({
 vi.mock("../../db/repositories", () => ({
   oauthRepository: {
     cleanupExpired: vi.fn().mockResolvedValue(undefined),
-    pruneUnusedClients: vi.fn().mockResolvedValue(0),
+    pruneUnapprovedDcrClients: vi.fn().mockResolvedValue(0),
     upsertClient: vi.fn().mockResolvedValue(undefined),
   },
   toolCallAuditRepository: { pruneOlderThan: vi.fn().mockResolvedValue(0) },
