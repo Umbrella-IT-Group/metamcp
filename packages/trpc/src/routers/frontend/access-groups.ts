@@ -70,9 +70,12 @@ export const createAccessGroupsRouter = (implementations: {
   return router({
     // EVERY procedure here is adminProcedure, queries included, and that is not
     // symmetry for its own sake. These rows ARE the authorization policy for
-    // OAuth callers: the group list tells a reader which endpoints are gated
-    // and who gets through them, which is a map of the estate's access model
-    // and of the accounts worth phishing. Unlike api-keys — where a member
+    // OAuth callers and for API keys by their owner: the group list tells a
+    // reader which endpoints are gated and who gets through them, which is a
+    // map of the estate's access model and of the accounts worth phishing. An
+    // operator-scope admin-plane key may call ten of the procedures below (see
+    // ADMIN_PLANE_OPERATOR_PROCEDURES); the administrator gate still applies to
+    // its owner on every one. Unlike api-keys — where a member
     // legitimately owns their own keys and reads them through
     // `protectedProcedure` — there is no per-user slice of this data that a
     // member has any business seeing, so there is nothing to scope and no

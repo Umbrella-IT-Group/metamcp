@@ -376,6 +376,29 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
     ).toBeUndefined();
   });
 
+  it("setToolPolicy runs inside the caller's transaction and rolls back with it", async () => {
+    // An admin-plane key's policy change shares one transaction with its audit
+    // row, so a failed audit insert has to undo the policy too.
+    class Rollback extends Error {}
+    await expect(
+      db.transaction(async (tx) => {
+        const set = await namespacesRepository.setToolPolicy(
+          NS_A,
+          "allowlist",
+          tx,
+        );
+        expect(set?.previous).toBe("allow_all");
+        throw new Rollback();
+      }),
+    ).rejects.toBeInstanceOf(Rollback);
+
+    const [row] = await db
+      .select({ tool_policy: schema.namespacesTable.tool_policy })
+      .from(schema.namespacesTable)
+      .where(eq(schema.namespacesTable.uuid, NS_A));
+    expect(row.tool_policy).toBe("allow_all");
+  });
+
   it("every namespace read carries the policy", async () => {
     await setPolicyDirect(NS_A, "allowlist");
     expect((await namespacesRepository.findByUuid(NS_A))?.tool_policy).toBe(

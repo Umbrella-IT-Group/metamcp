@@ -22,7 +22,7 @@ import logger from "@/utils/logger";
 import { accessGroupsRepository } from "../db/repositories/access-groups.repo";
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
 import { usersRepository } from "../db/repositories/users.repo";
-import { emitAdminEvent } from "../lib/audit/admin-event";
+import { withAdminAudit } from "../lib/audit/admin-write";
 import { clampAuditText } from "../lib/audit/audit-emitter";
 import { invalidateEndpointAccessCache } from "../lib/endpoint-access-control";
 
@@ -31,18 +31,28 @@ import { invalidateEndpointAccessCache } from "../lib/endpoint-access-control";
  * (migration 0033).
  *
  * EVERY MUTATION HERE INVALIDATES THE DECISION CACHE, unconditionally, on the
- * success path. Uniform rather than "only the ones that can change an answer":
- * `create` and `update` cannot change one today, but a later change that lets
- * `create` seed members would silently inherit a missing invalidation, and the
- * cost of over-invalidating is a cold cache and one extra round trip per key.
- * The failure mode of under-invalidating is a revoked user still being served
- * for up to a minute. See `lib/endpoint-access-control`.
+ * success path and only AFTER the write has committed. Uniform rather than
+ * "only the ones that can change an answer": `create` and `update` cannot
+ * change one today, but a later change that lets `create` seed members would
+ * silently inherit a missing invalidation, and the cost of over-invalidating is
+ * a cold cache and one extra round trip per key. The failure mode of
+ * under-invalidating is a revoked user still being served for up to a minute.
+ * After the commit rather than inside it, because a decision recomputed in the
+ * window between invalidating and committing would be cached against the old
+ * rows for the rest of the TTL. See `lib/endpoint-access-control`.
  *
- * EVERY MUTATION HERE EMITS. These grants are the authorization boundary for
- * OAuth callers, so who was added to what, and when an endpoint's gate was
- * switched on, must be answerable from `audit_log` and not from inference.
- * Emitted AFTER the write and BELOW every early return, so a mutation that
- * matched nothing leaves no row claiming it did.
+ * EVERY MUTATION HERE IS AUDITED, and WHO made it decides how. These grants are
+ * the authorization boundary for OAuth callers and for API keys, so who was
+ * added to what, and when an endpoint's gate was switched on, must be
+ * answerable from `audit_log` and not from inference. A request authenticated
+ * with an admin-plane API key (the operator scope may call all of them) writes
+ * its audit row in the SAME transaction as the change, awaited: if the row
+ * cannot be written the change is rolled back, including everything a group
+ * delete cascades to, and no success event is emitted twice. A human
+ * administrator's session keeps the best-effort record it always had. Both go
+ * through `withAdminAudit`; see `lib/audit/admin-write`. Emitted BELOW every
+ * early return, so a mutation that matched nothing leaves no row claiming it
+ * did.
  */
 export const accessGroupsImplementations = {
   list: async (): Promise<z.infer<typeof ListAccessGroupsResponseSchema>> => {
@@ -161,8 +171,8 @@ export const accessGroupsImplementations = {
           // actually gating anyone" — see EndpointAccessSchema.
           enable_oauth: endpoint.enable_oauth,
           enable_api_key_auth: endpoint.enable_api_key_auth,
-          // Carried so the panel stops reporting that unscoped API keys still
-          // reach a restricted endpoint once the pairing has closed that path.
+          // Carried so the panel can say whether gateway-wide keys are refused
+          // here outright, a separate switch from `restricted`.
           require_scoped_api_key: endpoint.require_scoped_api_key,
           groups,
         },
@@ -192,19 +202,25 @@ export const accessGroupsImplementations = {
         };
       }
 
-      const created = await accessGroupsRepository.create({
-        name: input.name,
-        description: input.description ?? null,
-      });
+      const created = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.create(
+            {
+              name: input.name,
+              description: input.description ?? null,
+            },
+            ...tx,
+          ),
+        (group) => ({
+          action: "group.create",
+          target_type: "access_group",
+          target_id: group.uuid,
+          detail: { name: clampAuditText(group.name, 100) },
+        }),
+      );
 
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.create",
-        target_type: "access_group",
-        target_id: created.uuid,
-        detail: { name: clampAuditText(created.name, 100) },
-      });
 
       return {
         success: true as const,
@@ -240,24 +256,33 @@ export const accessGroupsImplementations = {
         };
       }
 
-      const updated = await accessGroupsRepository.update({
-        uuid: input.uuid,
-        name: input.name,
-        description: input.description ?? null,
-      });
+      const updated = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.update(
+            {
+              uuid: input.uuid,
+              name: input.name,
+              description: input.description ?? null,
+            },
+            ...tx,
+          ),
+        (group) =>
+          group
+            ? {
+                action: "group.update",
+                target_type: "access_group",
+                target_id: group.uuid,
+                detail: { name: clampAuditText(group.name, 100) },
+              }
+            : null,
+      );
 
       if (!updated) {
         return { success: false as const, message: "Access group not found" };
       }
 
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.update",
-        target_type: "access_group",
-        target_id: updated.uuid,
-        detail: { name: clampAuditText(updated.name, 100) },
-      });
 
       return { success: true as const };
     } catch (error) {
@@ -275,7 +300,22 @@ export const accessGroupsImplementations = {
     actor?: AuditActor,
   ): Promise<z.infer<typeof AccessGroupMutationResponseSchema>> => {
     try {
-      const deleted = await accessGroupsRepository.deleteByUuid(input.uuid);
+      // The cascade to the group's memberships and mappings runs inside the
+      // delete statement, so for an admin-plane key a failed audit row rolls
+      // those back with the group.
+      const deleted = await withAdminAudit(
+        actor,
+        (...tx) => accessGroupsRepository.deleteByUuid(input.uuid, ...tx),
+        (group) =>
+          group
+            ? {
+                action: "group.delete",
+                target_type: "access_group",
+                target_id: input.uuid,
+                detail: { name: clampAuditText(group.name, 100) },
+              }
+            : null,
+      );
       if (!deleted) {
         return { success: false as const, message: "Access group not found" };
       }
@@ -283,13 +323,6 @@ export const accessGroupsImplementations = {
       // Deleting a group revokes every grant it carried (both mapping tables
       // cascade), so the cache must drop before the next request is served.
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.delete",
-        target_type: "access_group",
-        target_id: input.uuid,
-        detail: { name: clampAuditText(deleted.name, 100) },
-      });
 
       return { success: true as const };
     } catch (error) {
@@ -320,15 +353,34 @@ export const accessGroupsImplementations = {
         return { success: false as const, message: "User not found" };
       }
 
-      const added = await accessGroupsRepository.addMember(
-        input.group_uuid,
-        input.user_id,
+      const added = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.addMember(
+            input.group_uuid,
+            input.user_id,
+            ...tx,
+          ),
+        // No row when nothing was added: a row claiming a grant was made would
+        // be false.
+        (wasAdded) =>
+          wasAdded
+            ? {
+                action: "group.member.add",
+                target_type: "access_group",
+                target_id: input.group_uuid,
+                detail: {
+                  group_name: clampAuditText(group.name, 100),
+                  user_id: input.user_id,
+                  user_email: clampAuditText(user.email, 320),
+                },
+              }
+            : null,
       );
 
       if (!added) {
         // Already a member. Reported as success — the caller's intent holds —
-        // but with no audit row, because nothing changed and a row claiming a
-        // grant was made would be false.
+        // but with no audit row, because nothing changed.
         return {
           success: true as const,
           message: "User is already a member of this group",
@@ -336,17 +388,6 @@ export const accessGroupsImplementations = {
       }
 
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.member.add",
-        target_type: "access_group",
-        target_id: input.group_uuid,
-        detail: {
-          group_name: clampAuditText(group.name, 100),
-          user_id: input.user_id,
-          user_email: clampAuditText(user.email, 320),
-        },
-      });
 
       return { success: true as const };
     } catch (error) {
@@ -369,9 +410,26 @@ export const accessGroupsImplementations = {
         return { success: false as const, message: "Access group not found" };
       }
 
-      const removed = await accessGroupsRepository.removeMember(
-        input.group_uuid,
-        input.user_id,
+      const removed = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.removeMember(
+            input.group_uuid,
+            input.user_id,
+            ...tx,
+          ),
+        (wasRemoved) =>
+          wasRemoved
+            ? {
+                action: "group.member.remove",
+                target_type: "access_group",
+                target_id: input.group_uuid,
+                detail: {
+                  group_name: clampAuditText(group.name, 100),
+                  user_id: input.user_id,
+                },
+              }
+            : null,
       );
 
       if (!removed) {
@@ -385,16 +443,6 @@ export const accessGroupsImplementations = {
       // for the rest of the decision TTL, which is exactly the window an
       // operator removing someone in a hurry cannot afford.
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.member.remove",
-        target_type: "access_group",
-        target_id: input.group_uuid,
-        detail: {
-          group_name: clampAuditText(group.name, 100),
-          user_id: input.user_id,
-        },
-      });
 
       return { success: true as const };
     } catch (error) {
@@ -423,9 +471,32 @@ export const accessGroupsImplementations = {
         return { success: false as const, message: "Endpoint not found" };
       }
 
-      const added = await accessGroupsRepository.addEndpoint(
-        input.group_uuid,
-        input.endpoint_uuid,
+      const added = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.addEndpoint(
+            input.group_uuid,
+            input.endpoint_uuid,
+            ...tx,
+          ),
+        (wasAdded) =>
+          wasAdded
+            ? {
+                action: "group.endpoint.add",
+                target_type: "access_group",
+                target_id: input.group_uuid,
+                detail: {
+                  group_name: clampAuditText(group.name, 100),
+                  endpoint_uuid: input.endpoint_uuid,
+                  endpoint_name: clampAuditText(endpoint.name, 100),
+                  // Whether the grant does anything yet. A mapping onto an
+                  // endpoint that has not opted in is legal and inert, and a
+                  // reader of this row should not have to join against
+                  // `endpoints` to find that out.
+                  endpoint_restricted: endpoint.restricted,
+                },
+              }
+            : null,
       );
 
       if (!added) {
@@ -436,21 +507,6 @@ export const accessGroupsImplementations = {
       }
 
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.endpoint.add",
-        target_type: "access_group",
-        target_id: input.group_uuid,
-        detail: {
-          group_name: clampAuditText(group.name, 100),
-          endpoint_uuid: input.endpoint_uuid,
-          endpoint_name: clampAuditText(endpoint.name, 100),
-          // Whether the grant does anything yet. A mapping onto an endpoint
-          // that has not opted in is legal and inert, and a reader of this row
-          // should not have to join against `endpoints` to find that out.
-          endpoint_restricted: endpoint.restricted,
-        },
-      });
 
       return { success: true as const };
     } catch (error) {
@@ -473,9 +529,26 @@ export const accessGroupsImplementations = {
         return { success: false as const, message: "Access group not found" };
       }
 
-      const removed = await accessGroupsRepository.removeEndpoint(
-        input.group_uuid,
-        input.endpoint_uuid,
+      const removed = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.removeEndpoint(
+            input.group_uuid,
+            input.endpoint_uuid,
+            ...tx,
+          ),
+        (wasRemoved) =>
+          wasRemoved
+            ? {
+                action: "group.endpoint.remove",
+                target_type: "access_group",
+                target_id: input.group_uuid,
+                detail: {
+                  group_name: clampAuditText(group.name, 100),
+                  endpoint_uuid: input.endpoint_uuid,
+                },
+              }
+            : null,
       );
 
       if (!removed) {
@@ -486,16 +559,6 @@ export const accessGroupsImplementations = {
       }
 
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "group.endpoint.remove",
-        target_type: "access_group",
-        target_id: input.group_uuid,
-        detail: {
-          group_name: clampAuditText(group.name, 100),
-          endpoint_uuid: input.endpoint_uuid,
-        },
-      });
 
       return { success: true as const };
     } catch (error) {
@@ -520,9 +583,34 @@ export const accessGroupsImplementations = {
         return { success: false as const, message: "Endpoint not found" };
       }
 
-      const updated = await accessGroupsRepository.setEndpointRestricted(
-        input.endpoint_uuid,
-        input.restricted,
+      const updated = await withAdminAudit(
+        actor,
+        (...tx) =>
+          accessGroupsRepository.setEndpointRestricted(
+            input.endpoint_uuid,
+            input.restricted,
+            ...tx,
+          ),
+        (endpoint) =>
+          endpoint
+            ? {
+                action: "endpoint.restricted.set",
+                target_type: "endpoint",
+                target_id: endpoint.uuid,
+                detail: {
+                  name: clampAuditText(endpoint.name, 100),
+                  // Both values, because "who turned this on" and "what was it
+                  // before" are the two questions asked of this row, and a
+                  // single new value only answers the first.
+                  previous: existing.restricted,
+                  restricted: endpoint.restricted,
+                  // The stored value, unchanged by this write: restricting an
+                  // endpoint does not touch the scoped-key requirement, and the
+                  // row records which of the two switches was on at that moment.
+                  require_scoped_api_key: endpoint.require_scoped_api_key,
+                },
+              }
+            : null,
       );
       if (!updated) {
         return { success: false as const, message: "Endpoint not found" };
@@ -533,24 +621,6 @@ export const accessGroupsImplementations = {
       // restricted period are keyed on (user, endpoint) and carry no record of
       // the gate's state, so they would be reused against the new mapping.
       invalidateEndpointAccessCache();
-
-      emitAdminEvent(actor, {
-        action: "endpoint.restricted.set",
-        target_type: "endpoint",
-        target_id: updated.uuid,
-        detail: {
-          name: clampAuditText(updated.name, 100),
-          // Both values, because "who turned this on" and "what was it before"
-          // are the two questions asked of this row, and a single new value
-          // only answers the first.
-          previous: existing.restricted,
-          restricted: updated.restricted,
-          // Records the paired side effect: restricting an endpoint forces the
-          // scoped-key requirement on, so the audit shows the API-key plane was
-          // closed at the same moment, not left open.
-          require_scoped_api_key: updated.require_scoped_api_key,
-        },
-      });
 
       return { success: true as const };
     } catch (error) {

@@ -813,9 +813,34 @@ export const namespacesImplementations = {
         };
       }
 
-      const result = await namespacesRepository.setToolPolicy(
-        input.namespaceUuid,
-        input.toolPolicy,
+      // The policy write and its audit row are one transaction for an
+      // admin-plane key (an audit failure leaves the policy as it was); for
+      // everyone else the event is emitted best-effort right after the write.
+      // A no-op set (same value) is recorded too: it is still an administrator
+      // asserting the namespace's policy. Recorded with the value it replaced
+      // so the audit trail alone says whether a namespace was opened up or
+      // locked down, and when.
+      const result = await withAdminAudit(
+        actor,
+        (...tx) =>
+          namespacesRepository.setToolPolicy(
+            input.namespaceUuid,
+            input.toolPolicy,
+            ...tx,
+          ),
+        (written) =>
+          written
+            ? {
+                action: "namespace.tool_policy",
+                target_type: "namespace",
+                target_id: input.namespaceUuid,
+                detail: {
+                  name: written.namespace.name,
+                  previous: written.previous,
+                  tool_policy: written.namespace.tool_policy,
+                },
+              }
+            : null,
       );
 
       if (!result) {
@@ -827,23 +852,10 @@ export const namespacesImplementations = {
 
       // The filter caches the policy (and statuses) for up to a second; clear
       // this namespace's entries so the flip applies to the very next
-      // tools/list or tools/call rather than within the TTL.
+      // tools/list or tools/call rather than within the TTL. After the commit,
+      // so a request that refills the cache in between cannot cache the old
+      // policy.
       clearFilterCache(input.namespaceUuid);
-
-      // Recorded with the value it replaced so the audit trail alone says
-      // whether a namespace was opened up or locked down, and when. A no-op
-      // set (same value) is recorded too: it is still an administrator
-      // asserting the namespace's policy.
-      emitAdminEvent(actor, {
-        action: "namespace.tool_policy",
-        target_type: "namespace",
-        target_id: input.namespaceUuid,
-        detail: {
-          name: result.namespace.name,
-          previous: result.previous,
-          tool_policy: result.namespace.tool_policy,
-        },
-      });
 
       return {
         success: true as const,

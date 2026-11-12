@@ -15,7 +15,7 @@
     "lint:fix": "eslint . --fix",
     "check-types": "tsc --noEmit",
     "test": "vitest run",
-    "test:integration": "vitest run --no-file-parallelism --testTimeout=90000 --hookTimeout=180000 src/db/repositories/api-key-admin-plane-scope.integration.test.ts src/db/repositories/api-key-admin-plane.integration.test.ts src/db/repositories/api-key-ip-allowlist.integration.test.ts src/trpc/admin-plane-scope.integration.test.ts src/trpc/admin-write.integration.test.ts src/trpc/api-key-mint.integration.test.ts",
+    "test:integration": "vitest run --no-file-parallelism --testTimeout=90000 --hookTimeout=180000 src/db/repositories/api-key-admin-plane-scope.integration.test.ts src/db/repositories/api-key-admin-plane.integration.test.ts src/db/repositories/api-key-ip-allowlist.integration.test.ts src/trpc/admin-plane-scope.integration.test.ts src/trpc/admin-write.integration.test.ts src/trpc/api-key-mint.integration.test.ts src/trpc/key-owner-groups.integration.test.ts src/db/repositories/access-groups.integration.test.ts src/db/repositories/access-queries.integration.test.ts src/db/repositories/namespace-tool-policy.integration.test.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "db:generate": "dotenv -e ../../.env -- drizzle-kit generate",

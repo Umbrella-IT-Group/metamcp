@@ -4,7 +4,9 @@
  *
  * Two scopes (migration 0043). `sync` is what a CI credential holds: exactly
  * the 10 procedures the configuration-sync tooling calls. `operator` is those
- * 10 plus 16 more for the operator's tooling, 26 in all, and `apiKeys.create`
+ * 10 plus 26 more for the operator's tooling, 36 in all: the 16 of the key,
+ * policy and provisioning tooling, and 10 that let it manage access groups,
+ * the `restricted` switch and a namespace's tool policy. `apiKeys.create`
  * (which reaches the implementation's narrow agent-mint branch) is among the
  * operator's and never the sync set's.
  *
@@ -39,9 +41,10 @@ const UUID_B = "22222222-2222-4222-8222-222222222222";
 const UUID_C = "33333333-3333-4333-8333-333333333333";
 
 // The two lists, written out here rather than read from the constants, so this
-// test fails if either constant changes. Oracle: the plan's decision 2 and the
-// sync tooling's pinned copy (Umbrella-MCP-Server
-// metamcp/sync/tests/test_admin_plane_procedures.py).
+// test fails if either constant changes. Oracle: the admin-plane plan's decision
+// 2 for the sync set and the first 26 of the operator set, and the tool
+// collections plan's K2 paragraph for the ten added (nine accessGroups
+// procedures and namespaces.setToolPolicy); the sync tooling pins a copy.
 const EXPECTED_SYNC = [
   "frontend.config.getMcpMaxTotalTimeout",
   "frontend.config.getMcpTimeout",
@@ -56,8 +59,17 @@ const EXPECTED_SYNC = [
 ];
 
 const EXPECTED_OPERATOR_EXTRA = [
+  "frontend.accessGroups.addEndpoint",
+  "frontend.accessGroups.addMember",
+  "frontend.accessGroups.create",
+  "frontend.accessGroups.delete",
   "frontend.accessGroups.get",
+  "frontend.accessGroups.getEndpointAccess",
   "frontend.accessGroups.list",
+  "frontend.accessGroups.removeEndpoint",
+  "frontend.accessGroups.removeMember",
+  "frontend.accessGroups.setEndpointRestricted",
+  "frontend.accessGroups.update",
   "frontend.apiKeys.create",
   "frontend.apiKeys.deactivate",
   "frontend.apiKeys.getGlobalIpPolicy",
@@ -68,6 +80,7 @@ const EXPECTED_OPERATOR_EXTRA = [
   "frontend.endpoints.update",
   "frontend.namespaces.create",
   "frontend.namespaces.refreshTools",
+  "frontend.namespaces.setToolPolicy",
   "frontend.namespaces.update",
   "frontend.namespaces.updateToolStatus",
   "frontend.oauthClients.list",
@@ -80,8 +93,32 @@ const EXPECTED_OPERATOR = [...EXPECTED_SYNC, ...EXPECTED_OPERATOR_EXTRA];
 // tooling sends, so input validation passes and the scope check is what
 // decides.
 const VALID_INPUTS: Record<string, unknown> = {
+  "frontend.accessGroups.addEndpoint": {
+    group_uuid: UUID_A,
+    endpoint_uuid: UUID_B,
+  },
+  "frontend.accessGroups.addMember": {
+    group_uuid: UUID_A,
+    user_id: "member-user-1",
+  },
+  "frontend.accessGroups.create": { name: "helpdesk" },
+  "frontend.accessGroups.delete": { uuid: UUID_A },
   "frontend.accessGroups.get": { uuid: UUID_A },
+  "frontend.accessGroups.getEndpointAccess": { endpoint_uuid: UUID_B },
   "frontend.accessGroups.list": undefined,
+  "frontend.accessGroups.removeEndpoint": {
+    group_uuid: UUID_A,
+    endpoint_uuid: UUID_B,
+  },
+  "frontend.accessGroups.removeMember": {
+    group_uuid: UUID_A,
+    user_id: "member-user-1",
+  },
+  "frontend.accessGroups.setEndpointRestricted": {
+    endpoint_uuid: UUID_B,
+    restricted: true,
+  },
+  "frontend.accessGroups.update": { uuid: UUID_A, name: "helpdesk" },
   "frontend.apiKeys.create": {
     name: "agent minted",
     user_id: "member-user-1",
@@ -135,6 +172,10 @@ const VALID_INPUTS: Record<string, unknown> = {
   "frontend.namespaces.refreshTools": {
     namespaceUuid: UUID_A,
     tools: [{ name: "sync-server__ping", inputSchema: { type: "object" } }],
+  },
+  "frontend.namespaces.setToolPolicy": {
+    namespaceUuid: UUID_A,
+    toolPolicy: "allowlist",
   },
   "frontend.namespaces.update": { uuid: UUID_A, name: "sync-namespace" },
   "frontend.namespaces.updateToolStatus": {
@@ -272,11 +313,25 @@ describe("the two procedure sets", () => {
     expect(ADMIN_PLANE_SYNC_PROCEDURES.size).toBe(10);
   });
 
-  it("pins the operator set to exactly those 10 plus 16 more, 26 in all", () => {
+  it("pins the operator set to exactly those 10 plus 26 more, 36 in all", () => {
     expect([...ADMIN_PLANE_OPERATOR_PROCEDURES].sort()).toEqual(
       [...EXPECTED_OPERATOR].sort(),
     );
-    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(26);
+    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(36);
+  });
+
+  it("gives the operator the access-group and tool-policy procedures and the sync set none of them", () => {
+    const groupAndPolicy = EXPECTED_OPERATOR_EXTRA.filter(
+      (path) =>
+        path.startsWith("frontend.accessGroups.") ||
+        path === "frontend.namespaces.setToolPolicy",
+    );
+    // The ten added, plus accessGroups.get and .list the operator already held.
+    expect(groupAndPolicy).toHaveLength(12);
+    for (const path of groupAndPolicy) {
+      expect(ADMIN_PLANE_OPERATOR_PROCEDURES.has(path)).toBe(true);
+      expect(ADMIN_PLANE_SYNC_PROCEDURES.has(path)).toBe(false);
+    }
   });
 
   it("holds every sync procedure inside the operator set", () => {
@@ -304,8 +359,9 @@ describe("the two procedure sets", () => {
 
 // Never reachable by either scope. Named so a change that lets one in has to
 // change this list: key lifecycle writes other than create and deactivate,
-// every user change, every access-group write, every OAuth client decision, and
-// every config setter.
+// every user change, every OAuth client decision, every config setter, and the
+// neighbours of the access-group and tool-policy procedures the operator does
+// hold (`listEndpoints`, the tool overrides write).
 const NEVER_REACHABLE = [
   "frontend.apiKeys.update",
   "frontend.apiKeys.delete",
@@ -315,14 +371,8 @@ const NEVER_REACHABLE = [
   "frontend.users.revokeAccess",
   "frontend.users.delete",
   "frontend.users.previewDelete",
-  "frontend.accessGroups.create",
-  "frontend.accessGroups.update",
-  "frontend.accessGroups.delete",
-  "frontend.accessGroups.addMember",
-  "frontend.accessGroups.removeMember",
-  "frontend.accessGroups.addEndpoint",
-  "frontend.accessGroups.removeEndpoint",
-  "frontend.accessGroups.setEndpointRestricted",
+  "frontend.accessGroups.listEndpoints",
+  "frontend.namespaces.updateToolOverrides",
   "frontend.oauthClients.approve",
   "frontend.oauthClients.reject",
   "frontend.oauthClients.create",
@@ -741,5 +791,66 @@ describe("a tRPC batch shares one context but is checked per procedure", () => {
       "frontend.users.list",
       "frontend.apiKeys.listAll",
     ]);
+  });
+
+  it("lets an operator batch of mutations reach a group write and refuses the user disable beside it", async () => {
+    // The two share one context; only the path decides. A group write is the
+    // operator's, a user disable is a human administrator's.
+    await new Promise((resolve) => server?.close(resolve));
+    denials = [];
+    await start(operatorCtx);
+    const paths = [
+      "frontend.accessGroups.setEndpointRestricted",
+      "frontend.users.setDisabled",
+      "frontend.namespaces.setToolPolicy",
+    ];
+    const res = await fetch(`${base}/trpc/${paths.join(",")}?batch=1`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        "0": VALID_INPUTS["frontend.accessGroups.setEndpointRestricted"],
+        "1": { id: "someone", disabled: true },
+        "2": VALID_INPUTS["frontend.namespaces.setToolPolicy"],
+      }),
+    });
+    const body = (await res.json()) as Array<{
+      error?: { json?: { data?: { code?: string } }; data?: { code?: string } };
+    }>;
+    const codeOf = (entry: (typeof body)[number] | undefined) =>
+      entry?.error?.data?.code ?? entry?.error?.json?.data?.code;
+
+    expect(body).toHaveLength(3);
+    expect(codeOf(body[0])).not.toBe("FORBIDDEN");
+    expect(codeOf(body[1])).toBe("FORBIDDEN");
+    expect(codeOf(body[2])).not.toBe("FORBIDDEN");
+    expect(denials.map((d) => d.path)).toEqual(["frontend.users.setDisabled"]);
+    expect(denials[0]?.admin_plane?.scope).toBe("operator");
+  });
+
+  it("refuses the same group write batch to a sync key, procedure by procedure", async () => {
+    await new Promise((resolve) => server?.close(resolve));
+    denials = [];
+    await start(syncCtx);
+    const paths = [
+      "frontend.accessGroups.setEndpointRestricted",
+      "frontend.namespaces.setToolPolicy",
+    ];
+    const res = await fetch(`${base}/trpc/${paths.join(",")}?batch=1`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        "0": VALID_INPUTS["frontend.accessGroups.setEndpointRestricted"],
+        "1": VALID_INPUTS["frontend.namespaces.setToolPolicy"],
+      }),
+    });
+    const body = (await res.json()) as Array<{
+      error?: { json?: { data?: { code?: string } }; data?: { code?: string } };
+    }>;
+    const codeOf = (entry: (typeof body)[number] | undefined) =>
+      entry?.error?.data?.code ?? entry?.error?.json?.data?.code;
+
+    expect(body.map(codeOf)).toEqual(["FORBIDDEN", "FORBIDDEN"]);
+    expect(denials.map((d) => d.path)).toEqual(paths);
+    expect(denials.every((d) => d.admin_plane?.scope === "sync")).toBe(true);
   });
 });
