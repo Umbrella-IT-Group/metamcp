@@ -81,7 +81,8 @@ jobs:
       # (`describe.skipIf`), so they skip here and every other case runs
       # against no infrastructure at all. Standing up a real database to
       # un-skip them is a separate decision with its own cost, not something
-      # to smuggle in behind a unit-test gate.
+      # to smuggle in behind a unit-test gate. The credential-boundary suites
+      # run against one in their own job below, `postgres-integration`.
       - run: pnpm -C apps/backend test
       - run: pnpm -C apps/frontend test
 
@@ -90,3 +91,81 @@ jobs:
       # eslint warnings that `--max-warnings 0` turns into a hard failure, so
       # gating it today would just make this check permanently red.
       - run: pnpm check-types
+
+  # The Postgres-backed suites that pin the admin-plane credential boundary:
+  # the columns a created key is written with, the transaction a key and its
+  # audit row share, the row locks that order a create against an owner's
+  # disable, and the audit transaction every admin-plane write runs in. They
+  # cannot be unit tests: each one is a statement about what a real database
+  # does, and with the database removed every one of them passes (the
+  # `describe.skipIf` above), so a change that persists an unlocked, public or
+  # admin-plane key, or lets a write commit without its audit row, would pass
+  # `test-and-typecheck`. This job runs them.
+  #
+  # A SEPARATE job on purpose, not steps in `test-and-typecheck`: the decision
+  # recorded above (a database is not smuggled in behind the unit-test gate)
+  # stands, so this one is visible by name and can be made a required check in
+  # branch protection as its own decision (context name:
+  # `postgres-integration`). Like the job above it has no `paths:` filter, so a
+  # required check on it always reports.
+  #
+  # The service database is a throwaway container bound to the runner with
+  # trust authentication and no password, so there is no credential in this
+  # file. A skipped test is a failure here: the report is checked below, since
+  # a missing or unreachable TEST_DATABASE_URL would otherwise skip every suite
+  # and leave the job green.
+  postgres-integration:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: itest
+          POSTGRES_DB: metamcp_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U itest -d metamcp_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://itest@127.0.0.1:5432/metamcp_test
+      TEST_DATABASE_URL: postgresql://itest@127.0.0.1:5432/metamcp_test
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Same builds, same reason, as in `test-and-typecheck`.
+      - run: pnpm --filter @repo/zod-types build
+      - run: pnpm --filter @repo/trpc build
+
+      # The real migrator, so a migration that does not apply fails here too.
+      - run: pnpm -C apps/backend exec drizzle-kit migrate
+
+      # The file list lives in apps/backend/package.json (`test:integration`).
+      - run: >-
+          pnpm -C apps/backend test:integration
+          --reporter=default --reporter=json
+          --outputFile=${{ runner.temp }}/integration-report.json
+
+      # Every suite file ran at least one test, nothing failed, nothing was
+      # skipped. `numPendingTests` is vitest's count of skipped tests.
+      - run: >-
+          jq -e '.numFailedTests == 0 and .numPendingTests == 0
+          and .numTotalTests > 0
+          and ([.testResults[] | select((.assertionResults | length) == 0)]
+          | length) == 0'
+          "${{ runner.temp }}/integration-report.json"
