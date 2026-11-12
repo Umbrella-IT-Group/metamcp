@@ -1,6 +1,6 @@
 /**
- * Endpoint create/update defaults and the restricted => require_scoped_api_key
- * pairing.
+ * Endpoint create/update defaults, and the independence of `restricted` and
+ * require_scoped_api_key.
  *
  * Three behaviours pinned here:
  *
@@ -13,10 +13,11 @@
  *    it, are built only when the caller asks. A create that omits
  *    `createMcpServer` gets neither.
  *
- *  - The pairing is enforced server-side: restricting an endpoint (on create,
- *    or by editing one that is already restricted) forces the scoped-key
- *    requirement on, so a restricted endpoint can never keep admitting unscoped
- *    gateway-wide API keys, the two controls only confine an endpoint together.
+ *  - `restricted` does not force the scoped-key requirement on, on create or
+ *    when editing a restricted endpoint: access groups apply to API keys by
+ *    their owner, so a restricted endpoint keeps admitting each member's
+ *    gateway-wide key unless an operator turns the scoped-key requirement on
+ *    as a separate choice. Each value is stored as submitted.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -138,10 +139,22 @@ describe("endpoints.create: default-closed ownership", () => {
   });
 });
 
-describe("endpoints.create: restricted => require_scoped_api_key pairing", () => {
-  it("forces require_scoped_api_key on when restricted is set, even if false was passed", async () => {
+describe("endpoints.create: restricted and require_scoped_api_key are independent", () => {
+  it("leaves require_scoped_api_key off when restricted is set and false was passed", async () => {
     await endpointsImplementations.create(
       createInput({ restricted: true, requireScopedApiKey: false }),
+      ADMIN_ID,
+    );
+
+    expect(endpointsRepositoryMock.create.mock.calls[0][0]).toMatchObject({
+      restricted: true,
+      require_scoped_api_key: false,
+    });
+  });
+
+  it("keeps require_scoped_api_key on when both are asked for", async () => {
+    await endpointsImplementations.create(
+      createInput({ restricted: true, requireScopedApiKey: true }),
       ADMIN_ID,
     );
 
@@ -239,8 +252,8 @@ describe("endpoints.create: companion MCP server is opt-in at the API", () => {
   });
 });
 
-describe("endpoints.update: pairing on a restricted endpoint", () => {
-  it("forces require_scoped_api_key back on when the endpoint is already restricted", async () => {
+describe("endpoints.update: a restricted endpoint keeps the submitted require_scoped_api_key", () => {
+  it("honors require_scoped_api_key false when the endpoint is already restricted", async () => {
     endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
       uuid: ENDPOINT_UUID,
       name: "reporting",
@@ -256,7 +269,7 @@ describe("endpoints.update: pairing on a restricted endpoint", () => {
     );
 
     expect(endpointsRepositoryMock.update.mock.calls[0][0]).toMatchObject({
-      require_scoped_api_key: true,
+      require_scoped_api_key: false,
     });
   });
 

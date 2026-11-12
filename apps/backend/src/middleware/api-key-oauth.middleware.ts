@@ -30,7 +30,7 @@ import {
 import { resolveClientIp } from "../lib/client-ip";
 import {
   ENDPOINT_ACCESS_DENIED_MESSAGE,
-  isOAuthUserAllowedOnEndpoint,
+  isUserAllowedOnEndpoint,
   recordAccessDenial,
 } from "../lib/endpoint-access-control";
 import { GRANTED_OAUTH_SCOPE } from "../routers/oauth/utils";
@@ -328,31 +328,61 @@ function emitMcpAuthDenial(
 }
 
 /**
- * Apply the access-group gate to an OAuth caller, answering 403 when it refuses.
+ * Who is asking the access-group gate, in the two shapes the gate serves.
+ *
+ * An OAuth caller is a signed-in user. An API-key caller is the key: the
+ * decision is made on the key's OWNER (`ownerUserId`, null for a public key),
+ * and the key's own uuid and scope only label the refusal and its audit row.
+ */
+type AccessGroupCaller =
+  | { kind: "oauth"; userId: string | undefined }
+  | {
+      kind: "api_key";
+      keyUuid: string | undefined;
+      ownerUserId: string | null | undefined;
+      scoped: boolean;
+    };
+
+/**
+ * Apply the access-group gate to a caller, answering 403 when it refuses.
  *
  * Returns `true` when the request was ANSWERED (i.e. the caller must stop), and
  * `false` when the caller may continue to `next()`. That shape rather than a
- * boolean "allowed" so the two OAuth branches below stay a flat sequence of
- * early returns like every other check in this middleware, instead of growing a
+ * boolean "allowed" so the branches below stay a flat sequence of early
+ * returns like every other check in this middleware, instead of growing a
  * nested conditional around their `next()`.
  *
- * Placed AFTER `checkOAuthAccess` at both call sites: an endpoint the caller
- * cannot reach on ownership grounds keeps its existing, more specific message,
- * and the group gate only ever narrows a request that would otherwise have been
- * served. On an endpoint with `restricted` false this costs one boolean read
- * and no round trip — see `lib/endpoint-access-control`.
+ * Placed AFTER `checkOAuthAccess` / `checkApiKeyAccess` at every call site: an
+ * endpoint the caller cannot reach on ownership or key-scope grounds keeps its
+ * existing, more specific message, and the group gate only ever narrows a
+ * request that would otherwise have been served. On an endpoint with
+ * `restricted` false this costs one boolean read and no round trip — see
+ * `lib/endpoint-access-control`.
+ *
+ * An API key is judged by its owner. A key with no owner (a public key) has no
+ * membership to consult and is refused on a restricted endpoint without a
+ * query: failing closed is the only safe direction on an endpoint an operator
+ * switched on. A key whose owner is an administrator passes, and so does one
+ * whose owner belongs to a group mapped to the endpoint, whichever way the key
+ * is scoped.
  *
  * The deny path writes an `endpoint.access.denied` audit row through the same
  * fire-and-forget emitter as every other refusal here, throttled per
- * (user, endpoint) with a suppressed-since-last count so a retrying connector
- * cannot flood a table that has no prune path. Emission never affects the
+ * (principal, endpoint) with a suppressed-since-last count so a retrying
+ * connector cannot flood a table that has no prune path. The principal is the
+ * user id for OAuth and `key:<uuid>` for a key. Emission never affects the
  * answer: `emit` swallows its own failures and the envelope build is guarded.
+ *
+ * The refusal sentence is the same for both caller kinds and names no
+ * endpoint, group or owner. A database failure while deciding is not caught
+ * here: it propagates to the middleware's catch, which answers 500 and serves
+ * nobody.
  */
 async function refuseByAccessGroup(
   req: express.Request,
   res: express.Response,
   endpoint: DatabaseEndpoint,
-  userId: string | undefined,
+  caller: AccessGroupCaller,
   presentedToken: string,
 ): Promise<boolean> {
   // The gate is off for this endpoint: no cache read, no query, nothing. This
@@ -360,25 +390,35 @@ async function refuseByAccessGroup(
   // seeded and nothing flagged.
   if (!endpoint.restricted) return false;
 
-  // A token carrying no user cannot belong to a group. `checkOAuthAccess`
-  // already refuses that case before this runs, so the `undefined` arm is
-  // defence in depth rather than a reachable branch — and it fails CLOSED,
-  // which is the only safe direction on an endpoint an operator switched on.
-  const allowed = userId
-    ? await isOAuthUserAllowedOnEndpoint(userId, endpoint)
+  // The user whose membership decides. For OAuth that is the token's user; for
+  // a key it is the owner. Neither being present cannot belong to a group:
+  // `checkOAuthAccess` already refuses a token with no user, so that arm is
+  // defence in depth, and an ownerless key is a reachable case that is refused
+  // here by design.
+  const deciderId =
+    caller.kind === "oauth" ? caller.userId : (caller.ownerUserId ?? undefined);
+  const allowed = deciderId
+    ? await isUserAllowedOnEndpoint(deciderId, endpoint)
     : false;
   if (allowed) return false;
 
+  const principal =
+    caller.kind === "oauth"
+      ? (caller.userId ?? "")
+      : `key:${caller.keyUuid ?? ""}`;
   const { emit: shouldEmit, suppressed } = recordAccessDenial(
-    userId ?? "",
+    principal,
     endpoint.uuid,
   );
   if (shouldEmit) {
     try {
       const requestContext = auditRequestContext(req);
       emit({
-        actor_type: "user",
-        actor_id: userId ?? null,
+        actor_type: caller.kind === "oauth" ? "user" : "api_key",
+        actor_id:
+          caller.kind === "oauth"
+            ? (caller.userId ?? null)
+            : (caller.keyUuid ?? null),
         actor_label: null,
         actor_ip: requestContext.actor_ip,
         actor_user_agent: requestContext.actor_user_agent,
@@ -390,9 +430,19 @@ async function refuseByAccessGroup(
         http_status: 403,
         detail: {
           reason: "access_group_denied",
-          auth_method: "oauth",
+          auth_method: caller.kind,
           endpoint_name: endpoint.name,
           credential: credentialFingerprint(presentedToken),
+          // Which owner a refused key belongs to, and whether it was scoped to
+          // this endpoint or gateway-wide, so a row answers "whose key, and how
+          // far did it reach" without a join. A user id and a scope word, never
+          // the key.
+          ...(caller.kind === "api_key"
+            ? {
+                owner_user_id: caller.ownerUserId ?? null,
+                key_scope: caller.scoped ? "endpoint" : "gateway",
+              }
+            : {}),
           // Attempts swallowed by the throttle since the last row was written,
           // so volume survives even though per-attempt timestamps do not.
           suppressed_since_last: suppressed,
@@ -404,20 +454,64 @@ async function refuseByAccessGroup(
     }
   }
 
-  logger.warn(
-    `[auth] oauth token rejected reason=access_group endpoint=${endpoint.uuid} user=${userId ?? "unattributed"}`,
-  );
+  if (caller.kind === "oauth") {
+    logger.warn(
+      `[auth] oauth token rejected reason=access_group endpoint=${endpoint.uuid} user=${caller.userId ?? "unattributed"}`,
+    );
+    res.status(403).json({
+      error: "access_denied",
+      // `error_description` rather than `message`, matching every other 403 on
+      // the OAuth branches of this middleware. The string is verbatim operator
+      // copy and is asserted byte-for-byte in endpoint-access-groups.test.ts —
+      // it is the only sentence a refused user ever sees.
+      error_description: ENDPOINT_ACCESS_DENIED_MESSAGE,
+      timestamp: new Date().toISOString(),
+    });
+    return true;
+  }
 
+  logger.warn(
+    `[auth] api key rejected reason=access_group endpoint=${endpoint.uuid} key=${caller.keyUuid ?? "unattributed"} owner=${caller.ownerUserId ?? "none"}`,
+  );
+  // The key branches' own body shape (`error` / `message`), carrying the same
+  // sentence an OAuth user is shown.
   res.status(403).json({
-    error: "access_denied",
-    // `error_description` rather than `message`, matching every other 403 on
-    // the OAuth branches of this middleware. The string is verbatim operator
-    // copy and is asserted byte-for-byte in endpoint-access-groups.test.ts —
-    // it is the only sentence a refused user ever sees.
-    error_description: ENDPOINT_ACCESS_DENIED_MESSAGE,
+    error: "Access denied",
+    message: ENDPOINT_ACCESS_DENIED_MESSAGE,
     timestamp: new Date().toISOString(),
   });
   return true;
+}
+
+/**
+ * The owner rule for an authenticated API key: call after `checkApiKeyAccess`
+ * has passed, in either key branch. See `refuseByAccessGroup`.
+ */
+function refuseKeyByAccessGroup(
+  req: express.Request,
+  res: express.Response,
+  endpoint: DatabaseEndpoint,
+  apiKeyResult: {
+    key_uuid?: string;
+    user_id?: string | null;
+    endpoint_uuid?: string | null;
+  },
+  presentedToken: string,
+): Promise<boolean> {
+  return refuseByAccessGroup(
+    req,
+    res,
+    endpoint,
+    {
+      kind: "api_key",
+      keyUuid: apiKeyResult.key_uuid,
+      ownerUserId: apiKeyResult.user_id,
+      scoped:
+        apiKeyResult.endpoint_uuid !== null &&
+        apiKeyResult.endpoint_uuid !== undefined,
+    },
+    presentedToken,
+  );
 }
 
 /**
@@ -641,6 +735,19 @@ export const authenticateApiKey = async (
           });
         }
 
+        // Access-group gate for the key's OWNER, after the scope check so a key
+        // aimed at the wrong endpoint keeps its specific message and consults
+        // no group query, and after the disabled-account check above so a
+        // locked-out owner gets that refusal. Both API-key branches carry it,
+        // for gateway-wide and endpoint-scoped keys alike: either branch alone
+        // would leave the other endpoint shape governed by OAuth sign-ins only.
+        // No-op unless this endpoint has `restricted` set.
+        if (
+          await refuseKeyByAccessGroup(req, res, endpoint, apiKeyResult, token)
+        ) {
+          return;
+        }
+
         return next();
       } else {
         // IP policy refusal (migration 0041), handled FIRST, before the
@@ -790,7 +897,7 @@ export const authenticateApiKey = async (
               req,
               res,
               endpoint,
-              oauthResult.user_id,
+              { kind: "oauth", userId: oauthResult.user_id },
               token,
             )
           ) {
@@ -868,6 +975,19 @@ export const authenticateApiKey = async (
             message: accessCheckResult.message,
             timestamp: new Date().toISOString(),
           });
+        }
+
+        // Access-group gate for the key's OWNER, after the scope check so a key
+        // aimed at the wrong endpoint keeps its specific message and consults
+        // no group query, and after the disabled-account check above so a
+        // locked-out owner gets that refusal. Both API-key branches carry it,
+        // for gateway-wide and endpoint-scoped keys alike: either branch alone
+        // would leave the other endpoint shape governed by OAuth sign-ins only.
+        // No-op unless this endpoint has `restricted` set.
+        if (
+          await refuseKeyByAccessGroup(req, res, endpoint, apiKeyResult, token)
+        ) {
+          return;
         }
 
         return next();
@@ -1011,7 +1131,7 @@ export const authenticateApiKey = async (
             req,
             res,
             endpoint,
-            oauthResult.user_id,
+            { kind: "oauth", userId: oauthResult.user_id },
             token,
           )
         ) {
@@ -1096,6 +1216,12 @@ export { resolveActsAsUserId };
  *   reaches every enable_api_key_auth endpoint as before, UNLESS the endpoint
  *   sets require_scoped_api_key, which opts it out of gateway-wide keys.
  *
+ * This is the SCOPE check only. An endpoint with `restricted` set also applies
+ * the access-group rule to the key's owner, in the caller, after this passes
+ * (`refuseKeyByAccessGroup`): `restricted` does not imply
+ * `require_scoped_api_key`, and a gateway-wide key reaches a restricted
+ * endpoint exactly when its owner may.
+ *
  * Exported for unit tests (api-key-access.test.ts); production callers are the
  * two authenticateApiKey branches above.
  */
@@ -1166,16 +1292,12 @@ export function checkApiKeyAccess(
  * OAuth would be a category error. The flag's UI copy and the tRPC field
  * comment state this API-key-only limit explicitly.
  *
- * THE MIRROR IMAGE, since migration 0033: `endpoints.restricted` and the access
- * groups behind it are OAUTH-ONLY, and API keys are deliberately exempt from
- * THEM for the same category reason read the other way. A key is admin-minted
- * and already scoped per endpoint; the group model asks "which PERSON is this",
- * which a machine credential cannot answer meaningfully — its owner is an
- * administrative detail, not the identity it acts as. So the two mechanisms
- * cover the two credential classes and neither reaches across. That gate is
- * applied by `refuseByAccessGroup` above, AFTER this function has passed, so a
- * private endpoint owned by someone else still gets the specific message below
- * rather than the generic group refusal.
+ * THE ACCESS-GROUP GATE (migration 0033) is a separate step, not part of this
+ * function: `endpoints.restricted` and the groups behind it apply to OAuth
+ * sign-ins here and to API keys by their owner (see `checkApiKeyAccess` and
+ * `lib/endpoint-access-control`). It is applied by `refuseByAccessGroup` above,
+ * AFTER this function has passed, so a private endpoint owned by someone else
+ * still gets the specific message below rather than the generic group refusal.
  */
 function checkOAuthAccess(
   oauthResult: { user_id?: string; scopes?: string[] },

@@ -114,17 +114,15 @@ export const endpointsImplementations = {
         };
       }
 
-      // Enforce the restricted => require_scoped_api_key pairing at the source.
-      // `restricted` gates OAuth callers only; `require_scoped_api_key` gates
-      // API-key callers. A restricted endpoint that still admits unscoped
-      // (gateway-wide) keys is confined on one plane and wide open on the
-      // other, so the two only actually restrict an endpoint when set together.
-      // We force the scoped-key requirement on rather than rejecting, so asking
-      // for restriction can never silently leave the API-key path open.
+      // `restricted` and `require_scoped_api_key` are independent. Restricting
+      // an endpoint applies its access groups to OAuth sign-ins and to API keys
+      // by their owner (lib/endpoint-access-control), so it no longer needs to
+      // refuse gateway-wide keys to keep a key from outrunning its owner, and
+      // forcing the scoped-key requirement on would lock out every person's
+      // single gateway-wide key on exactly the endpoints groups exist for.
+      // Each is stored as the caller asked.
       const restricted = input.restricted ?? false;
-      const requireScopedApiKey = restricted
-        ? true
-        : (input.requireScopedApiKey ?? false);
+      const requireScopedApiKey = input.requireScopedApiKey ?? false;
 
       // See ADMIN_PLANE_PUBLISH_REFUSAL. Only the kind of endpoint a key may be
       // created for is judged: a private or restricted endpoint is not one.
@@ -198,10 +196,9 @@ export const endpointsImplementations = {
             namespace_uuid: input.namespaceUuid,
             owner_user_id: effectiveUserId,
             enable_api_key_auth: input.enableApiKeyAuth,
-            // The enforced values, not the raw input: restriction forces the
-            // scoped-key requirement on, and the audit row records what
-            // actually took effect so a later "was this ever open" query is
-            // answered by the truth, not by what the caller asked for.
+            // The stored values, so a later "was this ever open" query is
+            // answered by the truth: whether the endpoint was restricted and
+            // whether it refused gateway-wide keys are two separate facts.
             require_scoped_api_key: requireScopedApiKey,
             restricted,
             enable_oauth: input.enableOauth,
@@ -539,15 +536,13 @@ export const endpointsImplementations = {
         };
       }
 
-      // A restricted endpoint must keep rejecting unscoped API keys, the same
-      // pairing enforced on create and at the restricted toggle. `restricted`
-      // is not editable through this form (it has its own tRPC procedure and
-      // audit event), so the endpoint's stored value is authoritative: an edit
-      // that tries to turn require_scoped_api_key off while the endpoint is
-      // restricted would re-open the API-key path the restriction exists to
-      // close, so it is forced back on here rather than obeyed.
-      const requireScopedApiKey =
-        existingEndpoint.restricted === true ? true : input.requireScopedApiKey;
+      // `restricted` is not editable through this form (it has its own tRPC
+      // procedure and audit event), and `require_scoped_api_key` is stored as
+      // submitted whether or not the endpoint is restricted: the two are
+      // independent, because groups govern API keys by their owner and a
+      // restricted endpoint has to keep accepting each member's gateway-wide
+      // key (lib/endpoint-access-control).
+      const requireScopedApiKey = input.requireScopedApiKey;
 
       // The auth-posture fields are carried for the same reason as on create:
       // turning `enable_api_key_auth` off on a live endpoint opens it to the
@@ -585,9 +580,6 @@ export const endpointsImplementations = {
             name: updated.name,
             namespace_uuid: input.namespaceUuid,
             enable_api_key_auth: input.enableApiKeyAuth,
-            // The enforced value, not the raw input: an attempt to unset this
-            // on a restricted endpoint is coerced back on above, and the audit
-            // row records what actually took effect.
             require_scoped_api_key: requireScopedApiKey,
             enable_oauth: input.enableOauth,
           },

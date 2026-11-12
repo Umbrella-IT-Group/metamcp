@@ -425,6 +425,30 @@ describe("endpoint.restricted.set", () => {
     expect(rows[0].detail?.restricted).toBe(true);
   });
 
+  it("records the stored scoped-key requirement, not a forced one", async () => {
+    // Restricting an endpoint does not turn the scoped-key requirement on, so
+    // the row must say it was still off at that moment.
+    endpointFindByUuidMock.mockResolvedValue({
+      ...ENDPOINT_ROW,
+      restricted: false,
+      require_scoped_api_key: false,
+    });
+    setEndpointRestrictedMock.mockResolvedValue({
+      ...ENDPOINT_ROW,
+      restricted: true,
+      require_scoped_api_key: false,
+    });
+
+    await accessGroupsImplementations.setEndpointRestricted(
+      { endpoint_uuid: ENDPOINT_UUID, restricted: true },
+      ACTOR,
+    );
+    await flush();
+
+    expect(rows[0].detail?.restricted).toBe(true);
+    expect(rows[0].detail?.require_scoped_api_key).toBe(false);
+  });
+
   it("an unknown endpoint writes NO row", async () => {
     endpointFindByUuidMock.mockResolvedValue(undefined);
 
@@ -615,8 +639,8 @@ describe("read side", () => {
 
     expect(result.data?.enable_oauth).toBe(false);
     expect(result.data?.enable_api_key_auth).toBe(true);
-    // Carried so the panel can tell a scoped-only endpoint (pairing closed the
-    // unscoped path) from one where unscoped keys still reach it.
+    // Carried so the panel can say whether gateway-wide keys are refused on
+    // this endpoint outright, a switch that is independent of `restricted`.
     expect(result.data?.require_scoped_api_key).toBe(true);
   });
 });

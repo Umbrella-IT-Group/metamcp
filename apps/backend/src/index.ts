@@ -7,7 +7,6 @@ import { convergeConfiguredAdmins } from "./lib/admin-converge";
 import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
 import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
-import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import {
   declaredLengthGuard,
   globalBodyParser,
@@ -225,13 +224,6 @@ async function start(): Promise<void> {
   } catch (err) {
     logger.error("Retired-tools init: unexpected failure (ignored):", err);
   }
-
-  // Surface any pre-existing endpoint left in the unpaired state
-  // (restricted=true, require_scoped_api_key=false) so an operator can close
-  // the still-open API-key path deliberately. Non-fatal and self-swallowing;
-  // see ./lib/endpoint-pairing-check for why these rows are warned about rather
-  // than auto-migrated.
-  await warnOnUnpairedRestrictedEndpoints();
 
   // One boot-time signal for the gateway backend trust header: an absent or
   // short secret means backends receive no X-Gateway-Auth, and backends that
