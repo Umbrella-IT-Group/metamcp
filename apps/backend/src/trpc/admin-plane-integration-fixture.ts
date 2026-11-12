@@ -1,8 +1,10 @@
 /**
  * Shared setup for the admin-plane integration suites that run the real /trpc
- * stack against a real Postgres (api-key-mint.integration.test.ts and
- * admin-write.integration.test.ts): users, admin-plane keys of both scopes,
- * the express app around the real tRPC router, and the audit-fault trigger.
+ * stack against a real Postgres (api-key-mint.integration.test.ts,
+ * admin-write.integration.test.ts and key-owner-groups.integration.test.ts):
+ * users, admin-plane keys of both scopes, the express app around the real tRPC
+ * router, access groups, data-plane keys of a chosen owner and scope, and the
+ * audit-fault trigger.
  *
  * Test support only: nothing in the shipped backend imports it, and tsup's
  * only entry is `src/index.ts`. The two suites call `vi.mock` for the logger
@@ -71,6 +73,39 @@ export interface Fixture {
     oauth?: boolean;
     apiKeyAuth?: boolean;
   }) => Promise<string>;
+  /**
+   * An access group written straight to the tables (as a human administrator's
+   * UI would), with members and mapped endpoints; removed with the fixture.
+   * Returns its uuid.
+   */
+  group: (over: {
+    name: string;
+    members?: string[];
+    endpoints?: string[];
+  }) => Promise<string>;
+  /**
+   * A data-plane key of any owner and scope written through the repository
+   * (what an administrator creating a key in the UI produces): none of the
+   * agent mint rules apply. `ownerId` null is a public key.
+   */
+  dataKey: (over: {
+    name: string;
+    ownerId: string | null;
+    endpointUuid?: string | null;
+  }) => Promise<{ key: string; uuid: string }>;
+  /** Set a user's role directly, for a demotion or promotion mid-test. */
+  setRole: (userId: string, role: "admin" | "member") => Promise<void>;
+  /**
+   * Present `token` to the real data-plane middleware (`authenticateApiKey`,
+   * both API-key branches, real repositories) for the endpoint row as stored
+   * now. `next` is whether the request would have been served.
+   */
+  authenticateKey: (options: {
+    endpointUuid: string;
+    token: string;
+    via?: "bearer" | "x-api-key";
+    ip?: string | null;
+  }) => Promise<{ next: boolean; status: number; body: unknown }>;
   /** Make audit_log refuse an INSERT for `action` until `clearAuditFault`. */
   failAuditFor: (action: string) => Promise<void>;
   clearAuditFault: (action: string) => Promise<void>;
@@ -267,12 +302,114 @@ export async function createFixture(
         namespace_uuid: namespace.uuid,
         user_id: over.userId ?? null,
         restricted: over.restricted ?? false,
-        require_scoped_api_key: over.requireScoped ?? over.restricted ?? false,
+        // Independent of `restricted`: restricting an endpoint no longer turns
+        // the scoped-key requirement on, so neither does this helper.
+        require_scoped_api_key: over.requireScoped ?? false,
         enable_oauth: over.oauth ?? false,
         enable_api_key_auth: over.apiKeyAuth ?? true,
       })
       .returning({ uuid: schema.endpointsTable.uuid });
     return row.uuid;
+  }
+
+  const groupUuids: string[] = [];
+
+  async function group(over: {
+    name: string;
+    members?: string[];
+    endpoints?: string[];
+  }) {
+    const [row] = await db
+      .insert(schema.accessGroupsTable)
+      .values({ name: `${over.name}-${run}` })
+      .returning({ uuid: schema.accessGroupsTable.uuid });
+    groupUuids.push(row.uuid);
+    for (const userId of over.members ?? []) {
+      await db
+        .insert(schema.accessGroupMembersTable)
+        .values({ group_uuid: row.uuid, user_id: userId });
+    }
+    for (const endpointUuid of over.endpoints ?? []) {
+      await db
+        .insert(schema.accessGroupEndpointsTable)
+        .values({ group_uuid: row.uuid, endpoint_uuid: endpointUuid });
+    }
+    return row.uuid;
+  }
+
+  async function dataKey(over: {
+    name: string;
+    ownerId: string | null;
+    endpointUuid?: string | null;
+  }) {
+    const created = await repo.create({
+      name: `${over.name}-${run}`,
+      user_id: over.ownerId,
+      endpoint_uuid: over.endpointUuid ?? null,
+      is_active: true,
+    });
+    return { key: created.key, uuid: created.uuid };
+  }
+
+  async function setRole(userId: string, role: "admin" | "member") {
+    await db
+      .update(schema.usersTable)
+      .set({ role })
+      .where(eq(schema.usersTable.id, userId));
+  }
+
+  async function authenticateKey(options: {
+    endpointUuid: string;
+    token: string;
+    via?: "bearer" | "x-api-key";
+    ip?: string | null;
+  }) {
+    const { authenticateApiKey } = await import(
+      "../middleware/api-key-oauth.middleware"
+    );
+    const { endpointsRepository } = await import("../db/repositories");
+    const stored = await endpointsRepository.findByUuid(options.endpointUuid);
+    const headers: Record<string, string> = {};
+    if (options.via === "bearer") {
+      headers.authorization = `Bearer ${options.token}`;
+    } else {
+      headers["x-api-key"] = options.token;
+    }
+    if (options.ip) headers["cf-connecting-ip"] = options.ip;
+    const req = {
+      headers,
+      query: {},
+      ip: "127.0.0.1",
+      endpoint: stored,
+      protocol: "http",
+      originalUrl: "/metamcp/x/mcp",
+      path: "/mcp",
+      method: "POST",
+      get: () => undefined,
+    } as unknown as express.Request;
+    const result = { next: false, status: 0, body: undefined as unknown };
+    const res = {
+      status(code: number) {
+        result.status = code;
+        return res;
+      },
+      json(body: unknown) {
+        result.body = body;
+        return res;
+      },
+      send(body: unknown) {
+        result.body = body;
+        return res;
+      },
+      set: () => res,
+      setHeader: () => res,
+      header: () => res,
+      end: () => res,
+    } as unknown as express.Response;
+    await authenticateApiKey(req, res, () => {
+      result.next = true;
+    });
+    return result;
   }
 
   // Fault injection at the database: a trigger that raises on a marked INSERT
@@ -351,6 +488,15 @@ export async function createFixture(
     );
     await suiteLock.query(`DROP TABLE IF EXISTS itest_fail_audit_actions`);
     await clearKeyInsertFault();
+    for (const uuid of groupUuids) {
+      await db
+        .delete(schema.accessGroupsTable)
+        .where(eq(schema.accessGroupsTable.uuid, uuid));
+    }
+    // Groups a test made through the operator procedures, named with the run.
+    await suiteLock.query(`DELETE FROM access_groups WHERE name LIKE $1`, [
+      `%${run}`,
+    ]);
     await db
       .delete(schema.namespacesTable)
       .where(eq(schema.namespacesTable.uuid, namespace.uuid));
@@ -386,6 +532,10 @@ export async function createFixture(
     auditNow,
     auditEventually,
     endpoint,
+    group,
+    dataKey,
+    setRole,
+    authenticateKey,
     failAuditFor,
     clearAuditFault,
     failKeyInsertFor,

@@ -15,6 +15,7 @@ import {
 import {
   ApiKeyMintRefusal,
   assertEndpointEligible,
+  assertGatewayWideOwnerAllowed,
   type ValidatedMintRequest,
 } from "@/lib/api-key-mint-rules";
 import { configService } from "@/lib/config.service";
@@ -22,6 +23,7 @@ import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { apiKeysTable, endpointsTable, usersTable } from "../schema";
+import { accessGroupsRepository } from "./access-groups.repo";
 import { shouldTouchLastUsed } from "./api-keys.last-used";
 import type { DbExecutor, DbTransaction } from "./db-executor";
 
@@ -185,9 +187,17 @@ export class ApiKeysRepository {
    *    and a disable that committed first is seen here, so a key is never
    *    created for an account that was disabled before the insert;
    *  - an endpoint-scoped key locks the endpoint row FOR SHARE and requires it
-   *    to be public and not restricted. A gateway-wide key requires that no
-   *    endpoint is restricted without requiring scoped keys (the pairing),
-   *    which is what keeps a gateway-wide key off every restricted endpoint;
+   *    to be public; a restricted one is allowed only when the owner is an
+   *    explicit member of a group mapped to it, asked through this transaction
+   *    (an administrator's role alone does not count, and the request cache is
+   *    not consulted, so a membership removed a moment ago is not honoured from
+   *    a stale answer). The request-time gate stays authoritative, which is why
+   *    the mapping rows are not locked: a removal that commits after this
+   *    check still takes effect on the key's next request;
+   *  - a gateway-wide key is refused for an administrator-role owner, read from
+   *    the locked owner row, so a concurrent role change waits for this
+   *    transaction. For any other owner it is allowed whatever endpoints are
+   *    restricted: reach is decided per request by the owner's membership;
    *  - the name must not be taken by any key of the same owner. A concurrent
    *    create of the same name is caught by the unique constraint and refused
    *    the same way.
@@ -209,7 +219,11 @@ export class ApiKeysRepository {
     created_at: Date;
   }> {
     const [owner] = await tx
-      .select({ id: usersTable.id, disabled: usersTable.disabled })
+      .select({
+        id: usersTable.id,
+        disabled: usersTable.disabled,
+        role: usersTable.role,
+      })
       .from(usersTable)
       .where(eq(usersTable.id, request.ownerUserId))
       .for("share");
@@ -228,19 +242,19 @@ export class ApiKeysRepository {
         .where(eq(endpointsTable.uuid, request.endpointUuid))
         .for("share");
       if (!endpoint) throw new ApiKeyMintRefusal("endpoint_missing");
-      assertEndpointEligible(endpoint);
+      // Asked only for a restricted public endpoint: an unrestricted one needs
+      // no membership, and a private one is refused before membership matters.
+      const ownerIsMappedMember =
+        endpoint.user_id === null && endpoint.restricted
+          ? await accessGroupsRepository.hasEndpointGrant(
+              owner.id,
+              endpoint.uuid,
+              tx,
+            )
+          : false;
+      assertEndpointEligible(endpoint, ownerIsMappedMember);
     } else {
-      const [unpaired] = await tx
-        .select({ uuid: endpointsTable.uuid })
-        .from(endpointsTable)
-        .where(
-          and(
-            eq(endpointsTable.restricted, true),
-            eq(endpointsTable.require_scoped_api_key, false),
-          ),
-        )
-        .limit(1);
-      if (unpaired) throw new ApiKeyMintRefusal("gateway_wide_blocked");
+      assertGatewayWideOwnerAllowed(owner);
     }
 
     const [sameName] = await tx

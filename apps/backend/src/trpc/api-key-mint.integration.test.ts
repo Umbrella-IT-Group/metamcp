@@ -86,8 +86,9 @@ describeIfDb(
     const failureBodies: string[] = [];
 
     // Endpoints: public with API-key auth only, public with OAuth enabled too,
-    // private to each member, and a restricted public one (paired, as every
-    // writer of `restricted` pairs it).
+    // private to each member, and a restricted public one (which accepts
+    // gateway-wide keys: `restricted` does not require scoped keys, so the
+    // owner's groups decide what a key reaches there).
     let epPublic = "";
     let epPublicOauth = "";
     let epPrivateMember = "";
@@ -158,6 +159,74 @@ describeIfDb(
         expect(reply.message).toMatch(expected.message);
       }
     }
+
+    type AuthResult = { next: boolean; status: number; body: unknown };
+
+    async function authenticate(options: {
+      endpointUuid: string;
+      token: string;
+      via?: "bearer" | "x-api-key";
+      ip?: string | null;
+    }): Promise<AuthResult> {
+      const { authenticateApiKey } = await import(
+        "../middleware/api-key-oauth.middleware"
+      );
+      const { endpointsRepository } = await import("../db/repositories");
+      const endpoint = await endpointsRepository.findByUuid(
+        options.endpointUuid,
+      );
+      const headers: Record<string, string> = {};
+      if (options.via === "x-api-key") headers["x-api-key"] = options.token;
+      else headers.authorization = `Bearer ${options.token}`;
+      if (options.ip) headers["cf-connecting-ip"] = options.ip;
+      const req = {
+        headers,
+        query: {},
+        ip: "127.0.0.1",
+        endpoint,
+        protocol: "http",
+        originalUrl: "/metamcp/x/mcp",
+        path: "/mcp",
+        method: "POST",
+        get: () => undefined,
+      } as unknown as express.Request;
+      const result: AuthResult = { next: false, status: 0, body: undefined };
+      const res = {
+        status(code: number) {
+          result.status = code;
+          return res;
+        },
+        json(body: unknown) {
+          result.body = body;
+          return res;
+        },
+        send(body: unknown) {
+          result.body = body;
+          return res;
+        },
+        set: () => res,
+        setHeader: () => res,
+        header: () => res,
+        end: () => res,
+      } as unknown as express.Response;
+      await authenticateApiKey(req, res, () => {
+        result.next = true;
+      });
+      return result;
+    }
+
+    async function newKey(over: Record<string, unknown>): Promise<{
+      key: string;
+      uuid: string;
+    }> {
+      const reply = await mint(over);
+      expect(reply.status).toBe(200);
+      const key = valueOf(reply);
+      return { key, uuid: (reply.data as { uuid: string }).uuid };
+    }
+
+    const GENERIC_403 =
+      "This credential is not currently permitted to access this gateway.";
 
     /** Run a refused call and prove it wrote no key and no create row. */
     async function expectNothingWritten(call: () => Promise<void>) {
@@ -482,7 +551,8 @@ describeIfDb(
           "FORBIDDEN",
         ],
         [
-          "a restricted endpoint",
+          // The owner is an ordinary member in no group mapped to it.
+          "a restricted endpoint whose owner is in no mapped group",
           () => ({ endpoint_uuid: epRestricted }),
           403,
           "FORBIDDEN",
@@ -644,35 +714,69 @@ describeIfDb(
         }
       });
 
-      it("refuses a gateway-wide key while any endpoint is restricted without requiring scoped keys", async () => {
+      it("allows a gateway-wide key for a member owner while endpoints are restricted, paired or not", async () => {
+        // Oracle: the settled mint contract. Reach is decided per request by the
+        // owner's groups, so the pairing no longer blocks a gateway-wide mint;
+        // only an administrator-role owner does (next test).
         const unpaired = await fx.endpoint({
           name: "ep-unpaired",
           restricted: true,
           requireScoped: false,
         });
+        const paired = await fx.endpoint({
+          name: "ep-paired",
+          restricted: true,
+          requireScoped: true,
+        });
         try {
-          await expectNothingWritten(async () => {
-            const reply = await mint({
+          for (const _ of [unpaired, paired]) {
+            const accepted = await mint({
               endpoint_uuid: undefined,
               all_endpoints: true,
             });
-            await expectRefused(reply, { status: 403, code: "FORBIDDEN" });
-          });
+            expect(accepted.status).toBe(200);
+            valueOf(accepted);
+            await fx.trpc(
+              "frontend.apiKeys.deactivate",
+              { uuid: (accepted.data as { uuid: string }).uuid },
+              "mutation",
+            );
+          }
         } finally {
-          await fx.db
-            .delete(fx.schema.endpointsTable)
-            .where(fx.eq(fx.schema.endpointsTable.uuid, unpaired));
+          for (const uuid of [unpaired, paired]) {
+            await fx.db
+              .delete(fx.schema.endpointsTable)
+              .where(fx.eq(fx.schema.endpointsTable.uuid, uuid));
+          }
         }
-        // With the pairing intact the same request is accepted.
-        const accepted = await mint({
-          endpoint_uuid: undefined,
-          all_endpoints: true,
+      });
+
+      it("refuses a gateway-wide key for an administrator-role owner, with its own sentence, and creates nothing", async () => {
+        await expectNothingWritten(async () => {
+          const reply = await mint({
+            user_id: fx.ownerId,
+            endpoint_uuid: undefined,
+            all_endpoints: true,
+          });
+          await expectRefused(reply, {
+            status: 403,
+            code: "FORBIDDEN",
+            message:
+              "A gateway-wide key cannot be created for an administrator, because it would reach every restricted endpoint. Scope the key to one endpoint, or create it in the admin UI.",
+          });
         });
-        expect(accepted.status).toBe(200);
-        valueOf(accepted);
+      });
+
+      it("still allows an endpoint-scoped key for an administrator owner on an unrestricted endpoint", async () => {
+        const reply = await mint({
+          user_id: fx.ownerId,
+          endpoint_uuid: epPublic,
+        });
+        expect(reply.status).toBe(200);
+        valueOf(reply);
         await fx.trpc(
           "frontend.apiKeys.deactivate",
-          { uuid: (accepted.data as { uuid: string }).uuid },
+          { uuid: (reply.data as { uuid: string }).uuid },
           "mutation",
         );
       });
@@ -1028,74 +1132,6 @@ describeIfDb(
 
     // -------------------------------------------------------------------------
     describe("a created key through both API-key authentication branches of the real middleware", () => {
-      type AuthResult = { next: boolean; status: number; body: unknown };
-
-      async function authenticate(options: {
-        endpointUuid: string;
-        token: string;
-        via?: "bearer" | "x-api-key";
-        ip?: string | null;
-      }): Promise<AuthResult> {
-        const { authenticateApiKey } = await import(
-          "../middleware/api-key-oauth.middleware"
-        );
-        const { endpointsRepository } = await import("../db/repositories");
-        const endpoint = await endpointsRepository.findByUuid(
-          options.endpointUuid,
-        );
-        const headers: Record<string, string> = {};
-        if (options.via === "x-api-key") headers["x-api-key"] = options.token;
-        else headers.authorization = `Bearer ${options.token}`;
-        if (options.ip) headers["cf-connecting-ip"] = options.ip;
-        const req = {
-          headers,
-          query: {},
-          ip: "127.0.0.1",
-          endpoint,
-          protocol: "http",
-          originalUrl: "/metamcp/x/mcp",
-          path: "/mcp",
-          method: "POST",
-          get: () => undefined,
-        } as unknown as express.Request;
-        const result: AuthResult = { next: false, status: 0, body: undefined };
-        const res = {
-          status(code: number) {
-            result.status = code;
-            return res;
-          },
-          json(body: unknown) {
-            result.body = body;
-            return res;
-          },
-          send(body: unknown) {
-            result.body = body;
-            return res;
-          },
-          set: () => res,
-          setHeader: () => res,
-          header: () => res,
-          end: () => res,
-        } as unknown as express.Response;
-        await authenticateApiKey(req, res, () => {
-          result.next = true;
-        });
-        return result;
-      }
-
-      async function newKey(over: Record<string, unknown>): Promise<{
-        key: string;
-        uuid: string;
-      }> {
-        const reply = await mint(over);
-        expect(reply.status).toBe(200);
-        const key = valueOf(reply);
-        return { key, uuid: (reply.data as { uuid: string }).uuid };
-      }
-
-      const GENERIC_403 =
-        "This credential is not currently permitted to access this gateway.";
-
       it.each([
         ["an API-key-only endpoint", "public", "bearer"],
         ["an API-key-only endpoint", "public", "x-api-key"],
@@ -1210,8 +1246,9 @@ describeIfDb(
         }
         // And the concrete reach: a gateway-wide key reaches the public
         // unrestricted endpoints and the owner's own private one, and not
-        // another user's private one nor the restricted one (which requires a
-        // scoped key by the pairing); a scoped key reaches its one endpoint.
+        // another user's private one nor the restricted one (the owner is in no
+        // mapped group, so the owner rule refuses it); a scoped key reaches its
+        // one endpoint.
         expect(reached.gatewayWide.sort()).toEqual(
           [epPublic, epPublicOauth, epPrivateMember].sort(),
         );
@@ -1684,6 +1721,28 @@ describeIfDb(
           "endpoint_not_eligible",
           "FORBIDDEN",
         ],
+        [
+          "a restricted endpoint for an owner in no mapped group",
+          () => ({ endpoint_uuid: epRestricted }),
+          "endpoint_not_eligible",
+          "FORBIDDEN",
+        ],
+        [
+          "a restricted endpoint for an administrator owner who is in no mapped group",
+          () => ({ user_id: fx.ownerId, endpoint_uuid: epRestricted }),
+          "endpoint_not_eligible",
+          "FORBIDDEN",
+        ],
+        [
+          "a gateway-wide key for an administrator owner",
+          () => ({
+            user_id: fx.ownerId,
+            endpoint_uuid: undefined,
+            all_endpoints: true,
+          }),
+          "gateway_wide_admin_owner",
+          "FORBIDDEN",
+        ],
       ];
 
       it.each(PROBES)(
@@ -2069,6 +2128,387 @@ describeIfDb(
         expect(await scopeOf(fx.sync.uuid)).toEqual({
           admin_plane: true,
           admin_plane_scope: "sync",
+        });
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // The owner rule on a restricted endpoint, and the mint that follows it.
+    // Last in the file on purpose: these cases cause many fire-and-forget audit
+    // writes (a refusal row per refused request) through the audit pool, which is
+    // deliberately small and sheds load (db/audit-db), and the cases above read
+    // their own denied rows from the table and must not share a pool with that
+    // backlog. Oracle for every expectation: the settled mint contract (private
+    // plan, tool-collections-rollout, foreman decision 1) and the owner rule of
+    // the access-group gate: a key reaches a restricted endpoint exactly when its
+    // owner is an administrator or belongs to a mapped group.
+    describe("the owner rule and the mint that follows it", () => {
+      const invalidate = async () => {
+        const { invalidateEndpointAccessCache } = await import(
+          "../lib/endpoint-access-control"
+        );
+        invalidateEndpointAccessCache();
+      };
+
+      /** A group mapping `endpoints`, with `members`, removed afterwards. */
+      async function withGroup(
+        over: { members: string[]; endpoints: string[] },
+        run: (groupUuid: string) => Promise<void>,
+      ) {
+        const uuid = await fx.group({
+          name: `mint-grp-${++mintCounter}`,
+          ...over,
+        });
+        await invalidate();
+        try {
+          await run(uuid);
+        } finally {
+          await fx.db
+            .delete(fx.schema.accessGroupsTable)
+            .where(fx.eq(fx.schema.accessGroupsTable.uuid, uuid));
+          await invalidate();
+        }
+      }
+
+      async function reaches(
+        endpointUuid: string,
+        token: string,
+        via: "bearer" | "x-api-key" = "x-api-key",
+      ) {
+        const result = await authenticate({
+          endpointUuid,
+          token,
+          via,
+          ip: ALLOWED_IP,
+        });
+        return { next: result.next, status: result.status };
+      }
+
+      describe("a mint for a restricted endpoint follows the owner's membership", () => {
+        it("refuses an owner in no mapped group, and one whose group maps a different endpoint", async () => {
+          await withGroup(
+            { members: [fx.memberId], endpoints: [epPublicOauth] },
+            async () => {
+              await expectNothingWritten(async () => {
+                await expectRefused(
+                  await mint({ endpoint_uuid: epRestricted }),
+                  {
+                    status: 403,
+                    code: "FORBIDDEN",
+                  },
+                );
+              });
+            },
+          );
+        });
+
+        it("refuses an owner outside the group that is mapped to the endpoint", async () => {
+          await withGroup(
+            { members: [fx.otherMemberId], endpoints: [epRestricted] },
+            async () => {
+              await expectNothingWritten(async () => {
+                await expectRefused(
+                  await mint({ endpoint_uuid: epRestricted }),
+                  {
+                    status: 403,
+                    code: "FORBIDDEN",
+                  },
+                );
+              });
+            },
+          );
+        });
+
+        it("refuses an administrator owner who is not an explicit member: the role alone does not count at mint time", async () => {
+          await withGroup(
+            { members: [fx.memberId], endpoints: [epRestricted] },
+            async () => {
+              await expectNothingWritten(async () => {
+                await expectRefused(
+                  await mint({
+                    user_id: fx.ownerId,
+                    endpoint_uuid: epRestricted,
+                  }),
+                  { status: 403, code: "FORBIDDEN" },
+                );
+              });
+            },
+          );
+        });
+
+        it("allows an explicit member, and the key then reaches the endpoint on both branches only while the membership holds", async () => {
+          await withGroup(
+            { members: [fx.memberId], endpoints: [epRestricted] },
+            async (groupUuid) => {
+              const minted = await newKey({ endpoint_uuid: epRestricted });
+              // Both transports on the API-key-only endpoint.
+              for (const via of ["x-api-key", "bearer"] as const) {
+                expect(await reaches(epRestricted, minted.key, via)).toEqual({
+                  next: true,
+                  status: 0,
+                });
+              }
+
+              await fx.db
+                .delete(fx.schema.accessGroupMembersTable)
+                .where(
+                  fx.eq(
+                    fx.schema.accessGroupMembersTable.group_uuid,
+                    groupUuid,
+                  ),
+                );
+              await invalidate();
+
+              const after = await reaches(epRestricted, minted.key);
+              expect(after.next).toBe(false);
+              expect(after.status).toBe(403);
+            },
+          );
+        });
+
+        it("allows an administrator owner who IS an explicit member", async () => {
+          await withGroup(
+            { members: [fx.ownerId], endpoints: [epRestricted] },
+            async () => {
+              const minted = await newKey({
+                user_id: fx.ownerId,
+                endpoint_uuid: epRestricted,
+              });
+              expect((await reaches(epRestricted, minted.key)).next).toBe(true);
+              await fx.trpc(
+                "frontend.apiKeys.deactivate",
+                { uuid: minted.uuid },
+                "mutation",
+              );
+            },
+          );
+        });
+
+        it("reads the membership in the mint's own transaction, not from the request cache", async () => {
+          await withGroup(
+            { members: [fx.memberId], endpoints: [epRestricted] },
+            async (groupUuid) => {
+              // A key for the member, used once, so the decision cache holds
+              // "allowed" for (member, epRestricted).
+              const first = await newKey({ endpoint_uuid: epRestricted });
+              expect((await reaches(epRestricted, first.key)).next).toBe(true);
+
+              // The membership is removed behind the cache's back (another
+              // replica, or psql): no invalidation in this process.
+              await fx.db
+                .delete(fx.schema.accessGroupMembersTable)
+                .where(
+                  fx.eq(
+                    fx.schema.accessGroupMembersTable.group_uuid,
+                    groupUuid,
+                  ),
+                );
+
+              // The cache would still answer yes, and the mint must not.
+              expect((await reaches(epRestricted, first.key)).next).toBe(true);
+              await expectNothingWritten(async () => {
+                await expectRefused(
+                  await mint({ endpoint_uuid: epRestricted }),
+                  {
+                    status: 403,
+                    code: "FORBIDDEN",
+                  },
+                );
+              });
+            },
+          );
+        });
+      });
+
+      describe("a key reaches a restricted endpoint exactly when its owner may, on both branches", () => {
+        let epRestrictedOauth = "";
+        beforeAll(async () => {
+          epRestrictedOauth = await fx.endpoint({
+            name: "ep-restricted-oauth",
+            restricted: true,
+            oauth: true,
+          });
+        });
+
+        const BRANCH_ENDPOINTS = [
+          ["API-key-only", () => epRestricted],
+          ["OAuth-enabled", () => epRestrictedOauth],
+        ] as const;
+
+        it.each(BRANCH_ENDPOINTS)(
+          "on the %s endpoint: a member's gateway-wide and scoped keys pass, a non-member's are refused, a removed member's are refused",
+          async (_branch, endpointOf) => {
+            const endpointUuid = endpointOf();
+            const memberGateway = await newKey({
+              endpoint_uuid: undefined,
+              all_endpoints: true,
+            });
+            const memberScoped = await fx.dataKey({
+              name: `scoped-${++mintCounter}`,
+              ownerId: fx.memberId,
+              endpointUuid,
+            });
+            const outsiderGateway = await newKey({
+              user_id: fx.otherMemberId,
+              endpoint_uuid: undefined,
+              all_endpoints: true,
+            });
+            const outsiderScoped = await fx.dataKey({
+              name: `scoped-${++mintCounter}`,
+              ownerId: fx.otherMemberId,
+              endpointUuid,
+            });
+
+            await withGroup(
+              { members: [fx.memberId], endpoints: [endpointUuid] },
+              async (groupUuid) => {
+                for (const key of [memberGateway.key, memberScoped.key]) {
+                  expect((await reaches(endpointUuid, key)).next).toBe(true);
+                }
+                for (const key of [outsiderGateway.key, outsiderScoped.key]) {
+                  const refused = await reaches(endpointUuid, key);
+                  expect(refused).toEqual({ next: false, status: 403 });
+                }
+
+                await fx.db
+                  .delete(fx.schema.accessGroupMembersTable)
+                  .where(
+                    fx.eq(
+                      fx.schema.accessGroupMembersTable.group_uuid,
+                      groupUuid,
+                    ),
+                  );
+                await invalidate();
+                for (const key of [memberGateway.key, memberScoped.key]) {
+                  expect(await reaches(endpointUuid, key)).toEqual({
+                    next: false,
+                    status: 403,
+                  });
+                }
+              },
+            );
+          },
+        );
+
+        it.each(BRANCH_ENDPOINTS)(
+          "on the %s endpoint: an administrator-owned key and a public key",
+          async (_branch, endpointOf) => {
+            const endpointUuid = endpointOf();
+            // Created the way an administrator in the UI creates one: an admin
+            // owned gateway-wide key, and a public key (no owner).
+            const adminKey = await fx.dataKey({
+              name: `admin-gw-${++mintCounter}`,
+              ownerId: fx.ownerId,
+            });
+            const publicKey = await fx.dataKey({
+              name: `public-gw-${++mintCounter}`,
+              ownerId: null,
+            });
+            const publicScoped = await fx.dataKey({
+              name: `public-sc-${++mintCounter}`,
+              ownerId: null,
+              endpointUuid,
+            });
+
+            expect((await reaches(endpointUuid, adminKey.key)).next).toBe(true);
+            // No owner: refused even though no group could ever admit it, and
+            // an unrestricted endpoint stays open to it.
+            for (const key of [publicKey.key, publicScoped.key]) {
+              expect(await reaches(endpointUuid, key)).toEqual({
+                next: false,
+                status: 403,
+              });
+            }
+            expect((await reaches(epPublic, publicKey.key)).next).toBe(true);
+          },
+        );
+
+        it("refuses a key once its owner is disabled, with the account refusal and not the group one", async () => {
+          const key = await fx.dataKey({
+            name: `disabled-${++mintCounter}`,
+            ownerId: fx.memberId,
+          });
+          await withGroup(
+            { members: [fx.memberId], endpoints: [epRestricted] },
+            async () => {
+              expect((await reaches(epRestricted, key.key)).next).toBe(true);
+              await fx.db
+                .update(fx.schema.usersTable)
+                .set({ disabled: true })
+                .where(fx.eq(fx.schema.usersTable.id, fx.memberId));
+              try {
+                const refused = await authenticate({
+                  endpointUuid: epRestricted,
+                  token: key.key,
+                  via: "x-api-key",
+                  ip: ALLOWED_IP,
+                });
+                expect(refused.next).toBe(false);
+                expect(refused.status).toBe(403);
+                expect((refused.body as { message: string }).message).toBe(
+                  GENERIC_403,
+                );
+              } finally {
+                await fx.db
+                  .update(fx.schema.usersTable)
+                  .set({ disabled: false })
+                  .where(fx.eq(fx.schema.usersTable.id, fx.memberId));
+              }
+            },
+          );
+        });
+
+        it("keeps passing a demoted administrator's key until the 60 second cache bound, and refuses it at once after an invalidation", async () => {
+          const key = await fx.dataKey({
+            name: `demoted-${++mintCounter}`,
+            ownerId: fx.otherMemberId,
+          });
+          await fx.setRole(fx.otherMemberId, "admin");
+          await invalidate();
+          try {
+            expect((await reaches(epRestricted, key.key)).next).toBe(true);
+
+            await fx.setRole(fx.otherMemberId, "member");
+            // Not invalidated: the cached admission is still served.
+            expect((await reaches(epRestricted, key.key)).next).toBe(true);
+
+            await invalidate();
+            expect(await reaches(epRestricted, key.key)).toEqual({
+              next: false,
+              status: 403,
+            });
+          } finally {
+            await fx.setRole(fx.otherMemberId, "member");
+            await invalidate();
+          }
+        });
+
+        it("writes the refusal row of a refused key to audit_log, naming the key, its owner and its scope, and no raw key", async () => {
+          const key = await fx.dataKey({
+            name: `audited-${++mintCounter}`,
+            ownerId: fx.otherMemberId,
+          });
+          const refused = await reaches(epRestrictedOauth, key.key);
+          expect(refused.next).toBe(false);
+
+          const rows = await fx.auditEventually(
+            `action = 'endpoint.access.denied' AND actor_id = $1`,
+            [key.uuid],
+          );
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({
+            actor_type: "api_key",
+            actor_id: key.uuid,
+            target_id: epRestrictedOauth,
+            outcome: "denied",
+          });
+          expect(rows[0].detail).toMatchObject({
+            reason: "access_group_denied",
+            auth_method: "api_key",
+            owner_user_id: fx.otherMemberId,
+            key_scope: "gateway",
+          });
+          expect(JSON.stringify(rows[0])).not.toContain(key.key);
         });
       });
     });

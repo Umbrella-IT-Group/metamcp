@@ -22,6 +22,7 @@ import { agentCidrTooWide, mappedIpv4Prefix } from "./api-key-ip-policy";
 import {
   ApiKeyMintRefusal,
   assertEndpointEligible,
+  assertGatewayWideOwnerAllowed,
   MINT_REFUSALS,
   type MintRule,
   validateAgentIpPolicy,
@@ -400,29 +401,72 @@ describe("every refusal is one fixed sentence that echoes nothing of the request
 });
 
 describe("rule 4 against an endpoint row", () => {
-  it("allows a public, unrestricted endpoint", () => {
+  // Oracle: the settled mint contract (private plan, tool-collections-rollout,
+  // "Foreman decisions after the Sol plan review", decision 1): an endpoint
+  // scoped mint needs a public endpoint, and a restricted one only for an owner
+  // who is an explicit member of a mapped group.
+  it("allows a public, unrestricted endpoint with or without membership", () => {
+    for (const member of [false, true]) {
+      expect(() =>
+        assertEndpointEligible({ user_id: null, restricted: false }, member),
+      ).not.toThrow();
+    }
+  });
+
+  it("allows a public restricted endpoint only for an explicit member of a mapped group", () => {
     expect(() =>
-      assertEndpointEligible({ user_id: null, restricted: false }),
+      assertEndpointEligible({ user_id: null, restricted: true }, true),
     ).not.toThrow();
+    expect(() =>
+      assertEndpointEligible({ user_id: null, restricted: true }, false),
+    ).toThrow(MINT_REFUSALS.endpoint_not_eligible.message);
   });
 
   it.each([
     ["private", { user_id: "someone", restricted: false }],
-    ["restricted", { user_id: null, restricted: true }],
     ["private and restricted", { user_id: "someone", restricted: true }],
-  ])("refuses a %s endpoint with the one sentence", (_label, endpoint) => {
-    expect(() => assertEndpointEligible(endpoint)).toThrow(
-      MINT_REFUSALS.endpoint_not_eligible.message,
-    );
-  });
+  ])(
+    "refuses a %s endpoint even for a member, with the one sentence",
+    (_label, endpoint) => {
+      expect(() => assertEndpointEligible(endpoint, true)).toThrow(
+        MINT_REFUSALS.endpoint_not_eligible.message,
+      );
+    },
+  );
 
   it("treats a restricted flag that is not exactly false as restricted", () => {
     expect(() =>
-      assertEndpointEligible({
-        user_id: null,
-        restricted: undefined as unknown as boolean,
-      }),
+      assertEndpointEligible(
+        {
+          user_id: null,
+          restricted: undefined as unknown as boolean,
+        },
+        false,
+      ),
     ).toThrow(MINT_REFUSALS.endpoint_not_eligible.message);
+  });
+});
+
+describe("rule 4 for a gateway-wide key against its owner's role", () => {
+  it("refuses an administrator-role owner with its own sentence", () => {
+    expect(() => assertGatewayWideOwnerAllowed({ role: "admin" })).toThrow(
+      MINT_REFUSALS.gateway_wide_admin_owner.message,
+    );
+  });
+
+  it.each(["member", "", null])(
+    "allows an owner whose role is %j, because the request-time rule decides its reach",
+    (role) => {
+      expect(() => assertGatewayWideOwnerAllowed({ role })).not.toThrow();
+    },
+  );
+
+  it("does not honour a near-miss spelling of the role as an administrator", () => {
+    // The request-time gate compares to exactly "admin"; this must agree, so
+    // that no role is refused here that the gate would not treat as admin.
+    expect(() =>
+      assertGatewayWideOwnerAllowed({ role: "Admin" }),
+    ).not.toThrow();
   });
 });
 
