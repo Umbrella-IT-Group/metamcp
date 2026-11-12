@@ -371,7 +371,9 @@ describeIfDb(
         ).status,
       ).toBe(200);
 
-      // The operator CLI's IP-policy calls (kept reachable on purpose).
+      // The operator CLI's IP-policy calls (kept reachable on purpose). On a
+      // data-plane key an admin-plane key may only lock or narrow, so the write
+      // is a narrow enforce list; unlocking it is refused (api-key-mint suite).
       const policy = await trpc(
         "frontend.apiKeys.getGlobalIpPolicy",
         undefined,
@@ -392,7 +394,11 @@ describeIfDb(
         (
           await trpc(
             "frontend.apiKeys.setIpPolicy",
-            { uuid: dataKeyUuid, allowed_cidrs: null, ip_policy_mode: "off" },
+            {
+              uuid: dataKeyUuid,
+              allowed_cidrs: ["203.0.113.0/24"],
+              ip_policy_mode: "enforce",
+            },
             "mutation",
           )
         ).status,

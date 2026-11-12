@@ -22,6 +22,7 @@ const { repoMock, configServiceMock, loggerMock, txAudit, txState, emitMock } =
     repoMock: {
       setIpPolicy: vi.fn(),
       deactivate: vi.fn(),
+      lockPolicyTarget: vi.fn(),
     },
     configServiceMock: {
       getApiKeyIpPolicy: vi.fn(),
@@ -51,6 +52,7 @@ vi.mock("../db/repositories", () => ({
   ApiKeysRepository: class {
     setIpPolicy = repoMock.setIpPolicy;
     deactivate = repoMock.deactivate;
+    lockPolicyTarget = repoMock.lockPolicyTarget;
   },
   endpointsRepository: { findByUuid: vi.fn() },
   usersRepository: { findById: vi.fn(), isDisabled: vi.fn() },
@@ -82,6 +84,7 @@ const { apiKeysImplementations } = await import("./api-keys.impl");
 const { selfLockoutRefusal, SELF_LOCKOUT_REFUSALS } = await import(
   "../lib/api-key-self-lockout"
 );
+const { MINT_REFUSALS } = await import("../lib/api-key-mint-rules");
 const { ADMIN_AUDIT_WRITE_FAILED_MESSAGE } = await import(
   "../lib/audit/admin-write"
 );
@@ -125,6 +128,9 @@ beforeEach(() => {
   txState.callerRow = [];
   txState.transactions = 0;
   txAudit.record.mockImplementation(async () => undefined);
+  // The key being changed is a data-plane key unless a test says otherwise.
+  repoMock.lockPolicyTarget.mockReset();
+  repoMock.lockPolicyTarget.mockResolvedValue({ admin_plane: false });
   repoMock.setIpPolicy.mockImplementation(
     async (
       uuid: string,
@@ -366,6 +372,139 @@ describe("setIpPolicy outside the rail", () => {
     expect(repoMock.setIpPolicy.mock.calls[0]).toHaveLength(2);
     expect(txAudit.record).not.toHaveBeenCalled();
     expect(emitMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked and narrow", () => {
+  // A key an admin-plane key creates is locked and narrow (rule 5). A second
+  // call must not undo that: on a data-plane key the key may leave only an
+  // enforce list of its own, 1 to 8 entries, none wider than IPv4 /24 or
+  // IPv6 /48 (IPv4-mapped IPv6 counted at its IPv4 width).
+  const tooWide = MINT_REFUSALS.ip_policy_change_too_wide.message;
+  const notEnforced = MINT_REFUSALS.ip_policy_change_shape.message;
+  const nine = Array.from({ length: 9 }, (_v, i) => `203.0.113.${i}`);
+
+  const refused: Array<
+    [string, string[] | null, "off" | "audit" | "enforce", string]
+  > = [
+    ["follow the global policy", null, "off", notEnforced],
+    ["mode off with a list", ["203.0.113.0/24"], "off", notEnforced],
+    ["mode audit with a list", ["203.0.113.0/24"], "audit", notEnforced],
+    ["nine entries", nine, "enforce", notEnforced],
+    ["the any-IP exemption", ["0.0.0.0/0", "::/0"], "enforce", tooWide],
+    ["an IPv4 /8", ["10.0.0.0/8"], "enforce", tooWide],
+    ["an IPv4 /23", ["203.0.112.0/23"], "enforce", tooWide],
+    ["an IPv6 /47", ["2001:db8::/47"], "enforce", tooWide],
+    ["::/48", ["::/48"], "enforce", tooWide],
+    ["::ffff:0:0/96", ["::ffff:0:0/96"], "enforce", tooWide],
+    ["a mapped /119", ["::ffff:203.0.112.0/119"], "enforce", tooWide],
+    [
+      "one wide entry among narrow ones",
+      ["203.0.113.0/24", "10.0.0.0/8"],
+      "enforce",
+      tooWide,
+    ],
+  ];
+
+  it.each(refused)(
+    "refuses %s, writing nothing and leaving one denial row",
+    async (_label, cidrs, mode, sentence) => {
+      const failure = await setPolicy(OTHER_UUID, cidrs, mode, actor()).catch(
+        (e) => e,
+      );
+
+      expect(failure).toMatchObject({ code: "BAD_REQUEST", message: sentence });
+      expect(repoMock.setIpPolicy).not.toHaveBeenCalled();
+      expect(txAudit.record).not.toHaveBeenCalled();
+      expect(emitMock).toHaveBeenCalledTimes(1);
+      expect(emitMock.mock.calls[0][1]).toEqual({
+        action: "apikey.ip_policy.set",
+        target_type: "api_key",
+        target_id: OTHER_UUID,
+        outcome: "denied",
+        detail: {
+          rule:
+            sentence === tooWide
+              ? "ip_policy_change_too_wide"
+              : "ip_policy_change_shape",
+        },
+      });
+    },
+  );
+
+  it.each([
+    ["an IPv4 /24", ["203.0.113.0/24"]],
+    ["a single IPv4 address", ["203.0.113.7"]],
+    ["a native IPv6 /48 and an IPv4 /24", ["2001:db8::/48", "198.51.100.0/24"]],
+    ["a mapped /120", ["::ffff:203.0.113.0/120"]],
+    ["eight entries", nine.slice(0, 8)],
+  ])(
+    "accepts %s, writing and recording in one transaction",
+    async (_l, cidrs) => {
+      await setPolicy(OTHER_UUID, cidrs, "enforce", actor());
+
+      expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
+      expect(txState.transactions).toBe(1);
+      expect(txAudit.record).toHaveBeenCalledTimes(1);
+      expect(emitMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("looks the target up inside the write's transaction, by uuid", async () => {
+    await setPolicy(OTHER_UUID, ["203.0.113.0/24"], "enforce", actor());
+
+    expect(repoMock.lockPolicyTarget).toHaveBeenCalledTimes(1);
+    const [handle, uuid] = repoMock.lockPolicyTarget.mock.calls[0];
+    expect(handle).toBeDefined();
+    expect(uuid).toBe(OTHER_UUID);
+  });
+
+  it.each([
+    ["the any-IP exemption", ["0.0.0.0/0", "::/0"], "enforce"],
+    ["mode off", ["203.0.113.0/24"], "off"],
+    ["a wide list", ["10.0.0.0/8"], "enforce"],
+  ] as const)(
+    "leaves an admin-plane key's policy to the CLI's own judgement: %s is accepted",
+    async (_label, cidrs, mode) => {
+      // The CI key is locked to any address on purpose (its runners rotate), and
+      // the operator sets that; only data-plane keys are held to the bound.
+      repoMock.lockPolicyTarget.mockResolvedValue({ admin_plane: true });
+
+      await setPolicy(OTHER_UUID, [...cidrs], mode, actor());
+
+      expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("lets a key follow the global policy when the target is an admin-plane key", async () => {
+    repoMock.lockPolicyTarget.mockResolvedValue({ admin_plane: true });
+
+    await setPolicy(OTHER_UUID, null, "off", actor());
+
+    expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through to the repository's not-found for a key that does not exist", async () => {
+    repoMock.lockPolicyTarget.mockResolvedValue(null);
+    repoMock.setIpPolicy.mockResolvedValue(null);
+
+    await expect(
+      setPolicy(OTHER_UUID, ["10.0.0.0/8"], "enforce", actor()),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("does not look up the calling key's own row, which would run ahead of the config locks", async () => {
+    await setPolicy(CALLER_UUID, ["203.0.113.0/24"], "enforce", actor());
+
+    expect(repoMock.lockPolicyTarget).not.toHaveBeenCalled();
+  });
+
+  it("leaves a human administrator's session unbounded and unqueried", async () => {
+    await setPolicy(OTHER_UUID, ["0.0.0.0/0", "::/0"], "enforce", humanActor);
+    await setPolicy(OTHER_UUID, null, "off", humanActor);
+
+    expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(2);
+    expect(repoMock.lockPolicyTarget).not.toHaveBeenCalled();
   });
 });
 

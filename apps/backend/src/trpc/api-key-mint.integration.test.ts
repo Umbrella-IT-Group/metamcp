@@ -132,7 +132,7 @@ describeIfDb(
         table === "api_keys"
           ? await fx.suiteLock.query(`SELECT count(*)::int AS n FROM api_keys`)
           : await fx.suiteLock.query(
-              `SELECT count(*)::int AS n FROM audit_log WHERE action = 'apikey.create'`,
+              `SELECT count(*)::int AS n FROM audit_log WHERE action = 'apikey.create' AND outcome = 'success'`,
             );
       return rows[0].n as number;
     }
@@ -393,8 +393,9 @@ describeIfDb(
         [string, () => Record<string, unknown>, number, string]
       > = [
         // With an endpoint beside it the input schema refuses first; without one
-        // the request reaches the implementation, which refuses it as well.
-        ["admin_plane true", () => ({ admin_plane: true }), 400, "BAD_REQUEST"],
+        // the request reaches the implementation, which refuses it as well. The
+        // caller gets the rule's own code and sentence either way.
+        ["admin_plane true", () => ({ admin_plane: true }), 403, "FORBIDDEN"],
         [
           "admin_plane true with nothing else to refuse it",
           () => ({ admin_plane: true, endpoint_uuid: undefined }),
@@ -404,14 +405,14 @@ describeIfDb(
         [
           "admin_plane true with an operator scope",
           () => ({ admin_plane: true, admin_plane_scope: "operator" }),
-          400,
-          "BAD_REQUEST",
+          403,
+          "FORBIDDEN",
         ],
         [
           "a scope without admin_plane",
           () => ({ admin_plane_scope: "sync" }),
-          400,
-          "BAD_REQUEST",
+          403,
+          "FORBIDDEN",
         ],
         [
           "an acts-as identity",
@@ -422,14 +423,14 @@ describeIfDb(
         [
           "an acts-as identity that is null",
           () => ({ acts_as_user_id: null }),
-          400,
-          "BAD_REQUEST",
+          403,
+          "FORBIDDEN",
         ],
         [
           "an acts-as identity that is empty",
           () => ({ acts_as_user_id: "" }),
-          400,
-          "BAD_REQUEST",
+          403,
+          "FORBIDDEN",
         ],
         [
           "a public (null) owner",
@@ -593,7 +594,9 @@ describeIfDb(
         await expectNothingWritten(async () => {
           const reply = await mint(over());
           await expectRefused(reply, { status, code });
-          // One fixed sentence: nothing of the request is echoed back.
+          // One fixed sentence, not the schema's JSON dump of its issues, and
+          // nothing of the request is echoed back.
+          expect(() => JSON.parse(reply.message ?? "")).toThrow();
           const text = JSON.stringify(reply);
           expect(text).not.toContain(fx.memberId);
           expect(text).not.toContain("no-such-user-id");
@@ -1615,6 +1618,410 @@ describeIfDb(
         );
 
         expect(reply.status).toBe(200);
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    describe("a refusal leaves one denied row and no success row", () => {
+      // The generic accepted-request row carries no procedure name or payload,
+      // so without a denial row a key probing for a credential it may not create
+      // leaves no distinct signal, while an out-of-scope call is a denial.
+      const serverNow = async () =>
+        (await fx.suiteLock.query(`SELECT clock_timestamp() AS t`)).rows[0]
+          .t as Date;
+
+      const deniedSince = (since: Date) =>
+        fx.auditEventually(
+          `action = 'apikey.create' AND outcome = 'denied' AND actor_id = $1 AND occurred_at >= $2`,
+          [fx.operator.uuid, since],
+        );
+
+      const PROBES: Array<
+        [string, () => Record<string, unknown>, string, string]
+      > = [
+        [
+          "an admin-plane key",
+          () => ({
+            admin_plane: true,
+            endpoint_uuid: undefined,
+            all_endpoints: true,
+          }),
+          "admin_plane_field",
+          "FORBIDDEN",
+        ],
+        [
+          "an acts-as key",
+          () => ({ acts_as_user_id: fx.memberId }),
+          "acts_as_field",
+          "FORBIDDEN",
+        ],
+        [
+          "a public key",
+          () => ({ user_id: null }),
+          "owner_required",
+          "BAD_REQUEST",
+        ],
+        [
+          "an over-wide list",
+          () => ({
+            ip_policy: { mode: "enforce", allowed_cidrs: ["0.0.0.0/0"] },
+          }),
+          "ip_policy_too_wide",
+          "BAD_REQUEST",
+        ],
+        [
+          "a policy that is not enforce (refused by the input schema)",
+          () => ({
+            ip_policy: { mode: "off", allowed_cidrs: ["203.0.113.0/24"] },
+          }),
+          "ip_policy_shape",
+          "BAD_REQUEST",
+        ],
+        [
+          "a private endpoint (refused in the transaction)",
+          () => ({ endpoint_uuid: epPrivateMember }),
+          "endpoint_not_eligible",
+          "FORBIDDEN",
+        ],
+      ];
+
+      it.each(PROBES)(
+        "records one denial naming the rule for %s, and nothing of the request",
+        async (_label, over, rule, code) => {
+          const since = await serverNow();
+          const successBefore = await count("audit_create");
+
+          const reply = await mint(over());
+          await expectRefused(reply, {
+            status: code === "FORBIDDEN" ? 403 : 400,
+            code,
+          });
+
+          const rows = await deniedSince(since);
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({
+            actor_type: "api_key",
+            actor_id: fx.operator.uuid,
+            target_id: null,
+            outcome: "denied",
+          });
+          expect(rows[0].detail).toEqual({
+            rule,
+            admin_plane: {
+              key_uuid: fx.operator.uuid,
+              owner_user_id: fx.ownerId,
+              scope: "operator",
+            },
+          });
+          expect(await count("audit_create")).toBe(successBefore);
+          // Nothing the request carried reaches the row.
+          const text = JSON.stringify(rows);
+          for (const value of [fx.memberId, epPrivateMember, "0.0.0.0/0"]) {
+            expect(text).not.toContain(value);
+          }
+        },
+      );
+    });
+
+    // -------------------------------------------------------------------------
+    describe("the endpoint uuid in the audit row is the stored one", () => {
+      it("records a lower-case uuid when the request spelled it upper case", async () => {
+        const reply = await mint({ endpoint_uuid: epPublic.toUpperCase() });
+        expect(reply.status).toBe(200);
+        const uuid = (reply.data as { uuid: string }).uuid;
+        valueOf(reply);
+
+        const rows = await fx.auditNow(
+          `action = 'apikey.create' AND target_id = $1`,
+          [uuid],
+        );
+        expect(rows).toHaveLength(1);
+        const stored = (
+          await fx.suiteLock.query(
+            `SELECT endpoint_uuid::text AS u FROM api_keys WHERE uuid = $1`,
+            [uuid],
+          )
+        ).rows[0].u as string;
+        expect(stored).toBe(epPublic);
+        expect(
+          (rows[0].detail as { endpoint_uuid: string }).endpoint_uuid,
+        ).toBe(stored);
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    describe("a created key stays locked and narrow after it is created", () => {
+      // Rule 5 holds across calls, not only in one: the key that created a key
+      // may not then unlock it or widen it past the bound, with setIpPolicy.
+      let minted = "";
+      const policyOfMinted = async () =>
+        (
+          await fx.suiteLock.query(
+            `SELECT allowed_cidrs, ip_policy_mode FROM api_keys WHERE uuid = $1`,
+            [minted],
+          )
+        ).rows[0] as { allowed_cidrs: string[] | null; ip_policy_mode: string };
+      const setPolicy = (
+        cidrs: string[] | null,
+        mode: string,
+        options: { key?: string; cookie?: string } = {},
+      ) =>
+        fx.trpc(
+          "frontend.apiKeys.setIpPolicy",
+          { uuid: minted, allowed_cidrs: cidrs, ip_policy_mode: mode },
+          "mutation",
+          options,
+        );
+
+      beforeAll(async () => {
+        const reply = await mint();
+        expect(reply.status).toBe(200);
+        minted = (reply.data as { uuid: string }).uuid;
+        valueOf(reply);
+      });
+
+      it.each([
+        ["mode off, following the global policy", null, "off"],
+        ["mode off with a list", ["203.0.113.0/24"], "off"],
+        ["mode audit", ["203.0.113.0/24"], "audit"],
+        ["the any-IP exemption", ["0.0.0.0/0", "::/0"], "enforce"],
+        ["an IPv4 /8", ["10.0.0.0/8"], "enforce"],
+        ["::ffff:0:0/96", ["::ffff:0:0/96"], "enforce"],
+        ["::/48", ["::/48"], "enforce"],
+        ["a mapped /119", ["::ffff:203.0.112.0/119"], "enforce"],
+        [
+          "nine entries",
+          Array.from({ length: 9 }, (_v, i) => `203.0.113.${i}`),
+          "enforce",
+        ],
+      ] as const)(
+        "refuses %s, leaving the policy as it was",
+        async (_label, cidrs, mode) => {
+          const reply = await setPolicy(cidrs ? [...cidrs] : null, mode, {});
+          failureBodies.push(JSON.stringify(reply));
+
+          expect(reply.status).toBe(400);
+          expect(reply.code).toBe("BAD_REQUEST");
+          expect(() => JSON.parse(reply.message ?? "")).toThrow();
+          expect(await policyOfMinted()).toEqual({
+            allowed_cidrs: ["203.0.113.0/24"],
+            ip_policy_mode: "enforce",
+          });
+        },
+      );
+
+      it("leaves a denied row for a refusal, naming the rule and the key", async () => {
+        const since = (
+          await fx.suiteLock.query(`SELECT clock_timestamp() AS t`)
+        ).rows[0].t as Date;
+        await setPolicy(["10.0.0.0/8"], "enforce");
+
+        const rows = await fx.auditEventually(
+          `action = 'apikey.ip_policy.set' AND outcome = 'denied' AND target_id = $1 AND occurred_at >= $2`,
+          [minted, since],
+        );
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          actor_type: "api_key",
+          actor_id: fx.operator.uuid,
+        });
+        expect((rows[0].detail as { rule: string }).rule).toBe(
+          "ip_policy_change_too_wide",
+        );
+      });
+
+      it("lets the key move it to another narrow list, and records the change", async () => {
+        const moved = await setPolicy(
+          ["198.51.100.0/24", "2001:db8::/48"],
+          "enforce",
+        );
+        expect(moved.status).toBe(200);
+        expect(await policyOfMinted()).toEqual({
+          allowed_cidrs: ["198.51.100.0/24", "2001:db8::/48"],
+          ip_policy_mode: "enforce",
+        });
+        const rows = await fx.auditNow(
+          `action = 'apikey.ip_policy.set' AND outcome = 'success' AND target_id = $1`,
+          [minted],
+        );
+        expect(rows.length).toBeGreaterThanOrEqual(1);
+        // Back to the first list, for the cases after this one.
+        expect((await setPolicy(["203.0.113.0/24"], "enforce")).status).toBe(
+          200,
+        );
+      });
+
+      it("does not hold an administrator's session to the bound", async () => {
+        const widened = await setPolicy(["10.0.0.0/8"], "enforce", {
+          cookie: fx.ownerCookie,
+        });
+        expect(widened.status).toBe(200);
+        expect(await policyOfMinted()).toEqual({
+          allowed_cidrs: ["10.0.0.0/8"],
+          ip_policy_mode: "enforce",
+        });
+        const off = await setPolicy(null, "off", { cookie: fx.ownerCookie });
+        expect(off.status).toBe(200);
+        await setPolicy(["203.0.113.0/24"], "enforce", {
+          cookie: fx.ownerCookie,
+        });
+      });
+
+      it("does not hold the policy of an admin-plane key to the bound", async () => {
+        // The CI key is locked to any address on purpose (its runners rotate).
+        const ci = await fx.trpc(
+          "frontend.apiKeys.setIpPolicy",
+          {
+            uuid: fx.sync.uuid,
+            allowed_cidrs: ["0.0.0.0/0", "::/0"],
+            ip_policy_mode: "enforce",
+          },
+          "mutation",
+        );
+        expect(ci.status).toBe(200);
+        const { rows } = await fx.suiteLock.query(
+          `SELECT allowed_cidrs FROM api_keys WHERE uuid = $1`,
+          [fx.sync.uuid],
+        );
+        expect(rows[0].allowed_cidrs).toEqual(["0.0.0.0/0", "::/0"]);
+        await fx.trpc(
+          "frontend.apiKeys.setIpPolicy",
+          { uuid: fx.sync.uuid, allowed_cidrs: null, ip_policy_mode: "off" },
+          "mutation",
+        );
+      });
+
+      it("answers NOT_FOUND for a key that does not exist, whatever the policy", async () => {
+        const reply = await fx.trpc(
+          "frontend.apiKeys.setIpPolicy",
+          {
+            uuid: "99999999-9999-4999-8999-999999999999",
+            allowed_cidrs: ["10.0.0.0/8"],
+            ip_policy_mode: "enforce",
+          },
+          "mutation",
+        );
+        expect(reply.code).toBe("NOT_FOUND");
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    describe("an endpoint cannot be used to reach what a restricted endpoint keeps from a key", () => {
+      // A key may be created only for a public, unrestricted endpoint. The same
+      // key could otherwise create such an endpoint over the namespace a
+      // restricted (or private) endpoint serves, and create a key for it.
+      const created: string[] = [];
+      let freshNamespace = "";
+
+      const createEndpoint = (
+        name: string,
+        namespaceUuid: string,
+        over: Record<string, unknown> = {},
+        options: { key?: string; cookie?: string } = {},
+      ) =>
+        fx.trpc(
+          "frontend.endpoints.create",
+          {
+            name,
+            namespaceUuid,
+            enableApiKeyAuth: true,
+            enableMaxRate: false,
+            enableClientMaxRate: false,
+            enableOauth: false,
+            user_id: null,
+            createMcpServer: false,
+            ...over,
+          },
+          "mutation",
+          options,
+        );
+
+      const endpointRow = async (name: string) =>
+        (
+          await fx.suiteLock.query(
+            `SELECT uuid, namespace_uuid FROM endpoints WHERE name = $1`,
+            [name],
+          )
+        ).rows[0] as { uuid: string; namespace_uuid: string } | undefined;
+
+      beforeAll(async () => {
+        const [namespace] = await fx.db
+          .insert(fx.schema.namespacesTable)
+          .values({ name: `itest-${fx.run}-fresh-ns`, user_id: null })
+          .returning();
+        freshNamespace = namespace.uuid;
+      });
+
+      afterAll(async () => {
+        for (const name of created) {
+          await fx.suiteLock.query(`DELETE FROM endpoints WHERE name = $1`, [
+            name,
+          ]);
+        }
+        await fx.suiteLock.query(`DELETE FROM namespaces WHERE uuid = $1`, [
+          freshNamespace,
+        ]);
+      });
+
+      it("refuses a public endpoint over a namespace a restricted or private endpoint serves, creating nothing", async () => {
+        const name = `clone-${fx.run}`;
+        const reply = await createEndpoint(name, fx.publicNamespaceUuid);
+
+        // `success: false` inside an HTTP 200, like the rules beside it.
+        expect(reply.status).toBe(200);
+        const body = reply.data as { success: boolean; message: string };
+        expect(body.success).toBe(false);
+        expect(body.message).toBe(
+          "An admin-plane API key cannot make a namespace public that a restricted or private endpoint already serves. Do this in the admin UI.",
+        );
+        expect(await endpointRow(name)).toBeUndefined();
+      });
+
+      it("creates a public endpoint over a namespace nothing gates", async () => {
+        const name = `fresh-${fx.run}`;
+        created.push(name);
+        const reply = await createEndpoint(name, freshNamespace);
+
+        expect((reply.data as { success: boolean }).success).toBe(true);
+        expect((await endpointRow(name))?.namespace_uuid).toBe(freshNamespace);
+      });
+
+      it("refuses re-pointing that endpoint at the namespace a restricted endpoint serves, leaving it where it was", async () => {
+        const name = `fresh-${fx.run}`;
+        const row = await endpointRow(name);
+        expect(row).toBeDefined();
+
+        const reply = await fx.trpc(
+          "frontend.endpoints.update",
+          {
+            uuid: row?.uuid,
+            name,
+            namespaceUuid: fx.publicNamespaceUuid,
+            enableApiKeyAuth: true,
+            requireScopedApiKey: false,
+            enableMaxRate: false,
+            enableClientMaxRate: false,
+            enableOauth: false,
+          },
+          "mutation",
+        );
+
+        expect((reply.data as { success: boolean }).success).toBe(false);
+        expect((await endpointRow(name))?.namespace_uuid).toBe(freshNamespace);
+      });
+
+      it("does not hold an administrator's session to the rule", async () => {
+        const name = `human-${fx.run}`;
+        created.push(name);
+        const reply = await createEndpoint(
+          name,
+          fx.publicNamespaceUuid,
+          {},
+          { cookie: fx.ownerCookie },
+        );
+
+        expect((reply.data as { success: boolean }).success).toBe(true);
       });
     });
 

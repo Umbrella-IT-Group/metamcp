@@ -805,6 +805,26 @@ export class ApiKeysRepository {
   }
 
   /**
+   * Lock one key's row and report which plane it is on, inside the caller's
+   * transaction, for a policy change that is judged by the target's kind (an
+   * admin-plane key may only leave a DATA-plane key a narrow enforce policy).
+   * Returns null when no key has that uuid. The plane is fixed at creation and
+   * has no setter, so the lock is for ordering with the write that follows in
+   * the same transaction, not for the flag.
+   */
+  async lockPolicyTarget(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<{ admin_plane: boolean } | null> {
+    const [target] = await tx
+      .select({ admin_plane: apiKeysTable.admin_plane })
+      .from(apiKeysTable)
+      .where(eq(apiKeysTable.uuid, uuid))
+      .for("update");
+    return target ?? null;
+  }
+
+  /**
    * Deactivate one key (the containment write), inside the caller's
    * transaction. Reads the row FOR UPDATE and only then writes, so two
    * concurrent deactivations make one transition and the second sees the key

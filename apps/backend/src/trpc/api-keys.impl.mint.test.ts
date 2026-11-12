@@ -10,9 +10,11 @@
  *    sync scope, a missing scope, an unknown scope and a demoted owner all get
  *    the standing admin-plane refusal, with nothing written;
  *  - every rule refuses BEFORE the transaction opens (no repository call, no
- *    audit row) with its one fixed sentence;
+ *    success row) with its one fixed sentence, and leaves one `denied` row that
+ *    names the rule and nothing of the request;
  *  - a rule the database decides (owner, endpoint, name) is refused with the
- *    same sentence the pure rules use, and rolls back with no success row;
+ *    same sentence the pure rules use, rolls back with no success row, and
+ *    leaves the same one `denied` row;
  *  - the key and its single `apikey.create` audit row go through ONE
  *    transaction, the row is awaited, and an audit failure fails the create;
  *  - the raw value is returned once and appears in no audit row, no log line
@@ -144,6 +146,25 @@ const everything = () =>
     loggerMock.error.mock.calls,
   ]);
 
+/**
+ * A refusal writes no success row and exactly one `denied` apikey.create row:
+ * the rule, the acting key, and nothing the request carried.
+ */
+const expectOnlyDenial = (rule: string) => {
+  expect(txAudit.record).not.toHaveBeenCalled();
+  expect(emitMock).toHaveBeenCalledTimes(1);
+  const [actor, event] = emitMock.mock.calls[0];
+  expect(event).toEqual({
+    action: "apikey.create",
+    target_type: "api_key",
+    outcome: "denied",
+    detail: { rule },
+  });
+  expect(actor).toMatchObject({
+    admin_plane: { key_uuid: OPERATOR_KEY_UUID, scope: "operator" },
+  });
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   runnerMock.transactions = 0;
@@ -272,11 +293,11 @@ describe("every rule refuses before anything is written", () => {
       code: MINT_REFUSALS[rule].code,
       message: MINT_REFUSALS[rule].message,
     });
-    // Nothing was written: no transaction, no key, no audit row, no emit.
+    // Nothing was written: no transaction, no key, no success row. The one
+    // trace is the denial row.
     expect(runnerMock.transactions).toBe(0);
     expect(repoMock.mintDataPlaneKey).not.toHaveBeenCalled();
-    expect(txAudit.record).not.toHaveBeenCalled();
-    expect(emitMock).not.toHaveBeenCalled();
+    expectOnlyDenial(rule);
   });
 
   it("refuses while the global kill switch is on, without opening a transaction", async () => {
@@ -290,6 +311,142 @@ describe("every rule refuses before anything is written", () => {
     }
     expect(runnerMock.transactions).toBe(0);
     expect(repoMock.mintDataPlaneKey).not.toHaveBeenCalled();
+    expectOnlyDenial("ip_policy_disabled");
+  });
+
+  it("leaves a denial row for a caller that is not an operator, and for a demoted owner", async () => {
+    for (const [actor, admin] of [
+      [actorFor("sync"), true],
+      [operatorActor, false],
+    ] as const) {
+      vi.clearAllMocks();
+      await call(mintInput(), actor, admin).catch(() => undefined);
+      expect(emitMock).toHaveBeenCalledTimes(1);
+      expect(emitMock.mock.calls[0][1]).toMatchObject({
+        action: "apikey.create",
+        outcome: "denied",
+        detail: { rule: "caller_not_operator" },
+      });
+    }
+  });
+
+  it("names the rule in a denial row and nothing the probing request carried", async () => {
+    await call(
+      mintInput({
+        name: "probe/name with a slash",
+        user_id: "owner-probe-gamma",
+        acts_as_user_id: "acts-probe-delta",
+        ip_policy: { mode: "enforce", allowed_cidrs: ["10.1.2.0/8"] },
+      }),
+    ).catch(() => undefined);
+
+    const written = JSON.stringify(emitMock.mock.calls);
+    for (const probe of ["probe/name", "gamma", "delta", "10.1.2.0"]) {
+      expect(written).not.toContain(probe);
+    }
+    expectOnlyDenial("acts_as_field");
+  });
+});
+
+describe("a create request the input schema refused", () => {
+  // The router calls mintInputRefusal with the RAW request when the schema
+  // refuses an admin-plane key's create. The answer is the sentence and code
+  // the implementation gives the same request, never the schema's JSON dump.
+  const cases: Array<[string, unknown, keyof typeof MINT_REFUSALS]> = [
+    [
+      "admin_plane with a scope choice",
+      mintInput({ admin_plane: true }),
+      "admin_plane_field",
+    ],
+    [
+      "a scope without admin_plane",
+      mintInput({ admin_plane_scope: "sync" }),
+      "admin_plane_field",
+    ],
+    [
+      "admin_plane of the wrong type",
+      mintInput({ admin_plane: "yes" }),
+      "admin_plane_field",
+    ],
+    ["acts-as null", mintInput({ acts_as_user_id: null }), "acts_as_field"],
+    ["acts-as empty", mintInput({ acts_as_user_id: "" }), "acts_as_field"],
+    [
+      "no endpoint choice",
+      mintInput({ endpoint_uuid: undefined }),
+      "scope_choice",
+    ],
+    [
+      "both endpoint choices",
+      mintInput({ all_endpoints: true }),
+      "scope_choice",
+    ],
+    ["a bad name", mintInput({ name: "bad/name" }), "name_invalid"],
+    [
+      "a mode in lower case that is not enforce",
+      mintInput({
+        ip_policy: { mode: "off", allowed_cidrs: ["203.0.113.0/24"] },
+      }),
+      "ip_policy_shape",
+    ],
+    [
+      "a mode in the wrong case",
+      mintInput({
+        ip_policy: { mode: "Enforce", allowed_cidrs: ["203.0.113.0/24"] },
+      }),
+      "ip_policy_shape",
+    ],
+    [
+      "an empty list",
+      mintInput({ ip_policy: { mode: "enforce", allowed_cidrs: [] } }),
+      "ip_policy_shape",
+    ],
+    [
+      "nine entries",
+      mintInput({
+        ip_policy: {
+          mode: "enforce",
+          allowed_cidrs: Array.from({ length: 9 }, (_v, i) => `203.0.113.${i}`),
+        },
+      }),
+      "ip_policy_shape",
+    ],
+    ["a null owner", mintInput({ user_id: null }), "owner_required"],
+  ];
+
+  it.each(cases)(
+    "answers %s with the rule's own sentence",
+    (_label, raw, rule) => {
+      const refusal = apiKeysImplementations.mintInputRefusal(
+        raw,
+        operatorActor as never,
+      );
+
+      expect(refusal).toMatchObject({
+        code: MINT_REFUSALS[rule].code,
+        message: MINT_REFUSALS[rule].message,
+      });
+      // A sentence, not the schema's JSON dump of its issues.
+      expect(() => JSON.parse(refusal.message)).toThrow();
+      expectOnlyDenial(rule);
+    },
+  );
+
+  it.each([
+    ["a string", "not an object"],
+    ["null", null],
+    ["an array", []],
+    ["a request every rule accepts", mintInput()],
+  ])("answers %s with the generic sentence", (_label, raw) => {
+    const refusal = apiKeysImplementations.mintInputRefusal(
+      raw,
+      operatorActor as never,
+    );
+
+    expect(refusal).toMatchObject({
+      code: "BAD_REQUEST",
+      message: MINT_REFUSALS.request_invalid.message,
+    });
+    expectOnlyDenial("request_invalid");
   });
 });
 
@@ -373,6 +530,18 @@ describe("a valid mint", () => {
     });
   });
 
+  it("records the endpoint uuid as stored, not as submitted", async () => {
+    // Postgres reads a uuid case-insensitively and stores it lower case; the
+    // row the repository returns carries the stored form.
+    await call(mintInput({ endpoint_uuid: ENDPOINT_UUID.toUpperCase() }));
+
+    const [, event] = txAudit.record.mock.calls[0] as [
+      unknown,
+      { detail: { endpoint_uuid: string } },
+    ];
+    expect(event.detail.endpoint_uuid).toBe(ENDPOINT_UUID);
+  });
+
   it("puts the raw key in nothing it writes, logs or hands to the audit row", async () => {
     await call(mintInput());
 
@@ -401,8 +570,7 @@ describe("a refusal the database makes", () => {
         code: MINT_REFUSALS[rule].code,
         message: MINT_REFUSALS[rule].message,
       });
-      expect(txAudit.record).not.toHaveBeenCalled();
-      expect(emitMock).not.toHaveBeenCalled();
+      expectOnlyDenial(rule);
     },
   );
 });

@@ -43,6 +43,7 @@ import {
  */
 
 export type MintRule =
+  | "request_invalid"
   | "caller_not_operator"
   | "admin_plane_field"
   | "acts_as_field"
@@ -55,12 +56,21 @@ export type MintRule =
   | "ip_policy_entries"
   | "ip_policy_too_wide"
   | "ip_policy_disabled"
+  | "ip_policy_change_shape"
+  | "ip_policy_change_too_wide"
   | "name_invalid"
   | "name_taken";
 
 export const MINT_REFUSALS: Readonly<
   Record<MintRule, { code: "FORBIDDEN" | "BAD_REQUEST"; message: string }>
 > = {
+  // The request failed the input schema for a reason none of the rules below
+  // names (a malformed body, a type the schema refuses that the rules do not
+  // look at). One sentence, no echo of the request.
+  request_invalid: {
+    code: "BAD_REQUEST",
+    message: "The request is not a valid API key request.",
+  },
   // A legacy gateway, a sync-scope key and a missing or unknown scope all get
   // the sentence every other admin-plane refusal carries.
   caller_not_operator: {
@@ -119,6 +129,19 @@ export const MINT_REFUSALS: Readonly<
     code: "FORBIDDEN",
     message:
       "API key IP policies are switched off on this gateway, so a key cannot be created locked to a network list.",
+  },
+  // The two rules below apply when an admin-plane key CHANGES the policy of a
+  // data-plane key, so a key created locked cannot be unlocked or widened by a
+  // second call. A human administrator's change is not held to them.
+  ip_policy_change_shape: {
+    code: "BAD_REQUEST",
+    message:
+      "An admin-plane API key can set a data-plane key's IP policy only to mode enforce with 1 to 8 entries in allowed_cidrs. Turning a policy off, to audit, to the global policy or to an empty list is done in the admin UI.",
+  },
+  ip_policy_change_too_wide: {
+    code: "BAD_REQUEST",
+    message:
+      "allowed_cidrs holds an entry wider than IPv4 /24 or IPv6 /48 (IPv4-mapped IPv6 is counted at its IPv4 width). A data-plane key's list is widened in the admin UI.",
   },
   name_invalid: {
     code: "BAD_REQUEST",
@@ -262,14 +285,53 @@ export function validateAgentIpPolicy(policy: unknown): string[] {
   if (!normalized.ok) {
     throw new ApiKeyMintRefusal("ip_policy_entries");
   }
-  for (const cidr of normalized.cidrs) {
-    const parsed = parseCidr(cidr);
-    if (!parsed.ok) throw new ApiKeyMintRefusal("ip_policy_entries");
-    if (agentCidrTooWide(parsed.value)) {
-      throw new ApiKeyMintRefusal("ip_policy_too_wide");
-    }
-  }
+  const verdict = widthVerdict(normalized.cidrs);
+  if (verdict === "invalid") throw new ApiKeyMintRefusal("ip_policy_entries");
+  if (verdict === "too_wide") throw new ApiKeyMintRefusal("ip_policy_too_wide");
   return normalized.cidrs;
+}
+
+/** Is every canonical entry parseable and no wider than an agent may carry? */
+function widthVerdict(cidrs: readonly string[]): "ok" | "invalid" | "too_wide" {
+  for (const cidr of cidrs) {
+    const parsed = parseCidr(cidr);
+    if (!parsed.ok) return "invalid";
+    if (agentCidrTooWide(parsed.value)) return "too_wide";
+  }
+  return "ok";
+}
+
+/**
+ * The policy an admin-plane key may leave on a DATA-plane key it changes (the
+ * second half of rule 5: a key is created locked and narrow, and a later call
+ * must not undo that). `enforce`, a list of its own with 1 to `MINT_MAX_CIDRS`
+ * entries, none wider than an agent may carry. `cidrs` is the canonical list
+ * the caller already validated and normalised, or null for "follow the global
+ * policy".
+ *
+ * Unlike `validateAgentIpPolicy` this does not look at the kill switch: a
+ * narrower list on an existing key is never made worse by it. Throws
+ * `ApiKeyMintRefusal`; nothing has been written.
+ */
+export function assertAgentSettableIpPolicy(policy: {
+  mode: string;
+  cidrs: readonly string[] | null;
+}): void {
+  if (
+    policy.mode !== "enforce" ||
+    policy.cidrs === null ||
+    policy.cidrs.length < 1 ||
+    policy.cidrs.length > MINT_MAX_CIDRS
+  ) {
+    throw new ApiKeyMintRefusal("ip_policy_change_shape");
+  }
+  const verdict = widthVerdict(policy.cidrs);
+  if (verdict === "invalid") {
+    throw new ApiKeyMintRefusal("ip_policy_change_shape");
+  }
+  if (verdict === "too_wide") {
+    throw new ApiKeyMintRefusal("ip_policy_change_too_wide");
+  }
 }
 
 /**

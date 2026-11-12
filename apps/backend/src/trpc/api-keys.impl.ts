@@ -37,7 +37,9 @@ import {
 } from "../lib/api-key-ip-policy";
 import {
   ApiKeyMintRefusal,
+  assertAgentSettableIpPolicy,
   MINT_REFUSALS,
+  type MintRule,
   validateAgentMintRequest,
 } from "../lib/api-key-mint-rules";
 import {
@@ -104,6 +106,38 @@ function notAnOperatorRefusal(): TRPCError {
 }
 
 /**
+ * Leave a trace of a refusal an admin-plane key ran into: one `denied` audit
+ * row naming the rule and nothing of the request. Without it a key probing for
+ * a credential it may not create leaves only the generic accepted-request row,
+ * while an out-of-scope procedure call is recorded as a denial. Best effort,
+ * like the other denial rows: a refusal has nothing to roll back, and an audit
+ * outage must not turn a clean refusal into a failure.
+ */
+function recordRefusal(
+  actor: AuditActor,
+  action: "apikey.create" | "apikey.ip_policy.set",
+  rule: MintRule,
+  targetId?: string,
+): void {
+  emitAdminEvent(actor, {
+    action,
+    target_type: "api_key",
+    ...(targetId !== undefined ? { target_id: targetId } : {}),
+    outcome: "denied",
+    detail: { rule },
+  });
+}
+
+/** A refusal of an agent mint as the error a caller sees, recorded as denied. */
+function mintRefusalError(actor: AuditActor, rule: MintRule): TRPCError {
+  recordRefusal(actor, "apikey.create", rule);
+  return new TRPCError({
+    code: MINT_REFUSALS[rule].code,
+    message: MINT_REFUSALS[rule].message,
+  });
+}
+
+/**
  * Create a data-plane key on behalf of an admin-plane key.
  *
  * Reached ONLY when the request authenticated with an admin-plane key, which
@@ -131,6 +165,7 @@ async function createForAdminPlane(
   actor: AuditActor,
 ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> {
   if (actor.admin_plane?.scope !== "operator" || isAdmin !== true) {
+    recordRefusal(actor, "apikey.create", "caller_not_operator");
     throw notAnOperatorRefusal();
   }
 
@@ -138,7 +173,7 @@ async function createForAdminPlane(
   try {
     request = validateAgentMintRequest(input);
   } catch (error) {
-    throw mintFailure(error);
+    throw mintFailure(error, actor);
   }
 
   try {
@@ -155,7 +190,10 @@ async function createForAdminPlane(
         detail: {
           name: key.name,
           owner_user_id: request.ownerUserId,
-          endpoint_uuid: request.endpointUuid,
+          // As stored (Postgres reads a uuid case-insensitively and writes it
+          // lower case), not as submitted, so a forensic query by the
+          // canonical uuid finds the row.
+          endpoint_uuid: key.endpoint_uuid,
           all_endpoints: request.allEndpoints,
           acts_as_user_id: null,
           key_admin_plane: false,
@@ -166,7 +204,7 @@ async function createForAdminPlane(
     );
     return ApiKeysSerializer.serializeCreateApiKeyResponse(created);
   } catch (error) {
-    throw mintFailure(error);
+    throw mintFailure(error, actor);
   }
 }
 
@@ -177,10 +215,10 @@ async function createForAdminPlane(
  * its type: a driver error can carry statement parameters, and this path
  * handles a freshly generated credential.
  */
-function mintFailure(error: unknown): TRPCError {
+function mintFailure(error: unknown, actor: AuditActor): TRPCError {
   if (error instanceof TRPCError) return error;
   if (error instanceof ApiKeyMintRefusal) {
-    return new TRPCError({ code: error.code, message: error.message });
+    return mintRefusalError(actor, error.rule);
   }
   if (error instanceof AdminAuditWriteError) {
     return new TRPCError({
@@ -508,6 +546,33 @@ export const apiKeysImplementations = {
     }
   },
 
+  /**
+   * The error for a create request from an admin-plane key that the tRPC input
+   * schema refused. The schema's own message is a JSON dump of its issues, which
+   * is not one of the fixed sentences every other refusal of this procedure
+   * carries, so the router calls this instead and the caller gets the same
+   * sentence (and code) the implementation would give the same request had it
+   * reached it: the first rule `validateAgentMintRequest` finds broken in the RAW
+   * request, or `request_invalid` when the schema refused it for a reason no
+   * rule names. Nothing of the request is echoed, and the refusal is recorded as
+   * a denied `apikey.create` row.
+   */
+  mintInputRefusal: (rawInput: unknown, actor: AuditActor): TRPCError => {
+    let rule: MintRule = "request_invalid";
+    if (
+      typeof rawInput === "object" &&
+      rawInput !== null &&
+      !Array.isArray(rawInput)
+    ) {
+      try {
+        validateAgentMintRequest(rawInput as Record<string, unknown>);
+      } catch (error) {
+        if (error instanceof ApiKeyMintRefusal) rule = error.rule;
+      }
+    }
+    return mintRefusalError(actor, rule);
+  },
+
   // Member-facing list: the caller's own keys plus every public
   // ('everyone') key. Returns key_prefix only — never a usable secret — for
   // ALL of them (see serializeApiKeyList).
@@ -746,6 +811,50 @@ export const apiKeysImplementations = {
     const result = await withAdminAudit(
       actor,
       async (...tx) => {
+        // Second half of rule 5: an admin-plane key may leave a DATA-plane key
+        // only a narrow enforce policy of its own, so a key that was created
+        // locked cannot be unlocked or widened by a later call (a human
+        // administrator's change in the UI is not held to it). Judged against
+        // the target as locked in this transaction. The key's own row is
+        // skipped: it is an admin-plane key by definition, and taking its row
+        // lock here would run ahead of the config locks the own-policy rail
+        // below takes first.
+        if (actor?.admin_plane && !changesOwnPolicy) {
+          const handle = tx[0];
+          if (!handle) {
+            // Unreachable: an admin-plane actor always gets a transaction.
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Internal server error",
+            });
+          }
+          const target = await apiKeysRepository.lockPolicyTarget(
+            handle,
+            input.uuid,
+          );
+          if (target && !target.admin_plane) {
+            try {
+              assertAgentSettableIpPolicy({
+                mode: input.ip_policy_mode,
+                cidrs: allowedCidrs,
+              });
+            } catch (error) {
+              if (error instanceof ApiKeyMintRefusal) {
+                recordRefusal(
+                  actor,
+                  "apikey.ip_policy.set",
+                  error.rule,
+                  input.uuid,
+                );
+                throw new TRPCError({
+                  code: error.code,
+                  message: error.message,
+                });
+              }
+              throw error;
+            }
+          }
+        }
         if (changesOwnPolicy) {
           const handle = tx[0];
           if (!handle) {

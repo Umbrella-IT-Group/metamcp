@@ -36,6 +36,15 @@ const apiKeysRepository = new ApiKeysRepository();
 const DEFAULT_ENDPOINT_MAX_RATE = 600;
 const DEFAULT_ENDPOINT_MAX_RATE_SECONDS = 60;
 
+// An admin-plane key may create an API key only for a public, unrestricted
+// endpoint (lib/api-key-mint-rules.ts, rule 4). Without this refusal the same
+// key could create or re-point such an endpoint over the namespace a restricted
+// or private endpoint serves, then create a key for the new endpoint, and
+// reach through it what the restricted one keeps from that key's owner. The
+// refusal is a fixed sentence that names no endpoint or namespace.
+const ADMIN_PLANE_PUBLISH_REFUSAL =
+  "An admin-plane API key cannot make a namespace public that a restricted or private endpoint already serves. Do this in the admin UI.";
+
 export const endpointsImplementations = {
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
@@ -116,6 +125,22 @@ export const endpointsImplementations = {
       const requireScopedApiKey = restricted
         ? true
         : (input.requireScopedApiKey ?? false);
+
+      // See ADMIN_PLANE_PUBLISH_REFUSAL. Only the kind of endpoint a key may be
+      // created for is judged: a private or restricted endpoint is not one.
+      if (
+        actor?.admin_plane &&
+        isPublicEndpoint &&
+        !restricted &&
+        (await endpointsRepository.hasGatedEndpointOnNamespace(
+          input.namespaceUuid,
+        ))
+      ) {
+        return {
+          success: false as const,
+          message: ADMIN_PLANE_PUBLISH_REFUSAL,
+        };
+      }
 
       // A new endpoint gets a per-credential tool-call ceiling by default. When
       // the flag is on but no budget was supplied, fall back to a conservative
@@ -482,6 +507,25 @@ export const endpointsImplementations = {
             message: `Access denied: Public endpoints can only use public namespaces. Namespace "${namespace.name}" is private`,
           };
         }
+      }
+
+      // See ADMIN_PLANE_PUBLISH_REFUSAL. Judged only when the endpoint is the
+      // kind a key may be created for and its namespace is being changed: an
+      // endpoint left where it is keeps whatever reach it already had.
+      if (
+        actor?.admin_plane &&
+        isPublicEndpoint &&
+        existingEndpoint.restricted !== true &&
+        input.namespaceUuid !== existingEndpoint.namespace_uuid &&
+        (await endpointsRepository.hasGatedEndpointOnNamespace(
+          input.namespaceUuid,
+          input.uuid,
+        ))
+      ) {
+        return {
+          success: false as const,
+          message: ADMIN_PLANE_PUBLISH_REFUSAL,
+        };
       }
 
       // Check if another endpoint with the same name exists (excluding current one)

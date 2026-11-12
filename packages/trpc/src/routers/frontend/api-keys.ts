@@ -30,6 +30,21 @@ import {
   router,
 } from "../../trpc";
 
+/**
+ * Is this the cause tRPC attaches when an input schema refuses a request: a
+ * zod error, carrying its list of issues? Read structurally rather than with
+ * `instanceof`, because the schema package and this one may resolve different
+ * copies of zod. A BAD_REQUEST an implementation throws has no such cause, so
+ * its own fixed sentence is never replaced.
+ */
+function isSchemaFailure(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    Array.isArray((cause as { issues?: unknown }).issues)
+  );
+}
+
 export const createApiKeysRouter = (implementations: {
   create: (
     input: z.infer<typeof CreateApiKeyRequestSchema>,
@@ -37,6 +52,12 @@ export const createApiKeysRouter = (implementations: {
     isAdmin: boolean,
     actor: AuditActor,
   ) => Promise<z.infer<typeof CreateApiKeyResponseSchema>>;
+  /**
+   * The error to answer an admin-plane key's create request with when the
+   * input schema refused it (see the middleware on `create`). Receives the raw
+   * request and returns an error whose message is one fixed sentence.
+   */
+  mintInputRefusal: (rawInput: unknown, actor: AuditActor) => TRPCError;
   list: (userId: string) => Promise<z.infer<typeof ListApiKeysResponseSchema>>;
   listAll: () => Promise<z.infer<typeof ListAllApiKeysResponseSchema>>;
   update: (
@@ -93,7 +114,28 @@ export const createApiKeysRouter = (implementations: {
     // actor bundle below; the check right after is belt and braces: if an
     // admin-plane origin ever failed to reach the bundle, this must refuse
     // rather than fall through to the human branch, which can mint anything.
+    //
+    // The middleware ahead of the input schema is for an admin-plane key only:
+    // when the schema refuses its request, the caller would otherwise get the
+    // schema's issue list as a JSON dump, not the fixed sentence every other
+    // refusal of this procedure carries. A request from a browser session keeps
+    // the schema's own messages, which the admin UI reads.
     create: protectedProcedure
+      .use(async ({ ctx, getRawInput, next }) => {
+        const result = await next();
+        if (
+          result.ok ||
+          !adminPlaneOrigin(ctx) ||
+          result.error.code !== "BAD_REQUEST" ||
+          !isSchemaFailure(result.error.cause)
+        ) {
+          return result;
+        }
+        throw implementations.mintInputRefusal(
+          await getRawInput(),
+          auditActor(ctx),
+        );
+      })
       .input(CreateApiKeyRequestSchema)
       .output(CreateApiKeyResponseSchema)
       .mutation(async ({ input, ctx }) => {
