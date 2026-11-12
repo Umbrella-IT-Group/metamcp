@@ -105,7 +105,7 @@ export const mcpServersImplementations = {
         input.user_id !== undefined ? input.user_id : null;
 
       // SECRETS. An MCP server row carries the VENDOR credentials this
-      // gateway uses to reach a third party — `bearerToken`, `env`, and
+      // gateway uses to reach a third party: `bearerToken`, `env`, and
       // `headers` (which is where an API key lives for an HTTP backend). None
       // of the three appears in the audit event, and none may be added:
       // `audit_log` is append-only and un-clearable by design, so a credential

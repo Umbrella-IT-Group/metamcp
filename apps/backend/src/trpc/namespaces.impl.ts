@@ -1074,9 +1074,8 @@ export const namespacesImplementations = {
       // plane key they share ONE transaction with the audit row (an audit
       // failure rolls the whole refresh back, so a refresh is never half
       // applied or unrecorded); for everyone else each repository call is its
-      // own transaction, as it always was, and the event is emitted
-      // best-effort once the writes are done. The row names counts and ids, no
-      // tool schema or description.
+      // own transaction, as it always was, and nothing is recorded, as before.
+      // The row names counts and ids, no tool schema or description.
       const refreshed = await withAdminAudit(
         actor,
         async (...tx) => {
@@ -1138,16 +1137,23 @@ export const namespacesImplementations = {
           }
           return { toolsCreated, mappingsCreated, allowlist };
         },
-        (written) => ({
-          action: "namespace.refresh_tools",
-          target_type: "namespace",
-          target_id: input.namespaceUuid,
-          detail: {
-            server_count: Object.keys(toolsByServerName).length,
-            tools_written: written.toolsCreated,
-            mappings_written: written.mappingsCreated,
-          },
-        }),
+        // Only for an admin-plane key. A refresh has never been audited for a
+        // human session, and the namespace page's own connection can send one
+        // every time it is opened, so recording those would add a row per page
+        // view to an append-only table.
+        (written) =>
+          actor?.admin_plane
+            ? {
+                action: "namespace.refresh_tools",
+                target_type: "namespace",
+                target_id: input.namespaceUuid,
+                detail: {
+                  server_count: Object.keys(toolsByServerName).length,
+                  tools_written: written.toolsCreated,
+                  mappings_written: written.mappingsCreated,
+                },
+              }
+            : null,
       );
       const totalToolsCreated = refreshed.toolsCreated;
       const totalMappingsCreated = refreshed.mappingsCreated;

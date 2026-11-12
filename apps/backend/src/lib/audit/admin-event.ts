@@ -56,7 +56,7 @@ export interface AdminEventInput {
   action: string;
   target_type: string;
   target_id?: string | null;
-  /** Defaults to `success` — these fire on the outcome path after a write. */
+  /** Defaults to `success`: these fire on the outcome path after a write. */
   outcome?: AuditOutcome;
   detail?: Record<string, unknown>;
 }

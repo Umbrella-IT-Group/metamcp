@@ -192,7 +192,7 @@ describe("endpoints.create — companion MCP server", () => {
   });
 });
 
-describe("endpoints.create — an admin-plane key cannot mint a key through the companion server", () => {
+describe("endpoints.create: an admin-plane key cannot mint a key through the companion server", () => {
   // The companion-server path mints an endpoint-scoped key straight in the
   // repository, bypassing apiKeys.create and every rule that procedure holds an
   // admin-plane key to. So a request authenticated by an admin-plane key of
