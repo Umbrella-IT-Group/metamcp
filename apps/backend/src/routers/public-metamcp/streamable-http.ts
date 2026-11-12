@@ -28,7 +28,8 @@ import logger from "@/utils/logger";
 import { isAdminHealthRequest } from "../../lib/health-upstream";
 import { runWithM365UserContext } from "../../lib/m365/request-context";
 import {
-  resolveCallerContext,
+  callerBinding,
+  type ConsumerIdentity,
   stampCallerContext,
 } from "../../lib/metamcp/caller-context";
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
@@ -476,7 +477,11 @@ export async function dispatchTracked(
   req: express.Request,
   res: express.Response,
   sessionId: string,
-  clientName?: string,
+  // The consumer `resolveClientIdentity` resolved for THIS request: its label
+  // for the audit row and its account email for the verified caller header.
+  // Always this request's own lookup, never one recovered from a pooled
+  // instance or an earlier request.
+  consumer?: ConsumerIdentity,
   // The request body, when the route has already read it (a session-less
   // POST, see `prereadSessionlessPost`). Undefined means the transport reads
   // the body itself, as it does on every other leg.
@@ -490,10 +495,8 @@ export async function dispatchTracked(
     // Streamable-HTTP tool call reaches the transport through here, which is
     // what makes the store the authoritative source rather than a best-effort
     // one. See `lib/metamcp/caller-context-store`.
-    await runWithCallerContext(
-      { ...resolveCallerContext(authReq), clientName },
-      () =>
-        handleRequestWithUserContext(authReq, transport, req, res, parsedBody),
+    await runWithCallerContext(callerBinding(authReq, consumer), () =>
+      handleRequestWithUserContext(authReq, transport, req, res, parsedBody),
     );
   } finally {
     publicSessionSweeper.markSettled(sessionId);
@@ -854,7 +857,7 @@ async function recoverPersistedSessionOnce(
       sessionId,
       stored,
       authReq,
-      recoveredIdentity?.name,
+      recoveredIdentity,
       ceiling?.releaseAdmission,
     );
   } finally {
@@ -873,7 +876,7 @@ async function rebuildRecoveredTransport(
   sessionId: string,
   stored: PersistedMcpSession,
   authReq: ApiKeyAuthenticatedRequest,
-  clientName: string | undefined,
+  consumer: ConsumerIdentity | undefined,
   onRegistered: (() => void) | undefined,
 ): Promise<SessionRecoveryResult> {
   // Auth + scope match. Rebuild the transport with the stored sessionId
@@ -899,7 +902,7 @@ async function rebuildRecoveredTransport(
     // Re-stamp the consumer identity onto the rebuilt instance's context so
     // post-restart tool calls stay attributed (the registry/in-memory state is
     // gone after a restart; authReq is the re-validated current caller).
-    stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
+    stampCallerContext(mcpServerInstance.handlerContext, authReq, consumer);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => sessionId,
       // The same body ceiling as a fresh session: a recovered session carries
@@ -1444,10 +1447,12 @@ streamableHttpRouter.get(
         }
       }
       logger.info(`Handling GET for session ${sessionId}`);
-      // No clientName resolved for the standalone GET stream: it carries only
+      // No consumer resolved for the standalone GET stream: it carries only
       // server-initiated notifications, never a tools/call, so nothing on this
-      // leg reaches the auditing middleware. The identity half of the binding
-      // still rides the store via dispatchTracked, which costs no lookup.
+      // leg reaches the auditing middleware or sends a backend request that
+      // carries the verified caller (which would otherwise lack only its
+      // descriptive email and label). The identity half of the binding still
+      // rides the store via dispatchTracked, which costs no lookup.
       await dispatchTracked(authReq, transport, req, res, sessionId);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
@@ -2078,7 +2083,7 @@ streamableHttpRouter.post(
         stampCallerContext(
           mcpServerInstance.handlerContext,
           authReq,
-          clientIdentity?.name,
+          clientIdentity,
         );
 
         logger.info(
@@ -2209,7 +2214,7 @@ streamableHttpRouter.post(
           req,
           res,
           newSessionId,
-          clientIdentity?.name,
+          clientIdentity,
           parsedBody,
         );
 
@@ -2360,7 +2365,7 @@ streamableHttpRouter.post(
           stampCallerContext(
             activeInstance.handlerContext,
             authReq,
-            clientIdentity?.name,
+            clientIdentity,
           );
         }
 
@@ -2371,7 +2376,7 @@ streamableHttpRouter.post(
           req,
           res,
           sessionId,
-          clientIdentity?.name,
+          clientIdentity,
         );
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);

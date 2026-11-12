@@ -35,6 +35,7 @@ import { resolveEnvVariables } from "./utils";
 import {
   getVerifiedCallerFetchForServer,
   VERIFIED_CALLER_HEADER,
+  VERIFIED_CALLER_IDENTITY_HEADER,
 } from "./verified-caller";
 
 const sleep = (time: number) =>
@@ -373,9 +374,11 @@ export const transformDockerUrl = (url: string): string => {
  * `withVerifiedCaller` sets for the backends named in
  * VERIFIED_CALLER_SERVER_NAMES and the m365 injection sets for its own
  * backends (see `verified-caller.ts`): a person's account id never reaches a
- * third-party server. `dropOnMethodRewriteHeaders` removes that id when a
- * same-origin 301, 302 or 303 turns a tool POST into a GET, because the GET
- * executes nothing on the caller's behalf.
+ * third-party server. `x-umbrella-caller`, the structured verified caller
+ * (user id, credential, account email) that `withVerifiedCaller` sets beside
+ * it, is listed with it everywhere it is listed. `dropOnMethodRewriteHeaders`
+ * removes both when a same-origin 301, 302 or 303 turns a tool POST into a
+ * GET, because the GET executes nothing on the caller's behalf.
  *
  * The m365 injection adds one stricter rule on top of this posture
  * (`getInjectedFetchForServer`): its per-user `Authorization` and user id are
@@ -386,8 +389,15 @@ export const transformDockerUrl = (url: string): string => {
 const POOL_GUARD_OPTIONS: McpUrlGuardOptions = Object.freeze({
   allowPrivateAddresses: true,
   refuseCrossOriginRedirect: true,
-  internalOnlyHeaders: [ASSERTED_ACTOR_HEADER, VERIFIED_CALLER_HEADER],
-  dropOnMethodRewriteHeaders: [VERIFIED_CALLER_HEADER],
+  internalOnlyHeaders: [
+    ASSERTED_ACTOR_HEADER,
+    VERIFIED_CALLER_HEADER,
+    VERIFIED_CALLER_IDENTITY_HEADER,
+  ],
+  dropOnMethodRewriteHeaders: [
+    VERIFIED_CALLER_HEADER,
+    VERIFIED_CALLER_IDENTITY_HEADER,
+  ],
 });
 
 const createPoolGuardedFetch = (): FetchLike =>
@@ -476,9 +486,9 @@ export const createMetaMcpClient = (
     // `withAssertedActor` stamps each request with the X-MCP-Actor of the
     // inbound request it serves (the back-channel POST carries the tool call).
     // For a server named in VERIFIED_CALLER_SERVER_NAMES the verified-caller
-    // wrapper strips any X-Umbrella-User-Id and sets the authenticated
-    // caller's id on tool calls; every other server gets the guarded fetch
-    // itself. See `verified-caller.ts`.
+    // wrapper strips any X-Umbrella-User-Id and X-Umbrella-Caller and sets
+    // both from the authenticated caller on tool calls; every other server
+    // gets the guarded fetch itself. See `verified-caller.ts`.
     const poolFetch = withAssertedActor(
       getVerifiedCallerFetchForServer(
         serverParams.name,
@@ -538,8 +548,9 @@ export const createMetaMcpClient = (
     const guardedFetch = injectedFetch ?? createPoolGuardedFetch();
 
     // Verified caller: for a server named in VERIFIED_CALLER_SERVER_NAMES,
-    // strip any X-Umbrella-User-Id (a stored row header included) and set the
-    // authenticated caller's user id on requests that can execute a tool.
+    // strip any X-Umbrella-User-Id and X-Umbrella-Caller (a stored row header
+    // included) and set both from the authenticated caller on requests that
+    // can execute a tool.
     // Every other server gets its fetch back untouched. For a named server
     // `injectedFetch` is always undefined, because a server in both lists is
     // refused at boot and again here. See `verified-caller.ts`.

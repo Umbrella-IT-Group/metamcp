@@ -33,6 +33,12 @@ export interface MetaMCPHandlerContext {
   authMethod?: string;
   userId?: string;
   actsAsUserId?: string;
+  // The OAuth client and the effective account's email, carried so this
+  // fallback has the same shape as the request-scoped binding. Only the
+  // request-scoped store feeds the verified caller headers; nothing reads
+  // these two from a pooled handler context.
+  oauthClientId?: string;
+  email?: string;
   callerIp?: string;
   requestId?: string;
 }

@@ -1,0 +1,732 @@
+{
+  "about": "Test vectors for the X-Umbrella-Caller header, format v1. The value is \"v1.\" followed by unpadded base64url of the UTF-8 bytes of `json`. `payload` is `json` parsed. `caller` is the gateway's request-scoped caller binding the value is built from (field names as in apps/backend/src/lib/metamcp/caller-context-store.ts). `user_id_header` is the X-Umbrella-User-Id value the gateway sends on the same request, or null. Vectors under `no_value` produce no X-Umbrella-Caller header. Only `uid` and `cred` identify the caller; `email`, `label` and `rid` are descriptive.",
+  "header": "x-umbrella-caller",
+  "user_id_header": "x-umbrella-user-id",
+  "prefix": "v1.",
+  "key_order": ["v", "uid", "cred", "email", "label", "rid"],
+  "grammar": {
+    "uid": "^[A-Za-z0-9_-]{1,64}$",
+    "cred": "^(api_key:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|oauth:[A-Za-z0-9._-]{1,128}|session)$",
+    "descriptive_forbidden_categories": ["Cc", "Cf", "Cs", "Zl", "Zp"]
+  },
+  "limits": {
+    "email": 254,
+    "label": 200,
+    "rid": 64,
+    "encoded": 4096
+  },
+  "vectors": [
+    {
+      "name": "API key, key owner, every descriptive field present",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "email": "first.user@example.com",
+        "clientName": "build agent key",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":\"first.user@example.com\",\"label\":\"build agent key\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": "first.user@example.com",
+        "label": "build agent key",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6ImZpcnN0LnVzZXJAZXhhbXBsZS5jb20iLCJsYWJlbCI6ImJ1aWxkIGFnZW50IGtleSIsInJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSJ9",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "API key bound to act as another user: uid is that user, cred is the key",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr09AbCdEfGhIjKlMnOpQrStUvWxYz09",
+        "actsAsUserId": "usr02AbCdEfGhIjKlMnOpQrStUvWxYz02",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000002",
+        "email": "second.user@example.com",
+        "clientName": "service key (as second.user@example.com)",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr02AbCdEfGhIjKlMnOpQrStUvWxYz02\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000002\",\"email\":\"second.user@example.com\",\"label\":\"service key (as second.user@example.com)\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr02AbCdEfGhIjKlMnOpQrStUvWxYz02",
+        "cred": "api_key:00000000-0000-4000-8000-000000000002",
+        "email": "second.user@example.com",
+        "label": "service key (as second.user@example.com)",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMkFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDIiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJlbWFpbCI6InNlY29uZC51c2VyQGV4YW1wbGUuY29tIiwibGFiZWwiOiJzZXJ2aWNlIGtleSAoYXMgc2Vjb25kLnVzZXJAZXhhbXBsZS5jb20pIiwicmlkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1In0",
+      "user_id_header": "usr02AbCdEfGhIjKlMnOpQrStUvWxYz02"
+    },
+    {
+      "name": "OAuth token: cred is the client the token was issued to",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03",
+        "oauthClientId": "mcp_client_Ab3dEf6hIj9kLm2nOp5qRs",
+        "email": "third.user@example.com",
+        "clientName": "third.user@example.com",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr03AbCdEfGhIjKlMnOpQrStUvWxYz03\",\"cred\":\"oauth:mcp_client_Ab3dEf6hIj9kLm2nOp5qRs\",\"email\":\"third.user@example.com\",\"label\":\"third.user@example.com\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03",
+        "cred": "oauth:mcp_client_Ab3dEf6hIj9kLm2nOp5qRs",
+        "email": "third.user@example.com",
+        "label": "third.user@example.com",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwM0FiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDMiLCJjcmVkIjoib2F1dGg6bWNwX2NsaWVudF9BYjNkRWY2aElqOWtMbTJuT3A1cVJzIiwiZW1haWwiOiJ0aGlyZC51c2VyQGV4YW1wbGUuY29tIiwibGFiZWwiOiJ0aGlyZC51c2VyQGV4YW1wbGUuY29tIiwicmlkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1In0",
+      "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "OAuth client id using every character class the grammar allows",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03",
+        "oauthClientId": "client.v2_A-9"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr03AbCdEfGhIjKlMnOpQrStUvWxYz03\",\"cred\":\"oauth:client.v2_A-9\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03",
+        "cred": "oauth:client.v2_A-9",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwM0FiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDMiLCJjcmVkIjoib2F1dGg6Y2xpZW50LnYyX0EtOSIsImVtYWlsIjpudWxsLCJsYWJlbCI6bnVsbCwicmlkIjpudWxsfQ",
+      "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "Inspector session: cred is session and the label names the Inspector",
+      "caller": {
+        "authMethod": "session",
+        "userId": "usr04AbCdEfGhIjKlMnOpQrStUvWxYz04",
+        "email": "admin.user@example.com",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr04AbCdEfGhIjKlMnOpQrStUvWxYz04\",\"cred\":\"session\",\"email\":\"admin.user@example.com\",\"label\":\"Inspector\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr04AbCdEfGhIjKlMnOpQrStUvWxYz04",
+        "cred": "session",
+        "email": "admin.user@example.com",
+        "label": "Inspector",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwNEFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDQiLCJjcmVkIjoic2Vzc2lvbiIsImVtYWlsIjoiYWRtaW4udXNlckBleGFtcGxlLmNvbSIsImxhYmVsIjoiSW5zcGVjdG9yIiwicmlkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1In0",
+      "user_id_header": "usr04AbCdEfGhIjKlMnOpQrStUvWxYz04"
+    },
+    {
+      "name": "email, label and request id unknown are null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "user id of exactly 64 characters",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "json": "{\"v\":1,\"uid\":\"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1IiwiY3JlZCI6ImFwaV9rZXk6MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwiZW1haWwiOm51bGwsImxhYmVsIjpudWxsLCJyaWQiOm51bGx9",
+      "user_id_header": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "name": "descriptive fields are trimmed",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "email": "  first.user@example.com ",
+        "clientName": "\t build agent key \n",
+        "requestId": " 11111111-2222-4333-8444-555555555555 "
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":\"first.user@example.com\",\"label\":\"build agent key\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": "first.user@example.com",
+        "label": "build agent key",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6ImZpcnN0LnVzZXJAZXhhbXBsZS5jb20iLCJsYWJlbCI6ImJ1aWxkIGFnZW50IGtleSIsInJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSJ9",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a blank label is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "   "
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "non-ASCII label is sent as UTF-8",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "Zo\u00eb's laptop key \u00e9t\u00e9"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":\"Zo\u00eb's laptop key \u00e9t\u00e9\",\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": "Zo\u00eb's laptop key \u00e9t\u00e9",
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOiJab8OrJ3MgbGFwdG9wIGtleSDDqXTDqSIsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "quotes and backslashes in a label are JSON-escaped",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key \"north\" \\ path/one"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":\"key \\\"north\\\" \\\\ path/one\",\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": "key \"north\" \\ path/one",
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOiJrZXkgXCJub3J0aFwiIFxcIHBhdGgvb25lIiwicmlkIjpudWxsfQ",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label of exactly 200 code points is kept",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":\"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\",\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOiJra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2trayIsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label over 200 code points is shortened to 199 plus an ellipsis",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":\"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\u2026\",\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\u2026",
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOiJra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tr4oCmIiwicmlkIjpudWxsfQ",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "label length counts code points: 200 characters outside the BMP are kept",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":\"\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\",\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": "\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00",
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOiLwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgCIsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "label length counts code points: 201 characters outside the BMP are shortened",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":\"\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\u2026\",\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": "\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\ud835\udc00\u2026",
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOiLwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA8J2QgPCdkIDwnZCA4oCmIiwicmlkIjpudWxsfQ",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a control character is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\u0007name"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a delete character is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\u007fname"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a right-to-left override is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\u202ename"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a zero-width space is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\u200bname"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a line separator is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\u2028name"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a paragraph separator is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\u2029name"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with an inner newline is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\nname"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label with a lone surrogate is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": "key\ud800name"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a label that is not a string is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "clientName": 42
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "an email of exactly 254 code points is kept",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "email": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com\",\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com",
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhQGV4YW1wbGUuY29tIiwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "an email over 254 code points is null, never shortened",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "email": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "an email with a control character is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "email": "first.user@example.com\u0000"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a request id over 64 code points is null, never shortened",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "requestId": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "a request id that is not a string is null",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001",
+        "requestId": 12345
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"api_key:00000000-0000-4000-8000-000000000001\",\"email\":null,\"label\":null,\"rid\":null}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "api_key:00000000-0000-4000-8000-000000000001",
+        "email": null,
+        "label": null,
+        "rid": null
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoiYXBpX2tleTowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJlbWFpbCI6bnVsbCwibGFiZWwiOm51bGwsInJpZCI6bnVsbH0",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    }
+  ],
+  "no_value": [
+    {
+      "name": "no caller binding",
+      "caller": null,
+      "user_id_header": null
+    },
+    {
+      "name": "API key with no owner and no acts-as user",
+      "caller": {
+        "authMethod": "api_key",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "user_id_header": null
+    },
+    {
+      "name": "API key with a blank acts-as user: no fallback to the owner",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr09AbCdEfGhIjKlMnOpQrStUvWxYz09",
+        "actsAsUserId": "",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "user_id_header": null
+    },
+    {
+      "name": "API key with no key uuid",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "API key uuid not in canonical lowercase form",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-00000000000A"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "API key uuid that is not a uuid",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "key-one"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "OAuth token with no client id",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+      },
+      "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "OAuth client id with a character outside the grammar",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03",
+        "oauthClientId": "client one"
+      },
+      "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "OAuth client id over 128 characters",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03",
+        "oauthClientId": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "Inspector session with no user",
+      "caller": {
+        "authMethod": "session"
+      },
+      "user_id_header": null
+    },
+    {
+      "name": "unknown auth method",
+      "caller": {
+        "authMethod": "basic",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "no auth method",
+      "caller": {
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "user id with a character outside the grammar",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "user/one",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "user_id_header": "user/one"
+    },
+    {
+      "name": "user id over 64 characters",
+      "caller": {
+        "authMethod": "api_key",
+        "userId": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+        "apiKeyUuid": "00000000-0000-4000-8000-000000000001"
+      },
+      "user_id_header": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+    },
+    {
+      "name": "a client-asserted actor label is not an identity",
+      "caller": {
+        "assertedActor": "first.user@example.com"
+      },
+      "user_id_header": null
+    }
+  ]
+}

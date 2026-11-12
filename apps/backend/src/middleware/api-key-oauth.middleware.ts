@@ -56,6 +56,11 @@ export interface ApiKeyAuthenticatedRequest
   // fail-closes. Consumed ONLY by the streamable-http m365 context gate.
   apiKeyActsAsUserId?: string;
   oauthUserId?: string; // For OAuth-authenticated requests
+  // The OAuth client the presented access token was issued to
+  // (`oauth_access_tokens.client_id`). With `authMethod` and `apiKeyUuid` it
+  // names WHICH credential called; the verified caller header carries it to
+  // named backends (lib/metamcp/verified-caller.ts).
+  oauthClientId?: string;
   authMethod?: "api_key" | "oauth"; // Track which auth method was used
 }
 
@@ -121,6 +126,7 @@ const apiKeysRepository = new ApiKeysRepository();
 async function validateOAuthToken(token: string): Promise<{
   valid: boolean;
   user_id?: string;
+  client_id?: string;
   scopes?: string[];
   error?: string;
 }> {
@@ -140,6 +146,9 @@ async function validateOAuthToken(token: string): Promise<{
       return {
         valid: true,
         user_id: tokenData.user_id,
+        // The client this token was issued to, from the same row. Stamped as
+        // `oauthClientId` by both OAuth branches below.
+        client_id: tokenData.client_id,
         // Fall back to the scope this server grants, not "admin". Nothing
         // reads `scopes` for an authorization decision today (the gate is
         // the better-auth session role), but a write-only field that says
@@ -753,6 +762,7 @@ export const authenticateApiKey = async (
 
           // OAuth token valid - perform access control and pass
           authReq.oauthUserId = oauthResult.user_id;
+          authReq.oauthClientId = oauthResult.client_id;
           authReq.authMethod = "oauth";
 
           const accessCheckResult = checkOAuthAccess(oauthResult, endpoint);
@@ -973,6 +983,7 @@ export const authenticateApiKey = async (
 
         // OAuth token valid - perform access control and pass
         authReq.oauthUserId = oauthResult.user_id;
+        authReq.oauthClientId = oauthResult.client_id;
         authReq.authMethod = "oauth";
 
         const accessCheckResult = checkOAuthAccess(oauthResult, endpoint);

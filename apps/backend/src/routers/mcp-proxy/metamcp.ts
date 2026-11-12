@@ -26,7 +26,7 @@ const metamcpRouter = express.Router();
  * The session user, as `betterAuthMcpMiddleware` leaves it on the request —
  * same shape `requireAdminMcpMiddleware` and `mcp-proxy/server.ts` read.
  */
-type SessionUser = { id?: string; role?: string };
+type SessionUser = { id?: string; role?: string; email?: unknown };
 
 /**
  * Caller binding for tool calls driven from the Inspector (migration 0030).
@@ -43,13 +43,26 @@ type SessionUser = { id?: string; role?: string };
  * (api-key name / OAuth user email) and there is no consumer on this surface.
  * `callerIp` / `requestId` still come from `auditContextMiddleware`, which is
  * mounted app-wide ahead of every router.
+ *
+ * `email` is the signed-in admin's own account email, read with the session
+ * on this request, for the verified caller header (`verified-caller.ts`
+ * names this credential `session`). It is taken only alongside the same
+ * user's id: a session that yields no id yields no email either.
  */
 export function inspectorCaller(req: express.Request): CallerContext {
   const user = (req as express.Request & { user?: SessionUser }).user;
+  const email =
+    typeof user?.id === "string" &&
+    user.id !== "" &&
+    typeof user.email === "string" &&
+    user.email !== ""
+      ? user.email
+      : undefined;
   return {
     ...resolveCallerContext(req as AuditAttributedRequest),
     authMethod: "session",
     userId: user?.id,
+    email,
   };
 }
 
