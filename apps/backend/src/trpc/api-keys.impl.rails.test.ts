@@ -84,7 +84,6 @@ const { apiKeysImplementations } = await import("./api-keys.impl");
 const { selfLockoutRefusal, SELF_LOCKOUT_REFUSALS } = await import(
   "../lib/api-key-self-lockout"
 );
-const { MINT_REFUSALS } = await import("../lib/api-key-mint-rules");
 const { ADMIN_AUDIT_WRITE_FAILED_MESSAGE } = await import(
   "../lib/audit/admin-write"
 );
@@ -380,8 +379,11 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
   // call must not undo that: on a data-plane key the key may leave only an
   // enforce list of its own, 1 to 8 entries, none wider than IPv4 /24 or
   // IPv6 /48 (IPv4-mapped IPv6 counted at its IPv4 width).
-  const tooWide = MINT_REFUSALS.ip_policy_change_too_wide.message;
-  const notEnforced = MINT_REFUSALS.ip_policy_change_shape.message;
+  // The sentences are written out, not read from the rules module, so the
+  // contract is pinned by its words and a missing rule is an assertion failure.
+  const tooWide = "wider than IPv4 /24 or IPv6 /48";
+  const notEnforced =
+    "can set a data-plane key's IP policy only to mode enforce with 1 to 8 entries";
   const nine = Array.from({ length: 9 }, (_v, i) => `203.0.113.${i}`);
 
   const refused: Array<
@@ -413,7 +415,10 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
         (e) => e,
       );
 
-      expect(failure).toMatchObject({ code: "BAD_REQUEST", message: sentence });
+      expect(failure).toMatchObject({
+        code: "BAD_REQUEST",
+        message: expect.stringContaining(sentence),
+      });
       expect(repoMock.setIpPolicy).not.toHaveBeenCalled();
       expect(txAudit.record).not.toHaveBeenCalled();
       expect(emitMock).toHaveBeenCalledTimes(1);

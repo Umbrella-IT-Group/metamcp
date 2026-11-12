@@ -233,7 +233,7 @@ describe("a request the schema refuses, from an operator-scope admin-plane key",
 
     expect(failure).toMatchObject({
       code: "BAD_REQUEST",
-      message: MINT_REFUSALS.request_invalid.message,
+      message: "The request is not a valid API key request.",
     });
   });
 });
