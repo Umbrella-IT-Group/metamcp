@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { useTranslations } from "@/hooks/useTranslations";
 import { authClient } from "@/lib/auth-client";
+import { endpointGateState } from "@/lib/endpoint-gate-state";
 import { getLocalizedPath } from "@/lib/i18n";
 import { trpc } from "@/lib/trpc";
 
@@ -93,34 +94,19 @@ export function EndpointAccessSection({
   const groups = access?.groups ?? [];
 
   // What the switch ACTUALLY does on this endpoint, which `restricted` alone
-  // cannot say. The gate governs OAuth callers only:
-  //
-  //   enable_oauth off        -> the switch is inert; no caller reaches this
-  //                             endpoint through the gate at all.
-  //   + enable_api_key_auth   -> it narrows the OAuth half only; UNSCOPED
-  //                             API-key holders still pass UNLESS the endpoint
-  //                             also requires endpoint-scoped keys.
-  //
-  // Reporting "only administrators can reach it" in either case would be
-  // false, and false in the reassuring direction, which is the worst kind on a
-  // security panel.
-  const gateIsInert =
-    restricted && access !== undefined && !access.enable_oauth;
-  // Only fires when unscoped keys really do still reach the endpoint. The
-  // create/update pairing forces require_scoped_api_key on with restricted, so
-  // for a paired endpoint this is false and the note (which claims every key
-  // holder passes) correctly disappears; it can still fire on a legacy row the
-  // boot-time pairing check flags.
-  const apiKeysStillPass =
-    restricted &&
-    access !== undefined &&
-    access.enable_api_key_auth &&
-    !access.require_scoped_api_key;
-  const gateFullyGoverns =
-    restricted &&
-    access !== undefined &&
-    access.enable_oauth &&
-    !access.enable_api_key_auth;
+  // cannot say: see `endpointGateState`. The gate applies to OAuth sign-ins and
+  // to API keys by their owner, so it is inert only when the endpoint accepts
+  // neither, and no caller then arrives through it at all. Reporting "only
+  // administrators can reach it" on an endpoint nobody can reach would be false
+  // in the reassuring direction, which is the worst kind on a security panel.
+  const gateState = access ? endpointGateState(access) : "off";
+  const gateIsInert = gateState === "noAuth";
+  // The lockout warning. With no group mapped, a restricted endpoint admits
+  // administrators and nobody else, whichever way a caller arrives (an API key
+  // counts through its owner). Legitimate but almost never intended, and the
+  // person who set it is usually an administrator so they will not notice by
+  // using it.
+  const gateAdmitsOnlyAdmins = gateState === "enforcing" && groups.length === 0;
 
   return (
     <div className="space-y-4 border-t pt-4">
@@ -148,36 +134,23 @@ export function EndpointAccessSection({
       </div>
 
       {gateIsInert && (
-        // The switch is on but this endpoint accepts no OAuth callers, so it
-        // gates nobody. Said outright, because a switch that reads as "on" and
-        // does nothing is the most misleading state this panel can render.
+        // The switch is on but this endpoint accepts neither OAuth callers nor
+        // API keys, so it gates nobody. Said outright, because a switch that
+        // reads as "on" and does nothing is the most misleading state this
+        // panel can render.
         <div className="p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
           <p className="text-sm text-yellow-800 dark:text-yellow-200">
-            {t("access:groups.noOauthWarning")}
+            {t("access:groups.noAuthWarning")}
           </p>
         </div>
       )}
 
-      {gateFullyGoverns && groups.length === 0 && (
-        // The lockout warning, now correctly narrowed. It only holds when OAuth
-        // is the ONLY way in: a restricted endpoint with no group mapped then
-        // admits administrators and nobody else, which is legitimate but almost
-        // never intended, and the person who set it is usually an administrator
-        // so they will not notice by using it.
+      {gateAdmitsOnlyAdmins && (
         <div className="p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
           <p className="text-sm text-yellow-800 dark:text-yellow-200">
             {t("access:groups.noGroupsWarning")}
           </p>
         </div>
-      )}
-
-      {apiKeysStillPass && access?.enable_oauth && (
-        // Not a warning: this is the designed scope boundary. But an operator
-        // reading "restricted" on an endpoint that also accepts API keys should
-        // not have to infer that every key holder still gets in.
-        <p className="text-xs text-muted-foreground">
-          {t("access:groups.apiKeysStillPass")}
-        </p>
       )}
 
       <div className="space-y-2">
