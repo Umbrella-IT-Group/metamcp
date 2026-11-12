@@ -36,12 +36,14 @@ const apiKeysRepository = new ApiKeysRepository();
 const DEFAULT_ENDPOINT_MAX_RATE = 600;
 const DEFAULT_ENDPOINT_MAX_RATE_SECONDS = 60;
 
-// An admin-plane key may create an API key only for a public, unrestricted
-// endpoint (lib/api-key-mint-rules.ts, rule 4). Without this refusal the same
-// key could create or re-point such an endpoint over the namespace a restricted
-// or private endpoint serves, then create a key for the new endpoint, and
-// reach through it what the restricted one keeps from that key's owner. The
-// refusal is a fixed sentence that names no endpoint or namespace.
+// An admin-plane key may create an API key for a public, unrestricted endpoint
+// with no question about the owner's groups, and for a restricted one only for
+// an owner who is an explicit member of a mapped group (lib/api-key-mint-rules.ts,
+// rule 4). Without this refusal the same key could create or re-point an
+// unrestricted endpoint over the namespace a restricted or private endpoint
+// serves, then create a key for the new endpoint and any owner, and reach
+// through it what the restricted one keeps from that owner. The refusal is a
+// fixed sentence that names no endpoint or namespace.
 const ADMIN_PLANE_PUBLISH_REFUSAL =
   "An admin-plane API key cannot make a namespace public that a restricted or private endpoint already serves. Do this in the admin UI.";
 
@@ -125,7 +127,8 @@ export const endpointsImplementations = {
       const requireScopedApiKey = input.requireScopedApiKey ?? false;
 
       // See ADMIN_PLANE_PUBLISH_REFUSAL. Only the kind of endpoint a key may be
-      // created for is judged: a private or restricted endpoint is not one.
+      // created for without a membership check is judged: a private or
+      // restricted endpoint is not one.
       if (
         actor?.admin_plane &&
         isPublicEndpoint &&

@@ -53,7 +53,8 @@ export class EndpointsRepository {
    * Does a restricted or private endpoint (one that gates who may reach the
    * namespace's tools) serve this namespace, other than `exceptUuid`? Used to
    * stop an admin-plane key from publishing such a namespace through a public,
-   * unrestricted endpoint, which is the kind it may create API keys for.
+   * unrestricted endpoint, which is the kind it may create API keys for
+   * without a membership check.
    */
   async hasGatedEndpointOnNamespace(
     namespaceUuid: string,
