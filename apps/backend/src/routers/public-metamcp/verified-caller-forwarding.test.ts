@@ -37,17 +37,46 @@ const h = vi.hoisted(() => ({
 const CREDENTIALS: Record<string, Record<string, string>> = {
   "key-owner": {
     authMethod: "api_key",
-    apiKeyUuid: "k-owner",
+    apiKeyUuid: "00000000-0000-4000-8000-0000000000c1",
+    apiKeyUserId: "user-owner",
+  },
+  "key-owner-second": {
+    authMethod: "api_key",
+    apiKeyUuid: "00000000-0000-4000-8000-0000000000c2",
     apiKeyUserId: "user-owner",
   },
   "key-acts-as": {
     authMethod: "api_key",
-    apiKeyUuid: "k-acts-as",
+    apiKeyUuid: "00000000-0000-4000-8000-0000000000c3",
     apiKeyUserId: "user-admin",
     apiKeyActsAsUserId: "user-bound",
   },
-  "oauth-token": { authMethod: "oauth", oauthUserId: "user-oauth" },
-  "key-ownerless": { authMethod: "api_key", apiKeyUuid: "k-ownerless" },
+  "oauth-token": {
+    authMethod: "oauth",
+    oauthUserId: "user-oauth",
+    oauthClientId: "mcp_client_first",
+  },
+  "oauth-token-other-client": {
+    authMethod: "oauth",
+    oauthUserId: "user-oauth",
+    oauthClientId: "mcp_client_second",
+  },
+  "key-ownerless": {
+    authMethod: "api_key",
+    apiKeyUuid: "00000000-0000-4000-8000-0000000000c4",
+  },
+};
+
+/**
+ * The account email the consumer lookup reports per user id. `user-bound`
+ * has none it can read, so its calls must carry a null email and never the
+ * admin key owner's.
+ */
+const ACCOUNT_EMAILS: Record<string, string | null> = {
+  "user-owner": "owner@example.com",
+  "user-admin": "admin@example.com",
+  "user-bound": null,
+  "user-oauth": "oauth.user@example.com",
 };
 
 vi.mock("@/utils/logger", () => ({
@@ -111,13 +140,29 @@ vi.mock("@/middleware/rate-limit.middleware", () => ({
   ) => next(),
 }));
 vi.mock("@/lib/metamcp/consumer-identity-resolver", () => ({
-  resolveClientIdentity: async () => ({ name: "consumer" }),
+  // The real resolver reads the database; this one answers from the table
+  // above, for the effective user the request names, as the real one does.
+  resolveClientIdentity: async (auth: Record<string, string | undefined>) => {
+    const userId =
+      auth.authMethod === "oauth"
+        ? auth.oauthUserId
+        : (auth.apiKeyActsAsUserId ?? auth.apiKeyUserId);
+    return {
+      name: `label for ${userId ?? "nobody"}`,
+      account: userId
+        ? { userId, email: ACCOUNT_EMAILS[userId] ?? null }
+        : undefined,
+    };
+  },
 }));
 vi.mock("@/lib/metamcp/metamcp-server-pool", () => ({
   metaMcpServerPool: {
     getServer: h.getServer,
     getServerInstance: h.getServerInstance,
     cleanupSession: h.cleanupSession,
+    // The OpenAPI bridge only checks that its shared instance exists; its
+    // calls are routed through the mocked backend pool below.
+    getOpenApiServer: async () => ({}),
     getMcpServerPoolStatus: () => ({ idle: 0, active: 0 }),
   },
 }));
@@ -149,6 +194,7 @@ import type { ConnectedClient } from "../../lib/metamcp/client";
 import { createMetaMcpClient } from "../../lib/metamcp/client";
 import { createServer } from "../../lib/metamcp/metamcp-proxy";
 import { toolsSyncCache } from "../../lib/metamcp/tools-sync-cache";
+import { openApiRouter } from "./openapi";
 import sseRouter from "./sse";
 import streamableHttpRouter, { cleanupSession } from "./streamable-http";
 
@@ -157,6 +203,7 @@ interface SeenRequest {
   rpcMethod?: string;
   callId?: string;
   userId?: string;
+  caller?: string;
 }
 
 let httpServer: Server;
@@ -194,6 +241,7 @@ beforeEach(async () => {
       rpcMethod: message?.method,
       callId: message?.params?.arguments?.callId,
       userId: req.headers["x-umbrella-user-id"] as string | undefined,
+      caller: req.headers["x-umbrella-caller"] as string | undefined,
     });
     if (req.method === "GET") return void res.sendStatus(405);
     if (req.method === "DELETE") return void res.sendStatus(200);
@@ -220,7 +268,7 @@ beforeEach(async () => {
     }
     res.json({ jsonrpc: "2.0", id: message?.id, result });
   });
-  app.use("/metamcp", sseRouter, streamableHttpRouter);
+  app.use("/metamcp", sseRouter, streamableHttpRouter, openApiRouter);
   await new Promise<void>((resolve) => {
     httpServer = app.listen(0, "127.0.0.1", resolve);
   });
@@ -356,3 +404,147 @@ describe.each(["SSE", "STREAMABLE_HTTP"] as const)(
     });
   },
 );
+
+/** The identifying pair and the email from a recorded `X-Umbrella-Caller`. */
+function callerSeen(r: SeenRequest): {
+  pair: string;
+  email: string | null;
+  label: string | null;
+} | null {
+  if (r.caller === undefined) return null;
+  const payload = JSON.parse(
+    Buffer.from(r.caller.replace(/^v1\./, ""), "base64url").toString("utf8"),
+  ) as { uid: string; cred: string; email: string | null; label: string };
+  // Both headers come from one binding, so they always name the same user.
+  expect(payload.uid).toBe(r.userId);
+  return {
+    pair: `${payload.uid} ${payload.cred}`,
+    email: payload.email,
+    label: payload.label,
+  };
+}
+
+/** A consumer that presents `credential` and also sends both identity headers itself. */
+async function consumerSendingIdentityHeaders(
+  type: "SSE" | "STREAMABLE_HTTP",
+  credential: string,
+): Promise<Client> {
+  const send = (url: string | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `Bearer ${credential}`);
+    headers.set("X-Umbrella-User-Id", "user-supplied");
+    headers.set("X-Umbrella-Caller", "v1.c3VwcGxpZWQ");
+    return fetch(url, { ...init, headers });
+  };
+  const transport: Transport =
+    type === "SSE"
+      ? new SSEClientTransport(new URL(`${baseUrl}/metamcp/team/sse`), {
+          fetch: send,
+        })
+      : new StreamableHTTPClientTransport(
+          new URL(`${baseUrl}/metamcp/team/mcp`),
+          { fetch: send },
+        );
+  const client = new Client({ name: "teammate", version: "1.0.0" });
+  consumers.push(client);
+  await client.connect(transport);
+  await client.listTools();
+  return client;
+}
+
+describe.each(["SSE", "STREAMABLE_HTTP"] as const)(
+  "%s public endpoint verified credential",
+  (type) => {
+    it("each consumer's tool calls carry its own credential and account email in X-Umbrella-Caller, never one the consumer sent", async () => {
+      const names = [
+        "key-owner",
+        "key-owner-second",
+        "key-acts-as",
+        "oauth-token",
+        "oauth-token-other-client",
+        "key-ownerless",
+      ];
+      const clients: Client[] = [];
+      for (const name of names)
+        clients.push(await consumerSendingIdentityHeaders(type, name));
+      const results = await Promise.all(
+        clients.map((client, index) =>
+          client.callTool({
+            name: "team__echo",
+            arguments: { callId: names[index] },
+          }),
+        ),
+      );
+      for (const result of results) expect(result.isError).toBeFalsy();
+
+      const calls = seen.filter((r) => r.rpcMethod === "tools/call");
+      expect(calls).toHaveLength(names.length);
+      expect(
+        Object.fromEntries(calls.map((r) => [r.callId, callerSeen(r)])),
+      ).toEqual({
+        "key-owner": {
+          pair: "user-owner api_key:00000000-0000-4000-8000-0000000000c1",
+          email: "owner@example.com",
+          label: "label for user-owner",
+        },
+        "key-owner-second": {
+          pair: "user-owner api_key:00000000-0000-4000-8000-0000000000c2",
+          email: "owner@example.com",
+          label: "label for user-owner",
+        },
+        // The acts-as user's email could not be read: null, never the key
+        // owner's.
+        "key-acts-as": {
+          pair: "user-bound api_key:00000000-0000-4000-8000-0000000000c3",
+          email: null,
+          label: "label for user-bound",
+        },
+        "oauth-token": {
+          pair: "user-oauth oauth:mcp_client_first",
+          email: "oauth.user@example.com",
+          label: "label for user-oauth",
+        },
+        "oauth-token-other-client": {
+          pair: "user-oauth oauth:mcp_client_second",
+          email: "oauth.user@example.com",
+          label: "label for user-oauth",
+        },
+        "key-ownerless": null,
+      });
+
+      // Handshake, listing and stream traffic carry no caller header, and
+      // the values the consumer sent or the row stores reached the backend on
+      // no request.
+      for (const r of seen.filter((r) => r.rpcMethod !== "tools/call")) {
+        expect([r.method, r.rpcMethod, r.caller]).toEqual([
+          r.method,
+          r.rpcMethod,
+          undefined,
+        ]);
+      }
+      expect(seen.map((r) => r.caller)).not.toContain("v1.c3VwcGxpZWQ");
+      expect(seen.map((r) => r.userId)).not.toContain("user-supplied");
+    });
+  },
+);
+
+describe("OpenAPI bridge", () => {
+  it("sends neither identity header, and drops values the consumer sent", async () => {
+    const response = await fetch(`${baseUrl}/metamcp/team/api/team__echo`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer key-owner",
+        "Content-Type": "application/json",
+        "X-Umbrella-User-Id": "user-supplied",
+        "X-Umbrella-Caller": "v1.c3VwcGxpZWQ",
+      },
+      body: JSON.stringify({ callId: "bridge" }),
+    });
+    expect(response.status).toBe(200);
+
+    const call = seen.find((r) => r.rpcMethod === "tools/call");
+    expect(call?.callId).toBe("bridge");
+    expect([call?.userId, call?.caller]).toEqual([undefined, undefined]);
+    expect(seen.map((r) => r.caller)).not.toContain("v1.c3VwcGxpZWQ");
+  });
+});

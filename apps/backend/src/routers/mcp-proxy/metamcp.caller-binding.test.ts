@@ -23,6 +23,7 @@ vi.mock("@/db", () => ({ db: {}, pool: { on: vi.fn() } }));
 // Reached transitively via `lib/metamcp/index` -> the repositories barrel.
 vi.mock("@/db/audit-db", () => ({ auditDb: {}, auditPool: { on: vi.fn() } }));
 
+import { encodeVerifiedCaller } from "../../lib/metamcp/verified-caller";
 import { inspectorCaller } from "./metamcp";
 
 const fakeReq = (overrides: Record<string, unknown> = {}) =>
@@ -124,5 +125,77 @@ describe("Inspector caller-context wiring", () => {
     // adds a fourth dispatch turns this red and has to decide, rather than
     // inheriting an un-attributed path by default.
     expect(occurrences(/\.handleRequest\(|\.handlePostMessage\(/g)).toBe(4);
+  });
+});
+
+/**
+ * The Inspector's credential in the verified caller header: the signed-in
+ * admin's id, the `session` credential, and that admin's own email from the
+ * session read on this request.
+ */
+describe("inspectorCaller: the verified caller it yields", () => {
+  const decode = (value: string | undefined) =>
+    JSON.parse(
+      Buffer.from((value ?? "").replace(/^v1\./, ""), "base64url").toString(
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+
+  it("carries the signed-in admin's own email", () => {
+    const caller = inspectorCaller(
+      fakeReq({
+        user: { id: "admin-user-1", role: "admin", email: "admin@example.com" },
+      }),
+    );
+
+    expect(caller.email).toBe("admin@example.com");
+  });
+
+  it.each([
+    ["no user id", { role: "admin", email: "admin@example.com" }],
+    ["a blank user id", { id: "", email: "admin@example.com" }],
+  ])("carries no email for a session with %s", (_label, user) => {
+    expect(inspectorCaller(fakeReq({ user })).email).toBeUndefined();
+  });
+
+  it.each([
+    ["no email", { id: "admin-user-1" }],
+    ["a blank email", { id: "admin-user-1", email: "" }],
+    ["a non-string email", { id: "admin-user-1", email: 7 }],
+  ])("carries no email for a session user with %s", (_label, user) => {
+    expect(inspectorCaller(fakeReq({ user })).email).toBeUndefined();
+  });
+
+  it("encodes to the session credential labelled Inspector, and no consumer label in the audit binding", () => {
+    const caller = inspectorCaller(
+      fakeReq({
+        user: { id: "admin-user-1", role: "admin", email: "admin@example.com" },
+        auditRequestId: "req-inspector",
+      }),
+    );
+
+    expect(decode(encodeVerifiedCaller(caller))).toEqual({
+      v: 1,
+      uid: "admin-user-1",
+      cred: "session",
+      email: "admin@example.com",
+      label: "Inspector",
+      rid: "req-inspector",
+    });
+    expect(caller.clientName).toBeUndefined();
+  });
+
+  it("is never another credential, whatever the request carries", () => {
+    // An Inspector request has no API-key or OAuth stamp; if one appeared,
+    // the auth method still names the session.
+    const caller = inspectorCaller(
+      fakeReq({
+        user: { id: "admin-user-1" },
+        apiKeyUuid: "00000000-0000-4000-8000-000000000001",
+        oauthClientId: "mcp_client_example",
+      }),
+    );
+
+    expect(decode(encodeVerifiedCaller(caller)).cred).toBe("session");
   });
 });

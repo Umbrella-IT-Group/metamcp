@@ -76,8 +76,84 @@ import { getCallerContext } from "./caller-context-store";
  * no backend is named and `getVerifiedCallerFetchForServer` returns the base
  * fetch itself. The Inspector still reserves this custom header, and the
  * pool still strips it on non-internal hops, even with an empty list.
+ *
+ * `X-Umbrella-Caller`: WHICH CREDENTIAL, AS WELL AS WHO. The user id names a
+ * person, but one person may hold several credentials (a key per machine, an
+ * OAuth client per app), and a backend that hands out a session or a grant to
+ * "the caller" needs to know which of them asked, so that another of that
+ * person's credentials, or another person's, cannot pick it up. A named
+ * backend therefore also receives `X-Umbrella-Caller`, under exactly the
+ * rules above: deleted in every casing on every request, set only on a
+ * request that can execute backend code, read only from the request-scoped
+ * binding, internal hops only, dropped on a method-rewriting redirect,
+ * reserved in the Inspector. Its value is `v1.` followed by unpadded base64url
+ * of one UTF-8 JSON object whose keys are always, in this order:
+ *
+ *   v      1, the format version.
+ *   uid    the same user id `X-Umbrella-User-Id` carries.
+ *   cred   the credential that authenticated the request:
+ *          `api_key:<api_keys.uuid>`, `oauth:<oauth client id>`, or
+ *          `session` for the Inspector's signed-in admin.
+ *   email  the account email of `uid`, or null when it could not be read.
+ *   label  the gateway's display label for the credential, or null.
+ *   rid    the gateway's audit request id for this request, or null.
+ *
+ * Only `uid` and `cred` say who is calling; `email`, `label` and `rid` are
+ * descriptive and never part of what a backend should bind to. The header is
+ * set only when BOTH `uid` and `cred` resolve to values a strict reader
+ * accepts, so a backend never receives half an identity in it; the user id
+ * header keeps its own rule and is still sent without a credential (a
+ * backend that reads only the user id sees no change). Both headers are
+ * built from one binding in one step, so when both are present they always
+ * name the same user. `verified-caller-v1-vectors.json` beside this file pins
+ * the exact bytes for a set of inputs, so a reader in another language can
+ * test against the same values.
  */
 export const VERIFIED_CALLER_HEADER = "x-umbrella-user-id";
+
+/** The structured caller header. See the module comment for its format. */
+export const VERIFIED_CALLER_IDENTITY_HEADER = "x-umbrella-caller";
+
+/** The prefix of every `X-Umbrella-Caller` value in this format version. */
+export const VERIFIED_CALLER_IDENTITY_PREFIX = "v1.";
+
+/**
+ * The grammar a strict reader applies to the two identifying fields. The
+ * encoder checks its own output against the same patterns and sends no header
+ * when either fails, rather than a value the reader would refuse.
+ */
+const UID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const API_KEY_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const OAUTH_CLIENT_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * Length limits for the descriptive fields, in Unicode code points (what a
+ * Python `len` counts, not UTF-16 units), and for the whole encoded value.
+ * The field limits keep the worst case well under the encoded limit.
+ */
+export const VERIFIED_CALLER_IDENTITY_LIMITS = Object.freeze({
+  email: 254,
+  label: 200,
+  rid: 64,
+  encoded: 4096,
+});
+
+/**
+ * Characters a descriptive field may not contain: controls (Cc), format
+ * characters such as bidirectional overrides and zero-width marks (Cf), line
+ * and paragraph separators (Zl, Zp), and lone UTF-16 surrogates (Cs), which
+ * have no UTF-8 encoding. A value containing any of them is sent as null,
+ * never cleaned up, because a cleaned value would read as something the
+ * account never said.
+ */
+const FORBIDDEN_DISPLAY_CHARACTERS = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+
+/** Marks a label the gateway shortened, so a reader can see it was cut. */
+const SHORTENED_MARK = "…";
+
+/** The label for the Inspector's credential. See `verifiedCallerLabel`. */
+const INSPECTOR_LABEL = "Inspector";
 
 export const VERIFIED_CALLER_SERVER_NAMES_ENV = "VERIFIED_CALLER_SERVER_NAMES";
 
@@ -122,7 +198,7 @@ export function assertVerifiedCallerConfig(): void {
   if (overlap.length > 0) throw overlapError(overlap);
   if (names.size > 0) {
     logger.info(
-      `Verified caller identity: X-Umbrella-User-Id is set from the authenticated caller for: ${[...names].sort().join(", ")}`,
+      `Verified caller identity: X-Umbrella-User-Id and X-Umbrella-Caller are set from the authenticated caller for: ${[...names].sort().join(", ")}`,
     );
   }
 }
@@ -191,17 +267,136 @@ export function verifiedCallerUserId(
 }
 
 /**
+ * The credential a caller binding authenticated with, as `X-Umbrella-Caller`
+ * names it, or undefined.
+ *
+ * Chosen by the binding's auth method, never by which fields happen to be
+ * present: `api_key:<uuid>` needs the key's uuid in its canonical lowercase
+ * form, `oauth:<client id>` needs the OAuth client the access token was
+ * issued to, and the Inspector's `session` stands for its signed-in admin.
+ * Any other method, or a missing or malformed id, is no credential.
+ */
+export function verifiedCallerCredential(
+  caller: CallerContext | undefined,
+): string | undefined {
+  switch (caller?.authMethod) {
+    case "api_key": {
+      const uuid = caller.apiKeyUuid;
+      return typeof uuid === "string" && API_KEY_UUID_PATTERN.test(uuid)
+        ? `api_key:${uuid}`
+        : undefined;
+    }
+    case "oauth": {
+      const clientId = caller.oauthClientId;
+      return typeof clientId === "string" &&
+        OAUTH_CLIENT_ID_PATTERN.test(clientId)
+        ? `oauth:${clientId}`
+        : undefined;
+    }
+    case "session":
+      return "session";
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * A descriptive field as it is sent: trimmed, then null when it is not a
+ * string, is empty, or contains a forbidden character. Over its limit, a
+ * label is shortened visibly (the last kept code point is replaced by an
+ * ellipsis); an email or a request id is sent as null instead, because a
+ * shortened email names someone else and a shortened request id joins
+ * nothing.
+ */
+function descriptiveField(
+  value: unknown,
+  limit: number,
+  overLimit: "shorten" | "null",
+): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed === "" || FORBIDDEN_DISPLAY_CHARACTERS.test(trimmed)) {
+    return null;
+  }
+  const codePoints = Array.from(trimmed);
+  if (codePoints.length <= limit) return trimmed;
+  if (overLimit === "null") return null;
+  return codePoints.slice(0, limit - 1).join("") + SHORTENED_MARK;
+}
+
+/**
+ * The display label for a credential: the label the router resolved for an
+ * API key or OAuth caller (`clientName`), and "Inspector" for the
+ * Inspector's session. The Inspector's caller binding deliberately carries no
+ * `clientName`, because that field becomes the audit row's consumer column
+ * and the Inspector is not a consumer (`routers/mcp-proxy/metamcp.ts`); the
+ * header names the credential instead.
+ */
+function verifiedCallerLabel(
+  caller: CallerContext | undefined,
+  credential: string,
+): unknown {
+  return credential === "session" ? INSPECTOR_LABEL : caller?.clientName;
+}
+
+/**
+ * The `X-Umbrella-Caller` value for a caller binding, or undefined when
+ * either the user id or the credential does not resolve.
+ *
+ * The JSON object is built as a literal in the fixed key order (v, uid, cred,
+ * email, label, rid); `JSON.stringify` keeps insertion order for these
+ * non-numeric keys, so the bytes for one input are always the same.
+ */
+export function encodeVerifiedCaller(
+  caller: CallerContext | undefined,
+): string | undefined {
+  const uid = verifiedCallerUserId(caller);
+  const cred = verifiedCallerCredential(caller);
+  if (uid === undefined || !UID_PATTERN.test(uid) || cred === undefined) {
+    return undefined;
+  }
+  const limits = VERIFIED_CALLER_IDENTITY_LIMITS;
+  const json = JSON.stringify({
+    v: 1,
+    uid,
+    cred,
+    email: descriptiveField(caller?.email, limits.email, "null"),
+    label: descriptiveField(
+      verifiedCallerLabel(caller, cred),
+      limits.label,
+      "shorten",
+    ),
+    rid: descriptiveField(caller?.requestId, limits.rid, "null"),
+  });
+  const value =
+    VERIFIED_CALLER_IDENTITY_PREFIX +
+    Buffer.from(json, "utf8").toString("base64url");
+  // Unreachable with the field limits above (the test suite pins the worst
+  // case); kept so a later field cannot push a value past what a reader
+  // accepts.
+  return value.length <= limits.encoded ? value : undefined;
+}
+
+/**
  * Wrap a pooled transport's fetch so each outgoing request carries the
  * verified caller of the inbound request it serves, and no other value.
  * See the module comment for the strip and set rules.
+ *
+ * Both headers are deleted first, on every request. The user id is then set
+ * under its own rule even when no credential resolves, and the structured
+ * header only when both its identifying fields do.
  */
 export function withVerifiedCaller(baseFetch: FetchLike): FetchLike {
   return async (url, init) => {
     const headers = new Headers(init?.headers);
     headers.delete(VERIFIED_CALLER_HEADER);
+    headers.delete(VERIFIED_CALLER_IDENTITY_HEADER);
     if (requestExecutesBackendCode(init)) {
-      const userId = verifiedCallerUserId(getCallerContext());
+      const caller = getCallerContext();
+      const userId = verifiedCallerUserId(caller);
       if (userId) headers.set(VERIFIED_CALLER_HEADER, userId);
+      const identity = encodeVerifiedCaller(caller);
+      if (identity) headers.set(VERIFIED_CALLER_IDENTITY_HEADER, identity);
     }
     return baseFetch(url, { ...init, headers });
   };
@@ -225,22 +420,29 @@ export function getVerifiedCallerFetchForServer(
   return withVerifiedCaller(baseFetch);
 }
 
+const VERIFIED_CALLER_HEADER_NAMES: ReadonlySet<string> = new Set([
+  VERIFIED_CALLER_HEADER,
+  VERIFIED_CALLER_IDENTITY_HEADER,
+]);
+
 /**
- * Whether a header name is this one, in any casing and with surrounding
- * whitespace ignored. The admin Inspector uses it to refuse an
- * `x-custom-auth-header` that names it (`routers/mcp-proxy/server.ts`).
+ * Whether a header name is one of the two verified caller headers
+ * (`X-Umbrella-User-Id`, `X-Umbrella-Caller`), in any casing and with
+ * surrounding whitespace ignored. The admin Inspector uses it to refuse an
+ * `x-custom-auth-header` that names either (`routers/mcp-proxy/server.ts`).
  */
 export function isVerifiedCallerHeaderName(name: unknown): boolean {
   return (
     typeof name === "string" &&
-    name.trim().toLowerCase() === VERIFIED_CALLER_HEADER
+    VERIFIED_CALLER_HEADER_NAMES.has(name.trim().toLowerCase())
   );
 }
 
 /**
- * A copy of a stored-headers object with this header removed in every
- * casing. The Inspector's direct transports do not go through the pooled
- * fetch, so it applies this to a named backend's stored row headers itself.
+ * A copy of a stored-headers object with both verified caller headers
+ * removed in every casing. The Inspector's direct transports do not go
+ * through the pooled fetch, so it applies this to a named backend's stored
+ * row headers itself.
  */
 export function withoutVerifiedCallerHeader(
   headers: Record<string, string>,

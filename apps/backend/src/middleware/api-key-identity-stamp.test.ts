@@ -296,3 +296,78 @@ describe("authenticateApiKey — stamps a nameable identity on every success bra
     expect(stamped.authMethod).toBeUndefined();
   });
 });
+
+/**
+ * WHICH credential called, not only whose. An OAuth access token belongs to
+ * the client it was issued to, and the verified caller header names that
+ * client (`lib/metamcp/verified-caller.ts`). Each OAuth success branch stamps
+ * it on its own, so each is pinned separately: a regression in one would
+ * leave that endpoint shape sending a user id with no credential.
+ */
+describe("authenticateApiKey: stamps the OAuth client on every OAuth branch", () => {
+  const oauthShapes = authenticatedShapes.filter(
+    (shape) => shape.expected.method === "oauth",
+  );
+
+  it("covers both OAuth branches", () => {
+    expect(oauthShapes.map((shape) => shape.label)).toEqual([
+      "oauth-only endpoint, bearer token",
+      "dual-auth endpoint, bearer-token branch",
+    ]);
+  });
+
+  for (const shape of oauthShapes) {
+    it(`stamps the token's client on ${shape.label}`, async () => {
+      const { served, req } = await authenticate({
+        endpoint: shape.endpoint,
+        headers: { ...shape.headers },
+      });
+
+      expect(served).toBe(true);
+      const stamped = req as express.Request & {
+        oauthUserId?: string;
+        oauthClientId?: string;
+      };
+      expect(stamped.oauthClientId).toBe("mcp_client_test");
+      expect(stamped.oauthUserId).toBe(OWNER_ID);
+    });
+  }
+
+  it("takes the client from the token row, not from anything the request sends", async () => {
+    getAccessTokenMock.mockResolvedValue({
+      access_token: OAUTH_TOKEN,
+      client_id: "mcp_client_from_row",
+      user_id: OWNER_ID,
+      scope: "mcp",
+      expires_at: new Date(Date.now() + 60 * 60 * 1000),
+      created_at: new Date(Date.now() - 60 * 1000),
+    });
+
+    const { req } = await authenticate({
+      endpoint: makeEndpoint({
+        enable_api_key_auth: false,
+        enable_oauth: true,
+      }),
+      headers: {
+        authorization: `Bearer ${OAUTH_TOKEN}`,
+        "x-oauth-client-id": "mcp_client_from_header",
+      },
+    });
+
+    expect(
+      (req as express.Request & { oauthClientId?: string }).oauthClientId,
+    ).toBe("mcp_client_from_row");
+  });
+
+  it("stamps no OAuth client on an API-key branch", async () => {
+    const { served, req } = await authenticate({
+      endpoint: makeEndpoint({ enable_api_key_auth: true, enable_oauth: true }),
+      headers: { "x-api-key": API_KEY },
+    });
+
+    expect(served).toBe(true);
+    expect(
+      (req as express.Request & { oauthClientId?: string }).oauthClientId,
+    ).toBeUndefined();
+  });
+});

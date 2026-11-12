@@ -12,6 +12,7 @@ import {
 } from "./asserted-actor";
 import type { CallerContext } from "./caller-context-store";
 import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middleware";
+import { verifiedCallerUserId } from "./verified-caller";
 
 /**
  * Caller binding for the tool-call audit trail.
@@ -59,6 +60,14 @@ import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middlewar
  *                   of the audit row and is never treated as identity. It is
  *                   carried so the pooled client can forward it to the backend
  *                   for that backend's own audit trail (`asserted-actor.ts`).
+ *   oauthClientId <- `authenticateApiKey`: the OAuth client the access token
+ *                   was issued to. Not an audit column; with `authMethod` and
+ *                   `apiKeyUuid` it names the credential in the verified
+ *                   caller header (`verified-caller.ts`).
+ *   email        <- `callerBinding`, from the router's consumer lookup, only
+ *                   when that lookup answered for the same effective user id.
+ *                   Not an audit column; descriptive data in the verified
+ *                   caller header.
  */
 
 /**
@@ -83,10 +92,23 @@ export interface CallerContextSource extends AuditRequestFields {
   apiKeyUserId?: string;
   apiKeyActsAsUserId?: string;
   oauthUserId?: string;
+  oauthClientId?: string;
   authMethod?: string;
 }
 
 export type { CallerContext };
+
+/**
+ * What the router layer resolved about this request's consumer
+ * (`resolveClientIdentity`): its display label, and the effective account it
+ * looked up, as the user id the lookup was for and that account's email.
+ * Declared structurally so this module does not import the resolver, which
+ * reaches the database.
+ */
+export interface ConsumerIdentity {
+  name?: string;
+  account?: { userId: string; email: string | null };
+}
 
 export function resolveCallerContext(req: CallerContextSource): CallerContext {
   return {
@@ -97,6 +119,10 @@ export function resolveCallerContext(req: CallerContextSource): CallerContext {
     // middleware actually resolved rather than preferring either method.
     userId: req.apiKeyUserId ?? req.oauthUserId,
     actsAsUserId: req.apiKeyActsAsUserId,
+    // Stamped only by the OAuth branches of `authenticateApiKey`. Which
+    // credential it describes is decided by `authMethod`, not by its presence
+    // (`verifiedCallerCredential`).
+    oauthClientId: req.oauthClientId,
     // Prefer the value `auditContextMiddleware` already stamped — it is what
     // `audit_log.actor_ip` records for this same request, and reading it here
     // means the two tables cannot silently disagree about where a request came
@@ -129,6 +155,39 @@ export function resolveCallerContext(req: CallerContextSource): CallerContext {
 }
 
 /**
+ * The complete request-scoped binding for one request: what the auth and
+ * audit-context middlewares stamped (`resolveCallerContext`), plus the
+ * consumer's display label and its account email.
+ *
+ * The email is taken only when the consumer lookup answered for the SAME user
+ * id the binding names (`actsAsUserId ?? userId`, `verifiedCallerUserId`).
+ * Both are derived from this one request, so they agree; the check keeps it
+ * that way if either derivation changes later, because an email for another
+ * user would put one person's address beside another person's id. A null or
+ * missing email stays undefined: there is no fallback to a label, a key name
+ * or another account.
+ */
+export function callerBinding(
+  req: CallerContextSource,
+  consumer?: ConsumerIdentity,
+): CallerContext {
+  const caller = resolveCallerContext(req);
+  const account = consumer?.account;
+  const userId = verifiedCallerUserId(caller);
+  return {
+    ...caller,
+    clientName: consumer?.name,
+    email:
+      account !== undefined &&
+      userId !== undefined &&
+      account.userId === userId &&
+      typeof account.email === "string"
+        ? account.email
+        : undefined,
+  };
+}
+
+/**
  * Copy the caller binding onto a pooled handler context.
  *
  * This is the FALLBACK carrier, not the authoritative one — the audit row is
@@ -146,14 +205,16 @@ export function resolveCallerContext(req: CallerContextSource): CallerContext {
 export function stampCallerContext(
   context: MetaMCPHandlerContext,
   req: CallerContextSource,
-  clientName?: string,
+  consumer?: ConsumerIdentity,
 ): void {
-  const caller = resolveCallerContext(req);
-  context.clientName = clientName;
+  const caller = callerBinding(req, consumer);
+  context.clientName = caller.clientName;
   context.apiKeyUuid = caller.apiKeyUuid;
   context.authMethod = caller.authMethod;
   context.userId = caller.userId;
   context.actsAsUserId = caller.actsAsUserId;
+  context.oauthClientId = caller.oauthClientId;
+  context.email = caller.email;
   context.callerIp = caller.callerIp;
   context.requestId = caller.requestId;
 }

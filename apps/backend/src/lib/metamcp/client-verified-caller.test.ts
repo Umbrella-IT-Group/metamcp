@@ -21,6 +21,7 @@ interface SeenRequest {
   rpcMethod?: string;
   toolName?: string;
   userId: string | null;
+  caller: string | null;
   authorization: string | null;
 }
 
@@ -50,6 +51,7 @@ const { undiciFetch, seen, getAccessToken } = vi.hoisted(() => {
       rpcMethod: message?.method,
       toolName: message?.params?.name,
       userId: headers.get("x-umbrella-user-id"),
+      caller: headers.get("x-umbrella-caller"),
       authorization: headers.get("authorization"),
     });
     if (httpMethod === "DELETE") return new Response(null, { status: 200 });
@@ -430,5 +432,296 @@ describe("backends that are not named are untouched", () => {
     expect(seen[0].userId).toBeNull();
     expect(seen[0].authorization).toBeNull();
     expect(getAccessToken).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// X-Umbrella-Caller on the pooled transports.
+// ---------------------------------------------------------------------------
+
+const KEY_ONE = "00000000-0000-4000-8000-0000000000a1";
+const KEY_TWO = "00000000-0000-4000-8000-0000000000a2";
+const CLIENT_ONE = "mcp_client_one";
+const CLIENT_TWO = "mcp_client_two";
+const SUPPLIED_BOTH = {
+  "X-Umbrella-User-Id": "user-supplied",
+  "X-Umbrella-Caller": "v1.c3VwcGxpZWQ",
+};
+
+/** The identifying pair a backend would read from a recorded request. */
+function pairSeen(r: SeenRequest): string | null {
+  if (r.caller === null) return null;
+  const payload = JSON.parse(
+    Buffer.from(r.caller.replace(/^v1\./, ""), "base64url").toString("utf8"),
+  ) as { uid: string; cred: string };
+  // The two headers are set from one binding, so they always agree.
+  expect(payload.uid).toBe(r.userId);
+  return `${payload.uid} ${payload.cred}`;
+}
+
+describe("X-Umbrella-Caller on a named backend", () => {
+  it("two callers on one pooled connection each carry their own caller header", async () => {
+    const { client, transport } = createMetaMcpClient(
+      asParams({
+        type: "STREAMABLE_HTTP",
+        url: INTERNAL_URL,
+        headers: SUPPLIED_BOTH,
+      }),
+    );
+    if (!client || !transport) throw new Error("no client built");
+
+    // Connected outside any caller scope, as the pool's idle warm-up does:
+    // one backend session serves every call below.
+    await client.connect(transport);
+    await client.listTools();
+
+    const call = (toolName: string, caller: Record<string, string>) =>
+      runWithCallerContext(caller, () =>
+        client.callTool({ name: toolName, arguments: {} }),
+      );
+    const results = await Promise.all([
+      call("key-one", {
+        authMethod: "api_key",
+        userId: "user-1",
+        apiKeyUuid: KEY_ONE,
+      }),
+      call("key-two-same-user", {
+        authMethod: "api_key",
+        userId: "user-1",
+        apiKeyUuid: KEY_TWO,
+      }),
+      call("acts-as", {
+        authMethod: "api_key",
+        userId: "user-admin",
+        actsAsUserId: "user-2",
+        apiKeyUuid: KEY_ONE,
+      }),
+      call("oauth-one", {
+        authMethod: "oauth",
+        userId: "user-1",
+        oauthClientId: CLIENT_ONE,
+      }),
+      call("oauth-two-same-user", {
+        authMethod: "oauth",
+        userId: "user-1",
+        oauthClientId: CLIENT_TWO,
+      }),
+      call("oauth-no-client", { authMethod: "oauth", userId: "user-1" }),
+      call("ownerless-key", { authMethod: "api_key", apiKeyUuid: KEY_ONE }),
+    ]);
+    for (const result of results) expect(result.isError).toBeFalsy();
+    await client.callTool({ name: "no-scope", arguments: {} });
+
+    const calls = seen.filter((r) => r.rpcMethod === "tools/call");
+    expect(
+      Object.fromEntries(calls.map((r) => [r.toolName, pairSeen(r)])),
+    ).toEqual({
+      "key-one": `user-1 api_key:${KEY_ONE}`,
+      "key-two-same-user": `user-1 api_key:${KEY_TWO}`,
+      "acts-as": `user-2 api_key:${KEY_ONE}`,
+      "oauth-one": `user-1 oauth:${CLIENT_ONE}`,
+      "oauth-two-same-user": `user-1 oauth:${CLIENT_TWO}`,
+      // The user id still goes; the structured header needs a credential.
+      "oauth-no-client": null,
+      "ownerless-key": null,
+      "no-scope": null,
+    });
+    expect(calls.find((r) => r.toolName === "oauth-no-client")?.userId).toBe(
+      "user-1",
+    );
+    // The handshake and the listing carry neither header, and the stored
+    // values reached the backend on no request at all.
+    for (const r of seen.filter((r) => r.rpcMethod !== "tools/call")) {
+      expect([r.httpMethod, r.rpcMethod, r.caller]).toEqual([
+        r.httpMethod,
+        r.rpcMethod,
+        null,
+      ]);
+    }
+    expect(
+      seen.some((r) => r.caller === SUPPLIED_BOTH["X-Umbrella-Caller"]),
+    ).toBe(false);
+    expect(seen.some((r) => r.userId === "user-supplied")).toBe(false);
+
+    await client.close();
+  });
+
+  it("a cold connect inside a caller's scope sends no caller header on the handshake or the listing", async () => {
+    const { client, transport } = createMetaMcpClient(
+      asParams({ type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+    );
+    if (!client || !transport) throw new Error("no client built");
+    try {
+      await runWithCallerContext(
+        { authMethod: "api_key", userId: "user-one", apiKeyUuid: KEY_ONE },
+        async () => {
+          await client.connect(transport);
+          await client.listTools();
+          await client.callTool({ name: "first", arguments: {} });
+        },
+      );
+      await runWithCallerContext(
+        { authMethod: "api_key", userId: "user-two", apiKeyUuid: KEY_TWO },
+        () => client.callTool({ name: "second", arguments: {} }),
+      );
+
+      for (const r of seen.filter((r) => r.rpcMethod !== "tools/call")) {
+        expect(r.caller).toBeNull();
+      }
+      expect(
+        seen
+          .filter((r) => r.rpcMethod === "tools/call")
+          .map((r) => [r.toolName, pairSeen(r)]),
+      ).toEqual([
+        ["first", `user-one api_key:${KEY_ONE}`],
+        ["second", `user-two api_key:${KEY_TWO}`],
+      ]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("SSE: the back-channel tool call carries the caller header and replaces a supplied value", async () => {
+    const { transport } = createMetaMcpClient(
+      asParams({ type: "SSE", url: INTERNAL_SSE_URL }),
+    );
+    await runWithCallerContext(
+      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+      () =>
+        installedFetch(transport)(
+          new URL("http://10.0.0.5:3000/messages"),
+          toolCallInit(SUPPLIED_BOTH),
+        ),
+    );
+    expect(seen).toHaveLength(1);
+    expect(pairSeen(seen[0])).toBe(`user-1 oauth:${CLIENT_ONE}`);
+  });
+
+  it("SSE: the stream GET carries no caller header and drops a stored value", async () => {
+    const { transport } = createMetaMcpClient(
+      asParams({ type: "SSE", url: INTERNAL_SSE_URL, headers: SUPPLIED_BOTH }),
+    );
+    await runWithCallerContext(
+      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+      () => streamFetch(transport)(new URL(INTERNAL_SSE_URL), {}),
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0].caller).toBeNull();
+    expect(seen[0].userId).toBeNull();
+  });
+
+  it("a named backend at a public address receives neither header", async () => {
+    const { transport } = createMetaMcpClient(
+      asParams({ type: "STREAMABLE_HTTP", url: PUBLIC_URL }),
+    );
+    await runWithCallerContext(
+      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+      () => installedFetch(transport)(new URL(PUBLIC_URL), toolCallInit()),
+    );
+    expect(seen).toHaveLength(1);
+    expect([seen[0].userId, seen[0].caller]).toEqual([null, null]);
+  });
+
+  it.each([301, 302, 303])(
+    "drops both headers when a same-origin %i rewrites the tool POST to GET",
+    async (status) => {
+      const record = undiciFetch.getMockImplementation();
+      if (!record) throw new Error("no recording fetch installed");
+      undiciFetch.mockImplementationOnce(async (url, init) => {
+        await record(url, init);
+        return new Response(null, {
+          status,
+          headers: { location: "/redirected" },
+        });
+      });
+      const { transport } = createMetaMcpClient(
+        asParams({ type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+      );
+      await runWithCallerContext(
+        { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+        () => installedFetch(transport)(new URL(INTERNAL_URL), toolCallInit()),
+      );
+      expect(seen.map((r) => [r.httpMethod, pairSeen(r)])).toEqual([
+        ["POST", `user-1 oauth:${CLIENT_ONE}`],
+        ["GET", null],
+      ]);
+      expect(seen[1].userId).toBeNull();
+    },
+  );
+
+  it.each([307, 308])(
+    "keeps both headers when a same-origin %i replays the same tool POST",
+    async (status) => {
+      const record = undiciFetch.getMockImplementation();
+      if (!record) throw new Error("no recording fetch installed");
+      undiciFetch.mockImplementationOnce(async (url, init) => {
+        await record(url, init);
+        return new Response(null, {
+          status,
+          headers: { location: "/redirected" },
+        });
+      });
+      const { transport } = createMetaMcpClient(
+        asParams({ type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+      );
+      await runWithCallerContext(
+        { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+        () => installedFetch(transport)(new URL(INTERNAL_URL), toolCallInit()),
+      );
+      expect(seen.map((r) => [r.httpMethod, pairSeen(r)])).toEqual([
+        ["POST", `user-1 oauth:${CLIENT_ONE}`],
+        ["POST", `user-1 oauth:${CLIENT_ONE}`],
+      ]);
+    },
+  );
+});
+
+describe("X-Umbrella-Caller: backends that are not named are untouched", () => {
+  it("an unnamed backend's stored caller header reaches it unchanged", async () => {
+    const { transport } = createMetaMcpClient(
+      asParams({
+        name: "other",
+        type: "STREAMABLE_HTTP",
+        url: INTERNAL_URL,
+        headers: { "X-Umbrella-Caller": "stored" },
+      }),
+    );
+    await runWithCallerContext(
+      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+      () =>
+        installedFetch(transport)(new URL(INTERNAL_URL), {
+          ...toolCallInit(),
+          headers: { "X-Umbrella-Caller": "stored" },
+        }),
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0].caller).toBe("stored");
+  });
+
+  it("an unnamed backend gets no caller header from the caller binding", async () => {
+    const { transport } = createMetaMcpClient(
+      asParams({ name: "other", type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+    );
+    await runWithCallerContext(
+      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+      () => installedFetch(transport)(new URL(INTERNAL_URL), toolCallInit()),
+    );
+    expect(seen[0].caller).toBeNull();
+  });
+
+  it("m365 never gets the caller header from the caller binding", async () => {
+    const { transport } = createMetaMcpClient(
+      asParams({ name: "m365", type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
+    );
+    await runWithCallerContext(
+      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+      () =>
+        runWithM365UserContext({ userId: "m365-user" }, () =>
+          installedFetch(transport)(new URL(INTERNAL_URL), toolCallInit()),
+        ),
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0].userId).toBe("m365-user");
+    expect(seen[0].caller).toBeNull();
   });
 });

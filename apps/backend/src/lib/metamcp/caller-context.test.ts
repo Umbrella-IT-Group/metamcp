@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  callerBinding,
   CallerContextSource,
   resolveCallerContext,
   stampCallerContext,
@@ -190,12 +191,127 @@ describe("stampCallerContext — the consumer label travels with the binding", (
       namespaceUuid: "ns-1",
       sessionId: "sess-1",
     };
-    stampCallerContext(context, apiKeyRequest, "example connector");
+    stampCallerContext(context, apiKeyRequest, { name: "example connector" });
     expect(context.clientName).toBe("example connector");
 
     // A pooled instance handed to a caller with no resolvable identity must
     // not keep advertising the previous consumer's name.
     stampCallerContext(context, { headers: {} });
     expect(context.clientName).toBeUndefined();
+  });
+});
+
+describe("resolveCallerContext: the OAuth client", () => {
+  it("carries the OAuth client the token was issued to", () => {
+    const caller = resolveCallerContext({
+      headers: {},
+      authMethod: "oauth",
+      oauthUserId: "user-oauth-9",
+      oauthClientId: "mcp_client_example",
+    });
+
+    expect(caller.oauthClientId).toBe("mcp_client_example");
+  });
+
+  it("leaves it unset for an API-key caller", () => {
+    expect(resolveCallerContext(apiKeyRequest).oauthClientId).toBeUndefined();
+  });
+});
+
+describe("callerBinding: the label and the account email", () => {
+  const actsAsRequest: CallerContextSource = {
+    ...apiKeyRequest,
+    apiKeyActsAsUserId: "acted-as-user-1",
+  };
+
+  it("adds the consumer label and the effective account's email to the request's binding", () => {
+    expect(
+      callerBinding(apiKeyRequest, {
+        name: "example connector",
+        account: { userId: "user-owner-1", email: "owner@example.com" },
+      }),
+    ).toEqual({
+      ...resolveCallerContext(apiKeyRequest),
+      clientName: "example connector",
+      email: "owner@example.com",
+    });
+  });
+
+  it("takes the acts-as user's email for a bound key", () => {
+    const caller = callerBinding(actsAsRequest, {
+      account: { userId: "acted-as-user-1", email: "bound@example.com" },
+    });
+
+    expect(caller.email).toBe("bound@example.com");
+  });
+
+  it("never takes an email looked up for a different user than the binding names", () => {
+    // A lookup for the key owner must not describe a call made as the
+    // acts-as user: that would put one person's address beside another's id.
+    const caller = callerBinding(actsAsRequest, {
+      account: { userId: "user-owner-1", email: "owner@example.com" },
+    });
+
+    expect(caller.email).toBeUndefined();
+    expect(caller.actsAsUserId).toBe("acted-as-user-1");
+  });
+
+  it.each([
+    ["the email could not be read", { userId: "user-owner-1", email: null }],
+    ["no account was resolved", undefined],
+  ])(
+    "leaves the email unset when %s, with no fallback to the label",
+    (_l, account) => {
+      const caller = callerBinding(apiKeyRequest, {
+        name: "owner@example.com",
+        account: account as
+          | { userId: string; email: string | null }
+          | undefined,
+      });
+
+      expect(caller.email).toBeUndefined();
+      expect(caller.clientName).toBe("owner@example.com");
+    },
+  );
+
+  it("leaves the email unset when the binding names no user", () => {
+    const caller = callerBinding(
+      { headers: {}, authMethod: "api_key", apiKeyUuid: "k-1" },
+      { account: { userId: "", email: "someone@example.com" } },
+    );
+
+    expect(caller.email).toBeUndefined();
+  });
+
+  it("is the request's own binding with no consumer", () => {
+    expect(callerBinding(apiKeyRequest)).toEqual(
+      resolveCallerContext(apiKeyRequest),
+    );
+  });
+});
+
+describe("stampCallerContext: the credential and email fields", () => {
+  it("stamps the OAuth client and the email, and clears both for the next caller", () => {
+    const context: MetaMCPHandlerContext = {
+      namespaceUuid: "ns-1",
+      sessionId: "sess-1",
+    };
+    stampCallerContext(
+      context,
+      {
+        headers: {},
+        authMethod: "oauth",
+        oauthUserId: "user-oauth-9",
+        oauthClientId: "mcp_client_example",
+      },
+      { account: { userId: "user-oauth-9", email: "oauth@example.com" } },
+    );
+    expect(context.oauthClientId).toBe("mcp_client_example");
+    expect(context.email).toBe("oauth@example.com");
+
+    stampCallerContext(context, apiKeyRequest);
+
+    expect(context.oauthClientId).toBeUndefined();
+    expect(context.email).toBeUndefined();
   });
 });

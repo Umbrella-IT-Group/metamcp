@@ -147,6 +147,7 @@ import { setAuditSinkForTesting } from "../../lib/audit/audit-emitter";
 import type { M365UserContext } from "../../lib/m365/request-context";
 import { getM365UserContext } from "../../lib/m365/request-context";
 import { BASE_BUILD_CAPABILITY_HASH } from "../../lib/metamcp/base-build-capabilities.test-util";
+import type { ConsumerIdentity } from "../../lib/metamcp/caller-context";
 import type { CallerContext } from "../../lib/metamcp/caller-context-store";
 import { getCallerContext } from "../../lib/metamcp/caller-context-store";
 import {
@@ -760,7 +761,7 @@ describe("dispatchTracked — in-flight guard around a long-lived dispatch (item
       fakeReq,
       fakeRes,
       sessionId,
-      "test-consumer",
+      { name: "test-consumer" },
       body,
     );
     await dispatchTracked(
@@ -1819,7 +1820,7 @@ describe("caller binding — request-scoped store (the audited source)", () => {
   async function dispatchAndCaptureCaller(
     authReq: ApiKeyAuthenticatedRequest,
     sessionId: string,
-    clientName?: string,
+    consumer?: ConsumerIdentity,
   ): Promise<CallerContext | undefined> {
     publicSessionSweeper.beginTracking(sessionId);
     const captured: { caller: CallerContext | undefined } = {
@@ -1831,7 +1832,7 @@ describe("caller binding — request-scoped store (the audited source)", () => {
       {} as express.Request,
       {} as express.Response,
       sessionId,
-      clientName,
+      consumer,
     );
     return captured.caller;
   }
@@ -1846,7 +1847,7 @@ describe("caller binding — request-scoped store (the audited source)", () => {
         auditRequestId: "req-aaaa",
       }),
       "sess-binding-1",
-      "example connector",
+      { name: "example connector" },
     );
 
     expect(caller).toEqual({
@@ -1890,7 +1891,7 @@ describe("caller binding — request-scoped store (the audited source)", () => {
         auditRequestId: "req-first",
       }),
       "sess-binding-shared",
-      "example connector",
+      { name: "example connector" },
     );
     const second = await dispatchAndCaptureCaller(
       fakeAuthReq({
@@ -1900,7 +1901,7 @@ describe("caller binding — request-scoped store (the audited source)", () => {
         auditRequestId: "req-second",
       }),
       "sess-binding-shared",
-      "other consumer",
+      { name: "other consumer" },
     );
 
     expect(first?.requestId).toBe("req-first");

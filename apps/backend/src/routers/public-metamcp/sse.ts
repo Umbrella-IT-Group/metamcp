@@ -11,7 +11,7 @@ import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
 import {
-  resolveCallerContext,
+  callerBinding,
   stampCallerContext,
 } from "../../lib/metamcp/caller-context";
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
@@ -309,7 +309,7 @@ sseRouter.get(
       stampCallerContext(
         mcpServerInstance.handlerContext,
         authReq,
-        clientIdentity?.name,
+        clientIdentity,
       );
 
       // Bind the session to the endpoint it was opened on AND to the
@@ -377,14 +377,14 @@ sseRouter.post(
       // has already run above, so the identity is on the request; the instance
       // stamped at stream-open cannot serve because the SSE session is
       // long-lived and `requestId` / `callerIp` are per-message facts.
+      // Resolved per message, not reused from stream-open: the label and the
+      // account email describe THIS request.
       const clientIdentity = await resolveClientIdentity(authReq);
-      await runWithCallerContext(
-        { ...resolveCallerContext(authReq), clientName: clientIdentity?.name },
-        () =>
-          (resolution.transport as SSEServerTransport).handlePostMessage(
-            req,
-            res,
-          ),
+      await runWithCallerContext(callerBinding(authReq, clientIdentity), () =>
+        (resolution.transport as SSEServerTransport).handlePostMessage(
+          req,
+          res,
+        ),
       );
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);

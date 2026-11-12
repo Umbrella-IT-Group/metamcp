@@ -52,6 +52,23 @@ export interface CallerContext {
   userId?: string;
   /** An admin key's acts-as target (`api_keys.acts_as_user_id`), when bound. */
   actsAsUserId?: string;
+  /**
+   * The OAuth client the presented access token was issued to
+   * (`oauth_access_tokens.client_id`), for an OAuth caller. With the auth
+   * method and the key uuid it says WHICH credential called, which the
+   * verified caller header sends to named backends (`verified-caller.ts`).
+   * Not a `tool_call_audit` column.
+   */
+  oauthClientId?: string;
+  /**
+   * The account email of the effective user (`actsAsUserId ?? userId`), read
+   * for THIS request through a short-lived cache, or undefined when it could
+   * not be read. Never another account's email and never a display label: it
+   * is set only when the lookup answered for that same user id
+   * (`callerBinding` in `caller-context.ts`). Sent to named backends as
+   * descriptive data; not a `tool_call_audit` column.
+   */
+  email?: string;
   callerIp?: string;
   requestId?: string;
   /**
