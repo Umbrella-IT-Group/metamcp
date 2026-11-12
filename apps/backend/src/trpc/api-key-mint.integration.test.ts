@@ -1871,14 +1871,26 @@ describeIfDb(
       );
 
       it("leaves a denied row for a refusal, naming the rule and the key", async () => {
-        const since = (
-          await fx.suiteLock.query(`SELECT clock_timestamp() AS t`)
-        ).rows[0].t as Date;
-        await setPolicy(["10.0.0.0/8"], "enforce");
+        // The preceding refusals emit asynchronously for the shared key. A
+        // timestamp cannot separate their pending inserts from this request,
+        // and the driver's Date also loses Postgres microseconds. A fresh key
+        // gives this assertion one refusal of its own, however fast CI runs.
+        const { uuid } = await newKey({});
+        const refused = await fx.trpc(
+          "frontend.apiKeys.setIpPolicy",
+          {
+            uuid,
+            allowed_cidrs: ["10.0.0.0/8"],
+            ip_policy_mode: "enforce",
+          },
+          "mutation",
+        );
+        expect(refused.status).toBe(400);
+        expect(refused.code).toBe("BAD_REQUEST");
 
         const rows = await fx.auditEventually(
-          `action = 'apikey.ip_policy.set' AND outcome = 'denied' AND target_id = $1 AND occurred_at >= $2`,
-          [minted, since],
+          `action = 'apikey.ip_policy.set' AND outcome = 'denied' AND target_id = $1`,
+          [uuid],
         );
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({
