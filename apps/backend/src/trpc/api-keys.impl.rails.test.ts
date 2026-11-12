@@ -450,6 +450,21 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
     },
   );
 
+  it("records the denial under the key's lower-case uuid, however the request spelled it", async () => {
+    // Hex letters, or upper-casing would change nothing.
+    const stored = "abcdefab-2222-4222-8222-abcdefabcdef";
+
+    await setPolicy(
+      stored.toUpperCase(),
+      ["10.0.0.0/8"],
+      "enforce",
+      actor(),
+    ).catch(() => undefined);
+
+    expect(emitMock).toHaveBeenCalledTimes(1);
+    expect(emitMock.mock.calls[0][1]).toMatchObject({ target_id: stored });
+  });
+
   it("looks the target up inside the write's transaction, by uuid", async () => {
     await setPolicy(OTHER_UUID, ["203.0.113.0/24"], "enforce", actor());
 

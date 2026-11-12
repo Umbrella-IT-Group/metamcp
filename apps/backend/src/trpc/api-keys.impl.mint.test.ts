@@ -532,14 +532,26 @@ describe("a valid mint", () => {
 
   it("records the endpoint uuid as stored, not as submitted", async () => {
     // Postgres reads a uuid case-insensitively and stores it lower case; the
-    // row the repository returns carries the stored form.
-    await call(mintInput({ endpoint_uuid: ENDPOINT_UUID.toUpperCase() }));
+    // row the repository returns carries the stored form. The uuid has hex
+    // letters, or upper-casing it would change nothing.
+    const stored = "abcdefab-1111-4111-8111-abcdefabcdef";
+    repoMock.mintDataPlaneKey.mockImplementationOnce(async () => ({
+      uuid: NEW_KEY_UUID,
+      name: "metrics poller",
+      key: RAW_KEY,
+      user_id: "owner-user-1",
+      endpoint_uuid: stored,
+      acts_as_user_id: null,
+      created_at: new Date("2026-11-12T12:00:00Z"),
+    }));
+
+    await call(mintInput({ endpoint_uuid: stored.toUpperCase() }));
 
     const [, event] = txAudit.record.mock.calls[0] as [
       unknown,
       { detail: { endpoint_uuid: string } },
     ];
-    expect(event.detail.endpoint_uuid).toBe(ENDPOINT_UUID);
+    expect(event.detail.endpoint_uuid).toBe(stored);
   });
 
   it("puts the raw key in nothing it writes, logs or hands to the audit row", async () => {

@@ -840,11 +840,13 @@ export const apiKeysImplementations = {
               });
             } catch (error) {
               if (error instanceof ApiKeyMintRefusal) {
+                // Lower case, the way the key's own row spells its uuid, so a
+                // query by the canonical uuid finds the denial too.
                 recordRefusal(
                   actor,
                   "apikey.ip_policy.set",
                   error.rule,
-                  input.uuid,
+                  input.uuid.toLowerCase(),
                 );
                 throw new TRPCError({
                   code: error.code,
