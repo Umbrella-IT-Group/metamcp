@@ -306,6 +306,57 @@ export function normalizeCidrList(
   return errors.length > 0 ? { ok: false, errors } : { ok: true, cidrs };
 }
 
+/**
+ * The widest an agent-created key's allowlist entry may be (see
+ * `agentCidrTooWide`): an IPv4 network of at most 256 addresses, a native IPv6
+ * network of at most 2^80. The client that asks for the key applies the same
+ * two numbers; they change together.
+ */
+export const AGENT_MIN_IPV4_PREFIX = 24;
+export const AGENT_MIN_IPV6_PREFIX = 48;
+
+/**
+ * How much IPv4 space an IPv6 allowlist entry admits, as an IPv4 prefix
+ * length, or null when the entry admits none.
+ *
+ * node:net BlockList matches an IPv4 address against an IPv6 rule through its
+ * IPv4-mapped form (`::ffff:a.b.c.d`), so an IPv6 entry that overlaps the
+ * mapped range `::ffff:0:0/96` admits IPv4 addresses whatever its own prefix
+ * length says. `::ffff:0:0/96` admits all of IPv4, and so does `::/48`, which
+ * contains the whole mapped range; a mapped `/120` admits exactly one IPv4
+ * /24. An entry narrower than the mapped range admits a /(prefix - 96) of IPv4;
+ * an entry that does not overlap the mapped range admits none.
+ */
+export function mappedIpv4Prefix(parsed: ParsedCidr): number | null {
+  if (parsed.family !== "ipv6") return null;
+  const bytes = ipv6ToBytes(parsed.address);
+  if (!bytes) return 0;
+  const mapped = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+  const compared = Math.min(parsed.prefix, 96);
+  for (let bit = 0; bit < compared; bit += 1) {
+    const index = bit >> 3;
+    const mask = 0x80 >> (bit & 7);
+    const have = bytes[index] & mask;
+    const want = (index < mapped.length ? mapped[index] : 0) & mask;
+    if (have !== want) return null;
+  }
+  return parsed.prefix <= 96 ? 0 : parsed.prefix - 96;
+}
+
+/**
+ * Is this entry wider than an agent-created key may carry? True for an IPv4
+ * prefix shorter than /24, an IPv6 prefix shorter than /48, and any IPv6 entry
+ * that admits more than an IPv4 /24 through the mapped range (see
+ * `mappedIpv4Prefix`). `0.0.0.0/0` and `::/0` fall out of the first two. A
+ * human administrator's own policies are not held to this.
+ */
+export function agentCidrTooWide(parsed: ParsedCidr): boolean {
+  if (parsed.family === "ipv4") return parsed.prefix < AGENT_MIN_IPV4_PREFIX;
+  const mapped = mappedIpv4Prefix(parsed);
+  if (mapped !== null) return mapped < AGENT_MIN_IPV4_PREFIX;
+  return parsed.prefix < AGENT_MIN_IPV6_PREFIX;
+}
+
 /** True for the explicit any-IP exemption: BOTH 0.0.0.0/0 and ::/0 present. */
 export function isAnyIpExemption(cidrs: readonly string[]): boolean {
   return cidrs.includes(ANY_IPV4_CIDR) && cidrs.includes(ANY_IPV6_CIDR);

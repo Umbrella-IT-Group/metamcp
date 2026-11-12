@@ -169,12 +169,41 @@ describe("createContext — admin-plane bearer branch", () => {
       makeCtxArgs({ authorization: "Bearer sk_mt_ci_key" }),
     );
 
+    // A resolver answer without a scope reads as `sync`, the narrow one.
     expect(ctx.authOrigin).toEqual({
       kind: "admin_plane",
       key_uuid: "77777777-7777-4777-8777-777777777777",
       owner_user_id: "ci-user",
+      scope: "sync",
     });
   });
+
+  it.each([
+    ["operator", "operator"],
+    ["sync", "sync"],
+    // Anything but the literal `operator` fails closed to `sync`.
+    ["Operator", "sync"],
+    ["admin", "sync"],
+    [undefined, "sync"],
+    [null, "sync"],
+    [{ toString: (): string => "operator" }, "sync"],
+  ])(
+    "carries the resolver's verified scope %j into the origin as %s",
+    async (resolved, expected) => {
+      resolveMock.mockResolvedValue({
+        user: BEARER_USER,
+        session: BEARER_SESSION,
+        keyUuid: "77777777-7777-4777-8777-777777777777",
+        scope: resolved,
+      });
+
+      const ctx = await createContext(
+        makeCtxArgs({ authorization: "Bearer sk_mt_ci_key" }),
+      );
+
+      expect(ctx.authOrigin?.scope).toBe(expected);
+    },
+  );
 
   it("never marks a cookie session, even one that also sends a bearer", async () => {
     authHandlerMock.mockResolvedValue(cookieSessionResponse());

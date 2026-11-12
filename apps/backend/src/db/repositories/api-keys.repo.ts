@@ -12,12 +12,46 @@ import {
   type GlobalIpPolicy,
   type IpPolicyMode,
 } from "@/lib/api-key-ip-policy";
+import {
+  ApiKeyMintRefusal,
+  assertEndpointEligible,
+  type ValidatedMintRequest,
+} from "@/lib/api-key-mint-rules";
 import { configService } from "@/lib/config.service";
 import logger from "@/utils/logger";
 
 import { db } from "../index";
-import { apiKeysTable, usersTable } from "../schema";
+import { apiKeysTable, endpointsTable, usersTable } from "../schema";
 import { shouldTouchLastUsed } from "./api-keys.last-used";
+import type { DbExecutor, DbTransaction } from "./db-executor";
+
+/**
+ * The postgres error behind a failed statement. drizzle wraps the driver's
+ * error (`DrizzleQueryError.cause`), so the code and constraint can be one
+ * level down. Reads only those two fields: the error's message can carry the
+ * statement and its parameters, and nothing here ever returns or logs it.
+ */
+function postgresFailure(error: unknown): {
+  code?: string;
+  constraint?: string;
+} {
+  const read = (value: unknown) => {
+    const candidate = value as { code?: unknown; constraint?: unknown } | null;
+    return {
+      code: typeof candidate?.code === "string" ? candidate.code : undefined,
+      constraint:
+        typeof candidate?.constraint === "string"
+          ? candidate.constraint
+          : undefined,
+    };
+  };
+  const direct = read(error);
+  if (direct.code) return direct;
+  return read((error as { cause?: unknown } | null)?.cause);
+}
+
+/** The unique constraint that makes a name unique per owner (schema.ts). */
+const NAME_PER_USER_CONSTRAINT = "api_keys_name_per_user_idx";
 
 /**
  * The global IP policy, read live (one config query) only when a key with no
@@ -53,7 +87,18 @@ export class ApiKeysRepository {
     return key;
   }
 
-  async create(input: ApiKeyCreateInput): Promise<{
+  /**
+   * Insert a key. `executor` is the pool by default; a caller that holds a
+   * transaction passes it so the key commits or rolls back with the rest of
+   * that transaction (the agent mint inserts the key and its audit row in one).
+   *
+   * The generated value is a local that never leaves this method except in the
+   * returned object, and nothing here logs or throws with it.
+   */
+  async create(
+    input: ApiKeyCreateInput,
+    executor?: DbExecutor,
+  ): Promise<{
     uuid: string;
     name: string;
     key: string;
@@ -64,7 +109,7 @@ export class ApiKeysRepository {
   }> {
     const key = this.generateApiKey();
 
-    const [createdApiKey] = await db
+    const [createdApiKey] = await (executor ?? db)
       .insert(apiKeysTable)
       .values({
         name: input.name,
@@ -88,6 +133,26 @@ export class ApiKeysRepository {
         // repository just persists what it is given (default false = data
         // plane). The CHECK constraints refuse a straddling row regardless.
         admin_plane: input.admin_plane ?? false,
+        // Scope (migration 0043), kept only for an admin-plane key: a
+        // data-plane key is always `sync` (the CHECK refuses anything else), so
+        // a scope supplied alongside admin_plane false is dropped here rather
+        // than trusted. Creation only; nothing updates it afterwards.
+        admin_plane_scope:
+          input.admin_plane === true
+            ? input.admin_plane_scope === "operator"
+              ? "operator"
+              : "sync"
+            : "sync",
+        // IP policy (migration 0041), written with the row so a key that is
+        // meant to be locked is never visible unlocked. Omitted leaves the
+        // column defaults: no list of its own (follow the global policy) and
+        // mode off.
+        ...(input.allowed_cidrs !== undefined
+          ? { allowed_cidrs: input.allowed_cidrs }
+          : {}),
+        ...(input.ip_policy_mode !== undefined
+          ? { ip_policy_mode: input.ip_policy_mode }
+          : {}),
         is_active: input.is_active ?? true,
       })
       .returning({
@@ -107,6 +172,115 @@ export class ApiKeysRepository {
       ...createdApiKey,
       key, // Return the actual key
     };
+  }
+
+  /**
+   * Create a data-plane key on behalf of an admin-plane key, inside the
+   * caller's transaction (rules in lib/api-key-mint-rules.ts). The caller has
+   * already validated the request fields; this does what only the database can
+   * answer, against rows it locks, and then inserts the key WITH its IP policy:
+   *
+   *  - the owner row is locked FOR SHARE and rechecked (it exists and is not
+   *    disabled). A concurrent disable waits for this transaction to finish,
+   *    and a disable that committed first is seen here, so a key is never
+   *    created for an account that was disabled before the insert;
+   *  - an endpoint-scoped key locks the endpoint row FOR SHARE and requires it
+   *    to be public and not restricted. A gateway-wide key requires that no
+   *    endpoint is restricted without requiring scoped keys (the pairing),
+   *    which is what keeps a gateway-wide key off every restricted endpoint;
+   *  - the name must not be taken by any key of the same owner. A concurrent
+   *    create of the same name is caught by the unique constraint and refused
+   *    the same way.
+   *
+   * Throws ApiKeyMintRefusal for each; any other failure propagates as is.
+   * Returns the created key, whose raw value the caller hands back once after
+   * the transaction commits. Nothing is logged here.
+   */
+  async mintDataPlaneKey(
+    tx: DbTransaction,
+    request: ValidatedMintRequest,
+  ): Promise<{
+    uuid: string;
+    name: string;
+    key: string;
+    user_id: string | null;
+    endpoint_uuid: string | null;
+    acts_as_user_id: string | null;
+    created_at: Date;
+  }> {
+    const [owner] = await tx
+      .select({ id: usersTable.id, disabled: usersTable.disabled })
+      .from(usersTable)
+      .where(eq(usersTable.id, request.ownerUserId))
+      .for("share");
+    if (!owner || owner.disabled !== false) {
+      throw new ApiKeyMintRefusal("owner_required");
+    }
+
+    if (request.endpointUuid !== null) {
+      const [endpoint] = await tx
+        .select({
+          uuid: endpointsTable.uuid,
+          user_id: endpointsTable.user_id,
+          restricted: endpointsTable.restricted,
+        })
+        .from(endpointsTable)
+        .where(eq(endpointsTable.uuid, request.endpointUuid))
+        .for("share");
+      if (!endpoint) throw new ApiKeyMintRefusal("endpoint_missing");
+      assertEndpointEligible(endpoint);
+    } else {
+      const [unpaired] = await tx
+        .select({ uuid: endpointsTable.uuid })
+        .from(endpointsTable)
+        .where(
+          and(
+            eq(endpointsTable.restricted, true),
+            eq(endpointsTable.require_scoped_api_key, false),
+          ),
+        )
+        .limit(1);
+      if (unpaired) throw new ApiKeyMintRefusal("gateway_wide_blocked");
+    }
+
+    const [sameName] = await tx
+      .select({ uuid: apiKeysTable.uuid })
+      .from(apiKeysTable)
+      .where(
+        and(
+          eq(apiKeysTable.user_id, request.ownerUserId),
+          eq(apiKeysTable.name, request.name),
+        ),
+      )
+      .limit(1);
+    if (sameName) throw new ApiKeyMintRefusal("name_taken");
+
+    try {
+      return await this.create(
+        {
+          name: request.name,
+          user_id: request.ownerUserId,
+          endpoint_uuid: request.endpointUuid,
+          acts_as_user_id: null,
+          admin_plane: false,
+          allowed_cidrs: request.allowedCidrs,
+          ip_policy_mode: "enforce",
+          is_active: true,
+        },
+        tx,
+      );
+    } catch (error) {
+      const failure = postgresFailure(error);
+      if (
+        failure.code === "23505" &&
+        failure.constraint === NAME_PER_USER_CONSTRAINT
+      ) {
+        throw new ApiKeyMintRefusal("name_taken");
+      }
+      // Anything else (a driver failure, the key hash constraint) propagates
+      // without its message, which can carry statement parameters.
+      throw new Error("The API key could not be written.");
+    }
   }
 
   // Find all API keys (both public and user-owned). Admin-only surface. LEFT
@@ -135,6 +309,9 @@ export class ApiKeysRepository {
         // Plane flag (migration 0038): so the admin view can label a
         // control-plane key loudly, the way acts-as is labelled.
         admin_plane: apiKeysTable.admin_plane,
+        // Scope (migration 0043): `sync` or `operator`, meaningful only for an
+        // admin-plane key; a data-plane key reads `sync`.
+        admin_plane_scope: apiKeysTable.admin_plane_scope,
         // IP allowlist (migration 0041): the key's own list (NULL = follows
         // the global policy), its mode, and the last address it was used
         // from. None of it is credential material.
@@ -356,6 +533,9 @@ export class ApiKeysRepository {
     | {
         valid: true;
         key_uuid: string;
+        // The key's scope (migration 0043), normalised here: anything but the
+        // literal `operator` is `sync`.
+        scope: "sync" | "operator";
         disabled: boolean;
         user: {
           id: string;
@@ -379,6 +559,7 @@ export class ApiKeysRepository {
         key_uuid: apiKeysTable.uuid,
         is_active: apiKeysTable.is_active,
         admin_plane: apiKeysTable.admin_plane,
+        admin_plane_scope: apiKeysTable.admin_plane_scope,
         last_used_at: apiKeysTable.last_used_at,
         allowed_cidrs: apiKeysTable.allowed_cidrs,
         ip_policy_mode: apiKeysTable.ip_policy_mode,
@@ -442,6 +623,7 @@ export class ApiKeysRepository {
     return {
       valid: true,
       key_uuid: row.key_uuid,
+      scope: row.admin_plane_scope === "operator" ? "operator" : "sync",
       disabled: row.disabled,
       user: {
         id: row.user_id,
@@ -575,6 +757,7 @@ export class ApiKeysRepository {
   async setIpPolicy(
     uuid: string,
     policy: { allowed_cidrs: string[] | null; ip_policy_mode: IpPolicyMode },
+    executor?: DbExecutor,
   ): Promise<{
     before: { allowed_cidrs: string[] | null; ip_policy_mode: string };
     after: {
@@ -587,7 +770,10 @@ export class ApiKeysRepository {
       last_used_ip: string | null;
     };
   } | null> {
-    return await db.transaction(async (tx) => {
+    // `executor` is the caller's transaction when it holds one (an admin-plane
+    // write records its audit row in the same transaction); the inner
+    // transaction is then a savepoint of it.
+    return await (executor ?? db).transaction(async (tx) => {
       const [before] = await tx
         .select({
           allowed_cidrs: apiKeysTable.allowed_cidrs,
@@ -616,5 +802,70 @@ export class ApiKeysRepository {
       if (!after) return null;
       return { before, after };
     });
+  }
+
+  /**
+   * Lock one key's row and report which plane it is on, inside the caller's
+   * transaction, for a policy change that is judged by the target's kind (an
+   * admin-plane key may only leave a DATA-plane key a narrow enforce policy).
+   * Returns null when no key has that uuid. The plane is fixed at creation and
+   * has no setter, so the lock is for ordering with the write that follows in
+   * the same transaction, not for the flag.
+   */
+  async lockPolicyTarget(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<{ admin_plane: boolean } | null> {
+    const [target] = await tx
+      .select({ admin_plane: apiKeysTable.admin_plane })
+      .from(apiKeysTable)
+      .where(eq(apiKeysTable.uuid, uuid))
+      .for("update");
+    return target ?? null;
+  }
+
+  /**
+   * Deactivate one key (the containment write), inside the caller's
+   * transaction. Reads the row FOR UPDATE and only then writes, so two
+   * concurrent deactivations make one transition and the second sees the key
+   * already inactive. Writes `is_active` and nothing else: no rename, no
+   * re-activation, no delete, and the scope and policy columns are untouched.
+   *
+   * `unchanged` carries no write, so the caller records no event for it.
+   */
+  async deactivate(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<
+    | { status: "not_found" }
+    | {
+        status: "unchanged" | "deactivated";
+        key: { uuid: string; name: string; last4: string; is_active: boolean };
+      }
+  > {
+    const [current] = await tx
+      .select({
+        uuid: apiKeysTable.uuid,
+        name: apiKeysTable.name,
+        last4: apiKeysTable.last4,
+        is_active: apiKeysTable.is_active,
+      })
+      .from(apiKeysTable)
+      .where(eq(apiKeysTable.uuid, uuid))
+      .for("update");
+    if (!current) return { status: "not_found" };
+    if (!current.is_active) return { status: "unchanged", key: current };
+    const [updated] = await tx
+      .update(apiKeysTable)
+      .set({ is_active: false })
+      .where(eq(apiKeysTable.uuid, uuid))
+      .returning({
+        uuid: apiKeysTable.uuid,
+        name: apiKeysTable.name,
+        last4: apiKeysTable.last4,
+        is_active: apiKeysTable.is_active,
+      });
+    if (!updated) return { status: "not_found" };
+    return { status: "deactivated", key: updated };
   }
 }

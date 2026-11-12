@@ -2,6 +2,8 @@ import type { AuditActor } from "@repo/trpc";
 import {
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
+  DeactivateApiKeyRequestSchema,
+  DeactivateApiKeyResponseSchema,
   DeleteApiKeyRequestSchema,
   DeleteApiKeyResponseSchema,
   GetGlobalIpPolicyResponseSchema,
@@ -33,7 +35,25 @@ import {
   type IpPolicyMode,
   normalizeCidrList,
 } from "../lib/api-key-ip-policy";
+import {
+  ApiKeyMintRefusal,
+  assertAgentSettableIpPolicy,
+  MINT_REFUSALS,
+  type MintRule,
+  validateAgentMintRequest,
+} from "../lib/api-key-mint-rules";
+import {
+  followedGlobalPolicy,
+  globalPolicyRefusalForCaller,
+  selfLockoutRefusal,
+} from "../lib/api-key-self-lockout";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import {
+  ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+  AdminAuditWriteError,
+  runAuditedTransaction,
+  withAdminAudit,
+} from "../lib/audit/admin-write";
 import { configService } from "../lib/config.service";
 
 const apiKeysRepository = new ApiKeysRepository();
@@ -77,6 +97,144 @@ function validatedCidrs(
   return normalized.cidrs;
 }
 
+/** The fixed refusal for a caller that is not an operator-scope key. */
+function notAnOperatorRefusal(): TRPCError {
+  return new TRPCError({
+    code: MINT_REFUSALS.caller_not_operator.code,
+    message: MINT_REFUSALS.caller_not_operator.message,
+  });
+}
+
+/**
+ * Leave a trace of a refusal an admin-plane key ran into: one `denied` audit
+ * row naming the rule and nothing of the request. Without it a key probing for
+ * a credential it may not create leaves only the generic accepted-request row,
+ * while an out-of-scope procedure call is recorded as a denial. Best effort,
+ * like the other denial rows: a refusal has nothing to roll back, and an audit
+ * outage must not turn a clean refusal into a failure.
+ */
+function recordRefusal(
+  actor: AuditActor,
+  action: "apikey.create" | "apikey.ip_policy.set",
+  rule: MintRule,
+  targetId?: string,
+): void {
+  emitAdminEvent(actor, {
+    action,
+    target_type: "api_key",
+    ...(targetId !== undefined ? { target_id: targetId } : {}),
+    outcome: "denied",
+    detail: { rule },
+  });
+}
+
+/** A refusal of an agent mint as the error a caller sees, recorded as denied. */
+function mintRefusalError(actor: AuditActor, rule: MintRule): TRPCError {
+  recordRefusal(actor, "apikey.create", rule);
+  return new TRPCError({
+    code: MINT_REFUSALS[rule].code,
+    message: MINT_REFUSALS[rule].message,
+  });
+}
+
+/**
+ * Create a data-plane key on behalf of an admin-plane key.
+ *
+ * Reached ONLY when the request authenticated with an admin-plane key, which
+ * is decided from `actor.admin_plane`: the provenance `auditActor(ctx)` builds
+ * from the origin `createContext` set from the verified key row. Nothing the
+ * caller sends picks this branch, and nothing the caller sends can leave it
+ * for the human branch below (that needs an actor without that provenance).
+ *
+ * The caller must be an `operator`-scope key whose owner is still an
+ * administrator, checked here as well as by the procedure scope sets, so a
+ * direct call to this function, a missing scope and an unknown scope all fail
+ * closed with the sentence every other admin-plane refusal carries.
+ *
+ * Every rule in lib/api-key-mint-rules.ts is enforced before the first write
+ * (the field checks, the kill switch) or inside the one transaction that
+ * writes the key (the owner, the endpoint, the name). The key row, its IP
+ * policy and its single `apikey.create` audit row are inserted in that
+ * transaction, the audit row awaited, so there is no unlocked intermediate key
+ * and no key without its record. The raw value is returned once, after
+ * commit, and is in no audit row, log line or error.
+ */
+async function createForAdminPlane(
+  input: Record<string, unknown>,
+  isAdmin: boolean,
+  actor: AuditActor,
+): Promise<z.infer<typeof CreateApiKeyResponseSchema>> {
+  if (actor.admin_plane?.scope !== "operator" || isAdmin !== true) {
+    recordRefusal(actor, "apikey.create", "caller_not_operator");
+    throw notAnOperatorRefusal();
+  }
+
+  let request: ReturnType<typeof validateAgentMintRequest>;
+  try {
+    request = validateAgentMintRequest(input);
+  } catch (error) {
+    throw mintFailure(error, actor);
+  }
+
+  try {
+    const created = await runAuditedTransaction(
+      actor,
+      (tx) => apiKeysRepository.mintDataPlaneKey(tx, request),
+      (key) => ({
+        action: "apikey.create",
+        target_type: "api_key",
+        target_id: key.uuid,
+        // Never the key. `key_admin_plane` is named apart from the legacy
+        // `admin_plane` field because an admin-plane actor's event carries the
+        // acting key under `detail.admin_plane`.
+        detail: {
+          name: key.name,
+          owner_user_id: request.ownerUserId,
+          // As stored (Postgres reads a uuid case-insensitively and writes it
+          // lower case), not as submitted, so a forensic query by the
+          // canonical uuid finds the row.
+          endpoint_uuid: key.endpoint_uuid,
+          all_endpoints: request.allEndpoints,
+          acts_as_user_id: null,
+          key_admin_plane: false,
+          key_admin_plane_scope: "sync",
+          ip_policy: { mode: "enforce", allowed_cidrs: request.allowedCidrs },
+        },
+      }),
+    );
+    return ApiKeysSerializer.serializeCreateApiKeyResponse(created);
+  } catch (error) {
+    throw mintFailure(error, actor);
+  }
+}
+
+/**
+ * Turn anything that can go wrong in an agent mint into an error that is safe
+ * to return: a rule refusal keeps its fixed sentence, everything else becomes
+ * a fixed one. The original error is never attached and never logged beyond
+ * its type: a driver error can carry statement parameters, and this path
+ * handles a freshly generated credential.
+ */
+function mintFailure(error: unknown, actor: AuditActor): TRPCError {
+  if (error instanceof TRPCError) return error;
+  if (error instanceof ApiKeyMintRefusal) {
+    return mintRefusalError(actor, error.rule);
+  }
+  if (error instanceof AdminAuditWriteError) {
+    return new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+    });
+  }
+  logger.error(
+    `Error creating API key for an admin-plane key (${error instanceof Error ? error.name : typeof error})`,
+  );
+  return new TRPCError({
+    code: "INTERNAL_SERVER_ERROR",
+    message: "The API key could not be created.",
+  });
+}
+
 export const apiKeysImplementations = {
   create: async (
     input: z.infer<typeof CreateApiKeyRequestSchema>,
@@ -84,6 +242,27 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> => {
+    // A request that authenticated with an admin-plane key takes the agent mint
+    // branch and never reaches the human branch below. The branch is picked by
+    // the verified provenance in `actor`, not by anything in `input`.
+    if (actor?.admin_plane) {
+      return createForAdminPlane(
+        input as unknown as Record<string, unknown>,
+        isAdmin,
+        actor,
+      );
+    }
+
+    // Scope (migration 0043) only means something on an admin-plane key. The
+    // zod superRefine says the same; this is for a caller that bypassed it.
+    if (input.admin_plane_scope !== undefined && input.admin_plane !== true) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "admin_plane_scope applies only to an admin-plane key, pass admin_plane: true with it.",
+      });
+    }
+
     // Admin-plane (control-plane) mint policy (migration 0038), enforced here
     // and mirrored in the zod superRefine for schema-bypassing callers.
     // ADMIN-ONLY: only an admin session may mint a control-plane key. PLANE
@@ -280,6 +459,23 @@ export const apiKeysImplementations = {
       }
     }
 
+    // Optional IP policy at creation (migration 0041), the human flow's way to
+    // create a key already locked. Validated like setIpPolicy validates a list;
+    // the prefix bounds an agent-created key must meet do not apply to a human
+    // administrator. A key created without one follows the global policy, as
+    // before.
+    const ipPolicy =
+      input.ip_policy !== undefined
+        ? {
+            allowed_cidrs: validatedCidrs(
+              input.ip_policy.allowed_cidrs,
+              input.ip_policy.mode,
+              "key",
+            ),
+            ip_policy_mode: input.ip_policy.mode,
+          }
+        : undefined;
+
     try {
       const result = await apiKeysRepository.create({
         name: input.name,
@@ -294,6 +490,13 @@ export const apiKeysImplementations = {
         // owner-must-be-admin + plane-exclusivity gates above; the CHECK
         // constraints refuse a straddling row regardless.
         admin_plane: input.admin_plane === true,
+        // Scope (migration 0043): the administrator's choice for an admin-plane
+        // key, `sync` when they made none. The repository drops it for a
+        // data-plane key.
+        ...(input.admin_plane === true && input.admin_plane_scope !== undefined
+          ? { admin_plane_scope: input.admin_plane_scope }
+          : {}),
+        ...(ipPolicy ?? {}),
         is_active: true,
       });
 
@@ -315,6 +518,17 @@ export const apiKeysImplementations = {
           // Greppable "a control-plane key was minted" (migration 0038). Never
           // the key itself, detail already carries no credential material.
           admin_plane: input.admin_plane === true,
+          // The scope of a control-plane key (migration 0043) and the policy a
+          // key was created with. Absent when not applicable.
+          ...(input.admin_plane === true
+            ? { admin_plane_scope: input.admin_plane_scope ?? "sync" }
+            : {}),
+          ...(ipPolicy
+            ? {
+                allowed_cidrs: ipPolicy.allowed_cidrs,
+                ip_policy_mode: ipPolicy.ip_policy_mode,
+              }
+            : {}),
         },
       });
 
@@ -330,6 +544,33 @@ export const apiKeysImplementations = {
         error instanceof Error ? error.message : "Internal server error",
       );
     }
+  },
+
+  /**
+   * The error for a create request from an admin-plane key that the tRPC input
+   * schema refused. The schema's own message is a JSON dump of its issues, which
+   * is not one of the fixed sentences every other refusal of this procedure
+   * carries, so the router calls this instead and the caller gets the same
+   * sentence (and code) the implementation would give the same request had it
+   * reached it: the first rule `validateAgentMintRequest` finds broken in the RAW
+   * request, or `request_invalid` when the schema refused it for a reason no
+   * rule names. Nothing of the request is echoed, and the refusal is recorded as
+   * a denied `apikey.create` row.
+   */
+  mintInputRefusal: (rawInput: unknown, actor: AuditActor): TRPCError => {
+    let rule: MintRule = "request_invalid";
+    if (
+      typeof rawInput === "object" &&
+      rawInput !== null &&
+      !Array.isArray(rawInput)
+    ) {
+      try {
+        validateAgentMintRequest(rawInput as Record<string, unknown>);
+      } catch (error) {
+        if (error instanceof ApiKeyMintRefusal) rule = error.rule;
+      }
+    }
+    return mintRefusalError(actor, rule);
   },
 
   // Member-facing list: the caller's own keys plus every public
@@ -475,6 +716,71 @@ export const apiKeysImplementations = {
     }
   },
 
+  /**
+   * Deactivate one key, the containment write an operator-scope admin-plane key
+   * and an administrator's session may both make. Input is the uuid and
+   * nothing else; the procedure cannot rename, re-activate or delete.
+   *
+   * The calling key is refused (the uuid is compared lowercased, since
+   * Postgres reads a uuid case-insensitively and an upper-case spelling of the
+   * caller's own uuid must not slip past): a key that locks itself out is not
+   * containment. Re-activation stays an administrator's act in the UI, so what
+   * an agent deactivates only a human can undo.
+   *
+   * The state change and its `apikey.revoke` audit row (the verb the UI's
+   * deactivation writes, with `detail.via = "deactivate"`) are one transaction
+   * whoever calls, the row awaited: an audit failure leaves the key active. An
+   * already-inactive key returns `changed: false` and records nothing.
+   */
+  deactivate: async (
+    input: z.infer<typeof DeactivateApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof DeactivateApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    if (actor?.admin_plane?.key_uuid.toLowerCase() === uuid) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: "A key cannot deactivate itself.",
+      });
+    }
+
+    let outcome: Awaited<ReturnType<typeof apiKeysRepository.deactivate>>;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) => apiKeysRepository.deactivate(tx, uuid),
+        (written) =>
+          written.status === "deactivated"
+            ? {
+                action: "apikey.revoke",
+                target_type: "api_key",
+                target_id: uuid,
+                detail: {
+                  name: written.key.name,
+                  is_active: false,
+                  via: "deactivate",
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      if (error instanceof AdminAuditWriteError) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+        });
+      }
+      throw error;
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: "API key not found" });
+    }
+    return ApiKeysSerializer.serializeDeactivatedApiKey(
+      outcome.key,
+      outcome.status === "deactivated",
+    );
+  },
+
   // ---- IP allowlists (migration 0041), admin-only at the router ----
 
   setIpPolicy: async (
@@ -493,30 +799,124 @@ export const apiKeysImplementations = {
         ? null
         : validatedCidrs(input.allowed_cidrs, input.ip_policy_mode, "key");
 
-    const result = await apiKeysRepository.setIpPolicy(input.uuid, {
-      allowed_cidrs: allowedCidrs,
-      ip_policy_mode: input.ip_policy_mode,
-    });
+    // Self-lockout rail: an admin-plane key changing ITS OWN policy may not
+    // leave an enforce policy that excludes the address of this request. The
+    // uuid is compared lowercased because Postgres reads a uuid
+    // case-insensitively. A human session and a write to any other key are
+    // unaffected.
+    const callerKeyUuid = actor?.admin_plane?.key_uuid.toLowerCase();
+    const changesOwnPolicy =
+      callerKeyUuid !== undefined && input.uuid.toLowerCase() === callerKeyUuid;
+
+    const result = await withAdminAudit(
+      actor,
+      async (...tx) => {
+        // Second half of rule 5: an admin-plane key may leave a DATA-plane key
+        // only a narrow enforce policy of its own, so a key that was created
+        // locked cannot be unlocked or widened by a later call (a human
+        // administrator's change in the UI is not held to it). Judged against
+        // the target as locked in this transaction. The key's own row is
+        // skipped: it is an admin-plane key by definition, and taking its row
+        // lock here would run ahead of the config locks the own-policy rail
+        // below takes first.
+        if (actor?.admin_plane && !changesOwnPolicy) {
+          const handle = tx[0];
+          if (!handle) {
+            // Unreachable: an admin-plane actor always gets a transaction.
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Internal server error",
+            });
+          }
+          const target = await apiKeysRepository.lockPolicyTarget(
+            handle,
+            input.uuid,
+          );
+          if (target && !target.admin_plane) {
+            try {
+              assertAgentSettableIpPolicy({
+                mode: input.ip_policy_mode,
+                cidrs: allowedCidrs,
+              });
+            } catch (error) {
+              if (error instanceof ApiKeyMintRefusal) {
+                // Lower case, the way the key's own row spells its uuid, so a
+                // query by the canonical uuid finds the denial too.
+                recordRefusal(
+                  actor,
+                  "apikey.ip_policy.set",
+                  error.rule,
+                  input.uuid.toLowerCase(),
+                );
+                throw new TRPCError({
+                  code: error.code,
+                  message: error.message,
+                });
+              }
+              throw error;
+            }
+          }
+        }
+        if (changesOwnPolicy) {
+          const handle = tx[0];
+          if (!handle) {
+            // Unreachable: an admin-plane actor always gets a transaction.
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Internal server error",
+            });
+          }
+          // Taken first, in the order setGlobalIpPolicy takes them (the config
+          // locks, then the key row), so the two cannot deadlock. A key that
+          // is about to follow the global policy is judged against the global
+          // policy as it will be when this commits.
+          const effective =
+            allowedCidrs === null
+              ? followedGlobalPolicy(
+                  await configService.getApiKeyIpPolicyInTransaction(handle),
+                )
+              : { mode: input.ip_policy_mode, cidrs: allowedCidrs };
+          const refusal = selfLockoutRefusal(
+            effective,
+            actor?.actor_ip,
+            allowedCidrs === null ? "globalList" : "ownList",
+          );
+          if (refusal) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+          }
+        }
+        return apiKeysRepository.setIpPolicy(
+          input.uuid,
+          {
+            allowed_cidrs: allowedCidrs,
+            ip_policy_mode: input.ip_policy_mode,
+          },
+          ...tx,
+        );
+      },
+      // After the write, with the value it replaced (read under the same row
+      // lock), so "what did this change" is answerable from the row alone.
+      // CIDRs and modes only: no credential material.
+      (written) =>
+        written
+          ? {
+              action: "apikey.ip_policy.set",
+              target_type: "api_key",
+              target_id: input.uuid,
+              detail: {
+                name: written.after.name,
+                old_value: written.before,
+                new_value: {
+                  allowed_cidrs: written.after.allowed_cidrs,
+                  ip_policy_mode: written.after.ip_policy_mode,
+                },
+              },
+            }
+          : null,
+    );
     if (!result) {
       throw new TRPCError({ code: "NOT_FOUND", message: "API key not found" });
     }
-
-    // After the write, with the value it replaced (read under the same row
-    // lock), so "what did this change" is answerable from the row alone.
-    // CIDRs and modes only: no credential material.
-    emitAdminEvent(actor, {
-      action: "apikey.ip_policy.set",
-      target_type: "api_key",
-      target_id: input.uuid,
-      detail: {
-        name: result.after.name,
-        old_value: result.before,
-        new_value: {
-          allowed_cidrs: result.after.allowed_cidrs,
-          ip_policy_mode: result.after.ip_policy_mode,
-        },
-      },
-    });
 
     return ApiKeysSerializer.serializeApiKeyIpPolicy(result.after);
   },
@@ -539,20 +939,57 @@ export const apiKeysImplementations = {
   ): Promise<z.infer<typeof SetGlobalIpPolicyResponseSchema>> => {
     const cidrs = validatedCidrs(input.allowed_cidrs, input.mode, "global");
 
-    const { before, after } = await configService.setApiKeyIpPolicy({
-      mode: input.mode,
-      cidrs,
-    });
+    const callerKeyUuid = actor?.admin_plane?.key_uuid;
 
-    emitAdminEvent(actor, {
-      action: "config.api_key_ip_policy.set",
-      target_type: "config_key",
-      target_id: "API_KEY_IP_POLICY",
-      detail: {
-        old_value: { mode: before.mode, allowed_cidrs: before.cidrs },
-        new_value: { mode: after.mode, allowed_cidrs: after.cidrs },
+    const { after } = await withAdminAudit(
+      actor,
+      async (...tx) => {
+        const snapshots = await configService.setApiKeyIpPolicy(
+          { mode: input.mode, cidrs },
+          ...tx,
+        );
+        // Self-lockout rail: an admin-plane key that FOLLOWS the global policy
+        // may not set one that excludes the address of this request. Checked
+        // after the write and inside its transaction, with the config locks
+        // the write took still held, so a refusal rolls the write back and no
+        // other writer can slip in between. A human session is unaffected.
+        if (callerKeyUuid !== undefined) {
+          const handle = tx[0];
+          if (!handle) {
+            // Unreachable: an admin-plane actor always gets a transaction.
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Internal server error",
+            });
+          }
+          const refusal = await globalPolicyRefusalForCaller(
+            handle,
+            callerKeyUuid,
+            actor?.actor_ip,
+            snapshots.after,
+          );
+          if (refusal) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+          }
+        }
+        return snapshots;
       },
-    });
+      (snapshots) => ({
+        action: "config.api_key_ip_policy.set",
+        target_type: "config_key",
+        target_id: "API_KEY_IP_POLICY",
+        detail: {
+          old_value: {
+            mode: snapshots.before.mode,
+            allowed_cidrs: snapshots.before.cidrs,
+          },
+          new_value: {
+            mode: snapshots.after.mode,
+            allowed_cidrs: snapshots.after.cidrs,
+          },
+        },
+      }),
+    );
 
     // Read back inside the write transaction so another writer cannot replace
     // this mutation's response, or a later read failure turn success into 500.

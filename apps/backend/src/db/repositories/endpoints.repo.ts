@@ -4,14 +4,20 @@ import {
   EndpointCreateInput,
   EndpointUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, ne, or } from "drizzle-orm";
 
 import { db } from "../index";
 import { endpointsTable, namespacesTable } from "../schema";
+import type { DbExecutor } from "./db-executor";
 
 export class EndpointsRepository {
-  async create(input: EndpointCreateInput): Promise<DatabaseEndpoint> {
-    const [createdEndpoint] = await db
+  async create(
+    input: EndpointCreateInput,
+    // The caller's transaction when it holds one (an admin-plane write records
+    // its audit row in the same transaction). Omitted, the pool is used.
+    executor?: DbExecutor,
+  ): Promise<DatabaseEndpoint> {
+    const [createdEndpoint] = await (executor ?? db)
       .insert(endpointsTable)
       .values({
         name: input.name,
@@ -41,6 +47,35 @@ export class EndpointsRepository {
     }
 
     return createdEndpoint;
+  }
+
+  /**
+   * Does a restricted or private endpoint (one that gates who may reach the
+   * namespace's tools) serve this namespace, other than `exceptUuid`? Used to
+   * stop an admin-plane key from publishing such a namespace through a public,
+   * unrestricted endpoint, which is the kind it may create API keys for.
+   */
+  async hasGatedEndpointOnNamespace(
+    namespaceUuid: string,
+    exceptUuid?: string,
+  ): Promise<boolean> {
+    const [gated] = await db
+      .select({ uuid: endpointsTable.uuid })
+      .from(endpointsTable)
+      .where(
+        and(
+          eq(endpointsTable.namespace_uuid, namespaceUuid),
+          or(
+            eq(endpointsTable.restricted, true),
+            isNotNull(endpointsTable.user_id),
+          ),
+          exceptUuid !== undefined
+            ? ne(endpointsTable.uuid, exceptUuid)
+            : undefined,
+        ),
+      )
+      .limit(1);
+    return gated !== undefined;
   }
 
   async findAll(): Promise<DatabaseEndpoint[]> {
@@ -458,8 +493,11 @@ export class EndpointsRepository {
     return deletedEndpoint;
   }
 
-  async update(input: EndpointUpdateInput): Promise<DatabaseEndpoint> {
-    const [updatedEndpoint] = await db
+  async update(
+    input: EndpointUpdateInput,
+    executor?: DbExecutor,
+  ): Promise<DatabaseEndpoint> {
+    const [updatedEndpoint] = await (executor ?? db)
       .update(endpointsTable)
       .set({
         name: input.name,

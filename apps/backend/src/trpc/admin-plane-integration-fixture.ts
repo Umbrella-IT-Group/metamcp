@@ -1,0 +1,395 @@
+/**
+ * Shared setup for the admin-plane integration suites that run the real /trpc
+ * stack against a real Postgres (api-key-mint.integration.test.ts and
+ * admin-write.integration.test.ts): users, admin-plane keys of both scopes,
+ * the express app around the real tRPC router, and the audit-fault trigger.
+ *
+ * Test support only: nothing in the shipped backend imports it, and tsup's
+ * only entry is `src/index.ts`. The two suites call `vi.mock` for the logger
+ * and the MCP connection pools themselves (mock registration is per file),
+ * then call `createFixture` from `beforeAll`.
+ *
+ * Addresses are RFC 5737 documentation ranges, emails use .test, ids and
+ * names are synthetic.
+ */
+
+import type { AddressInfo } from "node:net";
+
+import express from "express";
+import { Client } from "pg";
+import { expect } from "vitest";
+
+import { INTEGRATION_DB_LOCK_KEY } from "../db/repositories/integration-db-lock";
+
+export type TrpcReply = {
+  status: number;
+  data: unknown;
+  code: string | undefined;
+  message: string | undefined;
+};
+
+export interface Fixture {
+  base: string;
+  run: string;
+  suiteLock: Client;
+  db: typeof import("../db/index").db;
+  schema: typeof import("../db/schema");
+  eq: typeof import("drizzle-orm").eq;
+  ownerId: string;
+  memberId: string;
+  otherMemberId: string;
+  ownerCookie: string;
+  memberCookie: string;
+  operator: { key: string; uuid: string };
+  sync: { key: string; uuid: string };
+  publicNamespaceUuid: string;
+  trpc: (
+    procedure: string,
+    input: unknown,
+    kind: "query" | "mutation",
+    options?: {
+      key?: string;
+      cookie?: string;
+      ip?: string | null;
+    },
+  ) => Promise<TrpcReply>;
+  /** Rows of audit_log matching `where`, read straight away (no polling). */
+  auditNow: (
+    where: string,
+    params: unknown[],
+  ) => Promise<Array<Record<string, unknown>>>;
+  /** Same, polling briefly for a row `emit()` writes after the response. */
+  auditEventually: (
+    where: string,
+    params: unknown[],
+  ) => Promise<Array<Record<string, unknown>>>;
+  endpoint: (over: {
+    name: string;
+    userId?: string | null;
+    restricted?: boolean;
+    requireScoped?: boolean;
+    oauth?: boolean;
+    apiKeyAuth?: boolean;
+  }) => Promise<string>;
+  /** Make audit_log refuse an INSERT for `action` until `clearAuditFault`. */
+  failAuditFor: (action: string) => Promise<void>;
+  clearAuditFault: (action: string) => Promise<void>;
+  /** Make api_keys refuse an INSERT of a key with this name. */
+  failKeyInsertFor: (name: string) => Promise<void>;
+  clearKeyInsertFault: () => Promise<void>;
+  close: () => Promise<void>;
+}
+
+const APP_ORIGIN = "http://127.0.0.1:1";
+
+export async function createFixture(
+  databaseUrl: string,
+  label: string,
+): Promise<Fixture> {
+  const run = `${label}${Date.now().toString(36)}`;
+  const PASSWORD = `itest-throwaway-password-${run}`;
+  process.env.DATABASE_URL = databaseUrl;
+  process.env.BETTER_AUTH_SECRET = `itest-throwaway-secret-${run}`;
+  process.env.APP_URL = APP_ORIGIN;
+
+  const suiteLock = new Client({ connectionString: databaseUrl });
+  await suiteLock.connect();
+  await suiteLock.query(`SELECT pg_advisory_lock(${INTEGRATION_DB_LOCK_KEY})`);
+
+  const { db } = await import("../db/index");
+  const schema = await import("../db/schema");
+  const { eq } = await import("drizzle-orm");
+  const { ApiKeysRepository } = await import(
+    "../db/repositories/api-keys.repo"
+  );
+  const { auth } = await import("../auth");
+
+  const emails = {
+    owner: `itest-${run}-owner@example.test`,
+    member: `itest-${run}-member@example.test`,
+    other: `itest-${run}-other@example.test`,
+  };
+  for (const email of Object.values(emails)) {
+    await db
+      .delete(schema.usersTable)
+      .where(eq(schema.usersTable.email, email));
+  }
+
+  async function signUp(email: string) {
+    const res = await auth.handler(
+      new Request(`${APP_ORIGIN}/api/auth/sign-up/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: APP_ORIGIN },
+        body: JSON.stringify({ email, password: PASSWORD, name: "itest" }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const id = ((await res.json()) as { user: { id: string } }).user.id;
+    const cookie = (res.headers.getSetCookie?.() ?? [])
+      .map((c) => c.split(";")[0])
+      .join("; ");
+    return { id, cookie };
+  }
+
+  const owner = await signUp(emails.owner);
+  const member = await signUp(emails.member);
+  const other = await signUp(emails.other);
+  await db
+    .update(schema.usersTable)
+    .set({ role: "admin" })
+    .where(eq(schema.usersTable.id, owner.id));
+  // A cookie minted before the promotion carries the old role; sign in again.
+  const signedIn = await auth.handler(
+    new Request(`${APP_ORIGIN}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: APP_ORIGIN },
+      body: JSON.stringify({ email: emails.owner, password: PASSWORD }),
+    }),
+  );
+  expect(signedIn.status).toBe(200);
+  const ownerCookie = (signedIn.headers.getSetCookie?.() ?? [])
+    .map((c) => c.split(";")[0])
+    .join("; ");
+
+  const repo = new ApiKeysRepository();
+  const syncKey = await repo.create({
+    name: `itest ${run} sync`,
+    user_id: owner.id,
+    admin_plane: true,
+    is_active: true,
+  });
+  const operatorKey = await repo.create({
+    name: `itest ${run} operator`,
+    user_id: owner.id,
+    admin_plane: true,
+    admin_plane_scope: "operator",
+    is_active: true,
+  });
+
+  const [namespace] = await db
+    .insert(schema.namespacesTable)
+    .values({ name: `itest-${run}-ns`, user_id: null })
+    .returning();
+
+  const { default: trpcRouter } = await import("../routers/trpc");
+  const { auditContextMiddleware } = await import(
+    "../middleware/audit-context.middleware"
+  );
+  const app = express();
+  // Mounted first in the real server (index.ts): it stamps the request id and
+  // the Cloudflare-supplied client address the self-lockout rails and the audit
+  // rows read.
+  app.use(auditContextMiddleware);
+  app.use("/trpc", trpcRouter);
+  let server!: import("node:http").Server;
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, "127.0.0.1", resolve);
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+  let ipCounter = 0;
+  const nextIp = () => `198.51.100.${(++ipCounter % 250) + 1}`;
+
+  async function trpc(
+    procedure: string,
+    input: unknown,
+    kind: "query" | "mutation",
+    options: { key?: string; cookie?: string; ip?: string | null } = {},
+  ): Promise<TrpcReply> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (options.ip !== null) {
+      headers["cf-connecting-ip"] = options.ip ?? nextIp();
+    }
+    if (options.cookie) {
+      headers.cookie = options.cookie;
+      headers.origin = APP_ORIGIN;
+    } else {
+      headers.authorization = `Bearer ${options.key ?? operatorKey.key}`;
+    }
+    const url =
+      kind === "query"
+        ? `${base}/trpc/frontend/${procedure}${
+            input === undefined
+              ? ""
+              : `?input=${encodeURIComponent(JSON.stringify(input))}`
+          }`
+        : `${base}/trpc/frontend/${procedure}`;
+    const res = await fetch(url, {
+      method: kind === "query" ? "GET" : "POST",
+      headers,
+      body: kind === "mutation" ? JSON.stringify(input ?? {}) : undefined,
+    });
+    const body = (await res.json()) as {
+      result?: { data?: unknown };
+      error?: { message?: string; data?: { code?: string } };
+    };
+    return {
+      status: res.status,
+      data: body.result?.data,
+      code: body.error?.data?.code,
+      message: body.error?.message,
+    };
+  }
+
+  const auditSql = (where: string) =>
+    `SELECT actor_type, actor_id, actor_label, action, target_type, target_id,
+            outcome, detail
+       FROM audit_log WHERE ${where} ORDER BY occurred_at`;
+
+  async function auditNow(where: string, params: unknown[]) {
+    const { rows } = await suiteLock.query(auditSql(where), params);
+    return rows;
+  }
+
+  async function auditEventually(where: string, params: unknown[]) {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const rows = await auditNow(where, params);
+      if (rows.length > 0 || Date.now() > deadline) return rows;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  async function endpoint(over: {
+    name: string;
+    userId?: string | null;
+    restricted?: boolean;
+    requireScoped?: boolean;
+    oauth?: boolean;
+    apiKeyAuth?: boolean;
+  }) {
+    const [row] = await db
+      .insert(schema.endpointsTable)
+      .values({
+        name: `${over.name}-${run}`,
+        namespace_uuid: namespace.uuid,
+        user_id: over.userId ?? null,
+        restricted: over.restricted ?? false,
+        require_scoped_api_key: over.requireScoped ?? over.restricted ?? false,
+        enable_oauth: over.oauth ?? false,
+        enable_api_key_auth: over.apiKeyAuth ?? true,
+      })
+      .returning({ uuid: schema.endpointsTable.uuid });
+    return row.uuid;
+  }
+
+  // Fault injection at the database: a trigger that raises on a marked INSERT
+  // is a real statement failure inside the transaction, which is what the
+  // atomicity claims are about (a mocked failure would prove only the mock).
+  async function failAuditFor(action: string) {
+    await suiteLock.query(
+      `CREATE TABLE IF NOT EXISTS itest_fail_audit_actions (action text PRIMARY KEY)`,
+    );
+    await suiteLock.query(`
+      CREATE OR REPLACE FUNCTION itest_fail_audit() RETURNS trigger AS $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM itest_fail_audit_actions WHERE action = NEW.action) THEN
+          RAISE EXCEPTION 'itest: audit insert refused';
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`);
+    await suiteLock.query(
+      `DROP TRIGGER IF EXISTS itest_fail_audit_trg ON audit_log`,
+    );
+    await suiteLock.query(
+      `CREATE TRIGGER itest_fail_audit_trg BEFORE INSERT ON audit_log
+         FOR EACH ROW EXECUTE FUNCTION itest_fail_audit()`,
+    );
+    await suiteLock.query(
+      `INSERT INTO itest_fail_audit_actions (action) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [action],
+    );
+  }
+
+  async function clearAuditFault(action: string) {
+    await suiteLock.query(
+      `DELETE FROM itest_fail_audit_actions WHERE action = $1`,
+      [action],
+    );
+  }
+
+  async function failKeyInsertFor(name: string) {
+    // The trigger reads a table, not a session setting, because the app's
+    // connection is not the test's.
+    await suiteLock.query(
+      `CREATE TABLE IF NOT EXISTS itest_fail_key_names (name text PRIMARY KEY)`,
+    );
+    await suiteLock.query(`
+      CREATE OR REPLACE FUNCTION itest_fail_key_insert() RETURNS trigger AS $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM itest_fail_key_names WHERE name = NEW.name) THEN
+          RAISE EXCEPTION 'itest: key insert refused';
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`);
+    await suiteLock.query(
+      `DROP TRIGGER IF EXISTS itest_fail_key_trg ON api_keys`,
+    );
+    await suiteLock.query(
+      `CREATE TRIGGER itest_fail_key_trg BEFORE INSERT ON api_keys
+         FOR EACH ROW EXECUTE FUNCTION itest_fail_key_insert()`,
+    );
+    await suiteLock.query(
+      `INSERT INTO itest_fail_key_names (name) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [name],
+    );
+  }
+
+  async function clearKeyInsertFault() {
+    await suiteLock.query(
+      `DROP TRIGGER IF EXISTS itest_fail_key_trg ON api_keys`,
+    );
+    await suiteLock.query(`DROP TABLE IF EXISTS itest_fail_key_names`);
+  }
+
+  async function close() {
+    await new Promise((resolve) => server?.close(resolve));
+    await suiteLock.query(
+      `DROP TRIGGER IF EXISTS itest_fail_audit_trg ON audit_log`,
+    );
+    await suiteLock.query(`DROP TABLE IF EXISTS itest_fail_audit_actions`);
+    await clearKeyInsertFault();
+    await db
+      .delete(schema.namespacesTable)
+      .where(eq(schema.namespacesTable.uuid, namespace.uuid));
+    for (const email of Object.values(emails)) {
+      await db
+        .delete(schema.usersTable)
+        .where(eq(schema.usersTable.email, email));
+    }
+    const { pool } = await import("../db/index");
+    await pool.end();
+    await suiteLock.query(
+      `SELECT pg_advisory_unlock(${INTEGRATION_DB_LOCK_KEY})`,
+    );
+    await suiteLock.end();
+  }
+
+  return {
+    base,
+    run,
+    suiteLock,
+    db,
+    schema,
+    eq,
+    ownerId: owner.id,
+    memberId: member.id,
+    otherMemberId: other.id,
+    ownerCookie,
+    memberCookie: member.cookie,
+    operator: { key: operatorKey.key, uuid: operatorKey.uuid },
+    sync: { key: syncKey.key, uuid: syncKey.uuid },
+    publicNamespaceUuid: namespace.uuid,
+    trpc,
+    auditNow,
+    auditEventually,
+    endpoint,
+    failAuditFor,
+    clearAuditFault,
+    failKeyInsertFor,
+    clearKeyInsertFault,
+    close,
+  };
+}

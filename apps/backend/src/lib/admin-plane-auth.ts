@@ -36,11 +36,12 @@ import { resolveClientIp } from "./client-ip";
  * lever.
  *
  * WHAT IT MAY CALL. An admin-plane key acts with its owner's role, but only
- * on the configuration-sync procedures in ADMIN_PLANE_ALLOWED_PROCEDURES
- * (packages/trpc/src/trpc.ts). createContext marks the request with the key's
- * uuid, and the procedure builders refuse everything outside that list with
- * FORBIDDEN, so a CI credential cannot mint API keys, edit users or change
- * auth settings even though its owner can.
+ * on the procedures of its scope in packages/trpc/src/trpc.ts: the
+ * configuration-sync set for a `sync` key (what CI holds), the larger operator
+ * set for an `operator` key (migration 0043). createContext marks the request
+ * with the key's uuid and verified scope, and the procedure builders refuse
+ * everything outside that set with FORBIDDEN, so a CI credential cannot mint
+ * API keys, edit users or change auth settings even though its owner can.
  */
 
 const apiKeysRepository = new ApiKeysRepository();
@@ -93,6 +94,7 @@ function emitAccepted(
   token: string,
   userId: string,
   keyUuid: string,
+  scope: "sync" | "operator",
 ): void {
   try {
     const ctx = auditRequestContext(req);
@@ -108,7 +110,14 @@ function emitAccepted(
       outcome: "success",
       request_id: ctx.request_id,
       http_status: 200,
-      detail: { user_id: userId, key: credentialFingerprint(token) },
+      // The scope is the verified one from the key row (migration 0043), so
+      // an investigation can tell an operator's accepted request from CI's
+      // without joining to the key.
+      detail: {
+        user_id: userId,
+        key: credentialFingerprint(token),
+        admin_plane: { key_uuid: keyUuid, owner_user_id: userId, scope },
+      },
     });
   } catch {
     // An audit failure must never change what authentication answers. Same
@@ -179,7 +188,14 @@ export async function resolveAdminPlaneSession(
   token: string,
   req: express.Request,
 ): Promise<
-  { user: User; session: Session; keyUuid: string } | AdminPlaneIpDenied | null
+  | {
+      user: User;
+      session: Session;
+      keyUuid: string;
+      scope: "sync" | "operator";
+    }
+  | AdminPlaneIpDenied
+  | null
 > {
   // Kill switch: the whole path is off. Not a failed verification and not an
   // "admin-plane request" to record or audit, a bearer here is simply
@@ -226,7 +242,7 @@ export async function resolveAdminPlaneSession(
     return null;
   }
 
-  emitAccepted(req, token, result.user.id, result.key_uuid);
+  emitAccepted(req, token, result.user.id, result.key_uuid, result.scope);
 
   // Built from the joined users row and cast to the better-auth types. `role`
   // travels here fresh from the DB, so adminProcedure sees the owner's CURRENT
@@ -254,9 +270,9 @@ export async function resolveAdminPlaneSession(
     expiresAt: new Date(Date.now() + 60 * 1000),
   } as unknown as Session;
 
-  // keyUuid is what createContext turns into the request's admin-plane
-  // auth origin (BaseContext.authOrigin in @repo/trpc), which confines the
-  // request to the configuration-sync procedures and names the key in admin
-  // audit rows. It comes from the verified key row, never from the request.
-  return { user, session, keyUuid: result.key_uuid };
+  // keyUuid and scope are what createContext turns into the request's
+  // admin-plane auth origin (BaseContext.authOrigin in @repo/trpc), which
+  // confines the request to its scope's procedures and names the key in admin
+  // audit rows. Both come from the verified key row, never from the request.
+  return { user, session, keyUuid: result.key_uuid, scope: result.scope };
 }

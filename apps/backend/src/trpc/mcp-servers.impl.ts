@@ -25,6 +25,7 @@ import {
 import { ServerCredentialRetentionError } from "../db/repositories/mcp-server-update-plan";
 import { McpServersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { withAdminAudit } from "../lib/audit/admin-write";
 import { clampAuditTextList } from "../lib/audit/audit-emitter";
 import { mcpServerPool } from "../lib/metamcp/mcp-server-pool";
 import { clearOverrideCache } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
@@ -103,10 +104,40 @@ export const mcpServersImplementations = {
       const effectiveUserId =
         input.user_id !== undefined ? input.user_id : null;
 
-      const createdServer = await mcpServersRepository.create({
-        ...input,
-        user_id: effectiveUserId,
-      });
+      // SECRETS. An MCP server row carries the VENDOR credentials this
+      // gateway uses to reach a third party: `bearerToken`, `env`, and
+      // `headers` (which is where an API key lives for an HTTP backend). None
+      // of the three appears in the audit event, and none may be added:
+      // `audit_log` is append-only and un-clearable by design, so a credential
+      // written into it cannot be taken back out. Identity and transport only.
+      //
+      // For an admin-plane key the row and its audit row are one transaction
+      // (an audit failure fails the create); for everyone else the event is
+      // emitted best-effort right after the write.
+      const createdServer = await withAdminAudit(
+        actor,
+        (...tx) =>
+          mcpServersRepository.create(
+            {
+              ...input,
+              user_id: effectiveUserId,
+            },
+            ...tx,
+          ),
+        (created) =>
+          created
+            ? {
+                action: "mcpserver.create",
+                target_type: "mcp_server",
+                target_id: created.uuid,
+                detail: {
+                  name: created.name,
+                  type: created.type,
+                  owner_user_id: effectiveUserId,
+                },
+              }
+            : null,
+      );
 
       if (!createdServer) {
         return {
@@ -132,23 +163,6 @@ export const mcpServersImplementations = {
             );
           });
       }
-
-      // SECRETS. An MCP server row carries the VENDOR credentials this
-      // gateway uses to reach a third party — `bearerToken`, `env`, and
-      // `headers` (which is where an API key lives for an HTTP backend). None
-      // of the three appears here, and none may be added: `audit_log` is
-      // append-only and un-clearable by design, so a credential written into
-      // it cannot be taken back out. Identity and transport only.
-      emitAdminEvent(actor, {
-        action: "mcpserver.create",
-        target_type: "mcp_server",
-        target_id: createdServer.uuid,
-        detail: {
-          name: createdServer.name,
-          type: createdServer.type,
-          owner_user_id: effectiveUserId,
-        },
-      });
 
       return {
         success: true as const,
@@ -534,10 +548,33 @@ export const mcpServersImplementations = {
         ReturnType<typeof mcpServersRepository.updateReportingChange>
       >;
       try {
-        result = await mcpServersRepository.updateReportingChange({
-          ...input,
-          user_id: effectiveUserId,
-        });
+        // Same credential ban as `create` above: an update is the call that
+        // ROTATES a vendor token, so it is the likeliest place for one to leak
+        // into a log. For an admin-plane key the row and its audit row are one
+        // transaction.
+        result = await withAdminAudit(
+          actor,
+          (...tx) =>
+            mcpServersRepository.updateReportingChange(
+              {
+                ...input,
+                user_id: effectiveUserId,
+              },
+              ...tx,
+            ),
+          (written) =>
+            written
+              ? {
+                  action: "mcpserver.update",
+                  target_type: "mcp_server",
+                  target_id: written.server.uuid,
+                  detail: {
+                    name: written.server.name,
+                    type: written.server.type,
+                  },
+                }
+              : null,
+        );
       } catch (error) {
         if (error instanceof ServerCredentialRetentionError) {
           logger.info(
@@ -647,16 +684,6 @@ export const mcpServersImplementations = {
           `Cleared tool overrides cache for ${affectedNamespaceUuids.length} namespaces after updating server: ${updatedServer.name} (${updatedServer.uuid})`,
         );
       }
-
-      // Same credential ban as `create` above — an update is the call that
-      // ROTATES a vendor token, so it is the likeliest place for one to leak
-      // into a log.
-      emitAdminEvent(actor, {
-        action: "mcpserver.update",
-        target_type: "mcp_server",
-        target_id: updatedServer.uuid,
-        detail: { name: updatedServer.name, type: updatedServer.type },
-      });
 
       return {
         success: true as const,

@@ -12,6 +12,7 @@ import {
   namespacesTable,
   namespaceToolMappingsTable,
 } from "../schema";
+import type { DbExecutor } from "./db-executor";
 
 export class NamespaceMappingsRepository {
   async updateServerStatus(input: NamespaceServerStatusUpdate) {
@@ -31,8 +32,13 @@ export class NamespaceMappingsRepository {
     return updatedMapping;
   }
 
-  async updateToolStatus(input: NamespaceToolStatusUpdate) {
-    const [updatedMapping] = await db
+  async updateToolStatus(
+    input: NamespaceToolStatusUpdate,
+    // The caller's transaction when it holds one (an admin-plane write records
+    // its audit row in the same transaction). Omitted, the pool is used.
+    executor?: DbExecutor,
+  ) {
+    const [updatedMapping] = await (executor ?? db)
       .update(namespaceToolMappingsTable)
       .set({
         status: input.status,
@@ -158,14 +164,20 @@ export class NamespaceMappingsRepository {
    * @returns the upserted rows and the policy the write followed (undefined
    *   when nothing was written)
    */
-  async bulkUpsertNamespaceToolMappings(input: {
-    namespaceUuid: string;
-    toolMappings: Array<{
-      toolUuid: string;
-      serverUuid: string;
-      status?: "ACTIVE" | "INACTIVE";
-    }>;
-  }): Promise<{
+  async bulkUpsertNamespaceToolMappings(
+    input: {
+      namespaceUuid: string;
+      toolMappings: Array<{
+        toolUuid: string;
+        serverUuid: string;
+        status?: "ACTIVE" | "INACTIVE";
+      }>;
+    },
+    // The caller's transaction when it holds one; the inner transaction is then
+    // a savepoint of it and the share lock on the namespace row is held until
+    // the outer transaction ends.
+    executor?: DbExecutor,
+  ): Promise<{
     mappings: Array<typeof namespaceToolMappingsTable.$inferSelect>;
     toolPolicy: NamespaceToolPolicy | undefined;
   }> {
@@ -173,7 +185,7 @@ export class NamespaceMappingsRepository {
       return { mappings: [], toolPolicy: undefined };
     }
 
-    return await db.transaction(async (tx) => {
+    return await (executor ?? db).transaction(async (tx) => {
       const [namespace] = await tx
         .select({ tool_policy: namespacesTable.tool_policy })
         .from(namespacesTable)

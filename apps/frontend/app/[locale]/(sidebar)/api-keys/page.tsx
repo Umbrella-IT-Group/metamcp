@@ -205,6 +205,9 @@ export default function ApiKeysPage() {
       // below flips it and clears the data-plane inputs, which are mutually
       // exclusive with a control-plane key.
       admin_plane: undefined,
+      // Scope of a control-plane key (migration 0043). Only set while the
+      // admin-plane box is ticked, where it starts at the narrow `sync`.
+      admin_plane_scope: undefined,
     },
   });
 
@@ -263,9 +266,19 @@ export default function ApiKeysPage() {
   // authenticates on /trpc as its owner and is refused on the data plane.
   // Surfaced loudly in the admin list so it can never be mistaken for a
   // data-plane key.
-  const renderAdminPlaneBadge = (adminPlane: boolean) =>
+  //
+  // The badge names the key's scope (migration 0043): an `operator` key can do
+  // far more than a `sync` (CI) key, and the list must say which is which.
+  const renderAdminPlaneBadge = (
+    adminPlane: boolean,
+    scope: "sync" | "operator",
+  ) =>
     adminPlane ? (
-      <Badge variant="warning">{t("api-keys:adminPlaneBadge")}</Badge>
+      <Badge variant="warning">
+        {scope === "operator"
+          ? t("api-keys:adminPlaneBadgeOperator")
+          : t("api-keys:adminPlaneBadgeSync")}
+      </Badge>
     ) : null;
 
   // Better-auth ids are opaque ~32-char strings — shorten for badge display.
@@ -406,6 +419,14 @@ export default function ApiKeysPage() {
                           onCheckedChange={(checked) => {
                             const on = checked === true;
                             form.setValue("admin_plane", on ? true : undefined);
+                            // The scope exists only on an admin-plane key and
+                            // starts at the narrow one; unticking clears it so
+                            // the request never carries a scope without the
+                            // flag (the schema refuses that).
+                            form.setValue(
+                              "admin_plane_scope",
+                              on ? "sync" : undefined,
+                            );
                             if (on) {
                               form.setValue("endpoint_uuid", undefined);
                               form.setValue("all_endpoints", undefined);
@@ -430,6 +451,44 @@ export default function ApiKeysPage() {
                           </p>
                         </div>
                       </div>
+                      {form.watch("admin_plane") === true && (
+                        <div>
+                          <Label
+                            htmlFor="admin-plane-scope"
+                            className="text-sm font-medium"
+                          >
+                            {t("api-keys:adminPlaneScope")}
+                          </Label>
+                          <Select
+                            value={form.watch("admin_plane_scope") ?? "sync"}
+                            onValueChange={(value) =>
+                              form.setValue(
+                                "admin_plane_scope",
+                                value === "operator" ? "operator" : "sync",
+                              )
+                            }
+                          >
+                            <SelectTrigger id="admin-plane-scope">
+                              <SelectValue
+                                placeholder={t("api-keys:adminPlaneScope")}
+                              />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="sync">
+                                {t("api-keys:adminPlaneScopeSync")}
+                              </SelectItem>
+                              <SelectItem value="operator">
+                                {t("api-keys:adminPlaneScopeOperator")}
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {form.watch("admin_plane_scope") === "operator"
+                              ? t("api-keys:adminPlaneScopeOperatorDescription")
+                              : t("api-keys:adminPlaneScopeSyncDescription")}
+                          </p>
+                        </div>
+                      )}
                       <div>
                         <Label
                           htmlFor="ownership"
@@ -825,7 +884,10 @@ export default function ApiKeysPage() {
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1 flex-wrap">
-                          {renderAdminPlaneBadge(apiKey.admin_plane)}
+                          {renderAdminPlaneBadge(
+                            apiKey.admin_plane,
+                            apiKey.admin_plane_scope,
+                          )}
                           {renderScopeBadge(apiKey.endpoint_uuid)}
                           {renderIdentityBadge(
                             apiKey.acts_as_email ??

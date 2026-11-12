@@ -35,6 +35,32 @@ export interface AdminPlaneAuthOrigin {
   key_uuid: string;
   /** The key's owning user, whose role the request otherwise runs with. */
   owner_user_id: string;
+  /**
+   * The key's scope as the backend verified it from the key row (migration
+   * 0043). Optional only so a context built without it still type-checks;
+   * a missing or unrecognised value is read as `sync`, the narrow scope, by
+   * `adminPlaneScopeOf` below. Never copied from the request.
+   */
+  scope?: AdminPlaneScope;
+}
+
+/**
+ * What an admin-plane key may do. `sync` is the scope a CI key holds: the
+ * configuration-sync procedures and nothing else. `operator` adds the
+ * procedures an operator's tooling needs, among them the key lifecycle ones.
+ * The scope is fixed when a human administrator creates the key (migration
+ * 0043) and is never writable afterwards.
+ */
+export type AdminPlaneScope = "sync" | "operator";
+
+/**
+ * The scope a request runs with, failing closed: anything other than the
+ * literal `operator` (missing, unknown, wrongly typed) is `sync`.
+ */
+export function adminPlaneScopeOf(
+  origin: { scope?: unknown } | null | undefined,
+): AdminPlaneScope {
+  return origin?.scope === "operator" ? "operator" : "sync";
 }
 
 // Create context interface that can be extended by backend
@@ -48,47 +74,77 @@ export interface BaseContext {
 }
 
 /**
- * Every tRPC procedure an admin-plane API key may call: exactly what the
- * configuration-sync tooling calls today. Provenance: the private
- * Umbrella-MCP-Server repo's `metamcp/sync/sync_config.py`,
- * `metamcp/sync/dump_config.py` and `metamcp/sync/admin_cli.py`, read
- * 2026-11-11; every `trpc_query`/`trpc_mutate` name in those three files and
- * nothing else. Full paths with the `frontend.` router prefix, the form the
- * middleware below compares against.
+ * The tRPC procedures an admin-plane API key of scope `sync` may call: exactly
+ * what the configuration-sync tooling (a CI credential) calls, nothing else.
+ * Provenance: the private Umbrella-MCP-Server repo's
+ * `metamcp/sync/sync_config.py` and `metamcp/sync/dump_config.py`, every
+ * `trpc_query`/`trpc_mutate` name in those two files and no other. Full paths
+ * with the `frontend.` router prefix, the form the middleware below compares
+ * against.
  *
- * An admin-plane key authenticates as its owning administrator, so without
- * this list it could call everything that administrator can: mint API keys
- * that act as any user, mint further admin-plane keys, edit users, access
- * groups, OAuth clients and auth settings. A key that lives in CI must not be
- * able to do any of that. A human administrator's browser session is not
- * affected by this list.
+ * An admin-plane key authenticates as its owning administrator, so without a
+ * list it could call everything that administrator can: mint API keys that act
+ * as any user, mint further admin-plane keys, edit users, access groups, OAuth
+ * clients and auth settings. A key that lives in CI must not be able to do any
+ * of that, and must not hold the operator's key and policy powers either. A
+ * human administrator's browser session is not affected by these lists.
  *
- * Still reachable, on purpose, because the operator CLI uses them: the per-key
- * and global IP policy setters, and create/update of servers, namespaces and
- * endpoints. Adding a name here widens what a CI credential can do; it needs
- * the same review as any other change to who can do what.
+ * Adding a name here widens what a CI credential can do; it needs the same
+ * review as any other change to who can do what, and the consumer repo pins a
+ * copy of this list that must change in the same step.
  */
-export const ADMIN_PLANE_ALLOWED_PROCEDURES: ReadonlySet<string> = new Set([
+export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
+  "frontend.config.getMcpMaxTotalTimeout",
+  "frontend.config.getMcpTimeout",
+  "frontend.endpoints.list",
+  "frontend.mcpServers.create",
+  "frontend.mcpServers.list",
+  "frontend.mcpServers.update",
+  "frontend.namespaces.get",
+  "frontend.namespaces.getTools",
+  "frontend.namespaces.list",
+  "frontend.tools.getByMcpServerUuid",
+]);
+
+/**
+ * The procedures an admin-plane key of scope `operator` may call: the sync
+ * set plus what the operator's tooling (`metamcp/sync/admin_cli.py`) needs.
+ * Built from the sync set so the operator can never hold less than it.
+ *
+ *  - The per-key and global IP-policy procedures, with self-lockout rails in
+ *    the implementations (a key cannot lock itself out).
+ *  - `apiKeys.listAll` and `apiKeys.deactivate`: inventory and containment.
+ *    `deactivate` refuses the calling key and cannot re-activate, rename or
+ *    delete (those stay a human administrator's act in the UI).
+ *  - `apiKeys.create`: reaches the implementation's agent-mint branch, which
+ *    only ever creates an endpoint-scoped or gateway-wide DATA-plane key for
+ *    one existing enabled user, locked to a narrow IP list at creation. Every
+ *    other kind of key (admin-plane of either scope, acts-as, public) is a
+ *    human click. The rules are enforced in the implementation, from the
+ *    verified origin, not here: this list only decides who gets that far.
+ *  - Create and update of namespaces and endpoints, and the tool refresh and
+ *    status writes the provisioning verbs call.
+ *  - Four reads for answering "who owns what" without a browser: users,
+ *    OAuth clients, access groups (list and get). None returns a credential.
+ */
+export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
+  ...ADMIN_PLANE_SYNC_PROCEDURES,
+  "frontend.accessGroups.get",
+  "frontend.accessGroups.list",
+  "frontend.apiKeys.create",
+  "frontend.apiKeys.deactivate",
   "frontend.apiKeys.getGlobalIpPolicy",
   "frontend.apiKeys.listAll",
   "frontend.apiKeys.setGlobalIpPolicy",
   "frontend.apiKeys.setIpPolicy",
-  "frontend.config.getMcpMaxTotalTimeout",
-  "frontend.config.getMcpTimeout",
   "frontend.endpoints.create",
-  "frontend.endpoints.list",
   "frontend.endpoints.update",
-  "frontend.mcpServers.create",
-  "frontend.mcpServers.list",
-  "frontend.mcpServers.update",
   "frontend.namespaces.create",
-  "frontend.namespaces.get",
-  "frontend.namespaces.getTools",
-  "frontend.namespaces.list",
   "frontend.namespaces.refreshTools",
   "frontend.namespaces.update",
   "frontend.namespaces.updateToolStatus",
-  "frontend.tools.getByMcpServerUuid",
+  "frontend.oauthClients.list",
+  "frontend.users.list",
 ]);
 
 /** One constant refusal for every procedure outside the list. */
@@ -121,7 +177,11 @@ export interface TrpcDenialEvent {
   http_status: number;
   audit?: AuditRequestContext;
   /** Set when an admin-plane API key was refused; see AdminPlaneAuthOrigin. */
-  admin_plane?: { key_uuid: string; owner_user_id: string };
+  admin_plane?: {
+    key_uuid: string;
+    owner_user_id: string;
+    scope?: AdminPlaneScope;
+  };
 }
 
 /**
@@ -226,8 +286,17 @@ export interface AuditActor {
    * The backend's admin-event writer then records the KEY as the actor and
    * keeps the owning user beside it, so a change made from CI is never
    * recorded as if the owner had made it in the browser.
+   *
+   * `scope` is the verified scope of that key, normalised by `auditActor`
+   * (anything but `operator` reads `sync`). It is what an implementation
+   * checks when a branch is reserved for operator keys: a direct call that
+   * omits it is not an operator, so such a branch fails closed.
    */
-  admin_plane?: { key_uuid: string; owner_user_id: string };
+  admin_plane?: {
+    key_uuid: string;
+    owner_user_id: string;
+    scope?: AdminPlaneScope;
+  };
 }
 
 /**
@@ -258,17 +327,37 @@ export function auditActor(ctx: BaseContext): AuditActor {
             admin_plane: {
               key_uuid: adminPlane.key_uuid,
               owner_user_id: adminPlane.owner_user_id,
+              scope: adminPlaneScopeOf(adminPlane),
             },
           }
         : {}),
     };
   } catch {
+    // Attribution degrades to nulls, but the admin-plane PROVENANCE must not:
+    // a branch that is reserved for (or closed to) admin-plane keys reads it,
+    // and an actor that silently lost it would be mistaken for a human
+    // session. The origin is a plain object createContext built, read on its
+    // own so a throwing getter elsewhere on the context cannot take it down.
+    let admin_plane: AuditActor["admin_plane"];
+    try {
+      const origin = adminPlaneOrigin(ctx);
+      if (origin) {
+        admin_plane = {
+          key_uuid: origin.key_uuid,
+          owner_user_id: origin.owner_user_id,
+          scope: adminPlaneScopeOf(origin),
+        };
+      }
+    } catch {
+      // Left undefined; the router-level guard on `apiKeys.create` refuses.
+    }
     return {
       actor_id: null,
       actor_label: null,
       actor_ip: null,
       actor_user_agent: null,
       request_id: null,
+      ...(admin_plane ? { admin_plane } : {}),
     };
   }
 }
@@ -315,9 +404,11 @@ const t = initTRPC.context<BaseContext>().create({
 });
 
 /**
- * Refuse an admin-plane request for any procedure outside
- * ADMIN_PLANE_ALLOWED_PROCEDURES. Throws FORBIDDEN with one constant message
- * and records the refusal; does nothing for any other request.
+ * Refuse an admin-plane request for any procedure outside its scope's set
+ * (ADMIN_PLANE_SYNC_PROCEDURES, or ADMIN_PLANE_OPERATOR_PROCEDURES for an
+ * `operator` key; a missing or unknown scope is `sync`). Throws FORBIDDEN with
+ * one constant message and records the refusal; does nothing for any other
+ * request.
  *
  * Exported so the backend's own tRPC instance (apps/backend/src/trpc.ts) can
  * apply the identical rule to its builders.
@@ -332,7 +423,13 @@ export function assertAdminPlaneProcedureAllowed(
   type: string,
 ): void {
   const origin = adminPlaneOrigin(ctx);
-  if (!origin || ADMIN_PLANE_ALLOWED_PROCEDURES.has(path)) {
+  if (!origin) return;
+  const scope = adminPlaneScopeOf(origin);
+  const allowed =
+    scope === "operator"
+      ? ADMIN_PLANE_OPERATOR_PROCEDURES
+      : ADMIN_PLANE_SYNC_PROCEDURES;
+  if (allowed.has(path)) {
     return;
   }
   emitDenial(() => {
@@ -349,6 +446,7 @@ export function assertAdminPlaneProcedureAllowed(
       admin_plane: {
         key_uuid: origin.key_uuid,
         owner_user_id: origin.owner_user_id,
+        scope,
       },
     };
   });
@@ -473,6 +571,7 @@ export const adminProcedure = protectedProcedure.use(
                 admin_plane: {
                   key_uuid: origin.key_uuid,
                   owner_user_id: origin.owner_user_id,
+                  scope: adminPlaneScopeOf(origin),
                 },
               }
             : {}),

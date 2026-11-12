@@ -50,8 +50,22 @@ vi.mock("../db/serializers", () => ({
 const { emitAdminEventMock } = vi.hoisted(() => ({
   emitAdminEventMock: vi.fn(),
 }));
-vi.mock("../lib/audit/admin-event", () => ({
+vi.mock("../lib/audit/admin-event", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/audit/admin-event")>()),
   emitAdminEvent: emitAdminEventMock,
+}));
+
+// An admin-plane key's endpoint row and its audit row share one transaction
+// (lib/audit/admin-write.ts); a stand-in transaction keeps that path loadable
+// here. The real one is pinned against Postgres in the integration tests.
+vi.mock("../db/index", () => ({
+  db: {
+    transaction: async (callback: (tx: object) => Promise<unknown>) =>
+      callback({}),
+  },
+}));
+vi.mock("../db/repositories/audit-log-tx", () => ({
+  recordAuditInTransaction: vi.fn(async () => undefined),
 }));
 
 import { endpointsImplementations } from "./endpoints.impl";
@@ -175,5 +189,94 @@ describe("endpoints.create — companion MCP server", () => {
     expect(mcpServersRepositoryMock.create).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
     expect(result.warning).toBeUndefined();
+  });
+});
+
+describe("endpoints.create: an admin-plane key cannot mint a key through the companion server", () => {
+  // The companion-server path mints an endpoint-scoped key straight in the
+  // repository, bypassing apiKeys.create and every rule that procedure holds an
+  // admin-plane key to. So a request authenticated by an admin-plane key of
+  // either scope may not ask for it, and is refused before any side effect.
+  const adminPlaneActor = (scope: "sync" | "operator") => ({
+    actor_id: USER_ID,
+    actor_label: "owner@example.test",
+    actor_ip: "203.0.113.5",
+    actor_user_agent: "test",
+    request_id: "r1",
+    admin_plane: {
+      key_uuid: "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b",
+      owner_user_id: USER_ID,
+      scope,
+    },
+  });
+
+  it.each(["sync", "operator"] as const)(
+    "refuses createMcpServer from a %s-scope key before any write",
+    async (scope) => {
+      const failure = await endpointsImplementations
+        .create(createInput(), USER_ID, adminPlaneActor(scope))
+        .catch((error) => error);
+
+      // A thrown tRPC error (HTTP 403), not `success: false` inside a 200.
+      expect(failure).toMatchObject({ code: "FORBIDDEN" });
+      expect(endpointsRepositoryMock.findByName).not.toHaveBeenCalled();
+      expect(endpointsRepositoryMock.create).not.toHaveBeenCalled();
+      expect(apiKeyCreateMock).not.toHaveBeenCalled();
+      expect(mcpServersRepositoryMock.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["true", true],
+    ["a truthy non-boolean", "yes"],
+    ["a number", 1],
+  ])("refuses createMcpServer that is %s", async (_label, value) => {
+    await expect(
+      endpointsImplementations.create(
+        createInput({ createMcpServer: value }),
+        USER_ID,
+        adminPlaneActor("operator"),
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(apiKeyCreateMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["false", false],
+    ["omitted", undefined],
+  ])(
+    "still creates the endpoint when createMcpServer is %s (the operator CLI's call)",
+    async (_label, value) => {
+      const result = await endpointsImplementations.create(
+        createInput({ createMcpServer: value }),
+        USER_ID,
+        adminPlaneActor("operator"),
+      );
+
+      expect(result.success).toBe(true);
+      expect(endpointsRepositoryMock.create).toHaveBeenCalledTimes(1);
+      // Handed the transaction handle, so its audit row shares it.
+      expect(endpointsRepositoryMock.create.mock.calls[0]).toHaveLength(2);
+      expect(apiKeyCreateMock).not.toHaveBeenCalled();
+      expect(mcpServersRepositoryMock.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("leaves a human administrator's companion-server creation working", async () => {
+    const result = await endpointsImplementations.create(
+      createInput(),
+      USER_ID,
+      {
+        actor_id: USER_ID,
+        actor_label: "admin@example.test",
+        actor_ip: null,
+        actor_user_agent: null,
+        request_id: null,
+      },
+    );
+
+    expect(result.success).toBe(true);
+    expect(apiKeyCreateMock).toHaveBeenCalledTimes(1);
+    expect(mcpServersRepositoryMock.create).toHaveBeenCalledTimes(1);
   });
 });

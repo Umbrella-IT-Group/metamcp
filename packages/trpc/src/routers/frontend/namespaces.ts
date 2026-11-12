@@ -98,6 +98,7 @@ export const createNamespacesRouter = (
       input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
       userId: string,
       isAdmin: boolean,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>>;
   },
 ) => {
@@ -255,6 +256,7 @@ export const createNamespacesRouter = (
           input,
           ctx.user.id,
           ctx.user.role === "admin",
+          auditActor(ctx),
         );
       }),
   });

@@ -274,6 +274,8 @@ describe("namespaces.refreshTools — isAdmin reaches the implementation", () =>
       REFRESH_TOOLS_INPUT,
       "member-1",
       false,
+      // The audit actor, so an admin-plane key's refresh is attributed to it.
+      expect.objectContaining({ actor_id: "member-1" }),
     );
   });
 
@@ -286,6 +288,8 @@ describe("namespaces.refreshTools — isAdmin reaches the implementation", () =>
       REFRESH_TOOLS_INPUT,
       "admin-1",
       true,
+      // The audit actor, so an admin-plane key's refresh is attributed to it.
+      expect.objectContaining({ actor_id: "admin-1" }),
     );
   });
 
@@ -298,6 +302,8 @@ describe("namespaces.refreshTools — isAdmin reaches the implementation", () =>
       REFRESH_TOOLS_INPUT,
       "ghost-1",
       false,
+      // The audit actor, so an admin-plane key's refresh is attributed to it.
+      expect.objectContaining({ actor_id: "ghost-1" }),
     );
   });
 

@@ -524,6 +524,15 @@ export const apiKeysTable = pgTable(
     // control-plane key cannot reach the data plane and vice versa. NOT NULL
     // default false so the deploy is inert and no live key changes behaviour.
     admin_plane: boolean("admin_plane").notNull().default(false),
+    // Admin-plane scope (migration 0043): `sync` (what a CI credential holds:
+    // the configuration-sync procedures) or `operator` (adds the operator's
+    // tooling). Only meaningful when admin_plane is true; a data-plane key is
+    // always `sync` (CHECK). Every existing row is `sync`, so the deploy only
+    // removes reach. Set at creation by a human administrator and absent from
+    // every update schema and repository setter: no key can be promoted. The
+    // tRPC layer reads it only on the admin-plane bearer path and treats any
+    // value other than the literal `operator` as `sync`.
+    admin_plane_scope: text("admin_plane_scope").notNull().default("sync"),
     // IP allowlist (migration 0041). NULL = the key has no list of its own and
     // follows the GLOBAL policy (config rows API_KEY_IP_ALLOWED_CIDRS and
     // API_KEY_IP_POLICY_MODE). Non-NULL (even empty) = the key's own list, and
@@ -584,6 +593,16 @@ export const apiKeysTable = pgTable(
     check(
       "api_keys_ip_policy_mode_valid",
       sql`${table.ip_policy_mode} IN ('off', 'audit', 'enforce')`,
+    ),
+    // Admin-plane scope (migration 0043): a row cannot carry a scope the
+    // gateway does not know, and only an admin-plane key can be `operator`.
+    check(
+      "api_keys_admin_plane_scope_valid",
+      sql`${table.admin_plane_scope} IN ('sync', 'operator')`,
+    ),
+    check(
+      "api_keys_admin_plane_scope_requires_admin_plane",
+      sql`${table.admin_plane} = true OR ${table.admin_plane_scope} = 'sync'`,
     ),
   ],
 );
