@@ -52,5 +52,12 @@
   "retryRoleLoad": "다시 시도",
   "adminPlane": "관리 평면(컨트롤 플레인 / CI) 키",
   "adminPlaneDescription": "관리자 전용. CI 및 자동화를 위해 소유자로서 컨트롤 플레인(/trpc)에서 인증합니다. 데이터 평면에서는 거부됩니다. 엔드포인트 범위 및 대리 실행 ID와 상호 배타적이며, 관리자가 소유해야 합니다.",
-  "adminPlaneBadge": "컨트롤 플레인"
+  "adminPlaneBadge": "컨트롤 플레인",
+  "adminPlaneScope": "관리 평면 범위",
+  "adminPlaneScopeSync": "구성 동기화(CI)",
+  "adminPlaneScopeSyncDescription": "구성 동기화와 일일 드리프트 점검이 호출하는 항목만 허용합니다. 서버, 네임스페이스, 엔드포인트 조회와 서버 생성 및 수정입니다. 기본값이며 CI 자격 증명에 부여해야 하는 범위입니다.",
+  "adminPlaneScopeOperator": "운영자",
+  "adminPlaneScopeOperatorDescription": "구성 동기화 범위에 더해 운영 도구를 허용합니다. 키 목록 조회, 키 비활성화, IP 정책, 프로비저닝, 사용자, OAuth 클라이언트, 액세스 그룹의 읽기 전용 목록, 그리고 짧은 네트워크 목록으로 잠긴 데이터 평면 키 한 종류의 생성입니다. 관리 평면 키와 대리 실행 키는 만들 수 없습니다.",
+  "adminPlaneBadgeSync": "컨트롤 플레인: 구성 동기화",
+  "adminPlaneBadgeOperator": "컨트롤 플레인: 운영자"
 }

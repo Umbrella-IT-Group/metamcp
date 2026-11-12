@@ -75,6 +75,7 @@
   },
   "apiKeyAdminPlane": {
     "noScope": "An admin-plane (control-plane) key has no endpoint scope, clear the endpoint and all-endpoints selection",
-    "noActsAs": "An admin-plane (control-plane) key carries no acts-as identity, clear the acts-as user"
+    "noActsAs": "An admin-plane (control-plane) key carries no acts-as identity, clear the acts-as user",
+    "scopeNeedsAdminPlane": "An admin-plane scope only applies to an admin-plane key, tick the admin-plane option first"
   }
 }

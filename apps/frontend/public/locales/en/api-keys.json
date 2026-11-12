@@ -52,5 +52,12 @@
   "retryRoleLoad": "Retry",
   "adminPlane": "Admin-plane (control-plane / CI) key",
   "adminPlaneDescription": "Administrators only. Authenticates on the control plane (/trpc) as its owner, for CI and automation. Refused on the data plane. Mutually exclusive with endpoint scope and acts-as identity, and it must be owned by an administrator.",
-  "adminPlaneBadge": "Control plane"
+  "adminPlaneBadge": "Control plane",
+  "adminPlaneScope": "Admin-plane scope",
+  "adminPlaneScopeSync": "Config sync (CI)",
+  "adminPlaneScopeSyncDescription": "Only what configuration sync and the daily drift check call: server, namespace and endpoint reads and the server create and update. The default, and what a CI credential should hold.",
+  "adminPlaneScopeOperator": "Operator",
+  "adminPlaneScopeOperatorDescription": "Everything Config sync holds, plus the operator tooling: key inventory, deactivating a key, IP policies, provisioning, read-only lists of users, OAuth clients and access groups, and creating one narrow kind of data-plane key (locked to a short network list). Never admin-plane or acts-as keys.",
+  "adminPlaneBadgeSync": "Control plane: config sync",
+  "adminPlaneBadgeOperator": "Control plane: operator"
 }

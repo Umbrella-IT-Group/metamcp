@@ -1,6 +1,7 @@
 import { ConfigKey, ConfigKeyEnum } from "@repo/zod-types";
 
 import { configRepo } from "../db/repositories/config.repo";
+import type { DbExecutor, DbTransaction } from "../db/repositories/db-executor";
 import {
   type GlobalIpPolicy,
   type IpPolicyMode,
@@ -189,24 +190,32 @@ export const configService = {
    * already validated and canonicalised the list; both rows and the snapshots
    * used for the audit/readback share one serialized transaction.
    */
-  async setApiKeyIpPolicy(policy: {
-    mode: IpPolicyMode;
-    cidrs: string[];
-  }): Promise<{ before: GlobalIpPolicy; after: GlobalIpPolicy }> {
-    const snapshots = await configRepo.setConfigs([
-      {
-        id: ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE,
-        value: policy.mode,
-        description:
-          "Global API-key IP policy mode (off | audit | enforce) for keys with no allowed_cidrs of their own",
-      },
-      {
-        id: ConfigKeyEnum.enum.API_KEY_IP_ALLOWED_CIDRS,
-        value: JSON.stringify(policy.cidrs),
-        description:
-          "Global API-key IP allowlist (JSON array of CIDRs) for keys with no allowed_cidrs of their own",
-      },
-    ]);
+  async setApiKeyIpPolicy(
+    policy: {
+      mode: IpPolicyMode;
+      cidrs: string[];
+    },
+    // The caller's transaction when it holds one, so the write commits or rolls
+    // back with the audit row an admin-plane caller records beside it.
+    executor?: DbExecutor,
+  ): Promise<{ before: GlobalIpPolicy; after: GlobalIpPolicy }> {
+    const snapshots = await configRepo.setConfigs(
+      [
+        {
+          id: ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE,
+          value: policy.mode,
+          description:
+            "Global API-key IP policy mode (off | audit | enforce) for keys with no allowed_cidrs of their own",
+        },
+        {
+          id: ConfigKeyEnum.enum.API_KEY_IP_ALLOWED_CIDRS,
+          value: JSON.stringify(policy.cidrs),
+          description:
+            "Global API-key IP allowlist (JSON array of CIDRs) for keys with no allowed_cidrs of their own",
+        },
+      ],
+      executor,
+    );
     const parse = (rows: Array<{ id: string; value: string }>) =>
       parseStoredGlobalPolicy(
         rows.find((row) => row.id === ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE)
@@ -216,6 +225,26 @@ export const configService = {
         )?.value,
       );
     return { before: parse(snapshots.before), after: parse(snapshots.after) };
+  },
+
+  /**
+   * The global API-key IP policy as it will be in force when `tx` commits, read
+   * under the same shared advisory locks the writer takes (see
+   * `configRepo.getConfigsShared`). For the self-lockout rail only; request
+   * authentication keeps using `getApiKeyIpPolicy` above.
+   */
+  async getApiKeyIpPolicyInTransaction(
+    tx: DbTransaction,
+  ): Promise<GlobalIpPolicy & { problems: string[] }> {
+    const rows = await configRepo.getConfigsShared(tx, [
+      ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE,
+      ConfigKeyEnum.enum.API_KEY_IP_ALLOWED_CIDRS,
+    ]);
+    const value = (id: string) => rows.find((row) => row.id === id)?.value;
+    return parseStoredGlobalPolicy(
+      value(ConfigKeyEnum.enum.API_KEY_IP_POLICY_MODE),
+      value(ConfigKeyEnum.enum.API_KEY_IP_ALLOWED_CIDRS),
+    );
   },
 
   async getConfig(key: ConfigKey): Promise<string | undefined> {

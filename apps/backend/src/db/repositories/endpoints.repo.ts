@@ -8,10 +8,16 @@ import { and, desc, eq, isNull, or } from "drizzle-orm";
 
 import { db } from "../index";
 import { endpointsTable, namespacesTable } from "../schema";
+import type { DbExecutor } from "./db-executor";
 
 export class EndpointsRepository {
-  async create(input: EndpointCreateInput): Promise<DatabaseEndpoint> {
-    const [createdEndpoint] = await db
+  async create(
+    input: EndpointCreateInput,
+    // The caller's transaction when it holds one (an admin-plane write records
+    // its audit row in the same transaction). Omitted, the pool is used.
+    executor?: DbExecutor,
+  ): Promise<DatabaseEndpoint> {
+    const [createdEndpoint] = await (executor ?? db)
       .insert(endpointsTable)
       .values({
         name: input.name,
@@ -458,8 +464,11 @@ export class EndpointsRepository {
     return deletedEndpoint;
   }
 
-  async update(input: EndpointUpdateInput): Promise<DatabaseEndpoint> {
-    const [updatedEndpoint] = await db
+  async update(
+    input: EndpointUpdateInput,
+    executor?: DbExecutor,
+  ): Promise<DatabaseEndpoint> {
+    const [updatedEndpoint] = await (executor ?? db)
       .update(endpointsTable)
       .set({
         name: input.name,

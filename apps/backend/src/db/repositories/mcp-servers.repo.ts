@@ -16,6 +16,7 @@ import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { mcpServersTable } from "../schema";
+import type { DbExecutor } from "./db-executor";
 import {
   planServerUpdate,
   ServerCredentialRetentionError,
@@ -91,9 +92,14 @@ function handleDatabaseError(
 }
 
 export class McpServersRepository {
-  async create(input: McpServerCreateInput): Promise<DatabaseMcpServer> {
+  async create(
+    input: McpServerCreateInput,
+    // The caller's transaction when it holds one (an admin-plane write records
+    // its audit row in the same transaction). Omitted, the pool is used.
+    executor?: DbExecutor,
+  ): Promise<DatabaseMcpServer> {
     try {
-      const [createdServer] = await db
+      const [createdServer] = await (executor ?? db)
         .insert(mcpServersTable)
         .values(withEncryptedBearerToken(input))
         .returning();
@@ -205,8 +211,9 @@ export class McpServersRepository {
    */
   async update(
     input: McpServerUpdateInput,
+    executor?: DbExecutor,
   ): Promise<DatabaseMcpServer | undefined> {
-    return (await this.updateReportingChange(input))?.server;
+    return (await this.updateReportingChange(input, executor))?.server;
   }
 
   /**
@@ -217,7 +224,13 @@ export class McpServersRepository {
    * make the answer stale. The caller uses it to retire pooled connections
    * still built from the old values.
    */
-  async updateReportingChange(input: McpServerUpdateInput): Promise<
+  async updateReportingChange(
+    input: McpServerUpdateInput,
+    // The caller's transaction when it holds one; the inner transaction is then
+    // a savepoint of it, and the row lock below is held until the outer
+    // transaction ends.
+    executor?: DbExecutor,
+  ): Promise<
     | {
         server: DatabaseMcpServer;
         destinationOrCredentialChanged: boolean;
@@ -227,7 +240,7 @@ export class McpServersRepository {
     const { uuid, ...updateData } = input;
 
     try {
-      return await db.transaction(async (tx) => {
+      return await (executor ?? db).transaction(async (tx) => {
         const [current] = await tx
           .select({
             type: mcpServersTable.type,

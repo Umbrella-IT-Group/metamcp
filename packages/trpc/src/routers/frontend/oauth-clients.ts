@@ -73,7 +73,7 @@ export const createOAuthClientsRouter = (implementations: {
       }),
 
     // Admin only: approve or reject a pending self-registered client. Not on
-    // ADMIN_PLANE_ALLOWED_PROCEDURES, so a CI (admin-plane) key cannot decide
+    // either admin-plane procedure set, so an admin-plane key cannot decide
     // which clients people may authorize; only an administrator's own session
     // can. The deciding administrator comes from the session, never the input.
     approve: adminProcedure

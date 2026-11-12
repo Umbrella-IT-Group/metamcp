@@ -25,9 +25,9 @@ import { isDcrLoopbackRedirectUri } from "../routers/oauth/utils";
  * The authenticated administrator a decision is attributed to.
  *
  * From the tRPC context only (auditActor), never from the request body. An
- * admin-plane (CI) key never reaches the decision procedures (they are not on
- * ADMIN_PLANE_ALLOWED_PROCEDURES); refusing one here as well keeps a future
- * allowlist edit from letting a CI credential approve clients unnoticed.
+ * admin-plane key never reaches the decision procedures (they are on neither
+ * admin-plane procedure set); refusing one here as well keeps a future set
+ * edit from letting a key approve clients unnoticed.
  */
 function decidingAdministrator(actor: AuditActor | undefined): string {
   if (!actor?.actor_id || actor.admin_plane) {

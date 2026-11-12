@@ -307,15 +307,22 @@ on is a sequence, and step 4 has a hard gate:
    without a working SSO sign-in the flip locks everyone out. The flip is
    itself audited (`config.basic_auth_disabled.set`).
 
-What an admin-plane key may call: only the configuration-sync procedures
-listed in `ADMIN_PLANE_ALLOWED_PROCEDURES` (`packages/trpc/src/trpc.ts`), which
-are exactly what `metamcp/sync/{sync_config,dump_config,admin_cli}.py` call in
-Umbrella-MCP-Server. Every other procedure answers FORBIDDEN for such a key,
-including minting or editing API keys, users, access groups, OAuth clients
-and auth settings; do those from an administrator's browser session. A new
-call in the sync tooling must be added to that list in the same change, or it
-fails with FORBIDDEN. Admin events from the key record `actor_type`
-`api_key` with the key's uuid, and the owner under `detail.admin_plane`.
+What an admin-plane key may call depends on its scope, fixed when an
+administrator creates it (migration 0043). A `sync` key (the default, what CI
+holds) may call exactly the 10 procedures in `ADMIN_PLANE_SYNC_PROCEDURES`
+(`packages/trpc/src/trpc.ts`), which are what `metamcp/sync/{sync_config,dump_config}.py`
+call in Umbrella-MCP-Server. An `operator` key may call those plus 16 more
+(`ADMIN_PLANE_OPERATOR_PROCEDURES`, what `admin_cli.py` calls and four read-only
+lists), including `apiKeys.deactivate` and `apiKeys.create`, whose
+implementation only creates a locked data-plane key under fixed rules (see the
+README's "Admin-plane API keys"). Every other procedure answers FORBIDDEN for
+either scope, including editing or deleting keys, users, access groups, OAuth
+clients and auth settings; do those from an administrator's browser session.
+A new call in the sync tooling must be added to the right list in the same
+change, or it fails with FORBIDDEN. Admin events from the key record
+`actor_type` `api_key` with the key's uuid, and the owner and scope under
+`detail.admin_plane`; each such change writes its audit row in its own
+transaction.
 
 Rollback at any step: leave `DISABLE_BASIC_AUTH` false so humans keep password
 login, and deactivate the admin-plane key to revoke it instantly.

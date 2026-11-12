@@ -1,13 +1,16 @@
 /**
- * An admin-plane (CI) API key on the real /trpc stack, against a REAL
- * Postgres: the real router module (routers/trpc.ts, with its CORS, rate-limit
+ * An admin-plane API key of each scope (migration 0043) on the real /trpc
+ * stack, against a REAL Postgres: the real router module (routers/trpc.ts, with its CORS, rate-limit
  * and admin-key middleware), the real createContext and bearer resolver, the
  * real implementations and repositories, and the real audit writer.
  *
- * It runs the configuration round trip the sync tooling performs (list, create,
- * read back, update, tool listing, IP policies, timeouts) with the bearer
- * alone, and shows that the same bearer is refused everything outside that
- * surface, while an administrator's browser session keeps it. Only the MCP
+ * It runs the configuration round trip the tooling performs (list, create,
+ * read back, update, tool listing, IP policies, timeouts) with the OPERATOR
+ * bearer alone, the sync subset of it with the SYNC bearer (what CI holds),
+ * and shows that each bearer is refused everything outside its scope, while an
+ * administrator's browser session keeps its whole surface. Every admin-plane
+ * mutation is audited in its own transaction (see
+ * admin-write.integration.test.ts for the failure behaviour). Only the MCP
  * connection pools are stubbed: creating a server must not dial it.
  *
  * Opt-in via TEST_DATABASE_URL, pointed at a disposable, migrated database:
@@ -72,8 +75,11 @@ describeIfDb(
     let eq: typeof import("drizzle-orm").eq;
     let ownerId = "";
     let otherId = "";
+    // A sync-scope key (what CI holds) and an operator-scope key.
     let ciKey = "";
     let ciKeyUuid = "";
+    let operatorKey = "";
+    let operatorKeyUuid = "";
     let dataKeyUuid = "";
     let ipCounter = 0;
 
@@ -83,7 +89,9 @@ describeIfDb(
       procedure: string,
       input: unknown,
       kind: "query" | "mutation",
-      headers: Record<string, string> = { authorization: `Bearer ${ciKey}` },
+      headers: Record<string, string> = {
+        authorization: `Bearer ${operatorKey}`,
+      },
     ): Promise<TrpcReply> {
       const url =
         kind === "query"
@@ -182,10 +190,20 @@ describeIfDb(
         name: "itest ci admin plane",
         user_id: ownerId,
         admin_plane: true,
+        // No scope given: it persists as the narrow `sync` default.
         is_active: true,
       });
       ciKey = ci.key;
       ciKeyUuid = ci.uuid;
+      const operator = await repo.create({
+        name: "itest operator admin plane",
+        user_id: ownerId,
+        admin_plane: true,
+        admin_plane_scope: "operator",
+        is_active: true,
+      });
+      operatorKey = operator.key;
+      operatorKeyUuid = operator.uuid;
       const data = await repo.create({
         name: "itest data plane",
         user_id: ownerId,
@@ -226,7 +244,7 @@ describeIfDb(
       await suiteLock?.end();
     });
 
-    it("runs the configuration round trip with the bearer alone", async () => {
+    it("runs the configuration round trip with the operator bearer alone", async () => {
       // Reads the dump tooling performs.
       for (const procedure of [
         "frontend.mcpServers.list",
@@ -380,7 +398,8 @@ describeIfDb(
         ).status,
       ).toBe(200);
 
-      // The persisted admin event names the key, with the owner beside it.
+      // The persisted admin event names the key, with the owner and the
+      // verified scope beside it.
       const rows = await auditRows(
         `action = 'namespace.create' AND target_id = $1`,
         [namespaceUuid],
@@ -388,15 +407,114 @@ describeIfDb(
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         actor_type: "api_key",
-        actor_id: ciKeyUuid,
+        actor_id: operatorKeyUuid,
         outcome: "success",
         detail: expect.objectContaining({
-          admin_plane: { key_uuid: ciKeyUuid, owner_user_id: ownerId },
+          admin_plane: {
+            key_uuid: operatorKeyUuid,
+            owner_user_id: ownerId,
+            scope: "operator",
+          },
         }),
       });
     });
 
-    it.each([
+    it("lets a sync-scope key reach exactly what config sync calls, and records its scope", async () => {
+      const syncHeaders = { authorization: `Bearer ${ciKey}` };
+      for (const procedure of [
+        "frontend.mcpServers.list",
+        "frontend.namespaces.list",
+        "frontend.endpoints.list",
+        "frontend.config.getMcpTimeout",
+        "frontend.config.getMcpMaxTotalTimeout",
+      ]) {
+        const reply = await trpc(procedure, undefined, "query", syncHeaders);
+        expect({ procedure, status: reply.status }).toEqual({
+          procedure,
+          status: 200,
+        });
+      }
+      const syncServer = `itest-srv-${RUN}-sync`;
+      const created = await trpc(
+        "frontend.mcpServers.create",
+        {
+          name: syncServer,
+          type: "STREAMABLE_HTTP",
+          url: "http://127.0.0.1:9/mcp",
+        },
+        "mutation",
+        syncHeaders,
+      );
+      expect(created.status).toBe(200);
+      expect(created.data).toMatchObject({ success: true });
+      const serverUuid = (created.data as { data: { uuid: string } }).data.uuid;
+
+      // Its audit row came from the key's own transaction and carries the scope.
+      const rows = await auditRows(
+        `action = 'mcpserver.create' AND target_id = $1`,
+        [serverUuid],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        actor_type: "api_key",
+        actor_id: ciKeyUuid,
+        detail: expect.objectContaining({
+          admin_plane: {
+            key_uuid: ciKeyUuid,
+            owner_user_id: ownerId,
+            scope: "sync",
+          },
+        }),
+      });
+      await db
+        .delete(schema.mcpServersTable)
+        .where(eq(schema.mcpServersTable.name, syncServer));
+    });
+
+    it("records each accepted request's scope on its authn.admin_key.accepted row", async () => {
+      await trpc("frontend.mcpServers.list", undefined, "query");
+      const rows = await auditRows(
+        `action = 'authn.admin_key.accepted' AND actor_id = $1`,
+        [operatorKeyUuid],
+      );
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      expect(rows[0].detail).toMatchObject({
+        admin_plane: { key_uuid: operatorKeyUuid, scope: "operator" },
+      });
+    });
+
+    it("lists the scope of every key, and a plain data-plane key reads sync", async () => {
+      const reply = await trpc("frontend.apiKeys.listAll", undefined, "query");
+      expect(reply.status).toBe(200);
+      const items = (
+        reply.data as {
+          apiKeys: Array<{
+            uuid: string;
+            admin_plane: boolean;
+            admin_plane_scope: string;
+          }>;
+        }
+      ).apiKeys;
+      const byUuid = new Map(items.map((item) => [item.uuid, item]));
+      expect(byUuid.get(operatorKeyUuid)).toMatchObject({
+        admin_plane: true,
+        admin_plane_scope: "operator",
+      });
+      expect(byUuid.get(ciKeyUuid)).toMatchObject({
+        admin_plane: true,
+        admin_plane_scope: "sync",
+      });
+      expect(byUuid.get(dataKeyUuid)).toMatchObject({
+        admin_plane: false,
+        admin_plane_scope: "sync",
+      });
+    });
+
+    // [label, procedure, input, kind, also refused to the OPERATOR scope].
+    // A sync key is refused every row; the operator holds the first four
+    // procedures' reads and the create path (whose rules are pinned in
+    // api-key-mint.integration.test.ts), so only the rows below it stay refused.
+    const REFUSALS = [
       [
         "an acts-as key for another user",
         "frontend.apiKeys.create",
@@ -407,6 +525,7 @@ describeIfDb(
           all_endpoints: true,
         }),
         "mutation",
+        false,
       ],
       [
         "another admin-plane key",
@@ -416,65 +535,119 @@ describeIfDb(
           admin_plane: true,
         }),
         "mutation",
+        false,
       ],
       [
         "the user list",
         "frontend.users.list",
         (): unknown => undefined,
         "query",
+        false,
       ],
       [
         "an account disable",
         "frontend.users.setDisabled",
         (): unknown => ({ user_id: otherId, disabled: true }),
         "mutation",
+        true,
       ],
       [
         "access groups",
         "frontend.accessGroups.list",
         (): unknown => undefined,
         "query",
+        false,
       ],
       [
         "an auth setting",
         "frontend.config.setSignupDisabled",
         (): unknown => ({ disabled: false }),
         "mutation",
+        true,
       ],
       [
         "OAuth client admin",
         "frontend.oauthClients.list",
         (): unknown => undefined,
         "query",
+        false,
+      ],
+      [
+        "a key update",
+        "frontend.apiKeys.update",
+        (): unknown => ({ uuid: dataKeyUuid, is_active: true }),
+        "mutation",
+        true,
+      ],
+      [
+        "a key delete",
+        "frontend.apiKeys.delete",
+        (): unknown => ({ uuid: dataKeyUuid }),
+        "mutation",
+        true,
       ],
       [
         "a public read outside the list",
         "frontend.config.getSignupDisabled",
         (): unknown => undefined,
         "query",
+        true,
       ],
-    ] as const)(
-      "refuses %s with 403",
+    ] as const;
+
+    async function expectStandingRefusal(
+      who: { key: string; uuid: string; scope: "sync" | "operator" },
+      procedure: string,
+      input: unknown,
+      kind: "query" | "mutation",
+    ) {
+      const keysBefore = await db.select().from(schema.apiKeysTable);
+
+      const reply = await trpc(procedure, input, kind, {
+        authorization: `Bearer ${who.key}`,
+      });
+
+      expect(reply.status).toBe(403);
+      expect(reply.code).toBe("FORBIDDEN");
+      expect(reply.message).toBe(
+        "This procedure is not available to an admin-plane API key.",
+      );
+      // Nothing was minted or changed on the way out.
+      expect(await db.select().from(schema.apiKeysTable)).toHaveLength(
+        keysBefore.length,
+      );
+      const denied = await auditRows(
+        `action = 'rbac.denied' AND target_id = $1 AND actor_id = $2`,
+        [procedure, who.uuid],
+      );
+      expect(denied.length).toBeGreaterThanOrEqual(1);
+      expect(denied[0]).toMatchObject({ actor_type: "api_key" });
+      expect(denied[0].detail).toMatchObject({
+        admin_plane: { key_uuid: who.uuid, scope: who.scope },
+      });
+    }
+
+    it.each(REFUSALS)(
+      "refuses %s to a sync-scope key with 403",
       async (_label, procedure, input, kind) => {
-        const keysBefore = await db.select().from(schema.apiKeysTable);
+        await expectStandingRefusal(
+          { key: ciKey, uuid: ciKeyUuid, scope: "sync" },
+          procedure,
+          input(),
+          kind,
+        );
+      },
+    );
 
-        const reply = await trpc(procedure, input(), kind);
-
-        expect(reply.status).toBe(403);
-        expect(reply.code).toBe("FORBIDDEN");
-        expect(reply.message).toBe(
-          "This procedure is not available to an admin-plane API key.",
+    it.each(REFUSALS.filter((row) => row[4]))(
+      "refuses %s to an operator-scope key with 403",
+      async (_label, procedure, input, kind) => {
+        await expectStandingRefusal(
+          { key: operatorKey, uuid: operatorKeyUuid, scope: "operator" },
+          procedure,
+          input(),
+          kind,
         );
-        // Nothing was minted on the way out.
-        expect(await db.select().from(schema.apiKeysTable)).toHaveLength(
-          keysBefore.length,
-        );
-        const denied = await auditRows(
-          `action = 'rbac.denied' AND target_id = $1 AND actor_id = $2`,
-          [procedure, ciKeyUuid],
-        );
-        expect(denied.length).toBeGreaterThanOrEqual(1);
-        expect(denied[0]).toMatchObject({ actor_type: "api_key" });
       },
     );
 

@@ -1,6 +1,8 @@
 import {
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
+  DeactivateApiKeyRequestSchema,
+  DeactivateApiKeyResponseSchema,
   DeleteApiKeyRequestSchema,
   DeleteApiKeyResponseSchema,
   GetGlobalIpPolicyResponseSchema,
@@ -15,9 +17,12 @@ import {
   ValidateApiKeyRequestSchema,
   ValidateApiKeyResponseSchema,
 } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import {
+  ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  adminPlaneOrigin,
   adminProcedure,
   type AuditActor,
   auditActor,
@@ -46,6 +51,10 @@ export const createApiKeysRouter = (implementations: {
     isAdmin: boolean,
     actor: AuditActor,
   ) => Promise<z.infer<typeof DeleteApiKeyResponseSchema>>;
+  deactivate: (
+    input: z.infer<typeof DeactivateApiKeyRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof DeactivateApiKeyResponseSchema>>;
   validate: (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
   ) => Promise<z.infer<typeof ValidateApiKeyResponseSchema>>;
@@ -76,15 +85,30 @@ export const createApiKeysRouter = (implementations: {
     // role to return precise FORBIDDEN/BAD_REQUEST messages. Swapping to
     // adminProcedure would coarsen those into a generic gate; the RBAC lives
     // in the impl, which this passes `ctx.user.role === "admin"` into.
+    //
+    // An operator-scope admin-plane key reaches this procedure (it is on that
+    // scope's set only) and the implementation then takes its agent-mint branch,
+    // which creates one narrow kind of data-plane key and nothing else. The
+    // branch is chosen from the origin the backend verified, carried in the
+    // actor bundle below; the check right after is belt and braces: if an
+    // admin-plane origin ever failed to reach the bundle, this must refuse
+    // rather than fall through to the human branch, which can mint anything.
     create: protectedProcedure
       .input(CreateApiKeyRequestSchema)
       .output(CreateApiKeyResponseSchema)
       .mutation(async ({ input, ctx }) => {
+        const actor = auditActor(ctx);
+        if (adminPlaneOrigin(ctx) && !actor.admin_plane) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: ADMIN_PLANE_FORBIDDEN_MESSAGE,
+          });
+        }
         return implementations.create(
           input,
           ctx.user.id,
           ctx.user.role === "admin",
-          auditActor(ctx),
+          actor,
         );
       }),
 
@@ -128,6 +152,18 @@ export const createApiKeysRouter = (implementations: {
           ctx.user.role === "admin",
           auditActor(ctx),
         );
+      }),
+
+    // Admin only: deactivate one key (containment). Input is the uuid alone: it
+    // cannot rename, re-activate or delete, it refuses the key that is calling,
+    // and re-activation stays an administrator's act in the admin UI. On an
+    // operator-scope admin-plane key's set; the state change and its audit row
+    // are one transaction (see the implementation).
+    deactivate: adminProcedure
+      .input(DeactivateApiKeyRequestSchema)
+      .output(DeactivateApiKeyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.deactivate(input, auditActor(ctx));
       }),
 
     validate: protectedProcedure

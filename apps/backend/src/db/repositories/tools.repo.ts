@@ -7,6 +7,7 @@ import { and, eq, inArray, notExists, notInArray, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import { namespaceToolMappingsTable, toolsTable } from "../schema";
+import type { DbExecutor } from "./db-executor";
 
 /** The rows an upsert writes, one per listed tool. */
 function toolRows(input: ToolUpsertInput) {
@@ -51,13 +52,18 @@ export class ToolsRepository {
     return createdTool;
   }
 
-  async bulkUpsert(input: ToolUpsertInput): Promise<DatabaseTool[]> {
+  async bulkUpsert(
+    input: ToolUpsertInput,
+    // The caller's transaction when it holds one (an admin-plane write records
+    // its audit row in the same transaction). Omitted, the pool is used.
+    executor?: DbExecutor,
+  ): Promise<DatabaseTool[]> {
     if (!input.tools || input.tools.length === 0) {
       return [];
     }
 
     // Batch insert all tools with upsert
-    return await db
+    return await (executor ?? db)
       .insert(toolsTable)
       .values(toolRows(input))
       .onConflictDoUpdate(upsertOnConflict())

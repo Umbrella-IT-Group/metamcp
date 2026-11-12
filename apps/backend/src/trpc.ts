@@ -71,7 +71,7 @@ export const createContext = async ({
   let user: User | undefined;
   let session: Session | undefined;
   // Set ONLY from the admin-plane resolver's verified key below. Its presence
-  // is what confines the request to the configuration-sync procedures; it is
+  // is what confines the request to the procedures of the key's scope; it is
   // never derived from a request field, the synthetic session's id, or the
   // mere presence of an Authorization header.
   let authOrigin: AdminPlaneAuthOrigin | undefined;
@@ -185,6 +185,9 @@ export const createContext = async ({
               kind: "admin_plane",
               key_uuid: resolved.keyUuid,
               owner_user_id: resolved.user.id,
+              // The key row's scope as the resolver verified it, normalised so
+              // that anything but the literal `operator` is `sync`.
+              scope: resolved.scope === "operator" ? "operator" : "sync",
             };
           }
         }
@@ -284,7 +287,7 @@ export const router = t.router;
 
 // The same admin-plane scope check the @repo/trpc builders apply, so a
 // procedure built from this instance cannot give an admin-plane key more than
-// the configuration-sync surface either. No router is built from these today;
+// its scope's surface either. No router is built from these today;
 // the check is here so that stays true if one ever is.
 const scopedProcedure = t.procedure.use(({ ctx, next, path, type }) => {
   assertAdminPlaneProcedureAllowed(ctx, path, type);

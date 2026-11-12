@@ -42,6 +42,28 @@ const { loggerMock } = vi.hoisted(() => ({
 
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
+// An admin-plane key's writes record their audit row through the change's own
+// transaction (lib/audit/admin-write.ts), awaited, instead of through emit().
+// A stand-in transaction hands that insert to the same capture the emitter's
+// sink feeds, so the row's shape is asserted the same way on both paths. The
+// real transaction, and what happens when its insert fails, are covered
+// against Postgres in admin-write.integration.test.ts and
+// api-key-mint.integration.test.ts.
+const { txAudit } = vi.hoisted(() => ({
+  txAudit: { sink: null as null | ((event: unknown) => void) },
+}));
+vi.mock("../db/index", () => ({
+  db: {
+    transaction: async (callback: (tx: object) => Promise<unknown>) =>
+      callback({}),
+  },
+}));
+vi.mock("../db/repositories/audit-log-tx", () => ({
+  recordAuditInTransaction: vi.fn(async (_tx: unknown, event: unknown) => {
+    txAudit.sink?.(event);
+  }),
+}));
+
 // ---------------------------------------------------------------------------
 // Repository / service doubles — the layer under the impls
 // ---------------------------------------------------------------------------
@@ -227,6 +249,7 @@ const usersRouter = () => createUsersRouter(usersImplementations);
 beforeEach(() => {
   vi.clearAllMocks();
   rows = [];
+  txAudit.sink = (event) => rows.push(event as AuditRow);
   setAuditSinkForTesting(async (event) => {
     rows.push(event as AuditRow);
   });
@@ -1227,7 +1250,13 @@ describe("an admin-plane (CI) key's mutation is attributed to the key", () => {
     });
     expect(created[0]?.detail).toMatchObject({
       name: "synced-backend",
-      admin_plane: { key_uuid: KEY_UUID, owner_user_id: "admin-1" },
+      // The verified scope rides with the key (migration 0043); this request's
+      // origin carries none, which reads as the narrow `sync`.
+      admin_plane: {
+        key_uuid: KEY_UUID,
+        owner_user_id: "admin-1",
+        scope: "sync",
+      },
     });
   });
 

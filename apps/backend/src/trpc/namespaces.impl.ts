@@ -32,6 +32,7 @@ import {
 } from "../db/repositories";
 import { NamespacesSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { withAdminAudit } from "../lib/audit/admin-write";
 import { clearFilterCache } from "../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   clearOverrideCache,
@@ -91,12 +92,32 @@ export const namespacesImplementations = {
         }
       }
 
-      const result = await namespacesRepository.create({
-        name: input.name,
-        description: input.description,
-        mcpServerUuids: input.mcpServerUuids,
-        user_id: effectiveUserId,
-      });
+      // For an admin-plane key the namespace rows and their audit row are one
+      // transaction (an audit failure fails the create); for everyone else the
+      // event is emitted best-effort right after the write.
+      const result = await withAdminAudit(
+        actor,
+        (...tx) =>
+          namespacesRepository.create(
+            {
+              name: input.name,
+              description: input.description,
+              mcpServerUuids: input.mcpServerUuids,
+              user_id: effectiveUserId,
+            },
+            ...tx,
+          ),
+        (created) => ({
+          action: "namespace.create",
+          target_type: "namespace",
+          target_id: created.uuid,
+          detail: {
+            name: created.name,
+            owner_user_id: effectiveUserId,
+            mcp_server_count: input.mcpServerUuids?.length ?? 0,
+          },
+        }),
+      );
 
       // Ensure idle MetaMCP server exists for the new namespace to improve performance
       // Run this asynchronously to avoid blocking the response
@@ -114,17 +135,6 @@ export const namespacesImplementations = {
           );
           // Don't fail the entire create operation if idle server creation fails
         });
-
-      emitAdminEvent(actor, {
-        action: "namespace.create",
-        target_type: "namespace",
-        target_id: result.uuid,
-        detail: {
-          name: result.name,
-          owner_user_id: effectiveUserId,
-          mcp_server_count: input.mcpServerUuids?.length ?? 0,
-        },
-      });
 
       return {
         success: true as const,
@@ -432,13 +442,32 @@ export const namespacesImplementations = {
         }
       }
 
-      const result = await namespacesRepository.update({
-        uuid: input.uuid,
-        name: input.name,
-        description: input.description,
-        user_id: input.user_id,
-        mcpServerUuids: input.mcpServerUuids,
-      });
+      // For an admin-plane key the namespace rows and their audit row are one
+      // transaction; for everyone else the event is emitted best-effort right
+      // after the write.
+      const result = await withAdminAudit(
+        actor,
+        (...tx) =>
+          namespacesRepository.update(
+            {
+              uuid: input.uuid,
+              name: input.name,
+              description: input.description,
+              user_id: input.user_id,
+              mcpServerUuids: input.mcpServerUuids,
+            },
+            ...tx,
+          ),
+        (updated) => ({
+          action: "namespace.update",
+          target_type: "namespace",
+          target_id: updated.uuid,
+          detail: {
+            name: updated.name,
+            mcp_server_count: input.mcpServerUuids?.length ?? 0,
+          },
+        }),
+      );
 
       // Invalidate idle MetaMCP server for this namespace since the MCP servers list may have changed
       // Run this asynchronously to avoid blocking the response
@@ -478,16 +507,6 @@ export const namespacesImplementations = {
       logger.info(
         `Cleared tool overrides cache for updated namespace ${input.uuid}`,
       );
-
-      emitAdminEvent(actor, {
-        action: "namespace.update",
-        target_type: "namespace",
-        target_id: result.uuid,
-        detail: {
-          name: result.name,
-          mcp_server_count: input.mcpServerUuids?.length ?? 0,
-        },
-      });
 
       return {
         success: true as const,
@@ -636,13 +655,34 @@ export const namespacesImplementations = {
         };
       }
 
-      const updatedMapping = await namespaceMappingsRepository.updateToolStatus(
-        {
-          namespaceUuid: input.namespaceUuid,
-          toolUuid: input.toolUuid,
-          serverUuid: input.serverUuid,
-          status: input.status,
-        },
+      // For an admin-plane key the mapping write and its audit row are one
+      // transaction; for everyone else the event is emitted best-effort right
+      // after the write. No row is recorded when no mapping matched.
+      const updatedMapping = await withAdminAudit(
+        actor,
+        (...tx) =>
+          namespaceMappingsRepository.updateToolStatus(
+            {
+              namespaceUuid: input.namespaceUuid,
+              toolUuid: input.toolUuid,
+              serverUuid: input.serverUuid,
+              status: input.status,
+            },
+            ...tx,
+          ),
+        (mapping) =>
+          mapping
+            ? {
+                action: "namespace.tool_status",
+                target_type: "namespace",
+                target_id: input.namespaceUuid,
+                detail: {
+                  tool_uuid: input.toolUuid,
+                  server_uuid: input.serverUuid,
+                  status: input.status,
+                },
+              }
+            : null,
       );
 
       if (!updatedMapping) {
@@ -651,17 +691,6 @@ export const namespacesImplementations = {
           message: "Tool not found in namespace",
         };
       }
-
-      emitAdminEvent(actor, {
-        action: "namespace.tool_status",
-        target_type: "namespace",
-        target_id: input.namespaceUuid,
-        detail: {
-          tool_uuid: input.toolUuid,
-          server_uuid: input.serverUuid,
-          status: input.status,
-        },
-      });
 
       return {
         success: true as const,
@@ -838,6 +867,7 @@ export const namespacesImplementations = {
     input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
     userId: string,
     isAdmin: boolean,
+    actor?: AuditActor,
   ): Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>> => {
     try {
       // First, check if user has permission to refresh tools for this namespace
@@ -1040,56 +1070,88 @@ export const namespacesImplementations = {
         };
       }
 
-      let totalToolsCreated = 0;
-      let totalMappingsCreated = 0;
-      // The policy the mapping writes followed, as each write read it under
-      // its own lock (see bulkUpsertNamespaceToolMappings).
-      let allowlistWrite = false;
+      // Every server's tools and mappings are written together. For an admin-
+      // plane key they share ONE transaction with the audit row (an audit
+      // failure rolls the whole refresh back, so a refresh is never half
+      // applied or unrecorded); for everyone else each repository call is its
+      // own transaction, as it always was, and the event is emitted
+      // best-effort once the writes are done. The row names counts and ids, no
+      // tool schema or description.
+      const refreshed = await withAdminAudit(
+        actor,
+        async (...tx) => {
+          let toolsCreated = 0;
+          let mappingsCreated = 0;
+          // The policy the mapping writes followed, as each write read it under
+          // its own lock (see bulkUpsertNamespaceToolMappings).
+          let allowlist = false;
 
-      // Process tools for each server
-      for (const [serverName, serverData] of Object.entries(
-        toolsByServerName,
-      )) {
-        const { serverUuid, tools } = serverData;
+          // Process tools for each server
+          for (const [serverName, serverData] of Object.entries(
+            toolsByServerName,
+          )) {
+            const { serverUuid, tools } = serverData;
 
-        // Bulk upsert tools to the tools table with the actual tool names
-        const upsertedTools = await toolsRepository.bulkUpsert({
-          mcpServerUuid: serverUuid,
-          tools: tools.map((tool) => ({
-            name: tool.toolName, // Use the actual tool name, not the prefixed name
-            description: tool.description,
-            inputSchema: tool.inputSchema,
-          })),
-        });
+            // Bulk upsert tools to the tools table with the actual tool names
+            const upsertedTools = await toolsRepository.bulkUpsert(
+              {
+                mcpServerUuid: serverUuid,
+                tools: tools.map((tool) => ({
+                  name: tool.toolName, // Use the actual tool name, not the prefixed name
+                  description: tool.description,
+                  inputSchema: tool.inputSchema,
+                })),
+              },
+              ...tx,
+            );
 
-        totalToolsCreated += upsertedTools.length;
+            toolsCreated += upsertedTools.length;
 
-        // Create namespace tool mappings. ACTIVE is what a refresh asks for;
-        // in an `allowlist` namespace the repository creates new rows
-        // INACTIVE instead and leaves existing rows' status alone, so a
-        // refresh never allowlists a tool (the platform's admin CLI runs one
-        // during provisioning).
-        const toolMappings = upsertedTools.map((tool) => ({
-          toolUuid: tool.uuid,
-          serverUuid: serverUuid,
-          status: "ACTIVE" as const,
-        }));
+            // Create namespace tool mappings. ACTIVE is what a refresh asks
+            // for; in an `allowlist` namespace the repository creates new rows
+            // INACTIVE instead and leaves existing rows' status alone, so a
+            // refresh never allowlists a tool (the platform's admin CLI runs
+            // one during provisioning).
+            const toolMappings = upsertedTools.map((tool) => ({
+              toolUuid: tool.uuid,
+              serverUuid: serverUuid,
+              status: "ACTIVE" as const,
+            }));
 
-        const { mappings: createdMappings, toolPolicy } =
-          await namespaceMappingsRepository.bulkUpsertNamespaceToolMappings({
-            namespaceUuid: input.namespaceUuid,
-            toolMappings,
-          });
+            const { mappings: createdMappings, toolPolicy } =
+              await namespaceMappingsRepository.bulkUpsertNamespaceToolMappings(
+                {
+                  namespaceUuid: input.namespaceUuid,
+                  toolMappings,
+                },
+                ...tx,
+              );
 
-        totalMappingsCreated += createdMappings.length;
-        if (toolPolicy !== undefined && toolPolicy !== "allow_all") {
-          allowlistWrite = true;
-        }
+            mappingsCreated += createdMappings.length;
+            if (toolPolicy !== undefined && toolPolicy !== "allow_all") {
+              allowlist = true;
+            }
 
-        logger.info(
-          `Processed ${tools.length} tools for server "${serverName}" (${serverUuid})`,
-        );
-      }
+            logger.info(
+              `Processed ${tools.length} tools for server "${serverName}" (${serverUuid})`,
+            );
+          }
+          return { toolsCreated, mappingsCreated, allowlist };
+        },
+        (written) => ({
+          action: "namespace.refresh_tools",
+          target_type: "namespace",
+          target_id: input.namespaceUuid,
+          detail: {
+            server_count: Object.keys(toolsByServerName).length,
+            tools_written: written.toolsCreated,
+            mappings_written: written.mappingsCreated,
+          },
+        }),
+      );
+      const totalToolsCreated = refreshed.toolsCreated;
+      const totalMappingsCreated = refreshed.mappingsCreated;
+      const allowlistWrite = refreshed.allowlist;
 
       // Invalidate idle MetaMCP server for this namespace since tools were refreshed
       // Run this asynchronously to avoid blocking the response

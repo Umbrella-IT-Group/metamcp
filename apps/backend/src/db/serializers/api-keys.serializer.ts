@@ -1,5 +1,12 @@
 import { readMode } from "../../lib/api-key-ip-policy";
 
+// The scope a stored value reads as. Only the literal `operator` is operator;
+// the CHECK keeps anything else out of the table, and this is the output
+// boundary for a row that was written around it.
+function readScope(raw: string): "sync" | "operator" {
+  return raw === "operator" ? "operator" : "sync";
+}
+
 export class ApiKeysSerializer {
   // The one display rule every key surface shares, so they can never drift
   // apart into "one of them still leaks". Since migration 0034 the key is not
@@ -116,6 +123,7 @@ export class ApiKeysSerializer {
       acts_as_email: string | null;
       owner_email: string | null;
       admin_plane: boolean;
+      admin_plane_scope: string;
       allowed_cidrs: string[] | null;
       ip_policy_mode: string;
       last_used_ip: string | null;
@@ -133,6 +141,10 @@ export class ApiKeysSerializer {
       // Plane flag (migration 0038): a boolean, never credential material, so
       // it is safe in a list. Labels a control-plane key in the admin view.
       admin_plane: apiKey.admin_plane,
+      // Scope (migration 0043), read the way the gateway reads it: anything but
+      // the literal `operator` is `sync`, so a value outside the CHECK (written
+      // outside the app) is never shown as the wider scope.
+      admin_plane_scope: readScope(apiKey.admin_plane_scope),
       created_at: apiKey.created_at,
       last_used_at: apiKey.last_used_at,
       is_active: apiKey.is_active,
@@ -143,6 +155,26 @@ export class ApiKeysSerializer {
       ip_policy_mode: readMode(apiKey.ip_policy_mode),
       last_used_ip: apiKey.last_used_ip,
     }));
+  }
+
+  // Readback for apiKeys.deactivate: the identifying fields and whether this
+  // call changed anything, never credential material.
+  static serializeDeactivatedApiKey(
+    dbApiKey: {
+      uuid: string;
+      name: string;
+      last4: string;
+      is_active: boolean;
+    },
+    changed: boolean,
+  ) {
+    return {
+      uuid: dbApiKey.uuid,
+      name: dbApiKey.name,
+      key_prefix: ApiKeysSerializer.keyPrefix(dbApiKey.last4),
+      is_active: dbApiKey.is_active,
+      changed,
+    };
   }
 
   // Readback for apiKeys.setIpPolicy: the stored policy (canonical CIDRs) plus

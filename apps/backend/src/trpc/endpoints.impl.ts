@@ -8,6 +8,7 @@ import {
   UpdateEndpointRequestSchema,
   UpdateEndpointResponseSchema,
 } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import logger from "@/utils/logger";
@@ -20,6 +21,7 @@ import {
 } from "../db/repositories";
 import { EndpointsSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { withAdminAudit } from "../lib/audit/admin-write";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -40,6 +42,21 @@ export const endpointsImplementations = {
     userId: string,
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateEndpointResponseSchema>> => {
+    // The companion-server option mints an endpoint-scoped API key directly in
+    // the repository, below, which bypasses apiKeys.create and every rule that
+    // procedure enforces on a key an admin-plane key asks for. So a request
+    // that authenticated with an admin-plane key, of either scope, may not ask
+    // for it: refused before any write, outside the try below because its
+    // catch would turn this into `success: false` inside an HTTP 200. A human
+    // administrator keeps the option, and an admin-plane caller that does not
+    // ask for it (the operator CLI passes createMcpServer false) is unaffected.
+    if (actor?.admin_plane && input.createMcpServer) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message:
+          "An admin-plane API key cannot create a companion MCP server, because that also creates an API key. Create the endpoint without createMcpServer.",
+      });
+    }
     try {
       // Check if endpoint name already exists (must be globally unique)
       const existingEndpoint = await endpointsRepository.findByName(input.name);
@@ -114,25 +131,58 @@ export const endpointsImplementations = {
 
       logger.info(input);
 
-      const result = await endpointsRepository.create({
-        name: input.name,
-        description: input.description,
-        namespace_uuid: input.namespaceUuid,
-        enable_api_key_auth: input.enableApiKeyAuth ?? true,
-        require_scoped_api_key: requireScopedApiKey,
-        restricted,
-        enable_max_rate: enableMaxRate,
-        enable_client_max_rate: input.enableClientMaxRate ?? false,
-        max_rate: maxRate,
-        max_rate_seconds: maxRateSeconds,
-        client_max_rate: input.clientMaxRate,
-        client_max_rate_seconds: input.clientMaxRateSeconds,
-        client_max_rate_strategy: input.clientMaxRateStrategy,
-        client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
-        enable_oauth: input.enableOauth ?? true,
-        use_query_param_auth: input.useQueryParamAuth ?? false,
-        user_id: effectiveUserId,
-      });
+      // For an admin-plane key the endpoint row and its audit row are one
+      // transaction (an audit failure fails the create); for everyone else the
+      // event is emitted best-effort right after the write. An endpoint is a
+      // publicly reachable MCP surface, so its creation and its auth posture
+      // (API-key gate, scoped-key requirement, OAuth) are the breadcrumbs that
+      // answer "when did this URL start existing, and did it ever require a
+      // credential". Never the bearer token the block below may embed in the
+      // companion MCP server.
+      const result = await withAdminAudit(
+        actor,
+        (...tx) =>
+          endpointsRepository.create(
+            {
+              name: input.name,
+              description: input.description,
+              namespace_uuid: input.namespaceUuid,
+              enable_api_key_auth: input.enableApiKeyAuth ?? true,
+              require_scoped_api_key: requireScopedApiKey,
+              restricted,
+              enable_max_rate: enableMaxRate,
+              enable_client_max_rate: input.enableClientMaxRate ?? false,
+              max_rate: maxRate,
+              max_rate_seconds: maxRateSeconds,
+              client_max_rate: input.clientMaxRate,
+              client_max_rate_seconds: input.clientMaxRateSeconds,
+              client_max_rate_strategy: input.clientMaxRateStrategy,
+              client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
+              enable_oauth: input.enableOauth ?? true,
+              use_query_param_auth: input.useQueryParamAuth ?? false,
+              user_id: effectiveUserId,
+            },
+            ...tx,
+          ),
+        (created) => ({
+          action: "endpoint.create",
+          target_type: "endpoint",
+          target_id: created.uuid,
+          detail: {
+            name: created.name,
+            namespace_uuid: input.namespaceUuid,
+            owner_user_id: effectiveUserId,
+            enable_api_key_auth: input.enableApiKeyAuth,
+            // The enforced values, not the raw input: restriction forces the
+            // scoped-key requirement on, and the audit row records what
+            // actually took effect so a later "was this ever open" query is
+            // answered by the truth, not by what the caller asked for.
+            require_scoped_api_key: requireScopedApiKey,
+            restricted,
+            enable_oauth: input.enableOauth,
+          },
+        }),
+      );
 
       // Partial-success detail for the companion MCP server. The endpoint
       // itself is already committed by the time this block runs, so a failure
@@ -217,30 +267,6 @@ export const endpointsImplementations = {
           mcpServerWarning = `The endpoint was created, but its companion MCP server was not: ${mcpError instanceof Error ? mcpError.message : "unknown error"}.`;
         }
       }
-
-      // An endpoint is a publicly reachable MCP surface, so its creation and
-      // its auth posture (API-key gate, scoped-key requirement, OAuth) are
-      // the breadcrumbs that answer "when did this URL start existing, and
-      // did it ever require a credential". Never the bearer token the block
-      // above may have embedded in the companion MCP server.
-      emitAdminEvent(actor, {
-        action: "endpoint.create",
-        target_type: "endpoint",
-        target_id: result.uuid,
-        detail: {
-          name: result.name,
-          namespace_uuid: input.namespaceUuid,
-          owner_user_id: effectiveUserId,
-          enable_api_key_auth: input.enableApiKeyAuth,
-          // The enforced values, not the raw input: restriction forces the
-          // scoped-key requirement on, and the audit row records what actually
-          // took effect so a later "was this ever open" query is answered by
-          // the truth, not by what the caller asked for.
-          require_scoped_api_key: requireScopedApiKey,
-          restricted,
-          enable_oauth: input.enableOauth,
-        },
-      });
 
       return {
         success: true as const,
@@ -479,43 +505,50 @@ export const endpointsImplementations = {
       const requireScopedApiKey =
         existingEndpoint.restricted === true ? true : input.requireScopedApiKey;
 
-      const result = await endpointsRepository.update({
-        uuid: input.uuid,
-        name: input.name,
-        description: input.description,
-        namespace_uuid: input.namespaceUuid,
-        enable_api_key_auth: input.enableApiKeyAuth,
-        require_scoped_api_key: requireScopedApiKey,
-        enable_max_rate: input.enableMaxRate ?? false,
-        enable_client_max_rate: input.enableClientMaxRate ?? false,
-        max_rate: input.maxRate,
-        max_rate_seconds: input.maxRateSeconds,
-        client_max_rate: input.clientMaxRate,
-        client_max_rate_seconds: input.clientMaxRateSeconds,
-        client_max_rate_strategy: input.clientMaxRateStrategy,
-        client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
-        enable_oauth: input.enableOauth,
-        use_query_param_auth: input.useQueryParamAuth,
-      });
-
       // The auth-posture fields are carried for the same reason as on create:
       // turning `enable_api_key_auth` off on a live endpoint opens it to the
       // internet, and that has to be attributable to a person and a moment.
-      emitAdminEvent(actor, {
-        action: "endpoint.update",
-        target_type: "endpoint",
-        target_id: result.uuid,
-        detail: {
-          name: result.name,
-          namespace_uuid: input.namespaceUuid,
-          enable_api_key_auth: input.enableApiKeyAuth,
-          // The enforced value, not the raw input: an attempt to unset this on
-          // a restricted endpoint is coerced back on above, and the audit row
-          // records what actually took effect.
-          require_scoped_api_key: requireScopedApiKey,
-          enable_oauth: input.enableOauth,
-        },
-      });
+      // For an admin-plane key the row and its audit row are one transaction.
+      const result = await withAdminAudit(
+        actor,
+        (...tx) =>
+          endpointsRepository.update(
+            {
+              uuid: input.uuid,
+              name: input.name,
+              description: input.description,
+              namespace_uuid: input.namespaceUuid,
+              enable_api_key_auth: input.enableApiKeyAuth,
+              require_scoped_api_key: requireScopedApiKey,
+              enable_max_rate: input.enableMaxRate ?? false,
+              enable_client_max_rate: input.enableClientMaxRate ?? false,
+              max_rate: input.maxRate,
+              max_rate_seconds: input.maxRateSeconds,
+              client_max_rate: input.clientMaxRate,
+              client_max_rate_seconds: input.clientMaxRateSeconds,
+              client_max_rate_strategy: input.clientMaxRateStrategy,
+              client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
+              enable_oauth: input.enableOauth,
+              use_query_param_auth: input.useQueryParamAuth,
+            },
+            ...tx,
+          ),
+        (updated) => ({
+          action: "endpoint.update",
+          target_type: "endpoint",
+          target_id: updated.uuid,
+          detail: {
+            name: updated.name,
+            namespace_uuid: input.namespaceUuid,
+            enable_api_key_auth: input.enableApiKeyAuth,
+            // The enforced value, not the raw input: an attempt to unset this
+            // on a restricted endpoint is coerced back on above, and the audit
+            // row records what actually took effect.
+            require_scoped_api_key: requireScopedApiKey,
+            enable_oauth: input.enableOauth,
+          },
+        }),
+      );
 
       return {
         success: true as const,

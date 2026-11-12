@@ -1,6 +1,6 @@
 import type { AuditActor } from "@repo/trpc";
 
-import { type AuditOutcome, emit } from "./audit-emitter";
+import { type AuditEvent, type AuditOutcome, emit } from "./audit-emitter";
 
 /**
  * Maps an admin/control-plane mutation onto an `audit_log` row.
@@ -35,15 +35,7 @@ import { type AuditOutcome, emit } from "./audit-emitter";
  */
 export function emitAdminEvent(
   actor: AuditActor | undefined | null,
-  event: {
-    /** Verb from the controlled list (e.g. `config.signup_disabled.set`). */
-    action: string;
-    target_type: string;
-    target_id?: string | null;
-    /** Defaults to `success` — these fire on the outcome path after a write. */
-    outcome?: AuditOutcome;
-    detail?: Record<string, unknown>;
-  },
+  event: AdminEventInput,
 ): void {
   try {
     emitEvent(actor, event);
@@ -58,25 +50,44 @@ export function emitAdminEvent(
   }
 }
 
+/** What a call site hands the admin-event writers. */
+export interface AdminEventInput {
+  /** Verb from the controlled list (e.g. `config.signup_disabled.set`). */
+  action: string;
+  target_type: string;
+  target_id?: string | null;
+  /** Defaults to `success` — these fire on the outcome path after a write. */
+  outcome?: AuditOutcome;
+  detail?: Record<string, unknown>;
+}
+
 function emitEvent(
   actor: AuditActor | undefined | null,
-  event: {
-    action: string;
-    target_type: string;
-    target_id?: string | null;
-    outcome?: AuditOutcome;
-    detail?: Record<string, unknown>;
-  },
+  event: AdminEventInput,
 ): void {
-  // An admin-plane (CI) API key acted. The KEY is the actor: actor_type
+  emit(buildAdminAuditEvent(actor, event));
+}
+
+/**
+ * The `audit_log` event an admin mutation becomes. Pure, and shared by the
+ * best-effort writer above and the transactional writer
+ * (`lib/audit/admin-write.ts`), so a row reads the same however it was written.
+ * May throw if a getter on `actor` throws; callers that must not throw wrap it.
+ */
+export function buildAdminAuditEvent(
+  actor: AuditActor | undefined | null,
+  event: AdminEventInput,
+): AuditEvent {
+  // An admin-plane API key acted. The KEY is the actor: actor_type
   // `api_key` and actor_id the key's uuid, the same shape the
   // `authn.admin_key.accepted` row that authenticated the request uses, so
   // the two join on actor_id. The owning user is kept beside it under
-  // `detail.admin_plane`, and actor_label stays the owner's email, so the row
-  // still says whose key it was without claiming that person acted in the UI.
+  // `detail.admin_plane`, with the key's verified scope (migration 0043), and
+  // actor_label stays the owner's email, so the row still says whose key it
+  // was without claiming that person acted in the UI.
   const adminPlane = actor?.admin_plane;
   if (adminPlane) {
-    emit({
+    return {
       actor_type: "api_key",
       actor_id: adminPlane.key_uuid,
       actor_label: actor?.actor_label ?? null,
@@ -92,12 +103,14 @@ function emitEvent(
         admin_plane: {
           key_uuid: adminPlane.key_uuid,
           owner_user_id: adminPlane.owner_user_id,
+          ...(adminPlane.scope !== undefined
+            ? { scope: adminPlane.scope }
+            : {}),
         },
       },
-    });
-    return;
+    };
   }
-  emit({
+  return {
     // A MISSING actor bundle means there was no tRPC request behind this call
     // at all, which is a different claim from "a user whose id we could not
     // read" — and it is reachable: `lib/metamcp/metamcp-proxy.ts` calls
@@ -118,5 +131,5 @@ function emitEvent(
     outcome: event.outcome ?? "success",
     request_id: actor?.request_id ?? null,
     detail: event.detail ?? {},
-  });
+  };
 }

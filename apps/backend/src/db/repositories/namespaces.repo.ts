@@ -16,10 +16,18 @@ import {
   namespaceToolMappingsTable,
   toolsTable,
 } from "../schema";
+import type { DbExecutor } from "./db-executor";
 
 export class NamespacesRepository {
-  async create(input: NamespaceCreateInput): Promise<DatabaseNamespace> {
-    return await db.transaction(async (tx) => {
+  // `executor` is the caller's transaction when it holds one (an admin-plane
+  // write records its audit row in the same transaction), and the inner
+  // transaction is then a savepoint of it. Omitted, the pool is used and
+  // nothing changes.
+  async create(
+    input: NamespaceCreateInput,
+    executor?: DbExecutor,
+  ): Promise<DatabaseNamespace> {
+    return await (executor ?? db).transaction(async (tx) => {
       // Create the namespace
       const [createdNamespace] = await tx
         .insert(namespacesTable)
@@ -408,8 +416,15 @@ export class NamespacesRepository {
    * before or after the other, and the policy read from RETURNING is the one in
    * force for the whole write.
    */
-  async update(input: NamespaceUpdateInput): Promise<DatabaseNamespace> {
-    return await db.transaction(async (tx) => {
+  // `executor` is the caller's transaction when it holds one (an admin-plane
+  // write records its audit row in the same transaction), and the inner
+  // transaction is then a savepoint of it. Omitted, the pool is used and
+  // nothing changes.
+  async update(
+    input: NamespaceUpdateInput,
+    executor?: DbExecutor,
+  ): Promise<DatabaseNamespace> {
+    return await (executor ?? db).transaction(async (tx) => {
       // Update the namespace
       const [updatedNamespace] = await tx
         .update(namespacesTable)
