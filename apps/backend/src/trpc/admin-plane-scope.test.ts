@@ -41,10 +41,11 @@ const UUID_B = "22222222-2222-4222-8222-222222222222";
 const UUID_C = "33333333-3333-4333-8333-333333333333";
 
 // The two lists, written out here rather than read from the constants, so this
-// test fails if either constant changes. Oracle: the admin-plane plan's decision
-// 2 for the sync set and the first 26 of the operator set, and the tool
-// collections plan's K2 paragraph for the ten added (nine accessGroups
-// procedures and namespaces.setToolPolicy); the sync tooling pins a copy.
+// test fails if either constant changes. Oracle: the sync set is the ten
+// procedures the configuration-sync tooling calls (that tooling pins a copy);
+// the operator set is those plus what an operator's tooling needs: the key and
+// provisioning procedures, and the ten that manage access groups (nine
+// accessGroups procedures) and a namespace's tool policy.
 const EXPECTED_SYNC = [
   "frontend.config.getMcpMaxTotalTimeout",
   "frontend.config.getMcpTimeout",

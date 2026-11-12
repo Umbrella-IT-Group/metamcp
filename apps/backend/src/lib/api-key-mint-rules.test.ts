@@ -401,10 +401,11 @@ describe("every refusal is one fixed sentence that echoes nothing of the request
 });
 
 describe("rule 4 against an endpoint row", () => {
-  // Oracle: the settled mint contract (private plan, tool-collections-rollout,
-  // "Foreman decisions after the Sol plan review", decision 1): an endpoint
-  // scoped mint needs a public endpoint, and a restricted one only for an owner
-  // who is an explicit member of a mapped group.
+  // Oracle: a key reaches what its owner reaches and no more, so a mint scoped
+  // to a restricted endpoint needs an owner who is an explicit member of a
+  // mapped group, and an administrator's role alone must not stand in for that
+  // (the key would then pass every restricted endpoint). A private endpoint is
+  // never available to an agent mint, member or not.
   it("allows a public, unrestricted endpoint with or without membership", () => {
     for (const member of [false, true]) {
       expect(() =>

@@ -715,9 +715,9 @@ describeIfDb(
       });
 
       it("allows a gateway-wide key for a member owner while endpoints are restricted, paired or not", async () => {
-        // Oracle: the settled mint contract. Reach is decided per request by the
-        // owner's groups, so the pairing no longer blocks a gateway-wide mint;
-        // only an administrator-role owner does (next test).
+        // Oracle: reach is decided per request by the owner's groups, so the
+        // pairing no longer blocks a gateway-wide mint; only an
+        // administrator-role owner does (next test).
         const unpaired = await fx.endpoint({
           name: "ep-unpaired",
           restricted: true,
@@ -2138,10 +2138,12 @@ describeIfDb(
     // writes (a refusal row per refused request) through the audit pool, which is
     // deliberately small and sheds load (db/audit-db), and the cases above read
     // their own denied rows from the table and must not share a pool with that
-    // backlog. Oracle for every expectation: the settled mint contract (private
-    // plan, tool-collections-rollout, foreman decision 1) and the owner rule of
-    // the access-group gate: a key reaches a restricted endpoint exactly when its
-    // owner is an administrator or belongs to a mapped group.
+    // backlog. Oracle for every expectation: a key reaches a restricted endpoint
+    // exactly when its owner is an administrator or belongs to a mapped group,
+    // and a mint must never create a key that reaches more than its owner: so
+    // an agent mint for a restricted endpoint needs an owner who is an explicit
+    // member (an administrator's role alone does not count), and a gateway-wide
+    // mint is refused for an administrator owner.
     describe("the owner rule and the mint that follows it", () => {
       const invalidate = async () => {
         const { invalidateEndpointAccessCache } = await import(
