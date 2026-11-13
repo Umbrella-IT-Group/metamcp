@@ -228,7 +228,7 @@ function McpInspectorContent() {
       connection.disconnect().then(() => {
         connection.connect();
       });
-    } else if (action === "connect") {
+    } else {
       connection.connect();
     }
     // The key stands in for `target` on purpose; see above.

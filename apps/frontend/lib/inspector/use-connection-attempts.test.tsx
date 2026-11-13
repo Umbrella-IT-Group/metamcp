@@ -1,0 +1,510 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import * as React from "react";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// React's DOM renderer is the only one in this repo's dependencies, and this
+// suite runs in Node with no DOM. The hook renders nothing, so the renderer
+// needs only a window to read `event` from and a container to hold nothing;
+// both are stubs. This runs before the imports below because react-dom reads
+// the environment when it is first loaded.
+vi.hoisted(() => {
+  const target = globalThis as unknown as Record<string, unknown>;
+  target.IS_REACT_ACT_ENVIRONMENT = true;
+  target.window = {
+    event: undefined,
+    HTMLIFrameElement: class {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+});
+
+vi.mock("@/lib/trpc", () => {
+  const setting = { useQuery: () => ({ data: undefined }) };
+  return {
+    trpc: {
+      frontend: {
+        config: {
+          getMcpTimeout: setting,
+          getMcpMaxTotalTimeout: setting,
+          getMcpResetTimeoutOnProgress: setting,
+        },
+      },
+    },
+  };
+});
+
+vi.mock("@/lib/oauth-provider", () => ({
+  createAuthProvider: () => ({
+    tokens: async () => undefined,
+    clear: () => undefined,
+  }),
+}));
+
+vi.mock("@/lib/env", () => ({
+  getAppUrl: () => "https://gateway.example.test",
+}));
+
+// Only the hook's own import is replaced; the SDK's transports keep the real
+// module.
+vi.mock("@modelcontextprotocol/sdk/client/auth.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("@modelcontextprotocol/sdk/client/auth.js")
+  >()),
+  auth: vi.fn(),
+}));
+
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
+
+import { useConnection } from "@/hooks/useConnection";
+
+import { RpcTrafficStore } from "./rpc-traffic/store";
+
+type Props = Parameters<typeof useConnection>[0];
+
+interface Gate {
+  promise: Promise<void>;
+  open: () => void;
+  fail: (reason: unknown) => void;
+}
+
+function gate(): Gate {
+  let open!: () => void;
+  let fail!: (reason: unknown) => void;
+  const promise = new Promise<void>((resolve, reject) => {
+    open = resolve;
+    fail = reject;
+  });
+  return { promise, open, fail };
+}
+
+// A started call, held in an object: an async function that returned the
+// promise itself would make `await` wait for the call to finish.
+interface Started {
+  finished: Promise<void>;
+}
+
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+const SERVER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const TARGET_A: Props = {
+  mcpServerUuid: SERVER,
+  transportType: "SSE",
+  command: "",
+  args: "",
+  url: "/mcp-proxy/metamcp/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/sse",
+  isMetaMCP: true,
+  captureTraffic: true,
+};
+const TARGET_B: Props = {
+  ...TARGET_A,
+  url: "/mcp-proxy/metamcp/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/sse",
+};
+
+// The network, as the hook meets it: the proxy health request (fetch) and the
+// handshake (Client.connect). Each call takes the next gate from its queue and
+// waits for it; with no gate left it answers at once. So a test decides, per
+// attempt, which of the two finishes when.
+function network() {
+  const healthGates: Gate[] = [];
+  const connectGates: Gate[] = [];
+  const attempts: { client: Client; transport: Transport }[] = [];
+  const closed: Client[] = [];
+  const order: string[] = [];
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      const next = healthGates.shift();
+      if (next) await next.promise;
+      return new Response(JSON.stringify({ status: "ok" }));
+    }),
+  );
+  vi.spyOn(Client.prototype, "connect").mockImplementation(async function (
+    this: Client,
+    transport: Transport,
+  ) {
+    attempts.push({ client: this, transport });
+    const next = connectGates.shift();
+    if (next) await next.promise;
+    // The server's answer to initialize, as the traffic tap would see it.
+    transport.onmessage?.({ jsonrpc: "2.0", id: 0, result: {} });
+  } as unknown as Client["connect"]);
+  vi.spyOn(Client.prototype, "close").mockImplementation(async function (
+    this: Client,
+  ) {
+    closed.push(this);
+    order.push("close");
+    // A real close ends the transport, which the tap records as a close.
+    attempts.find((attempt) => attempt.client === this)?.transport.onclose?.();
+  } as unknown as Client["close"]);
+  vi.spyOn(
+    StreamableHTTPClientTransport.prototype,
+    "terminateSession",
+  ).mockImplementation(async () => {
+    order.push("terminateSession");
+  });
+  const sent = vi.spyOn(SSEClientTransport.prototype, "send");
+  const notified = vi.spyOn(Client.prototype, "notification");
+
+  return { healthGates, connectGates, attempts, closed, order, sent, notified };
+}
+
+// Mounts the real hook under a real React root and keeps the latest value it
+// returned. Every call that can change state goes through act.
+function mountConnection() {
+  const container = {
+    nodeType: 1,
+    nodeName: "DIV",
+    tagName: "DIV",
+    namespaceURI: "http://www.w3.org/1999/xhtml",
+    textContent: "",
+    childNodes: [],
+    ownerDocument: null,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const root = createRoot(container as unknown as Element);
+  let latest: ReturnType<typeof useConnection> | undefined;
+  function Consumer(props: Props) {
+    latest = useConnection(props);
+    return null;
+  }
+  return {
+    get current() {
+      if (!latest) throw new Error("the hook has not rendered");
+      return latest;
+    },
+    render: (props: Props) =>
+      act(async () => {
+        root.render(React.createElement(Consumer, props));
+      }),
+    unmount: () =>
+      act(async () => {
+        root.unmount();
+      }),
+    // Runs `work` (which starts a connect or a disconnect), lets it run until
+    // it waits on a gate, and hands back what to wait for later.
+    start: async (work: () => Promise<void>): Promise<Started> => {
+      let finished!: Promise<void>;
+      await act(async () => {
+        finished = work();
+        await settle();
+      });
+      return { finished };
+    },
+    // Lets a started call complete (or fail) and waits for it.
+    complete: (started: Started, how?: () => void) =>
+      act(async () => {
+        how?.();
+        await started.finished;
+        await settle();
+      }),
+    // Runs a whole call to its end.
+    run: (work: () => Promise<void>) =>
+      act(async () => {
+        await work();
+      }),
+  };
+}
+
+async function mounted(props: Props) {
+  const hook = mountConnection();
+  await hook.render(props);
+  return hook;
+}
+
+beforeEach(() => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  vi.mocked(auth).mockReset();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("the connection hook's attempts", () => {
+  it("reports connecting while the handshake is pending, then connected", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const hook = await mounted(TARGET_A);
+    expect(hook.current.connectionStatus).toBe("disconnected");
+
+    const started = await hook.start(() => hook.current.connect());
+    expect(hook.current.connectionStatus).toBe("connecting");
+
+    await hook.complete(started, handshake.open);
+    expect(hook.current.connectionStatus).toBe("connected");
+    expect(hook.current.mcpClient).toBe(net.attempts[0]?.client);
+    // The current attempt's handshake is in the log the page shows.
+    expect(hook.current.rpcTraffic?.exportEntries()).toHaveLength(1);
+  });
+
+  // Both ways a second attempt can supersede the first: the page connects to
+  // another target, and a second connect() on the same target (a double click,
+  // or an effect that runs twice).
+  describe.each([
+    ["after a target change", true],
+    ["on the same target", false],
+  ])("when a second connect starts %s", (_name, switchTarget) => {
+    const supersede = async (hook: Awaited<ReturnType<typeof mounted>>) => {
+      if (switchTarget) await hook.render(TARGET_B);
+      await hook.run(() => hook.current.connect());
+    };
+
+    it("keeps the later attempt active when the earlier one completes last", async () => {
+      const net = network();
+      const first = gate();
+      net.connectGates.push(first);
+      const hook = await mounted(TARGET_A);
+
+      const slow = await hook.start(() => hook.current.connect());
+      const logOfA = hook.current.rpcTraffic;
+      await supersede(hook);
+      const [attemptA, attemptB] = net.attempts;
+      expect(net.attempts).toHaveLength(2);
+      expect(hook.current.mcpClient).toBe(attemptB?.client);
+      expect(hook.current.connectionStatus).toBe("connected");
+      const logOfB = hook.current.rpcTraffic;
+      expect(logOfB).toBeInstanceOf(RpcTrafficStore);
+      expect(logOfB).not.toBe(logOfA);
+      expect(logOfB?.exportEntries()).toHaveLength(1);
+
+      await hook.complete(slow, first.open);
+
+      // The earlier attempt finished last and must change nothing the page
+      // sees, must close what it opened, and must write nothing to either log
+      // (its handshake answer and its close).
+      expect(hook.current.mcpClient).toBe(attemptB?.client);
+      expect(hook.current.connectionStatus).toBe("connected");
+      expect(hook.current.rpcTraffic).toBe(logOfB);
+      expect(net.closed).toEqual([attemptA?.client]);
+      expect(logOfB?.exportEntries()).toHaveLength(1);
+      expect(logOfA?.exportEntries()).toEqual([]);
+    });
+
+    it("does not let a superseded failure overwrite a newer success", async () => {
+      const net = network();
+      const first = gate();
+      net.connectGates.push(first);
+      const published = vi.spyOn(
+        RpcTrafficStore.prototype,
+        "publishTransportError",
+      );
+      const hook = await mounted(TARGET_A);
+
+      const slow = await hook.start(() => hook.current.connect());
+      await supersede(hook);
+      const [attemptA, attemptB] = net.attempts;
+
+      await hook.complete(slow, () =>
+        first.fail(new Error("handshake refused")),
+      );
+
+      expect(hook.current.connectionStatus).toBe("connected");
+      expect(hook.current.mcpClient).toBe(attemptB?.client);
+      expect(published).not.toHaveBeenCalled();
+      expect(console.error).not.toHaveBeenCalled();
+      expect(net.closed).toEqual([attemptA?.client]);
+    });
+
+    it("does not let a superseded proxy health check connect", async () => {
+      const net = network();
+      const health = gate();
+      net.healthGates.push(health);
+      const hook = await mounted(TARGET_A);
+
+      const slow = await hook.start(() => hook.current.connect());
+      expect(hook.current.connectionStatus).toBe("connecting");
+      await supersede(hook);
+      expect(net.attempts).toHaveLength(1);
+
+      // It answers healthy, late: it must not go on to open a connection.
+      await hook.complete(slow, health.open);
+      expect(net.attempts).toHaveLength(1);
+      expect(hook.current.mcpClient).toBe(net.attempts[0]?.client);
+      expect(hook.current.connectionStatus).toBe("connected");
+    });
+
+    it("does not let a superseded proxy health failure report or overwrite", async () => {
+      const net = network();
+      const health = gate();
+      net.healthGates.push(health);
+      const published = vi.spyOn(
+        RpcTrafficStore.prototype,
+        "publishTransportError",
+      );
+      const hook = await mounted(TARGET_A);
+
+      const slow = await hook.start(() => hook.current.connect());
+      await supersede(hook);
+
+      await hook.complete(slow, () =>
+        health.fail(new TypeError("unreachable")),
+      );
+
+      expect(published).not.toHaveBeenCalled();
+      expect(hook.current.connectionStatus).toBe("connected");
+      expect(hook.current.mcpClient).toBe(net.attempts[0]?.client);
+    });
+
+    it("does not start the sign-in flow or retry for a superseded attempt", async () => {
+      const net = network();
+      const first = gate();
+      net.connectGates.push(first);
+      vi.stubGlobal("sessionStorage", {
+        setItem: vi.fn(),
+        getItem: vi.fn(),
+        removeItem: vi.fn(),
+      });
+      vi.mocked(auth).mockResolvedValue("AUTHORIZED");
+      const hook = await mounted(TARGET_A);
+
+      const slow = await hook.start(() => hook.current.connect());
+      await supersede(hook);
+      expect(net.attempts).toHaveLength(2);
+
+      await hook.complete(slow, () =>
+        first.fail(new Error("401 Unauthorized")),
+      );
+
+      expect(auth).not.toHaveBeenCalled();
+      expect(net.attempts).toHaveLength(2);
+      expect(hook.current.connectionStatus).toBe("connected");
+      expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
+    });
+  });
+
+  it("still retries once after a sign-in and keeps the failed attempt's log", async () => {
+    const net = network();
+    const first = gate();
+    net.connectGates.push(first);
+    vi.stubGlobal("sessionStorage", {
+      setItem: vi.fn(),
+      getItem: vi.fn(),
+      removeItem: vi.fn(),
+    });
+    vi.mocked(auth).mockResolvedValue("AUTHORIZED");
+    const hook = await mounted(TARGET_A);
+
+    const started = await hook.start(() => hook.current.connect());
+    const logOfFirst = hook.current.rpcTraffic;
+    await hook.complete(started, () =>
+      first.fail(new Error("401 Unauthorized")),
+    );
+
+    expect(auth).toHaveBeenCalledTimes(1);
+    expect(net.attempts).toHaveLength(2);
+    expect(hook.current.connectionStatus).toBe("connected");
+    expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
+    expect(hook.current.rpcTraffic).toBe(logOfFirst);
+  });
+
+  it("does not let an attempt finish after disconnect", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const hook = await mounted(TARGET_A);
+
+    const started = await hook.start(() => hook.current.connect());
+    expect(hook.current.connectionStatus).toBe("connecting");
+    await hook.run(() => hook.current.disconnect());
+    expect(hook.current.connectionStatus).toBe("disconnected");
+
+    await hook.complete(started, handshake.open);
+    expect(hook.current.connectionStatus).toBe("disconnected");
+    expect(hook.current.mcpClient).toBeNull();
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+    // A disconnect leaves the log in place, so it is still the one on screen:
+    // the abandoned attempt's late answer and its close are not added to it.
+    expect(hook.current.rpcTraffic?.exportEntries()).toEqual([]);
+  });
+
+  it("does not let an attempt for the old target finish after a target change", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const hook = await mounted(TARGET_A);
+
+    const started = await hook.start(() => hook.current.connect());
+    expect(hook.current.connectionStatus).toBe("connecting");
+    // The page moved to another target and has not connected to it (yet).
+    await hook.render(TARGET_B);
+    expect(hook.current.connectionStatus).toBe("disconnected");
+
+    await hook.complete(started, handshake.open);
+    expect(hook.current.connectionStatus).toBe("disconnected");
+    expect(hook.current.mcpClient).toBeNull();
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+  });
+
+  it("closes an attempt still in flight when the page unmounts, and sends no cancellation", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const hook = await mounted(TARGET_A);
+
+    const started = await hook.start(() => hook.current.connect());
+    await hook.unmount();
+    await hook.complete(started, handshake.open);
+
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+    expect(net.sent).not.toHaveBeenCalled();
+    expect(net.notified).not.toHaveBeenCalled();
+  });
+
+  it("ends the session of an abandoned streamable HTTP attempt before closing it", async () => {
+    const net = network();
+    const first = gate();
+    net.connectGates.push(first);
+    const streamable: Props = {
+      mcpServerUuid: SERVER,
+      transportType: "STREAMABLE_HTTP",
+      command: "",
+      args: "",
+      url: "https://backend.example.test/mcp",
+      captureTraffic: true,
+    };
+    const hook = await mounted(streamable);
+
+    const slow = await hook.start(() => hook.current.connect());
+    await hook.run(() => hook.current.connect());
+    net.order.length = 0;
+
+    await hook.complete(slow, first.open);
+
+    // close() aborts the transport's controller, so a DELETE issued after it
+    // could never reach the wire: terminate first, then close.
+    expect(net.order).toEqual(["terminateSession", "close"]);
+  });
+
+  it("reconnects the way the page does, disconnect and then connect, and ends connected", async () => {
+    const net = network();
+    const hook = await mounted(TARGET_A);
+    await hook.run(() => hook.current.connect());
+    expect(hook.current.connectionStatus).toBe("connected");
+
+    // The second handshake is still pending when React renders the
+    // "connecting" status; the status leaving "connected" must not make the
+    // hook disconnect the attempt that has just started.
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    await hook.render(TARGET_B);
+    const started = await hook.start(async () => {
+      await hook.current.disconnect();
+      await hook.current.connect();
+    });
+    expect(hook.current.connectionStatus).toBe("connecting");
+
+    await hook.complete(started, handshake.open);
+    expect(hook.current.connectionStatus).toBe("connected");
+    expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+  });
+});

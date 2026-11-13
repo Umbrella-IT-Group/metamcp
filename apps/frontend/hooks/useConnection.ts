@@ -46,7 +46,10 @@ import {
   reuseOrCreateStore,
   RpcTrafficStore,
 } from "../lib/inspector/rpc-traffic/store";
-import { connectWithTraffic } from "../lib/inspector/rpc-traffic/transport-tap";
+import {
+  connectWithTraffic,
+  type TrafficSink,
+} from "../lib/inspector/rpc-traffic/transport-tap";
 import type { InspectorServerInfo } from "../lib/inspector/server-info";
 import { resolveRequestTimeouts } from "../lib/mcp-request-options";
 import {
@@ -113,6 +116,19 @@ export function useConnection({
   const rpcTrafficRef = useRef<RpcTrafficStore | null>(null);
   const [rpcTraffic, setRpcTraffic] = useState<RpcTrafficStore | null>(null);
   const [completionsSupported, setCompletionsSupported] = useState(true);
+  // Every connect() is an attempt, numbered from this counter, and an attempt
+  // is current only while the counter still holds its number. A newer
+  // connect(), a disconnect(), a change of what the hook connects to and an
+  // unmount each move the counter on. An attempt that was waiting (on the
+  // proxy health check, the handshake or a sign-in) finds out it was
+  // superseded when it resumes, closes what it opened, and leaves the state,
+  // the traffic log and the sign-in flow alone. Without this the attempt that
+  // finishes last decides which connection the page holds, and a slow connect
+  // to the target the person just left replaces the one they selected.
+  const attemptRef = useRef(0);
+  // The status the unload and unmount handlers read: they run long after the
+  // render that registered them.
+  const connectionStatusRef = useRef(connectionStatus);
 
   // Fetch timeout configurations from the database
   const { data: mcpTimeout } = trpc.frontend.config.getMcpTimeout.useQuery(
@@ -308,6 +324,12 @@ export function useConnection({
 
   const connect = useMemoizedFn(
     async (_e?: unknown, retryCount: number = 0): Promise<void> => {
+      // Taking the next number supersedes every earlier attempt, the ones
+      // still in flight included, even when this call returns early below.
+      attemptRef.current += 1;
+      const attempt = attemptRef.current;
+      const isCurrent = () => attemptRef.current === attempt;
+
       // Skip connection if hook is disabled
       if (!enabled) {
         console.warn("Cannot connect: useConnection hook is disabled");
@@ -326,6 +348,10 @@ export function useConnection({
           return;
         }
       }
+
+      // The page reads this to show progress and to know a connect is under
+      // way, so a second connect is not started for the same target.
+      setConnectionStatus("connecting");
 
       const client = new Client<Request, Notification, Result>(
         {
@@ -354,13 +380,68 @@ export function useConnection({
       rpcTrafficRef.current = store;
       setRpcTraffic(store);
 
+      // What this attempt has opened, so it can close it when it turns out to
+      // be superseded. Ending the session comes first for the same reason as
+      // in disconnect(): close() aborts the transport, after which the DELETE
+      // could not be sent. Neither step sends a cancellation, and neither may
+      // throw into the caller; a failure is reported and the attempt ends.
+      let transport: Transport | undefined;
+
+      // The log an attempt writes to may still be the one the page shows (a
+      // disconnect leaves it in place). Until its connection is published, an
+      // attempt writes to it only while it is the current one: once superseded,
+      // a late handshake answer, or the close that abandon() causes, would be
+      // added as if that connection were live. A published connection owns its
+      // log until it is closed, so its own close is recorded.
+      let published = false;
+      const mayWriteToLog = () => published || isCurrent();
+      const sink: TrafficSink | null = store
+        ? {
+            message: (direction, message) => {
+              if (mayWriteToLog()) store.sink.message(direction, message);
+            },
+            transport: (event, error) => {
+              if (mayWriteToLog()) store.sink.transport(event, error);
+            },
+          }
+        : null;
+
+      const abandon = async () => {
+        try {
+          if (transport instanceof StreamableHTTPClientTransport) {
+            await transport.terminateSession();
+          }
+        } catch (error) {
+          console.error(
+            "Error ending the session of a superseded connection attempt:",
+            error,
+          );
+        }
+        try {
+          await client.close();
+        } catch (error) {
+          console.error(
+            "Error closing a superseded connection attempt:",
+            error,
+          );
+        }
+      };
+
       try {
         await checkProxyHealth();
       } catch (error) {
+        if (!isCurrent()) {
+          await abandon();
+          return;
+        }
         // The health check runs before a transport exists, so the tap cannot
         // report this failed connection attempt for us.
         store?.publishTransportError(error);
         setConnectionStatus("error-connecting-to-proxy");
+        return;
+      }
+      if (!isCurrent()) {
+        await abandon();
         return;
       }
 
@@ -372,6 +453,10 @@ export function useConnection({
         // Use manually provided bearer token if available, otherwise use OAuth tokens
         const token =
           bearerToken || (await authProvider.tokens())?.access_token;
+        if (!isCurrent()) {
+          await abandon();
+          return;
+        }
         if (token) {
           const authHeaderName = headerName || "Authorization";
 
@@ -563,7 +648,7 @@ export function useConnection({
 
         let capabilities;
         try {
-          const transport = isMetaMCP
+          const created = isMetaMCP
             ? new SSEClientTransport(mcpProxyServerUrl, transportOptions)
             : transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP
               ? new StreamableHTTPClientTransport(mcpProxyServerUrl, {
@@ -571,17 +656,22 @@ export function useConnection({
                   ...transportOptions,
                 })
               : new SSEClientTransport(mcpProxyServerUrl, transportOptions);
+          transport = created;
 
           // The only place this hook connects: the traffic tap has to be on
           // the transport before the SDK starts it (see transport-tap.ts).
-          await connectWithTraffic(
-            client,
-            transport as Transport,
-            store?.sink ?? null,
-          );
+          await connectWithTraffic(client, created as Transport, sink);
+
+          // Nothing below may run for a superseded attempt: it would publish
+          // a connection to a target the page has left over the one it holds.
+          if (!isCurrent()) {
+            await abandon();
+            return;
+          }
+          published = true;
 
           // The tap decorates this same object, so it is still the transport.
-          setClientTransport(transport);
+          setClientTransport(created);
 
           capabilities = client.getServerCapabilities();
           // The protocol version comes from the captured initialize result:
@@ -595,6 +685,13 @@ export function useConnection({
               typeof protocolVersion === "string" ? protocolVersion : undefined,
           });
         } catch (error) {
+          // A superseded attempt that failed has nothing to report: the log
+          // and the status belong to the attempt that replaced it.
+          if (!isCurrent()) {
+            await abandon();
+            return;
+          }
+
           // A failed handshake is the case the log exists for. The same error
           // can already be in it (the transport reports it and rejects with
           // it); the store records one object once.
@@ -615,12 +712,19 @@ export function useConnection({
           }
 
           const shouldRetry = await handleAuthError(error);
+          // Superseded while signing in: no retry, which would also reuse the
+          // newer attempt's traffic log (see reuseOrCreateStore).
+          if (!isCurrent()) {
+            await abandon();
+            return;
+          }
           if (shouldRetry) {
             return connect(undefined, retryCount + 1);
           }
           if (is401Error(error)) {
-            // Don't set error state if we're about to redirect for auth
-
+            // Don't set error state if we're about to redirect for auth, but
+            // do leave "connecting": nothing is connecting any more.
+            setConnectionStatus("disconnected");
             return;
           }
           throw error;
@@ -645,6 +749,10 @@ export function useConnection({
         setMcpClient(client);
         setConnectionStatus("connected");
       } catch (e) {
+        if (!isCurrent()) {
+          await abandon();
+          return;
+        }
         console.error(e);
         setConnectionStatus("error");
       }
@@ -652,6 +760,9 @@ export function useConnection({
   );
 
   const disconnect = useMemoizedFn(async () => {
+    // An attempt still in flight must not finish into a hook that was told to
+    // disconnect.
+    attemptRef.current += 1;
     try {
       if (
         transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP &&
@@ -688,35 +799,56 @@ export function useConnection({
     }
   }, [enabled, connectionStatus, disconnect]);
 
-  // Cleanup handlers for component unmount and browser navigation
+  // What the hook connects to. When any of it changes, or the page unmounts,
+  // an attempt still in flight is for a target the page has left: it is
+  // superseded, and a status that says "connecting" for it is put back, so a
+  // page that does not connect to the new target does not show a connect that
+  // will never finish. A page that does connect starts a new attempt after
+  // this runs (a cleanup runs before the effects of the same commit).
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      // Attempt to close connection gracefully before page unload
-      if (connectionStatus === "connected") {
-        disconnect();
-      }
-    };
-
-    const handleUnload = () => {
-      // Final cleanup on actual page unload (refresh, close, navigate away)
-      if (connectionStatus === "connected") {
-        disconnect();
-      }
-    };
-
-    // Add event listeners for browser navigation
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    window.addEventListener("unload", handleUnload);
-
-    // Cleanup on component unmount
     return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-      window.removeEventListener("unload", handleUnload);
-      if (connectionStatus === "connected") {
+      attemptRef.current += 1;
+      setConnectionStatus((status) =>
+        status === "connecting" ? "disconnected" : status,
+      );
+    };
+  }, [
+    mcpServerUuid,
+    transportType,
+    command,
+    args,
+    url,
+    bearerToken,
+    headerName,
+    isMetaMCP,
+    includeInactiveServers,
+  ]);
+
+  useEffect(() => {
+    connectionStatusRef.current = connectionStatus;
+  });
+
+  // Close a live connection when the page is left: on browser navigation, and
+  // on unmount. This runs once, not on every status change: a cleanup keyed on
+  // the status ran whenever the status left "connected", which now includes
+  // the move to "connecting" for a reconnect, and its disconnect() would
+  // supersede the attempt that had just started.
+  useEffect(() => {
+    const disconnectIfConnected = () => {
+      if (connectionStatusRef.current === "connected") {
         disconnect();
       }
     };
-  }, [connectionStatus, disconnect]);
+
+    window.addEventListener("beforeunload", disconnectIfConnected);
+    window.addEventListener("unload", disconnectIfConnected);
+
+    return () => {
+      window.removeEventListener("beforeunload", disconnectIfConnected);
+      window.removeEventListener("unload", disconnectIfConnected);
+      disconnectIfConnected();
+    };
+  }, [disconnect]);
 
   return {
     connectionStatus,

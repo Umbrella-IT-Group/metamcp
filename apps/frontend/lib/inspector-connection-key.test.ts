@@ -165,12 +165,19 @@ describe("inspectorConnectAction", () => {
   // loading. The error rows are the behavior change: after a failed connect the
   // hook holds no client, so a changed key connects again instead of leaving
   // the previous server's error showing under the new selection.
-  const CASES: [ConnectionStatus, "reconnect" | "connect" | "none"][] = [
+  //
+  // SPEC edit to the "connecting" row, "none" to "connect": the hook now
+  // reports "connecting" for the whole of a connect, and an attempt that was
+  // started for the previous target is superseded by the next connect() (see
+  // useConnection and use-connection-attempts.test.tsx). Leaving it alone
+  // would keep the old target's connection as the one the page holds while
+  // the new target is selected, which is the defect this edit exists to close.
+  const CASES: [ConnectionStatus, "reconnect" | "connect"][] = [
     ["connected", "reconnect"],
     ["disconnected", "connect"],
     ["error", "connect"],
     ["error-connecting-to-proxy", "connect"],
-    ["connecting", "none"],
+    ["connecting", "connect"],
   ];
 
   it.each(CASES)("%s -> %s", (status, action) => {
