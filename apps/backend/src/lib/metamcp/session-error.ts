@@ -258,7 +258,7 @@ export function isRecoverableBackendError(error: unknown): boolean {
 // SDK in the tree cannot make the check miss.
 const MCP_ERROR_MESSAGE_PREFIX = /^MCP error -?\d+: /;
 
-function isMcpErrorShape(error: Error): boolean {
+export function isMcpErrorShape(error: Error): boolean {
   return (
     error.name === "McpError" || MCP_ERROR_MESSAGE_PREFIX.test(error.message)
   );

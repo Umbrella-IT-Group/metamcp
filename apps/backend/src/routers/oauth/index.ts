@@ -11,7 +11,10 @@ import {
   toolCallAuditRepository,
 } from "../../db/repositories";
 import authorizationRouter from "./authorization";
-import { sweepUnapprovedDcrClients } from "./client-retention";
+import {
+  sweepUnapprovedDcrClients,
+  sweepUnusedCimdClients,
+} from "./client-retention";
 import metadataRouter from "./metadata";
 import registrationRouter from "./registration";
 import tokenRouter from "./token";
@@ -70,6 +73,9 @@ setInterval(
     // thing to reason about at shutdown. Errors are logged and swallowed here
     // deliberately — see sweepUnapprovedDcrClients, which never throws.
     await sweepUnapprovedDcrClients();
+    // Client metadata document rows (migration 0046) have their own sweep and
+    // rule; the DCR one above never matches them. Never throws.
+    await sweepUnusedCimdClients();
     // Audit-table growth tripwire. LAST on the tick, and that ordering is the
     // point: it reports what the estate looks like after the sweeps above have
     // run, not what it looked like a moment before they shrank it.

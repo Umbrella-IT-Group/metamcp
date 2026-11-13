@@ -49,6 +49,8 @@ export function registrationSourceKey(
       return "oauth-clients:sourceDcr";
     case "admin":
       return "oauth-clients:sourceAdmin";
+    case "cimd":
+      return "oauth-clients:sourceCimd";
     default:
       return "oauth-clients:sourceLegacy";
   }

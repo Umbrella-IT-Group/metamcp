@@ -436,3 +436,55 @@ describe("oauth-clients router RBAC", () => {
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 });
+
+describe("oauth-clients router list with a client metadata document row", () => {
+  // The enum trap: the router parses the listing with the shared output
+  // schema, so a stored `cimd` row that schema does not know fails the whole
+  // listing, and with it the OAuth Clients and Access pages for every
+  // operator. This runs the real implementation behind the real router and
+  // its real output schema.
+  const admin = createOAuthClientsRouter(
+    oauthClientsImplementations,
+  ).createCaller({
+    user: { id: "u-admin", role: "admin" },
+    session: { id: "s1" },
+  });
+
+  const row = (overrides: Record<string, unknown>) => ({
+    client_id: "mcp_client_abc",
+    client_secret: null,
+    client_name: "Hand made",
+    redirect_uris: CLAUDE_CALLBACKS,
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    scope: "mcp",
+    approval_status: "approved",
+    registration_source: "admin",
+    created_at: new Date("2026-01-01T00:00:00Z"),
+    updated_at: new Date("2026-01-02T00:00:00Z"),
+    ...overrides,
+  });
+
+  it("lists a cimd row next to the others, keeping its source", async () => {
+    oauthRepoMock.listClients.mockResolvedValue([
+      row({}),
+      row({
+        client_id: "https://app.example.com/oauth/client.json",
+        client_name: "Example",
+        registration_source: "cimd",
+      }),
+      row({ client_id: "mcp_client_def", registration_source: "dcr" }),
+      row({ client_id: "mcp_client_old", registration_source: null }),
+    ]);
+
+    const listed = await admin.list();
+
+    expect(listed.clients.map((c) => c.registration_source)).toEqual([
+      "admin",
+      "cimd",
+      "dcr",
+      null,
+    ]);
+  });
+});

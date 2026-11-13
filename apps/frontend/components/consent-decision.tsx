@@ -6,6 +6,11 @@ export interface ConsentInfo {
   client_name: string;
   redirect_uri: string;
   scope: string;
+  /**
+   * Only for a client identified by a published metadata document: the host
+   * that document was fetched from. Absent for every other client.
+   */
+  client_id_host?: string;
 }
 
 export interface ConsentDecisionProps {
@@ -50,6 +55,20 @@ export function ConsentDecision({
           <p className="text-xs text-muted-foreground">
             {t("auth:consentClientNameNote")}
           </p>
+          {/*
+            A client identified by a published metadata document also says
+            where that document came from. That is all it adds: it states a
+            fact about the address and does not vouch for the client, so the
+            unverified-name note above and the whole warning below stay as
+            they are. Never worded as "verified".
+          */}
+          {info.client_id_host ? (
+            <p className="text-xs text-muted-foreground break-all">
+              {t("auth:consentClientDetailsPublishedBy", {
+                host: info.client_id_host,
+              })}
+            </p>
+          ) : null}
         </div>
         <div className="space-y-1">
           <span className="text-muted-foreground">
