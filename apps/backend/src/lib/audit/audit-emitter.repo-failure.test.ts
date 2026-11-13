@@ -109,7 +109,9 @@ let ipCounter = 0;
 
 beforeEach(() => {
   vi.clearAllMocks();
-  recordMock.mockRejectedValue(new Error("audit_log INSERT failed"));
+  recordMock.mockRejectedValue(
+    Object.assign(new Error("audit_log INSERT failed"), { code: "23514" }),
+  );
   isDisabledMock.mockResolvedValue(false);
   setTrpcAuditSink(trpcDenialSink);
   // The emitter throttles failure reports to one a minute process-wide, so
@@ -218,9 +220,9 @@ describe("MCP bearer path with a failing audit_log", () => {
     // broke without saying what. It is carried as a log-safe summary in the
     // message, never as the raw error object, whose query error would copy
     // the lost row's bound values into the log (audit-emitter.redaction.test).
-    expect(loggerMock.warn.mock.calls[0]?.[0]).toContain(
-      "Error: audit_log INSERT failed",
-    );
+    // SPEC: keep the database code, not an arbitrary message, which can
+    // contain row data even when no query metadata is attached.
+    expect(loggerMock.warn.mock.calls[0]?.[0]).toContain("Error (code=23514)");
     expect(loggerMock.warn.mock.calls[0]).toHaveLength(1);
   });
 });

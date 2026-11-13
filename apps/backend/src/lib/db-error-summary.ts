@@ -14,15 +14,28 @@
  * database and the network stack attach (SQLSTATE or errno code, constraint,
  * table and column names). The message of a query-bearing error (a Drizzle
  * query error, or a server error from Postgres) never appears, nor does any
- * detail, hint, query text or params. Any other error keeps a short,
- * single-line message, because there the message is the diagnosis ("connect
- * ECONNREFUSED", "timeout exceeded when trying to connect") and carries no
- * row data.
+ * detail, hint, query text or params. Other messages survive only when they
+ * exactly match a fixed node-postgres diagnostic. Missing query metadata is
+ * not evidence that a message is safe: JSON encoding can fail before the
+ * query exists, and wrappers can copy a query error into their own message.
+ * Network failures remain diagnosable by their errno code.
  */
 
 const IDENTIFIER = /^[A-Za-z0-9_.$-]{1,64}$/;
 const SQLSTATE = /^[0-9A-Z]{5}$/;
-const MESSAGE_MAX = 200;
+// Exact literals from pg and pg-pool. Code-less timeouts still need a useful
+// diagnosis, but prefixes, truncation and control stripping do not redact row
+// data. Never admit an arbitrary message based on the absence of DB fields.
+const DRIVER_MESSAGES = new Set([
+  "Connection terminated",
+  "Connection terminated unexpectedly",
+  "Connection terminated due to connection timeout",
+  "timeout expired",
+  "timeout exceeded when trying to connect",
+  "Query read timeout",
+  "Client has encountered a connection error and is not queryable",
+  "Client was closed and is not queryable",
+]);
 
 function safeIdentifier(value: unknown): string | undefined {
   return typeof value === "string" && IDENTIFIER.test(value)
@@ -46,15 +59,10 @@ function isQueryBearing(record: Record<string, unknown>): boolean {
   );
 }
 
-function shortMessage(value: unknown): string | undefined {
-  if (typeof value !== "string" || !value) return undefined;
-  // Single line, no control characters, bounded: a log line, not a payload.
-  const flat = value
-    // eslint-disable-next-line no-control-regex -- the control ranges are the point
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
-    .trim();
-  if (!flat) return undefined;
-  return flat.length > MESSAGE_MAX ? `${flat.slice(0, MESSAGE_MAX)}...` : flat;
+function knownDriverMessage(value: unknown): string | undefined {
+  return typeof value === "string" && DRIVER_MESSAGES.has(value)
+    ? value
+    : undefined;
 }
 
 function describeOne(error: unknown): string {
@@ -76,7 +84,7 @@ function describeOne(error: unknown): string {
   }
   const message = isQueryBearing(record)
     ? undefined
-    : shortMessage(record.message);
+    : knownDriverMessage(record.message);
   let text = fields.length ? `${name} (${fields.join(" ")})` : name;
   if (message) text += `: ${message}`;
   return text;
@@ -86,14 +94,21 @@ function describeOne(error: unknown): string {
 const MAX_CAUSE_DEPTH = 4;
 
 export function describeDbError(error: unknown): string {
-  const parts: string[] = [];
-  let current: unknown = error;
-  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current; depth += 1) {
-    parts.push(describeOne(current));
-    current =
-      current && typeof current === "object"
-        ? (current as { cause?: unknown }).cause
-        : undefined;
+  try {
+    const parts: string[] = [];
+    let current: unknown = error;
+    for (let depth = 0; depth < MAX_CAUSE_DEPTH && current; depth += 1) {
+      parts.push(describeOne(current));
+      current =
+        current && typeof current === "object"
+          ? (current as { cause?: unknown }).cause
+          : undefined;
+    }
+    return parts.join(" <- ");
+  } catch {
+    // A thrown value can have getters or be a proxy. Failure reporting must
+    // not itself reject the audit's detached catch or the presentation save.
+    // Do not inspect this second error: it can hold the same private data.
+    return "Error (summary unavailable)";
   }
-  return parts.join(" <- ");
 }
