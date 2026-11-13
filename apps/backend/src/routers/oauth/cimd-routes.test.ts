@@ -456,9 +456,16 @@ describe("a row that is not a client metadata row is never resolved or touched",
   it.each(["admin", "dcr", null])(
     "authorizes a %s row with a URL-shaped id exactly as before",
     async (source) => {
+      // Stale on purpose: a row the resolver treated as its own would be
+      // refetched and rewritten, so a refresh that never happens is the proof
+      // it was never resolved.
       rows.set(
         CIMD_ID,
-        row(CIMD_ID, { registration_source: source, client_name: "Hand made" }),
+        row(CIMD_ID, {
+          registration_source: source,
+          client_name: "Hand made",
+          updated_at: new Date(T0 - 2 * 3_600_000),
+        }),
       );
 
       const res = await authorize(CIMD_ID);
@@ -474,7 +481,11 @@ describe("a row that is not a client metadata row is never resolved or touched",
   it("does not give a pending row of another source the allowlist's approval", async () => {
     rows.set(
       CIMD_ID,
-      row(CIMD_ID, { registration_source: "dcr", approval_status: "pending" }),
+      row(CIMD_ID, {
+        registration_source: "dcr",
+        approval_status: "pending",
+        updated_at: new Date(T0 - 2 * 3_600_000),
+      }),
     );
 
     const res = await authorize(CIMD_ID);
