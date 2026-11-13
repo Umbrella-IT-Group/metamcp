@@ -117,6 +117,37 @@ export function checkBootstrapLog(log: string): string[] {
   return problems;
 }
 
+/**
+ * A foreign Origin receives 200 in both audit and off modes, so the runner's
+ * DNS-rebinding failure cannot distinguish the production default from a
+ * disabled policy. Require both the announced mode and the served-request
+ * event from that scenario. The Origin is pinned by conformance 0.1.16; match
+ * its request, not an unrelated event or the boot line's promise to record.
+ */
+export function checkOriginPolicyLog(log: string): string[] {
+  const problems: string[] = [];
+  if (!log.includes("[origin-policy] MCP_ORIGIN_POLICY=audit: ")) {
+    problems.push(
+      "no boot confirmation for the default MCP_ORIGIN_POLICY=audit",
+    );
+  }
+  const eventHead =
+    '[MetaMCP][system][origin-policy] origin-policy audit: Origin "http://evil.example.com", POST mcp, served (200), credential present,';
+  const hasEvent = log
+    .split(/\r?\n/)
+    .some(
+      (line) =>
+        line.includes(eventHead) &&
+        line.includes("; would be refused under MCP_ORIGIN_POLICY=enforce;"),
+    );
+  if (!hasEvent) {
+    problems.push(
+      "no Origin audit event for the runner's http://evil.example.com request served with 200",
+    );
+  }
+  return problems;
+}
+
 export type RunnerClass = "OK" | "REGRESSION" | "HARNESS";
 
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");

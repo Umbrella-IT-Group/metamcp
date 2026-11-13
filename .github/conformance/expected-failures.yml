@@ -36,5 +36,5 @@ server:
   - elicitation-sep1034-defaults  # a backend cannot elicit through the gateway
   - elicitation-sep1330-enums     # a backend cannot elicit through the gateway
   # Known gaps and features not built.
-  - server-sse-polling            # no priming event: the gateway has no event store (SEP-1699); the fixture also lacks test_reconnection, so this cannot flip until both exist
+  - server-sse-polling            # two warnings: the POST SSE stream has no priming event with id and empty data, and no retry field (SEP-1699)
   - dns-rebinding-protection      # an invalid Origin still gets 200: MCP_ORIGIN_POLICY defaults to audit (serve and record), and Host is not validated

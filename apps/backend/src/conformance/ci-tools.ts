@@ -5,7 +5,7 @@
  * file only maps them to exit codes:
  *
  *   0  fine
- *   1  refused, or a finding (a secret in the results, a leaked bundle, a bootstrap warning)
+ *   1  refused, or a finding (a secret, leaked bundle, bootstrap warning or missing Origin evidence)
  *   2  the tool itself could not do its job (never treat as "fine")
  *  10  guard-db refused the database
  */
@@ -17,6 +17,7 @@ import { isMainModule } from "./cli";
 import {
   checkBootstrapLog,
   checkDatabaseUrl,
+  checkOriginPolicyLog,
   classifyRunnerOutput,
   findConformanceLeaks,
 } from "./gates";
@@ -170,12 +171,17 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
         return EXIT_DATABASE_REFUSED;
       }
 
-      case "bootstrap-gate": {
+      case "bootstrap-gate":
+      case "origin-policy-gate": {
         if (!values.log) {
-          io.err("bootstrap-gate: --log is required\n");
+          io.err(`${command}: --log is required\n`);
           return EXIT_TOOL_FAILED;
         }
-        const problems = checkBootstrapLog(readFileSync(values.log, "utf8"));
+        const check =
+          command === "bootstrap-gate"
+            ? checkBootstrapLog
+            : checkOriginPolicyLog;
+        const problems = check(readFileSync(values.log, "utf8"));
         for (const problem of problems) io.err(`${redact(problem)}\n`);
         return problems.length === 0 ? EXIT_OK : EXIT_REFUSED;
       }
@@ -208,7 +214,7 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 
       default:
         io.err(
-          "usage: ci-tools <alloc-run-dir|verify-run-dir|remove-run-dir|scan|guard-db|bootstrap-gate|classify-runner|check-bundle> [options]\n",
+          "usage: ci-tools <alloc-run-dir|verify-run-dir|remove-run-dir|scan|guard-db|bootstrap-gate|origin-policy-gate|classify-runner|check-bundle> [options]\n",
         );
         return EXIT_TOOL_FAILED;
     }

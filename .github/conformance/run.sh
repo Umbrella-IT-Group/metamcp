@@ -25,7 +25,8 @@
 #   HARNESS         the stack, the smoke test or the runner itself failed; the
 #                   suite result (if any) says nothing about the gateway
 #   REGRESSION      a scenario fails that the baseline does not list, or a listed
-#                   one now passes (delete its line and snapshot rows)
+#                   one now passes (delete its line and snapshot rows), or the
+#                   default Origin audit evidence is missing
 #   REASON CHANGED  a listed scenario fails for a new reason
 #   LEAK            a credential-shaped value was found in the output, which was
 #                   deleted
@@ -254,6 +255,22 @@ case "$verdict_class" in
   REGRESSION) FAILED_CLASSES+=("REGRESSION"); annotate REGRESSION "$verdict" ;;
   *) FAILED_CLASSES+=("HARNESS"); annotate HARNESS "$verdict" ;;
 esac
+
+# The DNS-rebinding scenario gets the same 200 under audit and off. The suite
+# must have completed before requiring its foreign-Origin event; a runner
+# crash is a HARNESS failure and cannot prove a missing gateway behaviour.
+if [ "$verdict_class" != "HARNESS" ]; then
+  note "Origin audit evidence"
+  set +e
+  tools origin-policy-gate --log "$RUN_DIR/gateway.log"
+  origin_rc=$?
+  set -e
+  case "$origin_rc" in
+    0) ;;
+    1) FAILED_CLASSES+=("REGRESSION"); annotate REGRESSION "the default Origin audit policy was not observed (see the lines above)" ;;
+    *) FAILED_CLASSES+=("HARNESS"); annotate HARNESS "the Origin audit evidence could not be read (exit $origin_rc)" ;;
+  esac
+fi
 
 # --------------------------------------------- 9. layer 2: the failing-check snapshot
 if [ "$verdict_class" != "HARNESS" ]; then
