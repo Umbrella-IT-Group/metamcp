@@ -32,7 +32,9 @@ let repoRoot: string;
 let parent: string;
 
 beforeEach(() => {
-  sandbox = realpathSync(mkdtempSync(path.join(tmpdir(), "w6-ci-tools-")));
+  sandbox = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "conformance-test-ci-tools-")),
+  );
   repoRoot = path.join(sandbox, "checkout");
   parent = path.join(sandbox, "out");
   mkdirSync(path.join(repoRoot, ".git"), { recursive: true });

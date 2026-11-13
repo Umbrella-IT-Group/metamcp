@@ -85,7 +85,7 @@ describe("production bundle reachability", () => {
   });
 
   it("would notice a planted import (negative control for the walker)", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "w6-reach-"));
+    const root = mkdtempSync(path.join(tmpdir(), "conformance-test-reach-"));
     try {
       mkdirSync(path.join(root, "conformance"));
       mkdirSync(path.join(root, "lib"));

@@ -32,7 +32,9 @@ const AUTH = `confsec_${HEX64}`;
 let root: string;
 
 beforeEach(() => {
-  root = realpathSync(mkdtempSync(path.join(tmpdir(), "w6-scan-")));
+  root = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "conformance-test-scan-")),
+  );
 });
 
 afterEach(() => {

@@ -1,6 +1,6 @@
 name: Umbrella MCP Conformance (umbrella branch)
 
-# Umbrella IT Group fork — see UMBRELLA_FORK.md.
+# Umbrella IT Group fork, see UMBRELLA_FORK.md.
 # Runs the official MCP conformance suite (@modelcontextprotocol/conformance,
 # pinned in .github/conformance/package-lock.json) against the gateway built from
 # this commit, with a small fixture MCP server registered behind it and a

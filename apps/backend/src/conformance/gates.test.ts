@@ -52,7 +52,7 @@ describe("checkDatabaseUrl", () => {
   it("refuses a non-loopback host, even with the override", () => {
     for (const url of [
       "postgresql://u@db.example.com/metamcp_test",
-      "postgresql://u@10.0.0.5/metamcp_test",
+      "postgresql://u@192.0.2.5/metamcp_test",
       "postgresql://u@localhost.example.com/metamcp_test",
     ]) {
       expect(checkDatabaseUrl(url, strict).ok, url).toBe(false);
@@ -63,7 +63,7 @@ describe("checkDatabaseUrl", () => {
   it("refuses a host smuggled in through a query parameter", () => {
     for (const q of [
       "host=db.example.com",
-      "hostaddr=10.0.0.5",
+      "hostaddr=192.0.2.5",
       "host=relative/dir",
     ]) {
       const url = `postgresql://u@localhost/metamcp_test?${q}`;

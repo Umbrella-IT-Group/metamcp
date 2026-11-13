@@ -40,7 +40,7 @@ describe("parseProxyConfig", () => {
   it("refuses an upstream that is not loopback http, so the key cannot be sent elsewhere", () => {
     for (const url of [
       "http://gateway.example.com/mcp",
-      "http://10.0.0.5:12009/mcp",
+      "http://192.0.2.5:12009/mcp",
       "https://127.0.0.1:12009/mcp",
       "http://localhost.example.com/mcp",
       "not a url",

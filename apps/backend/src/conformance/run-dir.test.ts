@@ -51,7 +51,9 @@ function sentinel(dir: string, name = "sentinel.txt"): string {
 }
 
 beforeEach(() => {
-  sandbox = realpathSync(mkdtempSync(path.join(tmpdir(), "w6-run-dir-")));
+  sandbox = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "conformance-test-run-dir-")),
+  );
   repoRoot = path.join(sandbox, "checkout");
   parent = path.join(sandbox, "caller-out");
   outside = path.join(sandbox, "elsewhere");

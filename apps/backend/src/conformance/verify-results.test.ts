@@ -51,7 +51,7 @@ const failing = (message: string) => [
 ];
 
 beforeEach(() => {
-  dir = mkdtempSync(path.join(tmpdir(), "w6-verify-"));
+  dir = mkdtempSync(path.join(tmpdir(), "conformance-test-verify-"));
   mkdirSync(path.join(dir, "results"));
 });
 
