@@ -319,6 +319,38 @@ class DbOAuthClientProvider implements OAuthClientProvider {
   }
 }
 
+// SDK transports can start OAuth inside a handshake, before useConnection's
+// completion guard runs. Guard the sign-in side effects at call time, while
+// retaining server-keyed credential writes: a stale refresh must still save its
+// rotated refresh token. A proxy preserves optional SDK members exactly, and
+// uses the original provider as `this` for both getters and methods.
+export function scopeAuthProviderToAttempt<T extends OAuthClientProvider>(
+  provider: T,
+  isCurrent: () => boolean,
+): T {
+  return new Proxy(provider, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+
+      if (
+        property === "redirectToAuthorization" ||
+        property === "saveCodeVerifier"
+      ) {
+        return (...args: unknown[]) => {
+          if (!isCurrent()) {
+            // Returning normally would let the SDK report REDIRECT even
+            // though the page never navigated.
+            throw new Error("Connection attempt was superseded before sign-in");
+          }
+          return Reflect.apply(value, target, args);
+        };
+      }
+      return value.bind(target);
+    },
+  });
+}
+
 // Factory function to create an OAuth provider for a specific MCP server
 export function createAuthProvider(
   mcpServerUuid: string,
