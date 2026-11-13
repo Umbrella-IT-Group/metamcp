@@ -44,6 +44,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import logger from "@/utils/logger";
+
 import type { ConnectedClient } from "./client";
 import type { SessionPresentation } from "./endpoint-presentation";
 import type {
@@ -1915,6 +1917,54 @@ describe("a read-only verdict revoked by a backend reconnect is re-verified once
     expect(replacement.listings()).toBe(1);
   });
 
+  it("refuses a fresh listing from a replacement UUID even when recovery selected the original UUID and the full name is unchanged", async () => {
+    const audit = auditRows();
+    const lean = await connectConsumer("s-lean-reverify-new-backend", LEAN);
+    await meta(lean, "search_tools");
+    const { replacement, staleToolCalls, sentTo } = await loseBackendSession();
+    const replacementServer = { uuid: "server-desk-replacement", name: "desk" };
+    getSessionMock.mockClear();
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        if (serverUuid === DESK.uuid) {
+          // Recovery already selected the original UUID. Replace the mount
+          // only now, so the fresh listing sees another backend while the
+          // router's selected UUID still matches the recorded verdict. Only
+          // the callback's fresh-listing UUID comparison can reject it.
+          state.servers = [replacementServer];
+          state.mounts = [
+            {
+              namespaceUuid: NS,
+              serverUuid: replacementServer.uuid,
+              status: "ACTIVE",
+            },
+          ];
+          sessionsByServer.set(replacementServer.uuid, replacement.connected);
+          clearFilterCache();
+          clearOverrideCache(NS);
+        }
+        return sessionsByServer.get(serverUuid);
+      },
+    );
+
+    const result = await meta(lean, "call_tool", { name: "desk__read" });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("changed");
+    expect(staleToolCalls.count).toBe(1);
+    expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+    expect(getSessionMock.mock.calls.map(([, uuid]) => uuid)).toEqual([
+      DESK.uuid,
+      replacementServer.uuid,
+    ]);
+    expect(replacement.listings()).toBe(1);
+    expect(replacement.calls).toEqual([]);
+    expect(sentTo("tools/call")).toBe(0);
+    await audit.arrived(1);
+    expect(audit.rows).toHaveLength(1);
+    expect(audit.rows[0]).toMatchObject({ tool_name: "read", success: false });
+  });
+
   it("refuses an alias that was rebound to a writer while the call waited, though the target it was classified as is still listed read-only", async () => {
     const lean = await connectConsumer("s-lean-reverify-rebound", LEAN);
     await meta(lean, "search_tools");
@@ -2038,6 +2088,7 @@ describe("a read-only verdict revoked by a backend reconnect is re-verified once
       const audit = auditRows();
       const lean = await connectConsumer("s-lean-reverify-fail", LEAN);
       const toolCallsOnDesk = vi.spyOn(desk.connected.client, "request");
+      vi.mocked(logger.error).mockClear();
 
       const { failed, replacementCalls } = await drive(lean);
 
@@ -2049,6 +2100,13 @@ describe("a read-only verdict revoked by a backend reconnect is re-verified once
       // connection (again) and sent the call once more.
       expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(
         replay ? 1 : 0,
+      );
+      // The replay has no further recovery, but its backend-error catch would
+      // misreport a failed listing as a failed tools/call. Keep the decision
+      // outside that catch as well as the first send's recovery detector.
+      expect(logger.error).not.toHaveBeenCalledWith(
+        expect.stringContaining("after session re-initialize:"),
+        expect.anything(),
       );
       if (!replay) {
         expect(
