@@ -11,8 +11,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { startToolCall, STOP_REASON } from "./tool-call-run";
 import { classifyCallFailure } from "./tool-result";
-import { STOP_REASON, startToolCall } from "./tool-call-run";
 
 // What these tests pin: the Inspector's explicit button asks the server to
 // cancel (MCP cancellation utility: a notifications/cancelled naming the
