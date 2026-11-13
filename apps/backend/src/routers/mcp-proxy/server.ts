@@ -468,10 +468,17 @@ const getHttpHeaders = (
  * `mcpServerUuid` fails to open it: no session user, a malformed uuid, a uuid
  * the caller cannot see (another user's private server included), a row of
  * another transport type or with no url, a row marked ERROR, and a row whose
- * address the destination guard refuses. Constant for the reason
- * NO_SUCH_SERVER is: an answer that differs by cause tells a caller which rows
- * exist. The specific reason goes to the log, naming the row by name and uuid
- * when there is one, never by its url.
+ * address the destination guard refuses in the check made before the
+ * transport is built. Constant for the reason NO_SUCH_SERVER is: an answer
+ * that differs by cause tells a caller which rows exist. The specific reason
+ * goes to the log, naming the row by name and uuid when there is one, never by
+ * its url.
+ *
+ * Not covered: a refusal by the guard on a request the transport makes later
+ * (the SSE stream's first GET, a redirect hop, a lookup whose answer changed)
+ * fails that request inside the transport, and a custom auth header naming a
+ * reserved identity header (INSPECTOR_RESERVED_HEADER) keeps the answer it
+ * gets on the by-url path. Neither answer names a row or an address.
  */
 const REGISTERED_SERVER_REFUSED =
   "This MCP server cannot be opened here: it is not a server you can see, it is in an error state, or its address is not one this gateway connects to. The gateway log records the specific reason.";

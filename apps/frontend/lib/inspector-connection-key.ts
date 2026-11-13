@@ -8,13 +8,13 @@ import type { ConnectionStatus } from "./constants";
  *
  * The Inspector page connects through the gateway's proxy, and the proxy
  * rebuilds the connection from the stored `mcp_servers` row at connect time
- * (see `findRegisteredStdioServer` and `findAccessibleRemoteServer` in
+ * (see `findRegisteredStdioServer` and `findRegisteredRemoteServer` in
  * `apps/backend/src/routers/mcp-proxy/server.ts`). So the settings that matter
  * are the ones the proxy reads, not only the ones the page passes to
  * `useConnection`:
  *
- *   uuid         which row the proxy resolves (STDIO), and which OAuth state the
- *                hook keys on.
+ *   uuid         which row the proxy resolves, for every transport, and which
+ *                OAuth state the hook keys on.
  *   type         picks the transport (STDIO, SSE, STREAMABLE_HTTP).
  *   command,
  *   args, env    what a STDIO server spawns. `args` is kept as an array: the
@@ -22,13 +22,15 @@ import type { ConnectionStatus } from "./constants";
  *                different servers even though the page joins them into the
  *                same string for the hook.
  *   url          the destination of a remote server.
- *   bearerToken  becomes the Authorization header the hook sends. This fork's
- *                list serializer always returns it as null (the token is never
- *                sent to the browser), so the field is inert here: a bearer-only
- *                edit cannot change the key and cannot change what the
- *                Inspector connects with either. It stays in the key because
- *                the page passes it to the hook, so the key follows the page if
- *                the serializer ever returns it.
+ *   bearerToken  This fork's list serializer always returns it as null (the
+ *                token is never sent to the browser), so the field cannot
+ *                change the key. The proxy reads the row's own credential at
+ *                connect time (`registeredServerToken`: its OAuth token, else
+ *                its stored bearer), so a bearer-only edit takes effect on the
+ *                next connect, but it does not change this key and does not
+ *                reconnect a session that is already open. It stays in the key
+ *                because the page passes it to the hook, so the key follows
+ *                the page if the serializer ever returns it.
  *   headers      stored request headers the proxy merges into every outbound
  *                remote request.
  *
