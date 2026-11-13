@@ -173,7 +173,7 @@ describe("classifyBackendAuthRejection", () => {
 
     it("a network failure", () => {
       const refused = new TypeError("fetch failed", {
-        cause: Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:3000"), {
+        cause: Object.assign(new Error("connect ECONNREFUSED 192.0.2.1:3000"), {
           code: "ECONNREFUSED",
         }),
       });
