@@ -35,6 +35,7 @@
 import { createHash } from "node:crypto";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   type CallToolResult,
@@ -81,6 +82,10 @@ const { state, queries, getSessionMock, serverStateMock, config } = vi.hoisted(
       resetOnProgress: true,
       /** Runs once the handler is about to read the timeout, just before the send. */
       beforeTimeoutRead: undefined as (() => Promise<void>) | undefined,
+      /** How many times the total-timeout setting was read this test. */
+      maxTotalReads: 0,
+      /** The read (1-based) that never answers, if any. */
+      hangMaxTotalRead: undefined as number | undefined,
     },
   }),
 );
@@ -129,7 +134,13 @@ vi.mock("../config.service", () => ({
       await config.beforeTimeoutRead?.();
       return config.timeoutMs;
     },
-    getMcpMaxTotalTimeout: async () => config.maxTotalMs,
+    getMcpMaxTotalTimeout: async () => {
+      config.maxTotalReads += 1;
+      if (config.maxTotalReads === config.hangMaxTotalRead) {
+        await new Promise<never>(() => undefined);
+      }
+      return config.maxTotalMs;
+    },
     getMcpToolCallReconnectWarmupTimeout: async () => 0,
   },
 }));
@@ -185,6 +196,8 @@ vi.mock("./tool-call-warmup", () => ({
 }));
 
 import { setGatewayEventSinkForTesting } from "../gateway-events/sink";
+import { DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS } from "../mcp-timeout-defaults";
+import { metamcpLogStore } from "./log-store";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { clearFilterCache } from "./metamcp-middleware/filter-tools.functional";
 import { clearOverrideCache } from "./metamcp-middleware/tool-overrides.functional";
@@ -257,6 +270,8 @@ interface Desk extends TestBackend {
   completed: string[];
   /** Ids whose handler returned because its request was aborted. */
   abortedIds: string[];
+  /** How many tools/list requests the backend answered. */
+  listings: () => number;
 }
 
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
@@ -297,9 +312,11 @@ async function makeDesk(): Promise<Desk> {
     },
     { serverName: DESK.name },
   );
-  made.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [READ, WRITE],
-  }));
+  let listingCount = 0;
+  made.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    listingCount += 1;
+    return { tools: [READ, WRITE] };
+  });
   cleanups.push(() => made.close());
 
   const wire: Desk["wire"] = { calls: [], cancels: [] };
@@ -340,6 +357,7 @@ async function makeDesk(): Promise<Desk> {
     },
     completed,
     abortedIds,
+    listings: () => listingCount,
   };
 }
 
@@ -356,6 +374,8 @@ interface ProgressSeen {
 
 interface Consumer {
   client: Client;
+  /** The session's shared, per-instance handler context (never a call's own). */
+  handlerContext: object;
   sessionId: string;
   /** Progress notifications and the "result" marker, in arrival order. */
   log: Array<ProgressSeen | "result">;
@@ -375,7 +395,7 @@ async function connectConsumer(
     holdProgress?: boolean;
   } = {},
 ): Promise<Consumer> {
-  const { server, cleanup } = lean
+  const { server, cleanup, handlerContext } = lean
     ? await createServer(NS, sessionId, false, LEAN)
     : await createServer(NS, sessionId);
   const [consumerSide, gatewaySide] = InMemoryTransport.createLinkedPair();
@@ -425,6 +445,7 @@ async function connectConsumer(
   cleanups.push(close);
   return {
     client,
+    handlerContext,
     sessionId,
     log,
     progress: () =>
@@ -618,6 +639,8 @@ beforeEach(async () => {
   config.maxTotalMs = 600_000;
   config.resetOnProgress = true;
   config.beforeTimeoutRead = undefined;
+  config.maxTotalReads = 0;
+  config.hangMaxTotalRead = undefined;
   state.servers = [DESK];
   state.mounts = [
     { namespaceUuid: NS, serverUuid: DESK.uuid, status: "ACTIVE" },
@@ -1579,5 +1602,532 @@ describe("kill switches, each alone", () => {
         });
       },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A `call_tool` verdict revoked by a catalog invalidation is re-verified once,
+// at each of two check points (the early middleware, and the router just before
+// the send), and the wait for the fresh listing is bounded.
+//
+// Every wait below holds the fresh listing at its session acquisition (a hang
+// no SDK request timeout bounds), so the only things that can end it are the
+// consumer's cancel and the gateway's own deadline.
+// ---------------------------------------------------------------------------
+
+describe("the re-verification of a revoked call_tool verdict", () => {
+  const SESSION_NOT_FOUND = () =>
+    new StreamableHTTPError(
+      404,
+      'Error POSTing to endpoint: {"jsonrpc":"2.0","error":{"code":-32001,"message":"Session not found"},"id":null}',
+    );
+  const CHANGED = "the tool behind this name changed";
+  const UNAVAILABLE = "catalog could not be read";
+
+  /**
+   * Whether a condition comes true within a bounded run of microtask turns.
+   * A boolean rather than a throw, so a build that never gets there fails the
+   * test on an assertion about what it did not do.
+   */
+  async function reachedWithin(condition: () => boolean): Promise<boolean> {
+    for (let turn = 0; turn < 500 && !condition(); turn += 1) await flush(50);
+    return condition();
+  }
+
+  /** Holds `count` calls where the router reads the timeout: past the early check, the filter and the routing, just before the send. */
+  function holdAtRouter(count = 1) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached = 0;
+    config.beforeTimeoutRead = async () => {
+      reached += 1;
+      await gate;
+    };
+    return {
+      held: () => reachedWithin(() => reached >= count),
+      release: () => {
+        config.beforeTimeoutRead = undefined;
+        release();
+      },
+    };
+  }
+
+  /** Holds the call at its alias resolution: before the early check. */
+  function holdAtEarlyCheck() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reachedFlag = false;
+    let armed = true;
+    state.beforeQueryResult = async (query) => {
+      if (
+        armed &&
+        query.table === "mappings" &&
+        query.where["ntm.override_name"] === "read"
+      ) {
+        armed = false;
+        reachedFlag = true;
+        await gate;
+      }
+    };
+    return {
+      held: () => reachedWithin(() => reachedFlag),
+      release,
+    };
+  }
+
+  /** The next listing's session acquisition waits for `release`. */
+  function holdNextListing() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reachedFlag = false;
+    getSessionMock.mockImplementationOnce(async () => {
+      reachedFlag = true;
+      await gate;
+      return desk.session;
+    });
+    return {
+      reached: () => reachedWithin(() => reachedFlag),
+      release,
+    };
+  }
+
+  /** What the reconnect does to a verdict: drops the snapshot. Nothing else changes. */
+  const revoke = () => clearOverrideCache(NS);
+
+  async function warm(sessionId: string, lean = true) {
+    const consumer = await connectConsumer(sessionId, lean);
+    await consumer.client.callTool({ name: "search_tools", arguments: {} });
+    return consumer;
+  }
+
+  type Point = "the early check" | "the router's check";
+  const POINTS: Point[] = ["the early check", "the router's check"];
+
+  /**
+   * Starts a `call_tool` and holds it, revoked, at `point`, with the listing it
+   * will then ask for held at its session acquisition. Returns once the call
+   * is waiting on that listing.
+   */
+  async function waitingOnListing(
+    point: Point,
+    consumer: Consumer,
+    id: string,
+    signal?: AbortSignal,
+  ) {
+    const hold =
+      point === "the early check" ? holdAtEarlyCheck() : holdAtRouter();
+    const call = leanCall(consumer, "call_tool", "read", {
+      id,
+      token: `tok-${id}`,
+      signal,
+    });
+    expect(await hold.held(), `the call reached ${point}`).toBe(true);
+    revoke();
+    const listing = holdNextListing();
+    hold.release();
+    const asked = await listing.reached();
+    if (!asked) {
+      // Settle the call before failing, so nothing is left running.
+      listing.release();
+      await call.catch(() => undefined);
+    }
+    expect(asked, "the revoked call asked for a fresh listing").toBe(true);
+    return { call, listing };
+  }
+
+  it.each(POINTS)(
+    "settles an explicit cancel while the fresh listing is held at %s, audits it as cancelled, and a late listing cannot resume it",
+    async (point) => {
+      const audit = auditRows();
+      const lean = await warm("sess-reverify-cancel");
+      const controller = new AbortController();
+      const { call, listing } = await waitingOnListing(
+        point,
+        lean,
+        "rc1",
+        controller.signal,
+      );
+      const outcome = rejectionOf(call);
+
+      controller.abort();
+      await outcome;
+      // The gateway's handler settled while the listing is STILL held.
+      await audit.arrived(1);
+      expect(audit.rows[0]).toMatchObject({
+        tool_name: "read",
+        session_id: "sess-reverify-cancel",
+        success: false,
+        error_code: "cancelled",
+        error_detail: "outcome_unknown",
+      });
+
+      listing.release();
+      await flush(300);
+      expect(desk.wire.calls).toEqual([]);
+      expect(desk.wire.cancels).toEqual([]);
+      expect(desk.live).toEqual([]);
+      expect(audit.rows).toHaveLength(1);
+    },
+  );
+
+  it.each(POINTS)(
+    "answers unavailable at the configured limit, not before, while the fresh listing is held at %s, and sends nothing",
+    async (point) => {
+      useCap();
+      const audit = auditRows();
+      const lean = await warm("sess-reverify-deadline");
+      const { call, listing } = await waitingOnListing(point, lean, "rd1");
+      let settled = false;
+      void call.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+
+      // config.maxTotalMs is 1 000 under useCap().
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const refused = await call;
+      expect(refused.isError).toBe(true);
+      expect(textOf(refused)).toContain(UNAVAILABLE);
+      expect(textOf(refused)).not.toContain("changed");
+      await audit.arrived(1);
+      expect(audit.rows[0]).toMatchObject({
+        success: false,
+        error_code: "tool_error",
+      });
+
+      listing.release();
+      await flush(300);
+      expect(desk.wire.calls).toEqual([]);
+      expect(audit.rows).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each([
+    ["the early check", 1],
+    ["the router's check", 2],
+  ] as Array<[Point, number]>)(
+    "does not hang on a setting lookup that never answers at %s: the default limit still ends the wait",
+    async (point, read) => {
+      useCap();
+      const lean = await warm("sess-reverify-hung-setting");
+      // The router reads the setting itself before its own check, so that
+      // check's re-verification is the second read.
+      config.hangMaxTotalRead = read;
+      const { call, listing } = await waitingOnListing(point, lean, "rh1");
+      let settled = false;
+      void call.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const refused = await call;
+      expect(textOf(refused)).toContain(UNAVAILABLE);
+      listing.release();
+      await flush(300);
+      expect(desk.wire.calls).toEqual([]);
+    },
+  );
+
+  it.each([0, Number.NaN])(
+    "falls back to the default limit when the setting is %s, and says so in the system log",
+    async (bad) => {
+      useCap();
+      const lines: string[] = [];
+      const off = metamcpLogStore.addListener((entry) =>
+        lines.push(entry.message),
+      );
+      cleanups.push(off);
+      const lean = await warm("sess-reverify-bad-setting");
+      config.maxTotalMs = bad;
+      const { call, listing } = await waitingOnListing(
+        "the early check",
+        lean,
+        "rb1",
+      );
+      let settled = false;
+      void call.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      await vi.advanceTimersByTimeAsync(DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(textOf(await call)).toContain(UNAVAILABLE);
+      expect(
+        lines.filter((line) => /default wait limit/.test(line)),
+      ).toHaveLength(1);
+      listing.release();
+    },
+  );
+
+  it.each(POINTS)(
+    "with MCP_TOOL_CALL_CANCEL=off a cancel does not end the wait at %s: the call runs when the listing answers, and is not audited as cancelled",
+    async (point) => {
+      setEnv("MCP_TOOL_CALL_CANCEL", "off");
+      const audit = auditRows();
+      const lean = await warm("sess-reverify-cancel-off");
+      const controller = new AbortController();
+      const { call, listing } = await waitingOnListing(
+        point,
+        lean,
+        "ro1",
+        controller.signal,
+      );
+      const outcome = rejectionOf(call);
+      controller.abort();
+      await outcome;
+      await flush(300);
+      expect(audit.rows).toEqual([]);
+
+      listing.release();
+      await until(() => desk.live.length === 1, "the call running after all");
+      desk.liveOf("ro1").finish();
+      await audit.arrived(1);
+      expect(audit.rows[0]).toMatchObject({ tool_name: "read", success: true });
+      expect(audit.rows[0].error_code).not.toBe("cancelled");
+    },
+  );
+
+  it("with MCP_TOOL_CALL_CANCEL=off the deadline still ends the wait", async () => {
+    setEnv("MCP_TOOL_CALL_CANCEL", "off");
+    useCap();
+    const lean = await warm("sess-reverify-cancel-off-deadline");
+    const controller = new AbortController();
+    const { call, listing } = await waitingOnListing(
+      "the router's check",
+      lean,
+      "ro2",
+      controller.signal,
+    );
+    const outcome = rejectionOf(call);
+    controller.abort();
+    await outcome;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flush(300);
+    listing.release();
+    await flush(300);
+    expect(desk.wire.calls).toEqual([]);
+  });
+
+  it.each(POINTS)(
+    "a closed consumer transport is not a cancel at %s: the wait goes on and the call runs to completion when the listing answers",
+    async (point) => {
+      const audit = auditRows();
+      const lean = await warm("sess-reverify-close");
+      const { call, listing } = await waitingOnListing(point, lean, "rt1");
+      const outcome = rejectionOf(call);
+
+      await lean.client.close();
+      await outcome;
+      await flush(300);
+      expect(audit.rows).toEqual([]);
+
+      listing.release();
+      await until(() => desk.live.length === 1, "the call running after all");
+      expect(desk.wire.cancels).toEqual([]);
+      desk.liveOf("rt1").finish();
+      await until(() => desk.completed.includes("rt1"), "the call ending");
+      await audit.arrived(1);
+      expect(audit.rows[0]).toMatchObject({ tool_name: "read" });
+      expect(audit.rows[0].error_code).not.toBe("cancelled");
+    },
+  );
+
+  it("refuses a load invalidated while it ran, using that load's own validity and not a new one, after exactly one listing at the check point", async () => {
+    const audit = auditRows();
+    const lean = await warm("sess-reverify-stale-load");
+    const { call, listing } = await waitingOnListing(
+      "the router's check",
+      lean,
+      "rs1",
+    );
+    const listingsBefore = desk.listings();
+    // The fresh load is invalidated during its own await, then returns late.
+    revoke();
+    listing.release();
+
+    const refused = await call;
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain(CHANGED);
+    await flush(300);
+    // One listing for the re-verification (the warm search was the other),
+    // never a second load at the same check point.
+    expect(desk.listings()).toBe(listingsBefore + 1);
+    expect(desk.wire.calls).toEqual([]);
+    await audit.arrived(1);
+    expect(audit.rows[0]).toMatchObject({ success: false });
+  });
+
+  it("sends nothing when the catalog is invalidated after the re-verification's last check but before the router resumes", async () => {
+    const audit = auditRows();
+    const lean = await warm("sess-reverify-handoff");
+    // The log line of a passed re-verification is written after the helper's
+    // own last check and before it returns to its caller: exactly that gap.
+    let reverified = 0;
+    const off = metamcpLogStore.addListener((entry) => {
+      if (!/re-verified/.test(entry.message)) return;
+      reverified += 1;
+      revoke();
+    });
+    cleanups.push(off);
+    const router = holdAtRouter();
+    const call = leanCall(lean, "call_tool", "read", {
+      id: "rg1",
+      token: "tok-rg1",
+    });
+    expect(await router.held(), "the call reached the router").toBe(true);
+    revoke();
+    router.release();
+
+    const refused = await call;
+    await flush(300);
+    // The revoked call was given its verdict again, and only then refused.
+    expect(reverified).toBe(1);
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain(CHANGED);
+    expect(desk.wire.calls).toEqual([]);
+    expect(desk.live).toEqual([]);
+    await audit.arrived(1);
+    expect(audit.rows[0]).toMatchObject({ success: false });
+  });
+
+  it("gives the router one attempt for its first send and its replay together: a second revocation during recovery is refused without another listing or send", async () => {
+    const audit = auditRows();
+    const lean = await warm("sess-reverify-budget");
+    const listingsBefore = desk.listings();
+    const real = desk.session.client.request.bind(desk.session.client);
+    let toolCalls = 0;
+    let recovering = false;
+    vi.spyOn(desk.session.client, "request").mockImplementation(((
+      message: { method: string },
+      schema: never,
+      options: never,
+    ) => {
+      if (message.method === "tools/call") {
+        toolCalls += 1;
+        recovering = true;
+        return Promise.reject(SESSION_NOT_FOUND());
+      }
+      return real(message as never, schema, options);
+    }) as never);
+    // The recovery's own session acquisition revokes the verdict again.
+    getSessionMock.mockImplementation(async () => {
+      if (recovering) {
+        recovering = false;
+        revoke();
+      }
+      return desk.session;
+    });
+    const router = holdAtRouter();
+    const call = leanCall(lean, "call_tool", "read", {
+      id: "rb2",
+      token: "tok-rb2",
+    });
+    expect(await router.held(), "the call reached the router").toBe(true);
+    revoke();
+    router.release();
+
+    const refused = await call;
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain(CHANGED);
+    // The first send's re-verification listed once; the replay did not.
+    expect(desk.listings()).toBe(listingsBefore + 1);
+    expect(toolCalls).toBe(1);
+    expect(desk.wire.calls).toEqual([]);
+    await audit.arrived(1);
+    await flush();
+    expect(audit.rows).toHaveLength(1);
+  });
+
+  it("gives the early check and the router one attempt each: a call revoked twice is re-verified twice and then runs once", async () => {
+    const audit = auditRows();
+    const lean = await warm("sess-reverify-both");
+    const early = holdAtEarlyCheck();
+    const call = leanCall(lean, "call_tool", "read", { id: "rboth" });
+    expect(await early.held(), "the call reached the early check").toBe(true);
+    revoke();
+    const listingsBefore = desk.listings();
+    const router = holdAtRouter();
+    early.release();
+    if (!(await router.held())) {
+      // The early check refused it: settle the call, then fail on that.
+      await call.catch(() => undefined);
+    }
+    expect(await router.held(), "the call reached the router").toBe(true);
+    // The early check re-verified (one listing); revoke again before the send.
+    expect(desk.listings()).toBe(listingsBefore + 1);
+    revoke();
+    router.release();
+    await until(() => desk.live.length === 1, "the call running");
+    desk.liveOf("rboth").finish();
+    expect(textOf(await call)).toBe("finished rboth by read");
+    expect(desk.listings()).toBe(listingsBefore + 2);
+    expect(desk.wire.calls).toHaveLength(1);
+    await audit.arrived(1);
+    expect(audit.rows[0]).toMatchObject({ tool_name: "read", success: true });
+  });
+
+  it("shares one fresh load between two concurrent calls of a session and keeps their verdicts apart: cancelling one leaves the other to finish once", async () => {
+    const audit = auditRows();
+    const lean = await warm("sess-reverify-shared");
+    const instanceBefore = { ...(lean.handlerContext as object) };
+    const router = holdAtRouter(2);
+    const cancelA = new AbortController();
+    const callA = rejectionOf(
+      leanCall(lean, "call_tool", "read", {
+        id: "A",
+        token: "tok-A",
+        signal: cancelA.signal,
+      }),
+    );
+    const callB = leanCall(lean, "call_tool", "read", {
+      id: "B",
+      token: "tok-B",
+    });
+    expect(await router.held(), "both calls reached the router").toBe(true);
+    revoke();
+    getSessionMock.mockClear();
+    const listing = holdNextListing();
+    const listingsBefore = desk.listings();
+    router.release();
+    expect(await listing.reached(), "the calls asked for a listing").toBe(true);
+    // Both calls wait on the one load: it asked for a session once.
+    await flush(300);
+    expect(getSessionMock).toHaveBeenCalledTimes(1);
+
+    cancelA.abort();
+    await callA;
+    await audit.arrived(1);
+    expect(audit.rows[0]).toMatchObject({
+      error_code: "cancelled",
+      params_hash: sha256({ id: "A" }),
+    });
+    // B still waits: nothing was aborted or invalidated for A's sake.
+    listing.release();
+    await until(() => desk.live.length === 1, "B running");
+    expect(desk.wire.calls.map((entry) => entry.args)).toEqual([{ id: "B" }]);
+    desk.liveOf("B").finish();
+    expect(textOf(await callB)).toBe("finished B by read");
+    expect(desk.listings()).toBe(listingsBefore + 1);
+    await audit.arrived(2);
+    expect(
+      audit.rows.find((row) => row.params_hash === sha256({ id: "B" })),
+    ).toMatchObject({ success: true });
+    // Neither refresh touched the shared instance context.
+    expect({ ...(lean.handlerContext as object) }).toEqual(instanceBefore);
+    expect(lean.handlerContext).not.toHaveProperty("classifiedTargetIsCurrent");
+    expect(lean.handlerContext).not.toHaveProperty("reverifyClassifiedTarget");
   });
 });

@@ -71,8 +71,11 @@ import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditingMiddleware } from "./metamcp-middleware/auditing.functional";
 import {
   type ClassifiedCallContext,
+  classifiedTargetDecision,
+  type ClassifiedTargetEnvironment,
   classifiedTargetRefusal,
   createClassifiedTargetMiddleware,
+  type ReverifyBudget,
 } from "./metamcp-middleware/classified-target.functional";
 import {
   createFilterCallToolMiddleware,
@@ -1423,18 +1426,73 @@ export const createServer = async (
         if (onprogress) mcpRequestOptions.onprogress = onprogress;
       }
 
-      const callOnce = async (session: ConnectedClient) => {
-        // The filter, dynamic routing, timeout config and recovery all await.
-        // Recheck a `call_tool` verdict immediately before each send, with the
-        // actual backend UUID: the prefix may have been reused, or same-target
-        // hints invalidated. A refusal sends nothing, so there is nothing to
-        // cancel.
-        const refusal = classifiedTargetRefusal(request, context, serverUuid);
-        if (refusal) {
-          leanLog(
-            "warn",
-            "lean listing: call_tool refused a tool that changed",
+      // The verdict this call is judged by. A revoked verdict that a fresh
+      // listing gives again is replaced here by a NEW context that differs only
+      // in its validity check. The context the chain handed in is per call, but
+      // it is never edited either, and the session's own never holds a verdict.
+      let verdictContext = context;
+      // This check point's one re-verification. It lives out here, not inside
+      // `callOnce`, so the first send and the replay share it: a verdict
+      // revoked a second time during recovery is refused, not looked at again.
+      const reverifyBudget: ReverifyBudget = { used: false };
+      const verdictStands = (): boolean =>
+        classifiedTargetRefusal(request, verdictContext, serverUuid) ===
+        undefined;
+      /**
+       * Gives a verdict that does not stand its one look at a fresh listing
+       * (see `classifiedTargetDecision`): a refusal to return, or `undefined`
+       * to go on with a verdict that stands again. Called only when
+       * `verdictStands()` is false, so a call with no verdict or a verdict that
+       * stands awaits nothing.
+       *
+       * It runs OUTSIDE the recovery `try` below on purpose. That `catch`
+       * decides, from an error's text, whether the backend provably never ran
+       * a request and so may be sent again. A failure of this decision is not a
+       * failure of a backend request: whatever its text says ("Not connected"
+       * included), it must neither start a recovery nor send anything. A
+       * cancel is reported as the call chain reports any other.
+       */
+      const reverifyBeforeSend = async (): Promise<
+        CallToolResult | undefined
+      > => {
+        try {
+          const decision = await classifiedTargetDecision(
+            request,
+            verdictContext,
+            {
+              ...classifiedTargetEnvironment,
+              budget: reverifyBudget,
+              resolvedServerUuid: serverUuid,
+            },
           );
+          if (decision.refusal) return decision.refusal;
+          verdictContext = decision.context;
+          return undefined;
+        } catch (error) {
+          if (error instanceof ToolCallCancelledError) noteCancelled();
+          throw error;
+        }
+      };
+
+      const callOnce = async (session: ConnectedClient) => {
+        // The filter, dynamic routing, timeout config, recovery and a
+        // re-verification all await. This is the last word: it checks a
+        // `call_tool` verdict immediately before each send, with the actual
+        // backend UUID (the prefix may have been reused, or same-target hints
+        // invalidated), in the same synchronous run as the request below, so
+        // nothing can be invalidated between the two. After a re-verification
+        // it is also the router's own check in its own continuation: the
+        // decision's check alone is not enough, because another call can
+        // invalidate the catalog before this one resumes. Nothing else may be
+        // awaited between this check and the send. A refusal sends nothing, so
+        // there is nothing to cancel.
+        const refusal = classifiedTargetRefusal(
+          request,
+          verdictContext,
+          serverUuid,
+        );
+        if (refusal) {
+          classifiedTargetEnvironment.onRefused?.("changed");
           return refusal;
         }
         try {
@@ -1458,6 +1516,10 @@ export const createServer = async (
         }
       };
 
+      if (!verdictStands()) {
+        const refused = await reverifyBeforeSend();
+        if (refused) return refused;
+      }
       try {
         return (await callOnce(clientForTool)) as CallToolResult;
       } catch (error) {
@@ -1561,6 +1623,14 @@ export const createServer = async (
         }
         toolToClient[name] = freshSession;
 
+        // Recovery is what revokes a verdict (the pool's invalidation fires the
+        // list-changed subscribers, which drop the catalog snapshot), so this
+        // is where a read-only call used to be refused for nothing. If this
+        // call already used its attempt, the verdict is refused as it stands.
+        if (!verdictStands()) {
+          const refused = await reverifyBeforeSend();
+          if (refused) return refused;
+        }
         try {
           return (await callOnce(freshSession)) as CallToolResult;
         } catch (retryError) {
@@ -1654,6 +1724,32 @@ export const createServer = async (
     });
   };
 
+  // What the two check points of a `call_tool` verdict report, in the lean
+  // listing's own words. Fixed text only: no argument value, no tool output,
+  // no backend error body and no tool or server name ever goes in a line.
+  const classifiedTargetEnvironment: ClassifiedTargetEnvironment = {
+    onRefused: (cause) =>
+      leanLog(
+        "warn",
+        cause === "unavailable"
+          ? "lean listing: call_tool could not read the catalog to re-verify a revoked verdict"
+          : "lean listing: call_tool refused a tool that changed",
+      ),
+    onReverified: () =>
+      leanLog(
+        "info",
+        "lean listing: call_tool verdict re-verified after a catalog change",
+      ),
+    onTimeoutSettingUnusable: () =>
+      leanLog(
+        "warn",
+        "lean listing: call_tool re-verification used the default wait limit; the configured limit was unusable",
+      ),
+    // MCP_MAX_TOTAL_TIMEOUT also bounds this wait (classified-target
+    // .functional.ts, awaitReverification). Read when a wait starts.
+    maxTotalTimeoutMs: () => configService.getMcpMaxTotalTimeout(),
+  };
+
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
     // A name this proxy holds no schema for is shaped after the call from its
@@ -1682,11 +1778,10 @@ export const createServer = async (
     // runs the tool: a `call_tool` call (the lean listing's read-only door) is
     // refused when the name now leads to another tool than the one its
     // read-only verdict was given for. A call that carries no verdict passes
-    // untouched. See classified-target.functional.ts; do not move it.
-    createClassifiedTargetMiddleware({
-      onRefused: () =>
-        leanLog("warn", "lean listing: call_tool refused a tool that changed"),
-    }),
+    // untouched. A verdict that a catalog invalidation revoked is given one
+    // look at a fresh listing first. See classified-target.functional.ts; do
+    // not move it.
+    createClassifiedTargetMiddleware(classifiedTargetEnvironment),
     // The mount status is part of this verdict: a public session's call to a
     // server whose mount is INACTIVE is refused here even when the session
     // still holds a route to it from an earlier listing, and the handler then
@@ -1814,7 +1909,11 @@ export const createServer = async (
     // A `call_tool` call carries the tool its read-only verdict was given for,
     // on a clone of the instance context made for this call alone (the filter
     // does the same with its verdict). The instance context is shared by every
-    // concurrent call of the session, so the field never goes on it.
+    // concurrent call of the session, so the field never goes on it. The
+    // callback that re-verifies the verdict after a catalog invalidation rides
+    // with it, and the fresh validity check a re-verification returns replaces
+    // the one on a copy of this clone, never on the instance's context or on
+    // another call's.
     const callContext: ClassifiedCallContext =
       prelude?.classifiedTarget === undefined
         ? handlerContext
@@ -1823,6 +1922,7 @@ export const createServer = async (
             classifiedTarget: prelude.classifiedTarget,
             classifiedServerUuid: prelude.classifiedServerUuid,
             classifiedTargetIsCurrent: prelude.classifiedTargetIsCurrent,
+            reverifyClassifiedTarget: prelude.reverifyClassifiedTarget,
           };
     // Progress goes back under the consumer's own token, and only when the
     // consumer sent one (MCP spec, basic/utilities/progress). A token that is

@@ -240,7 +240,11 @@ export interface LeanListing {
   readonly origins?: ReadonlyMap<string, readonly string[]>;
   /** Backend UUID by original full name, captured by this listing, never a route read later. */
   readonly serverUuids?: ReadonlyMap<string, string>;
-  /** False after an invalidation, including for an old load still returning to its waiters. */
+  /**
+   * False after an invalidation, including for an old load still returning to
+   * its waiters. A re-verification (`createLeanPrelude`) accepts a listing only
+   * while this is defined and true, and hands it on as the call's new proof.
+   */
   readonly isCurrent?: () => boolean;
 }
 
@@ -1035,6 +1039,14 @@ export class LeanCatalog {
    * Capture before loading: invalidation revokes hints already handed to a
    * caller too. Identity alone cannot detect a same-target annotation change.
    * Expiry still controls reuse through get(); this guard tracks changes.
+   *
+   * The closure a load captured BEFORE it started is the only proof that
+   * listing carries, and it is what a re-verification of a revoked verdict
+   * returns (`createLeanPrelude`). Invalidation revokes conservatively, and
+   * only a listing read after it can give a verdict again; one captured after
+   * a load returned would vouch for hints that an invalidation overtook while
+   * the load ran. An old load still returns its listing to its original
+   * waiters, with its own closure already false.
    */
   captureValidity(): () => boolean {
     const epoch = this.epoch;
