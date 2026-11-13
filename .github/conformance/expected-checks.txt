@@ -1,0 +1,20 @@
+completion-complete	FAILURE	completion-complete	6101c6c61baa769c	-	Failed: MCP error -32601: Method not found
+dns-rebinding-protection	FAILURE	localhost-host-rebinding-rejected	c9bccb246c9697bd	1bbd9ceb06212db2	Expected HTTP 4xx for invalid Host/Origin headers, got 200
+elicitation-sep1034-defaults	FAILURE	elicitation-sep1034-general	07c1f6f0b6e21a3b	-	Server did not request elicitation from client
+elicitation-sep1330-enums	FAILURE	elicitation-sep1330-general	07c1f6f0b6e21a3b	-	Server did not request elicitation from client
+logging-set-level	FAILURE	logging-set-level	6101c6c61baa769c	-	Failed: MCP error -32601: Method not found
+prompts-get-embedded-resource	FAILURE	prompts-get-embedded-resource	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+prompts-get-simple	FAILURE	prompts-get-simple	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+prompts-get-with-args	FAILURE	prompts-get-with-args	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+prompts-get-with-image	FAILURE	prompts-get-with-image	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+resources-read-binary	FAILURE	resources-read-binary	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+resources-read-text	FAILURE	resources-read-text	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+resources-subscribe	FAILURE	resources-subscribe	6101c6c61baa769c	-	Failed: MCP error -32601: Method not found
+resources-templates-read	FAILURE	resources-templates-read	656566fb4531e584	-	Failed: MCP error -32601: MCP error -32601: This gateway serves tools only; prompts and resources are not available.
+resources-unsubscribe	FAILURE	resources-unsubscribe	6101c6c61baa769c	-	Failed: MCP error -32601: Method not found
+server-sse-polling	WARNING	server-sse-priming-event	4eaeca60d3f9eaff	3a5f3950e3b45e76	Server did not send priming event with id and empty data on POST SSE stream. This is recommended for resumability.
+server-sse-polling	WARNING	server-sse-retry-field	cef50c678aecf30c	9d915d55e16f90b0	Server did not send retry field. This is recommended for controlling client reconnection timing.
+tools-call-elicitation	FAILURE	tools-call-elicitation	07c1f6f0b6e21a3b	621efd3716f2488a	Server did not request elicitation from client
+tools-call-sampling	FAILURE	tools-call-sampling	fe06d32f8130daef	273c373cb181b529	Server did not request sampling from client
+tools-call-with-logging	FAILURE	tools-call-with-logging	6101c6c61baa769c	-	Failed: MCP error -32601: Method not found
+tools-call-with-progress	FAILURE	tools-call-with-progress	e0aab0451cf22d7e	993d57648db40b2d	No progress notifications received

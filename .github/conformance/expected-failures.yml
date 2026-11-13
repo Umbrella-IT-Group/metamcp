@@ -1,0 +1,38 @@
+# Expected failures for the MCP conformance job (PROVISIONAL: see below).
+# Runner: @modelcontextprotocol/conformance 0.1.16 (it resolves SDK 1.32.2 from
+# package-lock.json), spec 2025-11-25, server mode, suite all.
+# Calibrated against the umbrella branch at the commit this file was added.
+# FINAL calibration waits for the progress-relay and Origin-policy work to merge,
+# then this file and expected-checks.txt are regenerated on that integrated
+# head. Bump the runner by hand, quarterly: a new runner adds scenarios.
+#
+# This runner matches by scenario name only and counts a WARNING as a failure.
+# A listed scenario that now passes makes the run exit 1: delete the line and its
+# rows in expected-checks.txt. An unlisted failing scenario also exits 1. An entry
+# naming no scenario is ignored silently by the runner, so verify-results.ts
+# checks every name, requires a reason of at least 10 characters, and refuses a
+# duplicate or a wrong scenario count.
+server:
+  # Tools only by design: prompts and resources are answered locally, never relayed.
+  - resources-read-text           # resources/read is Method not found (tools only by design)
+  - resources-read-binary         # resources/read is Method not found (tools only by design)
+  - resources-templates-read      # resources/read is Method not found (tools only by design)
+  - resources-subscribe           # resources/subscribe has no handler (tools only by design)
+  - resources-unsubscribe         # resources/unsubscribe has no handler (tools only by design)
+  - prompts-get-simple            # prompts/get is Method not found (tools only by design)
+  - prompts-get-with-args         # prompts/get is Method not found (tools only by design)
+  - prompts-get-embedded-resource # prompts/get is Method not found (tools only by design)
+  - prompts-get-with-image        # prompts/get is Method not found (tools only by design)
+  # Capabilities the gateway does not advertise.
+  - logging-set-level             # no logging capability, logging/setLevel has no handler
+  - tools-call-with-logging       # no logging capability, so setLoggingLevel fails first
+  - completion-complete           # no completions capability, completion/complete has no handler
+  # Backends cannot ask the client for anything: the gateway client declares no capabilities and has no handler.
+  - tools-call-sampling           # a backend cannot sample through the gateway
+  - tools-call-elicitation        # a backend cannot elicit through the gateway
+  - elicitation-sep1034-defaults  # a backend cannot elicit through the gateway
+  - elicitation-sep1330-enums     # a backend cannot elicit through the gateway
+  # Known gaps and features not built.
+  - tools-call-with-progress      # known gap: backend progress is dropped at the gateway; flips when passthrough ships
+  - server-sse-polling            # no priming event: the gateway has no event store (SEP-1699); the fixture also lacks test_reconnection, so this cannot flip until both exist
+  - dns-rebinding-protection      # no Host or Origin validation on the data plane (SDK hostHeaderValidation not mounted)

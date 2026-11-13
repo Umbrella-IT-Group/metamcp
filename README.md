@@ -276,6 +276,16 @@ pnpm dev
 
 (Postgres via Docker is still the easy path for local dev.) Common gates: `pnpm check-types`, `pnpm lint`, `pnpm --filter @metamcp/backend test` (backend vitest), `pnpm build`.
 
+#### Protocol conformance job
+
+A separate, non-required GitHub Actions workflow (`.github/workflows/umbrella-conformance.yml`) runs the official [MCP conformance suite](https://github.com/modelcontextprotocol/conformance) against the built gateway, with a small fixture backend registered behind it. The known gaps are listed with a reason each in `.github/conformance/expected-failures.yml`, and the run goes red when a scenario starts failing, starts passing, or fails for a new reason. To run it locally against a throwaway Postgres (a loopback host and a database name ending in `_test`; the script refuses anything else), build the backend, install the runner with `npm ci --ignore-scripts --prefix .github/conformance` on Node 22 or newer, then:
+
+```bash
+DATABASE_URL=postgresql://user@127.0.0.1:5432/metamcp_test bash .github/conformance/run.sh
+```
+
+The harness lives in `apps/backend/src/conformance/` and is not reachable from the production bundle (a test and a build check both enforce that). Its environment variables are for the harness only and are never read by the gateway: `CONFORMANCE_FIXTURE_PORT`, `CONFORMANCE_PROXY_PORT`, `CONFORMANCE_UPSTREAM_URL`, `CONFORMANCE_TOOL_PREFIX` and `CONFORMANCE_API_KEY` (a per-run random key the script generates), plus `CONFORMANCE_OUT`, `CONFORMANCE_RUN_DIR`, `CONFORMANCE_ALLOW_DB` and `CONFORMANCE_UPDATE_SNAPSHOT`, which only `run.sh` reads.
+
 ## Configuration
 
 Standard upstream configuration (Postgres, `APP_URL`, OIDC/SSO, rate limits) is unchanged; see [`example.env`](example.env). Three upstream DEFAULTS change in this fork: the registration controls, and `POSTGRES_PASSWORD` and `BETTER_AUTH_SECRET`, whose published compose defaults are removed rather than replaced (both variables are now required). Everything else below is additive. All are optional; defaults are shown.
