@@ -38,6 +38,7 @@ import {
   stdioServersAllowed,
 } from "../lib/metamcp/stdio-policy";
 import { convertDbServerToParams } from "../lib/metamcp/utils";
+import { isVerifiedCallerHeaderName } from "../lib/metamcp/verified-caller";
 
 /**
  * The stdio policy gate for `create` and `update` (see
@@ -93,6 +94,62 @@ function refuseStdioBulkImportUnlessAllowed(
   });
 }
 
+/**
+ * The refusal for a stored server header named `X-Umbrella-User-Id` or
+ * `X-Umbrella-Caller`. One fixed sentence, so a client can match it.
+ */
+export const STORED_IDENTITY_HEADER_REFUSED =
+  "X-Umbrella-User-Id and X-Umbrella-Caller are set by the gateway from the authenticated caller and cannot be stored as server headers. Remove them from the headers.";
+
+function namesIdentityHeader(
+  headers: Record<string, string> | undefined,
+): boolean {
+  return (
+    headers !== undefined &&
+    Object.keys(headers).some(isVerifiedCallerHeaderName)
+  );
+}
+
+/**
+ * Identity headers are gateway-set only (`lib/metamcp/verified-caller.ts`),
+ * so `create` and `update` refuse either name as a stored header key, in any
+ * casing and with surrounding whitespace ignored. Called before each method's
+ * `try`, for the same reason as the stdio gate above.
+ *
+ * Rows that already store one are not rewritten here. The pooled transport
+ * drops the stored copy on every connection (`storedHeadersForPool` in
+ * `lib/metamcp/client.ts`); an update that leaves `headers` out keeps it
+ * inert, and one that sends it back is refused, so it is removed on the next
+ * edit of the row's headers.
+ */
+function refuseStoredIdentityHeaders(
+  headers: Record<string, string> | undefined,
+): void {
+  if (!namesIdentityHeader(headers)) return;
+  throw new TRPCError({
+    code: "BAD_REQUEST",
+    message: STORED_IDENTITY_HEADER_REFUSED,
+  });
+}
+
+/**
+ * The same refusal for `bulkImport`: the WHOLE request is refused, before any
+ * row is written, when any entry stores either header, so an import is never
+ * half applied (as with the stdio gate).
+ */
+function refuseStoredIdentityHeadersInBulkImport(
+  servers: z.infer<typeof BulkImportMcpServersRequestSchema>["mcpServers"],
+): void {
+  const named = Object.values(servers).some((config) =>
+    namesIdentityHeader(config.headers),
+  );
+  if (!named) return;
+  throw new TRPCError({
+    code: "BAD_REQUEST",
+    message: `${STORED_IDENTITY_HEADER_REFUSED} Nothing was imported.`,
+  });
+}
+
 export const mcpServersImplementations = {
   create: async (
     input: z.infer<typeof CreateMcpServerRequestSchema>,
@@ -100,6 +157,7 @@ export const mcpServersImplementations = {
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateMcpServerResponseSchema>> => {
     refuseStdioServerUnlessAllowed(input.type);
+    refuseStoredIdentityHeaders(input.headers);
     try {
       // Determine user ownership based on input.user_id or default to current user
       const effectiveUserId =
@@ -245,6 +303,7 @@ export const mcpServersImplementations = {
     actor?: AuditActor,
   ): Promise<z.infer<typeof BulkImportMcpServersResponseSchema>> => {
     refuseStdioBulkImportUnlessAllowed(input.mcpServers);
+    refuseStoredIdentityHeadersInBulkImport(input.mcpServers);
     try {
       const serversToInsert = [];
       const errors: string[] = [];
@@ -518,6 +577,7 @@ export const mcpServersImplementations = {
     // answer does not depend on the row. An existing stdio row can still be
     // switched to Streamable HTTP or SSE, and deleted, with the flag off.
     refuseStdioServerUnlessAllowed(input.type);
+    refuseStoredIdentityHeaders(input.headers);
     try {
       // Check if server exists and user has permission to update it
       const server = await mcpServersRepository.findByUuid(input.uuid);

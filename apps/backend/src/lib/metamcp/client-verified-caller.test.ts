@@ -5,8 +5,10 @@
  * What this pins: a backend named in `VERIFIED_CALLER_SERVER_NAMES` receives
  * the verified caller's user id on its tool calls and on nothing else, a value
  * stored on the server row (or put there any other way) never reaches it, a
- * backend that is not named sees exactly what it saw before, and the m365
- * injection keeps its own behaviour.
+ * backend that is not named gets no identity from the caller binding, the m365
+ * injection keeps its own behaviour, and on every server, whatever its name,
+ * a stored `X-Umbrella-User-Id` or `X-Umbrella-Caller` is never sent while
+ * the row's other stored headers are.
  *
  * Driven through the production wiring: undici is mocked as the network and
  * every URL is an IP literal, so no resolver is touched. The SDK client and
@@ -23,6 +25,7 @@ interface SeenRequest {
   userId: string | null;
   caller: string | null;
   authorization: string | null;
+  custom: string | null;
 }
 
 const { undiciFetch, seen, getAccessToken } = vi.hoisted(() => {
@@ -53,6 +56,7 @@ const { undiciFetch, seen, getAccessToken } = vi.hoisted(() => {
       userId: headers.get("x-umbrella-user-id"),
       caller: headers.get("x-umbrella-caller"),
       authorization: headers.get("authorization"),
+      custom: headers.get("x-custom-tenant"),
     });
     if (httpMethod === "DELETE") return new Response(null, { status: 200 });
     // No standalone stream: the SDK treats 405 as "not offered".
@@ -370,26 +374,7 @@ describe("X-Umbrella-User-Id on a named backend", () => {
   });
 });
 
-describe("backends that are not named are untouched", () => {
-  it("an unnamed backend's stored header reaches it unchanged, whoever is calling", async () => {
-    const { transport } = createMetaMcpClient(
-      asParams({
-        name: "other",
-        type: "STREAMABLE_HTTP",
-        url: INTERNAL_URL,
-        headers: { "X-Umbrella-User-Id": "stored" },
-      }),
-    );
-    await runWithCallerContext({ authMethod: "oauth", userId: "user-1" }, () =>
-      installedFetch(transport)(new URL(INTERNAL_URL), {
-        ...toolCallInit(),
-        headers: { "X-Umbrella-User-Id": "stored" },
-      }),
-    );
-    expect(seen).toHaveLength(1);
-    expect(seen[0].userId).toBe("stored");
-  });
-
+describe("backends that are not named get no identity from the caller binding", () => {
   it("an unnamed backend gets no identity from the caller binding", async () => {
     const { transport } = createMetaMcpClient(
       asParams({ name: "other", type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
@@ -676,28 +661,7 @@ describe("X-Umbrella-Caller on a named backend", () => {
   );
 });
 
-describe("X-Umbrella-Caller: backends that are not named are untouched", () => {
-  it("an unnamed backend's stored caller header reaches it unchanged", async () => {
-    const { transport } = createMetaMcpClient(
-      asParams({
-        name: "other",
-        type: "STREAMABLE_HTTP",
-        url: INTERNAL_URL,
-        headers: { "X-Umbrella-Caller": "stored" },
-      }),
-    );
-    await runWithCallerContext(
-      { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
-      () =>
-        installedFetch(transport)(new URL(INTERNAL_URL), {
-          ...toolCallInit(),
-          headers: { "X-Umbrella-Caller": "stored" },
-        }),
-    );
-    expect(seen).toHaveLength(1);
-    expect(seen[0].caller).toBe("stored");
-  });
-
+describe("X-Umbrella-Caller: backends that are not named get none from the caller binding", () => {
   it("an unnamed backend gets no caller header from the caller binding", async () => {
     const { transport } = createMetaMcpClient(
       asParams({ name: "other", type: "STREAMABLE_HTTP", url: INTERNAL_URL }),
@@ -724,4 +688,151 @@ describe("X-Umbrella-Caller: backends that are not named are untouched", () => {
     expect(seen[0].userId).toBe("m365-user");
     expect(seen[0].caller).toBeNull();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Stored identity headers, on every server.
+// ---------------------------------------------------------------------------
+
+/**
+ * A row that stores both identity headers, in mixed casing, beside an
+ * unrelated custom header. The custom header must still be sent; the two
+ * stored identity values must never be.
+ */
+const STORED_WITH_IDENTITY = {
+  "x-UMBRELLA-user-id": "user-stored",
+  "X-UMBRELLA-CALLER": "v1.c3RvcmVk",
+  "X-Custom-Tenant": "tenant-a",
+};
+
+const TOOL_CALL = {
+  jsonrpc: "2.0",
+  id: 7,
+  method: "tools/call",
+  params: { name: "ask", arguments: {} },
+} as const;
+
+/**
+ * Answer the next request (the SSE stream GET) with an open event stream that
+ * names the message endpoint, recording it like any other request.
+ */
+function answerNextWithSseEndpoint(): void {
+  const record = undiciFetch.getMockImplementation();
+  if (!record) throw new Error("no recording fetch installed");
+  undiciFetch.mockImplementationOnce(async (url, init) => {
+    await record(url, init);
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode("event: endpoint\ndata: /messages\n\n"),
+          );
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  });
+}
+
+interface ExpectedToolCall {
+  userId: string | null;
+  pair: string | null;
+  authorization: string | null;
+}
+
+describe("a stored X-Umbrella-User-Id or X-Umbrella-Caller never reaches a backend, whatever the row's name", () => {
+  it.each<[string, string, "STREAMABLE_HTTP" | "SSE", ExpectedToolCall]>([
+    [
+      "an unnamed server",
+      "other",
+      "STREAMABLE_HTTP",
+      { userId: null, pair: null, authorization: null },
+    ],
+    [
+      "an unnamed server",
+      "other",
+      "SSE",
+      { userId: null, pair: null, authorization: null },
+    ],
+    [
+      "a named server",
+      "team",
+      "STREAMABLE_HTTP",
+      {
+        userId: "user-1",
+        pair: `user-1 oauth:${CLIENT_ONE}`,
+        authorization: null,
+      },
+    ],
+    [
+      "a named server",
+      "team",
+      "SSE",
+      {
+        userId: "user-1",
+        pair: `user-1 oauth:${CLIENT_ONE}`,
+        authorization: null,
+      },
+    ],
+    [
+      "the m365 server",
+      "m365",
+      "STREAMABLE_HTTP",
+      {
+        userId: "m365-user",
+        pair: null,
+        authorization: "Bearer graph-m365-user",
+      },
+    ],
+  ])(
+    "%s (%s) over %s sends only what the gateway sets, and the row's other headers",
+    async (_label, name, type, expected) => {
+      if (type === "SSE") answerNextWithSseEndpoint();
+      const { transport } = createMetaMcpClient(
+        asParams({
+          name,
+          type,
+          url: type === "SSE" ? INTERNAL_SSE_URL : INTERNAL_URL,
+          headers: STORED_WITH_IDENTITY,
+        }),
+      );
+      if (!transport) throw new Error("no transport built");
+
+      // The real SDK transport builds every request from the row: the SSE
+      // stream GET, then the tool call, with the stored headers merged in by
+      // the SDK itself rather than by this test.
+      await transport.start();
+      try {
+        await runWithCallerContext(
+          { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+          () =>
+            runWithM365UserContext({ userId: "m365-user" }, () =>
+              transport.send(TOOL_CALL),
+            ),
+        );
+      } finally {
+        await transport.close();
+      }
+
+      expect(seen.map((r) => r.httpMethod)).toEqual(
+        type === "SSE" ? ["GET", "POST"] : ["POST"],
+      );
+      for (const r of seen) {
+        expect(r.custom).toBe("tenant-a");
+        expect(r.userId).not.toBe("user-stored");
+        expect(r.caller).not.toBe("v1.c3RvcmVk");
+      }
+      const streamGet = seen.find((r) => r.httpMethod === "GET");
+      if (streamGet) {
+        expect([streamGet.userId, streamGet.caller]).toEqual([null, null]);
+      }
+      const toolCall = seen.find((r) => r.rpcMethod === "tools/call");
+      if (!toolCall) throw new Error("the tool call was not sent");
+      expect({
+        userId: toolCall.userId,
+        pair: pairSeen(toolCall),
+        authorization: toolCall.authorization,
+      }).toEqual(expected);
+    },
+  );
 });

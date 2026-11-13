@@ -79,6 +79,12 @@ import { getCallerContext } from "./caller-context-store";
  * fetch itself. The Inspector still reserves this custom header, and the
  * pool still strips it on non-internal hops, even with an empty list.
  *
+ * NEVER FROM A SERVER ROW, ON ANY SERVER. Both headers are gateway-set only.
+ * The pool drops a stored copy of either from every remote row before its
+ * transport is built, whatever the row's name (`storedHeadersForPool` in
+ * `client.ts`), and server create, update and bulk import refuse either name
+ * as a stored header key (`mcp-servers.impl.ts`).
+ *
  * `X-Umbrella-Caller`: WHICH CREDENTIAL, AS WELL AS WHO. The user id names a
  * person, but one person may hold several credentials (a key per machine, an
  * OAuth client per app), and a backend that hands out a session or a grant to
@@ -507,9 +513,10 @@ export function isVerifiedCallerHeaderName(name: unknown): boolean {
 
 /**
  * A copy of a stored-headers object with both verified caller headers
- * removed in every casing. The Inspector's direct transports do not go
- * through the pooled fetch, so it applies this to a named backend's stored
- * row headers itself.
+ * removed in every casing. The pool applies it to every remote row's stored
+ * headers (`storedHeadersForPool` in `client.ts`). The Inspector's direct
+ * transports do not go through the pooled fetch, so it applies this to a
+ * named backend's stored row headers itself.
  */
 export function withoutVerifiedCallerHeader(
   headers: Record<string, string>,
