@@ -21,18 +21,37 @@ const loggerMock = vi.hoisted(() => ({
 }));
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
-// A switch that corrupts what the crypto primitive writes, to prove the
-// rewrap's round-trip check is what stands between a bad seal and a write.
-const corrupt = vi.hoisted(() => ({ on: false }));
+// A switch that makes the crypto primitive write a BAD seal, to prove the
+// rewrap's round-trip check is what stands between a bad seal and a write:
+//  - tamper: a flipped ciphertext byte (fails authentication);
+//  - unbound: a valid envelope at the wrong version (the context is dropped);
+//  - other-plaintext: a valid envelope that holds a different token.
+const corrupt = vi.hoisted(() => ({
+  mode: "off" as "off" | "tamper" | "unbound" | "other-plaintext",
+}));
 vi.mock("./crypto", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./crypto")>();
   return {
     ...actual,
     encryptRefreshToken: (
-      ...args: Parameters<typeof actual.encryptRefreshToken>
+      plaintext: string,
+      kek: Buffer,
+      kekId: string,
+      context?: string,
     ) => {
-      const envelope = actual.encryptRefreshToken(...args);
-      if (!corrupt.on) return envelope;
+      if (corrupt.mode === "unbound") {
+        return actual.encryptRefreshToken(plaintext, kek, kekId);
+      }
+      if (corrupt.mode === "other-plaintext") {
+        return actual.encryptRefreshToken("not-the-token", kek, kekId, context);
+      }
+      const envelope = actual.encryptRefreshToken(
+        plaintext,
+        kek,
+        kekId,
+        context,
+      );
+      if (corrupt.mode !== "tamper") return envelope;
       const parts = envelope.split(".");
       const ct = Buffer.from(parts[4], "base64url");
       ct[0] ^= 0xff;
@@ -64,7 +83,7 @@ function policyFrom(env: Record<string, string | undefined>) {
 
 beforeEach(() => {
   __resetEnvelopePolicyLogsForTesting();
-  corrupt.on = false;
+  corrupt.mode = "off";
 });
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -298,9 +317,16 @@ describe("rewrapUserEnvelope", () => {
     expect(() => rewrapUserEnvelope(foreign, KEK, "k1", "u-1", "v2")).toThrow();
   });
 
-  it("throws on a corrupted seal instead of returning it (round-trip verify)", () => {
-    const v1 = encryptRefreshToken("the-rt", KEK, "k1");
-    corrupt.on = true;
-    expect(() => rewrapUserEnvelope(v1, KEK, "k1", "u-1", "v2")).toThrow();
-  });
+  it.each([
+    ["a tampered ciphertext", "tamper"],
+    ["a valid envelope at the wrong version", "unbound"],
+    ["a valid envelope holding a different token", "other-plaintext"],
+  ] as const)(
+    "throws instead of returning %s (round-trip verify)",
+    (_label, mode) => {
+      const v1 = encryptRefreshToken("the-rt", KEK, "k1");
+      corrupt.mode = mode;
+      expect(() => rewrapUserEnvelope(v1, KEK, "k1", "u-1", "v2")).toThrow();
+    },
+  );
 });

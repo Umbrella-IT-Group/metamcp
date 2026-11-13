@@ -94,6 +94,8 @@ type RotateMode = "ok" | "down" | "commit-then-throw" | "commit-then-down";
 class FakeTokensRepo {
   row: M365UserTokenRow | undefined;
   rotateMode: RotateMode = "ok";
+  /** Runs at the start of each rotation, to land a change "during the swap". */
+  beforeRotate: (() => void) | undefined;
   private committedThenFailed = false;
   readonly rotateCalls: { userId: string; rt: string; expected: string }[] = [];
   readonly markCalls: { userId: string; expected: string }[] = [];
@@ -144,6 +146,7 @@ class FakeTokensRepo {
   rotateRefreshToken = vi.fn(
     async (userId: string, rt: string, kekId: string, expected: string) => {
       this.rotateCalls.push({ userId, rt, expected });
+      this.beforeRotate?.();
       if (this.rotateMode === "down") throw new Error("pg down");
       if (this.rotateMode === "commit-then-down" && this.committedThenFailed) {
         throw new Error("pg down");
@@ -749,6 +752,47 @@ describe("an invalidation retires the mints that were running", () => {
     entra.ok(2, "NEW>");
     expect(await third).toBe("at:NEW>");
     expect(repo.stored()).toBe("NEW>>");
+  });
+
+  it("does not cache a token issued for a grant that was replaced mid-mint, even when Entra issued no new refresh token", async () => {
+    const repo = new FakeTokensRepo(rowFor("A"));
+    const entra = controlledEntra();
+    const service = new M365MintService(repo.asRepo(), entra.fetchStub);
+
+    const oldCaller = service.getAccessToken("user-1");
+    await entra.arrived(0);
+    repo.row = rowFor("NEW");
+    service.invalidateUser("user-1");
+    entra.respond(
+      0,
+      tokenResponse({ access_token: "at-old", expires_in: 3600 }),
+    );
+    expect(await oldCaller).toBe("at-old");
+
+    // Not cached: the next caller mints again, from the row as it is now.
+    const next = service.getAccessToken("user-1");
+    await entra.reached(1);
+    expect(entra.rtOf(1)).toBe("NEW");
+    entra.ok(1, "NEW");
+    expect(await next).toBe("at:NEW");
+  });
+
+  it("does not cache a token whose rotation applied while an invalidation landed during the swap", async () => {
+    const repo = new FakeTokensRepo(rowFor("A"));
+    const { sent, fetchStub } = entraChain();
+    const service = new M365MintService(repo.asRepo(), fetchStub);
+    // The user disconnects between the redemption and the swap's answer: the
+    // swap itself still matches the row it read.
+    repo.beforeRotate = () => service.invalidateUser("user-1");
+
+    expect(await service.getAccessToken("user-1")).toBe("at:A");
+    expect(mintAudits()[0].rotation).toBe("applied");
+
+    // The access token was not cached for the replaced generation, so the next
+    // caller mints again (from the rotation the swap stored).
+    repo.beforeRotate = undefined;
+    expect(await service.getAccessToken("user-1")).toBe("at:A>");
+    expect(sent).toEqual(["A", "A>"]);
   });
 });
 
