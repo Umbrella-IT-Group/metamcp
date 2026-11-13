@@ -84,13 +84,13 @@ export function resolveInspectorTarget(
   lists: TargetLists,
   opts: { isAdmin: boolean },
 ): InspectorTarget {
-  if (params.server) {
+  if (params.server !== undefined && params.server !== null) {
     const server = lists.servers.find((entry) => entry.uuid === params.server);
     return server ? { kind: "server", server } : NONE;
   }
   if (!opts.isAdmin) return NONE;
 
-  if (params.namespace) {
+  if (params.namespace !== undefined && params.namespace !== null) {
     const namespace = lists.namespaces.find(
       (entry) => entry.uuid === params.namespace,
     );
@@ -102,7 +102,7 @@ export function resolveInspectorTarget(
         }
       : NONE;
   }
-  if (params.endpoint) {
+  if (params.endpoint !== undefined && params.endpoint !== null) {
     const endpoint = lists.endpoints.find(
       (entry) => entry.uuid === params.endpoint,
     );

@@ -85,6 +85,7 @@ export interface RpcTrafficStoreOptions {
 }
 
 const EMPTY_SNAPSHOT: readonly RpcTrafficEntry[] = Object.freeze([]);
+const UTF8 = new TextEncoder();
 
 function defaultSchedule(run: () => void): void {
   if (typeof requestAnimationFrame === "function") {
@@ -132,7 +133,7 @@ function truncatedEnvelope(message: unknown, bytes: number): unknown {
 
 interface HeldEntry {
   entry: RpcTrafficEntry;
-  /** Characters this row counts against `maxBytes`. */
+  /** UTF-8 bytes this row counts against `maxBytes`. */
   held: number;
 }
 
@@ -182,12 +183,19 @@ export class RpcTrafficStore {
     // exception reaches the tap, which reports it with console.error, and
     // nothing here has changed yet.
     const text = JSON.stringify(input.message);
-    const bytes = text.length;
+    if (text === undefined) {
+      throw new TypeError("Traffic message has no JSON representation");
+    }
+    // The limits and the UI describe wire bytes. String.length counts UTF-16
+    // code units, which undercounts non-ASCII tool arguments and results.
+    const bytes = UTF8.encode(text).byteLength;
     const truncated = bytes > this.maxMessageBytes;
     const message = truncated
       ? truncatedEnvelope(input.message, bytes)
       : input.message;
-    const held = truncated ? JSON.stringify(message).length : bytes;
+    const held = truncated
+      ? UTF8.encode(JSON.stringify(message)).byteLength
+      : bytes;
 
     const timestampMs = this.now();
     const timestamp = new Date(timestampMs).toISOString();

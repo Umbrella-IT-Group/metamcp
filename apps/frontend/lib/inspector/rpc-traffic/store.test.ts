@@ -60,6 +60,12 @@ const received = (message: unknown): RpcTrafficInput => ({
 });
 
 describe("entries", () => {
+  it("rejects a value with no JSON representation without adding a row", () => {
+    const { store } = harness();
+    expect(() => store.publish(sent(undefined))).toThrow(TypeError);
+    expect(store.exportEntries()).toEqual([]);
+  });
+
   it("numbers rows, stamps them from the clock and records the size", () => {
     const { store, advance } = harness();
     store.publish(sent(request(1)));
@@ -95,6 +101,18 @@ describe("entries", () => {
 describe("the byte cap", () => {
   const padded = (id: number, padding: number) =>
     request(id, "tools/call", { padding: "x".repeat(padding) });
+
+  it("counts UTF-8 bytes when evicting messages with non-ASCII text", () => {
+    const first = request(1, "tools/call", { text: "界🙂".repeat(100) });
+    const second = request(2, "tools/call", { text: "界🙂".repeat(100) });
+    const firstBytes = Buffer.byteLength(JSON.stringify(first), "utf8");
+    const secondBytes = Buffer.byteLength(JSON.stringify(second), "utf8");
+    const { store } = harness({ maxBytes: firstBytes + secondBytes - 1 });
+    store.publish(sent(first));
+    store.publish(sent(second));
+    expect(store.exportEntries().map((row) => row.message)).toEqual([second]);
+    expect(store.exportEntries()[0]?.bytes).toBe(secondBytes);
+  });
 
   it("drops the oldest rows first", () => {
     const size = JSON.stringify(padded(1, 100)).length;
@@ -149,6 +167,27 @@ describe("the byte cap", () => {
 describe("large messages", () => {
   const message = (padding: number) =>
     response(5, { padding: "y".repeat(padding) });
+
+  it("truncates at the UTF-8 byte limit for non-ASCII text", () => {
+    const value = response(5, { text: "界🙂".repeat(100) });
+    const bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+    const { store } = harness({ maxMessageBytes: bytes - 1 });
+    store.publish(received(value));
+    const [row] = store.exportEntries();
+    expect(row).toMatchObject({
+      bytes,
+      truncated: true,
+      message: {
+        jsonrpc: "2.0",
+        id: 5,
+        result: { truncated: true, bytes },
+      },
+    });
+    const atLimit = harness({ maxMessageBytes: bytes }).store;
+    atLimit.publish(received(value));
+    expect(atLimit.exportEntries()[0]?.truncated).toBeUndefined();
+    expect(atLimit.exportEntries()[0]?.message).toEqual(value);
+  });
 
   it("stores a message at the limit intact", () => {
     const limit = JSON.stringify(message(200)).length;

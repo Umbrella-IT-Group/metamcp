@@ -19,7 +19,7 @@ export interface RpcTrafficEntry {
    * keep (see `truncated`).
    */
   message: unknown;
-  /** Length of the message's JSON text as exchanged (before any truncation). */
+  /** UTF-8 bytes of the message's JSON text (before any truncation). */
   bytes: number;
   /** How many bursts of one notification were merged into this row. */
   repeatCount?: number;

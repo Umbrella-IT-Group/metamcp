@@ -356,7 +356,10 @@ export function useConnection({
 
       try {
         await checkProxyHealth();
-      } catch {
+      } catch (error) {
+        // The health check runs before a transport exists, so the tap cannot
+        // report this failed connection attempt for us.
+        store?.publishTransportError(error);
         setConnectionStatus("error-connecting-to-proxy");
         return;
       }

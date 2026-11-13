@@ -214,6 +214,23 @@ describe("resolveInspectorTarget", () => {
     ).toEqual({ kind: "none" });
   });
 
+  it("does not skip an empty parameter to reach a later target", () => {
+    for (const params of [
+      { server: "", namespace: NS_A.uuid },
+      { server: "", endpoint: EP_1.uuid },
+      { namespace: "", endpoint: EP_1.uuid },
+    ]) {
+      expect(resolveInspectorTarget(params, LISTS, { isAdmin: true })).toEqual({
+        kind: "none",
+      });
+    }
+    expect(
+      resolveInspectorTarget({ server: null, namespace: NS_A.uuid }, LISTS, {
+        isAdmin: true,
+      }),
+    ).toMatchObject({ kind: "namespace", namespaceUuid: NS_A.uuid });
+  });
+
   it("gives an administrator no gateway target from empty lists", () => {
     // The lists are what an administrator loaded; before they load, or when
     // the listing fails, there is nothing to resolve against.
