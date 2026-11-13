@@ -31,16 +31,20 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
   type CallToolResult,
   ListToolsRequestSchema,
+  McpError,
   type Tool,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import logger from "@/utils/logger";
 
 import type { ConnectedClient } from "./client";
 import type { SessionPresentation } from "./endpoint-presentation";
@@ -75,6 +79,7 @@ const {
     invalidateServerConnection: vi.fn(),
     cleanupSession: vi.fn(),
     isPooledClient: vi.fn(),
+    getPoolStatus: vi.fn(),
   },
 }));
 
@@ -171,8 +176,10 @@ vi.mock("./mcp-server-pool", () => ({
     cleanupSession: pool.cleanupSession,
     isPooledClient: pool.isPooledClient,
     probeServerTools: probeMock,
-    // tools/list only: a warm pool, so it does not try to warm one up.
-    getPoolStatus: () => ({ idle: 1, active: 1 }),
+    // tools/list only: a warm pool, so it does not try to warm one up. A mock
+    // so a test can make the one read of it outside the listing's per-server
+    // handling throw, which no backend failure can (see `beforeEach`).
+    getPoolStatus: pool.getPoolStatus,
   },
 }));
 vi.mock("./cold-connect-broker-fallback", () => ({
@@ -332,6 +339,8 @@ const sessionsByServer = new Map<string, ConnectedClient | undefined>();
 
 interface Consumer {
   client: Client;
+  /** The session's shared, per-instance handler context (never a call's own). */
+  handlerContext: object;
   listChanged: () => number;
   close: () => Promise<void>;
 }
@@ -345,7 +354,7 @@ async function connectConsumer(
   sessionId: string,
   presentation?: SessionPresentation,
 ): Promise<Consumer> {
-  const { server, cleanup } =
+  const { server, cleanup, handlerContext } =
     presentation === undefined
       ? await createServer(NS, sessionId)
       : await createServer(NS, sessionId, false, presentation);
@@ -365,7 +374,12 @@ async function connectConsumer(
     await cleanup();
   };
   cleanups.push(close);
-  return { client: consumer, listChanged: () => notifications, close };
+  return {
+    client: consumer,
+    handlerContext,
+    listChanged: () => notifications,
+    close,
+  };
 }
 
 /** The audit rows the recorder receives, and a promise for the Nth. */
@@ -509,6 +523,8 @@ beforeEach(async () => {
   pool.cleanupSession.mockReset();
   pool.cleanupSession.mockResolvedValue(undefined);
   pool.isPooledClient.mockReset();
+  pool.getPoolStatus.mockReset();
+  pool.getPoolStatus.mockReturnValue({ idle: 1, active: 1 });
   findServersMock.mockReset();
   findServersMock.mockResolvedValue([]);
   warmupMock.mockReset();
@@ -1710,6 +1726,483 @@ describe("call_tool runs the tool it classified, and only that tool", () => {
       // the other call's and refused.
       expect(textOf(await slow)).toBe("ran read");
       expect(desk.calls.map((c) => c.name)).toEqual(["legacy", "read"]);
+    },
+  );
+});
+
+/**
+ * The lost-session defect, driven through the real proxy. A warm lean session has
+ * a snapshot; the backend's MCP session is then lost. The first send of a
+ * `call_tool` gets the replay-safe HTTP 404 answer (the backend ran nothing),
+ * the session recovery retires the pooled connection, and the real pool fires
+ * the backend client's list-changed subscribers, which drops the snapshot and
+ * so revokes the verdict. Nothing about the tool changed, and the replay used
+ * to refuse it as changed. It must now look at a fresh listing first.
+ *
+ * "guard" cases pass on the parent by design.
+ */
+describe("a read-only verdict revoked by a backend reconnect is re-verified once against a fresh listing", () => {
+  const SESSION_NOT_FOUND = () =>
+    new StreamableHTTPError(
+      404,
+      'Error POSTing to endpoint: {"jsonrpc":"2.0","error":{"code":-32001,"message":"Session not found"},"id":null}',
+    );
+  const ALL = [READ, WRITE, BARE, SECRET, LEGACY];
+
+  /**
+   * The lost session: `tools/call` on the old client answers the 404 envelope
+   * (and is counted), the pool's invalidation does what the real one does
+   * (fires the doomed client's subscribers without awaiting them, then drops
+   * it), and the next acquisition is a replacement backend that lists
+   * `recovered`. The mock pool alone makes invalidation a no-op, which does not
+   * reproduce the defect.
+   */
+  async function loseBackendSession(recovered: Tool[] = ALL) {
+    const replacement = await makeBackend("desk", recovered);
+    const stale = desk.connected;
+    const real = stale.client.request.bind(stale.client);
+    const staleToolCalls = { count: 0 };
+    vi.spyOn(stale.client, "request").mockImplementation(((
+      message: { method: string },
+      schema: never,
+      options: never,
+    ) => {
+      if (message.method === "tools/call") {
+        staleToolCalls.count += 1;
+        return Promise.reject(SESSION_NOT_FOUND());
+      }
+      return real(message as never, schema, options);
+    }) as never);
+    pool.isPooledClient.mockImplementation(
+      (_serverUuid: string, client: unknown) => client === stale,
+    );
+    pool.invalidateServerConnection.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        const subscribers = [...stale.listChangedSubscribers];
+        stale.listChangedSubscribers.clear();
+        for (const subscriber of subscribers) void subscriber();
+        sessionsByServer.set(serverUuid, replacement.connected);
+      },
+    );
+    const sent = vi.spyOn(replacement.connected.client, "request");
+    return {
+      replacement,
+      staleToolCalls,
+      /** Requests of one method the replacement backend's client was asked to send. */
+      sentTo: (method: string) =>
+        sent.mock.calls.filter(([message]) => message.method === method).length,
+    };
+  }
+
+  /**
+   * The next listing throws a plain error that is not the listing's own
+   * retryable one (those a listing turns into an unavailable catalog). Its text
+   * is one a tool-call replay recognises, which is the point: it comes from the
+   * re-verification, not from a backend request, and must not be read as one.
+   * The listing's one unguarded read of the pool is the seam; no backend
+   * failure reaches the caller as a plain error.
+   */
+  const failNextListing = () =>
+    pool.getPoolStatus.mockImplementationOnce(() => {
+      throw new Error("Not connected");
+    });
+
+  /**
+   * Holds the next call at the policy filter's mount-status lookup: after the
+   * early check, before the router. With the caches warm by a search, that is
+   * the only table read a call makes. `held()` answers whether it got there.
+   */
+  function holdAtPolicyFilter() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reachedFlag = false;
+    let armed = true;
+    state.beforeQueryResult = async (query) => {
+      if (
+        armed &&
+        query.table === "servers" &&
+        query.where["nsm.status"] === "ACTIVE"
+      ) {
+        armed = false;
+        reachedFlag = true;
+        await gate;
+      }
+    };
+    return {
+      held: async () => {
+        for (let turn = 0; turn < 200 && !reachedFlag; turn += 1) await flush();
+        return reachedFlag;
+      },
+      release,
+    };
+  }
+
+  it("runs the read-only tool once on the recovered backend, from a fresh listing, after the first send was answered 404", async () => {
+    const audit = auditRows();
+    const lean = await connectConsumer("s-lean-reverify", LEAN);
+    await meta(lean, "search_tools");
+    const { replacement, staleToolCalls, sentTo } = await loseBackendSession();
+
+    const result = await meta(lean, "call_tool", {
+      name: "desk__read",
+      arguments: { query: "x" },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toBe("ran read");
+    // The first send went to the dead session and the backend ran nothing.
+    expect(staleToolCalls.count).toBe(1);
+    expect(desk.calls).toEqual([]);
+    expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+    // The replay ran it exactly once, after one listing of the recovered backend.
+    expect(replacement.calls.map((call) => call.name)).toEqual(["read"]);
+    expect(sentTo("tools/call")).toBe(1);
+    expect(replacement.listings()).toBe(1);
+    await audit.arrived(1);
+    await flush();
+    expect(audit.rows).toHaveLength(1);
+    expect(audit.rows[0]).toMatchObject({
+      tool_name: "read",
+      success: true,
+    });
+    // The verdict, its fresh closure and its callback lived on this call's own
+    // context only.
+    expect(
+      Object.keys(lean.handlerContext).filter((key) =>
+        /^(classified|reverify)/.test(key),
+      ),
+    ).toEqual([]);
+  });
+
+  it("refuses the call as changed when the recovered backend lists the same tool as not read-only, runs nothing, and sends no second tool call", async () => {
+    const audit = auditRows();
+    const lean = await connectConsumer("s-lean-reverify-writer", LEAN);
+    await meta(lean, "search_tools");
+    const { replacement, staleToolCalls, sentTo } = await loseBackendSession([
+      { ...READ, annotations: { readOnlyHint: false } },
+      WRITE,
+    ]);
+
+    const result = await meta(lean, "call_tool", { name: "desk__read" });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("changed");
+    expect(textOf(result)).not.toContain("call_write_tool");
+    expect(staleToolCalls.count).toBe(1);
+    expect(replacement.calls).toEqual([]);
+    expect(sentTo("tools/call")).toBe(0);
+    // It looked, once, instead of refusing blind.
+    expect(replacement.listings()).toBe(1);
+    await audit.arrived(1);
+    await flush();
+    expect(audit.rows).toHaveLength(1);
+    expect(audit.rows[0]).toMatchObject({
+      tool_name: "read",
+      success: false,
+      error_code: "tool_error",
+    });
+  });
+
+  it("runs an alias's read-only tool again after the reconnect, under the alias the client used", async () => {
+    const lean = await connectConsumer("s-lean-reverify-alias", LEAN);
+    await meta(lean, "search_tools");
+    const { replacement } = await loseBackendSession();
+
+    const result = await meta(lean, "call_tool", { name: "desk__modern" });
+
+    expect(textOf(result)).toBe("ran legacy");
+    expect(replacement.calls.map((call) => call.name)).toEqual(["legacy"]);
+    expect(replacement.listings()).toBe(1);
+  });
+
+  it("refuses a fresh listing from a replacement UUID even when recovery selected the original UUID and the full name is unchanged", async () => {
+    const audit = auditRows();
+    const lean = await connectConsumer("s-lean-reverify-new-backend", LEAN);
+    await meta(lean, "search_tools");
+    const { replacement, staleToolCalls, sentTo } = await loseBackendSession();
+    const replacementServer = { uuid: "server-desk-replacement", name: "desk" };
+    getSessionMock.mockClear();
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        if (serverUuid === DESK.uuid) {
+          // Recovery already selected the original UUID. Replace the mount
+          // only now, so the fresh listing sees another backend while the
+          // router's selected UUID still matches the recorded verdict. Only
+          // the callback's fresh-listing UUID comparison can reject it.
+          state.servers = [replacementServer];
+          state.mounts = [
+            {
+              namespaceUuid: NS,
+              serverUuid: replacementServer.uuid,
+              status: "ACTIVE",
+            },
+          ];
+          sessionsByServer.set(replacementServer.uuid, replacement.connected);
+          clearFilterCache();
+          clearOverrideCache(NS);
+        }
+        return sessionsByServer.get(serverUuid);
+      },
+    );
+
+    const result = await meta(lean, "call_tool", { name: "desk__read" });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("changed");
+    expect(staleToolCalls.count).toBe(1);
+    expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+    expect(getSessionMock.mock.calls.map(([, uuid]) => uuid)).toEqual([
+      DESK.uuid,
+      replacementServer.uuid,
+    ]);
+    expect(replacement.listings()).toBe(1);
+    expect(replacement.calls).toEqual([]);
+    expect(sentTo("tools/call")).toBe(0);
+    await audit.arrived(1);
+    expect(audit.rows).toHaveLength(1);
+    expect(audit.rows[0]).toMatchObject({ tool_name: "read", success: false });
+  });
+
+  it("refuses an alias that was rebound to a writer while the call waited, though the target it was classified as is still listed read-only", async () => {
+    const lean = await connectConsumer("s-lean-reverify-rebound", LEAN);
+    await meta(lean, "search_tools");
+    const { held, release } = holdAtPolicyFilter();
+    const listingsBefore = desk.listings();
+    const pending = meta(lean, "call_tool", { name: "desk__modern" });
+    expect(await held(), "the call reached the mount check").toBe(true);
+    // The setter: `modern` now names the writer. The call already resolved the
+    // alias to the old target, so only the revocation is left to notice it.
+    const legacy = state.mappings.find((row) => row.toolName === "legacy");
+    if (!legacy) throw new Error("missing legacy mapping");
+    legacy.overrideName = "former";
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "write",
+      status: "ACTIVE",
+      overrideName: "modern",
+    });
+    clearOverrideCache(NS);
+    release();
+
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("changed");
+    expect(desk.calls).toEqual([]);
+    expect(desk.listings()).toBe(listingsBefore + 1);
+  });
+
+  it("refuses an alias that was rebound to ANOTHER read-only tool while the call waited: a fresh read-only hint is not enough, the alias must still stand for the tool it was classified as", async () => {
+    const lean = await connectConsumer(
+      "s-lean-reverify-readonly-rebound",
+      LEAN,
+    );
+    await meta(lean, "search_tools");
+    const { held, release } = holdAtPolicyFilter();
+    const listingsBefore = desk.listings();
+    const pending = meta(lean, "call_tool", { name: "desk__modern" });
+    expect(await held(), "the call reached the mount check").toBe(true);
+    // `modern` now names `read`, which is read-only too, so every hint the
+    // fresh listing shows for the name is as good as before.
+    const legacy = state.mappings.find((row) => row.toolName === "legacy");
+    if (!legacy) throw new Error("missing legacy mapping");
+    legacy.overrideName = "former";
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "read",
+      status: "ACTIVE",
+      overrideName: "modern",
+    });
+    clearOverrideCache(NS);
+    release();
+
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("changed");
+    expect(desk.calls).toEqual([]);
+    expect(desk.listings()).toBe(listingsBefore + 1);
+  });
+
+  it("answers the unavailable answer, not the changed one, when the fresh listing cannot reach any backend, and sends nothing", async () => {
+    const lean = await connectConsumer("s-lean-reverify-down", LEAN);
+    await meta(lean, "search_tools");
+    const { replacement } = await loseBackendSession();
+    // The recovered session cannot be acquired for the listing (the listing's
+    // own retryable error), though the replay's own acquisition succeeded.
+    let acquisitions = 0;
+    getSessionMock.mockImplementation(
+      async (_sessionId: string, serverUuid: string) => {
+        acquisitions += 1;
+        // 1: the recovery's reacquire. 2: the listing, which finds no session.
+        return acquisitions === 2
+          ? undefined
+          : sessionsByServer.get(serverUuid);
+      },
+    );
+
+    const result = await meta(lean, "call_tool", { name: "desk__read" });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("catalog could not be read");
+    expect(textOf(result)).not.toContain("changed");
+    expect(replacement.calls).toEqual([]);
+  });
+
+  it.each([
+    {
+      label: "its first send",
+      replay: false,
+      drive: async (lean: Consumer) => {
+        await meta(lean, "search_tools");
+        const { held, release } = holdAtPolicyFilter();
+        const pending = outcome(() =>
+          meta(lean, "call_tool", { name: "desk__read" }),
+        );
+        expect(await held(), "the call reached the mount check").toBe(true);
+        // The reconnect's invalidation, with nothing else changed.
+        clearOverrideCache(NS);
+        failNextListing();
+        release();
+        return { failed: await pending, replacementCalls: undefined };
+      },
+    },
+    {
+      label: "its replay after a lost session",
+      replay: true,
+      drive: async (lean: Consumer) => {
+        await meta(lean, "search_tools");
+        const lost = await loseBackendSession();
+        failNextListing();
+        const failed = await outcome(() =>
+          meta(lean, "call_tool", { name: "desk__read" }),
+        );
+        return { failed, replacementCalls: lost.sentTo("tools/call") };
+      },
+    },
+  ])(
+    "lets an unexpected failure of the re-verification out as it is, with nothing sent and no further recovery, though its text is one a replay recognises: $label",
+    async ({ replay, drive }) => {
+      const audit = auditRows();
+      const lean = await connectConsumer("s-lean-reverify-fail", LEAN);
+      const toolCallsOnDesk = vi.spyOn(desk.connected.client, "request");
+      vi.mocked(logger.error).mockClear();
+
+      const { failed, replacementCalls } = await drive(lean);
+
+      expect(failed.result).toBeUndefined();
+      expect(failed.error).toContain("Not connected");
+      expect(desk.calls).toEqual([]);
+      if (replacementCalls !== undefined) expect(replacementCalls).toBe(0);
+      // A replay-safe reading of that text would have retired the pooled
+      // connection (again) and sent the call once more.
+      expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(
+        replay ? 1 : 0,
+      );
+      // The replay has no further recovery, but its backend-error catch would
+      // misreport a failed listing as a failed tools/call. Keep the decision
+      // outside that catch as well as the first send's recovery detector.
+      expect(logger.error).not.toHaveBeenCalledWith(
+        expect.stringContaining("after session re-initialize:"),
+        expect.anything(),
+      );
+      if (!replay) {
+        expect(
+          toolCallsOnDesk.mock.calls.filter(
+            ([message]) => message.method === "tools/call",
+          ),
+        ).toHaveLength(0);
+      }
+      await audit.arrived(1);
+      await flush();
+      expect(audit.rows).toHaveLength(1);
+      expect(audit.rows[0]).toMatchObject({
+        tool_name: "read",
+        success: false,
+      });
+    },
+  );
+
+  it.each([
+    [
+      "call_write_tool through a lean session",
+      true,
+      (lean: Consumer) => meta(lean, "call_write_tool", { name: "desk__read" }),
+    ],
+    [
+      "a direct call through a lean session",
+      true,
+      (lean: Consumer) => meta(lean, "desk__read"),
+    ],
+    [
+      "a direct call through a session that is not lean",
+      false,
+      (plain: Consumer) => meta(plain, "desk__read"),
+    ],
+  ])(
+    "guard: %s replays once after the lost session and never re-verifies: no listing for it and no log line about it",
+    async (_label, isLean, call) => {
+      const sinks = eventSinks();
+      const consumer = await connectConsumer(
+        isLean ? "s-lean-unchanged" : "s-plain-unchanged",
+        isLean ? LEAN : undefined,
+      );
+      if (isLean) await meta(consumer, "search_tools");
+      else await consumer.client.listTools();
+      const { replacement, staleToolCalls, sentTo } =
+        await loseBackendSession();
+
+      const result = await call(consumer);
+
+      expect(textOf(result)).toBe("ran read");
+      expect(staleToolCalls.count).toBe(1);
+      expect(replacement.calls.map((entry) => entry.name)).toEqual(["read"]);
+      expect(sentTo("tools/call")).toBe(1);
+      expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+      // The only listing the recovered backend answers is the audit's own
+      // shaping of the call, the same one a plain call costs.
+      expect(replacement.listings()).toBeLessThanOrEqual(1);
+      expect(
+        sinks.live.filter((entry) => /re-verif/.test(entry.message)),
+      ).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["a request timeout", () => new McpError(-32001, "Request timed out")],
+    [
+      "a 5xx answer",
+      () =>
+        new StreamableHTTPError(502, "Error POSTing to endpoint: Bad Gateway"),
+    ],
+  ])(
+    "guard: %s on the first send of call_tool still surfaces with no replay, no recovery and no re-verification",
+    async (_label, failure) => {
+      const lean = await connectConsumer("s-lean-no-replay", LEAN);
+      await meta(lean, "search_tools");
+      const real = desk.connected.client.request.bind(desk.connected.client);
+      let toolCalls = 0;
+      vi.spyOn(desk.connected.client, "request").mockImplementation(((
+        message: { method: string },
+        schema: never,
+        options: never,
+      ) => {
+        if (message.method === "tools/call") {
+          toolCalls += 1;
+          return Promise.reject(failure());
+        }
+        return real(message as never, schema, options);
+      }) as never);
+      const listingsBefore = desk.listings();
+      const result = await outcome(() =>
+        meta(lean, "call_tool", { name: "desk__read" }),
+      );
+      expect(result.error).toBeDefined();
+      expect(toolCalls).toBe(1);
+      expect(pool.invalidateServerConnection).not.toHaveBeenCalled();
+      expect(desk.listings()).toBe(listingsBefore);
     },
   );
 });

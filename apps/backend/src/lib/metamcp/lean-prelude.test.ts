@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   CALL_TOOL_ROUTING_ANSWER,
-  type LeanCatalog,
+  LeanCatalog,
   type LeanListing,
 } from "./lean-listing";
 import { createLeanPrelude } from "./lean-prelude";
@@ -161,5 +161,237 @@ describe("a call that is not a call_tool", () => {
     expect(result.answer?.isError).toBe(true);
     expect(result.classifiedTarget).toBeUndefined();
     expect(get).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The callback a call_tool verdict carries to be given again by a fresh listing.
+//
+// These run the REAL callback `createLeanPrelude` returns, against a controlled
+// old listing (the verdict) and a controlled fresh one (what the reconnected
+// backend lists now). The first `get` is the snapshot the verdict came from;
+// every later one is the fresh listing. A stub callback result would prove
+// nothing about the predicates in here.
+// ---------------------------------------------------------------------------
+
+const ASKED = "desk__modern";
+const TARGET = "desk__legacy";
+const SELECTED = "desk-id";
+
+/** What a listing is when nothing changed: the alias still names the tool. */
+const listing = (overrides: Partial<LeanListing> = {}): LeanListing => ({
+  tools: [READ, WRITE],
+  unavailable: 0,
+  origins: new Map([[ASKED, [TARGET]]]),
+  serverUuids: new Map([[TARGET, SELECTED]]),
+  isCurrent: () => true,
+  ...overrides,
+});
+
+async function verdict(fresh: () => Promise<LeanListing>) {
+  const log = vi.fn();
+  const first = listing();
+  const get = vi
+    .fn<() => Promise<LeanListing>>()
+    .mockResolvedValueOnce(first)
+    .mockImplementation(fresh);
+  const run = createLeanPrelude({
+    catalog: { get } as unknown as LeanCatalog,
+    log,
+    elapsedMs: () => 0,
+  });
+  const result = await run(call("call_tool", ASKED));
+  // Asserted before it is called, so a build that has no callback fails here
+  // on an assertion and not on a TypeError.
+  expect(result.reverifyClassifiedTarget).toBeTypeOf("function");
+  return { result, get, log, first };
+}
+
+const reverify = async (fresh: LeanListing) => {
+  const { result } = await verdict(async () => fresh);
+  return result.reverifyClassifiedTarget?.();
+};
+
+describe("the re-verification callback of call_tool", () => {
+  it("answers current, with the fresh listing's own validity check, when the same name still stands for the same tool, backend and read-only hint", async () => {
+    const fresh = listing({ isCurrent: () => true });
+    const { result, get } = await verdict(async () => fresh);
+    expect(await result.reverifyClassifiedTarget?.()).toEqual({
+      kind: "current",
+      isCurrent: fresh.isCurrent,
+    });
+    // One read for the verdict, one for the re-verification.
+    expect(get).toHaveBeenCalledTimes(2);
+    // The verdict handed to the chain is untouched by it.
+    expect(result.classifiedTarget).toBe(TARGET);
+    expect(result.classifiedServerUuid).toBe(SELECTED);
+  });
+
+  it("is attached to call_tool only: no call_write_tool, direct call, nested meta call or refused call carries one", async () => {
+    const { run } = prelude(withOrigins([["desk__modern", ["desk__legacy"]]]));
+    for (const incoming of [
+      call("call_write_tool", ASKED),
+      { method: "tools/call", params: { name: ASKED } } as CallToolRequest,
+      call("call_tool", "call_write_tool"),
+      call("call_tool", "desk__unlisted"),
+    ]) {
+      const result = await run(incoming);
+      expect(result.reverifyClassifiedTarget).toBeUndefined();
+    }
+    const write = prelude(withOrigins([["desk__write", ["desk__write"]]]));
+    expect(
+      (await write.run(call("call_tool", "desk__write")))
+        .reverifyClassifiedTarget,
+    ).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "its read-only hint flipped under the same name and backend",
+      { tools: [{ ...READ, annotations: { readOnlyHint: false } }, WRITE] },
+    ],
+    [
+      "its hints disappeared",
+      { tools: [{ ...READ, annotations: undefined }, WRITE] },
+    ],
+    [
+      "a second entry under the name is not read-only",
+      { tools: [READ, { ...READ, annotations: { readOnlyHint: false } }] },
+    ],
+    ["the name is no longer listed", { tools: [WRITE] }],
+  ])("answers changed when %s", async (_label, fresh: Partial<LeanListing>) => {
+    expect(await reverify(listing(fresh))).toEqual({ kind: "changed" });
+  });
+
+  it.each([
+    [
+      "the requested name now lists a different full tool",
+      { origins: new Map([[ASKED, ["desk__other"]]]) },
+    ],
+    ["the fresh origins are missing", { origins: undefined }],
+    [
+      "the requested name has two origins",
+      { origins: new Map([[ASKED, [TARGET, "desk__other"]]]) },
+    ],
+    ["the requested name has no origin", { origins: new Map() }],
+  ])("answers changed when %s", async (_label, fresh: Partial<LeanListing>) => {
+    expect(await reverify(listing(fresh))).toEqual({ kind: "changed" });
+  });
+
+  it.each([
+    [
+      "a different backend now serves the same full name",
+      { serverUuids: new Map([[TARGET, "replacement-id"]]) },
+    ],
+    ["the fresh listing has no UUID for it", { serverUuids: new Map() }],
+    ["the fresh listing has no UUIDs at all", { serverUuids: undefined }],
+  ])(
+    "answers changed when %s, with the originally recorded UUID left as it was",
+    async (_label, fresh: Partial<LeanListing>) => {
+      const { result } = await verdict(async () => listing(fresh));
+      expect(result.classifiedServerUuid).toBe(SELECTED);
+      expect(await result.reverifyClassifiedTarget?.()).toEqual({
+        kind: "changed",
+      });
+    },
+  );
+
+  it.each([
+    ["has no validity check", { isCurrent: undefined }],
+    ["is already revoked", { isCurrent: () => false }],
+  ])(
+    "answers changed when the fresh listing %s",
+    async (_label, fresh: Partial<LeanListing>) => {
+      expect(await reverify(listing(fresh))).toEqual({ kind: "changed" });
+    },
+  );
+
+  it("looks the alias up under the name the client asked by, not the full name it was recorded as", async () => {
+    // The recorded tool is still listed read-only under its own name, but the
+    // alias the client used no longer exists: nothing may be inferred from the
+    // real name.
+    const fresh = listing({
+      tools: [{ ...READ, name: TARGET }, WRITE],
+      origins: new Map([[TARGET, [TARGET]]]),
+    });
+    expect(await reverify(fresh)).toEqual({ kind: "changed" });
+  });
+
+  it("answers unavailable when the catalog cannot be read (the listing's own retryable error)", async () => {
+    const { result } = await verdict(async () => {
+      throw new McpError(-32603, "backend unavailable");
+    });
+    expect(await result.reverifyClassifiedTarget?.()).toEqual({
+      kind: "unavailable",
+    });
+  });
+
+  it("lets an unexpected failure propagate, as the first read does, instead of calling it an unavailable catalog", async () => {
+    const boom = new Error("Not connected");
+    const { result } = await verdict(async () => {
+      throw boom;
+    });
+    await expect(result.reverifyClassifiedTarget?.()).rejects.toBe(boom);
+  });
+
+  it("returns the validity check of the load it waited for, never one captured after it, so a load invalidated while it ran is refused", async () => {
+    // A real catalog, whose loader captures validity before it loads, as the
+    // proxy's loader does.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let loads = 0;
+    const catalog: LeanCatalog = new LeanCatalog({
+      load: async () => {
+        loads += 1;
+        const isCurrent = catalog.captureValidity();
+        if (loads === 2) await gate;
+        return listing({ isCurrent });
+      },
+      now: () => 0,
+      ttlMs: 1_000,
+    });
+    const run = createLeanPrelude({
+      catalog,
+      log: vi.fn(),
+      elapsedMs: () => 0,
+    });
+    const result = await run(call("call_tool", ASKED));
+    expect(result.reverifyClassifiedTarget).toBeTypeOf("function");
+    // The reconnect: the verdict is revoked and the fresh load starts...
+    catalog.invalidate();
+    const pending = result.reverifyClassifiedTarget?.();
+    await Promise.resolve();
+    // ...and is itself invalidated while it runs.
+    catalog.invalidate();
+    release();
+    expect(await pending).toEqual({ kind: "changed" });
+    expect(loads).toBe(2);
+  });
+
+  it("answers current for a fresh load nothing invalidated, and shares a snapshot a concurrent search already built instead of loading again", async () => {
+    let loads = 0;
+    const catalog: LeanCatalog = new LeanCatalog({
+      load: async () => {
+        loads += 1;
+        return listing({ isCurrent: catalog.captureValidity() });
+      },
+      now: () => 0,
+      ttlMs: 1_000,
+    });
+    const run = createLeanPrelude({
+      catalog,
+      log: vi.fn(),
+      elapsedMs: () => 0,
+    });
+    const result = await run(call("call_tool", ASKED));
+    catalog.invalidate();
+    // A concurrent search rebuilds the snapshot after the invalidation.
+    await catalog.get();
+    expect(loads).toBe(2);
+    const answer = await result.reverifyClassifiedTarget?.();
+    expect(answer?.kind).toBe("current");
+    expect(loads).toBe(2);
   });
 });

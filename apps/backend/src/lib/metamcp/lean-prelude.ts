@@ -18,6 +18,7 @@ import {
   runSearch,
   toolError,
 } from "./lean-listing";
+import type { ReverifyResult } from "./metamcp-middleware/classified-target.functional";
 
 /**
  * What the `tools/call` handler of a lean session does before the middleware
@@ -38,6 +39,14 @@ import {
  * prelude, so concurrent calls cannot share it. The backend UUID and the
  * snapshot's validity check travel with it; dispatch checks both immediately
  * before sending, including after any asynchronous routing or recovery.
+ *
+ * `reverifyClassifiedTarget` travels with them, on a `call_tool` call only. A
+ * catalog invalidation (a backend reconnect, an override change) revokes the
+ * validity check without saying anything about the tool, and a revoked verdict
+ * is refused unless the chain can look again: it calls this, once per check
+ * point, to read a fresh listing and learn whether the very tool the verdict
+ * was given for still stands as read-only. It returns data and changes
+ * nothing, so a call that gave up waiting leaves no trace.
  */
 export interface LeanPreludeResult {
   answer?: CallToolResult;
@@ -45,6 +54,7 @@ export interface LeanPreludeResult {
   classifiedTarget?: string;
   classifiedServerUuid?: string;
   classifiedTargetIsCurrent?: () => boolean;
+  reverifyClassifiedTarget?: () => Promise<ReverifyResult>;
 }
 
 export type LeanPrelude = (
@@ -152,11 +162,41 @@ export function createLeanPrelude(options: {
           );
           return { answer: toolError(CALL_TOOL_ROUTING_ANSWER) };
         }
+        // The verdict does not survive an invalidation on trust: the backend
+        // behind the name may be a redeployed one whose tool now carries other
+        // hints. It can be given again, from a fresh listing and only then:
+        // for the SAME name the client asked by (through the same override
+        // resolution as above), standing for the SAME full tool on the SAME
+        // backend, read-only by the FRESH hints, in a listing that is itself
+        // still current. Anything missing or different is a change: nothing
+        // here widens what the verdict covered.
+        const requestedName = route.name;
+        const reverifyClassifiedTarget = async (): Promise<ReverifyResult> => {
+          // The catalog's own load (single-flight with a concurrent search).
+          // Its error contract is the first read's: the listing's retryable
+          // error is an unavailable catalog, anything else is a defect and
+          // propagates rather than passing for one.
+          const fresh = await readCatalog();
+          if (fresh === undefined) return { kind: "unavailable" };
+          if (
+            listedTargetOf(fresh, requestedName) !== classifiedTarget ||
+            fresh.serverUuids?.get(classifiedTarget) !== classifiedServerUuid ||
+            !classifyCallTarget(fresh, requestedName).readOnly ||
+            fresh.isCurrent === undefined ||
+            !fresh.isCurrent()
+          ) {
+            return { kind: "changed" };
+          }
+          // That listing's OWN validity check, captured before it loaded. One
+          // taken now would bless hints a late or invalidated load carries.
+          return { kind: "current", isCurrent: fresh.isCurrent };
+        };
         return {
           request: route.request,
           classifiedTarget,
           classifiedServerUuid,
           classifiedTargetIsCurrent: listing.isCurrent,
+          reverifyClassifiedTarget,
         };
       }
     }
