@@ -27,7 +27,15 @@ import {
   McpError,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from "vitest";
 
 import type { ConnectedClient } from "./client";
 
@@ -108,7 +116,7 @@ import { toolsSyncCache } from "./tools-sync-cache";
 type Pages = Record<string, { tools: string[]; next?: string }>;
 
 const cleanups: Array<() => Promise<unknown>> = [];
-let record: ReturnType<typeof vi.spyOn>;
+let record: MockInstance<typeof metamcpLogStore.record>;
 
 const tool = (name: string): Tool => ({
   name,

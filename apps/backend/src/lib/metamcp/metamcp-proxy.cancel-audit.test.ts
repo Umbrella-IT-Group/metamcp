@@ -14,7 +14,15 @@
  * auditing.functional.ts. A real SDK cancel drives everything.
  */
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from "vitest";
 
 import {
   connectGateway,
@@ -111,7 +119,7 @@ const DASHBOARD_ERROR_WORDS = /\b(error|fatal|panic|exception)\b/i;
 
 const cleanups: Array<() => Promise<unknown>> = [];
 const recorder = vi.fn().mockResolvedValue(undefined);
-let liveLogs: ReturnType<typeof vi.spyOn>;
+let liveLogs: MockInstance<typeof metamcpLogStore.record>;
 
 async function backend(
   onCall: Parameters<typeof makeBackend>[0],

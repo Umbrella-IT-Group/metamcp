@@ -16,7 +16,15 @@ import {
   StreamableHTTPError,
 } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ServerParameters } from "@repo/zod-types";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from "vitest";
 
 vi.mock("../../db/repositories/index", () => ({
   mcpServersRepository: {},
@@ -122,7 +130,7 @@ function connectWith(
   return { promise, createClient, transport: () => transport };
 }
 
-let record: ReturnType<typeof vi.spyOn>;
+let record: MockInstance<typeof metamcpLogStore.record>;
 const events = () =>
   record.mock.calls.map(
     ([entry]) => entry as { message: string; level: string; error?: unknown },
