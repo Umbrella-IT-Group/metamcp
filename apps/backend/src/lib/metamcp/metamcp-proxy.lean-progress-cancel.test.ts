@@ -859,6 +859,7 @@ describe("two lean sessions sharing one backend client", () => {
         { token, progress: 3 },
       ]);
       // Audit: the real tool, the right session, the right outcome.
+      // Hashes bind each row to its own arguments even when both tools match.
       await audit.arrived(2);
       await flush();
       expect(audit.rows).toHaveLength(2);
@@ -867,6 +868,7 @@ describe("two lean sessions sharing one backend client", () => {
       expect(audit.ofSession("sess-A")[0]).toMatchObject({
         server_name: DESK.name,
         tool_name: a.tool,
+        params_hash: sha256({ id: "A" }),
         success: false,
         error_code: "cancelled",
         error_detail: "outcome_unknown",
@@ -874,7 +876,318 @@ describe("two lean sessions sharing one backend client", () => {
       expect(audit.ofSession("sess-B")[0]).toMatchObject({
         server_name: DESK.name,
         tool_name: b.tool,
+        params_hash: sha256({ id: "B" }),
         success: true,
+      });
+    },
+  );
+});
+
+describe("a rewritten lean call after replay-safe recovery", () => {
+  it.each([
+    { a: DOORS[0], b: DOORS[1] },
+    { a: DOORS[1], b: DOORS[0] },
+  ])(
+    "A through $a.door and B through $b.door: the replacement keeps progress, cancel and audit with their own session",
+    async ({ a, b }) => {
+      const audit = auditRows();
+      const sessionA = await connectConsumer("sess-retry-A");
+      const sessionB = await connectConsumer("sess-retry-B");
+      await Promise.all(
+        [sessionA, sessionB].map((consumer) =>
+          consumer.client.callTool({ name: "search_tools", arguments: {} }),
+        ),
+      );
+      // Keep both routes on the old client, then really close it: the SDK's
+      // pre-send "Not connected" permits recovery without running either tool.
+      const stale = desk;
+      desk = await makeDesk();
+      await stale.close();
+      getSessionMock.mockClear();
+
+      const token = "tok-retry-shared";
+      const cancelA = new AbortController();
+      const callA = rejectionOf(
+        leanCall(sessionA, a.door, a.tool, {
+          id: "A",
+          token,
+          signal: cancelA.signal,
+        }),
+      );
+      const callB = leanCall(sessionB, b.door, b.tool, { id: "B", token });
+      await until(() => desk.live.length === 2, "both recovered backend calls");
+      expect(getSessionMock).toHaveBeenCalledTimes(2);
+      expect(sessionB.callIds).toEqual(sessionA.callIds);
+      const requestOf = (id: string) =>
+        desk.wire.calls.find((entry) => entry.args.id === id)?.requestId;
+      expect(requestOf("A")).toBeDefined();
+      expect(requestOf("B")).toBeDefined();
+      expect(requestOf("A")).not.toBe(requestOf("B"));
+      for (const call of desk.wire.calls) {
+        expect(call.progressToken).toBe(call.requestId);
+        expect(call.progressToken).not.toBe(token);
+      }
+
+      await desk.liveOf("A").progress(101);
+      await desk.liveOf("B").progress(1);
+      await until(
+        () =>
+          sessionA.progress().length === 1 && sessionB.progress().length === 1,
+        "both recovered progress updates",
+      );
+      cancelA.abort();
+      await callA;
+      await until(() => desk.abortedIds.includes("A"), "A's recovered abort");
+      expect(desk.wire.cancels).toEqual([{ requestId: requestOf("A") }]);
+      expect(desk.liveOf("B").call.signal.aborted).toBe(false);
+      await desk.liveOf("B").progress(2);
+      desk.liveOf("B").finish();
+      expect(textOf(await callB)).toBe(`finished B by ${b.tool}`);
+      await audit.arrived(2);
+      await flush();
+
+      expect(stale.wire.calls).toEqual([]);
+      expect(stale.wire.cancels).toEqual([]);
+      expect(desk.wire.calls).toHaveLength(2);
+      expect(desk.wire.cancels).toEqual([{ requestId: requestOf("A") }]);
+      expect(desk.abortedIds).toEqual(["A"]);
+      expect(desk.completed).toEqual(["B"]);
+      expect(sessionA.progress()).toEqual([{ token, progress: 101 }]);
+      expect(sessionB.progress()).toEqual([
+        { token, progress: 1 },
+        { token, progress: 2 },
+      ]);
+      expect(audit.rows).toHaveLength(2);
+      expect(audit.ofSession("sess-retry-A")).toHaveLength(1);
+      expect(audit.ofSession("sess-retry-A")[0]).toMatchObject({
+        server_name: DESK.name,
+        tool_name: a.tool,
+        params_hash: sha256({ id: "A" }),
+        success: false,
+        error_code: "cancelled",
+        error_detail: "outcome_unknown",
+      });
+      expect(audit.ofSession("sess-retry-B")).toHaveLength(1);
+      expect(audit.ofSession("sess-retry-B")[0]).toMatchObject({
+        server_name: DESK.name,
+        tool_name: b.tool,
+        params_hash: sha256({ id: "B" }),
+        success: true,
+      });
+    },
+  );
+
+  it.each(DOORS)(
+    "$door: a cancel during shared recovery prevents its retry while the sibling still runs",
+    async ({ door, tool }) => {
+      const audit = auditRows();
+      const lean = await connectConsumer("sess-recovery-cancel");
+      await lean.client.callTool({ name: "search_tools", arguments: {} });
+      const stale = desk;
+      desk = await makeDesk();
+      await stale.close();
+      getSessionMock.mockClear();
+      let reached!: () => void;
+      const held = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      getSessionMock.mockImplementationOnce(async () => {
+        reached();
+        await gate;
+        return desk.session;
+      });
+
+      const controller = new AbortController();
+      const cancelled = rejectionOf(
+        leanCall(lean, door, tool, {
+          id: "cancelled",
+          token: "tok-cancelled",
+          signal: controller.signal,
+        }),
+      );
+      await held;
+      const sibling = leanCall(lean, door, tool, {
+        id: "sibling",
+        token: "tok-sibling",
+      });
+      try {
+        await flush(300);
+        controller.abort();
+        await cancelled;
+        await flush(300);
+        expect(getSessionMock).toHaveBeenCalledTimes(1);
+        expect(desk.wire.calls).toEqual([]);
+      } finally {
+        release();
+      }
+      await until(() => desk.live.length === 1, "the sibling's recovered call");
+      expect(desk.wire.calls[0].args).toEqual({ id: "sibling" });
+      await desk.liveOf("sibling").progress(1);
+      desk.liveOf("sibling").finish();
+      expect(textOf(await sibling)).toBe(`finished sibling by ${tool}`);
+      await audit.arrived(2);
+      await flush();
+
+      expect(getSessionMock).toHaveBeenCalledTimes(1);
+      expect(stale.wire.calls).toEqual([]);
+      expect(desk.wire.calls).toHaveLength(1);
+      expect(desk.wire.cancels).toEqual([]);
+      expect(desk.completed).toEqual(["sibling"]);
+      expect(lean.progress()).toEqual([{ token: "tok-sibling", progress: 1 }]);
+      expect(audit.rows).toHaveLength(2);
+      expect(
+        audit.rows.find(
+          (row) => row.params_hash === sha256({ id: "cancelled" }),
+        ),
+      ).toMatchObject({
+        session_id: "sess-recovery-cancel",
+        tool_name: tool,
+        success: false,
+        error_code: "cancelled",
+        error_detail: "outcome_unknown",
+      });
+      expect(
+        audit.rows.find((row) => row.params_hash === sha256({ id: "sibling" })),
+      ).toMatchObject({
+        session_id: "sess-recovery-cancel",
+        tool_name: tool,
+        success: true,
+      });
+    },
+  );
+
+  it.each(DOORS)(
+    "$door: a broker refusal on the retry keeps the direct call's enrollment result and audit row",
+    async ({ door, tool }) => {
+      const audit = auditRows();
+      const plain = await connectConsumer("sess-retry-broker-direct", false);
+      const lean = await connectConsumer("sess-retry-broker-lean");
+      await plain.client.listTools();
+      await lean.client.callTool({ name: "search_tools", arguments: {} });
+      const stale = desk;
+      desk = await makeDesk();
+      await stale.close();
+      getSessionMock.mockClear();
+      const real = desk.session.client.request.bind(desk.session.client);
+      vi.spyOn(desk.session.client, "request").mockImplementation(((
+        request: { method: string },
+        schema: never,
+        options: never,
+      ) =>
+        request.method === "tools/call"
+          ? Promise.reject(
+              new M365BrokerError(
+                "credential_missing",
+                "No account.",
+                "https://enroll.example.test/m365",
+              ),
+            )
+          : real(request as never, schema, options)) as never);
+
+      const direct = await outcomeOf(
+        directCall(plain, tool, { id: "broker", token: "tok-direct" }),
+      );
+      const viaLean = await outcomeOf(
+        leanCall(lean, door, tool, { id: "broker", token: "tok-lean" }),
+      );
+      expect(getSessionMock).toHaveBeenCalledTimes(2);
+      expect(viaLean).toEqual(direct);
+      expect(viaLean.result?.isError).toBe(true);
+      expect(
+        JSON.parse(textOf(viaLean.result as CallToolResult)),
+      ).toMatchObject({
+        error: "credential_missing",
+        enroll_url: "https://enroll.example.test/m365",
+      });
+      expect(stale.wire.calls).toEqual([]);
+      expect(desk.wire.calls).toEqual([]);
+      expect(desk.wire.cancels).toEqual([]);
+      expect(lean.progress()).toEqual([]);
+      await audit.arrived(2);
+      await flush();
+      expect(audit.rows).toHaveLength(2);
+      expect(sameRow(audit.rows[1])).toEqual(sameRow(audit.rows[0]));
+      expect(audit.rows[1]).toMatchObject({
+        server_name: DESK.name,
+        tool_name: tool,
+        session_id: "sess-retry-broker-lean",
+        params_hash: sha256({ id: "broker" }),
+        success: false,
+      });
+    },
+  );
+
+  it.each(DOORS)(
+    "$door: a progressing retry keeps the direct call's total timeout and cancels only that retry",
+    async ({ door, tool }) => {
+      useCap();
+      const audit = auditRows();
+      const plain = await connectConsumer("sess-retry-cap-direct", false);
+      const lean = await connectConsumer("sess-retry-cap-lean");
+      await plain.client.listTools();
+      await lean.client.callTool({ name: "search_tools", arguments: {} });
+      const stale = desk;
+      desk = await makeDesk();
+      await stale.close();
+      const failedRequests = vi.spyOn(stale.session.client, "request");
+      getSessionMock.mockClear();
+
+      const direct = await overrunCap(() =>
+        directCall(plain, tool, { id: "cap", token: "tok-direct" }),
+      );
+      await until(
+        () => desk.wire.cancels.length === 1,
+        "the direct retry cancel",
+      );
+      // The direct leg outlived the catalog's one-second TTL. Start the lean
+      // leg at the same clock time so it retains the stale route and really
+      // exercises recovery, instead of refreshing onto the replacement.
+      vi.setSystemTime(new Date(T0));
+      const viaLean = await overrunCap(() =>
+        leanCall(lean, door, tool, { id: "cap", token: "tok-lean" }),
+      );
+      await until(
+        () => desk.wire.cancels.length === 2,
+        "the lean retry cancel",
+      );
+
+      expect(getSessionMock).toHaveBeenCalledTimes(2);
+      expect(viaLean.code).toBe(ErrorCode.RequestTimeout);
+      expect(
+        failedRequests.mock.calls.filter(
+          ([request]) => request.method === "tools/call",
+        ),
+      ).toHaveLength(2);
+      expect(viaLean.message).toContain("Maximum total timeout exceeded");
+      expect({
+        code: viaLean.code,
+        message: viaLean.message,
+        data: viaLean.data,
+      }).toEqual({
+        code: direct.code,
+        message: direct.message,
+        data: direct.data,
+      });
+      expect(stale.wire.calls).toEqual([]);
+      expect(stale.wire.cancels).toEqual([]);
+      expect(desk.wire.calls).toHaveLength(2);
+      expect(desk.wire.cancels).toEqual(
+        desk.wire.calls.map((call) => ({ requestId: call.requestId })),
+      );
+      expect(desk.abortedIds).toEqual(["cap", "cap"]);
+      await audit.arrived(2);
+      await flush();
+      expect(audit.rows).toHaveLength(2);
+      expect(sameRow(audit.rows[1])).toEqual(sameRow(audit.rows[0]));
+      expect(audit.rows[1]).toMatchObject({
+        server_name: DESK.name,
+        tool_name: tool,
+        session_id: "sess-retry-cap-lean",
+        success: false,
       });
     },
   );
