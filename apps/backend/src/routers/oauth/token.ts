@@ -1,5 +1,5 @@
 import { isOAuthClientApproved } from "@repo/zod-types";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import express from "express";
 
 import { CREDENTIAL_NOT_PERMITTED_MESSAGE } from "@/lib/api-key-ip-policy";
@@ -107,6 +107,77 @@ export function resolveRefreshClientAuthMode(): RefreshClientAuthMode {
 logger.info(
   `[oauth] refresh grant client auth: ${OAUTH_REFRESH_CLIENT_AUTH_ENV}=${resolveRefreshClientAuthMode()}`,
 );
+
+/**
+ * What the token endpoint does when an authorization code is presented a second
+ * time. RFC 6749 section 4.1.2: an authorization server MUST deny a reused code
+ * and SHOULD revoke the tokens previously issued from it. Denial was already
+ * true (redeeming a code deletes it), but the delete also erased the only
+ * record of which tokens the code produced, so a replay left whoever redeemed
+ * it first logged in and unrecorded. Migration 0045 keeps a short-lived record
+ * of each redeemed code (the "spent code") so a replay can be recognised.
+ *
+ * - `log` (default): a replay that proves possession of the original exchange
+ *   (same client, same redirect, a verifier matching the code's challenge, and
+ *   the client secret for a confidential client) is audited with how many
+ *   tokens of the family were live, and nothing is revoked. Whether a real
+ *   client ever submits the same code twice after receiving tokens is not
+ *   known, and revoking its session would be the visible cost of guessing
+ *   wrong, so this phase measures first.
+ * - `revoke`: the same validated replay also revokes the whole token family
+ *   (the existing refresh-token family revoke). Switched on deliberately,
+ *   after a baseline window with no audited replay from a known client.
+ * - `off`: the feature does nothing. No record is written, read or consumed
+ *   and no audit row is written, so a broken or missing table cannot affect a
+ *   login. This is the full rollback.
+ *
+ * The wire answer to a replay is the unchanged invalid_grant in every mode.
+ * Read per call, like resolveRefreshClientAuthMode, so a test can switch modes
+ * inside one file and the value in effect is the value in the env.
+ */
+export const OAUTH_CODE_REPLAY_ENV = "OAUTH_CODE_REPLAY";
+
+export type CodeReplayMode = "revoke" | "log" | "off";
+
+export function resolveCodeReplayMode(): CodeReplayMode {
+  const raw = process.env[OAUTH_CODE_REPLAY_ENV];
+  if (raw === undefined || raw.trim() === "") {
+    return "log";
+  }
+  const value = raw.trim().toLowerCase();
+  if (value === "revoke" || value === "log" || value === "off") {
+    return value;
+  }
+  // An unrecognised value falls back to `log`, never `revoke`: a typo must not
+  // switch on session revocation, and never `off`, which would silently drop
+  // the audit trail. The warning names the value so the operator can see the
+  // setting did not take.
+  logger.warn(
+    `[oauth] ${OAUTH_CODE_REPLAY_ENV}=${JSON.stringify(raw.slice(0, 40))} is not "revoke", "log" or "off"; using log`,
+  );
+  return "log";
+}
+
+logger.info(
+  `[oauth] authorization code replay: ${OAUTH_CODE_REPLAY_ENV}=${resolveCodeReplayMode()}`,
+);
+
+// How long past the code's own expiry its spent-code record stays actionable.
+// It covers a redemption that waits on the user lock past the code's expiry
+// and clock skew between the instants the code and the record are judged, so
+// a replay that arrives just after the code lapsed is still recognised. Short
+// on purpose: the record exists to catch a prompt replay, and a longer window
+// only grows the table.
+export const SPENT_CODE_MARGIN_MS = 5 * 60 * 1000;
+
+/**
+ * The PKCE S256 transform: BASE64URL(SHA-256(ASCII(code_verifier))), RFC 7636
+ * section 4.2. One implementation for the redemption check and the replay
+ * check, so the two cannot disagree about what a verifier proves.
+ */
+export function s256Challenge(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
 
 // Umbrella fork: success-path grant observability. Until now the token endpoint
 // logged only FAILURES, so nothing in `app.log` distinguished "the connector
@@ -591,9 +662,27 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
+  // Read once per request (see resolveCodeReplayMode): the lookup below, the
+  // lock callback and the replay handling must all agree on the mode.
+  const replayMode = resolveCodeReplayMode();
+  const presentedCode = {
+    code,
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeVerifier: code_verifier,
+  };
+
   // Look up the authorization code
   const codeData = await oauthRepository.getAuthCode(code);
   if (!codeData) {
+    // No live code: unknown, expired-and-reaped, or already redeemed. Only the
+    // last is a replay, and only a presentation that proves possession of the
+    // original exchange is acted on (see handleSpentCodePresentation). Whatever
+    // it finds, the caller gets the same answer it always did, so a holder of a
+    // spent code learns nothing about whether detection fired.
+    if (replayMode !== "off") {
+      await handleSpentCodePresentation(req, replayMode, presentedCode);
+    }
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Invalid or expired authorization code",
@@ -624,6 +713,27 @@ async function handleAuthorizationCodeGrant(
   // Check if code has expired (the lifetime is set when it is minted, see
   // authorizationCodeTtlMs in ./authorization).
   if (Date.now() > codeData.expires_at.getTime()) {
+    if (replayMode !== "off") {
+      // The first read can see a winner's uncommitted delete even after the
+      // code expires. Wait for its lock and distinguish that redeemed code
+      // from an expired live one: the spent record's margin still applies.
+      const wasRedeemed = await oauthRepository.withUserLock(
+        codeData.user_id,
+        async (tx) => {
+          if (await oauthRepository.getAuthCode(code, tx)) {
+            return false;
+          }
+          await handleSpentCodePresentation(req, replayMode, presentedCode, tx);
+          return true;
+        },
+      );
+      if (wasRedeemed) {
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Invalid or expired authorization code",
+        });
+      }
+    }
     emitCodeExpired();
     await oauthRepository.deleteAuthCode(code);
     return res.status(400).json({
@@ -705,12 +815,10 @@ async function handleAuthorizationCodeGrant(
   // against code interception. The authorize handler refuses to mint a "plain"
   // code, so a stored one is not reachable through the normal flow; this branch
   // is the defense-in-depth twin that refuses it here too.
-  const crypto = await import("crypto");
   let challengeFromVerifier: string;
 
   if (codeData.code_challenge_method === "S256") {
-    const hash = crypto.createHash("sha256").update(code_verifier).digest();
-    challengeFromVerifier = hash.toString("base64url");
+    challengeFromVerifier = s256Challenge(code_verifier);
   } else {
     return res.status(400).json({
       error: "invalid_grant",
@@ -758,6 +866,14 @@ async function handleAuthorizationCodeGrant(
   // live credential the administrator was told was gone. A failed insert rolls
   // the consume back with it. A new authorization code grant starts a new
   // refresh-token family.
+  //
+  // The spent-code record (migration 0045, unless OAUTH_CODE_REPLAY=off) is
+  // written in this same transaction, after the pair: consume, pair and record
+  // commit together or none do. A failed record write therefore fails the
+  // grant (the code stays redeemable) instead of minting a pair no replay could
+  // ever be tied back to. The challenge is read into a local so the narrowing
+  // from the PKCE check above holds inside the closure.
+  const codeChallenge: string = codeData.code_challenge;
   const issued = await oauthRepository.withUserLock(
     codeData.user_id,
     async (tx) => {
@@ -765,6 +881,15 @@ async function handleAuthorizationCodeGrant(
       // disable. Re-check both here before consuming it; a disabled account
       // keeps its code so re-enabling it within the TTL restores the flow.
       if (Date.now() > codeData.expires_at.getTime()) {
+        // Expiry of the stale live row must not bypass replay detection when
+        // a winner committed while this request waited for the lock.
+        if (
+          replayMode !== "off" &&
+          !(await oauthRepository.getAuthCode(code, tx))
+        ) {
+          await handleSpentCodePresentation(req, replayMode, presentedCode, tx);
+          return null;
+        }
         emitCodeExpired();
         await oauthRepository.consumeAuthCode(code, tx);
         return null;
@@ -777,15 +902,46 @@ async function handleAuthorizationCodeGrant(
       }
       const consumed = await oauthRepository.consumeAuthCode(code, tx);
       if (!consumed) {
+        // Lost the race for this code: another redemption consumed it between
+        // the read above and this delete. This request passed every check the
+        // winner did (client, redirect, client authentication, PKCE), so it is
+        // a validated replay. Once the winner's transaction has committed the
+        // lock hands us its record; if the code vanished for another reason
+        // (an administrator's revoke, a client delete, the reaper) there is no
+        // record and the answer is the plain refusal, as before.
+        if (
+          replayMode !== "off" &&
+          (await oauthRepository.getSpentCode(code, tx))
+        ) {
+          await revokeSpentCodeFamilyLocked(req, tx, code, replayMode);
+        }
         return null;
       }
-      return issueTokenPair(
+      const familyId = randomUUID();
+      const pair = await issueTokenPair(
         codeData.client_id,
         codeData.user_id,
         codeData.scope,
-        randomUUID(),
+        familyId,
         tx,
       );
+      if (replayMode !== "off") {
+        await oauthRepository.recordSpentCode(
+          code,
+          {
+            family_id: familyId,
+            client_id: codeData.client_id,
+            user_id: codeData.user_id,
+            redirect_uri: codeData.redirect_uri,
+            code_challenge: codeChallenge,
+            expires_at: new Date(
+              codeData.expires_at.getTime() + SPENT_CODE_MARGIN_MS,
+            ),
+          },
+          tx,
+        );
+      }
+      return pair;
     },
   );
   if (!issued) {
@@ -1019,6 +1175,140 @@ async function revokeReusedFamilyLocked(
   logger.warn(
     `[oauth] refresh token reuse detected; family revoked ` +
       `client=${reused.client_id} user=${reused.user_id} tokens_revoked=${revoked}`,
+  );
+}
+
+/**
+ * A presentation of an authorization code that has no live row. Acts only when
+ * the presentation proves possession of the exchange that spent the code; any
+ * failed check changes nothing, writes nothing and returns, and the caller
+ * answers the unchanged invalid_grant either way.
+ *
+ * WHY THE CHECKS. Authorization codes travel in redirect URLs, so a code alone
+ * is a value an observer can have. If merely presenting a spent code revoked
+ * its family, anyone who saw a code could log the legitimate user out: the
+ * detection would be a revocation lever. RFC 6749 section 4.1.2 says a
+ * server SHOULD revoke on reuse, not MUST, and this is the deliberate
+ * narrowing of that SHOULD. The checks are the ones redemption itself makes,
+ * in the same order, cheapest first, so a presentation is acted on only when
+ * it could have redeemed the code had it still been live: the client and
+ * redirect it was bound to (RFC 6749 section 4.1.3), a code_verifier whose S256
+ * digest is the stored challenge (RFC 7636 section 4.6), and for a confidential
+ * client its secret. The challenge was public (it travelled in the authorize
+ * URL), the verifier never did, so the verifier is what separates the party
+ * that started the flow from one that only saw the redirect.
+ *
+ * An unknown code finds no record and costs one primary-key read, bounded by
+ * the endpoint's request limiter.
+ */
+async function handleSpentCodePresentation(
+  req: express.Request,
+  mode: Exclude<CodeReplayMode, "off">,
+  presented: {
+    code: string;
+    clientId: unknown;
+    redirectUri: unknown;
+    codeVerifier: unknown;
+  },
+  // An expiry check may already hold the owner's lock. Reuse its transaction
+  // for every read and write instead of opening a lock that waits on itself.
+  tx?: OAuthTx,
+): Promise<void> {
+  const spent = await oauthRepository.getSpentCode(presented.code, tx);
+  if (!spent) {
+    return;
+  }
+  if (
+    spent.client_id !== presented.clientId ||
+    spent.redirect_uri !== presented.redirectUri
+  ) {
+    return;
+  }
+  if (
+    typeof presented.codeVerifier !== "string" ||
+    s256Challenge(presented.codeVerifier) !== spent.code_challenge
+  ) {
+    return;
+  }
+  const client = await oauthRepository.getClient(spent.client_id, tx);
+  if (!client) {
+    return;
+  }
+  const clientAuth = evaluateClientCredentials(req, client);
+  if (clientAuth && clientAuth.outcome !== "verified") {
+    return;
+  }
+  // The same per-user credential lock every mint and revoke takes, so the
+  // family cannot gain a member between the count and the revoke below.
+  if (tx) {
+    await revokeSpentCodeFamilyLocked(req, tx, presented.code, mode);
+  } else {
+    await oauthRepository.withUserLock(spent.user_id, (lockedTx) =>
+      revokeSpentCodeFamilyLocked(req, lockedTx, presented.code, mode),
+    );
+  }
+}
+
+/**
+ * Act on a validated replay of a spent authorization code, under the owner's
+ * credential lock. Both the sequential path (handleSpentCodePresentation) and
+ * the concurrent one (a redemption that lost the race for the live code) end
+ * here, and both hand over the lock's `tx`: the lock is not re-entrant, so
+ * opening a second transaction for the same user would wait on itself.
+ *
+ * The record is consumed first. Consuming it is the gate that makes exactly
+ * one replay act: of two replays arriving together one gets the row and the
+ * other, and every later one, gets nothing and returns, so a compromised code
+ * writes one audit row, not one per attempt.
+ *
+ * The audit row is emitted BEFORE the revoke and never awaited, for the reason
+ * emitTokenLifecycle documents: the record has to survive a delete that
+ * throws. `tokens_live` is counted under the lock, before the revoke, so it is
+ * exact, and `family_revoked` is derived from it: a replay after
+ * users.revokeAccess (which deletes a family's tokens but not this record)
+ * finds none live, and the row says nothing was revoked rather than claiming a
+ * revoke that did nothing. In `log` mode `tokens_live` above zero is the
+ * baseline signal: a replay that, under `revoke`, would have ended a live
+ * session.
+ */
+async function revokeSpentCodeFamilyLocked(
+  req: express.Request,
+  tx: OAuthTx,
+  code: string,
+  mode: Exclude<CodeReplayMode, "off">,
+): Promise<void> {
+  const spent = await oauthRepository.consumeSpentCode(code, tx);
+  if (!spent) {
+    return;
+  }
+  const tokensLive = await oauthRepository.countFamilyAccessTokens(
+    spent.family_id,
+    tx,
+  );
+  const familyRevoked = mode === "revoke" && tokensLive > 0;
+  emitTokenLifecycle(req, {
+    action: "oauth.token.reuse",
+    clientId: spent.client_id,
+    userId: spent.user_id,
+    token: code,
+    outcome: "denied",
+    httpStatus: 400,
+    detail: {
+      reason: "authorization_code_reuse",
+      token_type: "authorization_code",
+      family_id: spent.family_id,
+      mode,
+      tokens_live: tokensLive,
+      family_revoked: familyRevoked,
+    },
+  });
+  if (mode === "revoke") {
+    await oauthRepository.revokeFamily(spent.family_id, tx);
+  }
+  logger.warn(
+    `[oauth] authorization code reuse detected; mode=${mode} ` +
+      `client=${spent.client_id} user=${spent.user_id} ` +
+      `tokens_live=${tokensLive} family_revoked=${familyRevoked}`,
   );
 }
 
@@ -1303,6 +1593,18 @@ function isoOrNull(value: Date | null | undefined): string | null {
  *    `denied` rather than `failure`, so a query for active attacks filters on
  *    it. Emit-first here too — the revoke is the delete that must not be able to
  *    lose the record.
+ *  - AUTHORIZATION-CODE REUSE (migration 0045, OAUTH_CODE_REPLAY not `off`):
+ *    emitted, as `oauth.token.reuse` with `detail.reason` set to
+ *    `authorization_code_reuse` to tell it from the refresh-token row above.
+ *    The bound is the refresh-token one, tightened further: a row is written
+ *    only by a presentation of a code that has a spent-code record AND proves
+ *    possession of the exchange (client, redirect, a verifier matching the
+ *    stored challenge, the secret for a confidential client), and the first
+ *    such presentation CONSUMES the record, so one code writes one row however
+ *    often it is replayed. An invented code has no record and writes nothing;
+ *    a real code presented without its verifier writes nothing. `detail`
+ *    carries the mode, how many tokens of the family were live, and whether
+ *    this request revoked them. Emit-first, like the others.
  *  - A REJECTION THAT DESTROYS THE ROW IT JUST READ: emitted. Three branches
  *    qualify — an EXPIRED AUTHORIZATION CODE and an EXPIRED REFRESH TOKEN on
  *    /oauth/token, and an EXPIRED ACCESS TOKEN on /oauth/introspect. Each is

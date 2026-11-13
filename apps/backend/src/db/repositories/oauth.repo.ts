@@ -6,7 +6,7 @@ import {
   OAuthClient,
   OAuthClientCreateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, gte, isNull, lt, or, sql } from "drizzle-orm";
 
 import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
 import { hashClientSecret } from "@/routers/oauth/utils";
@@ -18,6 +18,7 @@ import {
   oauthAuthorizationCodesTable,
   oauthClientsTable,
   oauthRotatedRefreshTokensTable,
+  oauthSpentAuthorizationCodesTable,
   usersTable,
 } from "../schema";
 import {
@@ -283,8 +284,11 @@ export class OAuthRepository {
   // the old exact-value lookup matched. The returned row's `code` is the hash;
   // callers that re-address the row (consume/delete) pass the plaintext again
   // and it re-hashes, so no caller ever handles the stored digest directly.
-  async getAuthCode(code: string): Promise<OAuthAuthorizationCode | null> {
-    const result = await db
+  async getAuthCode(
+    code: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<OAuthAuthorizationCode | null> {
+    const result = await executor
       .select()
       .from(oauthAuthorizationCodesTable)
       .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)))
@@ -660,6 +664,109 @@ export class OAuthRepository {
     return revoked.length;
   }
 
+  // ===== Spent authorization codes (migration 0045) =====
+
+  // Record a redeemed authorization code, in the SAME transaction as the token
+  // pair it produced, so the tombstone exists exactly when the pair does. The
+  // key is the same sha256 the live codes table uses (hashApiKey), never the
+  // code. A plain insert on purpose: a conflict (the code hash is the primary
+  // key, and consumeAuthCode already guaranteed single use) or a missing table
+  // must fail the whole transaction loudly, so a login never succeeds without
+  // its record. `tx` is required, not defaulted to the pool, so a caller cannot
+  // write the record outside the transaction that issued the pair.
+  async recordSpentCode(
+    code: string,
+    data: {
+      family_id: string;
+      client_id: string;
+      user_id: string;
+      redirect_uri: string;
+      code_challenge: string;
+      expires_at: Date;
+    },
+    tx: OAuthTx,
+  ): Promise<void> {
+    await tx.insert(oauthSpentAuthorizationCodesTable).values({
+      code_hash: hashApiKey(code),
+      family_id: data.family_id,
+      client_id: data.client_id,
+      user_id: data.user_id,
+      redirect_uri: data.redirect_uri,
+      code_challenge: data.code_challenge,
+      expires_at: data.expires_at,
+    });
+  }
+
+  // Look up a redeemed code by the PLAINTEXT presented value, only while its
+  // record has not expired: an expired row is evidence nobody acts on, and the
+  // reaper may simply not have run yet. `now` is a parameter so the expiry rule
+  // is testable without a wall clock.
+  async getSpentCode(
+    code: string,
+    executor: OAuthDbExecutor = db,
+    now: Date = new Date(),
+  ) {
+    const result = await executor
+      .select({
+        family_id: oauthSpentAuthorizationCodesTable.family_id,
+        client_id: oauthSpentAuthorizationCodesTable.client_id,
+        user_id: oauthSpentAuthorizationCodesTable.user_id,
+        redirect_uri: oauthSpentAuthorizationCodesTable.redirect_uri,
+        code_challenge: oauthSpentAuthorizationCodesTable.code_challenge,
+        expires_at: oauthSpentAuthorizationCodesTable.expires_at,
+      })
+      .from(oauthSpentAuthorizationCodesTable)
+      .where(
+        and(
+          eq(oauthSpentAuthorizationCodesTable.code_hash, hashApiKey(code)),
+          gte(oauthSpentAuthorizationCodesTable.expires_at, now),
+        ),
+      )
+      .limit(1);
+    return result[0] || null;
+  }
+
+  // The gate that makes exactly one replay act: DELETE ... RETURNING on the
+  // primary key, the same shape as consumeAuthCode. Of two concurrent replays
+  // exactly one gets the row back; the other (and every later replay) gets null
+  // and does nothing, so one compromised code produces one audit row. Also
+  // refuses an expired row, so the expiry rule cannot be bypassed by going
+  // straight to the consume. Takes the caller's `tx` (the replay revoke runs
+  // under the owner's credential lock and must not open a second transaction).
+  async consumeSpentCode(code: string, tx: OAuthTx, now: Date = new Date()) {
+    const deleted = await tx
+      .delete(oauthSpentAuthorizationCodesTable)
+      .where(
+        and(
+          eq(oauthSpentAuthorizationCodesTable.code_hash, hashApiKey(code)),
+          gte(oauthSpentAuthorizationCodesTable.expires_at, now),
+        ),
+      )
+      .returning({
+        family_id: oauthSpentAuthorizationCodesTable.family_id,
+        client_id: oauthSpentAuthorizationCodesTable.client_id,
+        user_id: oauthSpentAuthorizationCodesTable.user_id,
+      });
+    return deleted[0] || null;
+  }
+
+  // How many rows revokeFamily would delete for this family right now: every
+  // access-token row carrying the family id, the same set revokeFamilyLocked
+  // removes. The replay handler reads it under the owner's credential lock
+  // before revoking, so the audit row states what was actually live and a
+  // replay after users.revokeAccess (which deletes the family's rows but leaves
+  // the tombstone) is recorded as having revoked nothing.
+  async countFamilyAccessTokens(
+    familyId: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<number> {
+    const [row] = await executor
+      .select({ n: sql<number>`count(*)::int` })
+      .from(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.family_id, familyId));
+    return row?.n ?? 0;
+  }
+
   // ===== Cleanup =====
 
   async cleanupExpired(): Promise<void> {
@@ -693,6 +800,17 @@ export class OAuthRepository {
       db
         .delete(oauthRotatedRefreshTokensTable)
         .where(lt(oauthRotatedRefreshTokensTable.expires_at, now)),
+      // `off` also bypasses this table in the periodic sweep: it is the full
+      // rollback when the table is missing or broken. Existing records are
+      // reaped once the feature is enabled again. Every other value keeps the
+      // sweep, matching the token endpoint's fallback to `log`.
+      ...(process.env.OAUTH_CODE_REPLAY?.trim().toLowerCase() === "off"
+        ? []
+        : [
+            db
+              .delete(oauthSpentAuthorizationCodesTable)
+              .where(lt(oauthSpentAuthorizationCodesTable.expires_at, now)),
+          ]),
     ]);
   }
 }

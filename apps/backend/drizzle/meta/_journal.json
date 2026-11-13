@@ -309,6 +309,13 @@
       "when": 1788220800000,
       "tag": "0044_endpoint_presentation",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1788307200000,
+      "tag": "0045_oauth_spent_authorization_codes",
+      "breakpoints": true
     }
   ]
 }

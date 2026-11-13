@@ -105,3 +105,54 @@ public client has no credential of its own and its ID appears in authorization U
 approval does not establish which program is using an approved client. Each person's consent
 still decides every grant, and the consent screen and the code page say who supplied the
 application details and that the organization never asks anyone for a code.
+
+### Authorization-code replay (Umbrella fork)
+
+RFC 6749 section 4.1.2 says an authorization code used more than once must be denied and
+the tokens issued from it should be revoked. Redeeming a code deletes it, so a second
+redemption was always denied with `invalid_grant`, but nothing recorded which tokens the
+code had produced and nothing was logged, so whoever redeemed it first stayed signed in.
+
+Every redeemed code now leaves a record for about 15 minutes (the code's lifetime plus five
+minutes): the token family it started, the client, the redirect URI and the PKCE challenge,
+keyed on the same hash the live code uses and never on the code. It is written in the same
+database transaction as the token pair, so the two exist together or not at all. A failed
+write fails the grant and the code stays redeemable.
+
+A later presentation of that code is acted on only when it proves possession of the
+original exchange: the same client and redirect URI, a `code_verifier` whose S256 digest is
+the stored challenge, and for a confidential client its secret. Anything less changes
+nothing and writes nothing. Codes travel in redirect URLs, so a code alone is something an
+observer can hold; without this check, detection would be a way to end someone else's
+session. This narrows the RFC's "should revoke" on purpose.
+
+A presentation that passes writes one `oauth.token.reuse` audit row (`detail.reason` is
+`authorization_code_reuse`, as distinct from `refresh_token_reuse`) and uses up the record,
+so one compromised code produces one row however often it is replayed. The row says how
+many tokens of the family were live (`tokens_live`) and whether this request revoked them
+(`family_revoked`). The caller always gets the same `invalid_grant` it got before, in every
+mode.
+
+`OAUTH_CODE_REPLAY` chooses what happens next (see `example.env`):
+
+| Value         | Effect                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `log` (unset) | Audit only. `tokens_live` above zero is a replay that `revoke` would have turned into a sign-out. Nothing is revoked.                |
+| `revoke`      | The same validated replay also revokes the whole token family (the refresh-token family revoke), so the first caller's session ends. |
+| `off`         | No record is written, read or removed and no row is written. The full rollback.                                                      |
+
+Any other value behaves as `log` and logs a warning naming it. The value in effect is logged
+once at startup.
+
+Moving from `log` to `revoke` is a deliberate step. Whether a real client ever submits the
+same code twice after receiving its tokens is not known, and under `revoke` that client
+would lose its session. Run `log` for at least a week and read the `authorization_code_reuse`
+rows first; the flip is safe when none has `tokens_live` above zero from a client you know.
+After the flip, a replay row with `family_revoked: true` followed within minutes by a new
+grant for the same user and client means a legitimate client double-submits: set `log` and
+investigate.
+
+After deploying migration 0045, confirm it took effect before relying on any of this:
+`SELECT to_regclass('oauth_spent_authorization_codes')` returns the table name. If it is
+null, logins fail loudly (the record write is part of the grant); set `OAUTH_CODE_REPLAY=off`
+to restore them while the migration is investigated.
