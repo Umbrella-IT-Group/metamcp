@@ -10,8 +10,10 @@
  * `set` is callable without the router.
  */
 import { createHash } from "node:crypto";
+import { format } from "node:util";
 
 import { GetEndpointPresentationResponseSchema } from "@repo/zod-types";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { findEndpointMock, findRowMock, upsertMock, deleteMock, loggerMock } =
@@ -456,17 +458,28 @@ describe("set", () => {
   });
 
   it("never writes administrator text to a log line", async () => {
-    upsertMock.mockRejectedValue(new Error("boom"));
+    // Drizzle includes bound values in both the message and the error's
+    // enumerable params. A plain Error("boom") cannot expose this leak.
+    upsertMock.mockRejectedValue(
+      new DrizzleQueryError(
+        "insert into endpoint_presentation (title, instructions) values ($1, $2)",
+        ["Secret title", "Secret instructions"],
+        new Error("connection refused"),
+      ),
+    );
     await impl.set(
       request({ title: "Secret title", instructions: "Secret instructions" }),
       ADMIN,
       ACTOR,
     );
-    const logged = JSON.stringify([
+    const logged = [
       ...loggerMock.error.mock.calls,
       ...loggerMock.warn.mock.calls,
       ...loggerMock.info.mock.calls,
-    ]);
+    ]
+      .map((args) => format(...args))
+      .join("\n");
+    expect(loggerMock.error).toHaveBeenCalledTimes(1);
     expect(logged).not.toContain("Secret title");
     expect(logged).not.toContain("Secret instructions");
   });
