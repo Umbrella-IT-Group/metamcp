@@ -13,7 +13,7 @@
  *     unavailable", never "Unknown tool" (tool-call-routing.ts: only an
  *     authoritative miss on a mounted server may say the tool is unknown);
  *   - a normal multi-page listing is unchanged.
- * Each backend carries a tripwire: it throws after 200 requests, so a
+ * Each backend carries a tripwire: its listing ends after 200 requests, so a
  * regression fails by assertion instead of hanging a worker.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -125,7 +125,9 @@ async function pagedBackend(pages: Pages) {
   );
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
     requests += 1;
-    if (requests > 200) throw new Error("runaway pagination (tripwire)");
+    // Tripwire: after 200 requests the listing simply ends, so an unguarded
+    // loop finishes and fails the assertions instead of hanging the worker.
+    if (requests > 200) return { tools: [] };
     const page = pages[request.params?.cursor ?? ""];
     return { tools: page.tools.map(tool), nextCursor: page.next };
   });
@@ -260,10 +262,14 @@ describe("a backend whose cursors cycle", () => {
 
 describe("a tool lookup on a listing it cannot finish", () => {
   it("answers backend unavailable, not Unknown tool, for a name past the cut", async () => {
-    await pagedBackend(CYCLE);
+    const target = await pagedBackend(CYCLE);
 
     const error = await callError(await consumer(), "ninja__z");
 
+    // The guard stopped the lookup after the cycle, and said so.
+    expect(target.requests()).toBeLessThanOrEqual(4);
+    expect(truncationEvents()).toHaveLength(1);
+    expect(truncationEvents()[0].message).toContain("(tool lookup)");
     expect(error.message).not.toContain("Unknown tool");
     expect(error.message).toContain("tool_lookup_failed");
     expect((error.data as { reason?: string }).reason).toBe(

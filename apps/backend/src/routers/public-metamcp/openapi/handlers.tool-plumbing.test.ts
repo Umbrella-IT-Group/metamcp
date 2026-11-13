@@ -119,7 +119,9 @@ async function pagedBackend(
   );
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
     requests += 1;
-    if (requests > 200) throw new Error("runaway pagination (tripwire)");
+    // Tripwire: after 200 requests the listing simply ends, so an unguarded
+    // loop finishes and fails the request-count assertions instead of hanging.
+    if (requests > 200) return { tools: [] };
     const page = pages[request.params?.cursor ?? ""];
     return {
       tools: page.tools.map((name) => ({

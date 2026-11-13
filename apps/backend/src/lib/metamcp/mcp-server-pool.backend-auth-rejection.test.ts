@@ -39,6 +39,8 @@ vi.mock("./server-error-tracker", () => ({
   },
 }));
 
+import logger from "@/utils/logger";
+
 import { connectMetaMcpClient } from "./client";
 import { metamcpLogStore } from "./log-store";
 import { McpServerPool } from "./mcp-server-pool";
@@ -184,6 +186,9 @@ describe("tool-definition sweep pagination guard", () => {
     const record = vi
       .spyOn(metamcpLogStore, "record")
       .mockImplementation(() => undefined);
+    // The sweep used to warn "hit the 50-page cap" here even though the
+    // backend had ended its listing on page 50.
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
     let page = 0;
     const client = stuckClient();
     client.client.request.mockImplementation(async () => {
@@ -198,5 +203,6 @@ describe("tool-definition sweep pagination guard", () => {
 
     expect(client.client.request).toHaveBeenCalledTimes(50);
     expect(record).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
   });
 });

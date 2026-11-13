@@ -33,7 +33,9 @@ function backend(script: Record<string, Page>) {
   const requested: Array<string | undefined> = [];
   const fetchPage = async (cursor: string | undefined) => {
     requested.push(cursor);
-    if (requested.length > 200) throw new Error("runaway pagination");
+    // Tripwire: after 200 requests the listing simply ends, so an unguarded
+    // loop finishes and fails the request-count assertions instead of hanging.
+    if (requested.length > 200) return { tools: [] };
     return script[cursor ?? ""];
   };
   return { fetchPage, requested };
@@ -90,8 +92,8 @@ describe("collectToolsListPages", () => {
     const result = await collectToolsListPages(async (cursor) => {
       requested.push(cursor);
       n += 1;
-      // Tripwire: an unguarded loop fails here instead of exhausting memory.
-      if (n > 200) throw new Error("runaway pagination");
+      // Tripwire: an unguarded loop ends here and fails the count assertion.
+      if (n > 200) return { tools: [] };
       return { tools: [], nextCursor: `page-${n}` };
     });
 
