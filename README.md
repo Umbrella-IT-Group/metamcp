@@ -269,7 +269,7 @@ Edit `.env` before that first `docker compose up`. `POSTGRES_PASSWORD` has no de
 
 The compose files publish both ports on loopback (`127.0.0.1:12008` and `127.0.0.1:9433`) rather than every host interface, so a box with a public IP does not expose the unauthenticated app port or the raw Postgres port to the network by default. `localhost:12008` still works on the host. To reach the app from another machine, put a reverse proxy or an SSH tunnel in front of it rather than widening the bind. This matches the loopback posture the platform overlay enforces on the real deployment.
 
-If you change `APP_URL`, access the app only from that URL. MetaMCP applies CORS per route: the OAuth discovery endpoints allow any origin, while the app and API routes (`/api/auth`, `/trpc`, `/mcp-proxy`, `/metamcp`) are restricted to an allowlist of `APP_URL` plus any origins you add to `EXTRA_TRUSTED_ORIGINS` (comma-separated). The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
+If you change `APP_URL`, access the app only from that URL. MetaMCP applies CORS per route: the OAuth discovery endpoints allow any origin, while the app and API routes (`/api/auth`, `/trpc`, `/mcp-proxy`, `/metamcp`) are restricted to an allowlist of `APP_URL` plus any origins you add to `EXTRA_TRUSTED_ORIGINS` (comma-separated). `/metamcp` also checks the `Origin` header itself, as the MCP transport spec requires (see [Origin policy](#origin-policy-on-the-mcp-endpoints)). The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
 
 ### Local development
 
@@ -317,6 +317,19 @@ Accounts get the `member` role by default, and only an administrator can change 
 If no administrator exists after the pass, the boot log carries a `NO ADMINISTRATOR` warning naming this variable and the SQL fallback: `UPDATE users SET role = 'admin' WHERE email = '<address>';`. **Upgrading an existing install past migration `0020`** turns every existing account into a `member`, so set `METAMCP_ADMIN_EMAIL` to your own address before (or right after) the upgrade and restart.
 
 Admin identity is a deployment concern, not a committed one: name it through `METAMCP_ADMIN_EMAIL`, not a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
+
+### Origin policy on the MCP endpoints
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_ORIGIN_POLICY` | `audit` | What `/metamcp/*` does with a request whose `Origin` header is not `APP_URL`, an `EXTRA_TRUSTED_ORIGINS` entry, an `MCP_ALLOWED_ORIGINS` entry, or loopback while `APP_URL` is loopback. `audit` serves it as before and records it; `enforce` answers `403` before any endpoint lookup, credential check or session slot; `off` does nothing. Strict values: anything else (including an empty value) runs as `audit` and logs an ERROR at boot. |
+| `MCP_ALLOWED_ORIGINS` | unset | Comma-separated http(s) origins that pass the check and are granted no CORS. For a server-side client that sends an `Origin` and must not also be trusted with the session relay, which is what `EXTRA_TRUSTED_ORIGINS` grants. |
+
+The MCP Streamable HTTP transport spec says a server must validate `Origin` on every incoming connection and answer an invalid one with `403`. Nothing on these routes did. A request with no `Origin` always passes, because every server-side client (Node `fetch`, httpx, curl, n8n) sends none. `/health`, `/health/sessions` and `/` (GET and HEAD only) are never checked; `/oauth/*`, `/.well-known/*`, `/api/auth`, `/trpc`, `/mcp-proxy` and `/m365` are other mounts and are not affected.
+
+`audit` records each would-be refusal as a `system` event (`origin-policy`) in the live logs, on stdout and in `gateway_events`, with the status the request was answered with (`served`, `denied` or `error`), the route family, the method, whether a credential was present (never its value) and the `Sec-Fetch-Site` value, so a decision to enforce rests on evidence. Events are bounded: one per origin, route, method, status class and credential presence per minute (the suppressed count rides on the next one), and at most 60 an hour per bucket. Non-OPTIONS `served` events on the MCP data plane have their own bucket, so preflight, liveness and failed-authentication floods cannot consume that reserve. Enforcing is a separate operator decision: the criteria are in [`example.env`](example.env). `enforce` also writes a throttled `mcp.auth.denied` audit row with `detail.reason` `origin_not_allowed`.
+
+This does not close DNS rebinding for same-origin GETs: a browser omits `Origin` there, and an absent `Origin` passes. The headers CORS grants on `/metamcp` and `/mcp-proxy` were also corrected (`MCP-Protocol-Version` and `Last-Event-ID` are allowed; `Mcp-Session-Id`, `WWW-Authenticate` and `Mcp-Session-Reinitialize-Required` are exposed to trusted origins).
 
 ### Sign-in rate limiting
 

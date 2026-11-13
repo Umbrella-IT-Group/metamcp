@@ -19,6 +19,7 @@ import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { warnIfStdioServersAllowed } from "./lib/metamcp/stdio-policy";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
 import { assertVerifiedCallerConfig } from "./lib/metamcp/verified-caller";
+import { logOriginPolicyBootState } from "./lib/origin-policy";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
@@ -255,6 +256,12 @@ async function start(): Promise<void> {
   // ALLOW_STDIO_SERVERS=true, so a deployment that can start child processes
   // in this container says so in its boot log (see lib/metamcp/stdio-policy).
   warnIfStdioServersAllowed();
+
+  // One boot-time line for the Origin policy on /metamcp (MCP_ORIGIN_POLICY:
+  // off | audit | enforce, default audit), so the posture is legible from the
+  // boot log. An unrecognised value is an ERROR line here and runs as audit,
+  // never as off. See lib/origin-policy.
+  logOriginPolicyBootState();
 
   // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
   // boot log records whether password login is on. Reads the DB-backed setting,
