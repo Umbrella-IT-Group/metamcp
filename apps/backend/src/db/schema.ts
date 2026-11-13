@@ -721,7 +721,7 @@ export const oauthClientsTable = pgTable(
       .defaultNow(),
   },
   (table) => [
-    // Migration 0029, widened by 0046 to admit 'cimd'. NULL stays legal — it is
+    // Migration 0029, widened by 0046 to admit 'cimd'. NULL stays legal, it is
     // the honest value for every row that predates the column.
     check(
       "oauth_clients_registration_source_valid",

@@ -37,7 +37,7 @@ export const OAuthTokensSchema = z.object({
  *
  * "dcr"   — the anonymous RFC 7591 `POST /oauth/register` endpoint.
  * "admin" — an authenticated administrator through the OAuth Clients UI.
- * "cimd"  — a client metadata document the gateway fetched for an allowlisted
+ * "cimd"  - a client metadata document the gateway fetched for an allowlisted
  *           https client id (migration 0046). The row is a cache of that
  *           document, not a registration: it is rewritten from the document,
  *           never approved or rejected by an administrator, and swept by its
