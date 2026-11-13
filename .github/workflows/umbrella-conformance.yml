@@ -83,9 +83,6 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgresql://itest@127.0.0.1:5432/metamcp_test
-      # The PARENT of the run directory. The run never deletes or writes into
-      # this path itself, only into a fresh child it allocates below.
-      CONFORMANCE_OUT: ${{ runner.temp }}/conformance
 
     steps:
       # persist-credentials: false keeps the checkout token out of the
@@ -129,6 +126,13 @@ jobs:
           node-version: 22.23.1
 
       - run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/conformance
+
+      # The PARENT of the run directory, outside the checkout. The run never
+      # deletes or writes into this path itself, only into a fresh child it
+      # allocates below. Set here because the runner context is not available
+      # in a job-level env.
+      - name: Choose the output parent
+        run: echo "CONFORMANCE_OUT=$RUNNER_TEMP/conformance" >> "$GITHUB_ENV"
 
       - name: Allocate the run directory
         working-directory: apps/backend

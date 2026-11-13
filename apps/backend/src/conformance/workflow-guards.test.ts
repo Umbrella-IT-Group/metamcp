@@ -86,6 +86,17 @@ describe("umbrella-conformance.yml", () => {
     expect(ciPin).toBe(PINS["pnpm/action-setup"]);
   });
 
+  it("does not use the runner context where GitHub does not provide it", () => {
+    // `runner.*` exists only inside steps. In a job-level `env:` it makes the
+    // whole file invalid ("workflow file issue"), so the run never starts and
+    // no local test of the harness notices. Steps read $RUNNER_TEMP instead.
+    const start = workflow.indexOf("\n    env:\n");
+    const end = workflow.indexOf("\n    steps:\n");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(workflow.slice(start, end)).not.toMatch(/\$\{\{\s*runner\./);
+  });
+
   it("checks out without persisting credentials", () => {
     expect(stepWith(/actions\/checkout@/).text).toMatch(
       /persist-credentials:\s*false/,
