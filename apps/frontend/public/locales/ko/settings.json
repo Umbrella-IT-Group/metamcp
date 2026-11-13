@@ -11,7 +11,7 @@
   "disableBasicAuthDescription": "활성화하면 사용자가 이메일/비밀번호로 로그인할 수 없습니다. SSO/OIDC 인증만 사용할 수 있습니다.",
   "mcpSettings": "MCP 설정",
   "mcpSettingsDescription": "Model Context Protocol 타임아웃 및 동작 설정을 구성합니다",
-  "mcpResetTimeoutOnProgress": "진행 시 타임아웃 재설정 (개발 중)",
+  "mcpResetTimeoutOnProgress": "진행 시 타임아웃 재설정",
   "mcpResetTimeoutOnProgressDescription": "활성화하면 MCP 요청에서 진행이 있을 때마다 타임아웃이 재설정됩니다",
   "mcpTimeout": "MCP 요청 타임아웃",
   "mcpTimeoutDescription": "개별 MCP 요청에 대한 타임아웃(밀리초, 1-86400초)",

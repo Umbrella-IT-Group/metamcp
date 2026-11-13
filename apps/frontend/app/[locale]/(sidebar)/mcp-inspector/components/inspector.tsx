@@ -88,7 +88,19 @@ export function Inspector({
         </TabsList>
 
         <div className="mt-4">
-          <TabsContent value="tools">
+          {/*
+            forceMount keeps the Tools tab mounted (and hidden, through the
+            data-state selector) while another tab is open. Radix unmounts an
+            inactive tab's content otherwise, which would drop the tool list,
+            the form and the results, and lose track of a call that is still
+            running. A force-mounted panel is always rendered and Radix does
+            not set `hidden` on it, so the class does the hiding.
+          */}
+          <TabsContent
+            value="tools"
+            forceMount
+            className="data-[state=inactive]:hidden"
+          >
             <InspectorTools makeRequest={makeRequest} enabled={hasTools} />
           </TabsContent>
 
