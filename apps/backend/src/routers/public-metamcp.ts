@@ -6,12 +6,35 @@ import logger from "@/utils/logger";
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
 import { credentialedCorsOrigin } from "../lib/cors-policy";
 import { isAdminHealthRequest } from "../lib/health-upstream";
+import { originPolicyMiddleware } from "../middleware/origin-policy.middleware";
 import adminRouter from "./public-metamcp/admin";
 import { openApiRouter } from "./public-metamcp/openapi";
 import sseRouter from "./public-metamcp/sse";
 import streamableHttpRouter from "./public-metamcp/streamable-http";
 
 const publicEndpointsRouter = express.Router();
+
+// Origin policy, FIRST on this router. The MCP Streamable HTTP transport spec
+// (2025-11-25, "Security Warning") says: "Servers MUST validate the Origin
+// header on all incoming connections to prevent DNS rebinding attacks. If the
+// Origin header is present and invalid, servers MUST respond with HTTP 403
+// Forbidden." Nothing below this line ever read `Origin` before: the CORS
+// middleware only decides whether to ADD a grant. The default, `audit`, serves
+// every request as before and records the ones `enforce` would refuse; see
+// ../lib/origin-policy and ../middleware/origin-policy.middleware.
+//
+// Three choices worth keeping:
+//  - It covers GET and HEAD. A guard that skipped them (the shape some
+//    frameworks ship) would exempt the SSE streams and the standalone GET
+//    stream on these routes, which are exactly where a rebound page reads.
+//  - It is not the SDK's `enableDnsRebindingProtection`, which compares raw
+//    strings, echoes the header into its error text and runs after session
+//    admission, nor the SDK's `Host` validation, which checks a different
+//    header against a fixed list.
+//  - It does not close DNS rebinding for same-origin GETs: a browser omits
+//    `Origin` there, and an absent `Origin` always passes (the module header
+//    states the residual and why no Host allowlist is added).
+publicEndpointsRouter.use(originPolicyMiddleware);
 
 // `origin: true` reflected whatever `Origin` the caller sent straight back
 // into `Access-Control-Allow-Origin`, next to
@@ -24,6 +47,17 @@ const publicEndpointsRouter = express.Router();
 // everyone else gets no grant at all. A browser-based third-party client that
 // needs to call these endpoints cross-origin belongs in
 // `EXTRA_TRUSTED_ORIGINS`. See ../lib/cors-policy.
+//
+// The header lists are what a browser client of the transport needs. Request
+// side: the 2025-11-25 spec has the client send `MCP-Protocol-Version` on every
+// request after initialize and resume a stream with `Last-Event-ID`; neither is
+// CORS-safelisted, so a preflight that omitted them failed such a client before
+// its first call. Response side: `Mcp-Session-Id`, `WWW-Authenticate` (only the
+// realm, scope and the public resource-metadata URL, see ../lib/auth-challenge)
+// and `Mcp-Session-Reinitialize-Required` (the fork's lazy-recovery 404) are not
+// safelisted response headers, so a trusted-origin browser client could read
+// none of them without an `Access-Control-Expose-Headers` entry, and the last
+// is how it learns it must re-initialize.
 publicEndpointsRouter.use(
   cors({
     origin: credentialedCorsOrigin,
@@ -32,8 +66,15 @@ publicEndpointsRouter.use(
     allowedHeaders: [
       "Content-Type",
       "mcp-session-id",
+      "mcp-protocol-version",
+      "last-event-id",
       "Authorization",
       "X-API-Key",
+    ],
+    exposedHeaders: [
+      "Mcp-Session-Id",
+      "WWW-Authenticate",
+      "Mcp-Session-Reinitialize-Required",
     ],
   }),
 );
