@@ -8,7 +8,7 @@
  *
  * Oracle for the target rules: the operator rule that ONLY an explicit
  * `M365_ENVELOPE_WRITE_VERSION=1` ever lowers a row (so `keep`, from unset or
- * any invalid value, writes nothing at all), and the foreman ruling on the
+ * any invalid value, writes nothing at all), and the operator ruling on the
  * first review round: the converge may rewrap a v1 row into a bound v2 envelope
  * ONLY while strict is off (the planned migration window). A v1 ciphertext
  * carries no proof of which user it belongs to, so under strict the converge
