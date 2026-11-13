@@ -1,7 +1,6 @@
 import { ListToolsRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
-import { describeDbError } from "@/lib/db-error-summary";
 import {
   ApiKeyAuthenticatedRequest,
   authenticateApiKey,
@@ -85,7 +84,7 @@ openApiRouter.get(
 
       res.json(openApiSchema);
     } catch (error) {
-      logger.error("Error generating OpenAPI schema:", describeDbError(error));
+      logger.error("Error generating OpenAPI schema:", error);
       res.status(500).json({
         error: "Internal server error",
         message: "Failed to generate OpenAPI schema",

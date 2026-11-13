@@ -45,7 +45,12 @@ import {
   getM365BrokerConfig,
   isM365BrokerConfigured,
 } from "../lib/m365/config";
-import { constantTimeEquals, encryptRefreshToken } from "../lib/m365/crypto";
+import { constantTimeEquals } from "../lib/m365/crypto";
+import {
+  peekEnvelopeVersion,
+  resolveEnvelopePolicy,
+  sealUserRefreshToken,
+} from "../lib/m365/envelope";
 import { m365MintService } from "../lib/m365/mint-service";
 import { securityHeaders } from "./oauth/utils";
 
@@ -372,8 +377,14 @@ m365Router.get("/m365/callback", async (req, res) => {
   // user may genuinely switch accounts) but worth a loud trace — it is
   // the account-grafting shape the session⇄state binding defends
   // against, so log when it happens through the legitimate path too.
+  // The envelope version of the row being replaced, so a re-enrollment never
+  // lowers a bound (v2) row when the write version is unset. A missing row is
+  // different from a failed read: in keep mode a failed read cannot safely
+  // choose v1, because there may already be a bound row.
+  let previousVersion: ReturnType<typeof peekEnvelopeVersion> = null;
   try {
     const existing = await m365TokensRepository.findByUserId(user.id);
+    previousVersion = peekEnvelopeVersion(existing?.rt_ciphertext);
     if (
       existing &&
       existing.entra_oid &&
@@ -393,10 +404,20 @@ m365Router.get("/m365/callback", async (req, res) => {
       );
     }
   } catch (lookupError) {
+    const mustKeepVersion = resolveEnvelopePolicy().mode === "keep";
     logger.warn(
-      `M365 broker: pre-enrollment row lookup failed for user ${user.id} (continuing):`,
+      `M365 broker: pre-enrollment row lookup failed for user ${user.id} (${mustKeepVersion ? "enrollment stopped to preserve the stored envelope version" : "continuing under an explicit envelope policy"}):`,
       describeDbError(lookupError),
     );
+    if (mustKeepVersion) {
+      sendHtml(
+        res,
+        500,
+        "Microsoft 365 connection failed",
+        "<p>The gateway could not read your existing credential. Please try connecting again.</p>",
+      );
+      return;
+    }
   }
 
   try {
@@ -405,10 +426,12 @@ m365Router.get("/m365/callback", async (req, res) => {
       entra_oid: entraOid,
       tenant_id: entraTid,
       entra_upn: entraUpn,
-      rt_ciphertext: encryptRefreshToken(
+      rt_ciphertext: sealUserRefreshToken(
         tokenBody.refresh_token,
         config.kek,
         config.kekId,
+        user.id,
+        previousVersion,
       ),
       kek_id: config.kekId,
       scopes_granted: tokenBody.scope ?? config.scopes,

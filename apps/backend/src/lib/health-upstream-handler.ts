@@ -60,6 +60,7 @@ async function computeUpstreamSnapshot(): Promise<UpstreamSnapshot> {
   const lastFailureAt = pool.lastConnectFailureAt ?? {};
   const lastSuccessAt = pool.lastConnectSuccessAt ?? {};
   const pingFailures = pool.pingFailures ?? {};
+  const authRejections = pool.backendAuthRejections ?? {};
 
   const details = servers.map((s) => {
     const inError = s.error_status === McpServerErrorStatusEnum.enum.ERROR;
@@ -88,6 +89,19 @@ async function computeUpstreamSnapshot(): Promise<UpstreamSnapshot> {
         ? new Date(succeededAt).toISOString()
         : null,
       ping_failures: pingFailures[s.uuid] ?? 0,
+      // Present only while the most recent connect was rejected with HTTP
+      // 401/403 (the credentials the gateway sends), so a server without one
+      // keeps exactly the shape it had. Admin view only; the anonymous body
+      // never carries per-server detail. Reachability is unchanged: a
+      // connect-time rejection already reads unreachable through the failure
+      // stamp above.
+      ...(authRejections[s.uuid]
+        ? {
+            auth_rejected: true,
+            auth_rejected_http_status: authRejections[s.uuid].status,
+            auth_rejected_at: new Date(authRejections[s.uuid].at).toISOString(),
+          }
+        : {}),
     };
   });
 

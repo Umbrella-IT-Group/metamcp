@@ -1,9 +1,9 @@
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
-import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
+import { backendErrorForLogging } from "../../../lib/metamcp/backend-auth-rejection";
 import { isBackendUnavailableError } from "../../../lib/metamcp/backend-unavailable";
 import { resolveCallerContext } from "../../../lib/metamcp/caller-context";
 import { resolveClientIdentity } from "../../../lib/metamcp/consumer-identity-resolver";
@@ -87,9 +87,16 @@ export const executeToolWithMiddleware = async (
     // line: `tool_name` is a URL-decoded path segment, so an embedded CR/LF
     // would forge whole log lines. Same discipline as the mcp-proxy
     // connection log.
+    //
+    // The error is logged through backendErrorForLogging: this catch sees the
+    // rethrown backend error as the handlers left it, so a backend's HTTP
+    // 401/403 would otherwise put its response body in this line even though
+    // the handler and audit lines keep it out. A refusal logs its status only;
+    // any other failure keeps its diagnostic. The consumer's reply below is
+    // unchanged.
     logger.error(
       `Error executing tool ${JSON.stringify(toolName)}:`,
-      describeDbError(error),
+      backendErrorForLogging(error),
     );
 
     // Handle different types of errors

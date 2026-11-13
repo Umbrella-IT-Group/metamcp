@@ -33,6 +33,12 @@ import {
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "./audit-listing-log";
+import {
+  backendErrorForLogging,
+  backendErrorTextForLogging,
+  classifyBackendAuthRejection,
+  describeBackendAuthRejection,
+} from "./backend-auth-rejection";
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import {
@@ -72,6 +78,12 @@ import {
 } from "./metamcp-middleware/tool-overrides.functional";
 import { onNamespaceMountChange } from "./namespace-mount-events";
 import {
+  collectToolsListPages,
+  flattenToolPages,
+  reportToolsListTruncation,
+  type ToolsListStop,
+} from "./paginate-tools-list";
+import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
 } from "./session-error";
@@ -81,6 +93,16 @@ import {
   ToolArgSchemaRegistry,
   unambiguousAuditTools,
 } from "./tool-arg-keys";
+import { ToolCallCancelledError } from "./tool-call-cancelled";
+import {
+  cancelAfterTotalTimeout,
+  cancelPassthroughEnabled,
+  getToolCallExtra,
+  linkCallerSignal,
+  NOOP_PROGRESS,
+  progressPassthroughEnabled,
+  runWithToolCallExtra,
+} from "./tool-call-extra";
 import {
   PrefixCandidate,
   ProbeOutcome,
@@ -91,6 +113,7 @@ import {
   registerToolRoute,
   ToolRouteOwner,
 } from "./tool-name-parser";
+import { createProgressRelay } from "./tool-progress-relay";
 import {
   renotifyMaxRounds,
   toolsListRenotifyEnabled,
@@ -724,17 +747,19 @@ export const createServer = async (
         try {
           const toolFetchStart = performance.now();
 
-          // Paginated tool discovery - load all pages automatically
+          // Paginated tool discovery: every page, through the one guarded
+          // loop (paginate-tools-list.ts). A backend that repeats a cursor or
+          // never ends its listing stops it early with `stopped` set.
           const fetchAllToolPages = async (
             active: ConnectedClient,
-          ): Promise<Tool[]> => {
-            const pages: Tool[] = [];
-            let cursor: string | undefined = undefined;
-            let hasMore = true;
-
-            while (hasMore) {
-              const result: z.infer<typeof ListToolsResultSchema> =
-                await active.client.request(
+          ): Promise<{
+            tools: Tool[];
+            stopped?: ToolsListStop;
+            pages: number;
+          }> => {
+            const collected = await collectToolsListPages(
+              (cursor): Promise<z.infer<typeof ListToolsResultSchema>> =>
+                active.client.request(
                   {
                     method: "tools/list",
                     params: {
@@ -743,17 +768,13 @@ export const createServer = async (
                     },
                   },
                   ListToolsResultSchema,
-                );
-
-              if (result.tools && result.tools.length > 0) {
-                pages.push(...result.tools);
-              }
-
-              cursor = result.nextCursor;
-              hasMore = !!result.nextCursor;
-            }
-
-            return pages;
+                ),
+            );
+            return {
+              tools: flattenToolPages(collected),
+              stopped: collected.stopped,
+              pages: collected.pages.length,
+            };
           };
 
           // Invalidate-and-retry-once on session-lost / transport-lost —
@@ -761,7 +782,7 @@ export const createServer = async (
           // it a dead pooled session is never evicted from here and the
           // namespace serves 0 tools as "success" until a manual restart.
           let activeSession = session;
-          const allServerTools = audit
+          const fetched = audit
             ? // A background audit must not retire pooled connections or
               // notify other clients. A late failure may belong to an old
               // session after a live call has already recovered its backend.
@@ -782,6 +803,20 @@ export const createServer = async (
                   activeSession = fresh;
                 },
               });
+          const allServerTools = fetched.tools;
+          // A truncated listing is served (the tools gathered are real) but
+          // never written to the catalog, below. The audit listing is this
+          // proxy's own background pass and reports nothing to anyone.
+          const listingTruncated = fetched.stopped !== undefined;
+          if (!audit && fetched.stopped) {
+            reportToolsListTruncation({
+              serverName,
+              serverUuid: mcpServerUuid,
+              stopped: fetched.stopped,
+              pages: fetched.pages,
+              scope: "tools/list",
+            });
+          }
 
           logger.debug(
             `[DEBUG-TOOLS] ⏱️  Fetched ${allServerTools.length} tools from ${serverName} in ${(performance.now() - toolFetchStart).toFixed(2)}ms`,
@@ -807,7 +842,13 @@ export const createServer = async (
               `[DEBUG-TOOLS] 🔍 Hash check for ${serverName}: ${hasChanged ? "CHANGED" : "UNCHANGED"}`,
             );
 
-            if (hasChanged && allServerTools.length > 0) {
+            // A truncated listing is a SUBSET of what the backend serves, and
+            // the sync deletes every unmapped catalog row of this server that
+            // is absent from the list it is given (tools.repo.ts, syncTools).
+            // Writing it would delete tools the backend still serves. The
+            // catalog keeps its previous rows and the sync cache stays as it
+            // was, so the next complete listing is evaluated normally.
+            if (hasChanged && allServerTools.length > 0 && !listingTruncated) {
               // Claim the full definitions we just observed, so concurrent
               // listings of the same set skip, then write. The write must
               // not re-check this cache: `tools.impl` sync used to, found
@@ -897,11 +938,15 @@ export const createServer = async (
           // `failedServers` would hide the one signal that catches that
           // regression.
           if (!audit) {
-            logger.error(`Error fetching tools from: ${serverName}`, error);
+            logger.error(
+              `Error fetching tools from: ${serverName}`,
+              backendErrorForLogging(error),
+            );
           }
           noteAuditSkip(
             serverName || mcpServerUuid,
-            () => `${describeListingFailure(error)}${closedNote()}`,
+            () =>
+              `${describeListingFailure(backendErrorForLogging(error))}${closedNote()}`,
           );
           failedServers.push(serverName || mcpServerUuid);
           settledServerUuids.delete(mcpServerUuid);
@@ -920,12 +965,13 @@ export const createServer = async (
       if (!audit) {
         logger.error(
           `Error preparing tools listing for: ${params.name || mcpServerUuid}`,
-          outcome.reason,
+          backendErrorForLogging(outcome.reason),
         );
       }
       noteAuditSkip(
         params.name || mcpServerUuid,
-        () => `${describeListingFailure(outcome.reason)}${closedNote()}`,
+        () =>
+          `${describeListingFailure(backendErrorForLogging(outcome.reason))}${closedNote()}`,
       );
       failedServers.push(params.name || mcpServerUuid);
       settledServerUuids.delete(mcpServerUuid);
@@ -1023,27 +1069,17 @@ export const createServer = async (
   // because a proxy serves exactly one session id.
   const recoveries: SessionRecoveries = new WeakMap();
 
-  const listToolPages = async (
-    session: ConnectedClient,
-  ): Promise<z.infer<typeof ListToolsResultSchema>[]> => {
-    const pages: z.infer<typeof ListToolsResultSchema>[] = [];
-    let cursor: string | undefined = undefined;
-    let hasMore = true;
-    while (hasMore) {
-      const page: z.infer<typeof ListToolsResultSchema> =
-        await session.client.request(
+  const listToolPages = (session: ConnectedClient) =>
+    collectToolsListPages(
+      (cursor): Promise<z.infer<typeof ListToolsResultSchema>> =>
+        session.client.request(
           {
             method: "tools/list",
             params: { cursor },
           },
           ListToolsResultSchema,
-        );
-      pages.push(page);
-      cursor = page.nextCursor;
-      hasMore = !!page.nextCursor;
-    }
-    return pages;
-  };
+        ),
+    );
 
   /**
    * Does this prefix-matched server serve the tool? Lists its tools (all
@@ -1077,22 +1113,28 @@ export const createServer = async (
     }
 
     let activeSession = session;
-    let pages: z.infer<typeof ListToolsResultSchema>[];
+    let collected: Awaited<ReturnType<typeof listToolPages>>;
     try {
-      pages = await listToolPages(activeSession);
+      collected = await listToolPages(activeSession);
     } catch (error) {
-      if (!isRecoverableBackendError(error)) {
+      // A refusal is an answer, even if its body quotes a connection-loss
+      // marker. Do not retire a shared session or retry that request for it.
+      if (
+        classifyBackendAuthRejection(error) ||
+        !isRecoverableBackendError(error)
+      ) {
+        const safeError = backendErrorForLogging(error);
         logger.warn(
           `Tool lookup on server ${candidate.uuid} failed while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool. (${
-            error instanceof Error ? error.message : String(error)
+            safeError instanceof Error ? safeError.message : String(safeError)
           })`,
         );
         return { kind: "lookup_failed" };
       }
       logger.warn(
-        `Backend connection lost for server ${candidate.uuid} on dynamic tools/list while routing tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${
-          error instanceof Error ? error.message : String(error)
-        })`,
+        `Backend connection lost for server ${candidate.uuid} on dynamic tools/list while routing tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${backendErrorTextForLogging(
+          error,
+        )})`,
       );
       let fresh: ConnectedClient | undefined;
       try {
@@ -1113,7 +1155,7 @@ export const createServer = async (
       } catch (recoveryError) {
         logger.error(
           `Failed to re-initialize session for server ${candidate.uuid} after backend session loss during dynamic tool routing:`,
-          recoveryError,
+          backendErrorForLogging(recoveryError),
         );
         return { kind: "no_session" };
       }
@@ -1126,25 +1168,44 @@ export const createServer = async (
       registerListChangedSubscriber(fresh, candidate.uuid);
       activeSession = fresh;
       try {
-        pages = await listToolPages(activeSession);
+        collected = await listToolPages(activeSession);
       } catch (retryError) {
+        const safeError = backendErrorForLogging(retryError);
         logger.warn(
           `Tool lookup on server ${candidate.uuid} failed again after session recovery while routing tool ${JSON.stringify(name)}. (${
-            retryError instanceof Error
-              ? retryError.message
-              : String(retryError)
+            safeError instanceof Error ? safeError.message : String(safeError)
           })`,
         );
         return { kind: "lookup_failed" };
       }
     }
 
-    const listed = pages.some((page) =>
+    const listed = collected.pages.some((page) =>
       page.tools?.some((tool: Tool) => tool.name === originalToolName),
     );
-    return listed
-      ? { kind: "found", session: activeSession }
-      : { kind: "absent" };
+    // Report truncation even when the requested tool was found: successful
+    // lookups must not hide a backend whose listing never terminates.
+    if (collected.stopped) {
+      reportToolsListTruncation({
+        serverName,
+        serverUuid: candidate.uuid,
+        stopped: collected.stopped,
+        pages: collected.pages.length,
+        scope: "tool lookup",
+      });
+    }
+    if (listed) return { kind: "found", session: activeSession };
+    if (collected.stopped) {
+      // The listing was cut short, so a miss proves nothing: the tool may be
+      // past the cut point. Answering "absent" would tell the consumer the
+      // tool does not exist; a lookup that could not see the whole list
+      // answers "backend unavailable" instead (tool-call-routing.ts).
+      logger.warn(
+        `Tool lookup on server ${candidate.uuid} could not see the whole tool list while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool.`,
+      );
+      return { kind: "lookup_failed" };
+    }
+    return { kind: "absent" };
   };
 
   /** Drop every route that still points at a client whose recovery failed. */
@@ -1225,141 +1286,226 @@ export const createServer = async (
 
     const abortController = new AbortController();
 
-    // Get configurable timeout values
-    const resetTimeoutOnProgress =
-      await configService.getMcpResetTimeoutOnProgress();
-    const timeout = await configService.getMcpTimeout();
-    const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+    // This call's own data (the consumer's signal, a progress relay) is in
+    // AsyncLocalStorage, never on the pooled handler context (see
+    // tool-call-extra.ts). Absent for a call that did not come through the
+    // CallTool handler.
+    const callExtra = getToolCallExtra();
+    const cancelOn = cancelPassthroughEnabled();
+    // A consumer cancel aborts the backend request; a transport close does
+    // not. Linked here, after routing: a cancel that arrived while the call
+    // was being routed is already aborted at this point, and the SDK then
+    // refuses the request before anything is sent (shared/protocol.js,
+    // `signal.throwIfAborted()` ahead of the send). The SDK ignores a cancel
+    // for request id 0, which a tools/call never has from the TypeScript and
+    // Python SDKs (see linkCallerSignal for the known limitation).
+    const unlink =
+      cancelOn && callExtra
+        ? linkCallerSignal(
+            callExtra.signal,
+            abortController,
+            callExtra.transportClosed,
+          )
+        : undefined;
 
-    const mcpRequestOptions: RequestOptions = {
-      signal: abortController.signal,
-      resetTimeoutOnProgress,
-      timeout,
-      maxTotalTimeout,
+    // A cancel's answer never reaches the consumer (the SDK drops the response
+    // of an aborted request), so this line is the only trace besides the
+    // audit row. INFO, not ERROR: the consumer asked for it. The outcome is
+    // unknown because the backend may have finished before the cancel landed.
+    const noteCancelled = (): void => {
+      logger.info(
+        `Tool call ${JSON.stringify(name)} cancelled by the caller; outcome unknown`,
+      );
+    };
+    // A classified backend 401/403 is logged by its fixed classification and
+    // status only: the response body is the backend's text and stays out of
+    // this log (the consumer still receives the error as before).
+    const logCallFailure = (message: string, failure: unknown): void => {
+      const rejection = classifyBackendAuthRejection(failure);
+      if (rejection) {
+        logger.error(
+          `${message} ${describeBackendAuthRejection(rejection.status, "request")}`,
+        );
+      } else {
+        logger.error(message, failure);
+      }
     };
 
-    const callOnce = (session: ConnectedClient) =>
-      session.client.request(
-        {
-          method: "tools/call",
-          params: {
-            name: originalToolName,
-            arguments: args || {},
-            _meta: request.params._meta,
-          },
-        },
-        CompatibilityCallToolResultSchema,
-        mcpRequestOptions,
-      );
-
     try {
-      return (await callOnce(clientForTool)) as CallToolResult;
-    } catch (error) {
-      // Replay a tools/call ONLY when the failure proves the backend never
-      // ran it: an HTTP 404 "Session not found" answer to the POST, or a
-      // transport already closed before the send. A tool call is not
-      // idempotent (a delete, a reboot, a password reset), so a timeout, a
-      // connection dropped mid-call or a 5xx surfaces to the client instead:
-      // the backend may have executed it, and a second send runs it twice.
-      // The 2026-09-30 client-side duplicate prompted finding this separate
-      // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
-      // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
-      // A typed M365 broker refusal (no grant, expired, revoked, MFA, broker
-      // not configured, mint failed) is the answer to this user's call, not a
-      // tool failure: the outer catch below turns it into the enrollment
-      // result and logs the one `m365_broker_refusal` line. No ERROR line for
-      // a per-user state.
-      if (isM365BrokerError(error)) {
-        throw error;
-      }
-      if (!isToolCallReplaySafeError(error)) {
-        logger.error(
-          `Error calling tool "${name}" through ${
-            clientForTool.client.getServerVersion()?.name || "unknown"
-          }:`,
-          error,
-        );
-        throw error;
+      // Get configurable timeout values
+      const resetTimeoutOnProgress =
+        await configService.getMcpResetTimeoutOnProgress();
+      const timeout = await configService.getMcpTimeout();
+      const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+
+      const mcpRequestOptions: RequestOptions = {
+        signal: abortController.signal,
+        resetTimeoutOnProgress,
+        timeout,
+        maxTotalTimeout,
+      };
+      if (progressPassthroughEnabled()) {
+        // The SDK arms the reset flag only through a registered handler, and
+        // replaces the request's progress token with its own. The relay (when
+        // the consumer sent a token) forwards under the consumer's token; a
+        // call with nobody to relay to still registers a handler so the stored
+        // reset flag works.
+        const onprogress =
+          callExtra?.progress?.onprogress ??
+          (resetTimeoutOnProgress ? NOOP_PROGRESS : undefined);
+        if (onprogress) mcpRequestOptions.onprogress = onprogress;
       }
 
-      logger.warn(
-        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; recovering the session and retrying once. (envelope: ${
-          error instanceof Error ? error.message : String(error)
-        })`,
-      );
-
-      // One recovery per failed client, shared by every call that fails on
-      // it, and no invalidation when that client was already retired by
-      // another recovery (session-recovery.ts). Parallel calls on a stale
-      // client used to each invalidate the server, retiring the replacement a
-      // sibling had just built and cutting calls already running on it.
-      const failedClient = clientForTool;
-      const routedServerUuid = serverUuid;
-      let freshSession: ConnectedClient | undefined;
-      try {
-        freshSession = await recoverFailedSession({
-          pool: mcpServerPool,
-          recoveries,
-          sessionId,
-          serverUuid: routedServerUuid,
-          failedClient,
-          reacquire: async () => {
-            const serverParamsMap = await getMcpServers(
-              namespaceUuid,
-              includeInactiveServers,
-            );
-            const params = serverParamsMap[routedServerUuid];
-            if (!params) {
-              throw new Error(
-                `Cannot re-initialize session: server ${routedServerUuid} no longer present in namespace ${namespaceUuid}`,
-              );
-            }
-            return await mcpServerPool.getSession(
-              sessionId,
-              routedServerUuid,
-              params,
-              namespaceUuid,
-            );
-          },
-        });
-      } catch (recoveryError) {
-        forgetRoutesTo(failedClient);
-        throw recoveryError;
-      }
-      if (!freshSession) {
-        forgetRoutesTo(failedClient);
-        throw new Error(
-          `Failed to re-initialize session for server ${routedServerUuid} after backend session loss`,
-        );
-      }
-
-      registerListChangedSubscriber(freshSession, routedServerUuid);
-      // Replace, never delete-then-set: a call arriving while the recovery
-      // ran found the old route, failed on the dead client and joined this
-      // same recovery, instead of finding no route and taking the dynamic
-      // lookup. Every route that pointed at the dead client moves over.
-      for (const [routedName, routedClient] of Object.entries(toolToClient)) {
-        if (routedClient === failedClient) {
-          toolToClient[routedName] = freshSession;
+      const callOnce = async (session: ConnectedClient) => {
+        try {
+          return await session.client.request(
+            {
+              method: "tools/call",
+              params: {
+                name: originalToolName,
+                arguments: args || {},
+                _meta: request.params._meta,
+              },
+            },
+            CompatibilityCallToolResultSchema,
+            mcpRequestOptions,
+          );
+        } catch (error) {
+          // The SDK sends the backend no cancel when the total cap rejects a
+          // call; close that gap (tool-call-extra.ts).
+          if (cancelOn) cancelAfterTotalTimeout(error, abortController);
+          throw error;
         }
-      }
-      toolToClient[name] = freshSession;
+      };
 
       try {
-        return (await callOnce(freshSession)) as CallToolResult;
-      } catch (retryError) {
-        // Same as above: a broker refusal on the retry is the user's own
-        // state, answered by the outer catch, not an ERROR here.
-        if (!isM365BrokerError(retryError)) {
-          logger.error(
+        return (await callOnce(clientForTool)) as CallToolResult;
+      } catch (error) {
+        // Replay a tools/call ONLY when the failure proves the backend never
+        // ran it: an HTTP 404 "Session not found" answer to the POST, or a
+        // transport already closed before the send. A tool call is not
+        // idempotent (a delete, a reboot, a password reset), so a timeout, a
+        // connection dropped mid-call or a 5xx surfaces to the client instead:
+        // the backend may have executed it, and a second send runs it twice.
+        // The 2026-09-30 client-side duplicate prompted finding this separate
+        // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
+        // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
+        // A typed M365 broker refusal (no grant, expired, revoked, MFA, broker
+        // not configured, mint failed) is the answer to this user's call, not a
+        // tool failure: the outer catch below turns it into the enrollment
+        // result and logs the one `m365_broker_refusal` line. No ERROR line for
+        // a per-user state.
+        if (isM365BrokerError(error)) {
+          throw error;
+        }
+        // A consumer cancel. The SDK rejects an aborted call with the typed
+        // reason, but its pre-send "Not connected" wins over its abort check
+        // (the exact shape the replay below accepts), so the abort reason is
+        // read here rather than the error. A cancelled call is never recovered
+        // and never replayed. The reason is the typed class, not just
+        // `.aborted`, because a total-cap cancel aborts the controller too.
+        if (abortController.signal.reason instanceof ToolCallCancelledError) {
+          noteCancelled();
+          throw abortController.signal.reason;
+        }
+        if (!isToolCallReplaySafeError(error)) {
+          logCallFailure(
             `Error calling tool "${name}" through ${
-              freshSession.client.getServerVersion()?.name || "unknown"
-            } after session re-initialize:`,
-            retryError,
+              clientForTool.client.getServerVersion()?.name || "unknown"
+            }:`,
+            error,
+          );
+          throw error;
+        }
+
+        logger.warn(
+          `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; recovering the session and retrying once. (envelope: ${
+            error instanceof Error ? error.message : String(error)
+          })`,
+        );
+
+        // One recovery per failed client, shared by every call that fails on
+        // it, and no invalidation when that client was already retired by
+        // another recovery (session-recovery.ts). Parallel calls on a stale
+        // client used to each invalidate the server, retiring the replacement a
+        // sibling had just built and cutting calls already running on it.
+        const failedClient = clientForTool;
+        const routedServerUuid = serverUuid;
+        let freshSession: ConnectedClient | undefined;
+        try {
+          freshSession = await recoverFailedSession({
+            pool: mcpServerPool,
+            recoveries,
+            sessionId,
+            serverUuid: routedServerUuid,
+            failedClient,
+            reacquire: async () => {
+              const serverParamsMap = await getMcpServers(
+                namespaceUuid,
+                includeInactiveServers,
+              );
+              const params = serverParamsMap[routedServerUuid];
+              if (!params) {
+                throw new Error(
+                  `Cannot re-initialize session: server ${routedServerUuid} no longer present in namespace ${namespaceUuid}`,
+                );
+              }
+              return await mcpServerPool.getSession(
+                sessionId,
+                routedServerUuid,
+                params,
+                namespaceUuid,
+              );
+            },
+          });
+        } catch (recoveryError) {
+          forgetRoutesTo(failedClient);
+          throw recoveryError;
+        }
+        if (!freshSession) {
+          forgetRoutesTo(failedClient);
+          throw new Error(
+            `Failed to re-initialize session for server ${routedServerUuid} after backend session loss`,
           );
         }
-        throw retryError;
+
+        registerListChangedSubscriber(freshSession, routedServerUuid);
+        // Replace, never delete-then-set: a call arriving while the recovery
+        // ran found the old route, failed on the dead client and joined this
+        // same recovery, instead of finding no route and taking the dynamic
+        // lookup. Every route that pointed at the dead client moves over.
+        for (const [routedName, routedClient] of Object.entries(toolToClient)) {
+          if (routedClient === failedClient) {
+            toolToClient[routedName] = freshSession;
+          }
+        }
+        toolToClient[name] = freshSession;
+
+        try {
+          return (await callOnce(freshSession)) as CallToolResult;
+        } catch (retryError) {
+          // A cancel during the recovery: the second attempt's pre-send abort
+          // check throws the typed reason. The recovery itself is shared with
+          // sibling calls and is never aborted for one caller's cancel.
+          if (abortController.signal.reason instanceof ToolCallCancelledError) {
+            noteCancelled();
+            throw abortController.signal.reason;
+          }
+          // Same as above: a broker refusal on the retry is the user's own
+          // state, answered by the outer catch, not an ERROR here.
+          if (!isM365BrokerError(retryError)) {
+            logCallFailure(
+              `Error calling tool "${name}" through ${
+                freshSession.client.getServerVersion()?.name || "unknown"
+              } after session re-initialize:`,
+              retryError,
+            );
+          }
+          throw retryError;
+        }
       }
+    } finally {
+      unlink?.();
     }
   };
 
@@ -1488,9 +1634,34 @@ export const createServer = async (
     }
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    // Progress goes back under the consumer's own token, and only when the
+    // consumer sent one (MCP spec, basic/utilities/progress). A token that is
+    // neither a string nor a number is not echoed.
+    const consumerToken = request.params._meta?.progressToken;
+    const relay =
+      (typeof consumerToken === "string" ||
+        typeof consumerToken === "number") &&
+      progressPassthroughEnabled()
+        ? createProgressRelay({
+            progressToken: consumerToken,
+            send: (notification) => extra.sendNotification(notification),
+            consumerGone: () => extra.signal.aborted,
+            warn: (message) =>
+              logger.warn(
+                `Tool ${JSON.stringify(request.params.name)}: ${message}`,
+              ),
+          })
+        : undefined;
     try {
-      return await callToolWithMiddleware(request, handlerContext);
+      return await runWithToolCallExtra(
+        {
+          signal: extra.signal,
+          transportClosed: () => server.transport === undefined,
+          progress: relay,
+        },
+        () => callToolWithMiddleware(request, handlerContext),
+      );
     } catch (error) {
       // WARM path: a mint failure inside the injected fetch on the
       // tools/call request itself (no enrollment, expired grant, CA
@@ -1519,6 +1690,14 @@ export const createServer = async (
         return coldFallback;
       }
       throw error;
+    } finally {
+      // After the chain settles and before the SDK sends the result, so
+      // relayed notifications precede the result on the same stream for up to
+      // five seconds; after that queued progress is dropped and at most one
+      // send already in flight can arrive after the result (the exact
+      // guarantee is in tool-progress-relay.ts). Never rejects; it also closes
+      // the relay, so nothing queued or arriving later is written.
+      await relay?.flush();
     }
   });
 

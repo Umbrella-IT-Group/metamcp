@@ -21,6 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useTranslations } from "@/hooks/useTranslations";
+import { collectAllPages } from "@/lib/paginate-list";
 import { trpc } from "@/lib/trpc";
 
 import { UnifiedToolsTable } from "./tools-data-table";
@@ -99,15 +100,10 @@ export function ToolManagement({
   const fetchMCPTools = useCallback(async () => {
     setLoading(true);
     try {
-      // Paginated tool fetching - load all pages automatically
-      const allTools: MCPTool[] = [];
-      let cursor: string | undefined = undefined;
-      let hasMore = true;
-      let pageCount = 0;
-
-      while (hasMore) {
-        pageCount++;
-
+      // Paginated tool fetching - load all pages automatically. The walk
+      // stops on a repeated cursor or the page cap instead of looping for as
+      // long as a server keeps returning a cursor.
+      const collected = await collectAllPages<MCPTool>(async (cursor) => {
         const response = (await makeRequest(
           {
             method: "tools/list" as const,
@@ -117,28 +113,42 @@ export function ToolManagement({
           { suppressToast: true },
         )) as ToolsListResponse & { nextCursor?: string };
 
-        if (response?.tools && response.tools.length > 0) {
-          allTools.push(...response.tools);
-        }
+        return {
+          items: response?.tools ?? [],
+          nextCursor: response?.nextCursor,
+        };
+      });
+      const allTools = collected.items;
 
-        cursor = response?.nextCursor;
-        hasMore = !!response?.nextCursor;
+      if (collected.truncated !== null) {
+        toast.warning(
+          t(
+            collected.truncated === "repeated_cursor"
+              ? "mcp-servers:toolListTruncated.repeatedCursor"
+              : "mcp-servers:toolListTruncated.pageCap",
+            { count: allTools.length, pages: collected.pages },
+          ),
+        );
       }
 
       if (allTools.length > 0) {
         setMcpTools(allTools);
 
-        // Automatically save tools to database
-        const toolsToSave = allTools.map((tool) => ({
-          name: tool.name,
-          description: tool.description || undefined,
-          inputSchema: tool.inputSchema || { type: "object" as const },
-        }));
+        // Automatically save tools to database. Not for a truncated listing:
+        // it is not the server's whole tool set, and the sync deletes saved
+        // tools that are missing from what it is given.
+        if (collected.truncated === null) {
+          const toolsToSave = allTools.map((tool) => ({
+            name: tool.name,
+            description: tool.description || undefined,
+            inputSchema: tool.inputSchema || { type: "object" as const },
+          }));
 
-        saveToolsMutation.mutate({
-          mcpServerUuid,
-          tools: toolsToSave,
-        });
+          saveToolsMutation.mutate({
+            mcpServerUuid,
+            tools: toolsToSave,
+          });
+        }
       } else {
         setMcpTools([]);
         toast.info(t("mcp-servers:tools.noToolsFromMcp"));

@@ -10,6 +10,7 @@ import logger from "@/utils/logger";
 
 import { namespacesRepository } from "../../db/repositories/namespaces.repo";
 import { configService } from "../config.service";
+import { backendErrorForLogging } from "./backend-auth-rejection";
 import {
   BackendUnavailableError,
   BackendUnavailableReason,
@@ -203,7 +204,7 @@ export async function routeUnmappedToolCall(
     } catch (error) {
       logger.error(
         `${logPrefix}tool lookup on server ${candidate.uuid} failed while routing ${display}:`,
-        error,
+        backendErrorForLogging(error),
       );
       return { kind: "lookup_failed" };
     }
@@ -223,7 +224,7 @@ export async function routeUnmappedToolCall(
       // rejection must still read as "no session", not escape the router.
       logger.error(
         `${logPrefix}session acquisition for server ${candidate.uuid} failed while routing ${display}:`,
-        error,
+        backendErrorForLogging(error),
       );
     }
     if (!session) {
