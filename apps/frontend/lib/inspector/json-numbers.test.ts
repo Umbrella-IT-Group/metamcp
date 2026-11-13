@@ -52,6 +52,44 @@ describe("findUnsafeNumber", () => {
     );
   });
 
+  it.each([
+    "9007199254740990.5",
+    "9007199254740991.1",
+    "-9007199254740990.5",
+    "1.0000000000000001",
+    "0.10000000000000001",
+    "1234567890123456.7",
+    "9.0071992547409905e15",
+    "4e-324",
+  ])("refuses a decimal that serializes to a different value: %s", (text) => {
+    expect(isUnsafeNumberText(text)).toBe(true);
+    expect(findUnsafeNumber(`{"n":${text}}`)).toBe(text);
+  });
+
+  it.each([
+    "1.2300",
+    "12300e-4",
+    "1.0000000000000000",
+    "0.10000000000000000",
+    "1.2345678901234567",
+    "0.30000000000000004",
+    "4503599627370495.5",
+    "5e-324",
+    "50e-325",
+    "2.2250738585072014e-308",
+    "9007199254740991000e-3",
+  ])("accepts equivalent decimal spellings: %s", (text) => {
+    expect(isUnsafeNumberText(text)).toBe(false);
+    expect(findUnsafeNumber(`{"n":${text}}`)).toBeNull();
+  });
+
+  it("retains significant digits after long zero runs", () => {
+    const zeros = "0".repeat(20000);
+    expect(isUnsafeNumberText(`0.1${zeros}`)).toBe(false);
+    expect(isUnsafeNumberText(`0.1${zeros}1`)).toBe(true);
+    expect(isUnsafeNumberText(`0.1${zeros}10`)).toBe(true);
+  });
+
   it("ignores numbers inside strings, keys included", () => {
     expect(findUnsafeNumber('{"a": "9007199254740993"}')).toBeNull();
     expect(findUnsafeNumber('"9007199254740993"')).toBeNull();

@@ -513,6 +513,12 @@ describe("numbers that cannot be sent exactly", () => {
     "1e400",
     "-1e400",
     "0x20000000000001",
+    "9007199254740990.5",
+    "9007199254740991.1",
+    "1.0000000000000001",
+    "0.10000000000000001",
+    "1234567890123456.7",
+    "4e-324",
   ];
 
   describe("in number and integer fields", () => {
@@ -545,7 +551,15 @@ describe("numbers that cannot be sent exactly", () => {
           ).args,
         ).toEqual({ [key]: -9007199254740991 });
       }
-      for (const text of ["1.5", "0.1", "2.5e3"]) {
+      for (const text of [
+        "1.5",
+        "0.1",
+        "2.5e3",
+        "1.2300",
+        "0.30000000000000004",
+        "4503599627370495.5",
+        "5e-324",
+      ]) {
         const built = buildArguments(specs, typeInto(specs, state, "n", text));
         expect(built.args).toEqual({ n: Number(text) });
         expect(built.errors).toEqual([]);
@@ -581,6 +595,9 @@ describe("numbers that cannot be sent exactly", () => {
         '{"id": 1e400}',
         '{"id": -9007199254740993}',
         '{"id": 9.007199254740993e15}',
+        '{"id": 9007199254740990.5}',
+        '{"id": 1.0000000000000001}',
+        '{"id": 0.10000000000000001}',
       ];
       for (const text of texts) {
         const built = buildArguments(specs, typeInto(specs, state, "j", text));
@@ -598,6 +615,15 @@ describe("numbers that cannot be sent exactly", () => {
       const built = buildArguments(
         specs,
         typeInto(specs, state, "e", "9007199254740993"),
+      );
+      expect(built.errors).toEqual([{ key: "e", reason: "unsafeNumber" }]);
+      expect(built.args).toEqual({});
+    });
+
+    it("refuses a decimal rounded within the safe range in an enum field", () => {
+      const built = buildArguments(
+        specs,
+        typeInto(specs, state, "e", "9007199254740990.5"),
       );
       expect(built.errors).toEqual([{ key: "e", reason: "unsafeNumber" }]);
       expect(built.args).toEqual({});

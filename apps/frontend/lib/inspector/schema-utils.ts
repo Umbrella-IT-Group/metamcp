@@ -42,9 +42,10 @@
  *     non-null types is reported as ambiguous instead of picking the first.
  *   - `extractEnumOptions` lists string, number and boolean enums and `const`.
  *   - `parsePastedObject` refuses a paste holding a number that cannot be
- *     sent exactly (a whole number past Number.MAX_SAFE_INTEGER, or one that
- *     overflows), because JSON.parse rounds it before any field sees it. It
- *     also says why a paste failed; `parseObjectFromPaste` keeps its null.
+ *     sent exactly (past Number.MAX_SAFE_INTEGER, nonfinite, or a decimal
+ *     whose value changes during JSON serialization), because JSON.parse
+ *     rounds it before any field sees it. It also says why a paste failed;
+ *     `parseObjectFromPaste` keeps its null.
  */
 
 import { findUnsafeNumber } from "./json-numbers";
@@ -430,10 +431,10 @@ export type PasteParse =
 
 /**
  * Reads pasted text as a JSON or JavaScript object, and says why when it
- * cannot. A paste holding a number the browser cannot carry exactly (a whole
- * number past Number.MAX_SAFE_INTEGER, or one that overflows; see
- * json-numbers.ts) is refused whole: JSON.parse would round it before any
- * field saw it, so the digits that were pasted would not be the digits sent.
+ * cannot. A paste holding a number the browser cannot carry exactly (past
+ * Number.MAX_SAFE_INTEGER, nonfinite, or a decimal whose value changes during
+ * JSON serialization; see json-numbers.ts) is refused whole: JSON.parse would
+ * round it before any field saw it, so the value pasted would not be sent.
  * The text that was actually parsed is the one scanned, so the backtick
  * fallback is covered, and numbers inside strings are never read as numbers.
  */

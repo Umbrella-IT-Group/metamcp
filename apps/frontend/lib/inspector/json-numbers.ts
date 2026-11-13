@@ -17,10 +17,14 @@
  *     90071992547409930e-1, 1e16;
  *   - not finite: 1e400 reads as Infinity, which JSON cannot carry (and
  *     JSON.stringify would turn into null);
- *   - zero although the digits are not: 1e-400 reads as 0.
- * Fractions that fit (1.5, 0.1) are unaffected. A fraction such as 0.1 is not
- * exact in binary either, but it is the same number to every reader, which is
- * not true of a whole number past the boundary.
+ *   - a different decimal value after JSON serialization, including zero
+ *     although the digits are not (1e-400), a fractional value rounded to an
+ *     integer within the safe range (9007199254740990.5), or lost decimal
+ *     precision (0.10000000000000001).
+ * Fractions that round-trip (1.5, 0.1) are unaffected. A fraction such as 0.1
+ * is not exact in binary either, but JSON still carries the decimal 0.1. We
+ * compare decimal values, so equivalent spellings such as 1.2300 and 1.23
+ * are accepted without accepting digits that disappear during conversion.
  *
  * The scan reads the raw text, never a parsed value, because the parse is
  * what loses the digits. Numbers inside string literals are text, not
@@ -33,7 +37,7 @@
 // optional point (5. and .5 are accepted), and an optional exponent. Every
 // JSON number is one; "Infinity", "NaN" and words are not.
 const DECIMAL_LITERAL =
-  /^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
+  /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
 
 // Number() also reads unsigned hex, octal and binary integers (0x1F). Each
 // pattern checks its own digits, so the value can be read without a parse
@@ -44,6 +48,28 @@ const RADIX_LITERAL = /^0(?:[xX][0-9a-fA-F]+|[oO][0-7]+|[bB][01]+)$/;
 // digits on both sides of a point, a signed exponent). Sticky, so a match
 // starts exactly at lastIndex.
 const JSON_NUMBER = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
+
+// A nonzero decimal as a signed coefficient and a base-ten exponent. Strip
+// insignificant zeros without expanding exponents, so 1.2300 and 123e-2
+// compare equal. Both inputs denote finite nonzero doubles, which bounds the
+// exponent by the input length plus the double range; Number can carry that
+// exponent exactly even when it cannot carry the coefficient exactly.
+function decimalValue(literal: string): string {
+  const [mantissa = "", exponent = "0"] = literal.toLowerCase().split("e");
+  const point = mantissa.indexOf(".");
+  const fractionLength = point < 0 ? 0 : mantissa.length - point - 1;
+  const digits = mantissa
+    .replace(/^[+-]/, "")
+    .replace(".", "")
+    .replace(/^0+/, "");
+  // Scan from the end so long runs of zeros inside a mantissa stay linear.
+  let end = digits.length;
+  while (digits.charAt(end - 1) === "0") end -= 1;
+  const coefficient = digits.slice(0, end);
+  const scale =
+    Number(exponent) - fractionLength + digits.length - coefficient.length;
+  return `${mantissa.startsWith("-") ? "-" : ""}${coefficient}e${scale}`;
+}
 
 /**
  * True when `text`, read the way a number field reads typed text (Number()),
@@ -63,9 +89,17 @@ export function isUnsafeNumberText(text: string): boolean {
   if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
     return true;
   }
-  // Underflow: the digits name a number that is not zero, the double is.
-  const mantissa = literal.split(/[eE]/, 1)[0] ?? "";
-  return value === 0 && /[1-9]/.test(mantissa);
+  if (value === 0) {
+    // Underflow: the digits name a number that is not zero, the double is.
+    const mantissa = literal.split(/[eE]/, 1)[0] ?? "";
+    return /[1-9]/.test(mantissa);
+  }
+  // Safe integer magnitude does not imply exact conversion: a fractional
+  // input can round to a safe integer, and ordinary-size decimals can lose
+  // significant digits. String(value) is the JSON serialization of a finite
+  // nonzero number. Compare its decimal value with the raw input's, not their
+  // Number() results, which have already lost the distinction.
+  return decimalValue(literal) !== decimalValue(String(value));
 }
 
 // The index just after the string literal that starts at `start` (an opening
