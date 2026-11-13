@@ -56,7 +56,9 @@ const t = (key: string, params?: Record<string, string | number>) =>
 
 const UUID = "11111111-1111-4111-8111-111111111111";
 
-type Stored = React.ComponentProps<typeof EndpointPresentationForm>["stored"];
+type FormProps = React.ComponentProps<typeof EndpointPresentationForm>;
+type Stored = NonNullable<FormProps["stored"]>;
+
 const stored = (over: Record<string, unknown> = {}): Stored =>
   ({
     endpoint_uuid: UUID,
@@ -69,9 +71,7 @@ const stored = (over: Record<string, unknown> = {}): Stored =>
     ...over,
   }) as Stored;
 
-function render(
-  props: Partial<React.ComponentProps<typeof EndpointPresentationForm>> = {},
-) {
+function render(props: Partial<FormProps> = {}) {
   return renderToStaticMarkup(
     React.createElement(EndpointPresentationForm, {
       endpointUuid: UUID,
@@ -85,6 +85,17 @@ function render(
   );
 }
 
+/** The props the fields hand to their children, as a test reads them. */
+interface FieldProps {
+  id?: string;
+  type?: string;
+  children?: unknown;
+  disabled?: boolean;
+  onClick: () => void;
+  onKeyDown: (event: { key: string; preventDefault: () => void }) => void;
+  onCheckedChange: (checked: boolean) => void;
+}
+
 /** Every element in a tree of React elements, depth first. */
 function elements(node: React.ReactNode): React.ReactElement[] {
   if (node === null || node === undefined || typeof node === "boolean")
@@ -96,11 +107,7 @@ function elements(node: React.ReactNode): React.ReactElement[] {
 }
 
 /** The fields, called as a plain function (they hold no hooks). */
-function fields(over: Partial<React.ComponentProps<typeof ReadyForm>> = {}): {
-  tree: React.ReactElement[];
-  onSave: ReturnType<typeof vi.fn>;
-  setForm: ReturnType<typeof vi.fn>;
-} {
+function fields(over: Partial<React.ComponentProps<typeof ReadyForm>> = {}) {
   const onSave = vi.fn();
   const setForm = vi.fn();
   const element = ReadyForm({
@@ -113,17 +120,25 @@ function fields(over: Partial<React.ComponentProps<typeof ReadyForm>> = {}): {
     setForm,
     ...over,
   });
-  return { tree: elements(element), onSave, setForm };
-}
+  const tree = elements(element);
 
-const byId = (tree: React.ReactElement[], id: string) =>
-  tree.find((el) => (el.props as { id?: string }).id === id);
-const buttonLabelled = (tree: React.ReactElement[], label: string) =>
-  tree.find(
-    (el) =>
-      (el.props as { type?: string }).type === "button" &&
-      (el.props as { children?: unknown }).children === label,
-  );
+  /** The one element matching `match`; a missing element fails the test. */
+  const find = (match: (props: FieldProps) => boolean): FieldProps => {
+    const found = tree.find((el) => match(el.props as FieldProps));
+    if (!found) throw new Error("expected element not found in the fields");
+    return found.props as FieldProps;
+  };
+  return {
+    tree,
+    onSave,
+    setForm,
+    byId: (id: string) => find((props) => props.id === id),
+    button: (label: string) =>
+      find((props) => props.type === "button" && props.children === label),
+    trimSwitch: () =>
+      find((props) => typeof props.onCheckedChange === "function"),
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -211,23 +226,17 @@ describe("the fields", () => {
   it("every button is type=button, so none submits the endpoint form around the panel", () => {
     const { tree } = fields();
     const buttons = tree.filter(
-      (el) =>
-        (el.type as { displayName?: string; name?: string }).name === "Button",
+      (el) => (el.type as { name?: string }).name === "Button",
     );
     expect(buttons.length).toBe(2);
     for (const button of buttons) {
-      expect((button.props as { type?: string }).type).toBe("button");
+      expect((button.props as FieldProps).type).toBe("button");
     }
   });
 
   it("Enter in the title is swallowed, and other keys are not", () => {
-    const { tree } = fields();
-    const title = byId(tree, "endpoint-presentation-title");
-    const onKeyDown = (
-      title?.props as {
-        onKeyDown: (e: { key: string; preventDefault: () => void }) => void;
-      }
-    ).onKeyDown;
+    const { byId } = fields();
+    const { onKeyDown } = byId("endpoint-presentation-title");
 
     const enter = vi.fn();
     onKeyDown({ key: "Enter", preventDefault: enter });
@@ -239,7 +248,7 @@ describe("the fields", () => {
   });
 
   it("Save sends the whole form as a full-listing request", () => {
-    const { tree, onSave } = fields({
+    const { button, onSave } = fields({
       stored: stored({
         title: null,
         instructions: null,
@@ -252,7 +261,7 @@ describe("the fields", () => {
       },
     });
 
-    buttonLabelled(tree, "Save")?.props.onClick();
+    button("Save").onClick();
 
     expect(onSave).toHaveBeenCalledWith({
       endpoint_uuid: UUID,
@@ -264,7 +273,7 @@ describe("the fields", () => {
   });
 
   it("Save from a stored lean state writes the full listing, which clears it", () => {
-    const { tree, onSave } = fields({
+    const { button, onSave } = fields({
       stored: stored({
         title: null,
         instructions: null,
@@ -274,7 +283,7 @@ describe("the fields", () => {
       form: { title: "", instructions: "", omitOutputSchemas: false },
     });
 
-    buttonLabelled(tree, "Save")?.props.onClick();
+    button("Save").onClick();
 
     expect(onSave).toHaveBeenCalledWith({
       endpoint_uuid: UUID,
@@ -286,8 +295,7 @@ describe("the fields", () => {
   });
 
   it("Save is disabled when nothing changed, while saving, and when a text is invalid", () => {
-    const unchanged = fields();
-    expect(buttonLabelled(unchanged.tree, "Save")?.props.disabled).toBe(true);
+    expect(fields().button("Save").disabled).toBe(true);
 
     // A valid change, but a save is already in flight.
     const saving = fields({
@@ -298,7 +306,7 @@ describe("the fields", () => {
         omitOutputSchemas: true,
       },
     });
-    expect(buttonLabelled(saving.tree, "Saving...")?.props.disabled).toBe(true);
+    expect(saving.button("Saving...").disabled).toBe(true);
 
     const invalid = fields({
       form: {
@@ -307,7 +315,7 @@ describe("the fields", () => {
         omitOutputSchemas: true,
       },
     });
-    expect(buttonLabelled(invalid.tree, "Save")?.props.disabled).toBe(true);
+    expect(invalid.button("Save").disabled).toBe(true);
   });
 
   it("Save is enabled for a valid change", () => {
@@ -318,7 +326,7 @@ describe("the fields", () => {
         omitOutputSchemas: true,
       },
     });
-    expect(buttonLabelled(changed.tree, "Save")?.props.disabled).toBe(false);
+    expect(changed.button("Save").disabled).toBe(false);
   });
 
   it("names the rule an invalid text breaks, next to the field", () => {
@@ -341,7 +349,7 @@ describe("the fields", () => {
   });
 
   it("Reset puts the stored settings back", () => {
-    const { tree, setForm } = fields({
+    const { button, setForm } = fields({
       form: {
         title: "Edited",
         instructions: "Edited",
@@ -349,7 +357,7 @@ describe("the fields", () => {
       },
     });
 
-    buttonLabelled(tree, "Reset")?.props.onClick();
+    button("Reset").onClick();
 
     expect(setForm).toHaveBeenCalledWith({
       title: "Desk",
@@ -359,16 +367,9 @@ describe("the fields", () => {
   });
 
   it("the trim switch updates only the trim flag", () => {
-    const { tree, setForm } = fields();
-    const trim = tree.find(
-      (el) =>
-        typeof (el.props as { onCheckedChange?: unknown }).onCheckedChange ===
-        "function",
-    );
+    const { trimSwitch, setForm } = fields();
 
-    (
-      trim?.props as { onCheckedChange: (checked: boolean) => void }
-    ).onCheckedChange(false);
+    trimSwitch().onCheckedChange(false);
 
     expect(setForm).toHaveBeenCalledWith({
       title: "Desk",
