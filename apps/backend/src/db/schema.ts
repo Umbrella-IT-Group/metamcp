@@ -9,6 +9,7 @@ import {
   McpServerTypeEnum,
   type NamespaceToolPolicy,
   type OAuthClientRegistrationSource,
+  type ToolListingMode,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
 import {
@@ -1257,5 +1258,57 @@ export const accessGroupEndpointsTable = pgTable(
     // Same reasoning as the members index: the authorization path filters on
     // endpoint_uuid, which is the PK's trailing column.
     index("access_group_endpoints_endpoint_uuid_idx").on(table.endpoint_uuid),
+  ],
+);
+
+/**
+ * Per-endpoint presentation (migration 0044): title, instructions, tool
+ * listing mode and the output-schema trim, one row per endpoint and only while
+ * something is non-default. No row means today's behaviour.
+ *
+ * A table of its own rather than columns on `endpoints`, for the reasons in the
+ * migration header: the endpoint select list stays untouched, and authorship
+ * stays human-only because no admin-plane procedure writes this table.
+ *
+ * Appended at the end of the file on purpose, and `endpointsTable` is not
+ * edited: that keeps this change out of the region other work on the endpoint
+ * row touches.
+ */
+export const endpointPresentationTable = pgTable(
+  "endpoint_presentation",
+  {
+    endpoint_uuid: uuid("endpoint_uuid")
+      .primaryKey()
+      .references(() => endpointsTable.uuid, { onDelete: "cascade" }),
+    title: text("title"),
+    instructions: text("instructions"),
+    tool_listing: text("tool_listing")
+      .$type<ToolListingMode>()
+      .notNull()
+      .default("full"),
+    omit_output_schemas: boolean("omit_output_schemas")
+      .notNull()
+      .default(false),
+    updated_at: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // Mirrored from migration 0044 so a fresh `drizzle-kit generate` re-adds
+    // nothing. The regular expressions are written with doubled backslashes
+    // because this is a JS template literal: the SQL must receive the
+    // backslash, not the control character it would otherwise be.
+    check(
+      "endpoint_presentation_tool_listing_check",
+      sql`${table.tool_listing} IN ('full', 'lean')`,
+    ),
+    check(
+      "endpoint_presentation_title_check",
+      sql`${table.title} IS NULL OR (char_length(${table.title}) BETWEEN 1 AND 80 AND ${table.title} !~ '[\\r\\n]')`,
+    ),
+    check(
+      "endpoint_presentation_instructions_check",
+      sql`${table.instructions} IS NULL OR (char_length(${table.instructions}) BETWEEN 1 AND 1500 AND ${table.instructions} !~ '[\\u0001-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]')`,
+    ),
   ],
 );

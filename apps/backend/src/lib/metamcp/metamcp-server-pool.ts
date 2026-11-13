@@ -3,6 +3,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import logger from "@/utils/logger";
 
 import { configService } from "../config.service";
+import type { SessionPresentation } from "./endpoint-presentation";
 import { mcpServerPool } from "./mcp-server-pool";
 import { MetaMCPHandlerContext } from "./metamcp-middleware/functional-middleware";
 import { createServer } from "./metamcp-proxy";
@@ -77,14 +78,25 @@ export class MetaMcpServerPool {
     sessionId: string,
     namespaceUuid: string,
     includeInactiveServers: boolean = false,
+    // The session's presentation (title, instructions, output-schema trim),
+    // for a session on an endpoint that has any. Undefined for every other
+    // session, which takes every path below exactly as it always did.
+    presentation?: SessionPresentation,
   ): Promise<MetaMcpServerInstance | undefined> {
     // Check if we already have an active server for this sessionId
     if (this.activeServers[sessionId]) {
       return this.activeServers[sessionId];
     }
 
-    // Check if we have an idle server for this namespace that we can convert
-    const idleServer = this.idleServers[namespaceUuid];
+    // Check if we have an idle server for this namespace that we can convert.
+    // A session WITH a presentation never converts one: an idle shell is built
+    // per namespace, before any endpoint or client exists, so it cannot carry
+    // endpoint-level settings, and the SDK reads instructions and serverInfo
+    // only at construction. Building a fresh shell is cheap (createServer has
+    // no top-level await; backend connections are acquired lazily), and the
+    // idle shell stays in place for the next default session.
+    const idleServer =
+      presentation === undefined ? this.idleServers[namespaceUuid] : undefined;
     if (idleServer) {
       // Convert idle server to active server
       delete this.idleServers[namespaceUuid];
@@ -102,11 +114,12 @@ export class MetaMcpServerPool {
       return idleServer;
     }
 
-    // No idle server available, create a new one
+    // No idle server available (or none this session may use), create a new one
     const newServer = await this.createNewServer(
       sessionId,
       namespaceUuid,
       includeInactiveServers,
+      presentation,
     );
     if (!newServer) {
       return undefined;
@@ -133,14 +146,21 @@ export class MetaMcpServerPool {
     sessionId: string,
     namespaceUuid: string,
     includeInactiveServers: boolean = false,
+    presentation?: SessionPresentation,
   ): Promise<MetaMcpServerInstance | undefined> {
     try {
-      // Create the MetaMCP server - MCP server pool is pre-warmed during startup
-      const serverInstance = await createServer(
-        namespaceUuid,
-        sessionId,
-        includeInactiveServers,
-      );
+      // Create the MetaMCP server - MCP server pool is pre-warmed during startup.
+      // The fourth argument is passed only when there is a presentation, so
+      // every other session reaches createServer with the call it always made.
+      const serverInstance =
+        presentation === undefined
+          ? await createServer(namespaceUuid, sessionId, includeInactiveServers)
+          : await createServer(
+              namespaceUuid,
+              sessionId,
+              includeInactiveServers,
+              presentation,
+            );
 
       return serverInstance;
     } catch (error) {
