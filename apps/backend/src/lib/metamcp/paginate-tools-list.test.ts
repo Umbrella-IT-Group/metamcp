@@ -90,6 +90,8 @@ describe("collectToolsListPages", () => {
     const result = await collectToolsListPages(async (cursor) => {
       requested.push(cursor);
       n += 1;
+      // Tripwire: an unguarded loop fails here instead of exhausting memory.
+      if (n > 200) throw new Error("runaway pagination");
       return { tools: [], nextCursor: `page-${n}` };
     });
 
