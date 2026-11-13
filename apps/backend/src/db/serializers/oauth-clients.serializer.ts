@@ -1,3 +1,5 @@
+import type { OAuthClientRegistrationSource } from "@repo/zod-types";
+
 export class OAuthClientsSerializer {
   // Admin list view for the OAuth Clients page. Deliberately DROPS
   // `client_secret` and `client_secret_salt` and reports only whether a secret
@@ -22,7 +24,10 @@ export class OAuthClientsSerializer {
       token_endpoint_auth_method: string;
       scope: string | null;
       approval_status: string;
-      registration_source?: "dcr" | "admin" | null;
+      // The shared enum, not a local literal union: a value added there (the
+      // "cimd" source) must reach this signature, or the list route's output
+      // schema and this type disagree and the page fails to parse.
+      registration_source?: OAuthClientRegistrationSource | null;
       approved_by?: string | null;
       approved_at?: Date | null;
       rejected_at?: Date | null;

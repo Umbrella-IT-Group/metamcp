@@ -63,6 +63,7 @@
   "statusUnknown": "未批准",
   "sourceDcr": "自助注册",
   "sourceAdmin": "由管理员创建",
+  "sourceCimd": "客户端元数据文档",
   "sourceLegacy": "在记录来源之前创建",
   "registeredFromUnavailable": "不可用",
   "registeredFromHelp": "自助注册请求来自的网络地址。它不能识别具体的人，也不表示该客户端是安全的。",

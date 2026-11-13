@@ -5,8 +5,9 @@ import {
   OAuthAuthorizationCodeCreateInput,
   OAuthClient,
   OAuthClientCreateInput,
+  OAuthClientRegistrationDraft,
 } from "@repo/zod-types";
-import { and, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, gte, isNull, lt, or, sql } from "drizzle-orm";
 
 import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
 import { hashClientSecret } from "@/routers/oauth/utils";
@@ -18,6 +19,7 @@ import {
   oauthAuthorizationCodesTable,
   oauthClientsTable,
   oauthRotatedRefreshTokensTable,
+  oauthSpentAuthorizationCodesTable,
   usersTable,
 } from "../schema";
 import {
@@ -276,6 +278,120 @@ export class OAuthRepository {
     return deleted.length;
   }
 
+  // ===== Client metadata documents (migration 0046) =====
+
+  // Write the row for an allowlisted client metadata document: insert it, or
+  // refresh the fields the document publishes. The row is a CACHE of the
+  // document, so the refresh rewrites exactly those fields (name, redirect
+  // URIs, grant and response types, the four URIs) and `updated_at`, which is
+  // the freshness clock the resolver reads (there is no separate column).
+  //
+  // What a refresh never touches: the approval columns. A row an operator
+  // rejected by hand stays rejected however often the document is fetched.
+  // And only a row that is already source `cimd` is refreshed at all: the
+  // conflict action's WHERE leaves a `dcr` or `admin` row that happens to own
+  // the id exactly as it was, in which case nothing is returned and the caller
+  // refuses. A document must never be able to rewrite a client an
+  // administrator created.
+  //
+  // Written approved with no approving person: the allowlist entry is the
+  // approval (migration 0046), and the approval-fields CHECK permits
+  // approved_by NULL.
+  async upsertCimdClient(
+    draft: OAuthClientRegistrationDraft,
+    now: Date,
+  ): Promise<OAuthClient | null> {
+    const rows = await db
+      .insert(oauthClientsTable)
+      .values({
+        client_id: draft.client_id,
+        client_secret: null,
+        client_secret_salt: null,
+        client_name: draft.client_name,
+        redirect_uris: draft.redirect_uris,
+        grant_types: draft.grant_types,
+        response_types: draft.response_types,
+        token_endpoint_auth_method: "none",
+        scope: draft.scope,
+        client_uri: draft.client_uri ?? null,
+        logo_uri: draft.logo_uri ?? null,
+        contacts: null,
+        tos_uri: draft.tos_uri ?? null,
+        policy_uri: draft.policy_uri ?? null,
+        software_id: null,
+        software_version: null,
+        registration_source: "cimd",
+        approval_status: "approved",
+        approved_by: null,
+        approved_at: now,
+        created_at: now,
+        updated_at: now,
+      })
+      .onConflictDoUpdate({
+        target: oauthClientsTable.client_id,
+        set: {
+          client_name: draft.client_name,
+          redirect_uris: draft.redirect_uris,
+          grant_types: draft.grant_types,
+          response_types: draft.response_types,
+          client_uri: draft.client_uri ?? null,
+          logo_uri: draft.logo_uri ?? null,
+          tos_uri: draft.tos_uri ?? null,
+          policy_uri: draft.policy_uri ?? null,
+          updated_at: now,
+        },
+        setWhere: eq(oauthClientsTable.registration_source, "cimd"),
+      })
+      .returning();
+    return rows[0] ?? null;
+  }
+
+  // How many rows are of source `cimd`; the resolver refuses a NEW id past a
+  // fixed cap (refreshing a row that exists is never refused).
+  async countCimdClients(): Promise<number> {
+    const result = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(oauthClientsTable)
+      .where(eq(oauthClientsTable.registration_source, "cimd"));
+    return result[0]?.count ?? 0;
+  }
+
+  // Retention for client metadata rows: delete `cimd` rows not refreshed for
+  // `olderThanDays` that have nothing hanging off them. A row with an access
+  // token, an authorization code or a rotated-token marker is kept, because
+  // deleting its client would cascade-revoke those sessions; a row with none
+  // costs nothing to lose, since the next authorize for a still-listed id
+  // fetches the document and writes it again.
+  //
+  // The predicates live in the DELETE, as in the DCR sweep above, so a token
+  // written while the sweep runs cannot have its client removed from under it:
+  // the WHERE is re-checked on the row about to be deleted. Only `cimd` rows
+  // can match; a `dcr`, `admin` or legacy row is never touched here.
+  async pruneUnusedCimdClients(
+    olderThanDays: number,
+    now: Date = new Date(),
+  ): Promise<number> {
+    if (!Number.isFinite(olderThanDays) || olderThanDays <= 0) return 0;
+
+    const cutoff = new Date(
+      now.getTime() - olderThanDays * 24 * 60 * 60 * 1000,
+    );
+    const deleted = await db
+      .delete(oauthClientsTable)
+      .where(
+        and(
+          eq(oauthClientsTable.registration_source, "cimd"),
+          lt(oauthClientsTable.updated_at, cutoff),
+          sql`NOT EXISTS (SELECT 1 FROM ${oauthAccessTokensTable} WHERE ${oauthAccessTokensTable.client_id} = ${oauthClientsTable.client_id})`,
+          sql`NOT EXISTS (SELECT 1 FROM ${oauthAuthorizationCodesTable} WHERE ${oauthAuthorizationCodesTable.client_id} = ${oauthClientsTable.client_id})`,
+          sql`NOT EXISTS (SELECT 1 FROM ${oauthRotatedRefreshTokensTable} WHERE ${oauthRotatedRefreshTokensTable.client_id} = ${oauthClientsTable.client_id})`,
+        ),
+      )
+      .returning({ client_id: oauthClientsTable.client_id });
+
+    return deleted.length;
+  }
+
   // ===== Authorization Codes =====
 
   // Codes are hashed at rest (migration 0036): the caller passes the plaintext
@@ -283,8 +399,11 @@ export class OAuthRepository {
   // the old exact-value lookup matched. The returned row's `code` is the hash;
   // callers that re-address the row (consume/delete) pass the plaintext again
   // and it re-hashes, so no caller ever handles the stored digest directly.
-  async getAuthCode(code: string): Promise<OAuthAuthorizationCode | null> {
-    const result = await db
+  async getAuthCode(
+    code: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<OAuthAuthorizationCode | null> {
+    const result = await executor
       .select()
       .from(oauthAuthorizationCodesTable)
       .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)))
@@ -660,6 +779,109 @@ export class OAuthRepository {
     return revoked.length;
   }
 
+  // ===== Spent authorization codes (migration 0045) =====
+
+  // Record a redeemed authorization code, in the SAME transaction as the token
+  // pair it produced, so the tombstone exists exactly when the pair does. The
+  // key is the same sha256 the live codes table uses (hashApiKey), never the
+  // code. A plain insert on purpose: a conflict (the code hash is the primary
+  // key, and consumeAuthCode already guaranteed single use) or a missing table
+  // must fail the whole transaction loudly, so a login never succeeds without
+  // its record. `tx` is required, not defaulted to the pool, so a caller cannot
+  // write the record outside the transaction that issued the pair.
+  async recordSpentCode(
+    code: string,
+    data: {
+      family_id: string;
+      client_id: string;
+      user_id: string;
+      redirect_uri: string;
+      code_challenge: string;
+      expires_at: Date;
+    },
+    tx: OAuthTx,
+  ): Promise<void> {
+    await tx.insert(oauthSpentAuthorizationCodesTable).values({
+      code_hash: hashApiKey(code),
+      family_id: data.family_id,
+      client_id: data.client_id,
+      user_id: data.user_id,
+      redirect_uri: data.redirect_uri,
+      code_challenge: data.code_challenge,
+      expires_at: data.expires_at,
+    });
+  }
+
+  // Look up a redeemed code by the PLAINTEXT presented value, only while its
+  // record has not expired: an expired row is evidence nobody acts on, and the
+  // reaper may simply not have run yet. `now` is a parameter so the expiry rule
+  // is testable without a wall clock.
+  async getSpentCode(
+    code: string,
+    executor: OAuthDbExecutor = db,
+    now: Date = new Date(),
+  ) {
+    const result = await executor
+      .select({
+        family_id: oauthSpentAuthorizationCodesTable.family_id,
+        client_id: oauthSpentAuthorizationCodesTable.client_id,
+        user_id: oauthSpentAuthorizationCodesTable.user_id,
+        redirect_uri: oauthSpentAuthorizationCodesTable.redirect_uri,
+        code_challenge: oauthSpentAuthorizationCodesTable.code_challenge,
+        expires_at: oauthSpentAuthorizationCodesTable.expires_at,
+      })
+      .from(oauthSpentAuthorizationCodesTable)
+      .where(
+        and(
+          eq(oauthSpentAuthorizationCodesTable.code_hash, hashApiKey(code)),
+          gte(oauthSpentAuthorizationCodesTable.expires_at, now),
+        ),
+      )
+      .limit(1);
+    return result[0] || null;
+  }
+
+  // The gate that makes exactly one replay act: DELETE ... RETURNING on the
+  // primary key, the same shape as consumeAuthCode. Of two concurrent replays
+  // exactly one gets the row back; the other (and every later replay) gets null
+  // and does nothing, so one compromised code produces one audit row. Also
+  // refuses an expired row, so the expiry rule cannot be bypassed by going
+  // straight to the consume. Takes the caller's `tx` (the replay revoke runs
+  // under the owner's credential lock and must not open a second transaction).
+  async consumeSpentCode(code: string, tx: OAuthTx, now: Date = new Date()) {
+    const deleted = await tx
+      .delete(oauthSpentAuthorizationCodesTable)
+      .where(
+        and(
+          eq(oauthSpentAuthorizationCodesTable.code_hash, hashApiKey(code)),
+          gte(oauthSpentAuthorizationCodesTable.expires_at, now),
+        ),
+      )
+      .returning({
+        family_id: oauthSpentAuthorizationCodesTable.family_id,
+        client_id: oauthSpentAuthorizationCodesTable.client_id,
+        user_id: oauthSpentAuthorizationCodesTable.user_id,
+      });
+    return deleted[0] || null;
+  }
+
+  // How many rows revokeFamily would delete for this family right now: every
+  // access-token row carrying the family id, the same set revokeFamilyLocked
+  // removes. The replay handler reads it under the owner's credential lock
+  // before revoking, so the audit row states what was actually live and a
+  // replay after users.revokeAccess (which deletes the family's rows but leaves
+  // the tombstone) is recorded as having revoked nothing.
+  async countFamilyAccessTokens(
+    familyId: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<number> {
+    const [row] = await executor
+      .select({ n: sql<number>`count(*)::int` })
+      .from(oauthAccessTokensTable)
+      .where(eq(oauthAccessTokensTable.family_id, familyId));
+    return row?.n ?? 0;
+  }
+
   // ===== Cleanup =====
 
   async cleanupExpired(): Promise<void> {
@@ -693,6 +915,17 @@ export class OAuthRepository {
       db
         .delete(oauthRotatedRefreshTokensTable)
         .where(lt(oauthRotatedRefreshTokensTable.expires_at, now)),
+      // `off` also bypasses this table in the periodic sweep: it is the full
+      // rollback when the table is missing or broken. Existing records are
+      // reaped once the feature is enabled again. Every other value keeps the
+      // sweep, matching the token endpoint's fallback to `log`.
+      ...(process.env.OAUTH_CODE_REPLAY?.trim().toLowerCase() === "off"
+        ? []
+        : [
+            db
+              .delete(oauthSpentAuthorizationCodesTable)
+              .where(lt(oauthSpentAuthorizationCodesTable.expires_at, now)),
+          ]),
     ]);
   }
 }

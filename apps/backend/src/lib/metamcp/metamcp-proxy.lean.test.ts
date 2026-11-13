@@ -778,15 +778,42 @@ describe("call_tool and call_write_tool run the real tool through the real chain
     },
   );
 
-  it("passes the request's _meta, a progress token included, to the backend call", async () => {
+  it("passes the request's _meta to the backend call, under the gateway's own progress token", async () => {
+    // With progress relayed (MCP_TOOL_CALL_PROGRESS, on by default) the SDK
+    // registers the gateway's handler and sends its own token, the request id;
+    // the relay answers the consumer under the consumer's token. Every other
+    // _meta field reaches the backend as sent.
     const lean = await connectConsumer("s-lean-m", LEAN);
     await meta(
       lean,
       "call_write_tool",
       { name: "desk__write", arguments: { ticket_id: "T-2" } },
-      { _meta: { progressToken: "token-7" } },
+      { _meta: { progressToken: "token-7", "example.test/trace": "t-1" } },
     );
-    expect(desk.calls.at(-1)?.meta).toMatchObject({ progressToken: "token-7" });
+    const sent = desk.calls.at(-1)?.meta as Record<string, unknown> | undefined;
+    expect(sent).toMatchObject({ "example.test/trace": "t-1" });
+    expect(sent?.progressToken).toBeDefined();
+    expect(sent?.progressToken).not.toBe("token-7");
+  });
+
+  it("passes the consumer's progress token verbatim when progress relay is off", async () => {
+    const saved = process.env.MCP_TOOL_CALL_PROGRESS;
+    process.env.MCP_TOOL_CALL_PROGRESS = "off";
+    try {
+      const lean = await connectConsumer("s-lean-m-off", LEAN);
+      await meta(
+        lean,
+        "call_write_tool",
+        { name: "desk__write", arguments: { ticket_id: "T-2" } },
+        { _meta: { progressToken: "token-7" } },
+      );
+      expect(desk.calls.at(-1)?.meta).toMatchObject({
+        progressToken: "token-7",
+      });
+    } finally {
+      if (saved === undefined) delete process.env.MCP_TOOL_CALL_PROGRESS;
+      else process.env.MCP_TOOL_CALL_PROGRESS = saved;
+    }
   });
 
   it("logs a search as one persisted system event from the gateway, with counts only and never a tool call or a name", async () => {
