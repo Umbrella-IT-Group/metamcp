@@ -42,9 +42,16 @@ function activeRow(
 type RepoStub = M365TokensRepository & {
   findByUserId: Mock<(userId: string) => Promise<M365UserTokenRow | undefined>>;
   rotateRefreshToken: Mock<
-    (userId: string, rt: string, kekId: string) => Promise<boolean>
+    (
+      userId: string,
+      rt: string,
+      kekId: string,
+      expectedCiphertext: string,
+    ) => Promise<boolean>
   >;
-  markReauthRequired: Mock<(userId: string) => Promise<void>>;
+  markReauthRequired: Mock<
+    (userId: string, expectedCiphertext: string) => Promise<void>
+  >;
 };
 
 function makeRepo(row: M365UserTokenRow | undefined): RepoStub {
@@ -217,7 +224,8 @@ describe("M365MintService", () => {
   });
 
   it("maps invalid_grant to credential_expired and marks reauth_required", async () => {
-    const repo = makeRepo(activeRow());
+    const row = activeRow();
+    const repo = makeRepo(row);
     const fetchStub = vi.fn(async () =>
       tokenResponse(
         {
@@ -234,7 +242,12 @@ describe("M365MintService", () => {
       code: "credential_expired",
       enrollUrl: "https://mcp.example.com/m365/enroll",
     });
-    expect(repo.markReauthRequired).toHaveBeenCalledWith("user-1");
+    // The mark is conditional on the ciphertext that was read (the fixture
+    // row), so a rejection of an old grant cannot mark a re-enrolled row.
+    expect(repo.markReauthRequired).toHaveBeenCalledWith(
+      "user-1",
+      row.rt_ciphertext,
+    );
   });
 
   it("maps Conditional Access / MFA error codes to mfa_required", async () => {

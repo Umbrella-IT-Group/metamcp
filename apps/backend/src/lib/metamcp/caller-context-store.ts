@@ -61,6 +61,14 @@ export interface CallerContext {
    */
   oauthClientId?: string;
   /**
+   * The refresh-token family of the presented OAuth access token
+   * (`oauth_access_tokens.family_id`), constant across the refreshes of one
+   * connection and different for each new one. Read only to tell two
+   * connections of one URL-identified client apart in the verified caller
+   * credential (`verified-caller.ts`); not a `tool_call_audit` column.
+   */
+  oauthTokenFamilyId?: string;
+  /**
    * The account email of the effective user (`actsAsUserId ?? userId`), read
    * for THIS request through a short-lived cache, or undefined when it could
    * not be read. Never another account's email and never a display label: it

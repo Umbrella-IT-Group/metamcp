@@ -21,6 +21,7 @@ import {
   checkConcurrentSessionCeiling,
   registerSessionCounter,
 } from "../../lib/metamcp/credential-session-quota";
+import { resolveSessionPresentation } from "../../lib/metamcp/endpoint-presentation-resolver";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
 import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
@@ -280,11 +281,25 @@ sseRouter.get(
 
       const sessionId = webAppTransport.sessionId;
 
-      // Get or create MetaMCP server instance from the pool
-      const mcpServerInstance = await metaMcpServerPool.getServer(
-        sessionId,
-        namespaceUuid,
+      // What this endpoint's settings say a new session presents; see the
+      // StreamableHTTP path. Resolved here, where the endpoint is known, and
+      // never throws. SSE sessions are not persisted and have no recovery path,
+      // so there is no pin to write.
+      const presentation = await resolveSessionPresentation(
+        authReq.endpoint?.uuid,
       );
+
+      // Get or create MetaMCP server instance from the pool. The call keeps its
+      // two-argument shape for every session without a presentation.
+      const mcpServerInstance =
+        presentation === undefined
+          ? await metaMcpServerPool.getServer(sessionId, namespaceUuid)
+          : await metaMcpServerPool.getServer(
+              sessionId,
+              namespaceUuid,
+              false,
+              presentation,
+            );
       if (admissionClosed) {
         // The pool can complete after the client disconnects. It must never
         // register a session that nobody owns, or consume the released slot.

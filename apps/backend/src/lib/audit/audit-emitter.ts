@@ -3,6 +3,7 @@ import type express from "express";
 import logger from "@/utils/logger";
 
 import { apiKeyLast4, hashApiKey } from "../api-key-hash";
+import { describeDbError } from "../db-error-summary";
 
 /**
  * Fire-and-forget writer for the control-plane security audit log
@@ -169,9 +170,11 @@ function reportAuditWriteFailure(
     return;
   }
   lastAuditFailureReportAt = now;
+  // Never the raw error: a failed INSERT's error carries the row's bound
+  // values (the event itself), so logging it would copy the audit row into
+  // the container log on exactly the path where its durable copy was lost.
   logger.warn(
-    `[audit] ${stage} failed, ${auditFailuresTotal} audit row(s) lost since startup (request unaffected):`,
-    error,
+    `[audit] ${stage} failed, ${auditFailuresTotal} audit row(s) lost since startup (request unaffected): ${describeDbError(error)}`,
   );
 }
 

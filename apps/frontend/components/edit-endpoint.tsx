@@ -12,6 +12,7 @@ import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 
 import { EndpointAccessSection } from "@/components/endpoint-access-section";
+import { EndpointPresentationSection } from "@/components/endpoint-presentation-section";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -675,6 +676,13 @@ export function EditEndpoint({
                 writes through its own mutation rather than this form, so there
                 is nothing for it to do on a record that has no uuid yet. */}
             {endpoint && <EndpointAccessSection endpointUuid={endpoint.uuid} />}
+
+            {/* Presentation (migration 0044): the title and instructions
+                clients receive, and the output-schema trim. Same shape as the
+                Access panel above: its own read and write, admins only. */}
+            {endpoint && (
+              <EndpointPresentationSection endpointUuid={endpoint.uuid} />
+            )}
           </div>
 
           <DialogFooter>
