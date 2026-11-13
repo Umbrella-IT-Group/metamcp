@@ -10,6 +10,7 @@ import {
   decisionCallbacks,
   isDecidableClient,
   refreshClientInventories,
+  registrationSourceKey,
 } from "@/lib/oauth-client-approval";
 
 import {
@@ -279,6 +280,36 @@ describe("decision outcomes", () => {
     });
     expect(clients).toHaveBeenCalledTimes(1);
     expect(tokens).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("client metadata document clients", () => {
+  it("labels the source and offers no decision for a pending one", () => {
+    expect(registrationSourceKey("cimd")).toBe("oauth-clients:sourceCimd");
+    expect(t("oauth-clients:sourceCimd")).toBe("Client metadata document");
+    // Approval is the allowlist entry, not an administrator's click, so the
+    // page never offers Approve or Reject for this source.
+    expect(
+      isDecidableClient({
+        registration_source: "cimd",
+        approval_status: "pending",
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    ["dcr", "oauth-clients:sourceDcr"],
+    ["admin", "oauth-clients:sourceAdmin"],
+    [null, "oauth-clients:sourceLegacy"],
+    ["something-new", "oauth-clients:sourceLegacy"],
+  ])("still labels %j as before", (source, key) => {
+    expect(registrationSourceKey(source)).toBe(key);
+  });
+
+  it.each(LOCALES)("has the source label translated in %s", (locale) => {
+    const label = translatorFor(locale)("oauth-clients:sourceCimd");
+    expect(label).not.toBe("oauth-clients:sourceCimd");
+    expect(label).not.toBe("");
   });
 });
 
