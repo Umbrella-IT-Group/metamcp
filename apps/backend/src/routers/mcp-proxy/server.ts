@@ -42,7 +42,6 @@ import {
   resolveEnvVariables,
 } from "../../lib/metamcp/utils";
 import {
-  getVerifiedCallerServerNames,
   isVerifiedCallerHeaderName,
   withoutVerifiedCallerHeader,
 } from "../../lib/metamcp/verified-caller";
@@ -323,23 +322,23 @@ const INSPECTOR_RESERVED_HEADER =
   "X-Umbrella-User-Id and X-Umbrella-Caller are set by the gateway from the signed-in caller and cannot be supplied as a custom header.";
 
 /**
- * A matched row's stored headers, for merging into an Inspector connection.
+ * A matched row's stored headers, for merging into an Inspector connection:
+ * all of them except X-Umbrella-User-Id and X-Umbrella-Caller (any casing,
+ * surrounding whitespace ignored), whatever the row's name.
  *
- * For a backend named in VERIFIED_CALLER_SERVER_NAMES a stored
- * X-Umbrella-User-Id or X-Umbrella-Caller is dropped: on the pooled path
- * `withVerifiedCaller` strips both from every request, and the Inspector's
- * direct transports do not go through that wrapper, so without this the row
- * would supply a fixed identity here. Every other row's headers are returned
- * exactly as stored.
+ * Identity headers are gateway-set only (`lib/metamcp/verified-caller.ts`).
+ * These direct transports go through the guarded fetch, which adds the
+ * gateway trust header on every internal hop (an MCP_PROXY_URL_ALLOWED_HOSTS
+ * entry included), so a backend that trusts the identity headers beside it
+ * must never see a value someone typed into a server row, whichever row the
+ * connection matched. The pool drops the same names from every row
+ * (`storedHeadersForPool` in `lib/metamcp/client.ts`), and server create,
+ * update and bulk import refuse them, so only rows saved before that refusal
+ * can still hold one.
  */
 const storedHeadersFor = (
   server: DatabaseMcpServer | undefined,
-): Record<string, string> => {
-  const stored = server?.headers || {};
-  return server && getVerifiedCallerServerNames().has(server.name)
-    ? withoutVerifiedCallerHeader(stored)
-    : stored;
-};
+): Record<string, string> => withoutVerifiedCallerHeader(server?.headers || {});
 
 /**
  * Find the registered `mcp_servers` row that describes a REMOTE (SSE or

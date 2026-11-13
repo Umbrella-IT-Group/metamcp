@@ -118,9 +118,10 @@ function namesIdentityHeader(
  *
  * Rows that already store one are not rewritten here. The pooled transport
  * drops the stored copy on every connection (`storedHeadersForPool` in
- * `lib/metamcp/client.ts`); an update that leaves `headers` out keeps it
- * inert, and one that sends it back is refused, so it is removed on the next
- * edit of the row's headers.
+ * `lib/metamcp/client.ts`), and so does the admin Inspector
+ * (`storedHeadersFor` in `routers/mcp-proxy/server.ts`); an update that
+ * leaves `headers` out keeps it inert, and one that sends it back is refused,
+ * so it is removed on the next edit of the row's headers.
  */
 function refuseStoredIdentityHeaders(
   headers: Record<string, string> | undefined,
