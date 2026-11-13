@@ -40,6 +40,7 @@ import {
   getVerifiedCallerFetchForServer,
   VERIFIED_CALLER_HEADER,
   VERIFIED_CALLER_IDENTITY_HEADER,
+  withoutVerifiedCallerHeader,
 } from "./verified-caller";
 
 const sleep = (time: number) =>
@@ -407,6 +408,34 @@ const POOL_GUARD_OPTIONS: McpUrlGuardOptions = Object.freeze({
 const createPoolGuardedFetch = (): FetchLike =>
   createGuardedFetch(POOL_GUARD_OPTIONS);
 
+/**
+ * A remote row's stored headers as a pooled transport sends them: all of them
+ * except `X-Umbrella-User-Id` and `X-Umbrella-Caller` (any casing, surrounding
+ * whitespace ignored), whatever the row's name.
+ *
+ * Identity headers are gateway-set only. A backend that trusts them beside the
+ * gateway trust header must only ever see values the gateway derived from the
+ * authenticated caller, never a value someone typed into a server row, and the
+ * trust header rides every internal hop whichever row the request came from.
+ *
+ * Why the stored copy rather than the fetch: the row's headers are the only
+ * place these names enter a pooled request, and every request reads them from
+ * the object built here (the transport's `requestInit`, and the SSE stream
+ * fetch). Dropping them here leaves both legitimate writers exactly as they
+ * were, later in the chain: `withVerifiedCaller` for a server named in
+ * VERIFIED_CALLER_SERVER_NAMES (it strips again at send time and sets both
+ * from the authenticated caller), and the m365 injection, which deletes and
+ * mints its user id per hop inside the guard (`InternalOnlyCredentials`).
+ *
+ * Rows that already store either header are not rewritten; this drop covers
+ * them on every connection, and `mcpServers.create`, `.update` and
+ * `.bulkImport` refuse the names, so a new value cannot be saved.
+ */
+const storedHeadersForPool = (
+  serverParams: ServerParameters,
+): Record<string, string> =>
+  withoutVerifiedCallerHeader(serverParams.headers || {});
+
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
 ): { client: Client | undefined; transport: Transport | undefined } => {
@@ -463,9 +492,10 @@ export const createMetaMcpClient = (
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
     const transformedUrl = transformDockerUrl(serverParams.url);
 
-    // Build headers: start with custom headers, then add auth header
+    // Build headers: start with the stored headers (minus the gateway-set
+    // identity headers, see storedHeadersForPool), then add auth header
     const headers: Record<string, string> = {
-      ...(serverParams.headers || {}),
+      ...storedHeadersForPool(serverParams),
     };
 
     // Check for authentication - prioritize OAuth tokens, fallback to
@@ -492,7 +522,8 @@ export const createMetaMcpClient = (
     // For a server named in VERIFIED_CALLER_SERVER_NAMES the verified-caller
     // wrapper strips any X-Umbrella-User-Id and X-Umbrella-Caller and sets
     // both from the authenticated caller on tool calls; every other server
-    // gets the guarded fetch itself. See `verified-caller.ts`.
+    // gets the guarded fetch itself (its stored copies of both were already
+    // dropped above). See `verified-caller.ts`.
     const poolFetch = withAssertedActor(
       getVerifiedCallerFetchForServer(
         serverParams.name,
@@ -512,9 +543,10 @@ export const createMetaMcpClient = (
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
     const transformedUrl = transformDockerUrl(serverParams.url);
 
-    // Build headers: start with custom headers, then add auth header
+    // Build headers: start with the stored headers (minus the gateway-set
+    // identity headers, see storedHeadersForPool), then add auth header
     const headers: Record<string, string> = {
-      ...(serverParams.headers || {}),
+      ...storedHeadersForPool(serverParams),
     };
 
     // Check for authentication - prioritize OAuth tokens, fallback to
@@ -555,7 +587,8 @@ export const createMetaMcpClient = (
     // strip any X-Umbrella-User-Id and X-Umbrella-Caller (a stored row header
     // included) and set both from the authenticated caller on requests that
     // can execute a tool.
-    // Every other server gets its fetch back untouched. For a named server
+    // Every other server gets its fetch back untouched; the row's stored
+    // copies of both were already dropped above. For a named server
     // `injectedFetch` is always undefined, because a server in both lists is
     // refused at boot and again here. See `verified-caller.ts`.
     //

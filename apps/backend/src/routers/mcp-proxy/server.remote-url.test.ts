@@ -637,7 +637,8 @@ describe("X-MCP-Actor passthrough — best-effort audit attribution", () => {
  * copy from the request onto the backend connection, so without a refusal it
  * is a path to hand a backend that trusts this header someone else's id. The
  * refusal applies whatever the destination: the m365 backend reads the same
- * header.
+ * header. A matched row's stored copy is dropped the same way, whatever the
+ * row's name.
  */
 describe("X-Umbrella-User-Id cannot be supplied through the Inspector", () => {
   const ORIGINAL_NAMES = process.env.VERIFIED_CALLER_SERVER_NAMES;
@@ -726,34 +727,53 @@ describe("X-Umbrella-User-Id cannot be supplied through the Inspector", () => {
     expect(headers["x-vendor-api-key"]).toBe("team-key");
   });
 
-  it("leaves a value stored on a backend that is not named exactly as it was", async () => {
-    process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
-    findAllAccessibleToUserMock.mockResolvedValue([
-      {
-        uuid: "ffffffff-6666-4666-8666-ffffffffffff",
-        name: "other",
-        type: "SSE",
-        url: "https://other.example.com/sse",
-        headers: { "X-Umbrella-User-Id": "user-stored" },
-        user_id: null,
-        error_status: null,
-      },
-    ]);
+  // Identity headers are gateway-set only, whatever the row's name: the
+  // Inspector's transports carry the gateway trust header to an allowlisted
+  // host, so a row that is not named gets no stored copy through either.
+  it.each([
+    ["SSE", "https://other.example.com/sse"],
+    ["STREAMABLE_HTTP", "https://other.example.com/mcp"],
+  ] as const)(
+    "drops a value stored on a row that is not named, and keeps the rest of the row (%s)",
+    async (transportType, url) => {
+      process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
+      findAllAccessibleToUserMock.mockResolvedValue([
+        {
+          uuid: "ffffffff-6666-4666-8666-ffffffffffff",
+          name: "other",
+          type: transportType,
+          url,
+          headers: {
+            "X-Umbrella-User-Id": "user-stored",
+            "x-vendor-api-key": "other-key",
+          },
+          user_id: null,
+          error_status: null,
+        },
+      ]);
 
-    await getSse({
-      transportType: "SSE",
-      url: "https://other.example.com/sse",
-    });
+      await (transportType === "SSE" ? getSse : postMcp)({
+        transportType,
+        url,
+      });
 
-    expect(sseHeaders()["X-Umbrella-User-Id"]).toBe("user-stored");
-  });
+      const built =
+        transportType === "SSE"
+          ? sseClientConstructions
+          : streamableClientConstructions;
+      expect(built).toHaveLength(1);
+      const headers = built[0].opts.requestInit.headers;
+      expect(JSON.stringify(headers)).not.toContain("user-stored");
+      expect(headers["x-vendor-api-key"]).toBe("other-key");
+    },
+  );
 });
 
 /**
  * `X-Umbrella-Caller` is set by the gateway beside `X-Umbrella-User-Id`, from
  * the same verified caller, and carries the credential as well as the user.
- * The Inspector reserves it, drops it from a named backend's stored row, and
- * never forwards a copy the browser sent.
+ * The Inspector reserves it, drops it from every row's stored headers
+ * whatever the row's name, and never forwards a copy the browser sent.
  */
 describe("X-Umbrella-Caller cannot be supplied through the Inspector", () => {
   const ORIGINAL_NAMES = process.env.VERIFIED_CALLER_SERVER_NAMES;
@@ -865,25 +885,42 @@ describe("X-Umbrella-Caller cannot be supplied through the Inspector", () => {
     expect(headers["x-vendor-api-key"]).toBe("team-key");
   });
 
-  it("leaves a value stored on a backend that is not named exactly as it was", async () => {
-    process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
-    findAllAccessibleToUserMock.mockResolvedValue([
-      {
-        uuid: "ffffffff-6666-4666-8666-ffffffffffff",
-        name: "other",
-        type: "SSE",
-        url: "https://other.example.com/sse",
-        headers: { "X-Umbrella-Caller": "v1.stored" },
-        user_id: null,
-        error_status: null,
-      },
-    ]);
+  it.each([
+    ["SSE", "https://other.example.com/sse"],
+    ["STREAMABLE_HTTP", "https://other.example.com/mcp"],
+  ] as const)(
+    "drops a value stored on a row that is not named, and keeps the rest of the row (%s)",
+    async (transportType, url) => {
+      process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
+      findAllAccessibleToUserMock.mockResolvedValue([
+        {
+          uuid: "ffffffff-6666-4666-8666-ffffffffffff",
+          name: "other",
+          type: transportType,
+          url,
+          headers: {
+            "X-Umbrella-Caller": "v1.stored",
+            "x-umbrella-caller": "v1.stored-lower",
+            "x-vendor-api-key": "other-key",
+          },
+          user_id: null,
+          error_status: null,
+        },
+      ]);
 
-    await getSse({
-      transportType: "SSE",
-      url: "https://other.example.com/sse",
-    });
+      await (transportType === "SSE" ? getSse : postMcp)({
+        transportType,
+        url,
+      });
 
-    expect(sseHeaders()["X-Umbrella-Caller"]).toBe("v1.stored");
-  });
+      const built =
+        transportType === "SSE"
+          ? sseClientConstructions
+          : streamableClientConstructions;
+      expect(built).toHaveLength(1);
+      const headers = built[0].opts.requestInit.headers;
+      expect(JSON.stringify(headers)).not.toContain("v1.stored");
+      expect(headers["x-vendor-api-key"]).toBe("other-key");
+    },
+  );
 });
