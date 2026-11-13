@@ -127,9 +127,8 @@ export function backendErrorForLogging(error: unknown): unknown {
 /**
  * The same value as text, for a log line that quotes the failure inline (the
  * "envelope" of a recovery WARN) instead of passing the error as a log
- * argument. The lost-connection detectors match their markers anywhere in the
- * message, so a refusal whose body happens to mention one is retried and its
- * line is built: this keeps the body out of that line too.
+ * argument. Keep the same redaction at either kind of sink; callers must
+ * classify refusals before running body-text connection-loss detectors.
  */
 export function backendErrorTextForLogging(error: unknown): string {
   const safe = backendErrorForLogging(error);

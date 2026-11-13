@@ -115,6 +115,7 @@ vi.mock("./tool-call-warmup", () => ({
 }));
 
 import { metamcpLogStore } from "./log-store";
+import { mcpServerPool } from "./mcp-server-pool";
 import { createServer } from "./metamcp-proxy";
 import { resetToolsListTruncationReportsForTesting } from "./paginate-tools-list";
 import { toolsSyncCache } from "./tools-sync-cache";
@@ -204,6 +205,7 @@ const CYCLE: Pages = {
 beforeEach(() => {
   toolsSyncCache.clear();
   getSessionMock.mockReset();
+  vi.mocked(mcpServerPool.invalidateServerConnection).mockClear();
   syncToolsMock.mockReset();
   syncToolsMock.mockResolvedValue({ upserted: [], deleted: [] });
   resetToolsListTruncationReportsForTesting();
@@ -436,10 +438,8 @@ describe("a refusal met while recovering or acquiring a session", () => {
     );
 
   it.each([401, 403] as const)(
-    "keeps the HTTP %s body out of the lookup's recovery line when the body reads as a lost connection",
+    "does not recover a lookup's HTTP %s refusal when its body reads as a lost connection",
     async (status) => {
-      // The lost-connection detector matches body text, so a refusal quoting
-      // "Not connected" is retried, and the retry line used to quote the body.
       const target = await makeHttpRefusingBackend([status], {
         body: `Not connected ${body}`,
       });
@@ -450,19 +450,43 @@ describe("a refusal met while recovering or acquiring a session", () => {
       const error = await callError(await consumer(), "ninja__z");
 
       expect(error.message).toContain("tool_lookup_failed");
-      // The recovery ran, so the line under test was built.
-      expect(target.requests).toEqual(["tools/list", "tools/list"]);
+      expect(target.requests).toEqual(["tools/list"]);
+      expect(getSessionMock).toHaveBeenCalledTimes(1);
+      expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
       expect(logged()).toContain(`HTTP ${status}`);
       expect(logged()).not.toContain(body);
+      expect(logged().toLowerCase()).not.toContain("connection lost");
+    },
+  );
+
+  it.each([401, 403] as const)(
+    "does not recover a listing's HTTP %s refusal when its body quotes session-loss markers",
+    async (status) => {
+      const target = await makeHttpRefusingBackend([status], {
+        body: `HTTP 404 Session not found ${body}`,
+      });
+      cleanups.push(() => target.close());
+      getSessionMock.mockResolvedValue(target.session);
+      allLogs().forEach((fn) => fn.mockClear());
+
+      await expect(listNames(await consumer())).rejects.toThrow(
+        "tools/list could not reach",
+      );
+
+      expect(target.requests).toEqual(["tools/list"]);
+      expect(getSessionMock).toHaveBeenCalledTimes(1);
+      expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
+      expect(logged()).toContain(`HTTP ${status}`);
+      expect(logged()).not.toContain(body);
+      expect(logged().toLowerCase()).not.toContain("connection lost");
     },
   );
 
   it.each([401, 403] as const)(
     "keeps the HTTP %s body out of the log when re-acquiring the session rejects with it",
     async (status) => {
-      const target = await makeHttpRefusingBackend([status], {
-        body: `Not connected ${body}`,
-      });
+      // Recover a genuine session loss, then refuse the new handshake.
+      const target = await makeHttpRefusingBackend([404]);
       cleanups.push(() => target.close());
       getSessionMock
         .mockResolvedValueOnce(target.session)
@@ -472,6 +496,9 @@ describe("a refusal met while recovering or acquiring a session", () => {
       const error = await callError(await consumer(), "ninja__z");
 
       expect(error.message).toContain("no_session");
+      expect(target.requests).toEqual(["tools/list"]);
+      expect(getSessionMock).toHaveBeenCalledTimes(2);
+      expect(mcpServerPool.invalidateServerConnection).toHaveBeenCalledTimes(1);
       expect(logged()).toContain(`HTTP ${status}`);
       expect(logged()).not.toContain(body);
     },

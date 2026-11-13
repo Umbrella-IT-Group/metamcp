@@ -166,7 +166,7 @@ export function createProgressRelay(
         }
       } finally {
         // Closed with or without a timeout, so a late or queued item is
-        // dropped and nothing is written after the result.
+        // dropped. A send already in flight can still finish after the result.
         closed = true;
         queue = [];
       }

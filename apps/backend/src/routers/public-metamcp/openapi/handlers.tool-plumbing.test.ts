@@ -82,6 +82,7 @@ vi.mock(
 import logger from "@/utils/logger";
 
 import { metamcpLogStore } from "../../../lib/metamcp/log-store";
+import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
 import { resetToolsListTruncationReportsForTesting } from "../../../lib/metamcp/paginate-tools-list";
 import {
   createOriginalCallToolHandler,
@@ -157,6 +158,7 @@ async function pagedBackend(
 
 beforeEach(() => {
   getSessionMock.mockReset();
+  vi.mocked(mcpServerPool.invalidateServerConnection).mockClear();
   config.timeoutMs = 60_000;
   config.maxTotalMs = 600_000;
   config.resetOnProgress = true;
@@ -360,12 +362,10 @@ describe("OpenAPI bridge refused listing logs", () => {
   );
 });
 
-describe("OpenAPI bridge listing recovery line for a refusal", () => {
+describe("OpenAPI bridge does not recover a refused listing", () => {
   it.each([401, 403] as const)(
-    "keeps the HTTP %s body out of the recovery WARN when the body reads as a lost connection",
+    "does not invalidate or retry HTTP %s when the body reads as a lost connection",
     async (status) => {
-      // The lost-connection detector matches body text, so a refusal quoting
-      // "Not connected" is retried, and the retry line used to quote the body.
       const made = await makeHttpRefusingBackend([status], {
         serverName: "autotask",
         body: `Not connected ${BODY_SECRET}`,
@@ -383,14 +383,16 @@ describe("OpenAPI bridge listing recovery line for a refusal", () => {
       );
 
       expect(result.tools).toEqual([]);
-      // The recovery ran (a second request), so the line under test was built.
-      expect(made.requests).toHaveLength(2);
+      expect(made.requests).toEqual(["tools/list"]);
+      expect(getSessionMock).toHaveBeenCalledTimes(1);
+      expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
       const messages = inspect(
         logs.flatMap((fn) => fn.mock.calls),
         { depth: null },
       );
       expect(messages).toContain(`HTTP ${status}`);
       expect(messages).not.toContain(BODY_SECRET);
+      expect(messages.toLowerCase()).not.toContain("connection lost");
     },
   );
 });

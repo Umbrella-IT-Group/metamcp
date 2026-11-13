@@ -20,6 +20,7 @@ import {
 import {
   backendErrorForLogging,
   backendErrorTextForLogging,
+  classifyBackendAuthRejection,
 } from "../../../lib/metamcp/backend-auth-rejection";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
@@ -192,7 +193,13 @@ export const createOriginalListToolsHandler = (
           try {
             result = await listOnce(activeSession);
           } catch (error) {
-            if (audit || !isRecoverableBackendError(error)) {
+            // The HTTP refusal takes precedence over connection-loss markers
+            // quoted in its body: it does not justify invalidation or replay.
+            if (
+              audit ||
+              classifyBackendAuthRejection(error) ||
+              !isRecoverableBackendError(error)
+            ) {
               throw error;
             }
             // Regression mirror — the OpenAPI tools/list

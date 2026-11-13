@@ -154,31 +154,54 @@ describe("requestWithSessionRecovery", () => {
   });
 });
 
-describe("requestWithSessionRecovery envelope line for a backend refusal", () => {
-  // A refusal whose body happens to read as a lost connection is still
-  // recoverable (the detector matches the body text), so the recovery runs and
-  // its WARN quotes the failure. The status stays, the backend's text does not.
+describe("requestWithSessionRecovery does not recover a backend refusal", () => {
+  // A transport-shaped refusal is an answer to this request, even if the
+  // body quotes the substring markers used by the lost-connection detectors.
   const BODY_SECRET = "backend-body-text-that-must-not-be-logged";
-  const refusal = (status: number, body: string) =>
-    new StreamableHTTPError(status, `Error POSTing to endpoint: ${body}`);
+  const refusals = [401, 403].flatMap((status) => [
+    {
+      status,
+      via: "Streamable HTTP",
+      error: new StreamableHTTPError(
+        status,
+        `Error POSTing to endpoint: Not connected ${BODY_SECRET}`,
+      ),
+    },
+    {
+      status,
+      via: "a wrapped SSE POST",
+      error: new Error("request failed", {
+        cause: new Error(
+          `Error POSTing to endpoint (HTTP ${status}): HTTP 404 Session not found ${BODY_SECRET}`,
+        ),
+      }),
+    },
+  ]);
 
-  it.each([401, 403] as const)(
-    "names HTTP %s and keeps the response body out of the line",
-    async (status) => {
+  it.each(refusals)(
+    "does not invalidate or retry HTTP $status via $via, or report a lost connection",
+    async ({ error }) => {
       const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+      const pool = makePool(makeSession("fresh"));
+      const onFreshSession = vi.fn();
       const attempt = vi
         .fn()
-        .mockRejectedValueOnce(refusal(status, `Not connected ${BODY_SECRET}`))
+        .mockRejectedValueOnce(error)
         .mockResolvedValueOnce(["tool-a"]);
 
-      await requestWithSessionRecovery({
-        ...baseOpts(makePool(makeSession("fresh")), makeSession("stale")),
-        attempt,
-      });
+      await expect(
+        requestWithSessionRecovery({
+          ...baseOpts(pool, makeSession("stale")),
+          attempt,
+          onFreshSession,
+        }),
+      ).rejects.toBe(error);
 
-      expect(attempt).toHaveBeenCalledTimes(2);
-      expect(inspect(warn.mock.calls)).toContain(`HTTP ${status}`);
-      expect(inspect(warn.mock.calls)).not.toContain(BODY_SECRET);
+      expect(attempt).toHaveBeenCalledTimes(1);
+      expect(pool.invalidateServerConnection).not.toHaveBeenCalled();
+      expect(pool.getSession).not.toHaveBeenCalled();
+      expect(onFreshSession).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
       warn.mockRestore();
     },
   );

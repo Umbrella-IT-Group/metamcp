@@ -2,7 +2,10 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
-import { backendErrorTextForLogging } from "./backend-auth-rejection";
+import {
+  backendErrorTextForLogging,
+  classifyBackendAuthRejection,
+} from "./backend-auth-rejection";
 import { ConnectedClient } from "./client";
 import { isRecoverableBackendError } from "./session-error";
 
@@ -78,7 +81,12 @@ export async function requestWithSessionRecovery<T>(
   try {
     return await opts.attempt(opts.session);
   } catch (error) {
-    if (!isRecoverableBackendError(error)) {
+    // An HTTP refusal answers this request. Its body can quote the legacy
+    // session/transport-loss markers without proving the connection is dead.
+    if (
+      classifyBackendAuthRejection(error) ||
+      !isRecoverableBackendError(error)
+    ) {
       throw error;
     }
 

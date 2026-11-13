@@ -1093,7 +1093,12 @@ export const createServer = async (
     try {
       collected = await listToolPages(activeSession);
     } catch (error) {
-      if (!isRecoverableBackendError(error)) {
+      // A refusal is an answer, even if its body quotes a connection-loss
+      // marker. Do not retire a shared session or retry that request for it.
+      if (
+        classifyBackendAuthRejection(error) ||
+        !isRecoverableBackendError(error)
+      ) {
         const safeError = backendErrorForLogging(error);
         logger.warn(
           `Tool lookup on server ${candidate.uuid} failed while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool. (${
