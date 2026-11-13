@@ -17,4 +17,3 @@ server-sse-polling	WARNING	server-sse-retry-field	cef50c678aecf30c	9d915d55e16f9
 tools-call-elicitation	FAILURE	tools-call-elicitation	07c1f6f0b6e21a3b	621efd3716f2488a	Server did not request elicitation from client
 tools-call-sampling	FAILURE	tools-call-sampling	fe06d32f8130daef	273c373cb181b529	Server did not request sampling from client
 tools-call-with-logging	FAILURE	tools-call-with-logging	6101c6c61baa769c	-	Failed: MCP error -32601: Method not found
-tools-call-with-progress	FAILURE	tools-call-with-progress	e0aab0451cf22d7e	993d57648db40b2d	No progress notifications received

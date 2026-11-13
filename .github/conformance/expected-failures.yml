@@ -1,10 +1,13 @@
-# Expected failures for the MCP conformance job (PROVISIONAL: see below).
+# Expected failures for the MCP conformance job.
 # Runner: @modelcontextprotocol/conformance 0.1.16 (it resolves SDK 1.32.2 from
 # package-lock.json), spec 2025-11-25, server mode, suite all.
-# Calibrated against the umbrella branch at the commit this file was added.
-# FINAL calibration waits for the progress-relay and Origin-policy work to merge,
-# then this file and expected-checks.txt are regenerated on that integrated
-# head. Bump the runner by hand, quarterly: a new runner adds scenarios.
+# Calibrated on the umbrella branch after the progress relay (tools-call-with-progress
+# now passes and is not listed) and the Origin policy (default `audit`) merged.
+# To recalibrate: run the job once, delete the lines the runner reports as stale,
+# add a reason-bearing line for a deliberate new gap, then regenerate
+# expected-checks.txt with CONFORMANCE_UPDATE_SNAPSHOT=1 (never by hand) and
+# confirm three clean runs. Bump the runner by hand, quarterly: a new runner adds
+# scenarios.
 #
 # This runner matches by scenario name only and counts a WARNING as a failure.
 # A listed scenario that now passes makes the run exit 1: delete the line and its
@@ -33,6 +36,5 @@ server:
   - elicitation-sep1034-defaults  # a backend cannot elicit through the gateway
   - elicitation-sep1330-enums     # a backend cannot elicit through the gateway
   # Known gaps and features not built.
-  - tools-call-with-progress      # known gap: backend progress is dropped at the gateway; flips when passthrough ships
   - server-sse-polling            # no priming event: the gateway has no event store (SEP-1699); the fixture also lacks test_reconnection, so this cannot flip until both exist
-  - dns-rebinding-protection      # no Host or Origin validation on the data plane (SDK hostHeaderValidation not mounted)
+  - dns-rebinding-protection      # an invalid Origin still gets 200: MCP_ORIGIN_POLICY defaults to audit (serve and record), and Host is not validated

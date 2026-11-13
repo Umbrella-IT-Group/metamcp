@@ -22,10 +22,9 @@ name: Umbrella MCP Conformance (umbrella branch)
 # REASON CHANGED or LEAK (run.sh explains each).
 #
 # Owner: the gateway maintainers, who also own the weekly cron and the
-# quarterly runner bump. The baseline is currently
-# provisional: it is calibrated against the umbrella branch as of the PR that
-# added it, and is regenerated once the progress-relay and Origin-policy work
-# have merged (expected-failures.yml says the same).
+# quarterly runner bump. The baseline is calibrated on the umbrella branch with
+# the progress relay and the Origin policy merged (expected-failures.yml says
+# how to recalibrate).
 #
 # Cost: this repository is public, so the minutes are free; if it ever goes
 # private, budget about 3 minutes per run (an estimate, to be measured).
