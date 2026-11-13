@@ -1,5 +1,7 @@
 import type express from "express";
 
+import logger from "@/utils/logger";
+
 import { auditRequestContext, emit } from "../lib/audit/audit-emitter";
 import { metamcpLogStore } from "../lib/metamcp/log-store";
 import {
@@ -154,19 +156,28 @@ function recordRefusal(
   eventClass: OriginEventClass,
   status: number,
 ): void {
-  try {
-    const key = originReportKey({
-      mode,
-      described: snapshot.described,
-      route: snapshot.route,
-      method: snapshot.method,
-      eventClass,
-      credentialPresent: snapshot.credentialPresent,
-    });
+  const key = originReportKey({
+    mode,
+    described: snapshot.described,
+    route: snapshot.route,
+    method: snapshot.method,
+    eventClass,
+    credentialPresent: snapshot.credentialPresent,
+  });
 
+  try {
+    // OPTIONS is answered without authentication, including when the caller
+    // adds a fake credential header. Its 200 must not spend the reserve that
+    // protects evidence of clients actually served by a data-plane handler.
+    // Nor may "other" routes: Express also serves non-exempt spellings of
+    // liveness paths (such as /HEALTH and /health/sessions/) without auth.
     const event = decideOriginReport(
       key,
-      eventClass === "served" ? "served" : "other",
+      eventClass === "served" &&
+        snapshot.method !== "OPTIONS" &&
+        snapshot.route !== "other"
+        ? "served"
+        : "other",
     );
     if (event.report) {
       metamcpLogStore.record({
@@ -188,9 +199,17 @@ function recordRefusal(
         }),
       });
     }
+  } catch {
+    reportRecordingFailure("event");
+  }
 
-    if (mode !== "enforce") return;
+  if (mode !== "enforce") return;
 
+  // The two sinks are independent: losing an activity event must not skip
+  // the security audit row as well. Their existing limits bound diagnostics
+  // too, and neither a failure nor its exception text may change the response
+  // or expose caller-controlled data in a log.
+  try {
     const audit = decideAuditRow(key);
     if (!audit.report) return;
 
@@ -223,7 +242,20 @@ function recordRefusal(
       },
     });
   } catch {
-    // A recording failure must never change what this guard answers.
+    reportRecordingFailure("audit");
+  }
+}
+
+function reportRecordingFailure(
+  stage: "event" | "audit" | "response-head",
+): void {
+  const message = `[origin-policy] ${stage} recording failed (request unaffected).`;
+  try {
+    logger.warn(message);
+  } catch {
+    // A broken logger can itself be why the event failed. Keep the diagnostic
+    // visible through the console without retrying that same broken sink.
+    console.warn(message);
   }
 }
 
@@ -245,7 +277,7 @@ function recordRefusal(
  * default).
  *
  * Transparent: the original is called with the unchanged arguments and `this`,
- * and a throw from `fn` is swallowed.
+ * and a throw from `fn` is reported without changing the response.
  */
 export function onceAtResponseHead(
   res: express.Response,
@@ -266,7 +298,7 @@ export function onceAtResponseHead(
       try {
         fn(statusFromWriteHeadArgs(args[0], this.statusCode));
       } catch {
-        // See the header: recording must not change the response.
+        reportRecordingFailure("response-head");
       }
     }
     return original.apply(this, args);

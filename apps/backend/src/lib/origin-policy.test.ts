@@ -108,6 +108,10 @@ describe("evaluateOrigin", () => {
       "two origins in one header",
       "https://gateway.example.test, https://partner.example.test",
     ],
+    ["two origins after a path", `${APP}/path, ${EXTRA}`],
+    ["two origins after a query", `${APP}/?q=1, ${EXTRA}`],
+    ["two origins after a fragment", `${APP}/#fragment, ${EXTRA}`],
+    ["a space-separated origin list after a path", `${APP}/path ${EXTRA}`],
     [
       "another port of an MCP_ALLOWED_ORIGINS entry",
       "https://connector.example.test:8080",

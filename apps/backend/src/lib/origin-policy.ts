@@ -152,8 +152,9 @@ export type OriginEvaluation =
  * do not matter and `https://trusted.example.evil.example`,
  * `https://trusted.example@evil.example` and a different port or scheme do not
  * match. The literal `null` (sandboxed iframes, `file:`, privacy redirects),
- * non-http(s) schemes and a multi-value header (Node joins duplicates with
- * ", ", which no URL parser accepts) are refused.
+ * non-http(s) schemes and a multi-value header are refused before URL parsing:
+ * Node joins duplicate fields with ", ", and WHATWG accepts that delimiter
+ * after a path, query or fragment instead of rejecting the extra origin.
  *
  * Empty or whitespace-only counts as absent: a browser never sends an empty
  * Origin, so only a hand-built client does, and it is no more a rebinding page
@@ -165,11 +166,18 @@ export function evaluateOrigin(header: unknown): OriginEvaluation {
     if (typeof header !== "string") {
       return { kind: "refused", described: UNPARSEABLE_ORIGIN };
     }
-    if (header.trim() === "") return { kind: "absent" };
+    const text = header.trim();
+    if (text === "") return { kind: "absent" };
+    // An Origin is one value. Reject both comma-joined duplicate fields and
+    // space-separated lists before a permissive URL parser can discard them
+    // as part of a trusted URL's path, query or fragment.
+    if (/[\s,]/.test(text)) {
+      return { kind: "refused", described: UNPARSEABLE_ORIGIN };
+    }
 
-    if (resolveTrustedOrigin(header) !== null) return { kind: "allowed" };
+    if (resolveTrustedOrigin(text) !== null) return { kind: "allowed" };
 
-    const candidate = normalizeOrigin(header);
+    const candidate = normalizeOrigin(text);
     if (candidate !== null && allowedOriginEntries().origins.has(candidate)) {
       return { kind: "allowed" };
     }
@@ -375,10 +383,12 @@ export const ORIGIN_REFUSAL_BODY = Object.freeze({
  *    that key, so "once" and "40,000 times in a minute" stay distinguishable.
  *  - PER HOUR, PER BUCKET. At most 60 event records per fixed hour. Events go
  *    into one of two buckets so a flood cannot hide the one that matters: the
- *    `served` bucket holds only events for requests that were answered below
- *    400 (those are the evidence that a legitimate caller would be refused),
- *    and the `other` bucket holds everything else. A flood without a valid
- *    credential is answered 401, so it can only fill `other`.
+ *    `served` bucket holds events for non-OPTIONS data-plane requests answered
+ *    below 400 (evidence that a legitimate caller would be refused), and
+ *    `other` holds everything else. Failed authentication answers 401;
+ *    OPTIONS and liveness routes answer without authentication even with a
+ *    forged credential header. These must use `other` so an anonymous flood
+ *    cannot consume the served reserve on authenticated endpoints.
  *  - AUDIT ROWS. `audit_log` is append-only with no prune path, so its rows get
  *    a much lower ceiling (20 an hour) and their own key map and counts.
  *

@@ -595,12 +595,94 @@ describe("enforce", () => {
     ["a longer host", "https://gateway.example.test.evil.example"],
     ["a userinfo lookalike", "https://gateway.example.test@evil.example"],
     ["two origins", `${APP_ORIGIN}, ${EXTRA_ORIGIN}`],
+    ["two origins after a path", `${APP_ORIGIN}/path, ${EXTRA_ORIGIN}`],
+    [
+      "a space-separated origin list after a path",
+      `${APP_ORIGIN}/path ${EXTRA_ORIGIN}`,
+    ],
   ])("refuses %s", async (_label, origin) => {
     const response = await mcp("POST", { origin });
 
     expect(response.status).toBe(403);
     expect(handlerCalls()).toBe(0);
   });
+});
+
+describe("recording failures", () => {
+  it("reports a synchronous audit failure without changing the refusal or losing its event", async () => {
+    vi.stubEnv("MCP_ORIGIN_POLICY", "enforce");
+    await startApp();
+    const auditEmitter = await import("../lib/audit/audit-emitter");
+    const emit = vi.spyOn(auditEmitter, "emit").mockImplementation(() => {
+      throw new Error("SECRET audit failure");
+    });
+
+    try {
+      const response = await mcp("POST", { origin: untrusted(17) });
+
+      expect(response.status).toBe(403);
+      expect(response.body).toBe(ENFORCE_REFUSAL_BODY);
+      expect(originEvents()).toHaveLength(1);
+      expect(h.logger.warn).toHaveBeenCalledWith(
+        "[origin-policy] audit recording failed (request unaffected).",
+      );
+      expect(JSON.stringify(h.logger.warn.mock.calls)).not.toContain("SECRET");
+    } finally {
+      emit.mockRestore();
+    }
+  });
+
+  it("uses the console when the logger fails and still writes the audit row", async () => {
+    vi.stubEnv("MCP_ORIGIN_POLICY", "enforce");
+    await startApp();
+    h.logger.warn.mockImplementation(() => {
+      throw new Error("SECRET logger failure");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const response = await mcp("POST", { origin: untrusted(18) });
+
+      expect(response.status).toBe(403);
+      expect(originAudits()).toHaveLength(1);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        "[origin-policy] event recording failed (request unaffected).",
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("SECRET");
+    } finally {
+      h.logger.warn.mockReset();
+      warn.mockRestore();
+    }
+  });
+
+  it.each(["audit", "enforce"])(
+    "reports an event recording failure without changing the %s response or skipping its audit row",
+    async (mode) => {
+      vi.stubEnv("MCP_ORIGIN_POLICY", mode);
+      await startApp();
+      const { metamcpLogStore } = await import("../lib/metamcp/log-store");
+      const record = vi
+        .spyOn(metamcpLogStore, "record")
+        .mockImplementation(() => {
+          throw new Error("SECRET recording failure");
+        });
+
+      try {
+        const response = await mcp("POST", { origin: untrusted(19) });
+
+        expect(response.status).toBe(mode === "enforce" ? 403 : 200);
+        expect(h.logger.warn).toHaveBeenCalledWith(
+          "[origin-policy] event recording failed (request unaffected).",
+        );
+        expect(originAudits()).toHaveLength(mode === "enforce" ? 1 : 0);
+        expect(JSON.stringify(h.logger.warn.mock.calls)).not.toContain(
+          "SECRET",
+        );
+      } finally {
+        record.mockRestore();
+      }
+    },
+  );
 });
 
 describe("other mounts are exempt by construction", () => {
@@ -673,6 +755,62 @@ describe("volume bounds", () => {
     beforeEach(async () => {
       await startApp();
     });
+
+    it.each(["/metamcp/HEALTH", "/metamcp/health/sessions/"])(
+      "keeps the served-client reserve available after a flood on %s",
+      async (route) => {
+        // These are real Express liveness matches but are not exact-path
+        // exemptions. Their unauthenticated 200s belong with other noise.
+        for (let i = 0; i < 60; i += 1) {
+          const response = await send("GET", route, {
+            origin: untrusted(4000 + i),
+          });
+          expect(response.status).toBe(200);
+        }
+        expect(originEvents()).toHaveLength(60);
+
+        await mcp("POST", {
+          origin: untrusted(4999),
+          headers: { "x-api-key": "k" },
+        });
+
+        expect(originEvents()).toHaveLength(61);
+        expect(originEvents()[60].message).toContain(
+          "served (200), credential present",
+        );
+      },
+    );
+
+    it.each([
+      ["without a credential header", {}],
+      ["with a caller-supplied credential header", { "x-api-key": "fake" }],
+    ])(
+      "keeps the served-client reserve available after a preflight flood %s",
+      async (_label, headers) => {
+        // Express answers OPTIONS without running authentication. Even a
+        // forged credential header must not let these fill the reserve for
+        // requests that were actually served by a data-plane handler.
+        for (let i = 0; i < 60; i += 1) {
+          const response = await mcp("OPTIONS", {
+            origin: untrusted(3000 + i),
+            headers: { ...headers, "Access-Control-Request-Method": "POST" },
+          });
+          expect(response.status).toBe(200);
+        }
+        expect(handlerCalls()).toBe(0);
+        expect(originEvents()).toHaveLength(60);
+
+        await mcp("POST", {
+          origin: untrusted(3999),
+          headers: { "x-api-key": "k" },
+        });
+
+        expect(originEvents()).toHaveLength(61);
+        expect(originEvents()[60].message).toContain(
+          "served (200), credential present",
+        );
+      },
+    );
 
     it("collapses one origin's repeats to one event a minute and carries the count", async () => {
       const origin = untrusted(50);
