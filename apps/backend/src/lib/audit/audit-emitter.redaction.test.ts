@@ -15,6 +15,8 @@
 import { format } from "node:util";
 
 import { DrizzleQueryError } from "drizzle-orm/errors";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { jsonb, pgTable } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { loggerMock } = vi.hoisted(() => ({
@@ -132,7 +134,7 @@ describe("audit write failure report", () => {
     expect(logged).toContain("22001");
   });
 
-  it("keeps a connection failure's own message, which is the diagnosis", async () => {
+  it("keeps a connection failure diagnosable by its errno code", async () => {
     setAuditSinkForTesting(async () => {
       throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), {
         code: "ECONNREFUSED",
@@ -148,6 +150,31 @@ describe("audit write failure report", () => {
 
     const logged = loggedText();
     expect(logged).toContain("code=ECONNREFUSED");
-    expect(logged).toContain("connect ECONNREFUSED 127.0.0.1:5432");
+    // SPEC: arbitrary messages can hold row data even without query metadata.
+    // The errno diagnoses this failure without trusting its message.
+    expect(logged).not.toContain("connect ECONNREFUSED 127.0.0.1:5432");
+  });
+
+  it("does not log detail keys when Drizzle's JSON encoder fails before querying", async () => {
+    const table = pgTable("audit_probe", { detail: jsonb("detail") });
+    const detail: Record<string, unknown> = {};
+    detail[SECRET] = detail;
+    setAuditSinkForTesting(async (event) => {
+      // Real Drizzle encoding, with no connection or database needed. This
+      // throws a plain TypeError whose message quotes the circular key.
+      drizzle.mock().insert(table).values({ detail: event.detail }).toSQL();
+    });
+
+    emit({
+      actor_type: "user",
+      action: "endpoint.presentation.set",
+      outcome: "success",
+      detail,
+    });
+    await flush();
+
+    expect(loggerMock.warn).toHaveBeenCalledTimes(1);
+    expect(loggedText()).toContain("TypeError");
+    expect(loggedText()).not.toContain(SECRET);
   });
 });

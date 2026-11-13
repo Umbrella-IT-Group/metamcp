@@ -227,7 +227,7 @@ export const endpointPresentationImplementations = {
       };
     } catch (error) {
       // Drizzle errors include bound values in their message and params, so
-      // only the error class and the database's own identifiers are logged:
+      // only a log-safe summary is logged:
       // the failure stays diagnosable without copying administrator text.
       logger.error(
         `Error saving endpoint presentation: ${describeDbError(error)}`,
