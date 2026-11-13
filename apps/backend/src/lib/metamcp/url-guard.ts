@@ -493,6 +493,13 @@ export interface McpUrlGuardOptions {
   /** Transport seam for `createGuardedFetch`. Production uses undici's fetch. */
   baseFetch?: PinnedFetch;
   /**
+   * Optional positive-integer bound for cached pinned agents. A process-wide
+   * fetcher can see indefinitely many DNS address sets, even for one URL;
+   * evict its least-recently-used agent with a graceful close so active
+   * responses finish. Omitted keeps existing transport lifetimes unchanged.
+   */
+  maxPinnedAgents?: number;
+  /**
    * The ONE origin at which an allowlist entry may apply — the URL the
    * operator typed, already validated by the route. Every other destination
    * this fetch is asked for (a redirect target, the SSE back-channel endpoint
@@ -1197,9 +1204,17 @@ export const createGuardedFetch = (
     headersTimeout: timeoutMs,
     bodyTimeout: timeoutMs,
   };
+  const agentLimit = options.maxPinnedAgents;
+  if (
+    agentLimit !== undefined &&
+    (!Number.isInteger(agentLimit) || agentLimit < 1)
+  ) {
+    throw new Error("maxPinnedAgents must be a positive integer");
+  }
 
   /**
-   * One dispatcher per validated address set, for the life of this transport.
+   * One dispatcher per cached validated address set, for the life of this
+   * transport unless `maxPinnedAgents` evicts it.
    * Rebuilding an Agent per request would throw away connection reuse, which
    * on the streamable-HTTP transport is a TLS handshake for every JSON-RPC
    * message. Keyed by the addresses, so a host that legitimately moves gets a
@@ -1213,7 +1228,19 @@ export const createGuardedFetch = (
     let agent = agents.get(key);
     if (!agent) {
       agent = createPinnedAgent(addresses, timeouts);
-      agents.set(key, agent);
+    }
+    // A hit becomes most recent too: a DNS answer that alternates between
+    // common pins should retain their pools instead of evicting a hot one.
+    agents.delete(key);
+    agents.set(key, agent);
+    if (agentLimit !== undefined && agents.size > agentLimit) {
+      const oldest = agents.entries().next().value;
+      if (oldest) {
+        agents.delete(oldest[0]);
+        void oldest[1].close().catch((error: unknown) => {
+          logger.warn("MCP proxy pinned agent could not be closed:", error);
+        });
+      }
     }
     return agent;
   };

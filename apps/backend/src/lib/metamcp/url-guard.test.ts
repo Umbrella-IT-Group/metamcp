@@ -11,6 +11,7 @@
  * a validator can be perfectly correct and still be wired to nothing.
  */
 
+import type { Agent } from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/logger", () => ({
@@ -765,6 +766,59 @@ describe("createGuardedFetch — the connection is pinned to the validated addre
     expect(lookup).toHaveBeenCalledTimes(1);
     expect(dispatchers[0]).toBeDefined();
   });
+
+  it("bounds an opted-in dispatcher cache, reuses recent pins and closes the evicted agent", async () => {
+    const dispatchers: Agent[] = [];
+    const baseFetch = vi.fn(
+      async (_url: URL, _init: RequestInit, dispatcher?: Agent) => {
+        if (!dispatcher) throw new Error("expected a pinned dispatcher");
+        dispatchers.push(dispatcher);
+        return new Response(null, { status: 200 });
+      },
+    );
+    const lookup = vi
+      .fn()
+      .mockResolvedValueOnce([PUBLIC_V4])
+      .mockResolvedValueOnce(["1.1.1.1"])
+      .mockResolvedValueOnce([PUBLIC_V4])
+      .mockResolvedValueOnce(["8.8.8.8"])
+      .mockResolvedValueOnce(["1.1.1.1"]);
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup,
+      maxPinnedAgents: 2,
+    });
+
+    try {
+      for (let i = 0; i < 4; i += 1) {
+        await guarded("https://changing.example.com/client.json");
+      }
+      expect(dispatchers[2]).toBe(dispatchers[0]);
+      expect(dispatchers[0].closed).toBe(false);
+      expect(dispatchers[1].closed).toBe(true);
+      expect(dispatchers[3].closed).toBe(false);
+
+      // A pin that was evicted can be used again with a new, open agent.
+      await guarded("https://changing.example.com/client.json");
+      expect(dispatchers[4]).not.toBe(dispatchers[1]);
+      expect(dispatchers[4].closed).toBe(false);
+    } finally {
+      await Promise.all(
+        [...new Set(dispatchers)]
+          .filter((agent) => !agent.closed)
+          .map((agent) => agent.close()),
+      );
+    }
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses an invalid pinned-agent bound (%s)",
+    (maxPinnedAgents) => {
+      expect(() => createGuardedFetch({ maxPinnedAgents })).toThrow(
+        "maxPinnedAgents must be a positive integer",
+      );
+    },
+  );
 
   it("does NOT pin an allowlisted host, which is trusted by name", async () => {
     const dispatchers: unknown[] = [];

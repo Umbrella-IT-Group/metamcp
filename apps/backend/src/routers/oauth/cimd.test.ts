@@ -21,6 +21,7 @@ import { createHash } from "node:crypto";
 
 import type { OAuthClient } from "@repo/zod-types";
 import type express from "express";
+import type { Agent } from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AuditEvent } from "@/lib/audit/audit-emitter";
@@ -526,6 +527,28 @@ describe("resolution and caching (design decisions)", () => {
     expect(h.upsertCimdClient).toHaveBeenCalledTimes(1);
     for (const result of results) expect(result.ok).toBe(true);
   });
+
+  it("shares a pending callback refresh with concurrent callers instead of returning the old callbacks", async () => {
+    const newCallback = "https://claude.ai/api/organizations/callback";
+    const existing = rowFor(ID, { updated_at: new Date(now - MINUTE) });
+    let release!: (response: Response) => void;
+    baseFetch.mockImplementation(
+      () => new Promise<Response>((resolveFetch) => (release = resolveFetch)),
+    );
+
+    const first = resolve(ID, { existing, redirectUri: newCallback });
+    await flush();
+    const second = resolve(ID, { existing, redirectUri: newCallback });
+    release(json(documentFor(ID, { redirect_uris: [HOSTED, newCallback] })));
+
+    const results = await Promise.all([first, second]);
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+    expect(h.upsertCimdClient).toHaveBeenCalledTimes(1);
+    for (const result of results) {
+      expect(result).toMatchObject({ ok: true, source: "fetched" });
+      expect(result.ok && result.client.redirect_uris).toContain(newCallback);
+    }
+  });
 });
 
 describe("stale rows and failure memory (design decisions)", () => {
@@ -689,20 +712,39 @@ describe("stale rows and failure memory (design decisions)", () => {
     expect(cimdStateSizesForTesting().negativeCache).toBe(0);
   });
 
-  it("never holds more than 1000 failed ids in memory", async () => {
+  it("never holds more than 1000 failed ids or pinned dispatchers in memory", async () => {
+    const dispatchers: Agent[] = [];
+    let addressIndex = 0;
+    lookup.mockImplementation(async () => {
+      const index = addressIndex++;
+      return [`93.184.${Math.floor(index / 250)}.${(index % 250) + 1}`];
+    });
     baseFetch.mockImplementation(
-      async () => new Response("no", { status: 404 }),
+      async (_url: URL, _init: RequestInit, dispatcher: Agent) => {
+        dispatchers.push(dispatcher);
+        return new Response("no", { status: 404 });
+      },
     );
 
-    for (let i = 0; i < 1100; i += 1) {
-      now += 1100; // inside the fetch rate, so every id really fetches
-      await resolve(`${ORIGIN}/c/${i}`);
-    }
+    try {
+      for (let i = 0; i < 1100; i += 1) {
+        now += 1100; // inside the fetch rate, so every id really fetches
+        await resolve(`${ORIGIN}/c/${i}`);
+      }
 
-    expect(baseFetch).toHaveBeenCalledTimes(1100);
-    const sizes = cimdStateSizesForTesting();
-    expect(sizes.negativeCache).toBe(1000);
-    expect(sizes.refusalAudited).toBeLessThanOrEqual(1000);
+      expect(baseFetch).toHaveBeenCalledTimes(1100);
+      const sizes = cimdStateSizesForTesting();
+      expect(sizes.negativeCache).toBe(1000);
+      expect(sizes.refusalAudited).toBeLessThanOrEqual(1000);
+      expect(dispatchers.filter((agent) => !agent.closed)).toHaveLength(1000);
+      expect(dispatchers[0].closed).toBe(true);
+    } finally {
+      await Promise.all(
+        dispatchers
+          .filter((agent) => !agent.closed)
+          .map((agent) => agent.close()),
+      );
+    }
   });
 });
 

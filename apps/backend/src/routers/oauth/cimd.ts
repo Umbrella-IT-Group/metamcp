@@ -171,6 +171,10 @@ function getGuardedFetch(): ReturnType<typeof createGuardedFetch> {
     // metadata ranges are refused, and the socket is pinned to the addresses
     // that were checked.
     maxResponseBytes: CIMD_MAX_BODY_BYTES,
+    // This fetcher lives for the whole process. Changing DNS answers must not
+    // retain a dispatcher per address set forever, including failed fetches
+    // that never create a row and therefore do not count toward the row cap.
+    maxPinnedAgents: CIMD_STATE_MAX_ENTRIES,
     followRedirects: false,
     requestTimeoutMs: CIMD_FETCH_TIMEOUT_MS,
     lookup: async (hostname) => {
@@ -633,8 +637,10 @@ export async function resolveCimdClient(
 
   // 5. A fresh row missing the redirect: refresh at most once per minute per
   //    client, so a client that keeps asking for a callback its document does
-  //    not list cannot turn into a fetch per request.
-  if (fresh) {
+  //    not list cannot turn into a fetch per request. A caller arriving during
+  //    that refresh must join it below, rather than fail authorization against
+  //    the old callback list while the first caller gets the new one.
+  if (fresh && !inFlight.has(clientId)) {
     const last = redirectRefreshAt.get(clientId);
     if (
       last !== undefined &&
