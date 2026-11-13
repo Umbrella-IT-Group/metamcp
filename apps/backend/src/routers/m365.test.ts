@@ -444,6 +444,30 @@ describe("GET /m365/callback envelope version", () => {
     repoMock.findByUserId.mockRejectedValue(new Error("pg down"));
     expect((await enroll()).startsWith("v2.")).toBe(true);
   });
+
+  it.each(["", "unrecognised-version"])(
+    "does not overwrite an unknown row version after a failed lookup in keep mode (%j)",
+    async (writeVersion) => {
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", writeVersion);
+      signInAs("user-1");
+      const state = await startEnrollment();
+      entraExchange.mockResolvedValue(
+        new Response(JSON.stringify(goodExchangeBody()), { status: 200 }),
+      );
+      // A failed read does not establish that there is no bound row. Defaulting
+      // it to v1 would turn a transient read failure into an implicit rollback.
+      repoMock.findByUserId.mockRejectedValue(
+        new Error("read connection lost"),
+      );
+
+      const response = await realFetch(
+        `${baseUrl}/m365/callback?code=c&state=${encodeURIComponent(state)}`,
+      );
+
+      expect(response.status).toBe(500);
+      expect(repoMock.upsertEnrollment).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("status + disconnect", () => {

@@ -416,6 +416,74 @@ describe("rotation persist reconciliation", () => {
     await service.getAccessToken("user-1");
     expect(sent).toEqual(["A"]);
   });
+
+  it.each(["re-enrollment", "revoke", "delete"] as const)(
+    "does not cache or hold the old grant after a %s beats the reconcile swap",
+    async (change) => {
+      const repo = new FakeTokensRepo(rowFor("A"));
+      const { sent, fetchStub } = entraChain({
+        onRedeem: (rt) => {
+          if (rt === "A") repo.row = rowFor("A", "v2");
+        },
+      });
+      repo.beforeRotate = () => {
+        if (repo.rotateCalls.length !== 2) return;
+        // This change lands after reconciliation read the same grant, but
+        // before its one retry. A second CAS miss is still a definite miss.
+        repo.row =
+          change === "delete"
+            ? undefined
+            : change === "revoke"
+              ? { ...rowFor("A", "v2"), status: "reauth_required" }
+              : rowFor("NEW", "v2");
+      };
+      const service = new M365MintService(repo.asRepo(), fetchStub);
+
+      expect(await service.getAccessToken("user-1")).toBe("at:A");
+      expect(repo.rotateCalls).toHaveLength(2);
+      expect(mintAudits()[0].rotation).toBe("skipped");
+      expect(
+        errorSpy.mock.calls.some((call) =>
+          String(call[0]).includes("holding rotation in memory"),
+        ),
+      ).toBe(false);
+
+      repo.beforeRotate = undefined;
+      if (change === "re-enrollment") {
+        expect(await service.getAccessToken("user-1")).toBe("at:NEW");
+        expect(sent).toEqual(["A", "NEW"]);
+      } else {
+        await expect(service.getAccessToken("user-1")).rejects.toMatchObject({
+          code: "credential_missing",
+        });
+        expect(sent).toEqual(["A"]);
+      }
+    },
+  );
+
+  it("holds the rotation without another write if a second rewrap beats the reconcile swap", async () => {
+    const repo = new FakeTokensRepo(rowFor("A"));
+    const { sent, fetchStub } = entraChain({
+      onRedeem: (rt) => {
+        if (rt === "A") repo.row = rowFor("A", "v2");
+      },
+    });
+    repo.beforeRotate = () => {
+      if (repo.rotateCalls.length === 2) repo.row = rowFor("A", "v2");
+    };
+    const service = new M365MintService(repo.asRepo(), fetchStub);
+
+    expect(await service.getAccessToken("user-1")).toBe("at:A");
+    expect(repo.rotateCalls).toHaveLength(2);
+    expect(repo.stored()).toBe("A");
+    expect(mintAudits()[0].rotation).toBe("held");
+
+    repo.beforeRotate = undefined;
+    pastExpiry();
+    expect(await service.getAccessToken("user-1")).toBe("at:A>");
+    expect(sent).toEqual(["A", "A>"]);
+    expect(repo.stored()).toBe("A>>");
+  });
 });
 
 // -------------------------------------------------------- pending lineage
@@ -582,6 +650,42 @@ describe("a held rotation stays anchored to the stored grant", () => {
 // ------------------------------------------------- generation-guarded state
 
 describe("an invalidation retires the mints that were running", () => {
+  it.each(["fresh", "missing"] as const)(
+    "joins the current mint when invalidation lands during a row read returning a %s row",
+    async (readOutcome) => {
+      const repo = new FakeTokensRepo(rowFor("A"));
+      const readStarted = deferred<void>();
+      const readResult = deferred<M365UserTokenRow | undefined>();
+      repo.findByUserId.mockImplementationOnce(async () => {
+        readStarted.resolve();
+        return readResult.promise;
+      });
+      const entra = controlledEntra();
+      const service = new M365MintService(repo.asRepo(), entra.fetchStub);
+      const oldCaller = service.getAccessToken("user-1").then(
+        (token) => token,
+        (error: { code: string }) => error.code,
+      );
+      await readStarted.promise;
+
+      repo.row = rowFor("NEW");
+      service.invalidateUser("user-1");
+      const newCaller = service.getAccessToken("user-1");
+      await entra.reached(0);
+      expect(entra.rtOf(0)).toBe("NEW");
+
+      // The retired mint has not redeemed anything yet. Its read can now see
+      // the fresh grant too, so it must join rather than redeem NEW twice.
+      readResult.resolve(readOutcome === "fresh" ? repo.row : undefined);
+      await flush();
+      expect(entra.calls).toHaveBeenCalledTimes(1);
+      entra.ok(0, "NEW");
+      expect(await newCaller).toBe("at:NEW");
+      expect(await oldCaller).toBe("at:NEW");
+      expect(mintAudits()).toHaveLength(1);
+    },
+  );
+
   it("does not cache the old mint's token, starts a new mint for a later caller, and does not hold a late persist failure", async () => {
     const repo = new FakeTokensRepo(rowFor("A"));
     const entra = controlledEntra();

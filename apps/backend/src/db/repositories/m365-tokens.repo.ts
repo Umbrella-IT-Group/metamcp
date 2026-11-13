@@ -5,9 +5,10 @@
  * `lib/m365/crypto.ts` — this repository never sees plaintext tokens.
  *
  * The mint service's rotate-and-persist path calls `rotateRefreshToken`
- * IMMEDIATELY after a successful refresh grant (Entra invalidates the
- * old RT on redemption, so losing the new one strands the user into
- * re-enrollment). Callers serialize per-user via the mint service's
+ * immediately after a successful refresh grant to preserve the newest issued
+ * token. Entra does not revoke the old token merely because it was redeemed
+ * (see the protocol note in `lib/m365/mint-service.ts`). Callers serialize
+ * per-user via the mint service's
  * single-flight lock, which is in-process only: the deployment runs exactly
  * one gateway process per database (see the single-flight note in
  * `lib/m365/mint-service.ts`; more than one replica reopens a documented

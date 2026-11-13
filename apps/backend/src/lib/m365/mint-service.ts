@@ -8,16 +8,18 @@
  * mints a fresh one via the Entra v2 refresh grant.
  *
  * Hard requirements (design doc §5.3):
- *  - Per-user SINGLE-FLIGHT: Entra rotates the refresh token on every
- *    redemption, so two concurrent mints for one user would race — the
- *    loser redeems an already-consumed RT and kills the grant. One
- *    in-process mutex per user (single-container deployment; documented
+ *  - Per-user SINGLE-FLIGHT: concurrent callers share one redemption and one
+ *    rotation write instead of racing independent successors. Entra does NOT
+ *    revoke an older refresh token merely because it was redeemed, so neither
+ *    concurrency safety nor replay protection can assume single-use tokens:
+ *    https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens
+ *    One in-process mutex per user (single-container deployment;
  *    multi-instance follow-up: pg advisory lock).
  *  - ATOMIC ROTATE-AND-PERSIST: the rotated RT is encrypted + persisted
  *    BEFORE the mint resolves. If the persist write fails, the fresh RT
  *    is held in memory (`pendingRotations`) and re-persisted on the next
- *    mint — losing it would strand the user into re-enrollment because
- *    the pre-rotation RT is already invalid.
+ *    mint. Keep the newest issued token without relying on the server to keep
+ *    accepting an older one after persistence fails.
  *  - COMPARE-AND-SWAP PERSIST: the rotation and the reauth mark only apply to
  *    the row state the mint READ (the stored ciphertext is both the grant's
  *    generation and its rotation version), so a re-enrollment, disconnect,
@@ -138,7 +140,7 @@ export class M365MintService {
   /**
    * Rotated RTs whose DB persist failed — kept (plaintext, in-process
    * memory only) so the next mint can use them and retry the persist
-   * instead of redeeming the already-invalidated stored RT. See
+   * instead of reverting to the older stored RT. See
    * `PendingRotation` for how the chain stays anchored to the stored grant.
    */
   private pendingRotations = new Map<string, PendingRotation>();
@@ -195,9 +197,9 @@ export class M365MintService {
     // fixed name, so a recreate stops the old container before the new one
     // starts and two never mint at once, in steady state or across a deploy.
     // MORE THAN ONE REPLICA REOPENS THIS. Two processes holding the same stored
-    // refresh token would both redeem it, Entra would accept the first and
-    // reject the second with invalid_grant, and the loser's conditional reauth
-    // mark could land before the winner's rotation and strand the user. A
+    // refresh token can both redeem it and race independent successors. The
+    // CAS protects the row, but the caches and held rotations have no shared
+    // owner, so one process can discard a successor the other never saw. A
     // cross-process lock (a Postgres advisory lock held on one dedicated
     // connection across the read, the redemption and the write) must land
     // before a second replica is planned.
@@ -246,6 +248,13 @@ export class M365MintService {
 
     const repo = await this.getRepo();
     const row = await repo.findByUserId(userId);
+    // An invalidation can land while the read is in flight. This retired mint
+    // has redeemed nothing yet, and its read may now return the NEW grant. Join
+    // the current generation before using the row so two generations cannot
+    // redeem that same fresh token concurrently inside this one process.
+    if (!this.isCurrent(userId, generation)) {
+      return this.getAccessToken(userId);
+    }
     if (!row || row.status !== "active") {
       this.audit(userId, "credential_missing", startedAt, {
         row_status: row?.status ?? "none",
@@ -290,10 +299,9 @@ export class M365MintService {
       );
     }
 
-    // Prefer a held (persist-failed) rotation over the stored RT, because the
-    // stored one may already be consumed, but only while the row still opens to
-    // the grant the held chain descends from. A mint of an older generation
-    // never reads another generation's held token.
+    // Prefer a held (persist-failed) rotation over the older stored RT only
+    // while the row still opens to the grant the held chain descends from.
+    // An older mint never reads another generation's held token.
     let redeemFrom = storedPlaintext;
     const pending = this.isCurrent(userId, generation)
       ? this.pendingRotations.get(userId)
@@ -315,8 +323,8 @@ export class M365MintService {
 
     const outcome = await this.redeemRefreshToken(config, ctx, redeemFrom);
 
-    // Rotate-and-persist BEFORE resolving. Entra has already
-    // invalidated the RT we just redeemed.
+    // Rotate-and-persist BEFORE resolving so the newest issued refresh token
+    // is durable whenever possible.
     let rotation: "applied" | "skipped" | "held" | "none" = "none";
     if (outcome.refreshToken) {
       const result = await this.persistRotation({
@@ -334,16 +342,16 @@ export class M365MintService {
       if (result === "failed") {
         if (current) {
           // Keep the fresh RT in memory and retry persistence on the next
-          // mint. Losing it = forced re-enrollment. The anchor is the stored
-          // grant this mint validated, so the chain survives further failed
-          // persists (see PendingRotation).
+          // mint instead of relying on the older stored token. The anchor is
+          // the stored grant this mint validated, so the chain survives further
+          // failed persists (see PendingRotation).
           this.pendingRotations.set(userId, {
             refreshToken: outcome.refreshToken,
             anchor: storedPlaintext,
           });
           rotation = "held";
           logger.error(
-            `M365 broker: rotated refresh token persist FAILED for user ${userId} — holding rotation in memory and retrying next mint. A gateway restart before a successful persist forces re-enrollment for this user.`,
+            `M365 broker: rotated refresh token persist FAILED for user ${userId}: holding rotation in memory and retrying next mint. A gateway restart loses the held token; re-enrollment may be needed if the older stored token no longer works.`,
           );
         } else {
           rotation = "skipped";
@@ -543,9 +551,9 @@ export class M365MintService {
     const { config, ctx, anchor, redeemedRt, rotatedRt } = args;
     const { userId, stored } = ctx;
 
-    // Sealing is inside the guarded section: the redeemed token is already
-    // consumed, so a seal failure must fall into the held-in-memory path
-    // rather than reject the mint and lose it.
+    // Sealing is inside the guarded section: a seal failure must fall into the
+    // held-in-memory path rather than reject the mint and lose the newest
+    // issued refresh token.
     let repo: M365TokensRepository;
     let envelope: string;
     try {
@@ -600,7 +608,8 @@ export class M365MintService {
    *    boot converge of a newly started process, a rolling deploy), so the row
    *    still opens to the grant this mint descends from: re-seal against the
    *    row's CURRENT version and retry the swap once against its CURRENT
-   *    ciphertext (`applied`, or `failed` and held if that misses too);
+   *    ciphertext. A second miss gets one final read, with no further write:
+   *    hold only if the same grant is still active or the read fails;
    *  - the row was re-enrolled, disconnected, revoked or is unreadable, so the
    *    stored state is not this grant's to overwrite (`skipped`).
    *
@@ -620,6 +629,7 @@ export class M365MintService {
       redeemedRt: string;
       rotatedRt: string;
     },
+    retry = true,
   ): Promise<RotationResult> {
     const { userId, anchor, redeemedRt, rotatedRt } = args;
     const skipped = (): RotationResult => {
@@ -659,6 +669,7 @@ export class M365MintService {
     if (currentPlaintext !== anchor && currentPlaintext !== redeemedRt) {
       return skipped();
     }
+    if (!retry) return "failed";
 
     try {
       const resealed = sealUserRefreshToken(
@@ -674,7 +685,13 @@ export class M365MintService {
         config.kekId,
         current.rt_ciphertext,
       );
-      return swapped ? "applied" : "failed";
+      // A miss is definite, even on this retry: a revoke, disconnect or fresh
+      // enrollment may have landed since the reconciliation read. Classify
+      // that state before deciding to hold a rotation and cache its access
+      // token. The final read cannot trigger another write.
+      return swapped
+        ? "applied"
+        : await this.reconcileMiss(repo, config, args, false);
     } catch (error) {
       logger.warn(
         `M365 broker: reconcile re-seal for user ${userId} failed:`,
