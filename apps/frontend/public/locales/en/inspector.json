@@ -240,9 +240,10 @@
     "noParameters": "This tool takes no parameters.",
     "warnNotNumber": "Typed text is not a number; sent as a string",
     "warnNotInteger": "Not a whole number",
-    "warnUnsafeInteger": "Too large to send as a number exactly; sent as a string",
     "warnNotBoolean": "Typed text is not true or false; sent as a string",
     "errInvalidJson": "Not valid JSON",
+    "errUnsafeNumber": "Cannot be sent exactly as a JSON number. If the tool accepts a string, quote it as a string.",
+    "errUnsafeNumberPaste": "The pasted JSON holds a number that cannot be sent exactly as a JSON number: {{value}}. Nothing was filled. If the tool accepts a string, quote that number as a string and paste again.",
     "errBlocked": "Fix these fields before calling: {{fields}}"
   },
   "inspectorResult": {

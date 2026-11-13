@@ -41,7 +41,13 @@
  *     (pydantic puts them on the outer schema), and a union of two different
  *     non-null types is reported as ambiguous instead of picking the first.
  *   - `extractEnumOptions` lists string, number and boolean enums and `const`.
+ *   - `parsePastedObject` refuses a paste holding a number that cannot be
+ *     sent exactly (a whole number past Number.MAX_SAFE_INTEGER, or one that
+ *     overflows), because JSON.parse rounds it before any field sees it. It
+ *     also says why a paste failed; `parseObjectFromPaste` keeps its null.
  */
+
+import { findUnsafeNumber } from "./json-numbers";
 
 export type JsonSchema = Record<string, unknown>;
 
@@ -417,43 +423,65 @@ function convertJSObjectToJSON(text: string): string {
   return result;
 }
 
+export type PasteParse =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; reason: "notAnObject" }
+  | { ok: false; reason: "unsafeNumber"; token: string };
+
 /**
- * Attempts to parse pasted text as a JSON or JavaScript object
- * Returns the parsed object or null if parsing fails
+ * Reads pasted text as a JSON or JavaScript object, and says why when it
+ * cannot. A paste holding a number the browser cannot carry exactly (a whole
+ * number past Number.MAX_SAFE_INTEGER, or one that overflows; see
+ * json-numbers.ts) is refused whole: JSON.parse would round it before any
+ * field saw it, so the digits that were pasted would not be the digits sent.
+ * The text that was actually parsed is the one scanned, so the backtick
+ * fallback is covered, and numbers inside strings are never read as numbers.
  */
-export function parseObjectFromPaste(
-  text: string,
-): Record<string, unknown> | null {
+export function parsePastedObject(text: string): PasteParse {
+  const notAnObject: PasteParse = { ok: false, reason: "notAnObject" };
   if (!text || typeof text !== "string") {
-    return null;
+    return notAnObject;
   }
 
   const trimmed = text.trim();
 
   // Must start with { to be an object
   if (!trimmed.startsWith("{")) {
-    return null;
+    return notAnObject;
   }
 
-  // First try standard JSON.parse
+  let jsonText = trimmed;
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
+    // First try standard JSON.parse
+    parsed = JSON.parse(jsonText);
   } catch {
     // If JSON.parse fails, try converting JS syntax to JSON
+    jsonText = convertJSObjectToJSON(trimmed);
     try {
-      const converted = convertJSObjectToJSON(trimmed);
-      const parsed = JSON.parse(converted);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
+      parsed = JSON.parse(jsonText);
     } catch {
       // Both attempts failed
-      return null;
+      return notAnObject;
     }
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return notAnObject;
+  }
 
-  return null;
+  const token = findUnsafeNumber(jsonText);
+  if (token !== null) return { ok: false, reason: "unsafeNumber", token };
+  return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+/**
+ * Attempts to parse pasted text as a JSON or JavaScript object
+ * Returns the parsed object, or null when the text is not an object or holds
+ * a number that cannot be sent exactly (parsePastedObject says which).
+ */
+export function parseObjectFromPaste(
+  text: string,
+): Record<string, unknown> | null {
+  const result = parsePastedObject(text);
+  return result.ok ? result.value : null;
 }
