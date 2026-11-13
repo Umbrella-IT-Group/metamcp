@@ -239,6 +239,18 @@ function controlledEntra() {
     fetchStub: fetchStub as unknown as typeof fetch,
     calls: fetchStub,
     arrived: (n: number) => slot(n).arrived.promise,
+    /**
+     * Assert (rather than wait for) the nth redemption having started once the
+     * queued work has run: a mint that was wrongly joined to an earlier one never
+     * starts it, and that should fail on the assertion, not hang.
+     */
+    reached: async (n: number) => {
+      await flush();
+      expect(
+        slots[n]?.rt,
+        `redemption #${n} should have started`,
+      ).toBeDefined();
+    },
     rtOf: (n: number) => slots[n]?.rt,
     respond: (n: number, response: Response) =>
       slot(n).response.resolve(response),
@@ -582,7 +594,7 @@ describe("an invalidation retires the mints that were running", () => {
     // A caller arriving after the invalidation must NOT join the old mint: it
     // starts its own, from the row as it is now.
     const newCaller = service.getAccessToken("user-1");
-    await entra.arrived(1);
+    await entra.reached(1);
     expect(entra.rtOf(1)).toBe("NEW");
     entra.ok(1, "NEW");
     expect(await newCaller).toBe("at:NEW");
@@ -602,7 +614,7 @@ describe("an invalidation retires the mints that were running", () => {
     // stored (NEW's rotation) and discards nothing.
     pastExpiry();
     const third = service.getAccessToken("user-1");
-    await entra.arrived(2);
+    await entra.reached(2);
     expect(entra.rtOf(2)).toBe("NEW>");
     entra.ok(2, "NEW>");
     expect(await third).toBe("at:NEW>");
@@ -626,7 +638,7 @@ describe("an invalidation retires the mints that were running", () => {
     // caches its token.
     repo.rotateMode = "down";
     const newCaller = service.getAccessToken("user-1");
-    await entra.arrived(1);
+    await entra.reached(1);
     entra.ok(1, "NEW");
     expect(await newCaller).toBe("at:NEW");
     repo.rotateMode = "ok";
@@ -643,7 +655,7 @@ describe("an invalidation retires the mints that were running", () => {
     // held NEW>, not the stored NEW (the database still opens to NEW).
     pastExpiry();
     const third = service.getAccessToken("user-1");
-    await entra.arrived(2);
+    await entra.reached(2);
     expect(entra.rtOf(2)).toBe("NEW>");
     entra.ok(2, "NEW>");
     expect(await third).toBe("at:NEW>");
@@ -663,7 +675,7 @@ describe("an invalidation retires the mints that were running", () => {
 
     // A newer mint is running when the old one completes.
     const newer = service.getAccessToken("user-1");
-    await entra.arrived(1);
+    await entra.reached(1);
     entra.ok(0, "A");
     expect(await oldCaller).toBe("at:A");
 
@@ -698,7 +710,7 @@ describe("an invalidation retires the mints that were running", () => {
     // New generation: mints, caches, and holds a rotation (persist down).
     repo.rotateMode = "down";
     const newCaller = service.getAccessToken("user-1");
-    await entra.arrived(1);
+    await entra.reached(1);
     entra.ok(1, "NEW");
     expect(await newCaller).toBe("at:NEW");
     repo.rotateMode = "ok";
@@ -732,7 +744,7 @@ describe("an invalidation retires the mints that were running", () => {
     // held token (the database still opens to NEW).
     pastExpiry();
     const third = service.getAccessToken("user-1");
-    await entra.arrived(2);
+    await entra.reached(2);
     expect(entra.rtOf(2)).toBe("NEW>");
     entra.ok(2, "NEW>");
     expect(await third).toBe("at:NEW>");
