@@ -9,6 +9,7 @@ import {
   McpServerTypeEnum,
   type NamespaceToolPolicy,
   type OAuthClientRegistrationSource,
+  type ToolListingMode,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
 import {
@@ -884,6 +885,46 @@ export const oauthRotatedRefreshTokensTable = pgTable(
   ],
 );
 
+// Spent authorization codes (migration 0045): the replay-detection surface for
+// RFC 6749 section 4.1.2.
+//
+// Redeeming a code is a DELETE ... RETURNING on its hash, so a second
+// redemption finds no row and gets invalid_grant, but the delete also destroys
+// the record that the code produced a token family. One row per redeemed code is
+// written in the SAME transaction as the token pair, keyed on the same sha256
+// the live table uses. A later presentation of the code that carries the same
+// client, redirect and a verifier matching `code_challenge` is a replay: it is
+// audited and, under OAUTH_CODE_REPLAY=revoke, revokes `family_id` through the
+// existing family revoke. The binding checks mean a leaked code alone cannot be
+// used to revoke someone's session. `expires_at` is the code's expiry plus a
+// margin, so rows live about fifteen minutes and `cleanupExpired` reaps them;
+// both foreign keys cascade so no orphan outlives a client or user.
+export const oauthSpentAuthorizationCodesTable = pgTable(
+  "oauth_spent_authorization_codes",
+  {
+    code_hash: text("code_hash").primaryKey(),
+    family_id: uuid("family_id").notNull(),
+    client_id: text("client_id")
+      .notNull()
+      .references(() => oauthClientsTable.client_id, { onDelete: "cascade" }),
+    user_id: text("user_id")
+      .notNull()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    redirect_uri: text("redirect_uri").notNull(),
+    code_challenge: text("code_challenge").notNull(),
+    expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
+    created_at: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // The reaper sweeps on expiry.
+    index("oauth_spent_authorization_codes_expires_at_idx").on(
+      table.expires_at,
+    ),
+  ],
+);
+
 // MCP Sessions table — persists Streamable HTTP session metadata so that
 // metamcp restarts don't force every consumer to re-initialize. When a
 // request arrives with an unknown `Mcp-Session-Id` (in-memory transport
@@ -1259,5 +1300,57 @@ export const accessGroupEndpointsTable = pgTable(
     // Same reasoning as the members index: the authorization path filters on
     // endpoint_uuid, which is the PK's trailing column.
     index("access_group_endpoints_endpoint_uuid_idx").on(table.endpoint_uuid),
+  ],
+);
+
+/**
+ * Per-endpoint presentation (migration 0044): title, instructions, tool
+ * listing mode and the output-schema trim, one row per endpoint and only while
+ * something is non-default. No row means today's behaviour.
+ *
+ * A table of its own rather than columns on `endpoints`, for the reasons in the
+ * migration header: the endpoint select list stays untouched, and authorship
+ * stays human-only because no admin-plane procedure writes this table.
+ *
+ * Appended at the end of the file on purpose, and `endpointsTable` is not
+ * edited: that keeps this change out of the region other work on the endpoint
+ * row touches.
+ */
+export const endpointPresentationTable = pgTable(
+  "endpoint_presentation",
+  {
+    endpoint_uuid: uuid("endpoint_uuid")
+      .primaryKey()
+      .references(() => endpointsTable.uuid, { onDelete: "cascade" }),
+    title: text("title"),
+    instructions: text("instructions"),
+    tool_listing: text("tool_listing")
+      .$type<ToolListingMode>()
+      .notNull()
+      .default("full"),
+    omit_output_schemas: boolean("omit_output_schemas")
+      .notNull()
+      .default(false),
+    updated_at: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // Mirrored from migration 0044 so a fresh `drizzle-kit generate` re-adds
+    // nothing. The regular expressions are written with doubled backslashes
+    // because this is a JS template literal: the SQL must receive the
+    // backslash, not the control character it would otherwise be.
+    check(
+      "endpoint_presentation_tool_listing_check",
+      sql`${table.tool_listing} IN ('full', 'lean')`,
+    ),
+    check(
+      "endpoint_presentation_title_check",
+      sql`${table.title} IS NULL OR (char_length(${table.title}) BETWEEN 1 AND 80 AND ${table.title} !~ '[\\r\\n]')`,
+    ),
+    check(
+      "endpoint_presentation_instructions_check",
+      sql`${table.instructions} IS NULL OR (char_length(${table.instructions}) BETWEEN 1 AND 1500 AND ${table.instructions} !~ '[\\u0001-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]')`,
+    ),
   ],
 );

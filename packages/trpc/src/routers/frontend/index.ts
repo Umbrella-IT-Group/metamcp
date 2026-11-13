@@ -1,6 +1,7 @@
 import { createAccessGroupsRouter } from "./access-groups";
 import { createApiKeysRouter } from "./api-keys";
 import { createConfigRouter } from "./config";
+import { createEndpointPresentationRouter } from "./endpoint-presentation";
 import { createEndpointsRouter } from "./endpoints";
 import { createLogsRouter } from "./logs";
 import { createMcpServersRouter } from "./mcp-servers";
@@ -23,6 +24,7 @@ export { createApiKeysRouter };
 export { createConfigRouter };
 export { createLogsRouter };
 export { createAccessGroupsRouter };
+export { createEndpointPresentationRouter };
 
 export const createFrontendRouter = (implementations: {
   mcpServers: Parameters<typeof createMcpServersRouter>[0];
@@ -37,6 +39,7 @@ export const createFrontendRouter = (implementations: {
   config: Parameters<typeof createConfigRouter>[0];
   logs: Parameters<typeof createLogsRouter>[0];
   accessGroups: Parameters<typeof createAccessGroupsRouter>[0];
+  endpointPresentation: Parameters<typeof createEndpointPresentationRouter>[0];
 }) => {
   return {
     mcpServers: createMcpServersRouter(implementations.mcpServers),
@@ -51,5 +54,8 @@ export const createFrontendRouter = (implementations: {
     config: createConfigRouter(implementations.config),
     logs: createLogsRouter(implementations.logs),
     accessGroups: createAccessGroupsRouter(implementations.accessGroups),
+    endpointPresentation: createEndpointPresentationRouter(
+      implementations.endpointPresentation,
+    ),
   };
 };
