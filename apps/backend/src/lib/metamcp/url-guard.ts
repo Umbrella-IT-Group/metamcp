@@ -480,7 +480,7 @@ const allowedHostsFromEnv = (): ReadonlySet<string> =>
  * itself; `dns.resolve*` queries DNS directly and would happily call a host
  * public that the hosts file points at an internal address.
  */
-const resolveHost = async (hostname: string): Promise<string[]> => {
+export const resolveHost = async (hostname: string): Promise<string[]> => {
   const records = await dnsLookup(hostname, { all: true, verbatim: true });
   return records.map((record) => record.address);
 };
@@ -526,6 +526,17 @@ export interface McpUrlGuardOptions {
    * mid-session) with credentials dropped.
    */
   refuseCrossOriginRedirect?: boolean;
+  /**
+   * Follow redirects at all. Defaults to true; `false` hands a 3xx answer back
+   * to the caller unfollowed (no second request, no re-validation of a
+   * Location, the body still capped). For a fetch whose only legitimate answer
+   * is the document at the URL it was given: the OAuth client metadata
+   * document fetch treats any redirect as a refusal, because a redirect is the
+   * cheapest way to make an allowlisted URL name some other host's content.
+   * `refuseCrossOriginRedirect` cannot express that, it still follows
+   * same-origin hops. Every other transport keeps the default.
+   */
+  followRedirects?: boolean;
   /**
    * Headers that speak for the caller of ONE executing request, deleted when a
    * redirect rewrites that request into a bodyless GET (a 303, or a 301 or 302
@@ -1265,8 +1276,10 @@ export const createGuardedFetch = (
         ? response.headers.get("location")
         : null;
       // Only the final (non-redirect) body is capped; redirect bodies are
-      // drained below.
-      if (!location) {
+      // drained below. With `followRedirects: false` the 3xx itself is the
+      // final answer, so it is returned (and capped) like any other response
+      // and the caller sees the status.
+      if (!location || options.followRedirects === false) {
         return capResponseBody(response, maxBytes, () => controller.abort());
       }
 

@@ -1004,6 +1004,91 @@ describe("createGuardedFetch: refuseCrossOriginRedirect (pooled posture)", () =>
   });
 });
 
+describe("createGuardedFetch: followRedirects false", () => {
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+
+  // The OAuth client metadata document fetch treats any redirect as a refusal
+  // (mcp-use clients.ts `redirect: "manual"` plus `status !== 200`). The
+  // guard's own same-origin follow is what this option turns off, so the
+  // caller sees the 3xx and no second request is sent.
+  it.each([301, 302, 303, 307, 308])(
+    "returns a %s to the caller and sends no second request, even to the same origin",
+    async (status) => {
+      const baseFetch = vi
+        .fn()
+        .mockResolvedValueOnce(redirect(status, "https://meta.example.com/b"))
+        .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+      const guarded = createGuardedFetch({
+        baseFetch,
+        lookup: resolvesTo(PUBLIC_V4),
+        followRedirects: false,
+      });
+
+      const response = await guarded("https://meta.example.com/a");
+
+      expect(response.status).toBe(status);
+      expect(response.headers.get("location")).toBe(
+        "https://meta.example.com/b",
+      );
+      expect(baseFetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("does not validate or resolve the Location it declines to follow", async () => {
+    const lookup = resolvesTo(PUBLIC_V4);
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        redirect(302, "http://169.254.169.254/latest/meta-data/"),
+      );
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup,
+      followRedirects: false,
+    });
+
+    const response = await guarded("https://meta.example.com/a");
+
+    expect(response.status).toBe(302);
+    // Only the first hop was ever resolved.
+    expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it("still refuses an internal first hop before any connection", async () => {
+    const baseFetch = vi.fn(async () => new Response("ok"));
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo("10.0.0.5"),
+      followRedirects: false,
+    });
+
+    await expect(guarded("https://meta.example.com/a")).rejects.toThrow(
+      NOT_A_PERMITTED_TARGET,
+    );
+    expect(baseFetch).not.toHaveBeenCalled();
+  });
+
+  it("leaves the default alone: a same-origin redirect is followed when the option is omitted or true", async () => {
+    for (const options of [{}, { followRedirects: true }]) {
+      const baseFetch = vi
+        .fn()
+        .mockResolvedValueOnce(redirect(302, "https://meta.example.com/b"))
+        .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+      const guarded = createGuardedFetch({
+        baseFetch,
+        lookup: resolvesTo(PUBLIC_V4),
+        ...options,
+      });
+
+      const response = await guarded("https://meta.example.com/a");
+
+      expect(response.status).toBe(200);
+      expect(baseFetch).toHaveBeenCalledTimes(2);
+    }
+  });
+});
+
 describe("createGuardedFetch: the response body is bounded", () => {
   it("aborts a response body that exceeds the byte ceiling", async () => {
     const baseFetch = vi.fn(async () => new Response("abcdefgh")); // 8 bytes
