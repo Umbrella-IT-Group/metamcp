@@ -1194,6 +1194,37 @@ describe("which call tool runs a tool", () => {
     ]);
   });
 
+  it("does not run a writer through an alias cached as read-only after the alias is rebound", async () => {
+    const lean = await connectConsumer("s-lean-rebound", LEAN);
+    const described = json(
+      await meta(lean, "describe_tool", { names: ["desk__modern"] }),
+    );
+    expect(described.tools[0].runs_with).toBe("call_tool");
+
+    const legacy = state.mappings.find((row) => row.toolName === "legacy");
+    if (!legacy) throw new Error("missing legacy mapping");
+    legacy.overrideName = "former";
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "write",
+      status: "ACTIVE",
+      overrideName: "modern",
+    });
+    // The real setter clears live alias resolution immediately. A cached
+    // read-only hint must not authorize a different, writable target: the
+    // namespace policy permits that target and does not enforce its hints.
+    clearOverrideCache(NS);
+
+    const result = await meta(lean, "call_tool", {
+      name: "desk__modern",
+      arguments: { ticket_id: "example-ticket", mode: "close" },
+    });
+
+    expect(desk.calls.map((call) => call.name)).not.toContain("write");
+    expect(result.isError).toBe(true);
+  });
+
   it("does not let the name's case or an unknown name through call_tool, and answers an unknown name through call_write_tool as a direct call does", async () => {
     const plain = await connectConsumer("s-plain-f4e");
     const lean = await connectConsumer("s-lean-f4e", LEAN);
