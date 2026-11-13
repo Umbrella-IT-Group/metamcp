@@ -9,7 +9,9 @@ import {
   ListPromptsRequestSchema,
   ListResourcesRequestSchema,
   ListResourceTemplatesRequestSchema,
+  ListToolsRequest,
   ListToolsRequestSchema,
+  ListToolsResult,
   ListToolsResultSchema,
   McpError,
   ReadResourceRequestSchema,
@@ -32,6 +34,7 @@ import {
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "./audit-listing-log";
+import { getCallerContext } from "./caller-context-store";
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import {
@@ -47,9 +50,16 @@ import {
 } from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import {
+  LEAN_CATALOG_TTL_MS,
+  LeanCatalog,
+  leanMetaTools,
+} from "./lean-listing";
+import { createLeanPrelude } from "./lean-prelude";
+import {
   RecoverySessionPool,
   requestWithSessionRecovery,
 } from "./list-handler-recovery";
+import { metamcpLogStore } from "./log-store";
 import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditingMiddleware } from "./metamcp-middleware/auditing.functional";
 import {
@@ -137,7 +147,18 @@ export const createServer = async (
   // this function, the admin Inspector and tests included, is then subject to
   // the MCP_ENDPOINT_PRESENTATION kill switch. Applying it twice is harmless.
   const presentation = effectivePresentation(presentationInput);
-  const omitOutputSchemas = presentation?.omitOutputSchemas === true;
+  // A lean session lists four meta tools instead of the catalog (lean-
+  // listing.ts). The trim is moot there: lean listings carry no output schemas
+  // and `describe_tool` returns one only on request.
+  const lean = presentation?.toolListing === "lean";
+  const omitOutputSchemas = presentation?.omitOutputSchemas === true && !lean;
+  // Declared up front, before any handler or listener that reads them, so no
+  // later-running closure can reach them before they exist.
+  let leanCatalog: LeanCatalog | undefined;
+  // How many servers the last client-facing listing could not reach, for the
+  // lean search's `unavailable_server_count`. A count and never names: a
+  // server the policy hides from this caller can fail too.
+  let lastListingUnavailableCount = 0;
   const toolToClient: Record<string, ConnectedClient> = {};
   const toolToServerUuid: Record<string, string> = {};
   // Which server first claimed each fully-qualified tool name, so a second
@@ -234,6 +255,15 @@ export const createServer = async (
     // stale names must not remain verified until the consumer lists again.
     toolSchemaGeneration += 1;
     toolArgSchemas.replace([]);
+    // The next search must see the change, not a snapshot taken before it.
+    leanCatalog?.invalidate();
+    // A lean session's advertised tool list cannot change: it is always the
+    // same four meta tools, so a re-list would return the same four and the
+    // notification would only cost the client a round trip. What changed is
+    // visible to the next search, which re-lists because the snapshot was just
+    // dropped. `tools.listChanged` stays advertised (gateway-capabilities.ts):
+    // it is part of the capability hash that lazy recovery compares.
+    if (lean) return;
     try {
       await server.notification({
         method: "notifications/tools/list_changed",
@@ -333,7 +363,10 @@ export const createServer = async (
         renotifyCapLogged.delete(mcpServerUuid);
       }
     }
-    if (proxyClosed || !toolsListRenotifyEnabled()) return;
+    // Not for a lean session: it would never send the notification, so a watch
+    // would only cost backend probes and make the cap warning claim
+    // notifications that were never sent. Everything above still runs.
+    if (proxyClosed || lean || !toolsListRenotifyEnabled()) return;
     for (const [mcpServerUuid, params] of unreachableServers) {
       if (owedServers.has(mcpServerUuid)) continue;
       const serverName = params.name || mcpServerUuid;
@@ -1000,9 +1033,10 @@ export const createServer = async (
             errorGatedUuids.has(mcpServerUuid) ? " (error-gated)" : ""
           }`,
       );
-      const renotify = toolsListRenotifyEnabled()
-        ? " This session gets notifications/tools/list_changed when the server answers again."
-        : "";
+      const renotify =
+        toolsListRenotifyEnabled() && !lean
+          ? " This session gets notifications/tools/list_changed when the server answers again."
+          : "";
       throw new McpError(
         ErrorCode.InternalError,
         `tools/list could not reach ${described.join(", ")}: no tools were listed, which is not the same as an empty tool list. Retry shortly.${renotify}`,
@@ -1014,6 +1048,7 @@ export const createServer = async (
       );
     }
 
+    lastListingUnavailableCount = failedServers.length;
     return { tools: allTools };
   };
 
@@ -1456,8 +1491,14 @@ export const createServer = async (
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);
 
-  // Set up the handlers with middleware
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+  // The real client-facing listing: the whole chain (overrides, policy filter),
+  // the audit snapshot and the routes it registers. A lean session never
+  // serves this to its client as `tools/list`; its search and describe read
+  // it through the catalog below, so they see exactly what a non-lean client
+  // of the same namespace would see.
+  const listForClient = async (
+    request: ListToolsRequest,
+  ): Promise<ListToolsResult> => {
     const generation = ++toolSchemaGeneration;
     toolArgSchemas.replace([]);
     const recorded = (async () => {
@@ -1474,20 +1515,78 @@ export const createServer = async (
     })();
     clientListing = recorded;
     try {
-      const result = await recorded;
-      // The trim applies to what the client receives only. The audit snapshot
-      // above was taken from the untrimmed result, and `withoutOutputSchema`
-      // copies, so the shared result objects the middleware cache keep are
-      // untouched. A session with no trim gets the very same object as before.
-      return omitOutputSchemas
-        ? { ...result, tools: result.tools.map(withoutOutputSchema) }
-        : result;
+      return await recorded;
     } finally {
       if (clientListing === recorded) clientListing = undefined;
     }
+  };
+
+  if (lean) {
+    leanCatalog = new LeanCatalog({
+      load: async () => {
+        const listing = await listForClient({
+          method: "tools/list",
+          params: {},
+        });
+        return {
+          tools: listing.tools,
+          unavailable: lastListingUnavailableCount,
+        };
+      },
+      now: () => Date.now(),
+      ttlMs: LEAN_CATALOG_TTL_MS,
+    });
+  }
+
+  // Set up the handlers with middleware
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+    // Static: no backend, no database, and no state touched. A lean
+    // `tools/list` must not bump the schema generation or clear the audit
+    // registry, because no real listing was exposed to the client.
+    if (lean) return { tools: [...leanMetaTools()] };
+    const result = await listForClient(request);
+    // The trim applies to what the client receives only. The audit snapshot
+    // was taken from the untrimmed result inside `listForClient`, and
+    // `withoutOutputSchema` copies, so the shared result objects the
+    // middleware caches keep are untouched. A session with no trim gets the
+    // very same object as before.
+    return omitOutputSchemas
+      ? { ...result, tools: result.tools.map(withoutOutputSchema) }
+      : result;
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  // Only a lean session has a prelude, so every other session answers
+  // `search_tools`, `call_tool` and the rest exactly as it always did
+  // (`Invalid tool name format`). The prelude answers a search or describe, or
+  // hands back the request the chain should run: the rewritten real-name call
+  // of a call meta tool, or the unchanged call of a direct real-name call.
+  // `callToolWithMiddleware` below stays the only way a tool executes, so a
+  // lean call is audited, redirected, overridden, filtered and timed on the
+  // REAL tool name, like any other.
+  const leanPrelude =
+    lean && leanCatalog
+      ? createLeanPrelude({
+          catalog: leanCatalog,
+          // System category (persisted and mirrored to stdout), never
+          // tool_call: a meta call executes nothing, so the tool-call views
+          // stay "who ran which real tool". Counts and durations only.
+          log: (level, message) =>
+            metamcpLogStore.record({
+              category: "system",
+              serverName: "gateway",
+              level,
+              message,
+              sessionId: handlerContext.sessionId,
+              clientName:
+                getCallerContext()?.clientName ?? handlerContext.clientName,
+            }),
+        })
+      : undefined;
+
+  server.setRequestHandler(CallToolRequestSchema, async (incoming) => {
+    const prelude = leanPrelude ? await leanPrelude(incoming) : undefined;
+    if (prelude?.answer) return prelude.answer;
+    const request = prelude?.request ?? incoming;
     try {
       return await callToolWithMiddleware(request, handlerContext);
     } catch (error) {

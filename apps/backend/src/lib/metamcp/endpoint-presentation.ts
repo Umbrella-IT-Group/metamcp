@@ -53,16 +53,43 @@ export function presentationEnabled(
 }
 
 /**
- * Does this build serve a lean tool listing? Not in this release, so a stored
- * or pinned `lean` is always served as the full listing (see
- * `effectivePresentation`). The release that serves lean replaces this body
- * with its own switch; the callers do not change.
+ * `MCP_LEAN_LISTING=off` (or `false`, `0`, in any case) turns the lean tool
+ * listing off while leaving title, instructions and the output-schema trim
+ * alone: a stored or pinned `lean` is then served as the full listing (see
+ * `effectivePresentation`), and so is a lean session that recovers after the
+ * restart. It is the emergency lever for the lean path; unticking lean in the
+ * admin panel is the graceful one and leaves running lean sessions alone.
+ *
+ * A client that is still holding the lean tool list when this is switched off
+ * has four meta tools the gateway no longer answers (`Invalid tool name
+ * format`) until it reconnects, and a client that does not honour
+ * re-initialization needs a manual reconnect.
+ *
+ * Read at call time and parsed like `presentationEnabled`.
  */
 export function leanListingEnabled(
-  _env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return false;
+  const raw = (env.MCP_LEAN_LISTING ?? "true").trim().toLowerCase();
+  return !["false", "off", "0"].includes(raw);
 }
+
+/**
+ * The paragraph a lean endpoint always starts its `instructions` with, because
+ * four bare meta tools with no context perform worse than a short workflow
+ * description. The administrator's own text, if any, follows after a blank
+ * line (see `buildServerMetadata`).
+ *
+ * LENGTH. Some clients are reported to keep only about 2 KiB of server
+ * instructions (unverified), so this paragraph plus the blank line plus the
+ * longest administrator text (`ENDPOINT_INSTRUCTIONS_MAX`) must stay under
+ * 2048 characters or the tail of the administrator's text is the part that
+ * gets cut. A test pins the sum. (The header of migration 0044 quotes the
+ * length of an earlier, shorter wording of this paragraph; the bound it
+ * justifies is the one pinned here.)
+ */
+export const LEAN_INSTRUCTIONS =
+  "This endpoint lists its tools on demand. Use search_tools with a few words describing the task to find tool names, describe_tool to read a tool's input schema, description, safety hints (read-only or destructive) and which tool runs it, then call_tool for a tool marked read-only or call_write_tool for any other tool, passing the full tool name and its arguments. A tool can also be called directly by its full name.";
 
 /**
  * The presentation a session is actually served, or `undefined` for "none".
@@ -76,10 +103,11 @@ export function effectivePresentation(
   env: NodeJS.ProcessEnv = process.env,
 ): SessionPresentation | undefined {
   if (input === undefined || !presentationEnabled(env)) return undefined;
-  // A `lean` that this build does not serve is coerced here rather than
-  // refused, so such a row (an image rolled back past the release that serves
-  // lean, or a row written by hand) reads as an ordinary full listing and no
-  // lean text is ever emitted.
+  // A `lean` that this process does not serve (MCP_LEAN_LISTING is off, or the
+  // row came from an image that serves it and this one was rolled back past
+  // that) is coerced here rather than refused, so the row reads as an ordinary
+  // full listing and no lean text is ever emitted. Title, instructions and the
+  // trim are unaffected: the lean switch is narrower than the master one.
   const toolListing: ToolListingMode =
     input.toolListing === "lean" && leanListingEnabled(env) ? "lean" : "full";
   const title = input.title === "" ? undefined : input.title;
@@ -122,6 +150,16 @@ export function buildServerMetadata(
   serverInfo: { name: string; version: string; title?: string };
   instructions?: string;
 } {
+  // A lean session's instructions begin with the workflow paragraph, then the
+  // administrator's text after a blank line. Only a lean session served by this
+  // process gets the paragraph: `presentation` has been through
+  // `effectivePresentation`, which turns `lean` into `full` when it is off.
+  const instructions =
+    presentation?.toolListing === "lean"
+      ? presentation.instructions !== undefined
+        ? `${LEAN_INSTRUCTIONS}\n\n${presentation.instructions}`
+        : LEAN_INSTRUCTIONS
+      : presentation?.instructions;
   return {
     serverInfo: {
       name: `metamcp-unified-${namespaceUuid}`,
@@ -130,9 +168,7 @@ export function buildServerMetadata(
         ? { title: presentation.title }
         : {}),
     },
-    ...(presentation?.instructions !== undefined
-      ? { instructions: presentation.instructions }
-      : {}),
+    ...(instructions !== undefined ? { instructions } : {}),
   };
 }
 
@@ -211,6 +247,3 @@ export function presentationFromInitParams(
     env,
   );
 }
-
-/** Inert stub: the workflow paragraph arrives with the implementation. */
-export const LEAN_INSTRUCTIONS = "";

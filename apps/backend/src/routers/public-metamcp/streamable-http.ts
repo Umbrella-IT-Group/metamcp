@@ -2091,7 +2091,7 @@ streamableHttpRouter.post(
         if (presentation !== undefined) {
           // Flags only: the text is administrator-written and stays out of logs.
           logger.info(
-            `Endpoint ${endpointName} presents custom settings to session ${newSessionId} (title: ${presentation.title !== undefined}, instructions: ${presentation.instructions !== undefined}, trimmed output schemas: ${presentation.omitOutputSchemas})`,
+            `Endpoint ${endpointName} presents custom settings to session ${newSessionId} (title: ${presentation.title !== undefined}, instructions: ${presentation.instructions !== undefined}, trimmed output schemas: ${presentation.omitOutputSchemas}, lean listing: ${presentation.toolListing === "lean"})`,
           );
         }
 
