@@ -16,6 +16,8 @@
  * Each backend carries a tripwire: its listing ends after 200 requests, so a
  * regression fails by assertion instead of hanging a worker.
  */
+import { inspect } from "node:util";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -37,7 +39,10 @@ import {
   vi,
 } from "vitest";
 
+import logger from "@/utils/logger";
+
 import type { ConnectedClient } from "./client";
+import { makeHttpRefusingBackend } from "./tool-call-harness.test-util";
 
 const { getSessionMock, syncToolsMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
@@ -125,7 +130,7 @@ const tool = (name: string): Tool => ({
 });
 
 /** A backend that pages `tools/list` by `pages[cursor ?? ""]`. */
-async function pagedBackend(pages: Pages) {
+async function pagedBackend(pages: Pages, firstPageKey = "") {
   let requests = 0;
   const server = new Server(
     { name: "ninja", version: "1.0.0" },
@@ -136,7 +141,7 @@ async function pagedBackend(pages: Pages) {
     // Tripwire: after 200 requests the listing simply ends, so an unguarded
     // loop finishes and fails the assertions instead of hanging the worker.
     if (requests > 200) return { tools: [] };
-    const page = pages[request.params?.cursor ?? ""];
+    const page = pages[request.params?.cursor ?? firstPageKey];
     return { tools: page.tools.map(tool), nextCursor: page.next };
   });
   server.setRequestHandler(CallToolRequestSchema, async (request) => ({
@@ -249,6 +254,24 @@ describe("a backend whose cursors cycle", () => {
     expect(update).not.toHaveBeenCalled();
   });
 
+  it("does not sync a subset when the next page uses an empty cursor", async () => {
+    const target = await pagedBackend(
+      {
+        start: { tools: ["a"], next: "" },
+        "": { tools: ["b"] },
+      },
+      "start",
+    );
+
+    expect(await listNames(await consumer())).toEqual(["ninja__a", "ninja__b"]);
+    expect(target.requests()).toBe(2);
+    expect(syncToolsMock).toHaveBeenCalledTimes(1);
+    expect(
+      syncToolsMock.mock.calls[0][0].tools.map((t: Tool) => t.name),
+    ).toEqual(["a", "b"]);
+    expect(truncationEvents()).toHaveLength(0);
+  });
+
   it("still writes a complete multi-page listing (control)", async () => {
     await pagedBackend({
       "": { tools: ["a"], next: "p2" },
@@ -296,6 +319,8 @@ describe("a tool lookup on a listing it cannot finish", () => {
     );
 
     expect(result.content).toEqual([{ type: "text", text: "ran b" }]);
+    expect(truncationEvents()).toHaveLength(1);
+    expect(truncationEvents()[0].message).toContain("(tool lookup)");
   });
 
   it("still says Unknown tool when a complete listing lacks the name (control)", async () => {
@@ -304,5 +329,43 @@ describe("a tool lookup on a listing it cannot finish", () => {
     const error = await callError(await consumer(), "ninja__z");
 
     expect(error.message).toContain("Unknown tool");
+  });
+});
+
+describe("refused backend listing logs", () => {
+  it.each([
+    [401, "list"],
+    [403, "list"],
+    [401, "lookup"],
+    [403, "lookup"],
+  ] as const)("keeps the HTTP %s body out of %s logs", async (status, mode) => {
+    const body = "private-backend-listing-response";
+    const target = await makeHttpRefusingBackend([status], { body });
+    cleanups.push(() => target.close());
+    getSessionMock.mockResolvedValue(target.session);
+    const logs = [logger.error, logger.warn, logger.info, logger.debug].map(
+      (fn) => vi.mocked(fn),
+    );
+    logs.forEach((fn) => fn.mockClear());
+    const c = await consumer();
+
+    if (mode === "list") {
+      await expect(listNames(c)).rejects.toMatchObject({
+        data: { code: "backend_unavailable" },
+      });
+    } else {
+      expect((await callError(c, "ninja__z")).message).toContain(
+        "tool_lookup_failed",
+      );
+    }
+
+    expect(target.requests).toContain("tools/list");
+    const messages = inspect(
+      logs.flatMap((fn) => fn.mock.calls),
+      { depth: null },
+    );
+    expect(messages).toContain(`HTTP ${status}`);
+    expect(messages).not.toContain(body);
+    expect(inspect(record.mock.calls, { depth: null })).not.toContain(body);
   });
 });

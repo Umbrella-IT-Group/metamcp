@@ -15,6 +15,7 @@ import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 
 import {
+  backendErrorForLogging,
   classifyBackendAuthRejection,
   describeBackendAuthRejection,
 } from "./backend-auth-rejection";
@@ -205,5 +206,24 @@ describe("describeBackendAuthRejection", () => {
     expect(describeBackendAuthRejection(403, "request")).not.toContain(
       "credentials",
     );
+  });
+});
+
+describe("backendErrorForLogging", () => {
+  it.each([401, 403] as const)(
+    "keeps a wrapped HTTP %s body out of logs",
+    async (status) => {
+      const error = new Error("wrapper", {
+        cause: await postError(status, "private response body"),
+      });
+      expect(backendErrorForLogging(error)).toBe(
+        `the backend answered the request with HTTP ${status}`,
+      );
+    },
+  );
+
+  it("preserves the diagnostic error for other failures", async () => {
+    const error = await postError(502, "bad gateway");
+    expect(backendErrorForLogging(error)).toBe(error);
   });
 });

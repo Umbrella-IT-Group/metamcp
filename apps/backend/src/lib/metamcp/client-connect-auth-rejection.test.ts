@@ -9,6 +9,8 @@
  * (client/streamableHttp.js, client/sse.js); and the connect loop's existing
  * contract that a 5xx retries `maxAttempts` times with backoff.
  */
+import { inspect } from "node:util";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SseError } from "@modelcontextprotocol/sdk/client/sse.js";
 import {
@@ -40,6 +42,8 @@ vi.mock("./server-error-tracker", () => ({
     markSuccess: vi.fn(),
   },
 }));
+
+import logger from "@/utils/logger";
 
 import { connectMetaMcpClient } from "./client";
 import { metamcpLogStore } from "./log-store";
@@ -234,26 +238,41 @@ describe("a 401/403 answer to one POST over a live connection", () => {
 
   describe("narrowness: every other transport error still drops", () => {
     async function dropFor(error: Error) {
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
       const state = backend({});
       const { client, attempt, onTransportDrop } = await connected(state);
       attempt.transport()?.onerror?.(error);
       await client?.cleanup();
+      expect(inspect(events())).not.toContain(BODY_SECRET);
+      expect(inspect(warn.mock.calls)).not.toContain(BODY_SECRET);
+      // The pool logs the callback's error too, so that boundary must carry
+      // only the fixed classification for a refused stream.
+      expect(inspect(onTransportDrop.mock.calls)).not.toContain(BODY_SECRET);
       return onTransportDrop;
     }
 
-    it("a refused SSE stream (SseError 401) is a dead channel", async () => {
-      const drop = await dropFor(
-        new SseError(401, "Unauthorized", {} as never),
-      );
-      expect(drop).toHaveBeenCalledWith("error", expect.any(Error));
-    });
+    it.each([401, 403] as const)(
+      "a refused SSE stream (%s) drops without logging its body",
+      async (status) => {
+        const drop = await dropFor(
+          new SseError(status, BODY_SECRET, {} as never),
+        );
+        expect(drop).toHaveBeenCalledWith("error", expect.any(Error));
+      },
+    );
 
-    it("a refused stream open (Failed to open SSE stream, 403) is a dead channel", async () => {
-      const drop = await dropFor(
-        new StreamableHTTPError(403, "Failed to open SSE stream: Forbidden"),
-      );
-      expect(drop).toHaveBeenCalledWith("error", expect.any(Error));
-    });
+    it.each([401, 403] as const)(
+      "a refused stream open (%s) drops without logging its body",
+      async (status) => {
+        const drop = await dropFor(
+          new StreamableHTTPError(
+            status,
+            `Failed to open SSE stream: ${BODY_SECRET}`,
+          ),
+        );
+        expect(drop).toHaveBeenCalledWith("error", expect.any(Error));
+      },
+    );
 
     it("an ordinary transport error still drops", async () => {
       const drop = await dropFor(new Error("terminated"));

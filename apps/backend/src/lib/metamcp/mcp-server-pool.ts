@@ -14,6 +14,7 @@ import logger from "@/utils/logger";
 // fully mocked in that test, so this is the only live db import the pool has.
 import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
+import { backendErrorForLogging } from "./backend-auth-rejection";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import {
   collectToolsListPages,
@@ -2386,7 +2387,7 @@ export class McpServerPool {
           // callback.
           logger.debug(
             `Tool-definition sweep: iteration failed for ${serverUuid}, skipping this tick:`,
-            error,
+            backendErrorForLogging(error),
           );
         }
       }

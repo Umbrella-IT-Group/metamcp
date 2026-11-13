@@ -114,15 +114,32 @@ describe("collectToolsListPages", () => {
     expect(result.stopped).toBeUndefined();
   });
 
-  it("treats an empty-string cursor as the end of the listing", async () => {
+  it("follows an empty-string cursor because cursors are opaque", async () => {
+    const requested: Array<string | undefined> = [];
+    const result = await collectToolsListPages(async (cursor) => {
+      requested.push(cursor);
+      return cursor === undefined
+        ? { tools: [{ name: "a" }], nextCursor: "" }
+        : { tools: [{ name: "b" }] };
+    });
+
+    expect(requested).toEqual([undefined, ""]);
+    expect(flattenToolPages(result).map((tool) => tool.name)).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(result.stopped).toBeUndefined();
+  });
+
+  it("reports a repeated empty-string cursor as truncation", async () => {
     const { fetchPage, requested } = backend({
       "": { tools: [{ name: "a" }], nextCursor: "" },
     });
 
     const result = await collectToolsListPages(fetchPage);
 
-    expect(requested).toHaveLength(1);
-    expect(result.stopped).toBeUndefined();
+    expect(requested).toEqual([undefined, ""]);
+    expect(result.stopped).toBe("cursor_repeat");
   });
 });
 

@@ -111,3 +111,15 @@ export function describeBackendAuthRejection(
   }
   return `the backend answered the request with HTTP ${status}`;
 }
+
+/**
+ * The value safe to put in a request-failure log. A classified refusal carries
+ * fixed text and status only, including when wrapped in a cause chain. Other
+ * failures keep their diagnostic error. Never use this for a consumer reply.
+ */
+export function backendErrorForLogging(error: unknown): unknown {
+  const rejection = classifyBackendAuthRejection(error);
+  return rejection
+    ? describeBackendAuthRejection(rejection.status, "request")
+    : error;
+}

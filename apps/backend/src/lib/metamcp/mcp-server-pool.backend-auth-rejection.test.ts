@@ -9,6 +9,9 @@
  * requests, fifty fresh cursors stop at the cap), now reported once per
  * server per window instead of silently.
  */
+import { inspect } from "node:util";
+
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { findAll } = vi.hoisted(() => ({ findAll: vi.fn() }));
@@ -181,6 +184,27 @@ describe("tool-definition sweep pagination guard", () => {
     });
     expect(truncations[0].message).toContain("tool-definition sweep");
   });
+
+  it.each([401, 403] as const)(
+    "keeps a refused sweep's HTTP %s body out of debug logs",
+    async (status) => {
+      const body = "private-sweep-response";
+      const debug = vi
+        .spyOn(logger, "debug")
+        .mockImplementation(() => undefined);
+      const client = stuckClient();
+      client.client.request.mockRejectedValue(
+        new StreamableHTTPError(status, `Error POSTing to endpoint: ${body}`),
+      );
+      internals.activeSessions["session-A"] = { "server-1": client };
+
+      await internals.sweepToolDefinitions();
+
+      expect(client.client.request).toHaveBeenCalledTimes(1);
+      expect(inspect(debug.mock.calls)).toContain(`HTTP ${status}`);
+      expect(inspect(debug.mock.calls)).not.toContain(body);
+    },
+  );
 
   it("does not report a listing of exactly the page cap that ends on its own", async () => {
     const record = vi

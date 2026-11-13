@@ -14,6 +14,8 @@
  *     server/utilities/pagination) and stops on a repeated cursor instead of
  *     hanging, as the MCP-surface listing does.
  */
+import { inspect } from "node:util";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -27,6 +29,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   makeBackend,
+  makeHttpRefusingBackend,
   OK,
   sendProgress,
   sleep,
@@ -75,6 +78,8 @@ vi.mock(
     createToolOverridesListToolsMiddleware: () => (next: unknown) => next,
   }),
 );
+
+import logger from "@/utils/logger";
 
 import { metamcpLogStore } from "../../../lib/metamcp/log-store";
 import { resetToolsListTruncationReportsForTesting } from "../../../lib/metamcp/paginate-tools-list";
@@ -262,6 +267,92 @@ describe("OpenAPI bridge tools/call: reset on progress and the total cap", () =>
     expect(error.message).toContain("Maximum total timeout exceeded");
     expect(target.calls[0].signal.aborted).toBe(false);
   });
+});
+
+const BODY_SECRET = "backend-body-text-that-must-not-be-logged";
+
+async function httpRefusingBackend(statuses: number[]) {
+  const made = await makeHttpRefusingBackend(statuses, {
+    serverName: "autotask",
+    body: BODY_SECRET,
+  });
+  cleanups.push(() => made.close());
+  getSessionMock.mockResolvedValue(made.session);
+  return { calls: () => made.requests.length };
+}
+
+describe("OpenAPI bridge backend refusal logging", () => {
+  it.each([
+    [401, false],
+    [403, false],
+    [401, true],
+    [403, true],
+  ] as const)(
+    "keeps HTTP %s response text out of the log (after recovery: %s)",
+    async (status, recover) => {
+      const log = vi.mocked(logger.error);
+      log.mockClear();
+      const target = await httpRefusingBackend(
+        recover ? [404, status] : [status],
+      );
+
+      // The consumer still receives the original error. Only the log changes.
+      await expect(
+        createOriginalCallToolHandler()(callRequest, context),
+      ).rejects.toMatchObject({
+        code: status,
+        message: expect.stringContaining(BODY_SECRET),
+      });
+
+      expect(target.calls()).toBe(recover ? 2 : 1);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(inspect(log.mock.calls)).toContain(`HTTP ${status}`);
+      expect(inspect(log.mock.calls)).not.toContain(BODY_SECRET);
+    },
+  );
+
+  it("keeps the diagnostic error for a non-auth HTTP failure", async () => {
+    const log = vi.mocked(logger.error);
+    log.mockClear();
+    await httpRefusingBackend([502]);
+
+    await expect(
+      createOriginalCallToolHandler()(callRequest, context),
+    ).rejects.toMatchObject({ code: 502 });
+
+    expect(inspect(log.mock.calls)).toContain(BODY_SECRET);
+  });
+});
+
+describe("OpenAPI bridge refused listing logs", () => {
+  it.each([
+    [401, false],
+    [403, false],
+    [401, true],
+    [403, true],
+  ] as const)(
+    "keeps HTTP %s bodies out of listing logs (audit: %s)",
+    async (status, audit) => {
+      await httpRefusingBackend([status]);
+      const logs = [logger.error, logger.warn, logger.info, logger.debug].map(
+        (fn) => vi.mocked(fn),
+      );
+      logs.forEach((fn) => fn.mockClear());
+
+      const result = await createOriginalListToolsHandler(false, { audit })(
+        { method: "tools/list", params: {} },
+        context,
+      );
+
+      expect(result.tools).toEqual([]);
+      const messages = inspect(
+        logs.flatMap((fn) => fn.mock.calls),
+        { depth: null },
+      );
+      expect(messages).toContain(`HTTP ${status}`);
+      expect(messages).not.toContain(BODY_SECRET);
+    },
+  );
 });
 
 describe("OpenAPI bridge tools/list paging", () => {

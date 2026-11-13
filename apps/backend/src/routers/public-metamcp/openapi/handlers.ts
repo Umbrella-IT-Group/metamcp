@@ -17,6 +17,7 @@ import {
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "../../../lib/metamcp/audit-listing-log";
+import { backendErrorForLogging } from "../../../lib/metamcp/backend-auth-rejection";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
 import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
@@ -243,9 +244,12 @@ export const createOriginalListToolsHandler = (
 
           allTools.push(...toolsWithSource);
         } catch (error) {
-          reportFailure(`Error fetching tools from: ${serverName}`, error);
+          reportFailure(
+            `Error fetching tools from: ${serverName}`,
+            backendErrorForLogging(error),
+          );
           noteAuditSkip(serverName || mcpServerUuid, () =>
-            describeListingFailure(error),
+            describeListingFailure(backendErrorForLogging(error)),
           );
           failedServers.push(serverName || mcpServerUuid);
         }
@@ -266,7 +270,9 @@ export const createOriginalListToolsHandler = (
       // provides its scrubbed cause; the served path needs the failure count
       // and marker, without inspecting or serializing an untrusted error.
       reportFailure(`Error preparing tools listing for: ${name}`);
-      noteAuditSkip(name, () => describeListingFailure(outcome.reason));
+      noteAuditSkip(name, () =>
+        describeListingFailure(backendErrorForLogging(outcome.reason)),
+      );
       failedServers.push(name);
     }
 
@@ -514,7 +520,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
           `Error calling tool ${JSON.stringify(name)} through ${
             targetSession.client.getServerVersion()?.name || "unknown"
           }:`,
-          error,
+          backendErrorForLogging(error),
         );
         throw error;
       }
@@ -564,7 +570,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
           `OpenAPI bridge: error calling tool ${JSON.stringify(name)} through ${
             freshSession.client.getServerVersion()?.name || "unknown"
           } after session re-initialize:`,
-          retryError,
+          backendErrorForLogging(retryError),
         );
         throw retryError;
       }

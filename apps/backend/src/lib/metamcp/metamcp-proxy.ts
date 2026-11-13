@@ -33,6 +33,7 @@ import {
   SEPARATOR_CAUSE,
 } from "./audit-listing-log";
 import {
+  backendErrorForLogging,
   classifyBackendAuthRejection,
   describeBackendAuthRejection,
 } from "./backend-auth-rejection";
@@ -912,11 +913,15 @@ export const createServer = async (
           // `failedServers` would hide the one signal that catches that
           // regression.
           if (!audit) {
-            logger.error(`Error fetching tools from: ${serverName}`, error);
+            logger.error(
+              `Error fetching tools from: ${serverName}`,
+              backendErrorForLogging(error),
+            );
           }
           noteAuditSkip(
             serverName || mcpServerUuid,
-            () => `${describeListingFailure(error)}${closedNote()}`,
+            () =>
+              `${describeListingFailure(backendErrorForLogging(error))}${closedNote()}`,
           );
           failedServers.push(serverName || mcpServerUuid);
           settledServerUuids.delete(mcpServerUuid);
@@ -940,7 +945,8 @@ export const createServer = async (
       }
       noteAuditSkip(
         params.name || mcpServerUuid,
-        () => `${describeListingFailure(outcome.reason)}${closedNote()}`,
+        () =>
+          `${describeListingFailure(backendErrorForLogging(outcome.reason))}${closedNote()}`,
       );
       failedServers.push(params.name || mcpServerUuid);
       settledServerUuids.delete(mcpServerUuid);
@@ -1087,9 +1093,10 @@ export const createServer = async (
       collected = await listToolPages(activeSession);
     } catch (error) {
       if (!isRecoverableBackendError(error)) {
+        const safeError = backendErrorForLogging(error);
         logger.warn(
           `Tool lookup on server ${candidate.uuid} failed while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool. (${
-            error instanceof Error ? error.message : String(error)
+            safeError instanceof Error ? safeError.message : String(safeError)
           })`,
         );
         return { kind: "lookup_failed" };
@@ -1133,11 +1140,10 @@ export const createServer = async (
       try {
         collected = await listToolPages(activeSession);
       } catch (retryError) {
+        const safeError = backendErrorForLogging(retryError);
         logger.warn(
           `Tool lookup on server ${candidate.uuid} failed again after session recovery while routing tool ${JSON.stringify(name)}. (${
-            retryError instanceof Error
-              ? retryError.message
-              : String(retryError)
+            safeError instanceof Error ? safeError.message : String(safeError)
           })`,
         );
         return { kind: "lookup_failed" };
@@ -1147,12 +1153,9 @@ export const createServer = async (
     const listed = collected.pages.some((page) =>
       page.tools?.some((tool: Tool) => tool.name === originalToolName),
     );
-    if (listed) return { kind: "found", session: activeSession };
+    // Report truncation even when the requested tool was found: successful
+    // lookups must not hide a backend whose listing never terminates.
     if (collected.stopped) {
-      // The listing was cut short, so a miss proves nothing: the tool may be
-      // past the cut point. Answering "absent" would tell the consumer the
-      // tool does not exist; a lookup that could not see the whole list
-      // answers "backend unavailable" instead (tool-call-routing.ts).
       reportToolsListTruncation({
         serverName,
         serverUuid: candidate.uuid,
@@ -1160,6 +1163,13 @@ export const createServer = async (
         pages: collected.pages.length,
         scope: "tool lookup",
       });
+    }
+    if (listed) return { kind: "found", session: activeSession };
+    if (collected.stopped) {
+      // The listing was cut short, so a miss proves nothing: the tool may be
+      // past the cut point. Answering "absent" would tell the consumer the
+      // tool does not exist; a lookup that could not see the whole list
+      // answers "backend unavailable" instead (tool-call-routing.ts).
       logger.warn(
         `Tool lookup on server ${candidate.uuid} could not see the whole tool list while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool.`,
       );

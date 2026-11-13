@@ -8,6 +8,7 @@
  * calls (they are hoisted per file) and passes `createServer` in.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
@@ -193,4 +194,61 @@ export class DroppableTransport implements Transport {
   drop(): void {
     this.onclose?.();
   }
+}
+
+/** Real HTTP transport refusal shapes, without opening a network connection. */
+export async function makeHttpRefusingBackend(
+  statuses: number[],
+  options: { serverName?: string; body?: string } = {},
+): Promise<{
+  session: ConnectedClient;
+  requests: string[];
+  close: () => Promise<void>;
+}> {
+  const requests: string[] = [];
+  const transport = new StreamableHTTPClientTransport(
+    new URL("https://backend.test/mcp"),
+    {
+      fetch: (async (_url: unknown, init?: RequestInit) => {
+        if ((init?.method ?? "GET") === "GET") {
+          return new Response(null, { status: 405 });
+        }
+        const request = JSON.parse(String(init?.body)) as {
+          id?: number;
+          method: string;
+        };
+        if (request.method === "initialize") {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: options.serverName ?? "ninja", version: "1" },
+            },
+          });
+        }
+        if (request.id === undefined) {
+          return new Response(null, { status: 202 });
+        }
+        const status = statuses[Math.min(requests.length, statuses.length - 1)];
+        requests.push(request.method);
+        return new Response(
+          status === 404 ? "Session not found" : (options.body ?? "denied"),
+          { status },
+        );
+      }) as typeof fetch,
+    },
+  );
+  const client = new Client({ name: "metamcp", version: "1" });
+  await client.connect(transport);
+  return {
+    session: {
+      client,
+      cleanup: () => client.close(),
+      listChangedSubscribers: new Set(),
+    },
+    requests,
+    close: () => client.close(),
+  };
 }

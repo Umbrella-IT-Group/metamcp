@@ -45,7 +45,9 @@ export async function collectToolsListPages<T extends { nextCursor?: string }>(
     pages.push(page);
 
     const next = page.nextCursor;
-    if (!next) return { pages };
+    // Cursors are opaque strings: even "" can identify another page. Only
+    // an absent cursor proves the listing is complete and safe to sync.
+    if (next === undefined) return { pages };
     if (requested.has(next) || next === cursor) {
       return { pages, stopped: "cursor_repeat" };
     }

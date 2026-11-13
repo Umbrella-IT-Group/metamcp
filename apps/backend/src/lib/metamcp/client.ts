@@ -858,10 +858,10 @@ export const connectMetaMcpClient = async (
           // sustained refusal still converges: the active health ping gets the
           // same answer, counts failures and invalidates, and the next
           // connect then names the credentials rejection.
-          const postRefusal = classifyBackendAuthRejection(transportError);
-          if (postRefusal?.via === "post") {
+          const authRejection = classifyBackendAuthRejection(transportError);
+          if (authRejection?.via === "post") {
             // Fixed text and status only; the body is the backend's text.
-            const refusalText = `A request to the backend was answered with HTTP ${postRefusal.status}; the connection is alive, so it stays pooled`;
+            const refusalText = `A request to the backend was answered with HTTP ${authRejection.status}; the connection is alive, so it stays pooled`;
             if (!announcedPostRefusal) {
               announcedPostRefusal = true;
               metamcpLogStore.record({
@@ -879,10 +879,15 @@ export const connectMetaMcpClient = async (
             return;
           }
           const age = formatConnectionAge(connectedAt);
-          const detail = describeConnectError(transportError);
+          const detail = authRejection
+            ? describeBackendAuthRejection(authRejection.status, "request")
+            : describeConnectError(transportError);
+          // A refused stream still drops, but its backend response body must
+          // reach neither the event nor the pool callback, which logs it too.
+          const dropError = authRejection ? new Error(detail) : transportError;
           logger.warn(
-            `Transport error for server ${serverParams.name} (${serverParams.uuid}) — ${detail} (${age}):`,
-            transportError,
+            `Transport error for server ${serverParams.name} (${serverParams.uuid}): ${detail} (${age})`,
+            ...(authRejection ? [] : [transportError]),
           );
           metamcpLogStore.record({
             category: "connection",
@@ -890,11 +895,11 @@ export const connectMetaMcpClient = async (
             serverUuid: serverParams.uuid,
             level: "warn",
             message: `Transport error (backend drop, ${detail}, ${age})`,
-            error: transportError,
+            ...(authRejection ? {} : { error: transportError }),
           });
           if (onTransportDrop) {
             try {
-              onTransportDrop("error", transportError);
+              onTransportDrop("error", dropError);
             } catch (cbError) {
               logger.warn(
                 `onTransportDrop(error) threw for server ${serverParams.name} (${serverParams.uuid}):`,
