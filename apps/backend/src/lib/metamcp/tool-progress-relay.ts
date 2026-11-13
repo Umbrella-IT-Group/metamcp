@@ -15,10 +15,20 @@
  * that floods cannot grow memory) and the drain stops for good after the
  * first failed send or once the consumer is gone.
  *
- * `flush` is awaited by the proxy before the call's result is returned, so
- * every relayed notification precedes the result on the stream. It is itself
- * bounded, and it closes the relay: a late notification is dropped instead of
- * being written after the result.
+ * `flush` is awaited by the proxy before the call's result is returned. The
+ * ordering guarantee is bounded, and this is the whole of it: progress is
+ * flushed before the result for up to five seconds (PROGRESS_FLUSH_MAX_MS);
+ * after that, queued progress is dropped and at most one send already in
+ * flight can arrive after the result, which clients ignore for a completed
+ * request. `flush` closes the relay either way, so nothing queued or arriving
+ * later is written.
+ *
+ * Why one send can still land after the result: a send is not abortable. The
+ * SDK's `sendNotification` takes no signal (NotificationOptions carries only a
+ * related request id), so a send that is in flight when the deadline passes
+ * cannot be cancelled and settles on its own. Making sends abortable would
+ * need a transport-level change; the bounded hold was chosen instead of
+ * holding a result for a stuck consumer link.
  */
 
 /** The consumer-chosen token echoed back (never the backend-facing one). */

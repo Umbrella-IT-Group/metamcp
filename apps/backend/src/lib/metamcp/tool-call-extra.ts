@@ -94,6 +94,16 @@ export function cancelPassthroughEnabled(
  * listener on the backend request signal and never removes it, so aborting
  * after the request finished would still send the backend a cancel for a
  * request that is already done.
+ *
+ * KNOWN SDK LIMITATION (read in SDK 1.32.0, shared/protocol.js `_oncancel`):
+ * a `notifications/cancelled` whose `requestId` is 0 is ignored, because the
+ * SDK tests the id for falsiness (`if (!notification.params.requestId)`). So
+ * the consumer's signal never aborts for a request with id 0 and this link
+ * never fires. A client's first request (`initialize`) takes id 0 in the
+ * TypeScript and Python SDKs, so a `tools/call` never carries id 0 from them
+ * and their cancels work. Only a client that numbers differently and calls a
+ * tool as its id 0 cannot cancel it. No workaround is built into SDK
+ * internals; recheck this on the next SDK bump.
  */
 export function linkCallerSignal(
   callerSignal: AbortSignal,

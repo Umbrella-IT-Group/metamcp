@@ -202,4 +202,49 @@ describe("createProgressRelay", () => {
 
     expect(sent.map((n) => n.params.progress)).toEqual([1]);
   });
+
+  it("holds the result for the full bound, then drops what is queued; only the send already in flight can settle after it", async () => {
+    // The qualified guarantee, as documented: flushed before the result for up
+    // to PROGRESS_FLUSH_MAX_MS; after that queued progress is dropped and at
+    // most one send already in flight can arrive after the result. A send is
+    // not abortable (the SDK's sendNotification takes no signal), so the stuck
+    // one settles on its own, after flush has released the result.
+    vi.useFakeTimers();
+    const events: string[] = [];
+    let finish: () => void = () => undefined;
+    const { relay, sent } = setup((n) =>
+      n.params.progress === 1
+        ? new Promise<void>((resolve) => {
+            finish = () => {
+              events.push("in-flight send settled");
+              resolve();
+            };
+          })
+        : Promise.resolve(),
+    );
+    relay.onprogress({ progress: 1 });
+    await turns();
+    relay.onprogress({ progress: 2 });
+    relay.onprogress({ progress: 3 });
+
+    const done = relay.flush().then(() => {
+      events.push("flush released the result");
+    });
+    await vi.advanceTimersByTimeAsync(PROGRESS_FLUSH_MAX_MS - 1);
+    // Still holding: the result is not released before the bound.
+    expect(events).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await done;
+    finish();
+    await turns();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(events).toEqual([
+      "flush released the result",
+      "in-flight send settled",
+    ]);
+    // Items 2 and 3 were queued behind the stuck send and never written.
+    expect(sent.map((n) => n.params.progress)).toEqual([1]);
+  });
 });
