@@ -126,11 +126,32 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    status writes the provisioning verbs call.
  *  - Four reads for answering "who owns what" without a browser: users,
  *    OAuth clients, access groups (list and get). None returns a credential.
+ *  - Access groups and who they admit: create, update and delete a group, add
+ *    and remove a member, map and unmap an endpoint, and the `restricted`
+ *    switch (an accessGroups procedure, not an endpoints one), with
+ *    `getEndpointAccess` as the read-back (it answers for an endpoint that has
+ *    no mapping, which the list and group-detail reads cannot). And
+ *    `namespaces.setToolPolicy`, the allow-all/allowlist switch of a namespace.
+ *    Each write is audited in the change's own transaction. A group
+ *    restriction cannot cut an operator key off: these procedures are reached
+ *    on /trpc and depend on no MCP endpoint.
+ *
+ * Left out on purpose, and still a human administrator's act in the UI: user
+ * disable, delete and role changes, and every OAuth client decision.
  */
 export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
   ...ADMIN_PLANE_SYNC_PROCEDURES,
+  "frontend.accessGroups.addEndpoint",
+  "frontend.accessGroups.addMember",
+  "frontend.accessGroups.create",
+  "frontend.accessGroups.delete",
   "frontend.accessGroups.get",
+  "frontend.accessGroups.getEndpointAccess",
   "frontend.accessGroups.list",
+  "frontend.accessGroups.removeEndpoint",
+  "frontend.accessGroups.removeMember",
+  "frontend.accessGroups.setEndpointRestricted",
+  "frontend.accessGroups.update",
   "frontend.apiKeys.create",
   "frontend.apiKeys.deactivate",
   "frontend.apiKeys.getGlobalIpPolicy",
@@ -141,6 +162,7 @@ export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
   "frontend.endpoints.update",
   "frontend.namespaces.create",
   "frontend.namespaces.refreshTools",
+  "frontend.namespaces.setToolPolicy",
   "frontend.namespaces.update",
   "frontend.namespaces.updateToolStatus",
   "frontend.oauthClients.list",

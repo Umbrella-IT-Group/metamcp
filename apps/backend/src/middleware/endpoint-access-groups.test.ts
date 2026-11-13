@@ -1,12 +1,12 @@
 /**
- * The access-group gate on the MCP bearer path (migration 0033).
+ * The access-group gate on the MCP bearer path (migration 0033), for OAuth
+ * sign-ins and for API keys by their owner.
  *
  * This is a PRODUCTION SECURITY BOUNDARY on a live gateway, so every claim it
  * makes is proved in both directions: the same request that is refused when the
- * user is not a member is SERVED once the membership query answers true, and
- * the same endpoint that refuses an OAuth caller SERVES an API-key caller. A
- * suite that only asserted the denial could not tell "the gate works" from "the
- * middleware is broken and refuses everything".
+ * user (or the key's owner) is not a member is SERVED once the membership query
+ * answers true. A suite that only asserted the denial could not tell "the gate
+ * works" from "the middleware is broken and refuses everything".
  *
  * Four properties, in the order they matter:
  *
@@ -16,8 +16,12 @@
  *   3. An endpoint that has NOT opted in behaves exactly as it did before this
  *      feature existed — no query, no cache entry, no behaviour change. This is
  *      the regression pin for the "ships wide open" requirement.
- *   4. API-key callers are untouched on a restricted endpoint, which is the
- *      deliberate scope boundary rather than a gap.
+ *   4. An API key is judged by its OWNER, for gateway-wide and endpoint-scoped
+ *      keys alike, on both API-key branches of the middleware: the owner a
+ *      member or an administrator is served, a non-member or an ownerless key
+ *      gets the same refusal sentence an OAuth user gets, and every other
+ *      refusal (disabled owner, wrong scope) keeps its own message and asks no
+ *      group question.
  *
  * Driven as real express middleware against fake req/res, the same harness as
  * api-key-oauth-audit.test.ts. The real cache and the real audit emitter are
@@ -353,50 +357,414 @@ describe("an endpoint that has not opted in is unchanged", () => {
   });
 });
 
-describe("API-key callers are the deliberate scope boundary", () => {
-  it("an API key is SERVED on a restricted endpoint", async () => {
-    validateApiKeyMock.mockResolvedValue({
-      valid: true,
-      user_id: OTHER_USER_ID,
-      key_uuid: KEY_UUID,
-      endpoint_uuid: null,
+const OWNER_ID = "user-key-owner";
+const SECOND_KEY_UUID = "66666666-6666-4666-8666-666666666666";
+
+/**
+ * A request carrying an API key, resolved to `owner` and scoped to `scopedTo`
+ * (null = gateway-wide), against `endpoint`.
+ */
+const asKey = (options: {
+  endpoint: DatabaseEndpoint;
+  owner?: string | null;
+  scopedTo?: string | null;
+  keyUuid?: string;
+}): Promise<{ served: boolean; res: FakeRes }> => {
+  validateApiKeyMock.mockResolvedValue({
+    valid: true,
+    user_id: options.owner === undefined ? OWNER_ID : options.owner,
+    key_uuid: options.keyUuid ?? KEY_UUID,
+    endpoint_uuid: options.scopedTo ?? null,
+  });
+  return authenticate({
+    endpoint: options.endpoint,
+    headers: { "x-api-key": API_KEY },
+  });
+};
+
+// Both API-key branches carry the owner rule, for both kinds of key. Either
+// branch or either kind left out would leave that endpoint shape governed by
+// OAuth sign-ins only, so every case below runs over all four combinations.
+const BRANCHES = [
+  [
+    "CONDITION 2 (API key only)",
+    { enable_api_key_auth: true, enable_oauth: false },
+  ],
+  [
+    "CONDITION 3 (API key and OAuth)",
+    { enable_api_key_auth: true, enable_oauth: true },
+  ],
+] as const;
+const KEY_KINDS = [
+  ["gateway-wide", null],
+  ["endpoint-scoped", ENDPOINT_UUID],
+] as const;
+
+describe.each(BRANCHES)("API-key owner rule on %s", (_branch, auth) => {
+  describe.each(KEY_KINDS)("with a %s key", (_kind, scopedTo) => {
+    const restrictedEndpoint = () =>
+      makeEndpoint({ restricted: true, ...auth });
+
+    it("SERVES a key whose owner belongs to a mapped group, and asks about that owner and endpoint", async () => {
+      hasEndpointGrantMock.mockResolvedValue(true);
+
+      const { served, res } = await asKey({
+        endpoint: restrictedEndpoint(),
+        scopedTo,
+      });
+
+      expect(served).toBe(true);
+      expect(res.statusCode).toBe(200);
+      expect(hasEndpointGrantMock).toHaveBeenCalledWith(
+        OWNER_ID,
+        ENDPOINT_UUID,
+      );
     });
 
-    const { served, res } = await authenticate({
-      endpoint: makeEndpoint({
-        restricted: true,
-        enable_api_key_auth: true,
-        enable_oauth: false,
-      }),
-      headers: { "x-api-key": API_KEY },
+    it("SERVES a key owned by an administrator with no membership at all", async () => {
+      findRoleByIdMock.mockResolvedValue("admin");
+      hasEndpointGrantMock.mockResolvedValue(false);
+
+      const { served } = await asKey({
+        endpoint: restrictedEndpoint(),
+        scopedTo,
+      });
+
+      expect(served).toBe(true);
     });
 
-    expect(served).toBe(true);
-    expect(res.statusCode).toBe(200);
-    // Not "it happened to pass" — the gate was never consulted for this
-    // credential class at all.
+    it("REFUSES a key whose owner is neither: 403, the exact sentence, and next() is not called", async () => {
+      const { served, res } = await asKey({
+        endpoint: restrictedEndpoint(),
+        scopedTo,
+      });
+
+      expect(served).toBe(false);
+      expect(res.statusCode).toBe(403);
+      // The same sentence an OAuth user sees, compared against the constant AND
+      // the literal so neither side can drift alone.
+      expect(res.body?.message).toBe(ENDPOINT_ACCESS_DENIED_MESSAGE);
+      expect(res.body?.message).toBe(
+        "Permission denied, this connector is not available for you. Please reach out to your administrator.",
+      );
+      expect(res.body?.error).toBe("Access denied");
+      // It names no endpoint, owner, key or group.
+      const body = JSON.stringify(res.body);
+      expect(body).not.toContain("autotask");
+      expect(body).not.toContain(ENDPOINT_UUID);
+      expect(body).not.toContain(OWNER_ID);
+      expect(body).not.toContain(KEY_UUID);
+    });
+
+    it("REFUSES an ownerless (public) key and asks no question, because there is nobody to be a member", async () => {
+      // Membership would answer true for anyone; an ownerless key must still
+      // be refused, so the refusal cannot be a by-product of the query.
+      hasEndpointGrantMock.mockResolvedValue(true);
+      findRoleByIdMock.mockResolvedValue("admin");
+
+      const { served, res } = await asKey({
+        endpoint: restrictedEndpoint(),
+        owner: null,
+        scopedTo,
+      });
+
+      expect(served).toBe(false);
+      expect(res.statusCode).toBe(403);
+      expect(res.body?.message).toBe(ENDPOINT_ACCESS_DENIED_MESSAGE);
+      expect(hasEndpointGrantMock).not.toHaveBeenCalled();
+      expect(findRoleByIdMock).not.toHaveBeenCalled();
+    });
+
+    it("gives a disabled owner the account refusal, not the group refusal, and asks no group question", async () => {
+      isDisabledMock.mockResolvedValue(true);
+      hasEndpointGrantMock.mockResolvedValue(true);
+
+      const { served, res } = await asKey({
+        endpoint: restrictedEndpoint(),
+        scopedTo,
+      });
+      await flush();
+
+      expect(served).toBe(false);
+      expect(res.statusCode).toBe(403);
+      expect(res.body?.message).toBe(
+        "This credential is not currently permitted to access this gateway.",
+      );
+      expect(hasEndpointGrantMock).not.toHaveBeenCalled();
+      expect(accessRows()).toHaveLength(0);
+    });
+
+    it("takes membership removal on the very next request once the cache is invalidated", async () => {
+      hasEndpointGrantMock.mockResolvedValue(true);
+      const endpoint = restrictedEndpoint();
+
+      const before = await asKey({ endpoint, scopedTo });
+      expect(before.served).toBe(true);
+
+      // What removeMember does after it commits.
+      hasEndpointGrantMock.mockResolvedValue(false);
+      invalidateEndpointAccessCache();
+
+      const after = await asKey({ endpoint, scopedTo });
+      expect(after.served).toBe(false);
+      expect(after.res.statusCode).toBe(403);
+      expect(after.res.body?.message).toBe(ENDPOINT_ACCESS_DENIED_MESSAGE);
+    });
+
+    it("fails closed with a 500 when the grant query fails, caches nothing, and recovers", async () => {
+      hasEndpointGrantMock.mockRejectedValue(
+        new Error("connection terminated unexpectedly"),
+      );
+      const endpoint = restrictedEndpoint();
+
+      const failed = await asKey({ endpoint, scopedTo });
+      expect(failed.served).toBe(false);
+      expect(failed.res.statusCode).toBe(500);
+      expect(__endpointAccessCacheSizeForTesting()).toBe(0);
+
+      hasEndpointGrantMock.mockResolvedValue(true);
+      const recovered = await asKey({ endpoint, scopedTo });
+      expect(recovered.served).toBe(true);
+    });
+
+    it("fails closed with a 500 when the role lookup fails, even though the grant query said yes", async () => {
+      findRoleByIdMock.mockRejectedValue(new Error("role lookup failed"));
+      hasEndpointGrantMock.mockResolvedValue(true);
+
+      const { served, res } = await asKey({
+        endpoint: restrictedEndpoint(),
+        scopedTo,
+      });
+
+      expect(served).toBe(false);
+      expect(res.statusCode).toBe(500);
+      expect(__endpointAccessCacheSizeForTesting()).toBe(0);
+    });
+
+    it("touches neither query nor the cache on an unrestricted endpoint, even for an ownerless key", async () => {
+      hasEndpointGrantMock.mockRejectedValue(new Error("must not be asked"));
+      findRoleByIdMock.mockRejectedValue(new Error("must not be asked"));
+
+      for (const owner of [OWNER_ID, null]) {
+        const { served, res } = await asKey({
+          endpoint: makeEndpoint({ restricted: false, ...auth }),
+          owner,
+          scopedTo,
+        });
+        expect(served).toBe(true);
+        expect(res.statusCode).toBe(200);
+      }
+      expect(hasEndpointGrantMock).not.toHaveBeenCalled();
+      expect(findRoleByIdMock).not.toHaveBeenCalled();
+      expect(__endpointAccessCacheSizeForTesting()).toBe(0);
+    });
+
+    it("writes one endpoint.access.denied row naming the key, its owner and its scope, and no raw key", async () => {
+      await asKey({ endpoint: restrictedEndpoint(), scopedTo });
+      await flush();
+
+      expect(accessRows()).toHaveLength(1);
+      const row = accessRows()[0];
+      expect(row.outcome).toBe("denied");
+      expect(row.actor_type).toBe("api_key");
+      expect(row.actor_id).toBe(KEY_UUID);
+      expect(row.target_id).toBe(ENDPOINT_UUID);
+      expect(row.http_status).toBe(403);
+      expect(row.detail?.reason).toBe("access_group_denied");
+      expect(row.detail?.auth_method).toBe("api_key");
+      expect(row.detail?.owner_user_id).toBe(OWNER_ID);
+      expect(row.detail?.key_scope).toBe(scopedTo ? "endpoint" : "gateway");
+      const credential = row.detail?.credential as {
+        sha256: string | null;
+        last4: string | null;
+      };
+      expect(credential.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(credential.last4).toBe(API_KEY.slice(-4));
+      expect(JSON.stringify(row)).not.toContain(API_KEY);
+    });
+
+    it("names an ownerless key's refusal with a null owner", async () => {
+      await asKey({ endpoint: restrictedEndpoint(), owner: null, scopedTo });
+      await flush();
+
+      expect(accessRows()).toHaveLength(1);
+      expect(accessRows()[0].detail?.owner_user_id).toBeNull();
+    });
+
+    it("throttles a hammering key to one row, counts the rest, and still refuses every attempt", async () => {
+      const endpoint = restrictedEndpoint();
+
+      for (let i = 0; i < 25; i += 1) {
+        __resetEndpointAccessCacheForTesting();
+        const { served } = await asKey({ endpoint, scopedTo });
+        expect(served).toBe(false);
+      }
+      await flush();
+
+      expect(accessRows()).toHaveLength(1);
+      expect(hasEndpointGrantMock).toHaveBeenCalledTimes(25);
+    });
+
+    it("gives two keys of one owner a first row each", async () => {
+      const endpoint = restrictedEndpoint();
+
+      for (let i = 0; i < 3; i += 1) {
+        __resetEndpointAccessCacheForTesting();
+        await asKey({ endpoint, scopedTo });
+      }
+      __resetEndpointAccessCacheForTesting();
+      await asKey({ endpoint, scopedTo, keyUuid: SECOND_KEY_UUID });
+      await flush();
+
+      expect(
+        accessRows()
+          .map((r) => r.actor_id)
+          .sort(),
+      ).toEqual([KEY_UUID, SECOND_KEY_UUID].sort());
+    });
+  });
+
+  it("keeps the scope message for a key aimed at another endpoint, and asks no group question", async () => {
+    hasEndpointGrantMock.mockResolvedValue(true);
+
+    const { served, res } = await asKey({
+      endpoint: makeEndpoint({ restricted: true, ...auth }),
+      scopedTo: OTHER_ENDPOINT_UUID,
+    });
+
+    expect(served).toBe(false);
+    expect(res.statusCode).toBe(403);
+    expect(String(res.body?.message)).toContain("scoped to a different");
+    expect(res.body?.message).not.toBe(ENDPOINT_ACCESS_DENIED_MESSAGE);
     expect(hasEndpointGrantMock).not.toHaveBeenCalled();
   });
 
-  it("an API key is served on a restricted endpoint that ALSO has OAuth on", async () => {
-    validateApiKeyMock.mockResolvedValue({
-      valid: true,
-      user_id: OTHER_USER_ID,
-      key_uuid: KEY_UUID,
-      endpoint_uuid: null,
+  it("keeps require_scoped_api_key as its own switch: a restricted endpoint that requires it still refuses a gateway-wide key with the scope message", async () => {
+    findRoleByIdMock.mockResolvedValue("admin");
+    const endpoint = makeEndpoint({
+      restricted: true,
+      require_scoped_api_key: true,
+      ...auth,
     });
 
-    const { served } = await authenticate({
+    const gatewayWide = await asKey({ endpoint, scopedTo: null });
+    expect(gatewayWide.served).toBe(false);
+    expect(String(gatewayWide.res.body?.message)).toContain(
+      "requires an endpoint-scoped API key",
+    );
+    expect(hasEndpointGrantMock).not.toHaveBeenCalled();
+
+    // The scoped key for the same endpoint is still judged by its owner.
+    const scoped = await asKey({ endpoint, scopedTo: ENDPOINT_UUID });
+    expect(scoped.served).toBe(true);
+  });
+
+  it("serves a key whose owner is a member, on a restricted endpoint that does not require scoped keys", async () => {
+    // The state `restricted` now leaves an endpoint in: gateway-wide keys are
+    // accepted and the owner rule governs them. This is the one-key-per-person
+    // case the change exists for.
+    hasEndpointGrantMock.mockResolvedValue(true);
+
+    const { served } = await asKey({
       endpoint: makeEndpoint({
         restricted: true,
-        enable_api_key_auth: true,
-        enable_oauth: true,
+        require_scoped_api_key: false,
+        ...auth,
       }),
-      headers: { "x-api-key": API_KEY },
+      scopedTo: null,
     });
 
     expect(served).toBe(true);
-    expect(hasEndpointGrantMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("one cache serves OAuth sign-ins and keys", () => {
+  it("decides an owner once whether the OAuth token or the key asks first", async () => {
+    hasEndpointGrantMock.mockResolvedValue(true);
+    const endpoint = makeEndpoint({
+      restricted: true,
+      enable_api_key_auth: true,
+      enable_oauth: true,
+    });
+
+    const viaOAuth = await asOAuthUser(OWNER_ID, endpoint);
+    const viaKey = await asKey({ endpoint, scopedTo: null });
+
+    expect(viaOAuth.served).toBe(true);
+    expect(viaKey.served).toBe(true);
+    expect(hasEndpointGrantMock).toHaveBeenCalledTimes(1);
+    expect(findRoleByIdMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops an owner's cached answer for a key and an OAuth token together on invalidation", async () => {
+    hasEndpointGrantMock.mockResolvedValue(true);
+    const endpoint = makeEndpoint({
+      restricted: true,
+      enable_api_key_auth: true,
+      enable_oauth: true,
+    });
+    await asKey({ endpoint, scopedTo: null });
+
+    hasEndpointGrantMock.mockResolvedValue(false);
+    invalidateEndpointAccessCache();
+
+    expect((await asKey({ endpoint, scopedTo: null })).served).toBe(false);
+    expect((await asOAuthUser(OWNER_ID, endpoint)).served).toBe(false);
+  });
+});
+
+describe("a role change reaches a key within the 60 second cache bound, not instantly", () => {
+  // The decision cache is the only thing between a demotion and the next
+  // request, and it is not invalidated by a role change. Stated, and pinned
+  // here, so nobody reads this feature as instant revocation: a demoted
+  // administrator's key keeps passing a restricted endpoint for up to
+  // ACCESS_DECISION_TTL_MS in each backend process. The clock is faked (Date
+  // only), never slept.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("serves an administrator-owned key until the entry is 60 s old, then refuses it once the owner is a member", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-12T12:00:00.000Z"));
+    const endpoint = makeEndpoint({
+      restricted: true,
+      enable_api_key_auth: true,
+      enable_oauth: false,
+    });
+
+    findRoleByIdMock.mockResolvedValue("admin");
+    expect((await asKey({ endpoint, scopedTo: null })).served).toBe(true);
+
+    // Demoted now. Nothing invalidates the cache.
+    findRoleByIdMock.mockResolvedValue("member");
+
+    vi.setSystemTime(new Date("2026-11-12T12:00:59.999Z"));
+    expect((await asKey({ endpoint, scopedTo: null })).served).toBe(true);
+    expect(findRoleByIdMock).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(new Date("2026-11-12T12:01:00.000Z"));
+    const refused = await asKey({ endpoint, scopedTo: null });
+    expect(refused.served).toBe(false);
+    expect(refused.res.statusCode).toBe(403);
+    expect(findRoleByIdMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a demotion wait out the bound when the cache is invalidated", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-12T12:00:00.000Z"));
+    const endpoint = makeEndpoint({
+      restricted: true,
+      enable_api_key_auth: true,
+      enable_oauth: false,
+    });
+    findRoleByIdMock.mockResolvedValue("admin");
+    await asKey({ endpoint, scopedTo: null });
+
+    findRoleByIdMock.mockResolvedValue("member");
+    invalidateEndpointAccessCache();
+
+    expect((await asKey({ endpoint, scopedTo: null })).served).toBe(false);
   });
 });
 

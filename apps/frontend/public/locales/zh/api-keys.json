@@ -57,7 +57,7 @@
   "adminPlaneScopeSync": "配置同步（CI）",
   "adminPlaneScopeSyncDescription": "仅限配置同步和每日漂移检查所调用的内容：服务器、命名空间和端点的读取，以及服务器的创建和更新。这是默认值，也是 CI 凭据应持有的范围。",
   "adminPlaneScopeOperator": "运维",
-  "adminPlaneScopeOperatorDescription": "包含配置同步范围的全部内容，另加运维工具：密钥清单、停用密钥、IP 策略、预配、用户、OAuth 客户端和访问组的只读列表，以及创建一种受限的数据平面密钥（锁定到简短的网络列表）。不能创建管理平面密钥或代理身份密钥。",
+  "adminPlaneScopeOperatorDescription": "包含配置同步范围的全部内容，另加运维工具：密钥清单、停用密钥、IP 策略、预配、管理访问组（成员、端点映射和限制开关）以及命名空间的工具策略、用户和 OAuth 客户端的只读列表，以及创建一种受限的数据平面密钥（锁定到简短的网络列表）。不能创建管理平面密钥或代理身份密钥，也不能停用用户或审批 OAuth 客户端。",
   "adminPlaneBadgeSync": "控制平面：配置同步",
   "adminPlaneBadgeOperator": "控制平面：运维"
 }

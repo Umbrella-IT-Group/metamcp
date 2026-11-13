@@ -12,12 +12,10 @@ export const createEndpointFormSchema = z.object({
   namespaceUuid: z.string().uuid("Please select a valid namespace"),
   enableApiKeyAuth: z.boolean(),
   requireScopedApiKey: z.boolean(),
-  // Access-group gate (OAuth callers). Exposed on create so an endpoint can be
-  // stood up already confined instead of being created open and locked down in
-  // a second step. When on, the server forces requireScopedApiKey on too (the
-  // two only compose when both are set: a restricted endpoint that still
-  // admits unscoped keys leaves the API-key path fully open), which is why the
-  // create dialog binds the two toggles together.
+  // Access-group gate (OAuth sign-ins and API keys by their owner). Exposed on
+  // create so an endpoint can be stood up already confined instead of being
+  // created open and locked down in a second step. Independent of
+  // requireScopedApiKey: the server stores each as submitted.
   restricted: z.boolean(),
   enableClientMaxRate: z.boolean(),
   enableMaxRate: z.boolean(),
@@ -77,11 +75,9 @@ export const CreateEndpointRequestSchema = z.object({
   // scoping the consumer's key before flipping enable_api_key_auth on a
   // sensitive endpoint.
   requireScopedApiKey: z.boolean().default(false),
-  // Access-group gate for OAuth callers, settable at create time. The
-  // implementation forces `requireScopedApiKey` true whenever this is true, so
-  // a restricted endpoint never ships with the API-key path left open (the two
-  // controls only confine an endpoint when both are set). Default false keeps
-  // an unspecified create as today's behaviour.
+  // Access-group gate (OAuth sign-ins and API keys by their owner), settable
+  // at create time. Independent of `requireScopedApiKey`: each is stored as
+  // submitted. Default false keeps an unspecified create as today's behaviour.
   restricted: z.boolean().default(false),
   enableClientMaxRate: z.boolean(),
   // Default ON: a new endpoint gets a per-credential tool-call ceiling out of
@@ -255,8 +251,7 @@ export const EndpointCreateInputSchema = z.object({
   enable_api_key_auth: z.boolean().optional().default(true),
   require_scoped_api_key: z.boolean().optional().default(false),
   // Access-group gate persisted at create time. Default false matches the
-  // column default; the create handler is what enforces the restricted =>
-  // require_scoped_api_key pairing before this reaches the row.
+  // column default. Independent of require_scoped_api_key.
   restricted: z.boolean().optional().default(false),
   enable_max_rate: z.boolean(),
   enable_client_max_rate: z.boolean(),

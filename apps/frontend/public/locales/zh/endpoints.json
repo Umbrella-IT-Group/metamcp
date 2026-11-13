@@ -128,5 +128,5 @@
   "requireScopedApiKey": "要求端点范围 API 密钥",
   "requireScopedApiKeyDescription": "仅接受限定到此端点的 API 密钥；拒绝网关级（无范围）密钥。仅适用于 API 密钥认证，不影响 OAuth 访问。",
   "restrictedLabel": "限制为访问组",
-  "restrictedDescription": "开启后，只有管理员和已映射访问组的成员才能通过 OAuth 访问此端点。开启同时会要求使用端点范围 API 密钥，因此网关级（无范围）密钥也会被拒绝。"
+  "restrictedDescription": "开启后，只有管理员和已映射访问组的成员才能访问此端点，无论是通过 OAuth 登录，还是使用其本人拥有的 API 密钥。没有所有者的密钥会被拒绝。这不会改变上方的端点范围密钥要求，那是一个独立的开关。"
 }

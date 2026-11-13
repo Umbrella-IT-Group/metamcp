@@ -1,14 +1,14 @@
 import { z } from "zod";
 
 /**
- * Named access groups (migration 0033): which OAuth users may reach which
+ * Named access groups (migration 0033): which people may reach which
  * endpoints.
  *
  * SCOPE, stated here because it is the first thing a reader of this contract
- * needs: these grants govern OAUTH callers only. An API key is minted by an
- * administrator and already carries its own per-endpoint scoping (migration
- * 0023), so it is a different trust class and is deliberately untouched — see
- * `checkOAuthAccess` and the README's Access Groups section.
+ * needs: these grants govern OAuth sign-ins and API keys. A key is judged by
+ * its OWNER, whether it is scoped to one endpoint or gateway-wide, and a key
+ * with no owner is refused on a restricted endpoint — see
+ * `lib/endpoint-access-control` and the README's Access groups section.
  */
 
 /**
@@ -68,17 +68,16 @@ export const AccessGroupEndpointSchema = z.object({
   // to say so — otherwise an operator reads a grant list as protection that is
   // not switched on.
   restricted: z.boolean(),
-  // `restricted` alone is not enough to answer that question. The gate governs
-  // OAuth callers only, so it is inert on an endpoint with `enable_oauth` off,
-  // and only partial on one that also accepts API keys. The badge needs all
-  // four to be honest.
+  // `restricted` alone is not enough to answer that question. The gate applies
+  // to OAuth sign-ins and to API keys by their owner, so it is inert only on an
+  // endpoint with both `enable_oauth` and `enable_api_key_auth` off. The badge
+  // needs both to be honest.
   enable_oauth: z.boolean(),
   enable_api_key_auth: z.boolean(),
-  // Whether the API-key plane is closed to unscoped gateway-wide keys. A
-  // restricted endpoint forces this on (see the endpoint create/update pairing),
-  // so a restricted endpoint that also accepts API keys is scoped-only, not
-  // wide open: the badge reads that as enforcing rather than as a bypass. Only
-  // a legacy row from before the pairing can be restricted with this still off.
+  // Whether gateway-wide keys are refused on this endpoint. Independent of
+  // `restricted`: restricting an endpoint does not turn it on, and a restricted
+  // endpoint with it off still admits a key whose owner may reach the
+  // endpoint. Carried so the panel can report both switches without a guess.
   require_scoped_api_key: z.boolean(),
 });
 
@@ -132,20 +131,19 @@ export const GetEndpointAccessRequestSchema = z.object({
  *
  * `enable_oauth` and `enable_api_key_auth` ride along because the gate's REAL
  * effect depends on them and the switch alone cannot express it. The gate
- * applies to OAuth callers only, so on an endpoint with `enable_oauth` off it
- * is inert no matter what `restricted` says, and on one that also accepts API
- * keys it narrows the OAuth half while every key holder still passes. Without
+ * applies to OAuth sign-ins and to API keys by their owner, so it is inert
+ * only on an endpoint that accepts neither, whatever `restricted` says. Without
  * these two fields the UI can only say "restricted", which an operator
- * reasonably reads as "locked down" in both of those cases.
+ * reasonably reads as "locked down" even when no caller can arrive through the
+ * gate.
  */
 export const EndpointAccessSchema = z.object({
   endpoint_uuid: z.string(),
   restricted: z.boolean(),
   enable_oauth: z.boolean(),
   enable_api_key_auth: z.boolean(),
-  // Carried so the panel can stop claiming "every API-key holder still passes"
-  // once the pairing has closed the unscoped path: a restricted endpoint forces
-  // this on, so the note only fires on a legacy row where it is still off.
+  // Carried so the panel can say whether gateway-wide keys are refused here
+  // outright, on top of the owner rule. Independent of `restricted`.
   require_scoped_api_key: z.boolean(),
   groups: z.array(
     z.object({

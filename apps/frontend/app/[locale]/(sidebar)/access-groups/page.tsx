@@ -62,7 +62,8 @@ import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 type CreateAccessGroupFormData = z.infer<typeof CreateAccessGroupRequestSchema>;
 
 /**
- * Access groups: which OAuth users may reach which endpoints (migration 0033).
+ * Access groups: which people may reach which endpoints, by OAuth sign-in or
+ * through an API key they own (migration 0033).
  *
  * DISTINCT FROM `/access`, which is the read-only inventory of every way into
  * this gateway (accounts, tokens, keys, clients). That page answers "who can
@@ -601,14 +602,14 @@ export default function AccessGroupsPage() {
                               {endpoint.name}
                             </TableCell>
                             <TableCell>
-                              {/* Four states, because `restricted` alone is not
-                                  the answer. The gate governs OAuth callers
-                                  only, so it is INERT on an endpoint with OAuth
-                                  off and PARTIAL on one that also accepts API
-                                  keys. Collapsing those into "Enforcing" is the
-                                  difference between a grant list an operator can
-                                  trust and one they misread as protection that
-                                  is already fully switched on. */}
+                              {/* Three states, because `restricted` alone is
+                                  not the answer. The gate applies to OAuth
+                                  sign-ins and to API keys by their owner, so it
+                                  is INERT only on an endpoint that accepts
+                                  neither. Collapsing that into "Enforcing" is
+                                  the difference between a grant list an
+                                  operator can trust and one they misread as
+                                  protection that is already switched on. */}
                               <Badge
                                 variant={
                                   endpointGateState(endpoint) === "enforcing"

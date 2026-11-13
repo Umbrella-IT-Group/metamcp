@@ -341,10 +341,12 @@ describeIfDb("read shapes the admin UI depends on", () => {
 
   it("findDetailByUuid carries the auth toggles the badge reads", async () => {
     // `restricted` alone cannot say whether a mapping does anything: the gate
-    // is OAuth-only, so it is inert with `enable_oauth` off and partial when
-    // API keys are also accepted. These two columns are what let the group
-    // screen distinguish those states instead of labelling all three
-    // "Enforcing".
+    // applies to OAuth sign-ins and to API keys by their owner, so it is inert
+    // only with both `enable_oauth` and `enable_api_key_auth` off. These
+    // columns are what let the group screen tell that case from the others
+    // instead of labelling all of them "Enforcing", and
+    // `require_scoped_api_key` rides along because the admin panel reports it
+    // (an independent switch, not implied by `restricted`).
     await db.execute(
       `UPDATE endpoints SET restricted = true, enable_oauth = false, enable_api_key_auth = true WHERE uuid = '${ENDPOINT_A}'` as never,
     );
@@ -360,6 +362,7 @@ describeIfDb("read shapes the admin UI depends on", () => {
         restricted: true,
         enable_oauth: false,
         enable_api_key_auth: true,
+        require_scoped_api_key: false,
       },
     ]);
   });
@@ -388,6 +391,23 @@ describeIfDb("read shapes the admin UI depends on", () => {
       .where(eq(schema.endpointsTable.uuid, ENDPOINT_A));
     expect(row.restricted).toBe(true);
 
+    // Restricting did not turn the scoped-key requirement on, and turning the
+    // gate off leaves it as it was: the two are independent switches.
+    expect(updated?.require_scoped_api_key).toBe(false);
+    const off = await repo.setEndpointRestricted(ENDPOINT_A, false);
+    expect(off?.restricted).toBe(false);
+    expect(off?.require_scoped_api_key).toBe(false);
+    await db
+      .update(schema.endpointsTable)
+      .set({ require_scoped_api_key: true })
+      .where(eq(schema.endpointsTable.uuid, ENDPOINT_A));
+    const on = await repo.setEndpointRestricted(ENDPOINT_A, true);
+    expect(on?.restricted).toBe(true);
+    expect(on?.require_scoped_api_key).toBe(true);
+    const back = await repo.setEndpointRestricted(ENDPOINT_A, false);
+    expect(back?.require_scoped_api_key).toBe(true);
+    await repo.setEndpointRestricted(ENDPOINT_A, true);
+
     // And the sibling endpoint was not swept along with it.
     const untouched = await db
       .select({
@@ -398,6 +418,27 @@ describeIfDb("read shapes the admin UI depends on", () => {
     expect(untouched.find((r) => r.uuid === ENDPOINT_B)?.restricted).toBe(
       false,
     );
+  });
+
+  it("hasEndpointGrant asks through the transaction it is given, and sees that transaction's own rows only", async () => {
+    // The agent mint asks whether a key's owner belongs to a group mapped to an
+    // endpoint inside its own transaction. A grant written in that transaction
+    // is visible to it and to nobody else until commit.
+    const group = await repo.create({ name: "tx-view" });
+    class Rollback extends Error {}
+    await expect(
+      db.transaction(async (tx) => {
+        await repo.addMember(group.uuid, MEMBER_ID, tx);
+        await repo.addEndpoint(group.uuid, ENDPOINT_A, tx);
+        expect(await repo.hasEndpointGrant(MEMBER_ID, ENDPOINT_A, tx)).toBe(
+          true,
+        );
+        // The pool, a different connection, sees nothing yet.
+        expect(await repo.hasEndpointGrant(MEMBER_ID, ENDPOINT_A)).toBe(false);
+        throw new Rollback();
+      }),
+    ).rejects.toBeInstanceOf(Rollback);
+    expect(await repo.hasEndpointGrant(MEMBER_ID, ENDPOINT_A)).toBe(false);
   });
 
   it("setEndpointRestricted on an unknown endpoint returns undefined", async () => {

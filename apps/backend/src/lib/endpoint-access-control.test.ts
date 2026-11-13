@@ -32,6 +32,7 @@ const {
   ACCESS_DENIAL_REPORT_INTERVAL_MS,
   ENDPOINT_ACCESS_DENIED_MESSAGE,
   isOAuthUserAllowedOnEndpoint,
+  isUserAllowedOnEndpoint,
   invalidateEndpointAccessCache,
   recordAccessDenial,
   __resetEndpointAccessCacheForTesting,
@@ -302,5 +303,32 @@ describe("the denial throttle", () => {
     // endpoint, both still get their first row.
     expect(recordAccessDenial("user-2", ENDPOINT.uuid).emit).toBe(true);
     expect(recordAccessDenial(USER, "endpoint-2").emit).toBe(true);
+  });
+});
+
+describe("the decision is one function for OAuth sign-ins and key owners", () => {
+  it("keeps the OAuth name as the same function, so one cache serves both callers", async () => {
+    expect(isOAuthUserAllowedOnEndpoint).toBe(isUserAllowedOnEndpoint);
+
+    hasEndpointGrantMock.mockResolvedValue(true);
+    await isUserAllowedOnEndpoint(USER, ENDPOINT);
+    await isOAuthUserAllowedOnEndpoint(USER, ENDPOINT);
+
+    expect(hasEndpointGrantMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the denial throttle, for keys", () => {
+  it("does not let a key's slot stand in for a user whose id is that key's uuid", () => {
+    // A key is throttled under `key:<uuid>`, so it cannot share a slot with a
+    // user id, whatever that id looks like.
+    const KEY_UUID = "44444444-4444-4444-8444-444444444444";
+    expect(recordAccessDenial(`key:${KEY_UUID}`, ENDPOINT.uuid).emit).toBe(
+      true,
+    );
+    expect(recordAccessDenial(KEY_UUID, ENDPOINT.uuid).emit).toBe(true);
+    expect(recordAccessDenial(`key:${KEY_UUID}`, ENDPOINT.uuid).emit).toBe(
+      false,
+    );
   });
 });

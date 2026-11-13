@@ -20,13 +20,23 @@ import {
  *  3. `user_id` names an existing user whose account is not disabled. Never
  *     null (the public, everyone key) and never omitted (which would default
  *     to the calling key's owner).
- *  4. Exactly one of `endpoint_uuid` (an existing, public, unrestricted
- *     endpoint) or `all_endpoints: true` (refused while any endpoint is
- *     restricted without requiring scoped keys). Together with rule 3 this is
- *     what keeps a key from reaching more than its owner can reach through
- *     OAuth: that reach is public endpoints, the owner's own private
- *     endpoints, and restricted endpoints only for administrators and group
- *     members, and the key is kept off the third kind.
+ *  4. Exactly one of `endpoint_uuid` (an existing PUBLIC endpoint) or
+ *     `all_endpoints: true`, and what each may reach follows the owner, not the
+ *     request:
+ *       - An endpoint-scoped key may name a restricted endpoint only when the
+ *         owner is an explicit member of a group mapped to it. An
+ *         administrator's role alone does not count at mint time, though it
+ *         does at request time: otherwise an operator key could mint an
+ *         admin-owned key for any restricted endpoint.
+ *       - A gateway-wide key is refused for an administrator-role owner,
+ *         because it would inherit the administrator's bypass on every
+ *         restricted endpoint. For any other owner it is allowed, since the
+ *         access-group rule decides each request by the owner's membership
+ *         (lib/endpoint-access-control), whichever endpoint the key is aimed
+ *         at.
+ *     Together with rule 3 this keeps a key from reaching more than its owner
+ *     can reach through OAuth. A human administrator's mint in the admin UI is
+ *     not held to this rule.
  *  5. An IP policy in the same request: `enforce`, one to eight entries, each
  *     IPv4 /24 or narrower and IPv6 /48 or narrower, IPv4-mapped IPv6 counted
  *     at its IPv4 width; refused while the global IP-policy kill switch is on.
@@ -51,7 +61,7 @@ export type MintRule =
   | "scope_choice"
   | "endpoint_missing"
   | "endpoint_not_eligible"
-  | "gateway_wide_blocked"
+  | "gateway_wide_admin_owner"
   | "ip_policy_shape"
   | "ip_policy_entries"
   | "ip_policy_too_wide"
@@ -103,12 +113,12 @@ export const MINT_REFUSALS: Readonly<
   endpoint_not_eligible: {
     code: "FORBIDDEN",
     message:
-      "endpoint_uuid must name a public endpoint that is not restricted. A key for any other endpoint is created in the admin UI.",
+      "endpoint_uuid must name a public endpoint, and a restricted one only when the key's owner is a member of a group mapped to it. A key for any other endpoint is created in the admin UI.",
   },
-  gateway_wide_blocked: {
+  gateway_wide_admin_owner: {
     code: "FORBIDDEN",
     message:
-      "A gateway-wide key cannot be created while any endpoint is restricted without requiring scoped keys.",
+      "A gateway-wide key cannot be created for an administrator, because it would reach every restricted endpoint. Scope the key to one endpoint, or create it in the admin UI.",
   },
   ip_policy_shape: {
     code: "BAD_REQUEST",
@@ -335,15 +345,38 @@ export function assertAgentSettableIpPolicy(policy: {
 }
 
 /**
- * Rule 4 against an endpoint row (read under lock in the transaction): a key
- * may be scoped only to a PUBLIC endpoint (no owner) that is not restricted.
- * One sentence for both reasons, so a refusal does not say which.
+ * Rule 4 for an endpoint-scoped key, against an endpoint row read under lock in
+ * the transaction: the endpoint must be PUBLIC (no owner), and when it is
+ * restricted the key's owner must be an explicit member of a group mapped to it
+ * (`ownerIsMappedMember`, read in the same transaction; the owner's role does
+ * not stand in for it). One sentence for every reason, so a refusal does not
+ * say which.
  */
-export function assertEndpointEligible(endpoint: {
-  user_id: string | null;
-  restricted: boolean;
-}): void {
-  if (endpoint.user_id !== null || endpoint.restricted !== false) {
+export function assertEndpointEligible(
+  endpoint: {
+    user_id: string | null;
+    restricted: boolean;
+  },
+  ownerIsMappedMember: boolean,
+): void {
+  if (endpoint.user_id !== null) {
     throw new ApiKeyMintRefusal("endpoint_not_eligible");
+  }
+  if (endpoint.restricted !== false && !ownerIsMappedMember) {
+    throw new ApiKeyMintRefusal("endpoint_not_eligible");
+  }
+}
+
+/**
+ * Rule 4 for a gateway-wide key, against the owner row read under lock in the
+ * transaction: an administrator-role owner is refused. The check is on the
+ * role exactly as the request-time gate reads it (`"admin"`), so the two cannot
+ * drift into a role this refuses and that passes.
+ */
+export function assertGatewayWideOwnerAllowed(owner: {
+  role: string | null;
+}): void {
+  if (owner.role === "admin") {
+    throw new ApiKeyMintRefusal("gateway_wide_admin_owner");
   }
 }

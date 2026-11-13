@@ -8,6 +8,7 @@ import {
   endpointsTable,
   usersTable,
 } from "../schema";
+import type { DbExecutor } from "./db-executor";
 
 /**
  * Named access groups and the grants they carry (migration 0033).
@@ -29,6 +30,11 @@ export class AccessGroupsRepository {
    * know WHICH group admitted them, and an endpoint mapped to several groups a
    * user belongs to must not drag a row per group back to compute `true`.
    *
+   * `executor` is the caller's transaction when it holds one: the agent mint
+   * asks the same question about the key's owner inside its own transaction,
+   * against the committed grants that transaction sees, rather than through the
+   * request cache. Omitted, the pool is used (the request-time gate).
+   *
    * Both indexes added by 0033 are used here — `access_group_members_user_id_idx`
    * for the filter and `access_group_endpoints_endpoint_uuid_idx` for the join
    * side. Neither composite primary key can serve this shape, because both have
@@ -37,8 +43,9 @@ export class AccessGroupsRepository {
   async hasEndpointGrant(
     userId: string,
     endpointUuid: string,
+    executor?: DbExecutor,
   ): Promise<boolean> {
-    const [row] = await db
+    const [row] = await (executor ?? db)
       .select({ group_uuid: accessGroupMembersTable.group_uuid })
       .from(accessGroupMembersTable)
       .innerJoin(
@@ -165,11 +172,9 @@ export class AccessGroupsRepository {
           name: endpointsTable.name,
           restricted: endpointsTable.restricted,
           // The auth toggles decide whether `restricted` gates anybody: the
-          // gate is OAuth-only, so it is inert with `enable_oauth` off and
-          // partial when API keys are also accepted AND unscoped keys still
-          // pass. `require_scoped_api_key` closes that API-key bypass (the
-          // pairing forces it on with `restricted`), so the badge needs it to
-          // tell a scoped-only endpoint from a wide-open one.
+          // gate applies to OAuth sign-ins and to API keys by their owner, so
+          // it is inert only when both `enable_oauth` and
+          // `enable_api_key_auth` are off.
           enable_oauth: endpointsTable.enable_oauth,
           enable_api_key_auth: endpointsTable.enable_api_key_auth,
           require_scoped_api_key: endpointsTable.require_scoped_api_key,
@@ -224,8 +229,15 @@ export class AccessGroupsRepository {
     }));
   }
 
-  async create(input: { name: string; description?: string | null }) {
-    const [created] = await db
+  // Every write below takes the caller's transaction when it holds one: a
+  // request authenticated by an admin-plane key records its audit row in the
+  // same transaction as the change (lib/audit/admin-write), so a change whose
+  // audit row cannot be written does not happen. Omitted, the pool is used.
+  async create(
+    input: { name: string; description?: string | null },
+    executor?: DbExecutor,
+  ) {
+    const [created] = await (executor ?? db)
       .insert(accessGroupsTable)
       .values({ name: input.name, description: input.description ?? null })
       .returning();
@@ -234,12 +246,15 @@ export class AccessGroupsRepository {
     return created;
   }
 
-  async update(input: {
-    uuid: string;
-    name: string;
-    description?: string | null;
-  }) {
-    const [updated] = await db
+  async update(
+    input: {
+      uuid: string;
+      name: string;
+      description?: string | null;
+    },
+    executor?: DbExecutor,
+  ) {
+    const [updated] = await (executor ?? db)
       .update(accessGroupsTable)
       .set({ name: input.name, description: input.description ?? null })
       .where(eq(accessGroupsTable.uuid, input.uuid))
@@ -248,9 +263,13 @@ export class AccessGroupsRepository {
     return updated;
   }
 
-  /** Returns the deleted row, or undefined when nothing matched. */
-  async deleteByUuid(uuid: string) {
-    const [deleted] = await db
+  /**
+   * Returns the deleted row, or undefined when nothing matched. The foreign
+   * keys cascade to every membership and mapping the group held, inside the same
+   * statement and so inside the caller's transaction when it passes one.
+   */
+  async deleteByUuid(uuid: string, executor?: DbExecutor) {
+    const [deleted] = await (executor ?? db)
       .delete(accessGroupsTable)
       .where(eq(accessGroupsTable.uuid, uuid))
       .returning();
@@ -267,8 +286,12 @@ export class AccessGroupsRepository {
    * `added` distinguishes the two so the audit row is not written for a
    * no-op — see the impl.
    */
-  async addMember(groupUuid: string, userId: string): Promise<boolean> {
-    const inserted = await db
+  async addMember(
+    groupUuid: string,
+    userId: string,
+    executor?: DbExecutor,
+  ): Promise<boolean> {
+    const inserted = await (executor ?? db)
       .insert(accessGroupMembersTable)
       .values({ group_uuid: groupUuid, user_id: userId })
       .onConflictDoNothing()
@@ -277,8 +300,12 @@ export class AccessGroupsRepository {
     return inserted.length > 0;
   }
 
-  async removeMember(groupUuid: string, userId: string): Promise<boolean> {
-    const deleted = await db
+  async removeMember(
+    groupUuid: string,
+    userId: string,
+    executor?: DbExecutor,
+  ): Promise<boolean> {
+    const deleted = await (executor ?? db)
       .delete(accessGroupMembersTable)
       .where(
         and(
@@ -291,8 +318,12 @@ export class AccessGroupsRepository {
     return deleted.length > 0;
   }
 
-  async addEndpoint(groupUuid: string, endpointUuid: string): Promise<boolean> {
-    const inserted = await db
+  async addEndpoint(
+    groupUuid: string,
+    endpointUuid: string,
+    executor?: DbExecutor,
+  ): Promise<boolean> {
+    const inserted = await (executor ?? db)
       .insert(accessGroupEndpointsTable)
       .values({ group_uuid: groupUuid, endpoint_uuid: endpointUuid })
       .onConflictDoNothing()
@@ -304,8 +335,9 @@ export class AccessGroupsRepository {
   async removeEndpoint(
     groupUuid: string,
     endpointUuid: string,
+    executor?: DbExecutor,
   ): Promise<boolean> {
-    const deleted = await db
+    const deleted = await (executor ?? db)
       .delete(accessGroupEndpointsTable)
       .where(
         and(
@@ -330,23 +362,23 @@ export class AccessGroupsRepository {
    * Returns the new row so the caller can emit the change and report the miss
    * when no endpoint matched.
    *
-   * Turning restriction ON also forces `require_scoped_api_key` ON in the same
-   * statement, pairing the API-key plane with the OAuth gate: a restricted
-   * endpoint must not keep admitting unscoped gateway-wide keys, or it is
-   * confined on one plane and open on the other. This is the primary path an
-   * operator uses to restrict a live endpoint, so the pairing has to hold here
-   * and not only on create/update. Turning restriction OFF leaves
-   * require_scoped_api_key as it was: keeping the more restrictive setting is
-   * safe, and the operator clears it deliberately if they want to.
+   * Sets `restricted` and nothing else, in both directions. It used to turn
+   * `require_scoped_api_key` on with `restricted`, to keep gateway-wide keys off
+   * a restricted endpoint while groups governed OAuth sign-ins only. Groups now
+   * govern API keys by their owner (see `lib/endpoint-access-control`), so the
+   * two switches are independent: an operator who also wants gateway-wide keys
+   * refused on the endpoint turns `require_scoped_api_key` on, and neither
+   * direction of this toggle touches it. `require_scoped_api_key` stays in the
+   * returned row because the audit row and the admin panel report it.
    */
-  async setEndpointRestricted(endpointUuid: string, restricted: boolean) {
-    const [updated] = await db
+  async setEndpointRestricted(
+    endpointUuid: string,
+    restricted: boolean,
+    executor?: DbExecutor,
+  ) {
+    const [updated] = await (executor ?? db)
       .update(endpointsTable)
-      .set(
-        restricted
-          ? { restricted, require_scoped_api_key: true, updated_at: new Date() }
-          : { restricted, updated_at: new Date() },
-      )
+      .set({ restricted, updated_at: new Date() })
       .where(eq(endpointsTable.uuid, endpointUuid))
       .returning({
         uuid: endpointsTable.uuid,
