@@ -1,6 +1,7 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { resolveRuntimeConnection } from "./runtime-connection";
@@ -31,7 +32,7 @@ export const pool = new Pool({
 pool.on("error", (err) => {
   // Log and continue so the process doesn't crash on idle client errors.
   // pg-pool will create a new client on the next checkout automatically.
-  logger.error("PostgreSQL pool error (ignored):", err);
+  logger.error("PostgreSQL pool error (ignored):", describeDbError(err));
 });
 
 export const db = drizzle(pool, { schema });

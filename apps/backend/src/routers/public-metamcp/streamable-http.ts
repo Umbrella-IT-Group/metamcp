@@ -17,6 +17,7 @@ import {
   mcpSessionsRepository,
   type PersistedMcpSession,
 } from "@/db/repositories/mcp-sessions.repo";
+import { describeDbError } from "@/lib/db-error-summary";
 import {
   ApiKeyAuthenticatedRequest,
   authenticateApiKey,
@@ -257,7 +258,7 @@ export async function resolveDeletableSession(
   } catch (lookupError) {
     logger.warn(
       `mcp_sessions lookup failed during DELETE for session ${sessionId}; treating as not found.`,
-      lookupError,
+      describeDbError(lookupError),
     );
     stored = null;
   }
@@ -722,7 +723,7 @@ async function recoverPersistedSessionOnce(
     // a security event.
     logger.error(
       `mcp_sessions lookup failed for session ${sessionId}; treating as not-found.`,
-      error,
+      describeDbError(error),
     );
     return { status: "not_found" };
   }
@@ -980,7 +981,7 @@ async function rebuildRecoveredTransport(
       .catch((error: unknown) =>
         logger.warn(
           `mcp_sessions touch failed for session ${sessionId}; pruner may reap prematurely.`,
-          error,
+          describeDbError(error),
         ),
       );
     logger.info(
@@ -1156,7 +1157,10 @@ const cleanupSessionInternal = async (
     if (eviction) {
       logger.error("Error during eviction cleanup; releasing in-memory state.");
     } else {
-      logger.error(`Error during cleanup of session ${sessionId}:`, error);
+      logger.error(
+        `Error during cleanup of session ${sessionId}:`,
+        describeDbError(error),
+      );
     }
     // Even if cleanup fails, remove the session from manager to prevent memory
     // leaks, unless the id now belongs to a newer transport (see above).
@@ -1208,7 +1212,7 @@ function deletePersistedSessionRow(sessionId: string): void {
   deleted.catch((error: unknown) =>
     logger.warn(
       `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
-      error,
+      describeDbError(error),
     ),
   );
 }
@@ -1284,7 +1288,10 @@ async function runMcpSessionPrune(): Promise<void> {
       );
     }
   } catch (error) {
-    logger.error("mcp_sessions pruner: postgres delete failed.", error);
+    logger.error(
+      "mcp_sessions pruner: postgres delete failed.",
+      describeDbError(error),
+    );
   }
 }
 
@@ -1400,7 +1407,10 @@ streamableHttpRouter.get("/health/sessions", async (req, res) => {
   try {
     isAdmin = await isAdminHealthRequest(req);
   } catch (error) {
-    logger.error("Admin check failed for /health/sessions:", error);
+    logger.error(
+      "Admin check failed for /health/sessions:",
+      describeDbError(error),
+    );
   }
 
   res.json(buildSessionsHealthPayload(isAdmin));
@@ -2237,7 +2247,7 @@ streamableHttpRouter.post(
             .catch((error: unknown) =>
               logger.warn(
                 `mcp_sessions persist failed for session ${newSessionId}; lazy-recovery will be unavailable for this consumer until next init.`,
-                error,
+                describeDbError(error),
               ),
             )
             .finally(() => {
@@ -2479,7 +2489,10 @@ streamableHttpRouter.delete(
           sessionId: sessionId,
         });
       } catch (error) {
-        logger.error("Error in public endpoint /mcp DELETE route:", error);
+        logger.error(
+          "Error in public endpoint /mcp DELETE route:",
+          describeDbError(error),
+        );
         // Constant body via the terminal error handler; no error message or
         // session id in the client-facing response.
         return next(error);

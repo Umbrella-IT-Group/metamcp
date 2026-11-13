@@ -1,6 +1,7 @@
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { isBackendUnavailableError } from "../../../lib/metamcp/backend-unavailable";
@@ -86,7 +87,10 @@ export const executeToolWithMiddleware = async (
     // line: `tool_name` is a URL-decoded path segment, so an embedded CR/LF
     // would forge whole log lines. Same discipline as the mcp-proxy
     // connection log.
-    logger.error(`Error executing tool ${JSON.stringify(toolName)}:`, error);
+    logger.error(
+      `Error executing tool ${JSON.stringify(toolName)}:`,
+      describeDbError(error),
+    );
 
     // Handle different types of errors
     if (isBackendUnavailableError(error)) {

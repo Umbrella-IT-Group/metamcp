@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 
 import { checkAuditStorage } from "@/lib/audit-storage/tripwire";
+import { describeDbError } from "@/lib/db-error-summary";
 import { pruneGatewayEvents } from "@/lib/gateway-events/retention";
 import { TOOL_AUDIT_RETENTION_DAYS } from "@/lib/tool-audit-retention";
 import logger from "@/utils/logger";
@@ -51,13 +52,16 @@ setInterval(
       await oauthRepository.cleanupExpired();
       logger.info("Cleaned up expired OAuth codes and tokens");
     } catch (error) {
-      logger.error("Error cleaning up expired OAuth entries:", error);
+      logger.error(
+        "Error cleaning up expired OAuth entries:",
+        describeDbError(error),
+      );
     }
     if (TOOL_AUDIT_RETENTION_DAYS > 0) {
       try {
         await toolCallAuditRepository.pruneOlderThan(TOOL_AUDIT_RETENTION_DAYS);
       } catch (error) {
-        logger.error("Error pruning tool_call_audit:", error);
+        logger.error("Error pruning tool_call_audit:", describeDbError(error));
       }
     }
     // Gateway activity history (migration 0031). Rides this interval for the

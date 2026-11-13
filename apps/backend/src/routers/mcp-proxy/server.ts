@@ -17,6 +17,7 @@ import express from "express";
 import { findActualExecutable } from "spawn-rx";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import {
   assertPublicMcpUrl,
   createGuardedFetch,
@@ -829,7 +830,7 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
               .catch((error) => {
                 logger.error(
                   `Error reporting StreamableHttp STDIO crash to server pool for ${serverUuid}:`,
-                  error,
+                  describeDbError(error),
                 );
               });
           } else {
@@ -884,7 +885,7 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
         );
       }
     } catch (error) {
-      logger.error("Error in /mcp POST route:", error);
+      logger.error("Error in /mcp POST route:", describeDbError(error));
       // Close what this request started unless it became a live session. The
       // proxy wiring or the first request can throw before
       // `onsessioninitialized` fills the session maps, and `cleanupSession`
@@ -1039,7 +1040,7 @@ serverRouter.get("/stdio", async (req, res) => {
           .catch((error) => {
             logger.error(
               `Error reporting STDIO crash to server pool for ${serverUuid}:`,
-              error,
+              describeDbError(error),
             );
           });
       } else {
@@ -1131,7 +1132,7 @@ serverRouter.get("/stdio", async (req, res) => {
       },
     });
   } catch (error) {
-    logger.error("Error in /stdio route:", error);
+    logger.error("Error in /stdio route:", describeDbError(error));
     res.status(500).json(error);
   }
 });
@@ -1210,7 +1211,7 @@ serverRouter.get("/sse", async (req, res) => {
       });
     }
   } catch (error) {
-    logger.error("Error in /sse route:", error);
+    logger.error("Error in /sse route:", describeDbError(error));
     res.status(500).json(error);
   }
 });

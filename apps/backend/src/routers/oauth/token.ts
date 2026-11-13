@@ -12,6 +12,7 @@ import {
   authRateLimiter,
   getPublicOAuthRateLimitIdentifier,
 } from "@/lib/auth-rate-limiter";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
@@ -630,7 +631,7 @@ tokenRouter.post("/oauth/token", rateLimitToken, async (req, res) => {
         "Supported grant types: authorization_code, refresh_token",
     });
   } catch (error) {
-    logger.error("Error in OAuth token endpoint:", error);
+    logger.error("Error in OAuth token endpoint:", describeDbError(error));
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",
@@ -1988,7 +1989,7 @@ tokenRouter.post("/oauth/introspect", async (req, res) => {
       sub: tokenData.user_id,
     });
   } catch (error) {
-    logger.error("Error in OAuth introspect endpoint:", error);
+    logger.error("Error in OAuth introspect endpoint:", describeDbError(error));
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",
@@ -2242,7 +2243,7 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
     // RFC 7009 specifies that revocation endpoint should return 200 OK
     res.status(200).send();
   } catch (error) {
-    logger.error("Error in OAuth revoke endpoint:", error);
+    logger.error("Error in OAuth revoke endpoint:", describeDbError(error));
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",

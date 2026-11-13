@@ -1,5 +1,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { configService } from "../config.service";
@@ -725,7 +726,10 @@ export class MetaMcpServerPool {
         );
       }
     } catch (error) {
-      logger.error("Error during automatic MetaMCP session cleanup:", error);
+      logger.error(
+        "Error during automatic MetaMCP session cleanup:",
+        describeDbError(error),
+      );
     }
   }
 

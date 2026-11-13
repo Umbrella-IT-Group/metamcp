@@ -1,5 +1,6 @@
 import { DatabaseMcpServer, ServerParameters } from "@repo/zod-types";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthSessionsRepository } from "../../db/repositories/oauth-sessions.repo";
@@ -143,7 +144,7 @@ export async function convertDbServerToParams(
   } catch (error) {
     logger.error(
       `Error converting server ${server.uuid} to parameters:`,
-      error,
+      describeDbError(error),
     );
     return null;
   }

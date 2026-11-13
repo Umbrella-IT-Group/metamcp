@@ -1,3 +1,4 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { configService } from "./config.service";
@@ -283,7 +284,7 @@ export class SessionLifetimeManagerImpl<T>
     } catch (error) {
       logger.error(
         `Error during automatic ${this.name} session cleanup:`,
-        error,
+        describeDbError(error),
       );
     }
   }

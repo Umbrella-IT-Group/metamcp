@@ -25,6 +25,7 @@
  *    proxy layer can answer the consumer with an actionable, typed tool
  *    error (+ enrollment elicitation) instead of an opaque 500.
  */
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 // TYPE-ONLY import: the drizzle client behind the repository throws at
@@ -309,7 +310,7 @@ export class M365MintService {
         .catch((persistError) => {
           logger.warn(
             `M365 broker: failed to mark reauth_required for user ${userId}:`,
-            persistError,
+            describeDbError(persistError),
           );
         });
 
@@ -375,7 +376,7 @@ export class M365MintService {
       } catch (error) {
         logger.warn(
           `M365 broker: rotation persist attempt ${attempt + 1}/2 failed for user ${userId}:`,
-          error,
+          describeDbError(error),
         );
       }
     }

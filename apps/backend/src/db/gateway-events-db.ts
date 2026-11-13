@@ -1,6 +1,7 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { resolveRuntimeConnection } from "./runtime-connection";
@@ -123,7 +124,10 @@ gatewayEventsPool.on("error", (err) => {
   // (database maintenance, a killed backend) emits an 'error' event on the
   // pool, and an unhandled one takes the process down. Logged and ignored;
   // pg-pool creates a fresh client on the next checkout.
-  logger.error("PostgreSQL gateway-events pool error (ignored):", err);
+  logger.error(
+    "PostgreSQL gateway-events pool error (ignored):",
+    describeDbError(err),
+  );
 });
 
 export const gatewayEventsDb = drizzle(gatewayEventsPool, { schema });

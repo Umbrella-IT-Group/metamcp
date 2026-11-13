@@ -1,6 +1,7 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { resolveRuntimeConnection } from "./runtime-connection";
@@ -79,7 +80,7 @@ auditPool.on("error", (err) => {
   // maintenance, a killed backend) emits an 'error' event on the pool, and an
   // unhandled one takes the process down. Logged and ignored; pg-pool creates
   // a fresh client on the next checkout.
-  logger.error("PostgreSQL audit pool error (ignored):", err);
+  logger.error("PostgreSQL audit pool error (ignored):", describeDbError(err));
 });
 
 export const auditDb = drizzle(auditPool, { schema });

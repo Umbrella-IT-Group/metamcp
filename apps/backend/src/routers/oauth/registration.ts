@@ -6,6 +6,7 @@ import {
   clampAuditTextList,
   emit,
 } from "@/lib/audit/audit-emitter";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
@@ -301,7 +302,10 @@ registrationRouter.post(
 
       res.status(201).json(response);
     } catch (error) {
-      logger.error("Error in OAuth registration endpoint:", error);
+      logger.error(
+        "Error in OAuth registration endpoint:",
+        describeDbError(error),
+      );
       res.status(500).json({
         error: "server_error",
         error_description: "Internal server error during client registration",

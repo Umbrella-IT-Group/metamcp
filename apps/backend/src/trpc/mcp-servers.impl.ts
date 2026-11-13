@@ -16,6 +16,7 @@ import {
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -172,7 +173,7 @@ export const mcpServersImplementations = {
         message: "MCP server created successfully",
       };
     } catch (error) {
-      logger.error("Error creating MCP server:", error);
+      logger.error("Error creating MCP server:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -199,7 +200,7 @@ export const mcpServersImplementations = {
         message: "MCP servers retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching MCP servers:", error);
+      logger.error("Error fetching MCP servers:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -229,7 +230,7 @@ export const mcpServersImplementations = {
         message: "MCP servers retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching all MCP servers:", error);
+      logger.error("Error fetching all MCP servers:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -310,7 +311,7 @@ export const mcpServersImplementations = {
             } catch (error) {
               logger.error(
                 `Error processing idle session for bulk imported server ${server.name} (${server.uuid}):`,
-                error,
+                describeDbError(error),
               );
             }
           });
@@ -350,7 +351,7 @@ export const mcpServersImplementations = {
         message: `Successfully imported ${imported} MCP servers${errors.length > 0 ? ` with ${errors.length} errors` : ""}`,
       };
     } catch (error) {
-      logger.error("Error bulk importing MCP servers:", error);
+      logger.error("Error bulk importing MCP servers:", describeDbError(error));
       return {
         success: false as const,
         imported: 0,
@@ -395,7 +396,7 @@ export const mcpServersImplementations = {
         message: "MCP server retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching MCP server:", error);
+      logger.error("Error fetching MCP server:", describeDbError(error));
       return {
         success: false as const,
         message: "Failed to fetch MCP server",
@@ -499,7 +500,7 @@ export const mcpServersImplementations = {
         message: "MCP server deleted successfully",
       };
     } catch (error) {
-      logger.error("Error deleting MCP server:", error);
+      logger.error("Error deleting MCP server:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -617,7 +618,7 @@ export const mcpServersImplementations = {
         } catch (error) {
           logger.error(
             `Error resetting error status for updated stdio server ${updatedServer.name} (${updatedServer.uuid}):`,
-            error,
+            describeDbError(error),
           );
         }
       }
@@ -692,7 +693,7 @@ export const mcpServersImplementations = {
         message: "MCP server updated successfully",
       };
     } catch (error) {
-      logger.error("Error updating MCP server:", error);
+      logger.error("Error updating MCP server:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -776,7 +777,7 @@ export const mcpServersImplementations = {
         .catch((error) => {
           logger.error(
             `Error resetting error state during reconnect of ${server.name} (${server.uuid}):`,
-            error,
+            describeDbError(error),
           );
         });
 
@@ -823,7 +824,7 @@ export const mcpServersImplementations = {
         message: "Server reconnected — tools re-list on the next request",
       };
     } catch (error) {
-      logger.error("Error reconnecting MCP server:", error);
+      logger.error("Error reconnecting MCP server:", describeDbError(error));
       return {
         success: false as const,
         message:

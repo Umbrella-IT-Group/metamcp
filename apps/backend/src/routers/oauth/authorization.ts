@@ -7,6 +7,7 @@ import {
   clampAuditText,
   emit,
 } from "@/lib/audit/audit-emitter";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
@@ -143,7 +144,7 @@ async function resolveSession(
       sessionId: typeof sessionId === "string" ? sessionId : null,
     };
   } catch (error) {
-    logger.info("OAuth session verification failed:", error);
+    logger.info("OAuth session verification failed:", describeDbError(error));
     return null;
   }
 }
@@ -576,7 +577,7 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     consentUrl.searchParams.set("areq", areq);
     res.redirect(consentUrl.toString());
   } catch (error) {
-    logger.error("Error in OAuth authorize endpoint:", error);
+    logger.error("Error in OAuth authorize endpoint:", describeDbError(error));
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",
@@ -709,7 +710,10 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
         : {}),
     });
   } catch (error) {
-    logger.error("Error in OAuth consent info endpoint:", error);
+    logger.error(
+      "Error in OAuth consent info endpoint:",
+      describeDbError(error),
+    );
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",
@@ -1034,7 +1038,10 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
 
     res.redirect(redirectUrl.toString());
   } catch (error) {
-    logger.error("Error in OAuth consent decision endpoint:", error);
+    logger.error(
+      "Error in OAuth consent decision endpoint:",
+      describeDbError(error),
+    );
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",
@@ -1131,7 +1138,7 @@ authorizationRouter.get("/oauth/callback", async (req, res) => {
       });
     }
   } catch (error) {
-    logger.error("Error in OAuth callback:", error);
+    logger.error("Error in OAuth callback:", describeDbError(error));
     res.status(500).send("OAuth callback error");
   }
 });

@@ -17,6 +17,7 @@ import {
 import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { emitAdminEvent } from "./audit/admin-event";
 import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
+import { describeDbError } from "./db-error-summary";
 import {
   MIN_BOOTSTRAP_PASSWORD_LENGTH,
   SHIPPED_PLACEHOLDER_AUTH_SECRET,
@@ -521,7 +522,7 @@ async function readRegistrationFlag(key: string): Promise<boolean | null> {
     // than a state the flag was ever in.
     console.warn(
       `⚠️ Failed to read current ${key} for the registration-control audit; assuming changed:`,
-      err,
+      describeDbError(err),
     );
     return null;
   }
@@ -594,7 +595,10 @@ async function applyRegistrationControls(config: EnvConfig): Promise<void> {
       });
     }
   } catch (err) {
-    console.warn("⚠️ Failed to set UI registration control:", err);
+    console.warn(
+      "⚠️ Failed to set UI registration control:",
+      describeDbError(err),
+    );
   }
 
   try {
@@ -619,7 +623,10 @@ async function applyRegistrationControls(config: EnvConfig): Promise<void> {
       });
     }
   } catch (err) {
-    console.warn("⚠️ Failed to set SSO registration control:", err);
+    console.warn(
+      "⚠️ Failed to set SSO registration control:",
+      describeDbError(err),
+    );
   }
 
   console.log(
@@ -641,7 +648,7 @@ async function shouldSkipBootstrap(config: EnvConfig): Promise<boolean> {
   } catch (err) {
     console.warn(
       "⚠️ Failed to read BOOTSTRAP_COMPLETE marker; proceeding with bootstrap.",
-      err,
+      describeDbError(err),
     );
   }
 
@@ -656,7 +663,10 @@ async function markBootstrapComplete(): Promise<void> {
       "One-time bootstrap completion marker",
     );
   } catch (err) {
-    console.warn("⚠️ Failed to write BOOTSTRAP_COMPLETE marker:", err);
+    console.warn(
+      "⚠️ Failed to write BOOTSTRAP_COMPLETE marker:",
+      describeDbError(err),
+    );
   }
 }
 
@@ -689,7 +699,7 @@ async function warnIfPasswordChanged(
   } catch (err) {
     console.warn(
       `⚠️ Failed password-change detection for ${email} (ignored):`,
-      err,
+      describeDbError(err),
     );
   }
 }
@@ -706,7 +716,10 @@ async function recordPasswordFingerprint(
       `Fingerprint of last-applied password for ${email}`,
     );
   } catch (err) {
-    console.warn(`⚠️ Failed to store password fingerprint for ${email}:`, err);
+    console.warn(
+      `⚠️ Failed to store password fingerprint for ${email}:`,
+      describeDbError(err),
+    );
   }
 }
 
@@ -857,7 +870,10 @@ async function ensureUser(
           );
         }
       } catch (err) {
-        console.warn(`⚠️ Failed to preserve API keys for ${email}:`, err);
+        console.warn(
+          `⚠️ Failed to preserve API keys for ${email}:`,
+          describeDbError(err),
+        );
       }
     }
 
@@ -866,7 +882,10 @@ async function ensureUser(
         .delete(accountsTable)
         .where(eq(accountsTable.userId, existing.id));
     } catch (err) {
-      console.warn(`⚠️ Failed to delete accounts for ${email}:`, err);
+      console.warn(
+        `⚠️ Failed to delete accounts for ${email}:`,
+        describeDbError(err),
+      );
     }
 
     try {
@@ -876,14 +895,17 @@ async function ensureUser(
     } catch (err) {
       console.warn(
         `⚠️ Failed to delete user-scoped API keys for ${email}:`,
-        err,
+        describeDbError(err),
       );
     }
 
     try {
       await db.delete(usersTable).where(eq(usersTable.id, existing.id));
     } catch (err) {
-      console.warn(`⚠️ Failed to delete existing user ${email}:`, err);
+      console.warn(
+        `⚠️ Failed to delete existing user ${email}:`,
+        describeDbError(err),
+      );
     }
   }
 
@@ -935,7 +957,10 @@ async function ensureUser(
       })
       .where(eq(usersTable.id, user.id));
   } catch (err) {
-    console.warn(`⚠️ Failed to update user metadata for ${email}:`, err);
+    console.warn(
+      `⚠️ Failed to update user metadata for ${email}:`,
+      describeDbError(err),
+    );
   }
 
   // NOTE: preserved keys are deliberately NOT restored here. The restore
@@ -1007,7 +1032,10 @@ async function bootstrapUsers(config: EnvConfig): Promise<{
         }
       }
     } catch (err) {
-      console.warn(`⚠️ Failed to bootstrap user ${userConfig.email}:`, err);
+      console.warn(
+        `⚠️ Failed to bootstrap user ${userConfig.email}:`,
+        describeDbError(err),
+      );
     }
   }
 
@@ -1044,7 +1072,7 @@ async function restorePreservedApiKeys(
     const total = pending.reduce((sum, p) => sum + p.keys.length, 0);
     console.warn(
       `⚠️ Failed to load endpoints for API key restore — ${total} preserved key(s) NOT restored (restoring blind could widen a scoped key to gateway-wide):`,
-      err,
+      describeDbError(err),
     );
     return;
   }
@@ -1069,7 +1097,7 @@ async function restorePreservedApiKeys(
       const total = pending.reduce((sum, p) => sum + p.keys.length, 0);
       console.warn(
         `⚠️ Failed to load users for API key restore — ${total} preserved key(s) NOT restored (identity-bound keys cannot be re-bound without the email → user map):`,
-        err,
+        describeDbError(err),
       );
       return;
     }
@@ -1117,7 +1145,7 @@ async function restorePreservedApiKeys(
         failed++;
         console.warn(
           `⚠️ Failed to restore preserved API key "${values.name}" for ${email}:`,
-          err,
+          describeDbError(err),
         );
       }
     }
@@ -1162,7 +1190,7 @@ async function maybeDeleteOtherUsers(
       .where(notInArray(usersTable.email, bootstrappedEmails));
     console.log("✓ Deleted other users");
   } catch (err) {
-    console.warn("⚠️ Failed to delete other users:", err);
+    console.warn("⚠️ Failed to delete other users:", describeDbError(err));
   }
 }
 
@@ -1349,7 +1377,7 @@ async function bootstrapApiKeys(
     } catch (err) {
       console.warn(
         `⚠️ Failed to bootstrap API key "${apiKeyConfig.name}":`,
-        err,
+        describeDbError(err),
       );
     }
   }
@@ -1459,7 +1487,10 @@ async function bootstrapNamespaces(
         }
       }
     } catch (err) {
-      console.warn(`⚠️ Failed to bootstrap namespace "${nsConfig.name}":`, err);
+      console.warn(
+        `⚠️ Failed to bootstrap namespace "${nsConfig.name}":`,
+        describeDbError(err),
+      );
     }
   }
 
@@ -1591,7 +1622,10 @@ async function bootstrapEndpoints(
         }
       }
     } catch (err) {
-      console.warn(`⚠️ Failed to bootstrap endpoint "${epConfig.name}":`, err);
+      console.warn(
+        `⚠️ Failed to bootstrap endpoint "${epConfig.name}":`,
+        describeDbError(err),
+      );
     }
   }
 }
@@ -1858,7 +1892,7 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
   try {
     ({ userMap, pendingApiKeyRestores } = await bootstrapUsers(config));
   } catch (err) {
-    console.warn("⚠️ Users bootstrap failed:", err);
+    console.warn("⚠️ Users bootstrap failed:", describeDbError(err));
     userMap = new Map();
     pendingApiKeyRestores = [];
   } finally {
@@ -1870,7 +1904,7 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
     const bootstrappedEmails = Array.from(userMap.keys());
     await maybeDeleteOtherUsers(config, bootstrappedEmails);
   } catch (err) {
-    console.warn("⚠️ User cleanup step failed:", err);
+    console.warn("⚠️ User cleanup step failed:", describeDbError(err));
   }
 
   // Registration controls, HERE and not earlier. The bootstrap exemption above
@@ -1890,7 +1924,7 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
     );
     await bootstrapApiKeys(config, userMap, pendingRestoreIds);
   } catch (err) {
-    console.warn("⚠️ API keys bootstrap failed:", err);
+    console.warn("⚠️ API keys bootstrap failed:", describeDbError(err));
   }
 
   // Bootstrap namespaces and collect UUID mappings
@@ -1898,7 +1932,7 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
   try {
     namespaceMap = await bootstrapNamespaces(config, userMap);
   } catch (err) {
-    console.warn("⚠️ Namespaces bootstrap failed:", err);
+    console.warn("⚠️ Namespaces bootstrap failed:", describeDbError(err));
     namespaceMap = new Map();
   }
 
@@ -1906,7 +1940,7 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
   try {
     await bootstrapEndpoints(config, namespaceMap, userMap);
   } catch (err) {
-    console.warn("⚠️ Endpoints bootstrap failed:", err);
+    console.warn("⚠️ Endpoints bootstrap failed:", describeDbError(err));
   }
 
   // Restore API keys preserved across a user recreate — AFTER endpoints, so
@@ -1916,7 +1950,7 @@ export async function initializeEnvironmentConfiguration(): Promise<void> {
   try {
     await restorePreservedApiKeys(pendingApiKeyRestores);
   } catch (err) {
-    console.warn("⚠️ Preserved API key restore failed:", err);
+    console.warn("⚠️ Preserved API key restore failed:", describeDbError(err));
   }
 
   // Mark one-time bootstrap complete

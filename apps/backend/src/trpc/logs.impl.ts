@@ -7,6 +7,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { gatewayEventsRepository } from "../db/repositories/gateway-events.repo";
@@ -133,7 +134,10 @@ export const logsImplementations = {
         serverNames,
       };
     } catch (error) {
-      logger.error("Error getting gateway event history:", error);
+      logger.error(
+        "Error getting gateway event history:",
+        describeDbError(error),
+      );
       throw new Error("Failed to get gateway event history");
     }
   },

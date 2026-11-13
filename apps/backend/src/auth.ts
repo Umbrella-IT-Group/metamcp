@@ -17,6 +17,7 @@ import {
 } from "./lib/audit/auth-hook-audit";
 import { isBootstrapSignupAllowed } from "./lib/bootstrap-signup-override";
 import { configService } from "./lib/config.service";
+import { describeDbError } from "./lib/db-error-summary";
 import { shouldRefuseAuthSecretInProduction } from "./lib/shipped-placeholders";
 import logger from "./utils/logger";
 
@@ -154,7 +155,7 @@ export async function logBasicAuthEnforcementState(): Promise<void> {
   } catch (err) {
     logger.warn(
       "Could not read DISABLE_BASIC_AUTH at boot; password-login posture unknown until first request:",
-      err,
+      describeDbError(err),
     );
   }
 }

@@ -12,6 +12,7 @@ import {
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../db/repositories";
@@ -159,7 +160,7 @@ export const oauthClientsImplementations = {
     try {
       await oauthRepository.upsertClient(client);
     } catch (error) {
-      logger.error("Error creating OAuth client:", error);
+      logger.error("Error creating OAuth client:", describeDbError(error));
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to create OAuth client",
@@ -319,7 +320,7 @@ export const oauthClientsImplementations = {
         clients: OAuthClientsSerializer.serializeOAuthClientList(clients),
       };
     } catch (error) {
-      logger.error("Error fetching OAuth clients:", error);
+      logger.error("Error fetching OAuth clients:", describeDbError(error));
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to fetch OAuth clients",
@@ -359,7 +360,7 @@ export const oauthClientsImplementations = {
         message: "OAuth client deleted successfully",
       };
     } catch (error) {
-      logger.error("Error deleting OAuth client:", error);
+      logger.error("Error deleting OAuth client:", describeDbError(error));
       return {
         success: false,
         message:

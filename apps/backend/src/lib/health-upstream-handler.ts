@@ -2,6 +2,7 @@ import { McpServerErrorStatusEnum } from "@repo/zod-types";
 import express from "express";
 
 import logger from "../utils/logger";
+import { describeDbError } from "./db-error-summary";
 import {
   buildUpstreamHealthBody,
   buildUpstreamHealthErrorBody,
@@ -187,7 +188,7 @@ export function createUpstreamHealthHandler(): express.RequestHandler {
       // Logged here, never serialised: the body is the constant from
       // ./health-upstream, because this endpoint answers unauthenticated
       // callers and a driver error's message names internal hosts and SQL.
-      logger.error("/health/upstream failed:", error);
+      logger.error("/health/upstream failed:", describeDbError(error));
       res.status(500).json(buildUpstreamHealthErrorBody());
     }
   };

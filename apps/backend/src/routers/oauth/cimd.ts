@@ -10,6 +10,7 @@ import {
   clampAuditTextList,
   emit,
 } from "@/lib/audit/audit-emitter";
+import { describeDbError } from "@/lib/db-error-summary";
 import {
   createGuardedFetch,
   type McpUrlGuardOptions,
@@ -491,7 +492,10 @@ async function fetchAndStore(
         return fail({ reason: "too_many_clients", transient: false });
       }
     } catch (error) {
-      logger.error("[oauth] client metadata row count failed:", error);
+      logger.error(
+        "[oauth] client metadata row count failed:",
+        describeDbError(error),
+      );
       return fail({ reason: "store_failed", transient: true });
     }
   }
@@ -524,7 +528,7 @@ async function fetchAndStore(
     // failure, and the operator reads this line.
     logger.error(
       `[oauth] client metadata row could not be stored client=${logId(clientId)}:`,
-      error,
+      describeDbError(error),
     );
     return fail({ reason: "store_failed", transient: true });
   }

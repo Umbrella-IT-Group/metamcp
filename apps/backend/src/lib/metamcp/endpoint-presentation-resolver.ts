@@ -1,3 +1,4 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -46,7 +47,7 @@ export async function resolveSessionPresentation(
   } catch (error) {
     logger.warn(
       "Endpoint presentation could not be read; serving this session with the default presentation.",
-      error,
+      describeDbError(error),
     );
     return undefined;
   }

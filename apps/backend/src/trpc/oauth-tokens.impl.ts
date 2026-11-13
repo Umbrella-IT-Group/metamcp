@@ -2,6 +2,7 @@ import { ListActiveOAuthTokensResponseSchema } from "@repo/zod-types";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../db/repositories";
@@ -32,7 +33,10 @@ export const oauthTokensImplementations = {
         tokens: OAuthTokensSerializer.serializeActiveTokenList(tokens),
       };
     } catch (error) {
-      logger.error("Error fetching active OAuth tokens:", error);
+      logger.error(
+        "Error fetching active OAuth tokens:",
+        describeDbError(error),
+      );
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to fetch active OAuth tokens",

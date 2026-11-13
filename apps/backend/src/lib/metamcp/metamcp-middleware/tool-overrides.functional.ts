@@ -1,6 +1,7 @@
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { and, eq } from "drizzle-orm";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { db } from "../../../db/index";
@@ -295,7 +296,7 @@ async function getToolOverrides(
   } catch (error) {
     logger.error(
       `Error fetching tool overrides for ${toolName} in namespace ${namespaceUuid}:`,
-      error,
+      describeDbError(error),
     );
     return null;
   }
@@ -403,7 +404,10 @@ async function applyToolOverrides(
 
         overriddenTools.push(overriddenTool);
       } catch (error) {
-        logger.error(`Error applying overrides for tool ${tool.name}:`, error);
+        logger.error(
+          `Error applying overrides for tool ${tool.name}:`,
+          describeDbError(error),
+        );
         // On error, include the tool as-is (fail-safe behavior)
         overriddenTools.push(tool);
       }
@@ -483,7 +487,7 @@ export async function mapOverrideNameToOriginal(
   } catch (error) {
     logger.error(
       `Error mapping override name ${toolName} to original in namespace ${namespaceUuid}:`,
-      error,
+      describeDbError(error),
     );
   }
 

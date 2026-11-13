@@ -21,6 +21,7 @@ import {
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -539,7 +540,7 @@ export const apiKeysImplementations = {
       if (error instanceof TRPCError) {
         throw error;
       }
-      logger.error("Error creating API key:", error);
+      logger.error("Error creating API key:", describeDbError(error));
       throw new Error(
         error instanceof Error ? error.message : "Internal server error",
       );
@@ -596,7 +597,7 @@ export const apiKeysImplementations = {
         apiKeys: ApiKeysSerializer.serializeApiKeyList(apiKeys),
       };
     } catch (error) {
-      logger.error("Error fetching API keys:", error);
+      logger.error("Error fetching API keys:", describeDbError(error));
       throw new Error("Failed to fetch API keys");
     }
   },
@@ -612,7 +613,7 @@ export const apiKeysImplementations = {
         apiKeys: ApiKeysSerializer.serializeAdminApiKeyList(apiKeys),
       };
     } catch (error) {
-      logger.error("Error fetching all API keys:", error);
+      logger.error("Error fetching all API keys:", describeDbError(error));
       throw new Error("Failed to fetch API keys");
     }
   },
@@ -673,7 +674,7 @@ export const apiKeysImplementations = {
 
       return ApiKeysSerializer.serializeApiKey(result);
     } catch (error) {
-      logger.error("Error updating API key:", error);
+      logger.error("Error updating API key:", describeDbError(error));
       throw new Error(
         error instanceof Error ? error.message : "Internal server error",
       );
@@ -707,7 +708,7 @@ export const apiKeysImplementations = {
         message: "API key deleted successfully",
       };
     } catch (error) {
-      logger.error("Error deleting API key:", error);
+      logger.error("Error deleting API key:", describeDbError(error));
       return {
         success: false,
         message:
@@ -1070,7 +1071,7 @@ export const apiKeysImplementations = {
         key_uuid: result.key_uuid,
       };
     } catch (error) {
-      logger.error("Error validating API key:", error);
+      logger.error("Error validating API key:", describeDbError(error));
       return { valid: false };
     }
   },

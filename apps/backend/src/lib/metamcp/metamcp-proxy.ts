@@ -18,6 +18,7 @@ import {
 import { McpServerErrorStatusEnum, ServerParameters } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
@@ -481,7 +482,7 @@ export const createServer = async (
       if (!audit) {
         logger.error(
           `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
-          error,
+          describeDbError(error),
         );
       }
       throw new McpError(
@@ -833,7 +834,7 @@ export const createServer = async (
           } catch (dbError) {
             logger.error(
               `Error syncing tools to database for server ${serverName}:`,
-              dbError,
+              describeDbError(dbError),
             );
           }
 

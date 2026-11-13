@@ -5,6 +5,7 @@ import {
 } from "@repo/zod-types";
 import { and, eq } from "drizzle-orm";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { db } from "../../db/index";
@@ -120,7 +121,10 @@ export async function getMcpServers(
     }
     return serverDict;
   } catch (error) {
-    logger.error("Error fetching active MCP servers from database:", error);
+    logger.error(
+      "Error fetching active MCP servers from database:",
+      describeDbError(error),
+    );
     return {};
   }
 }

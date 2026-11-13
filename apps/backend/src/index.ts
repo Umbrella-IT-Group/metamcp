@@ -7,6 +7,7 @@ import { convergeConfiguredAdmins } from "./lib/admin-converge";
 import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
 import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
+import { describeDbError } from "./lib/db-error-summary";
 import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import {
   declaredLengthGuard,
@@ -147,7 +148,10 @@ async function start(): Promise<void> {
   try {
     await verifyRuntimeDatabaseRole();
   } catch (err) {
-    logger.error("Runtime DB role check failed (continuing):", err);
+    logger.error(
+      "Runtime DB role check failed (continuing):",
+      describeDbError(err),
+    );
   }
 
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
@@ -164,7 +168,10 @@ async function start(): Promise<void> {
   try {
     await convergeConfiguredAdmins();
   } catch (err) {
-    logger.error("Admin converge: unexpected error (ignored):", err);
+    logger.error(
+      "Admin converge: unexpected error (ignored):",
+      describeDbError(err),
+    );
   }
 
   // Encrypt any legacy plaintext mcp_servers.bearer_token once, then arm the
@@ -178,7 +185,10 @@ async function start(): Promise<void> {
   try {
     await convergeServerBearerTokens();
   } catch (err) {
-    logger.error("Bearer-token converge: unexpected error (ignored):", err);
+    logger.error(
+      "Bearer-token converge: unexpected error (ignored):",
+      describeDbError(err),
+    );
   }
 
   // Auto-nuke pre-deploy `mcp_sessions` rows ONLY when the advertised
@@ -211,7 +221,10 @@ async function start(): Promise<void> {
     // DB call. This outer guard exists so any future refactor that
     // throws out of the helper (e.g. a constructor error) still
     // doesn't crash the gateway on boot.
-    logger.error("Auto-nuke: unexpected error (ignored):", err);
+    logger.error(
+      "Auto-nuke: unexpected error (ignored):",
+      describeDbError(err),
+    );
   }
 
   // Retired-tool map: load it now so the boot log says how many entries are in
@@ -285,7 +298,7 @@ async function start(): Promise<void> {
 }
 
 start().catch((err) => {
-  console.error("❌ Fatal startup error:", err);
+  console.error("❌ Fatal startup error:", describeDbError(err));
   // Do not throw - keep consistent with other startup behavior
 });
 

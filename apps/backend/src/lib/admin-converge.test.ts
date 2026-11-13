@@ -396,9 +396,11 @@ describe("convergeConfiguredAdmins: failures never stop the boot", () => {
 
     expect(result.promoted).toEqual(["u-other"]);
     expect(auditRows.map((r) => r.target_id)).toEqual(["u-other"]);
+    // The failure is reported as the log-safe summary (class and database
+    // codes), never the raw error: a write error can quote the row it failed on.
     expect(loggerMock.error).toHaveBeenCalledWith(
       expect.stringContaining("failed to promote user u-member"),
-      expect.any(Error),
+      "Error",
     );
   });
 
@@ -457,7 +459,7 @@ describe("convergeConfiguredAdmins: failures never stop the boot", () => {
     expect(result.admins).toBeNull();
     expect(loggerMock.error).toHaveBeenCalledWith(
       expect.stringContaining("could not count administrators"),
-      expect.any(Error),
+      "Error",
     );
   });
 });
