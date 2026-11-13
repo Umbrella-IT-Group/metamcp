@@ -1,0 +1,105 @@
+{
+  "$comment": "Synthetic tool listing for tests. The input schema has the shape pydantic 2.13.5 emits for TypeAdapter(f).json_schema() where f takes (query: Optional[str] = None, include_closed: bool = False, page: Optional[int] = None, filt: Optional[Filt] = None, tags: Optional[list[str]] = None) and Filt is (status: Optional[Literal['open','closed']] = None, limit: int = 50). Every optional parameter is anyOf [X, null] with default null, and there is no required array because every parameter has a default. The descriptions on query and filt were added by hand: pydantic puts a Field description on the OUTER schema, next to anyOf. prunedVariant is the same tool with title and additionalProperties removed, the way a server that trims schemas would send it.",
+  "tool": {
+    "name": "search_items",
+    "description": "Search items by text and filter.",
+    "inputSchema": {
+      "$defs": {
+        "Filt": {
+          "properties": {
+            "status": {
+              "anyOf": [
+                { "enum": ["open", "closed"], "type": "string" },
+                { "type": "null" }
+              ],
+              "default": null,
+              "title": "Status"
+            },
+            "limit": { "default": 50, "title": "Limit", "type": "integer" }
+          },
+          "title": "Filt",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "query": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "default": null,
+          "description": "Search text",
+          "title": "Query"
+        },
+        "include_closed": {
+          "default": false,
+          "title": "Include Closed",
+          "type": "boolean"
+        },
+        "page": {
+          "anyOf": [{ "type": "integer" }, { "type": "null" }],
+          "default": null,
+          "title": "Page"
+        },
+        "filt": {
+          "anyOf": [{ "$ref": "#/$defs/Filt" }, { "type": "null" }],
+          "default": null,
+          "description": "Optional filter"
+        },
+        "tags": {
+          "anyOf": [
+            { "items": { "type": "string" }, "type": "array" },
+            { "type": "null" }
+          ],
+          "default": null,
+          "title": "Tags"
+        }
+      },
+      "type": "object",
+      "additionalProperties": false
+    }
+  },
+  "prunedVariant": {
+    "name": "search_items",
+    "description": "Search items by text and filter.",
+    "inputSchema": {
+      "$defs": {
+        "Filt": {
+          "properties": {
+            "status": {
+              "anyOf": [
+                { "enum": ["open", "closed"], "type": "string" },
+                { "type": "null" }
+              ],
+              "default": null
+            },
+            "limit": { "default": 50, "type": "integer" }
+          },
+          "type": "object"
+        }
+      },
+      "properties": {
+        "query": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "default": null,
+          "description": "Search text"
+        },
+        "include_closed": { "default": false, "type": "boolean" },
+        "page": {
+          "anyOf": [{ "type": "integer" }, { "type": "null" }],
+          "default": null
+        },
+        "filt": {
+          "anyOf": [{ "$ref": "#/$defs/Filt" }, { "type": "null" }],
+          "default": null,
+          "description": "Optional filter"
+        },
+        "tags": {
+          "anyOf": [
+            { "items": { "type": "string" }, "type": "array" },
+            { "type": "null" }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    }
+  }
+}

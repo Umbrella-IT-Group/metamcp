@@ -42,6 +42,7 @@ import { SESSION_KEYS } from "@/lib/constants";
 
 import { ConnectionStatus } from "../lib/constants";
 import { getAppUrl } from "../lib/env";
+import { resolveRequestTimeouts } from "../lib/mcp-request-options";
 import {
   Notification,
   StdErrNotificationSchema,
@@ -139,16 +140,23 @@ export function useConnection({
       try {
         const abortController = new AbortController();
 
-        // Get configurable timeout values from database, similar to backend metamcp-proxy.ts
+        // Get configurable timeout values from database, similar to backend metamcp-proxy.ts.
+        // The fallbacks apply only while a setting has not loaded; a stored
+        // value is used as stored (see lib/mcp-request-options.ts).
         const mcpRequestOptions: RequestOptions = {
           signal: options?.signal ?? abortController.signal,
-          resetTimeoutOnProgress:
-            options?.resetTimeoutOnProgress ??
-            mcpResetTimeoutOnProgress ??
-            true,
-          timeout: options?.timeout ?? mcpTimeout ?? 60000,
-          maxTotalTimeout:
-            options?.maxTotalTimeout ?? mcpMaxTotalTimeout ?? 60000,
+          ...resolveRequestTimeouts(
+            {
+              resetTimeoutOnProgress: mcpResetTimeoutOnProgress,
+              timeout: mcpTimeout,
+              maxTotalTimeout: mcpMaxTotalTimeout,
+            },
+            {
+              resetTimeoutOnProgress: options?.resetTimeoutOnProgress,
+              timeout: options?.timeout,
+              maxTotalTimeout: options?.maxTotalTimeout,
+            },
+          ),
         };
 
         // If progress notifications are enabled, add an onprogress hook to the MCP Client request options

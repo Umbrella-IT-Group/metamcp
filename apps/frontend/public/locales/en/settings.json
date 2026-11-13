@@ -11,7 +11,7 @@
   "disableBasicAuthDescription": "When enabled, users will not be able to sign in using email/password. Only SSO/OIDC authentication will be available.",
   "mcpSettings": "MCP Settings",
   "mcpSettingsDescription": "Configure Model Context Protocol timeout and behavior settings",
-  "mcpResetTimeoutOnProgress": "Reset Timeout on Progress (Under Development)",
+  "mcpResetTimeoutOnProgress": "Reset Timeout on Progress",
   "mcpResetTimeoutOnProgressDescription": "When enabled, the timeout will reset each time progress is made on an MCP request",
   "mcpTimeout": "MCP Request Timeout",
   "mcpTimeoutDescription": "Timeout for individual MCP requests in milliseconds (1-86400 seconds)",
