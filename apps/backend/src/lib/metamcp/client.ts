@@ -390,8 +390,12 @@ export const transformDockerUrl = (url: string): string => {
  * minted inside the guard and set only on a hop that is internal by resolved,
  * pinned address, never on a host trusted by allowlist name
  * (`InternalOnlyCredentials` in `url-guard.ts`).
+ *
+ * Exported for the admin Inspector proxy (`routers/mcp-proxy/server.ts`),
+ * which opens a registered server by uuid under this same posture, so the two
+ * paths cannot drift apart.
  */
-const POOL_GUARD_OPTIONS: McpUrlGuardOptions = Object.freeze({
+export const POOL_GUARD_OPTIONS: McpUrlGuardOptions = Object.freeze({
   allowPrivateAddresses: true,
   refuseCrossOriginRedirect: true,
   internalOnlyHeaders: [
