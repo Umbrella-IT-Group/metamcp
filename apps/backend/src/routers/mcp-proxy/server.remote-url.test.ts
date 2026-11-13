@@ -1210,6 +1210,50 @@ describe("registered servers by uuid: the server page's own backends", () => {
   );
 
   it.each(TRANSPORTS)(
+    "refuses a %s request whose host answer turned mixed after the connection opened",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+      // The check before the transport is built sees an internal answer;
+      // every lookup after it answers internal and public at once.
+      resolvesTo(INTERNAL_V4, PUBLIC_V4);
+      lookupMock.mockResolvedValueOnce([{ address: INTERNAL_V4 }]);
+
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      expect(built).toHaveLength(1);
+
+      await expect(sendThroughTransport(type, built)).rejects.toThrow(
+        NOT_A_PERMITTED_TARGET,
+      );
+      expect(lookupMock).toHaveBeenCalledTimes(2);
+      expect(undiciFetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses a same-origin redirect hop whose host answer turned mixed", async () => {
+    // Internal for the open and for the request's first hop, mixed for the
+    // hop the redirect asks for.
+    resolvesTo(INTERNAL_V4, PUBLIC_V4);
+    lookupMock
+      .mockResolvedValueOnce([{ address: INTERNAL_V4 }])
+      .mockResolvedValueOnce([{ address: INTERNAL_V4 }]);
+    await postMcp({
+      transportType: "STREAMABLE_HTTP",
+      mcpServerUuid: ROW_UUID,
+    });
+    undiciFetchMock.mockResolvedValueOnce(
+      new Response(null, { status: 307, headers: { location: "/mcp-moved" } }),
+    );
+
+    await expect(
+      sendThroughTransport("STREAMABLE_HTTP", streamableClientConstructions),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+    expect(lookupMock).toHaveBeenCalledTimes(3);
+    expect(undiciFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(TRANSPORTS)(
     "keeps every %s request on the row's own origin",
     async (type, rowUrl, send, built) => {
       findAllAccessibleToUserMock.mockResolvedValue([

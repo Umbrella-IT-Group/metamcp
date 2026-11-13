@@ -25,9 +25,10 @@ import {
   assertPublicMcpUrl,
   createGuardedFetch,
   type InternalOnlyCredentials,
-  isInternalTarget,
+  isInternalAddress,
   type McpUrlGuardOptions,
   NOT_A_PERMITTED_TARGET,
+  resolveHost,
   type ValidatedMcpTarget,
 } from "@/lib/metamcp/url-guard";
 import logger from "@/utils/logger";
@@ -586,6 +587,34 @@ const NO_CALLER_CREDENTIALS: InternalOnlyCredentials = Object.freeze({
 });
 
 /**
+ * The resolver a registered row's guard runs under: getaddrinfo, as the
+ * guard's default (`resolveHost`), refusing an answer that mixes
+ * internal-service addresses with external ones. The pool's posture accepts
+ * such an answer and treats the hop as external; here it is refused, because
+ * which address a socket lands on is then up to the resolver's ordering.
+ *
+ * It is the guard's resolver seam (`McpUrlGuardOptions.lookup`), so it runs on
+ * every resolution the guard makes for this connection: the check before the
+ * transport is built, every request the transport sends, and every redirect
+ * hop. An answer that turns mixed after the connection opened is refused on
+ * the request that sees it. An IP literal is one address and is never looked
+ * up.
+ */
+const refusingMixedAnswers =
+  (label: string) =>
+  async (hostname: string): Promise<string[]> => {
+    const addresses = await resolveHost(hostname);
+    const internal = addresses.filter(isInternalAddress).length;
+    if (internal > 0 && internal < addresses.length) {
+      logger.warn(
+        `Registered server refused: ${label}: its host resolves to internal and external addresses at once`,
+      );
+      throw new Error(NOT_A_PERMITTED_TARGET);
+    }
+    return addresses;
+  };
+
+/**
  * The guard posture for a registered row opened by uuid: the pooled data
  * plane's own (POOL_GUARD_OPTIONS in client.ts). It permits the private ranges
  * the gateway's backends live on, pins every socket to the addresses it
@@ -594,30 +623,20 @@ const NO_CALLER_CREDENTIALS: InternalOnlyCredentials = Object.freeze({
  * X-MCP-Actor only to an internal destination, so a third-party server
  * someone registered gets neither.
  *
- * On top of it, the caller headers the guard deletes on every hop and never
- * sets (NO_VERIFIED_CALLER, or NO_CALLER_CREDENTIALS for an m365-injected row).
+ * On top of it, two rules of this path: refusingMixedAnswers as the resolver,
+ * and the caller headers the guard deletes on every hop and never sets
+ * (NO_VERIFIED_CALLER, or NO_CALLER_CREDENTIALS for an m365-injected row).
  */
 const registeredServerGuardOptions = (
   server: DatabaseMcpServer,
+  label: string,
 ): McpUrlGuardOptions => ({
   ...POOL_GUARD_OPTIONS,
+  lookup: refusingMixedAnswers(label),
   internalOnlyCredentials: getInjectedServerNames().has(server.name)
     ? NO_CALLER_CREDENTIALS
     : NO_VERIFIED_CALLER,
 });
-
-/**
- * Whether a target's resolved addresses mix internal-service ranges with
- * public ones. The pool's posture accepts such an answer and treats it as
- * external; here it is refused, because which of the two the connection lands
- * on is then up to the resolver's ordering.
- */
-const resolvesBothWays = (target: ValidatedMcpTarget): boolean => {
-  const internal = target.addresses.filter((address) =>
-    isInternalTarget({ url: target.url, addresses: [address] }),
-  ).length;
-  return internal > 0 && internal < target.addresses.length;
-};
 
 /**
  * A fetch that refuses every request whose origin is not `origin` and hands
@@ -724,8 +743,10 @@ const openRegisteredServer = async (
 ): Promise<RemoteConnection> => {
   const { server, url } = await findRegisteredRemoteServer(req, transportType);
   const label = `server=${server.name} (${server.uuid})`;
-  const options = registeredServerGuardOptions(server);
+  const options = registeredServerGuardOptions(server, label);
 
+  // The same options as the transport's fetch below, so this check refuses
+  // what every later request would, and answers it before anything is built.
   let target: ValidatedMcpTarget;
   try {
     target = await assertPublicMcpUrl(transformDockerUrl(url), options);
@@ -733,12 +754,6 @@ const openRegisteredServer = async (
     // The guard has logged its specific reason; its messages carry no url.
     logger.warn(
       `Registered server refused: ${label}: ${error instanceof Error ? error.message : "destination check failed"}`,
-    );
-    throw new RegisteredServerRefusedError();
-  }
-  if (resolvesBothWays(target)) {
-    logger.warn(
-      `Registered server refused: ${label}: its host resolves to internal and public addresses at once`,
     );
     throw new RegisteredServerRefusedError();
   }
