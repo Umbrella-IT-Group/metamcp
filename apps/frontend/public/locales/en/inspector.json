@@ -242,7 +242,7 @@
     "oauthLoopbackNote": "This gateway registers only local callback addresses automatically and refuses any other. If sign-in fails in this client, use an API key where the endpoint accepts one.",
     "claudeCodeMcpPanelNote": "You can also sign in from the /mcp panel inside Claude Code.",
     "vscodeFormatNote": "This is the native format the Copilot agent in VS Code reads. The older editor-managed format belongs to VS Code's deprecated Local harness and is not shown.",
-    "noAuthNote": "This endpoint has no authentication enabled, so the snippets contain only the URL.",
+    "noAuthNote": "Both authentication methods are disabled for this endpoint. The gateway refuses unauthenticated requests by default; an administrator must explicitly allow unauthenticated endpoints before these snippets can connect.",
     "claudeStep1": "In Claude, open Customize, then Connectors, and add a custom connector.",
     "claudeStep2": "Name it and paste the MCP URL shown above.",
     "claudeStep3": "Under OAuth client, choose \"Use your own OAuth client\" and enter the client ID and secret of a client an administrator created on the OAuth Clients page (the Use Claude callbacks preset fills in the callbacks).",

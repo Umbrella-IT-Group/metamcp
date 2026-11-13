@@ -494,7 +494,7 @@ describe("which options a client gets", () => {
     }
   });
 
-  it("only the no-auth case says the endpoint is open", () => {
+  it("only the auth-disabled case carries unauthenticated-endpoint guidance", () => {
     for (const m of AUTH_MATRIX) {
       const s = snippets(matrixInput(m));
       const keys = Object.values(s.clients).flatMap((os) =>

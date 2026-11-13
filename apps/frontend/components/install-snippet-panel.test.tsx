@@ -83,6 +83,16 @@ describe("InstallSnippetPanel", () => {
     },
   );
 
+  it("explains that disabled authentication needs an explicit gateway opt-in", () => {
+    // authenticateApiKey refuses this configuration by default, even though
+    // neither endpoint-level authentication switch is on.
+    const html = render(snippets({}));
+    expect(html).toContain("refuses unauthenticated requests by default");
+    expect(html).toContain(
+      "an administrator must explicitly allow unauthenticated endpoints",
+    );
+  });
+
   it("renders snippet text as text, whatever the gateway URL holds", () => {
     const html = render(
       snippets({
