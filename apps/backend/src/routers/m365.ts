@@ -44,7 +44,11 @@ import {
   getM365BrokerConfig,
   isM365BrokerConfigured,
 } from "../lib/m365/config";
-import { constantTimeEquals, encryptRefreshToken } from "../lib/m365/crypto";
+import { constantTimeEquals } from "../lib/m365/crypto";
+import {
+  peekEnvelopeVersion,
+  sealUserRefreshToken,
+} from "../lib/m365/envelope";
 import { m365MintService } from "../lib/m365/mint-service";
 import { securityHeaders } from "./oauth/utils";
 
@@ -368,8 +372,13 @@ m365Router.get("/m365/callback", async (req, res) => {
   // user may genuinely switch accounts) but worth a loud trace — it is
   // the account-grafting shape the session⇄state binding defends
   // against, so log when it happens through the legitimate path too.
+  // The envelope version of the row being replaced, so a re-enrollment never
+  // lowers a bound (v2) row when the write version is unset. Null when there is
+  // no row or the lookup failed; the seal then follows the policy alone.
+  let previousVersion: ReturnType<typeof peekEnvelopeVersion> = null;
   try {
     const existing = await m365TokensRepository.findByUserId(user.id);
+    previousVersion = peekEnvelopeVersion(existing?.rt_ciphertext);
     if (
       existing &&
       existing.entra_oid &&
@@ -401,10 +410,12 @@ m365Router.get("/m365/callback", async (req, res) => {
       entra_oid: entraOid,
       tenant_id: entraTid,
       entra_upn: entraUpn,
-      rt_ciphertext: encryptRefreshToken(
+      rt_ciphertext: sealUserRefreshToken(
         tokenBody.refresh_token,
         config.kek,
         config.kekId,
+        user.id,
+        previousVersion,
       ),
       kek_id: config.kekId,
       scopes_granted: tokenBody.scope ?? config.scopes,
