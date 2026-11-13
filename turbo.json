@@ -92,6 +92,8 @@
     "M365_KEK_ID",
     "M365_SCOPES",
     "M365_INJECTED_SERVER_NAMES",
+    "M365_ENVELOPE_WRITE_VERSION",
+    "M365_ENVELOPE_STRICT",
     "VERIFIED_CALLER_SERVER_NAMES"
   ],
   // Passed THROUGH to tasks without entering the hash. A secret in
