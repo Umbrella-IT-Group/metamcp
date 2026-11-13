@@ -658,19 +658,17 @@ export default function EndpointsPage() {
                           {t("endpoints:requireScopedApiKeyDescription")}
                         </p>
                       </div>
+                      {/* An independent switch. Restricting the endpoint to
+                          access groups does not turn it on and does not lock
+                          it: groups govern API keys by their owner, so a
+                          restricted endpoint keeps accepting each member's
+                          gateway-wide key unless this is chosen as well. */}
                       <Switch
-                        checked={
-                          form.watch("requireScopedApiKey") ||
-                          form.watch("restricted")
-                        }
+                        checked={form.watch("requireScopedApiKey")}
                         onCheckedChange={(checked) =>
                           form.setValue("requireScopedApiKey", checked)
                         }
-                        // Locked on while the endpoint is restricted: a
-                        // restricted endpoint must reject unscoped keys, so the
-                        // server pairs the two and the form shows it forced
-                        // rather than a value the operator can silently clear.
-                        disabled={isSubmitting || form.watch("restricted")}
+                        disabled={isSubmitting}
                       />
                     </div>
                   )}
@@ -722,12 +720,12 @@ export default function EndpointsPage() {
                     />
                   </div>
 
-                  {/* Restrict to access groups (OAuth plane). Shown only when
-                      OAuth is on, since the gate governs OAuth callers. Turning
-                      it on also forces endpoint-scoped API keys on: the two
-                      controls only confine an endpoint together, so the form
-                      pairs them exactly as the server does on create. */}
-                  {form.watch("enableOauth") && (
+                  {/* Restrict to access groups. Shown when either way in is
+                      on, since the gate applies to OAuth sign-ins and to API
+                      keys by their owner. It does not touch the scoped-key
+                      switch above: the two are independent. */}
+                  {(form.watch("enableOauth") ||
+                    form.watch("enableApiKeyAuth")) && (
                     <div className="flex items-center justify-between">
                       <div className="space-y-0.5">
                         <label className="text-sm font-medium">
@@ -739,12 +737,9 @@ export default function EndpointsPage() {
                       </div>
                       <Switch
                         checked={form.watch("restricted")}
-                        onCheckedChange={(checked) => {
-                          form.setValue("restricted", checked);
-                          if (checked) {
-                            form.setValue("requireScopedApiKey", true);
-                          }
-                        }}
+                        onCheckedChange={(checked) =>
+                          form.setValue("restricted", checked)
+                        }
                         disabled={isSubmitting}
                       />
                     </div>

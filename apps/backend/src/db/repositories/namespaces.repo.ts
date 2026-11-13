@@ -351,15 +351,20 @@ export class NamespacesRepository {
    * entirely before or entirely after a flip, never with a policy that changed
    * underneath it.
    *
+   * `executor` is the caller's transaction when it holds one (an admin-plane
+   * write records its audit row in the same transaction), and the inner
+   * transaction is then a savepoint of it. Omitted, the pool is used.
+   *
    * @returns undefined when no namespace has this uuid
    */
   async setToolPolicy(
     uuid: string,
     toolPolicy: NamespaceToolPolicy,
+    executor?: DbExecutor,
   ): Promise<
     { previous: NamespaceToolPolicy; namespace: DatabaseNamespace } | undefined
   > {
-    return await db.transaction(async (tx) => {
+    return await (executor ?? db).transaction(async (tx) => {
       const [current] = await tx
         .select({ tool_policy: namespacesTable.tool_policy })
         .from(namespacesTable)

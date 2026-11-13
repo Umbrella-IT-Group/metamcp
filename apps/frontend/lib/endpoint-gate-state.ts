@@ -1,41 +1,33 @@
 /**
  * What a group's mapping onto one endpoint actually does today.
  *
- * `restricted` alone cannot say, and reporting it alone is wrong in the
- * reassuring direction. The access-group gate governs OAUTH callers only, and
- * the API-key plane is a separate way in, so:
+ * `restricted` alone cannot say, and reporting it alone can be wrong in the
+ * reassuring direction. The access-group gate applies to every caller that can
+ * arrive at the endpoint: an OAuth sign-in is judged as the user, an API key as
+ * its owner (an ownerless key is refused), for gateway-wide and
+ * endpoint-scoped keys alike. So the gate is only inert when no caller can
+ * arrive through it:
  *
  *   off        the endpoint has not opted in; the mapping is legal and inert.
- *   noOauth    it opted in, but accepts no OAuth callers, so nothing is gated.
- *   oauthOnly  it gates OAuth callers, but unscoped API keys still bypass the
- *              gate (require_scoped_api_key is off); the only remaining case
- *              is a legacy row from before the create/update pairing, which the
- *              boot-time pairing check flags for an operator to close.
- *   enforcing  no ungated path in: OAuth is gated to groups AND the API-key
- *              plane is closed to unscoped keys (API keys off entirely, or
- *              require_scoped_api_key on so only endpoint-scoped keys pass,
- *              which are themselves a deliberate per-endpoint grant, not a
- *              bypass of the access-group intent).
+ *   noAuth     it opted in, but accepts neither OAuth callers nor API keys, so
+ *              nobody reaches it and nothing is gated.
+ *   enforcing  it opted in and accepts at least one of the two.
  *
- * `require_scoped_api_key` is what moved a restricted-plus-API-keys endpoint
- * out of "oauthOnly" and into "enforcing": the endpoint create/update pairing
- * forces it on with `restricted`, so a restricted endpoint is scoped-only by
- * construction rather than wide open on the key plane.
+ * `require_scoped_api_key` is deliberately NOT an input. It is a separate
+ * switch that only decides whether gateway-wide keys are accepted at all; the
+ * owner rule applies to a key whichever way that switch is set, so it cannot
+ * move an endpoint between these states.
  */
 export interface EndpointGateInput {
   restricted: boolean;
   enable_oauth: boolean;
   enable_api_key_auth: boolean;
-  require_scoped_api_key: boolean;
 }
 
 export function endpointGateState(
   endpoint: EndpointGateInput,
-): "off" | "noOauth" | "oauthOnly" | "enforcing" {
+): "off" | "noAuth" | "enforcing" {
   if (!endpoint.restricted) return "off";
-  if (!endpoint.enable_oauth) return "noOauth";
-  if (endpoint.enable_api_key_auth && !endpoint.require_scoped_api_key) {
-    return "oauthOnly";
-  }
+  if (!endpoint.enable_oauth && !endpoint.enable_api_key_auth) return "noAuth";
   return "enforcing";
 }

@@ -343,21 +343,15 @@ export const endpointsTable = pgTable(
     require_scoped_api_key: boolean("require_scoped_api_key")
       .notNull()
       .default(false),
-    // Access-group gate for OAUTH callers (migration 0033). When true, an
-    // OAuth-authenticated user reaches this endpoint only if they are an
-    // administrator or belong to a group mapped to it — see
-    // `lib/endpoint-access-control`. This column governs the OAuth plane ONLY.
+    // Access-group gate (migration 0033). When true, a caller reaches this
+    // endpoint only if they are an administrator or belong to a group mapped to
+    // it — see `lib/endpoint-access-control`. The caller is the signed-in user
+    // of an OAuth token, or the OWNER of an API key (gateway-wide and
+    // endpoint-scoped keys alike); an ownerless key is refused.
     //
-    // The API-key plane is governed by `require_scoped_api_key` above, and the
-    // two are PAIRED by the application layer: every writer that can set
-    // `restricted` true (endpoint create, endpoint update, and the
-    // `setEndpointRestricted` toggle) also forces `require_scoped_api_key` on,
-    // because a restricted endpoint that still admitted unscoped gateway-wide
-    // keys would be confined on the OAuth plane and wide open on the API-key
-    // plane. The pairing is enforced in code rather than as a CHECK constraint
-    // so that pre-existing rows violating it are not rejected at migrate time;
-    // a boot-time warning (see `endpoint-pairing-check`) lists any such rows for
-    // an operator to fix deliberately.
+    // `require_scoped_api_key` above is an independent switch and is not
+    // implied by this one: it only decides whether gateway-wide keys are
+    // accepted at all. No writer ties the two together, and there is no CHECK.
     //
     // Default false = today's behaviour, which is what lets this ship without
     // locking any live connector out while the groups are still being drawn up.

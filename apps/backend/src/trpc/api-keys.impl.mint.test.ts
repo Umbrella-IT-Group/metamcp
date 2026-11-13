@@ -567,7 +567,7 @@ describe("a refusal the database makes", () => {
     "owner_required",
     "endpoint_missing",
     "endpoint_not_eligible",
-    "gateway_wide_blocked",
+    "gateway_wide_admin_owner",
     "name_taken",
   ] as const)(
     "keeps the fixed sentence for %s and records no success row",

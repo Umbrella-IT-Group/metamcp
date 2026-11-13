@@ -4,7 +4,8 @@ import { accessGroupsRepository } from "../db/repositories/access-groups.repo";
 import { usersRepository } from "../db/repositories/users.repo";
 
 /**
- * Per-endpoint access groups for OAUTH callers (migration 0033).
+ * Per-endpoint access groups (migration 0033), applied to OAuth sign-ins and to
+ * API keys by their owner.
  *
  * WHAT THIS GATE IS FOR. `checkOAuthAccess` in
  * `middleware/api-key-oauth.middleware` admits any authenticated user to any
@@ -12,18 +13,25 @@ import { usersRepository } from "../db/repositories/users.repo";
  * estate that publishes one connector per business system, "you completed an
  * OAuth flow once" therefore meant "you can reach every system on the gateway".
  * This module is the opt-in that narrows it: an endpoint with `restricted` set
- * admits an OAuth caller only when that caller is an administrator or belongs
- * to at least one access group mapped to that endpoint.
+ * admits a caller only when that caller is an administrator or belongs to at
+ * least one access group mapped to that endpoint.
  *
- * WHY OAUTH ONLY, and this is a deliberate scope boundary rather than an
- * omission. API keys are admin-minted, already carry per-endpoint scoping
- * (migration 0023 `endpoint_uuid` plus `require_scoped_api_key`), and are held
- * by machines rather than by people who log in — a key's OWNER is an
- * administrative detail, not the identity the key acts as. Gating a
- * server-to-server key on the group membership of whoever happens to own it
- * would break integrations to solve a problem those keys do not have. The same
- * boundary is stated on `checkOAuthAccess`, in migration 0033, and in the
- * README.
+ * WHO "THAT CALLER" IS. For an OAuth sign-in it is the signed-in user. For an
+ * API key it is the key's OWNER: a key held by a person is that person's
+ * credential, so it reaches what the person reaches and no more, whether it is
+ * scoped to one endpoint or valid gateway-wide. A key that has no owner (a
+ * public key, `user_id` null) has nobody whose membership could admit it and is
+ * refused on a restricted endpoint. A key owned by an administrator passes, like
+ * the administrator would; that is how the service accounts that run
+ * automation keep working. Both caller kinds go through the one decision below
+ * and share its cache, so an owner's answer is computed once whichever
+ * credential asked.
+ *
+ * `require_scoped_api_key` is a separate switch and is NOT implied by
+ * `restricted`. It still refuses gateway-wide keys where an operator turns it
+ * on; restricting an endpoint no longer turns it on, because group membership
+ * now decides what a key reaches and one key per person has to keep working
+ * across every endpoint that person may use.
  *
  * WHY PER-REQUEST AND NOT AT AUTHORIZE TIME. Tokens this gateway issues are
  * gateway-wide: the authorize handler reads no RFC 8707 `resource` and no
@@ -34,8 +42,10 @@ import { usersRepository } from "../db/repositories/users.repo";
  * so a connect-time refusal would have to be invented rather than enforced —
  * and inventing it would mean making the 401 challenge endpoint-specific, which
  * `lib/auth-challenge` deliberately made uniform to close an endpoint-
- * enumeration oracle. The request is the first moment the pair (user, endpoint)
- * exists, so the request is where the decision is made.
+ * enumeration oracle. The request is the first moment the pair (caller,
+ * endpoint) exists, so the request is where the decision is made. A key is no
+ * different: its owner is known at validation, the endpoint at routing, and the
+ * pair only together.
  *
  * TOOL-LEVEL SCOPING IS OUT OF SCOPE. A group grants or denies a whole
  * endpoint. The supported way to give an audience a narrower tool set is to
@@ -58,8 +68,8 @@ export const ENDPOINT_ACCESS_DENIED_MESSAGE =
 /**
  * How long one (user, endpoint) decision is reused.
  *
- * The gate sits on every OAuth-authenticated MCP request, and an MCP session is
- * chatty — tools/list, then a call per tool use — so an uncached decision would
+ * The gate sits on every OAuth-authenticated and every API-key MCP request to a
+ * restricted endpoint, and an MCP session is chatty — tools/list, then a call per tool use — so an uncached decision would
  * add two database round trips to each of them. 60 seconds is short enough that
  * an operator who removes someone from a group sees it take effect while they
  * are still watching, and long enough that the steady-state cost of the gate is
@@ -208,7 +218,8 @@ function writeCachedDecision(
 }
 
 /**
- * May this OAuth-authenticated user be served by this endpoint?
+ * May this user be served by this endpoint? The user is the signed-in user of
+ * an OAuth token, or the owner of an API key (see the header).
  *
  * Returns `true` immediately for an endpoint that has not opted in, WITHOUT
  * touching the cache or the database. That early return is what makes this
@@ -221,7 +232,13 @@ function writeCachedDecision(
  * still drawing the groups up — the exact failure this feature was required not
  * to have. The role is read fresh from the database rather than from the token,
  * for the same reason `usersRepository.isDisabled` is: a token minted before a
- * demotion must not keep carrying the old role.
+ * demotion must not keep carrying the old role. "Fresh" is bounded by the
+ * decision cache: a role change does not invalidate it (only access-group and
+ * endpoint-gate writes do), so a demoted administrator's token or key keeps
+ * passing a restricted endpoint for up to `ACCESS_DECISION_TTL_MS` in each
+ * backend process. That bound is stated, tested, and not an instant revocation;
+ * a disabled account is a separate check made on every request and is not
+ * affected by it.
  *
  * FAILS CLOSED. A database error while deciding produces a refusal, not an
  * admission. That is the opposite of the choice made for `restricted` itself
@@ -231,7 +248,7 @@ function writeCachedDecision(
  * is not swallowed here — it propagates to the middleware's own catch, which
  * answers 500 rather than serving the request.
  */
-export async function isOAuthUserAllowedOnEndpoint(
+export async function isUserAllowedOnEndpoint(
   userId: string,
   endpoint: Pick<DatabaseEndpoint, "uuid" | "restricted">,
 ): Promise<boolean> {
@@ -259,8 +276,17 @@ export async function isOAuthUserAllowedOnEndpoint(
 }
 
 /**
+ * The name this decision had while it governed OAuth sign-ins only. Kept as an
+ * alias so the OAuth call sites and their tests keep reading as they did.
+ */
+export const isOAuthUserAllowedOnEndpoint = isUserAllowedOnEndpoint;
+
+/**
  * How long one reported denial suppresses the next report for the same
- * (user, endpoint) pair.
+ * (principal, endpoint) pair. The principal is a user id for an OAuth caller
+ * and `key:<key uuid>` for an API key, so a key is throttled on its own and a
+ * key id can never be mistaken for a user id (`:` does not occur in either id
+ * format).
  *
  * WHY THROTTLE AT ALL. `audit_log` has BEFORE UPDATE / DELETE / TRUNCATE
  * triggers and deliberately no prune path (migration 0028), so every row
@@ -278,9 +304,9 @@ export async function isOAuthUserAllowedOnEndpoint(
  * last minute" remain distinguishable, which is the question a responder
  * actually asks of this event.
  *
- * PER PAIR, not global: one user hammering one endpoint must not suppress the
- * first denial of a different user on a different endpoint, which would be
- * exactly the row worth seeing.
+ * PER PAIR, not global: one caller hammering one endpoint must not suppress the
+ * first denial of a different caller on a different endpoint, which would be
+ * exactly the row worth seeing. Two keys of one owner are two callers here.
  */
 export const ACCESS_DENIAL_REPORT_INTERVAL_MS = 60 * 1000;
 
@@ -304,10 +330,10 @@ const denialThrottle = new Map<string, DenialThrottleEntry>();
  * envelope stays with the other emitters in `middleware/api-key-oauth`.
  */
 export function recordAccessDenial(
-  userId: string,
+  principal: string,
   endpointUuid: string,
 ): { emit: boolean; suppressed: number } {
-  const key = decisionKey(userId, endpointUuid);
+  const key = decisionKey(principal, endpointUuid);
   const now = Date.now();
   const entry = denialThrottle.get(key);
 

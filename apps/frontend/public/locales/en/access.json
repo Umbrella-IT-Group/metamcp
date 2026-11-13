@@ -119,7 +119,7 @@
 
   "groups": {
     "title": "Access Groups",
-    "description": "Named groups that decide which OAuth users may reach which endpoints. API keys are unaffected.",
+    "description": "Named groups that decide which people may reach which endpoints, whether they sign in with OAuth or use an API key. A key reaches an endpoint only as far as its owner does.",
     "heading": "Groups",
     "createGroup": "Create group",
     "createGroupDescription": "A group is a reusable set of people. Map endpoints to it, then switch those endpoints on.",
@@ -132,7 +132,7 @@
     "nameHelp": "Free text, unique across the gateway. Names appear in the audit log.",
     "descriptionLabel": "Description",
     "noGroups": "No access groups yet.",
-    "noGroupsDescription": "Until a group exists and an endpoint is switched on, every OAuth user reaches every endpoint they already could.",
+    "noGroupsDescription": "Until a group exists and an endpoint is switched on, every OAuth user and API key reaches every endpoint it already could.",
     "columnName": "Name",
     "columnDescription": "Description",
     "columnMembers": "Members",
@@ -147,7 +147,7 @@
     "deleteConfirmAction": "Delete group",
 
     "membersHeading": "Members",
-    "membersHelp": "People in this group reach every endpoint mapped to it. Administrators reach every endpoint regardless.",
+    "membersHelp": "People in this group, and the API keys they own, reach every endpoint mapped to it. Administrators, and keys they own, reach every endpoint regardless.",
     "selectUser": "Select a user",
     "addMember": "Add",
     "adminSuffix": "admin",
@@ -166,24 +166,22 @@
     "endpointFailed": "Could not update the endpoint mapping",
     "gate": {
       "off": "Not enforcing",
-      "noOauth": "No effect (OAuth off)",
-      "oauthOnly": "OAuth callers only",
+      "noAuth": "No effect (OAuth and API keys both off)",
       "enforcing": "Enforcing"
     },
     "scopeNote": "A group grants or denies a whole endpoint. To give an audience a narrower tool set, curate a second namespace and publish a second endpoint over it, then map the group to that one.",
 
     "sectionTitle": "Access",
     "restrictedLabel": "Restrict to access groups",
-    "restrictedDescription": "When on, an OAuth user reaches this endpoint only if they are an administrator or belong to a group mapped to it. Saved on its own, not with the rest of this dialog. It applies to the next request; an already-open notification stream keeps running until it disconnects, though no tool call can land through it.",
+    "restrictedDescription": "When on, an OAuth user, or an API key through its owner, reaches this endpoint only if that person is an administrator or belongs to a group mapped to it. A key with no owner is refused. Saved on its own, not with the rest of this dialog. It applies to the next request, except that a role change can take up to a minute to be seen; an already-open notification stream keeps running until it disconnects, though no tool call can land through it.",
     "restrictedUpdated": "Endpoint access updated.",
     "restrictedUpdateFailed": "Could not update endpoint access",
-    "noOauthWarning": "This endpoint does not accept OAuth callers, so this switch has no effect today. Access groups gate OAuth users only; turn OAuth on for this endpoint if you want the switch to do anything.",
-    "apiKeysStillPass": "This endpoint also accepts API keys, and those are not affected by access groups. The switch narrows OAuth callers only; every API-key holder still reaches this endpoint.",
-    "noGroupsWarning": "This endpoint is restricted but no group is mapped to it, so only administrators can reach it.",
+    "noAuthWarning": "This endpoint accepts neither OAuth callers nor API keys, so this switch has no effect today. Turn OAuth or API-key authentication on for this endpoint if you want the switch to do anything.",
+    "noGroupsWarning": "This endpoint is restricted but no group is mapped to it, so only administrators, and API keys owned by administrators, can reach it.",
     "mappedGroupsLabel": "Groups that may reach this endpoint",
     "noMappedGroups": "None.",
     "memberCount": "({{count}} members)",
     "manageLink": "Manage access groups",
-    "apiKeyNote": "API keys are not affected by this. A key is minted by an administrator and already carries its own per-endpoint scoping."
+    "apiKeyNote": "An API key is judged by its owner: it reaches this endpoint only if its owner is an administrator or belongs to a mapped group, whether the key is scoped to one endpoint or works on all of them. Whether gateway-wide keys are accepted here at all is the separate \"Require endpoint-scoped API keys\" switch."
   }
 }
