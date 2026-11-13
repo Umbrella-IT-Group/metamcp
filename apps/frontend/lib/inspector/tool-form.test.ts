@@ -144,6 +144,25 @@ describe("describeFields", () => {
     ]);
   });
 
+  it("lets a type-array union send each permitted JSON type", () => {
+    const { specs, state } = formFor({
+      choice: { type: ["string", "integer", "null"] },
+    });
+    expect(specOf(specs, "choice")).toMatchObject({
+      kind: "json",
+      nullable: true,
+    });
+    expect(
+      buildArguments(specs, typeInto(specs, state, "choice", "42")).args,
+    ).toEqual({ choice: 42 });
+    expect(
+      buildArguments(specs, typeInto(specs, state, "choice", '"42"')).args,
+    ).toEqual({ choice: "42" });
+    expect(buildArguments(specs, setNull(state, "choice", true)).args).toEqual({
+      choice: null,
+    });
+  });
+
   it("returns no fields for a schema without properties", () => {
     expect(describeFields({ inputSchema: { type: "object" } })).toEqual([]);
     expect(describeFields({})).toEqual([]);

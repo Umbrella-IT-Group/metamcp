@@ -255,6 +255,32 @@ describe("resolveToolPropertySchema on real pydantic output", () => {
     expect(getToolPropertyType({ type: ["null"] }, {})).toBeUndefined();
   });
 
+  it("does not guess between non-null types in a type array", () => {
+    for (const type of [
+      ["string", "integer"],
+      ["null", "integer", "string"],
+    ]) {
+      expect(getToolPropertyType({ type }, {})).toBeUndefined();
+      expect(
+        getToolPropertyType({ anyOf: [{ type }, { type: "string" }] }, {}),
+      ).toBeUndefined();
+    }
+  });
+
+  it("keeps nullability from a type array inside a same-type union", () => {
+    expect(
+      resolveToolPropertySchema(
+        {
+          anyOf: [
+            { type: ["string", "null"] },
+            { type: "string", format: "date" },
+          ],
+        },
+        {},
+      ),
+    ).toMatchObject({ type: "string", nullable: true });
+  });
+
   it("does not guess between two different non-null types", () => {
     const resolved = resolveToolPropertySchema(
       { anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }] },

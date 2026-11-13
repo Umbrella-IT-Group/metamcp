@@ -154,13 +154,17 @@ function isNullSchema(schema: JsonSchema): boolean {
   return Array.isArray(type) && type.length === 1 && type[0] === "null";
 }
 
-/** The schema's type, or the first non-null one of a type array. */
+/** The schema's single non-null type, or undefined for an ambiguous type array. */
 export function firstNonNullType(schema: JsonSchema): string | undefined {
   const type = schema.type;
   if (typeof type === "string") return type;
   if (Array.isArray(type)) {
-    const found = type.find((entry) => entry !== "null");
-    return typeof found === "string" ? found : undefined;
+    // A type array is a union too. Picking its first member would prevent the
+    // JSON field from carrying the other permitted types.
+    const types = [...new Set(type.filter((entry) => entry !== "null"))];
+    return types.length === 1 && typeof types[0] === "string"
+      ? types[0]
+      : undefined;
   }
   return undefined;
 }
@@ -205,7 +209,13 @@ function normalizeUnionType(
   if (nonNull.length === 1) {
     const inner = nonNull[0] as JsonSchema;
     return overlayMetadata(
-      { ...inner, nullable: sawNull || inner.nullable === true },
+      {
+        ...inner,
+        nullable:
+          sawNull ||
+          inner.nullable === true ||
+          (Array.isArray(inner.type) && inner.type.includes("null")),
+      },
       schema,
     );
   }
@@ -222,7 +232,12 @@ function normalizeUnionType(
   const merged: JsonSchema =
     only !== undefined ? { type: only } : { ambiguousUnion: true };
   merged.nullable =
-    sawNull || nonNull.some((option) => option.nullable === true);
+    sawNull ||
+    nonNull.some(
+      (option) =>
+        option.nullable === true ||
+        (Array.isArray(option.type) && option.type.includes("null")),
+    );
   return overlayMetadata(merged, schema);
 }
 

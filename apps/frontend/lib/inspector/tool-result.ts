@@ -103,7 +103,19 @@ function prettyJsonOf(text: string): string | undefined {
   const first = text.trimStart()[0];
   if (first !== "{" && first !== "[") return undefined;
   try {
-    return JSON.stringify(JSON.parse(text), null, 2);
+    const parsed = JSON.parse(text, (_key, value: unknown) => {
+      // Re-serializing would round large integer IDs or replace overflow with
+      // null. Keep the server's original text instead of offering that view.
+      if (
+        typeof value === "number" &&
+        (!Number.isFinite(value) ||
+          (Number.isInteger(value) && !Number.isSafeInteger(value)))
+      ) {
+        throw new RangeError("JSON number cannot be formatted safely");
+      }
+      return value;
+    });
+    return JSON.stringify(parsed, null, 2);
   } catch {
     return undefined;
   }
@@ -225,17 +237,18 @@ export function classifyCallFailure(
   const failure: ClassifiedFailure = {
     status: options.stoppedByUser ? "stopped" : "protocol_error",
     message,
-    outcomeUnknown: options.stoppedByUser,
+    // Fetch and result-validation failures are not McpError instances. They
+    // can happen after a write ran, so only an explicit protocol answer below
+    // can establish a known outcome.
+    outcomeUnknown: true,
   };
   if (error instanceof McpError) {
     failure.code = error.code;
     if (error.data !== undefined) failure.data = error.data;
-    if (
+    failure.outcomeUnknown =
+      options.stoppedByUser ||
       error.code === ErrorCode.RequestTimeout ||
-      error.code === ErrorCode.ConnectionClosed
-    ) {
-      failure.outcomeUnknown = true;
-    }
+      error.code === ErrorCode.ConnectionClosed;
   }
   return failure;
 }
