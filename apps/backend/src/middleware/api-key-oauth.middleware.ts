@@ -61,6 +61,10 @@ export interface ApiKeyAuthenticatedRequest
   // names WHICH credential called; the verified caller header carries it to
   // named backends (lib/metamcp/verified-caller.ts).
   oauthClientId?: string;
+  // The refresh-token family of that access token (`oauth_access_tokens
+  // .family_id`). Carried so the verified caller credential for a URL-identified
+  // client can tell two connections of it apart.
+  oauthTokenFamilyId?: string;
   authMethod?: "api_key" | "oauth"; // Track which auth method was used
 }
 
@@ -127,6 +131,7 @@ async function validateOAuthToken(token: string): Promise<{
   valid: boolean;
   user_id?: string;
   client_id?: string;
+  family_id?: string;
   scopes?: string[];
   error?: string;
 }> {
@@ -149,6 +154,9 @@ async function validateOAuthToken(token: string): Promise<{
         // The client this token was issued to, from the same row. Stamped as
         // `oauthClientId` by both OAuth branches below.
         client_id: tokenData.client_id,
+        // The refresh-token family of this token, from the same row. Stamped
+        // as `oauthTokenFamilyId` by both OAuth branches below.
+        family_id: tokenData.family_id,
         // Fall back to the scope this server grants, not "admin". Nothing
         // reads `scopes` for an authorization decision today (the gate is
         // the better-auth session role), but a write-only field that says
@@ -763,6 +771,7 @@ export const authenticateApiKey = async (
           // OAuth token valid - perform access control and pass
           authReq.oauthUserId = oauthResult.user_id;
           authReq.oauthClientId = oauthResult.client_id;
+          authReq.oauthTokenFamilyId = oauthResult.family_id;
           authReq.authMethod = "oauth";
 
           const accessCheckResult = checkOAuthAccess(oauthResult, endpoint);
@@ -984,6 +993,7 @@ export const authenticateApiKey = async (
         // OAuth token valid - perform access control and pass
         authReq.oauthUserId = oauthResult.user_id;
         authReq.oauthClientId = oauthResult.client_id;
+        authReq.oauthTokenFamilyId = oauthResult.family_id;
         authReq.authMethod = "oauth";
 
         const accessCheckResult = checkOAuthAccess(oauthResult, endpoint);

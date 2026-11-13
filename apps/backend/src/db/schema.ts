@@ -673,8 +673,10 @@ export const oauthClientsTable = pgTable(
     policy_uri: text("policy_uri"),
     software_id: text("software_id"),
     software_version: text("software_version"),
-    // Which mint path wrote this row. Read by exactly one query: the retention
-    // sweep in db/repositories/oauth.repo.ts, which deletes only 'dcr'.
+    // Which mint path wrote this row. Read by the retention sweeps in
+    // db/repositories/oauth.repo.ts (the DCR sweep deletes only 'dcr', the
+    // client-metadata-document sweep only 'cimd') and by the gates that treat a
+    // 'cimd' row as a cache of a published document (routers/oauth/cimd-*).
     //
     // NULLABLE WITH NO DEFAULT, both on purpose. No default because a
     // forgotten insert path must land as "unknown" (never swept) rather than
@@ -720,11 +722,11 @@ export const oauthClientsTable = pgTable(
       .defaultNow(),
   },
   (table) => [
-    // Migration 0029. NULL stays legal — it is the honest value for every row
-    // that predates the column.
+    // Migration 0029, widened by 0046 to admit 'cimd'. NULL stays legal, it is
+    // the honest value for every row that predates the column.
     check(
       "oauth_clients_registration_source_valid",
-      sql`${table.registration_source} IS NULL OR ${table.registration_source} IN ('dcr', 'admin')`,
+      sql`${table.registration_source} IS NULL OR ${table.registration_source} IN ('dcr', 'admin', 'cimd')`,
     ),
     // Migration 0042. The status set, enforced by the database so a row
     // written by hand cannot carry a value the gates have never heard of.

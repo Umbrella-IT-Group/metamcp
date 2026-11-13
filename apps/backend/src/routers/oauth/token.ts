@@ -19,6 +19,7 @@ import type {
   OAuthDbExecutor,
   OAuthTx,
 } from "../../db/repositories/oauth-user-lock";
+import { isCimdRowBlocked } from "./cimd-config";
 import { CLIENT_NOT_APPROVED_ERROR } from "./client-not-approved-page";
 import { requireIntrospectionCredential } from "./introspection-auth";
 import {
@@ -780,6 +781,19 @@ async function handleAuthorizationCodeGrant(
     return res.status(400).json(CLIENT_NOT_APPROVED_ERROR);
   }
 
+  // The allowlist gate for a client metadata document row (migration 0046),
+  // the analogue of the approval gate above: a `cimd` row whose entry was
+  // removed from OAUTH_CIMD_ALLOWED_CLIENTS exchanges no code. Before the code
+  // is consumed, for the same reason, so a refusal leaves everything intact;
+  // and it never fetches: only the authorize endpoint resolves a document,
+  // because a fetch here would let an unauthenticated token POST trigger one.
+  if (isCimdRowBlocked(clientData)) {
+    logger.warn(
+      `[oauth] token rejected reason=cimd_not_admitted grant=authorization_code client=${JSON.stringify(codeData.client_id.slice(0, 200))} user=${codeData.user_id}`,
+    );
+    return res.status(400).json(CLIENT_NOT_APPROVED_ERROR);
+  }
+
   // Validate client authentication based on registered auth method. The row was
   // loaded by `client_id`, which already matched the code's client above, so
   // the Basic header's id is compared against the same value it always was.
@@ -1424,6 +1438,19 @@ async function rotateRefreshTokenLocked(
   if (!isOAuthClientApproved(clientData)) {
     logger.warn(
       `[oauth] token rejected reason=client_not_approved grant=refresh_token client=${tokenData.client_id} user=${tokenData.user_id}`,
+    );
+    return { kind: "client_not_approved" };
+  }
+
+  // The allowlist gate for a client metadata document row (migration 0046), in
+  // the same place and with the same effect as the approval gate above: before
+  // the claim, the marker and the mint, so a refusal consumes and records
+  // nothing and the token is refreshable again once the entry is back.
+  // Removing an entry therefore stops refreshes as well as new authorizations;
+  // access tokens already issued live until they expire.
+  if (isCimdRowBlocked(clientData)) {
+    logger.warn(
+      `[oauth] token rejected reason=cimd_not_admitted grant=refresh_token client=${JSON.stringify(tokenData.client_id.slice(0, 200))} user=${tokenData.user_id}`,
     );
     return { kind: "client_not_approved" };
   }
