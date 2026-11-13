@@ -302,6 +302,13 @@
       "when": 1788134400000,
       "tag": "0043_api_key_admin_plane_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1788307200000,
+      "tag": "0045_oauth_spent_authorization_codes",
+      "breakpoints": true
     }
   ]
 }
