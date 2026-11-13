@@ -759,6 +759,16 @@ export const warnIfGatewayBackendSecretUnset = (): void => {
 };
 
 /**
+ * Whether one resolved address is an internal-service range: blocked under the
+ * strict posture yet permitted under `allowPrivate`. The per-address half of
+ * `isInternalTarget`, exported for a caller that has to judge each address of
+ * an answer on its own (the Inspector proxy's registered-server resolver).
+ */
+export const isInternalAddress = (address: string): boolean =>
+  isBlockedSsrfAddress(address, false) !== null &&
+  isBlockedSsrfAddress(address, true) === null;
+
+/**
  * Whether the guard classifies a validated target as an INTERNAL destination,
  * i.e. one that may receive the gateway trust header.
  *
@@ -766,20 +776,15 @@ export const warnIfGatewayBackendSecretUnset = (): void => {
  * by NAME (the `MCP_PROXY_URL_ALLOWED_HOSTS` escape hatch exists only for a
  * backend fronted on a private address), so it is internal by operator
  * designation. Otherwise a target is internal exactly when EVERY resolved
- * address is an internal-service range: blocked under the strict posture yet
- * permitted under `allowPrivate`. Deriving that from the one range table rather
- * than a second copy of it means metadata / CGNAT / multicast / reserved
- * (blocked under both postures) and public addresses (allowed under both) are
- * both correctly external, and this classification cannot drift from the SSRF
- * check it rides on.
+ * address is an internal-service range (`isInternalAddress`). Deriving that
+ * from the one range table rather than a second copy of it means metadata /
+ * CGNAT / multicast / reserved (blocked under both postures) and public
+ * addresses (allowed under both) are both correctly external, and this
+ * classification cannot drift from the SSRF check it rides on.
  */
 export const isInternalTarget = (target: ValidatedMcpTarget): boolean => {
   if (target.addresses.length === 0) return true;
-  return target.addresses.every(
-    (address) =>
-      isBlockedSsrfAddress(address, false) !== null &&
-      isBlockedSsrfAddress(address, true) === null,
-  );
+  return target.addresses.every(isInternalAddress);
 };
 
 /**

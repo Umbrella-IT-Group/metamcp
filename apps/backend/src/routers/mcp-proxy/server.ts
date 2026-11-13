@@ -7,7 +7,10 @@ import {
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  FetchLike,
+  Transport,
+} from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   DatabaseMcpServer,
   McpServerErrorStatusEnum,
@@ -21,17 +24,35 @@ import { describeDbError } from "@/lib/db-error-summary";
 import {
   assertPublicMcpUrl,
   createGuardedFetch,
+  type InternalOnlyCredentials,
+  isInternalAddress,
+  type McpUrlGuardOptions,
+  NOT_A_PERMITTED_TARGET,
+  resolveHost,
+  type ValidatedMcpTarget,
 } from "@/lib/metamcp/url-guard";
 import logger from "@/utils/logger";
 
-import { mcpServersRepository } from "../../db/repositories";
+import {
+  mcpServersRepository,
+  oauthSessionsRepository,
+} from "../../db/repositories";
+import { getInjectedServerNames } from "../../lib/m365/config";
 import mcpProxy from "../../lib/mcp-proxy";
-import { transformDockerUrl } from "../../lib/metamcp/client";
+import {
+  ASSERTED_ACTOR_HEADER,
+  normalizeAssertedActor,
+} from "../../lib/metamcp/asserted-actor";
+import {
+  POOL_GUARD_OPTIONS,
+  transformDockerUrl,
+} from "../../lib/metamcp/client";
 import {
   MCP_REQUEST_BODY_LIMIT_BYTES,
   refuseDeclaredOversize,
 } from "../../lib/metamcp/mcp-request-body-limit";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
+import { resolveServerBearerToken } from "../../lib/metamcp/server-bearer-crypto";
 import {
   assertStdioServersAllowed,
   STDIO_SERVERS_DISABLED_MESSAGE,
@@ -43,6 +64,8 @@ import {
 } from "../../lib/metamcp/utils";
 import {
   isVerifiedCallerHeaderName,
+  VERIFIED_CALLER_HEADER,
+  VERIFIED_CALLER_IDENTITY_HEADER,
   withoutVerifiedCallerHeader,
 } from "../../lib/metamcp/verified-caller";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
@@ -150,9 +173,10 @@ const uuidSchema = z.string().uuid();
 
 /**
  * The session user, as `betterAuthMcpMiddleware` leaves it on the request.
- * Mirrors the shape `requireAdminMcpMiddleware` reads.
+ * Mirrors the shape `requireAdminMcpMiddleware` reads, plus the account email
+ * `inspectorCaller` (metamcp.ts) reads.
  */
-type SessionUser = { id?: string; role?: string };
+type SessionUser = { id?: string; role?: string; email?: unknown };
 
 /**
  * Find the registered `mcp_servers` row a STDIO proxy request is asking to
@@ -439,6 +463,397 @@ const getHttpHeaders = (
   return headers;
 };
 
+/**
+ * The one answer for every way a request that names a remote server by
+ * `mcpServerUuid` fails to open it: no session user, a malformed uuid, a uuid
+ * the caller cannot see (another user's private server included), a row of
+ * another transport type or with no url, a row marked ERROR, and a row whose
+ * address the destination guard refuses in the check made before the
+ * transport is built. Constant for the reason NO_SUCH_SERVER is: an answer
+ * that differs by cause tells a caller which rows exist. The specific reason
+ * goes to the log, naming the row by name and uuid when there is one, never by
+ * its url.
+ *
+ * Not covered: a refusal by the guard on a request the transport makes later
+ * (the SSE stream's first GET, a redirect hop, a lookup whose answer changed)
+ * fails that request inside the transport, and a custom auth header naming a
+ * reserved identity header (INSPECTOR_RESERVED_HEADER) keeps the answer it
+ * gets on the by-url path. Neither answer names a row or an address.
+ */
+const REGISTERED_SERVER_REFUSED =
+  "This MCP server cannot be opened here: it is not a server you can see, it is in an error state, or its address is not one this gateway connects to. The gateway log records the specific reason.";
+
+/**
+ * Thrown by the by-uuid path of `openRemoteServer` before anything is opened.
+ * Each route answers it with REGISTERED_SERVER_REFUSED_BODY and HTTP 400.
+ */
+class RegisteredServerRefusedError extends Error {
+  constructor() {
+    super(REGISTERED_SERVER_REFUSED);
+    this.name = "RegisteredServerRefusedError";
+  }
+}
+
+/** A remote transport's destination, fetch and headers, ready to construct. */
+interface RemoteConnection {
+  url: URL;
+  /** Every request the transport makes goes through this. */
+  fetch: FetchLike;
+  headers: Record<string, string>;
+  /** How the connect log names the destination. Never carries a query string. */
+  logTarget: string;
+}
+
+/**
+ * Find the registered remote row a request names by `mcpServerUuid`, or throw
+ * RegisteredServerRefusedError.
+ *
+ * The STDIO resolver's rules (findRegisteredStdioServer): the identifier must
+ * be a uuid, the row must be one the caller may see (`findAllAccessibleToUser`:
+ * public rows plus their own), its type must be the requested transport, and
+ * it must have a url. Its error state is read off this same row.
+ */
+const findRegisteredRemoteServer = async (
+  req: express.Request,
+  transportType: string,
+): Promise<{ server: DatabaseMcpServer; url: string }> => {
+  const userId = (req as express.Request & { user?: SessionUser }).user?.id;
+  if (!userId) {
+    // Fail closed. The gates ahead of this router already refuse a session
+    // without a user id, so reaching here means the chain changed.
+    logger.warn(
+      "Registered server request refused: no session user on the request",
+    );
+    throw new RegisteredServerRefusedError();
+  }
+
+  const requestedUuid = req.query.mcpServerUuid;
+  if (
+    typeof requestedUuid !== "string" ||
+    !uuidSchema.safeParse(requestedUuid).success
+  ) {
+    logger.warn(
+      "Registered server request refused: malformed server identifier",
+    );
+    throw new RegisteredServerRefusedError();
+  }
+
+  const accessible = await mcpServersRepository.findAllAccessibleToUser(userId);
+  const server = accessible.find(
+    (candidate) =>
+      candidate.uuid === requestedUuid && candidate.type === transportType,
+  );
+  if (!server || !server.url) {
+    logger.warn(
+      "Registered server request refused: no accessible server of this transport type matches the requested identifier",
+    );
+    throw new RegisteredServerRefusedError();
+  }
+
+  if (server.error_status === McpServerErrorStatusEnum.enum.ERROR) {
+    logger.info(`Server ${server.name} (${server.uuid}) is in ERROR state`);
+    throw new RegisteredServerRefusedError();
+  }
+
+  return { server, url: server.url };
+};
+
+/**
+ * The verified caller headers (`verified-caller.ts`) on the by-uuid path. The
+ * guard deletes both on every hop and sets neither (`InternalOnlyCredentials`
+ * in url-guard.ts), whatever put them on the request: a row's stored headers
+ * included, whether or not the row is named in VERIFIED_CALLER_SERVER_NAMES.
+ * Stripped by destination rather than by row name, so an identity stored on
+ * a row never stands in for the signed-in caller. A backend that requires
+ * them lists its tools here and refuses to execute one, which fails closed.
+ */
+const NO_VERIFIED_CALLER: InternalOnlyCredentials = Object.freeze({
+  headerNames: [VERIFIED_CALLER_HEADER, VERIFIED_CALLER_IDENTITY_HEADER],
+  forInternalHop: async () => undefined,
+});
+
+/**
+ * NO_VERIFIED_CALLER plus `Authorization`, for a row named in
+ * M365_INJECTED_SERVER_NAMES (`getInjectedServerNames`). A backend named there
+ * takes Authorization on a gateway-trusted request as the per-user Graph token
+ * the gateway mints inside the guard for the request's user, and nothing else
+ * (`createM365Credentials`, lib/m365/injected-fetch.ts, invariants 1, 2 and
+ * 7). This path mints no such token, so it sends no Authorization at all: not
+ * the browser's, not the row's OAuth token or stored bearer, not one in the
+ * row's stored headers. The guard deletes it on every hop. Such a backend
+ * lists its tools without one and refuses to execute a tool, which fails
+ * closed.
+ */
+const NO_CALLER_CREDENTIALS: InternalOnlyCredentials = Object.freeze({
+  headerNames: [
+    "authorization",
+    VERIFIED_CALLER_HEADER,
+    VERIFIED_CALLER_IDENTITY_HEADER,
+  ],
+  forInternalHop: async () => undefined,
+});
+
+/**
+ * The resolver a registered row's guard runs under: getaddrinfo, as the
+ * guard's default (`resolveHost`), refusing an answer that mixes
+ * internal-service addresses with external ones. The pool's posture accepts
+ * such an answer and treats the hop as external; here it is refused, because
+ * which address a socket lands on is then up to the resolver's ordering.
+ *
+ * It is the guard's resolver seam (`McpUrlGuardOptions.lookup`), so it runs on
+ * every resolution the guard makes for this connection: the check before the
+ * transport is built, every request the transport sends, and every redirect
+ * hop. An answer that turns mixed after the connection opened is refused on
+ * the request that sees it. An IP literal is one address and is never looked
+ * up.
+ */
+const refusingMixedAnswers =
+  (label: string) =>
+  async (hostname: string): Promise<string[]> => {
+    const addresses = await resolveHost(hostname);
+    const internal = addresses.filter(isInternalAddress).length;
+    if (internal > 0 && internal < addresses.length) {
+      logger.warn(
+        `Registered server refused: ${label}: its host resolves to internal and external addresses at once`,
+      );
+      throw new Error(NOT_A_PERMITTED_TARGET);
+    }
+    return addresses;
+  };
+
+/**
+ * The guard posture for a registered row opened by uuid: the pooled data
+ * plane's own (POOL_GUARD_OPTIONS in client.ts). It permits the private ranges
+ * the gateway's backends live on, pins every socket to the addresses it
+ * validated, refuses the never-a-backend ranges (metadata, CGNAT, multicast,
+ * reserved) and every cross-origin redirect, and sends X-Gateway-Auth and
+ * X-MCP-Actor only to an internal destination, so a third-party server
+ * someone registered gets neither.
+ *
+ * On top of it, two rules of this path: refusingMixedAnswers as the resolver,
+ * and the caller headers the guard deletes on every hop and never sets
+ * (NO_VERIFIED_CALLER, or NO_CALLER_CREDENTIALS for an m365-injected row).
+ */
+const registeredServerGuardOptions = (
+  server: DatabaseMcpServer,
+  label: string,
+): McpUrlGuardOptions => ({
+  ...POOL_GUARD_OPTIONS,
+  lookup: refusingMixedAnswers(label),
+  internalOnlyCredentials: getInjectedServerNames().has(server.name)
+    ? NO_CALLER_CREDENTIALS
+    : NO_VERIFIED_CALLER,
+});
+
+/**
+ * A fetch that refuses every request whose origin is not `origin` and hands
+ * the rest to `fetch`. The guarded fetch already refuses a cross-origin
+ * redirect under this posture; this covers the first hop of each request,
+ * which on SSE is the back-channel endpoint the remote server advertises.
+ * The row authorised one origin, not every address in the same private range,
+ * and the pin keeps that true whatever a future SDK does with its URLs.
+ */
+const pinnedToOrigin =
+  (origin: string, fetch: FetchLike): FetchLike =>
+  async (input, init) => {
+    let requested: string | undefined;
+    try {
+      requested = (input instanceof URL ? input : new URL(input)).origin;
+    } catch {
+      requested = undefined;
+    }
+    if (requested !== origin) {
+      logger.warn(
+        "MCP proxy remote URL refused: a request off the registered server's origin",
+      );
+      throw new Error(NOT_A_PERMITTED_TARGET);
+    }
+    return fetch(input, init);
+  };
+
+/** A copy of `headers` without `name` (lowercase) in any casing. */
+const withoutHeader = (
+  headers: Record<string, string>,
+  name: string,
+): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(headers).filter(([key]) => key.toLowerCase() !== name),
+  );
+
+/**
+ * The credential the pool presents to this row (client.ts
+ * createMetaMcpClient): its OAuth access token, else its stored bearer,
+ * decrypted at the point of use. Null when the row yields neither.
+ *
+ * The browser cannot supply the stored bearer (the server serializer never
+ * sends it), so without this a bearer-protected row could not be opened from
+ * the admin UI at all.
+ */
+const registeredServerToken = async (
+  server: DatabaseMcpServer,
+): Promise<string | null> => {
+  const oauthSession = await oauthSessionsRepository.findByMcpServerUuid(
+    server.uuid,
+  );
+  return (
+    oauthSession?.tokens?.access_token ||
+    resolveServerBearerToken(server.bearerToken)
+  );
+};
+
+/**
+ * Headers for a registered row opened by uuid: its stored headers, then the
+ * request's passthrough (getHttpHeaders), with two replacements.
+ *  - X-MCP-Actor is the signed-in admin's account email, read as
+ *    `inspectorCaller` (metamcp.ts) reads it (only beside a non-empty user id),
+ *    never the browser's value or a stored one. None is sent without one. The
+ *    guard drops it on any hop that is not internal.
+ *  - Authorization is the row's own credential (registeredServerToken); the
+ *    browser's passthrough is used only when the row yields none. For a row
+ *    named in M365_INJECTED_SERVER_NAMES the guard deletes it on every hop
+ *    (NO_CALLER_CREDENTIALS), so none is sent.
+ */
+const registeredServerHeaders = async (
+  req: express.Request,
+  transportType: string,
+  server: DatabaseMcpServer,
+): Promise<Record<string, string>> => {
+  // Strip legacy identity keys before Headers parses them. Reserved names
+  // with surrounding whitespace are invalid in a Headers initializer, so
+  // leaving their removal to the per-hop guard would break the connection.
+  let headers = withoutHeader(
+    { ...storedHeadersFor(server), ...getHttpHeaders(req, transportType) },
+    ASSERTED_ACTOR_HEADER,
+  );
+
+  const user = (req as express.Request & { user?: SessionUser }).user;
+  const actor =
+    typeof user?.id === "string" && user.id !== ""
+      ? normalizeAssertedActor(user.email)
+      : undefined;
+  if (actor) headers[ASSERTED_ACTOR_HEADER] = actor;
+
+  const token = await registeredServerToken(server);
+  if (token) {
+    headers = withoutHeader(headers, "authorization");
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+};
+
+/**
+ * Open a registered remote row by uuid (the server page and the Inspector's
+ * server targets send one). `query.url` is not read on this path: the row
+ * decides where the connection goes, so two rows sharing a url cannot be
+ * confused, and a destination is reached only by naming a row the caller may
+ * see. It connects to `transformDockerUrl(row.url)` under the pool's posture,
+ * public row or private, pinned to the row's origin.
+ */
+const openRegisteredServer = async (
+  req: express.Request,
+  transportType: string,
+): Promise<RemoteConnection> => {
+  const { server, url } = await findRegisteredRemoteServer(req, transportType);
+  const label = `server=${server.name} (${server.uuid})`;
+  const options = registeredServerGuardOptions(server, label);
+
+  // The same options as the transport's fetch below, so this check refuses
+  // what every later request would, and answers it before anything is built.
+  let target: ValidatedMcpTarget;
+  try {
+    target = await assertPublicMcpUrl(transformDockerUrl(url), options);
+  } catch (error) {
+    // The guard has logged its specific reason; its messages carry no url.
+    logger.warn(
+      `Registered server refused: ${label}: ${error instanceof Error ? error.message : "destination check failed"}`,
+    );
+    throw new RegisteredServerRefusedError();
+  }
+
+  return {
+    url: target.url,
+    fetch: pinnedToOrigin(target.url.origin, createGuardedFetch(options)),
+    headers: await registeredServerHeaders(req, transportType, server),
+    logTarget: label,
+  };
+};
+
+/**
+ * Open a remote destination named by `query.url` (no `mcpServerUuid`): a tab
+ * holding an older bundle, or a URL that is not saved. The strict posture:
+ * public destinations only, so this path never reaches the private network.
+ */
+const openByUrl = async (
+  req: express.Request,
+  transportType: string,
+): Promise<RemoteConnection> => {
+  const url = transformDockerUrl(req.query.url as string);
+
+  // The destination is caller-supplied, so it is checked BEFORE anything is
+  // opened and before the database is asked about it (see the url-guard module). The
+  // check is by address range rather than by "is this row registered",
+  // because pointing the Inspector at a not-yet-saved public server is a
+  // flow that has to keep working.
+  const target = await assertPublicMcpUrl(url);
+
+  // Find the row this URL belongs to, among the rows the caller may see.
+  // Its stored `headers` are merged below, so an unscoped lookup here hands
+  // out another user's vendor API keys: see findAccessibleRemoteServer.
+  const matchingServer = await findAccessibleRemoteServer(
+    req,
+    transportType,
+    url,
+  );
+
+  // Error state is read off the row already loaded rather than re-fetched by
+  // uuid: the re-fetch was a second, UNSCOPED lookup of a row we are already
+  // holding, which is the exact call this fix exists to remove from the path.
+  if (matchingServer?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
+    logger.info(
+      `Server ${matchingServer.name} (${matchingServer.uuid}) is in ERROR state`,
+    );
+    throw new Error(
+      `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
+    );
+  }
+
+  return {
+    url: target.url,
+    // `allowlistOrigin` is what keeps an MCP_PROXY_URL_ALLOWED_HOSTS entry from
+    // becoming a hole: the exemption applies to the origin the operator typed
+    // and to nothing else this transport is later told to fetch.
+    fetch: createGuardedFetch({ allowlistOrigin: target.url.origin }),
+    // Merge custom headers from database with passthrough headers from request
+    headers: {
+      ...storedHeadersFor(matchingServer),
+      ...getHttpHeaders(req, transportType),
+    },
+    // ORIGIN AND PATH ONLY, never the query string. Hosted MCP servers
+    // routinely carry their credential in it (`?api_key=`, `?token=`). It is
+    // JSON.stringify'd because the value is caller-supplied, and an embedded
+    // newline forges log lines.
+    logTarget: `url=${JSON.stringify(target.url.origin + target.url.pathname)}`,
+  };
+};
+
+/**
+ * Where a remote (SSE or STREAMABLE_HTTP) Inspector connection goes, and with
+ * what. A request that carries `mcpServerUuid` at all is resolved by uuid and
+ * nothing else (openRegisteredServer); a request without one keeps the strict
+ * by-url path (openByUrl), unchanged.
+ *
+ * Before 2026-11-13 only the by-url path existed, and every backend the
+ * gateway serves is on the private container network, so the admin UI's
+ * server page refused every registered server.
+ */
+const openRemoteServer = (
+  req: express.Request,
+  transportType: string,
+): Promise<RemoteConnection> =>
+  req.query.mcpServerUuid !== undefined
+    ? openRegisteredServer(req, transportType)
+    : openByUrl(req, transportType);
+
 const serverRouter = express.Router();
 
 // The Inspector's SDK includes response text in its error message. A fixed
@@ -566,6 +981,32 @@ const answerStdioPolicyRefusal = (
   return true;
 };
 
+/**
+ * The answer to a remote server request by uuid that cannot be opened (see
+ * REGISTERED_SERVER_REFUSED). A constant, JSON-RPC shaped, and the same on
+ * every route, like STDIO_DISABLED_BODY.
+ */
+const REGISTERED_SERVER_REFUSED_BODY = Object.freeze({
+  jsonrpc: "2.0",
+  error: { code: -32000, message: REGISTERED_SERVER_REFUSED },
+  id: null,
+});
+
+/**
+ * Answer a RegisteredServerRefusedError from `createTransport` with HTTP 400
+ * and return true; return false for any other error. Called beside
+ * answerStdioPolicyRefusal. The reason was logged where it was thrown, and
+ * nothing has been opened yet, so there is nothing to close.
+ */
+const answerRegisteredServerRefusal = (
+  error: unknown,
+  res: express.Response,
+): boolean => {
+  if (!(error instanceof RegisteredServerRefusedError)) return false;
+  res.status(400).json(REGISTERED_SERVER_REFUSED_BODY);
+  return true;
+};
+
 const createTransport = async (req: express.Request): Promise<Transport> => {
   const query = req.query;
   // Only the transport type is logged. The whole query used to be dumped here,
@@ -643,58 +1084,24 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       throw error;
     }
   } else if (transportType === McpServerTypeEnum.enum.SSE) {
-    const url = transformDockerUrl(query.url as string);
-
-    // The destination is caller-supplied, so it is checked BEFORE anything is
-    // opened and before the database is asked about it (see the url-guard module). The
-    // check is by address range rather than by "is this row registered",
-    // because pointing the Inspector at a not-yet-saved public server is a
-    // flow that has to keep working.
-    const target = await assertPublicMcpUrl(url);
-
-    // Find the row this URL belongs to, among the rows the caller may see.
-    // Its stored `headers` are merged below, so an unscoped lookup here hands
-    // out another user's vendor API keys — see findAccessibleRemoteServer.
-    const matchingServer = await findAccessibleRemoteServer(
-      req,
-      transportType,
+    // Destination, fetch and headers: by uuid for a registered row, else the
+    // strict by-url path (see openRemoteServer).
+    const {
       url,
-    );
-
-    // Error state is read off the row already loaded rather than re-fetched by
-    // uuid: the re-fetch was a second, UNSCOPED lookup of a row we are already
-    // holding, which is the exact call this fix exists to remove from the path.
-    if (matchingServer?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
-      logger.info(
-        `Server ${matchingServer.name} (${matchingServer.uuid}) is in ERROR state`,
-      );
-      throw new Error(
-        `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-      );
-    }
-
-    // Merge custom headers from database with passthrough headers from request
-    const headers = {
-      ...storedHeadersFor(matchingServer),
-      ...getHttpHeaders(req, transportType),
-    };
+      fetch: guardedFetch,
+      headers,
+      logTarget,
+    } = await openRemoteServer(req, transportType);
 
     // Header NAMES only. `headers` is the row's stored `headers` jsonb merged
     // with the request's passthrough `authorization`, so stringifying the whole
     // object wrote both the caller's bearer token and the server's vendor API
     // keys into app.log on every SSE connect. The names are what a connectivity
-    // problem is actually diagnosed from; the values never were.
-    //
-    // ORIGIN AND PATH ONLY — never the query string. Hosted MCP servers
-    // routinely carry their credential in it (`?api_key=`, `?token=`), so
-    // logging the full url writes that key into app.log, which is the same
-    // leak this line already avoids for the header values. It is still
-    // JSON.stringify'd for the reason the transportType line above is: the
-    // value is caller-supplied, and an embedded newline forges log lines.
+    // problem is actually diagnosed from; the values never were. The
+    // destination is named by row (`server=<name> (<uuid>)`) or by origin and
+    // path, never with its query string (see RemoteConnection.logTarget).
     logger.info(
-      `SSE transport: url=${JSON.stringify(
-        target.url.origin + target.url.pathname,
-      )}, headers=[${Object.keys(headers).join(", ")}]`,
+      `SSE transport: ${logTarget}, headers=[${Object.keys(headers).join(", ")}]`,
     );
 
     // Every request this transport makes goes through the guard, not just the
@@ -703,20 +1110,13 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     // input that never passes through this handler — and `eventSourceInit.fetch`
     // takes precedence over the `fetch` option inside the SDK, so both have to
     // be set for the stream and the POSTs to be covered.
-    // `allowlistOrigin` is what keeps an MCP_PROXY_URL_ALLOWED_HOSTS entry from
-    // becoming a hole: the exemption applies to the origin the operator typed
-    // and to nothing else this transport is later told to fetch.
     //
     // Back-channel coverage rests on the PINNED SDK (1.30.0) honouring
     // `opts.fetch` for the POST to the server-advertised endpoint. If that pin
     // moves, re-check `client/sse.js` still routes that POST through it.
-    const guardedFetch = createGuardedFetch({
-      allowlistOrigin: target.url.origin,
-    });
-
-    const transport = new SSEClientTransport(target.url, {
+    const transport = new SSEClientTransport(url, {
       eventSourceInit: {
-        fetch: (url, init) => guardedFetch(url, { ...init, headers }),
+        fetch: (input, init) => guardedFetch(input, { ...init, headers }),
       },
       requestInit: {
         headers,
@@ -726,41 +1126,20 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     await transport.start();
     return transport;
   } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
-    const url = transformDockerUrl(query.url as string);
-
-    // Same destination check as the SSE branch above (see the url-guard module).
-    const target = await assertPublicMcpUrl(url);
-
-    // Same caller-scoped row lookup and same in-memory error-state read as the
-    // SSE branch above — see findAccessibleRemoteServer.
-    const matchingServer = await findAccessibleRemoteServer(
-      req,
-      transportType,
+    // Same resolution as the SSE branch above (see openRemoteServer).
+    const {
       url,
-    );
-
-    if (matchingServer?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
-      logger.info(
-        `Server ${matchingServer.name} (${matchingServer.uuid}) is in ERROR state`,
-      );
-      throw new Error(
-        `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-      );
-    }
-
-    // Merge custom headers from database with passthrough headers from request
-    const headers = {
-      ...storedHeadersFor(matchingServer),
-      ...getHttpHeaders(req, transportType),
-    };
+      fetch: guardedFetch,
+      headers,
+    } = await openRemoteServer(req, transportType);
 
     // Covers the transport's own reconnects and every redirect hop, which the
-    // one-shot check above cannot reach.
-    const transport = new StreamableHTTPClientTransport(target.url, {
+    // one-shot check cannot reach.
+    const transport = new StreamableHTTPClientTransport(url, {
       requestInit: {
         headers,
       },
-      fetch: createGuardedFetch({ allowlistOrigin: target.url.origin }),
+      fetch: guardedFetch,
     });
     await transport.start();
     return transport;
@@ -803,6 +1182,9 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
         serverTransport = await createTransport(req);
       } catch (error) {
         if (answerStdioPolicyRefusal(error, res)) {
+          return;
+        }
+        if (answerRegisteredServerRefusal(error, res)) {
           return;
         }
         if (error instanceof SseError && error.code === 401) {
@@ -986,6 +1368,9 @@ serverRouter.get("/stdio", async (req, res) => {
       if (answerStdioPolicyRefusal(error, res)) {
         return;
       }
+      if (answerRegisteredServerRefusal(error, res)) {
+        return;
+      }
       if (error instanceof SseError && error.code === 401) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
@@ -1153,6 +1538,9 @@ serverRouter.get("/sse", async (req, res) => {
       serverTransport = await createTransport(req);
     } catch (error) {
       if (answerStdioPolicyRefusal(error, res)) {
+        return;
+      }
+      if (answerRegisteredServerRefusal(error, res)) {
         return;
       }
       if (error instanceof SseError && error.code === 401) {

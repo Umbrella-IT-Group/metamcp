@@ -87,6 +87,25 @@ interface UseConnectionOptions {
   captureTraffic?: boolean;
 }
 
+// Name a remote (SSE or Streamable HTTP) server to the proxy. A registered
+// server is named by its uuid alone, as the STDIO case does: the proxy then
+// connects to the url stored on that row, which is what lets the server page
+// reach a backend on the gateway's private network, and the url (which can
+// carry a credential in its query string) stays out of this request. Only a
+// target with no uuid is named by url, and the proxy holds that to public
+// destinations.
+function appendRemoteTarget(
+  proxyUrl: URL,
+  mcpServerUuid: string,
+  url: string,
+): void {
+  if (mcpServerUuid) {
+    proxyUrl.searchParams.append("mcpServerUuid", mcpServerUuid);
+  } else {
+    proxyUrl.searchParams.append("url", url);
+  }
+}
+
 // A transport belongs to the connection that created it, not to the current
 // target's options. End Streamable HTTP sessions before close() aborts their
 // controller, and still close the client if ending its session fails.
@@ -597,7 +616,7 @@ export function useConnection({
 
             case McpServerTypeEnum.enum.SSE:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/sse`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append("url", url);
+              appendRemoteTarget(mcpProxyServerUrl, mcpServerUuid, url);
               transportOptions = {
                 eventSourceInit: {
                   fetch: (
@@ -626,7 +645,7 @@ export function useConnection({
 
             case McpServerTypeEnum.enum.STREAMABLE_HTTP:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append("url", url);
+              appendRemoteTarget(mcpProxyServerUrl, mcpServerUuid, url);
               transportOptions = {
                 authProvider: attemptAuthProvider,
                 eventSourceInit: {

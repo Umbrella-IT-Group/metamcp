@@ -33,6 +33,8 @@ const {
   streamableClientConstructions,
   lookupMock,
   findAllAccessibleToUserMock,
+  findOAuthSessionMock,
+  undiciFetchMock,
 } = vi.hoisted(() => ({
   /** Every SSEClientTransport construction, in order. */
   sseClientConstructions: [] as Array<{ url: URL; opts: any }>,
@@ -40,6 +42,9 @@ const {
   streamableClientConstructions: [] as Array<{ url: URL; opts: any }>,
   lookupMock: vi.fn(),
   findAllAccessibleToUserMock: vi.fn(),
+  findOAuthSessionMock: vi.fn(),
+  /** The wire: what the guarded fetch hands undici, after every guard step. */
+  undiciFetchMock: vi.fn(),
 }));
 
 // THE ASSERTION SURFACE. These constructors are the point of no return: past
@@ -114,9 +119,17 @@ vi.mock("../../lib/metamcp/mcp-server-pool", () => ({
   mcpServerPool: { handleServerCrashWithoutNamespace: vi.fn() },
 }));
 
-vi.mock("../../lib/metamcp/client", () => ({
-  transformDockerUrl: (url: string) => url,
-}));
+// The real localhost transform and the real pool posture: the by-uuid path
+// connects under POOL_GUARD_OPTIONS, and a stand-in copy here would test the
+// copy. Nothing else from the client module is used by the route.
+vi.mock("../../lib/metamcp/client", async (importOriginal) => {
+  const real =
+    await importOriginal<typeof import("../../lib/metamcp/client")>();
+  return {
+    transformDockerUrl: real.transformDockerUrl,
+    POOL_GUARD_OPTIONS: real.POOL_GUARD_OPTIONS,
+  };
+});
 
 // `findAll` and `findByUuid` are TRIPWIRES, matching the STDIO call-site
 // suite. Both ignore ownership: `findAll` returns every row in the
@@ -136,6 +149,7 @@ vi.mock("../../db/repositories", () => ({
     }),
     findAllAccessibleToUser: findAllAccessibleToUserMock,
   },
+  oauthSessionsRepository: { findByMcpServerUuid: findOAuthSessionMock },
 }));
 
 // `db/index.ts` throws without DATABASE_URL.
@@ -145,8 +159,17 @@ vi.mock("../../db/index", () => ({ db: {}, pool: {} }));
 // route keeps calling the guard exactly as production does.
 vi.mock("node:dns/promises", () => ({ lookup: lookupMock }));
 
+// The transport under the guarded fetch. Only `fetch` is replaced, so the
+// guard's own pinned Agent is still built; nothing here opens a socket.
+vi.mock("undici", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("undici")>()),
+  fetch: undiciFetchMock,
+}));
+
 const { default: serverRouter } = await import("./server");
-const { NOT_A_PERMITTED_TARGET } = await import("@/lib/metamcp/url-guard");
+const { CROSS_ORIGIN_REDIRECT_REFUSED, NOT_A_PERMITTED_TARGET } = await import(
+  "@/lib/metamcp/url-guard"
+);
 
 const PUBLIC_V4 = "93.184.216.34";
 
@@ -206,7 +229,10 @@ const accessibleTo = (userId: string) =>
 /** Header names+values the transport was actually built with. */
 const sseHeaders = () => sseClientConstructions[0]?.opts?.requestInit?.headers;
 
-/** Minimal express res double; the routes only stream or 500. */
+/** The body of the last `res.json(...)` any route sent. */
+let lastJsonBody: unknown;
+
+/** Minimal express res double; the routes only stream, refuse or 500. */
 const makeRes = () => {
   let statusCode = 200;
   const res: any = {
@@ -217,7 +243,8 @@ const makeRes = () => {
       statusCode = code;
       return res;
     },
-    json() {
+    json(body: unknown) {
+      lastJsonBody = body;
       return res;
     },
     end() {
@@ -240,13 +267,16 @@ const makeRes = () => {
   return res;
 };
 
+/** The session user a request carries, as `betterAuthMcpMiddleware` sets it. */
+type SessionUserDouble = { id?: string; role?: string; email?: string };
+
 /** Drive one of the real routes and settle. */
 async function drive(
   method: "GET" | "POST",
   path: string,
   query: Record<string, string>,
   /** `null` means the request arrives with NO session user at all. */
-  user: { id?: string; role?: string } | null = CALLER,
+  user: SessionUserDouble | null = CALLER,
   /** Request headers, lowercase-keyed as Express delivers them. */
   headers: Record<string, string> = {},
 ): Promise<number> {
@@ -279,22 +309,44 @@ async function drive(
 
 const getSse = (
   query: Record<string, string>,
-  user: { id?: string; role?: string } | null = CALLER,
+  user: SessionUserDouble | null = CALLER,
   headers: Record<string, string> = {},
 ) => drive("GET", "/sse", query, user, headers);
 const postMcp = (
   query: Record<string, string>,
-  user: { id?: string; role?: string } | null = CALLER,
+  user: SessionUserDouble | null = CALLER,
   headers: Record<string, string> = {},
 ) => drive("POST", "/mcp", query, user, headers);
+/** GET /stdio reaches `createTransport` for any transport type it is given. */
+const getStdio = (
+  query: Record<string, string>,
+  user: SessionUserDouble | null = CALLER,
+  headers: Record<string, string> = {},
+) => drive("GET", "/stdio", query, user, headers);
 
 beforeEach(() => {
   vi.clearAllMocks();
   sseClientConstructions.length = 0;
   streamableClientConstructions.length = 0;
+  lastJsonBody = undefined;
   findAllAccessibleToUserMock.mockResolvedValue([]);
+  findOAuthSessionMock.mockResolvedValue(undefined);
+  undiciFetchMock.mockImplementation(
+    async () => new Response("{}", { status: 200 }),
+  );
   resolvesTo(PUBLIC_V4);
   delete process.env.MCP_PROXY_URL_ALLOWED_HOSTS;
+  // The client module's real transformDockerUrl is in use (see its mock
+  // above), and the compose files and example.env turn the transform on. Off
+  // here, so every case reads the url it names; a case that needs it sets it.
+  vi.stubEnv("TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL", "");
+  // The default m365-injected list (`m365`), whatever the shell exports; the
+  // rows here are not on it unless a case says so.
+  vi.stubEnv("M365_INJECTED_SERVER_NAMES", "");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("GET /mcp-proxy/server/sse — where the SSE branch will connect", () => {
@@ -923,4 +975,606 @@ describe("X-Umbrella-Caller cannot be supplied through the Inspector", () => {
       expect(headers["x-vendor-api-key"]).toBe("other-key");
     },
   );
+});
+
+/**
+ * The server page's own backends, opened by uuid.
+ *
+ * The admin UI opens every registered server through this proxy to list its
+ * tools, and the gateway's backends live on the private container network, so
+ * the strict "public destinations only" by-url posture refused every one of
+ * them. A request that names a row by `mcpServerUuid` now connects to that
+ * row's url (never `query.url`) under the pool's own guard posture, pinned to
+ * the row's origin; a request without one keeps the strict path.
+ *
+ * The guard here is the real one, resolving through the mocked getaddrinfo
+ * (`node:dns/promises`), and the wire is undici's fetch under it. Expected
+ * values follow the guard's range table (url-guard.ts BLOCKED_IPV4_RANGES):
+ * 172.16.0.0/12 is an internal-service range, 169.254.0.0/16 and
+ * 100.64.0.0/10 are never a backend.
+ */
+describe("registered servers by uuid: the server page's own backends", () => {
+  const INTERNAL_V4 = "172.18.0.7";
+  const ROW_UUID = "dddddddd-4444-4444-8444-dddddddddddd";
+  const OTHER_USERS_UUID = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
+  const OTHER_TYPE_UUID = "ffffffff-6666-4666-8666-ffffffffffff";
+  const OWN_ROW_UUID = "a1a1a1a1-1111-4111-8111-a1a1a1a1a1a1";
+  const ERROR_ROW_UUID = "abababab-7777-4777-8777-abababababab";
+  const NO_URL_ROW_UUID = "cdcdcdcd-8888-4888-8888-cdcdcdcdcdcd";
+  const UNKNOWN_UUID = "12121212-9999-4999-8999-121212121212";
+  const BACKEND_MCP = "http://mcp-backend.example.com:3000/mcp";
+  const BACKEND_SSE = "http://mcp-backend.example.com:3000/sse";
+  const ELSEWHERE = "https://elsewhere.example.com/mcp";
+  const SESSION = { ...CALLER, email: "admin@example.com" };
+  // A test value of the minimum length the guard accepts (32 bytes).
+  const GATEWAY_SECRET = "test-gateway-backend-secret-0000000000";
+
+  const row = (over: Record<string, unknown> = {}) => ({
+    uuid: ROW_UUID,
+    name: "backend",
+    type: "STREAMABLE_HTTP",
+    url: BACKEND_MCP,
+    headers: {} as Record<string, string>,
+    user_id: null as string | null,
+    error_status: null as string | null,
+    bearerToken: null as string | null,
+    ...over,
+  });
+
+  type Send = (
+    query: Record<string, string>,
+    user?: SessionUserDouble | null,
+    headers?: Record<string, string>,
+  ) => Promise<number>;
+  const TRANSPORTS: Array<
+    [string, string, Send, Array<{ url: URL; opts: any }>]
+  > = [
+    ["STREAMABLE_HTTP", BACKEND_MCP, postMcp, streamableClientConstructions],
+    ["SSE", BACKEND_SSE, getSse, sseClientConstructions],
+  ];
+
+  /**
+   * Send one request through the transport's own fetch the way the SDK does:
+   * a POST with the constructed headers (STREAMABLE_HTTP), or the SSE stream
+   * GET through `eventSourceInit.fetch`, which adds the headers itself.
+   */
+  const sendThroughTransport = async (
+    type: string,
+    built: Array<{ url: URL; opts: any }>,
+  ) => {
+    expect(built).toHaveLength(1);
+    const { url, opts } = built[0];
+    if (type === "SSE") {
+      return opts.eventSourceInit.fetch(url, { method: "GET" });
+    }
+    return opts.fetch(url, {
+      method: "POST",
+      headers: opts.requestInit.headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+  };
+
+  /** The headers of the last request that reached the wire. */
+  const wireHeaders = (): Headers => {
+    const calls = undiciFetchMock.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    return new Headers(calls[calls.length - 1][1].headers);
+  };
+
+  const ORIGINAL_NAMES = process.env.VERIFIED_CALLER_SERVER_NAMES;
+
+  beforeEach(() => {
+    resolvesTo(INTERNAL_V4);
+    findAllAccessibleToUserMock.mockResolvedValue([row()]);
+  });
+
+  afterEach(() => {
+    delete process.env.GATEWAY_BACKEND_SECRET;
+    delete process.env.TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL;
+    if (ORIGINAL_NAMES === undefined) {
+      delete process.env.VERIFIED_CALLER_SERVER_NAMES;
+    } else {
+      process.env.VERIFIED_CALLER_SERVER_NAMES = ORIGINAL_NAMES;
+    }
+  });
+
+  it.each(TRANSPORTS)(
+    "connects a public row on the private network over %s, to the row's url and not query.url (real guard)",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+
+      await send({
+        transportType: type,
+        mcpServerUuid: ROW_UUID,
+        url: ELSEWHERE,
+      });
+
+      expect(built).toHaveLength(1);
+      expect(built[0].url.href).toBe(rowUrl);
+      expect(findAllAccessibleToUserMock).toHaveBeenCalledWith(CALLER.id);
+      expect(lookupMock).toHaveBeenCalledWith("mcp-backend.example.com", {
+        all: true,
+        verbatim: true,
+      });
+      expect(lookupMock).not.toHaveBeenCalledWith(
+        "elsewhere.example.com",
+        expect.anything(),
+      );
+    },
+  );
+
+  it("connects the caller's own private row by uuid", async () => {
+    findAllAccessibleToUserMock.mockResolvedValue([
+      row({ user_id: CALLER.id }),
+    ]);
+
+    await postMcp({
+      transportType: "STREAMABLE_HTTP",
+      mcpServerUuid: ROW_UUID,
+    });
+
+    expect(streamableClientConstructions).toHaveLength(1);
+  });
+
+  it.each(TRANSPORTS)(
+    "answers every miss on %s with the same constant 400 refusal and opens nothing",
+    async (type, rowUrl, send, built) => {
+      const otherType = type === "SSE" ? "STREAMABLE_HTTP" : "SSE";
+      const estate = [
+        row({ type, url: rowUrl }),
+        row({
+          uuid: OTHER_USERS_UUID,
+          type,
+          url: rowUrl,
+          user_id: "user-someone-else",
+        }),
+        row({ uuid: OTHER_TYPE_UUID, type: otherType, url: rowUrl }),
+        row({ uuid: ERROR_ROW_UUID, type, url: rowUrl, error_status: "ERROR" }),
+        row({ uuid: NO_URL_ROW_UUID, type, url: null }),
+      ];
+      findAllAccessibleToUserMock.mockImplementation(async (userId: string) =>
+        estate.filter((r) => r.user_id === null || r.user_id === userId),
+      );
+
+      const misses: Array<[string, SessionUserDouble | null]> = [
+        [OTHER_USERS_UUID, CALLER],
+        ["not-a-uuid", CALLER],
+        ["undefined", CALLER],
+        [OTHER_TYPE_UUID, CALLER],
+        [ERROR_ROW_UUID, CALLER],
+        [NO_URL_ROW_UUID, CALLER],
+        [UNKNOWN_UUID, CALLER],
+        [ROW_UUID, null],
+      ];
+      const answers: Array<{ status: number; body: unknown }> = [];
+      // The transport's own route, and GET /stdio, which reaches the same
+      // resolver for a remote transport type.
+      for (const route of [send, getStdio]) {
+        for (const [mcpServerUuid, user] of misses) {
+          lastJsonBody = undefined;
+          const status = await route(
+            { transportType: type, mcpServerUuid, url: rowUrl },
+            user,
+          );
+          answers.push({ status, body: lastJsonBody });
+        }
+      }
+
+      expect(built).toEqual([]);
+      expect(answers[0]).toEqual({
+        status: 400,
+        body: {
+          jsonrpc: "2.0",
+          error: { code: -32000, message: expect.any(String) },
+          id: null,
+        },
+      });
+      for (const answer of answers) expect(answer).toEqual(answers[0]);
+      // The message names no row, uuid, address or url.
+      const message = JSON.stringify(answers[0].body);
+      expect(message).not.toContain("example.com");
+      expect(message).not.toContain(OTHER_USERS_UUID);
+    },
+  );
+
+  it.each(TRANSPORTS)(
+    "STILL refuses an internal url with no uuid on %s, even when a visible row has that exact url",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+        row({ uuid: OWN_ROW_UUID, type, url: rowUrl, user_id: CALLER.id }),
+      ]);
+
+      const status = await send({ transportType: type, url: rowUrl });
+
+      expect(built).toEqual([]);
+      // The strict path, unchanged: its refusal is the generic 500.
+      expect(status).toBe(500);
+    },
+  );
+
+  it.each([
+    ["cloud metadata", ["169.254.169.254"]],
+    ["carrier-grade NAT", ["100.64.0.1"]],
+    ["a mixed public and private answer", [PUBLIC_V4, INTERNAL_V4]],
+    ["a mixed private and public answer", [INTERNAL_V4, PUBLIC_V4]],
+  ])(
+    "refuses a registered row whose host resolves to %s",
+    async (_name, addresses) => {
+      resolvesTo(...addresses);
+
+      for (const [type, rowUrl, send, built] of TRANSPORTS) {
+        findAllAccessibleToUserMock.mockResolvedValue([
+          row({ type, url: rowUrl }),
+        ]);
+        lastJsonBody = undefined;
+
+        const status = await send({
+          transportType: type,
+          mcpServerUuid: ROW_UUID,
+        });
+
+        expect(built).toEqual([]);
+        expect(status).toBe(400);
+        expect(lastJsonBody).toMatchObject({ jsonrpc: "2.0", id: null });
+      }
+    },
+  );
+
+  it.each(TRANSPORTS)(
+    "refuses a %s request whose host answer turned mixed after the connection opened",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+      // The check before the transport is built sees an internal answer;
+      // every lookup after it answers internal and public at once.
+      resolvesTo(INTERNAL_V4, PUBLIC_V4);
+      lookupMock.mockResolvedValueOnce([{ address: INTERNAL_V4 }]);
+
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      expect(built).toHaveLength(1);
+
+      await expect(sendThroughTransport(type, built)).rejects.toThrow(
+        NOT_A_PERMITTED_TARGET,
+      );
+      expect(lookupMock).toHaveBeenCalledTimes(2);
+      expect(undiciFetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses a same-origin redirect hop whose host answer turned mixed", async () => {
+    // Internal for the open and for the request's first hop, mixed for the
+    // hop the redirect asks for.
+    resolvesTo(INTERNAL_V4, PUBLIC_V4);
+    lookupMock
+      .mockResolvedValueOnce([{ address: INTERNAL_V4 }])
+      .mockResolvedValueOnce([{ address: INTERNAL_V4 }]);
+    await postMcp({
+      transportType: "STREAMABLE_HTTP",
+      mcpServerUuid: ROW_UUID,
+    });
+    undiciFetchMock.mockResolvedValueOnce(
+      new Response(null, { status: 307, headers: { location: "/mcp-moved" } }),
+    );
+
+    await expect(
+      sendThroughTransport("STREAMABLE_HTTP", streamableClientConstructions),
+    ).rejects.toThrow(NOT_A_PERMITTED_TARGET);
+    expect(lookupMock).toHaveBeenCalledTimes(3);
+    expect(undiciFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(TRANSPORTS)(
+    "keeps every %s request on the row's own origin",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      expect(built).toHaveLength(1);
+      const { opts } = built[0];
+      // Another host on the same private address: the row authorised one
+      // origin, not the private network.
+      const offOrigin = "http://mcp-other.example.com:3000/mcp";
+
+      await expect(opts.fetch(offOrigin)).rejects.toThrow(
+        NOT_A_PERMITTED_TARGET,
+      );
+      if (type === "SSE") {
+        await expect(opts.eventSourceInit.fetch(offOrigin)).rejects.toThrow(
+          NOT_A_PERMITTED_TARGET,
+        );
+      }
+      await expect(opts.fetch("http://169.254.169.254/")).rejects.toThrow(
+        NOT_A_PERMITTED_TARGET,
+      );
+      expect(undiciFetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses a redirect off the row's origin", async () => {
+    await postMcp({
+      transportType: "STREAMABLE_HTTP",
+      mcpServerUuid: ROW_UUID,
+    });
+    undiciFetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: "http://mcp-other.example.com:3000/mcp" },
+      }),
+    );
+
+    await expect(
+      sendThroughTransport("STREAMABLE_HTTP", streamableClientConstructions),
+    ).rejects.toThrow(CROSS_ORIGIN_REDIRECT_REFUSED);
+    expect(undiciFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(TRANSPORTS)(
+    "sends X-Gateway-Auth over %s to an internal row and not to a public one",
+    async (type, rowUrl, send, built) => {
+      process.env.GATEWAY_BACKEND_SECRET = GATEWAY_SECRET;
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      await sendThroughTransport(type, built);
+      expect(wireHeaders().get("x-gateway-auth")).toBe(GATEWAY_SECRET);
+
+      built.length = 0;
+      undiciFetchMock.mockClear();
+      resolvesTo(PUBLIC_V4);
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      await sendThroughTransport(type, built);
+      expect(wireHeaders().has("x-gateway-auth")).toBe(false);
+    },
+  );
+
+  it.each(TRANSPORTS)(
+    "never puts a row's stored X-Umbrella-User-Id or X-Umbrella-Caller on the %s wire",
+    async (type, rowUrl, send, built) => {
+      // The row is NOT a named verified-caller backend, so nothing strips
+      // these by row name; only the destination rule can.
+      process.env.VERIFIED_CALLER_SERVER_NAMES = "team";
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({
+          type,
+          url: rowUrl,
+          headers: {
+            "X-Umbrella-User-Id": "user-stored",
+            "x-umbrella-caller": "v1.stored",
+            "x-vendor-api-key": "backend-key",
+          },
+        }),
+      ]);
+
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      await sendThroughTransport(type, built);
+
+      const wire = wireHeaders();
+      expect(wire.has("x-umbrella-user-id")).toBe(false);
+      expect(wire.has("x-umbrella-caller")).toBe(false);
+      expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+    },
+  );
+
+  it.each(TRANSPORTS)(
+    "drops whitespace-padded legacy identity header keys before normalizing %s headers",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({
+          type,
+          url: rowUrl,
+          headers: {
+            " X-Umbrella-User-Id ": "user-stored",
+            "\tx-umbrella-caller\t": "v1.stored",
+            "x-vendor-api-key": "backend-key",
+          },
+        }),
+      ]);
+
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      await sendThroughTransport(type, built);
+
+      const wire = wireHeaders();
+      expect(wire.has("x-umbrella-user-id")).toBe(false);
+      expect(wire.has("x-umbrella-caller")).toBe(false);
+      expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+    },
+  );
+
+  it.each(TRANSPORTS)(
+    "strips identity headers supplied at the %s fetch boundary, after stored-header filtering",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+
+      // The SDK can supply request headers after connection-level headers
+      // were built. Only the guard can protect this final boundary.
+      await built[0].opts.fetch(rowUrl, {
+        method: "POST",
+        headers: {
+          "X-Umbrella-User-Id": "user-request",
+          "X-Umbrella-Caller": "v1.request",
+          "x-vendor-api-key": "backend-key",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+
+      const wire = wireHeaders();
+      expect(wire.has("x-umbrella-user-id")).toBe(false);
+      expect(wire.has("x-umbrella-caller")).toBe(false);
+      expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+    },
+  );
+
+  it("replaces the browser's and the row's X-MCP-Actor with the session email", async () => {
+    findAllAccessibleToUserMock.mockResolvedValue([
+      row({ headers: { "X-MCP-Actor": "stored@example.com" } }),
+    ]);
+
+    await postMcp(
+      { transportType: "STREAMABLE_HTTP", mcpServerUuid: ROW_UUID },
+      SESSION,
+      { "x-mcp-actor": "browser@example.com" },
+    );
+    await sendThroughTransport(
+      "STREAMABLE_HTTP",
+      streamableClientConstructions,
+    );
+
+    expect(wireHeaders().get("x-mcp-actor")).toBe(SESSION.email);
+  });
+
+  it("sends no X-MCP-Actor when the session has no email, whatever the browser sent", async () => {
+    await postMcp(
+      { transportType: "STREAMABLE_HTTP", mcpServerUuid: ROW_UUID },
+      CALLER,
+      { "x-mcp-actor": "browser@example.com" },
+    );
+    await sendThroughTransport(
+      "STREAMABLE_HTTP",
+      streamableClientConstructions,
+    );
+
+    expect(wireHeaders().has("x-mcp-actor")).toBe(false);
+  });
+
+  it("sends no X-MCP-Actor to a public registered row", async () => {
+    resolvesTo(PUBLIC_V4);
+
+    await postMcp(
+      { transportType: "STREAMABLE_HTTP", mcpServerUuid: ROW_UUID },
+      SESSION,
+    );
+    await sendThroughTransport(
+      "STREAMABLE_HTTP",
+      streamableClientConstructions,
+    );
+
+    expect(wireHeaders().has("x-mcp-actor")).toBe(false);
+  });
+
+  it("connects a localhost row by uuid with the localhost transform on", async () => {
+    process.env.TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL = "true";
+    resolvesTo("172.17.0.1");
+    findAllAccessibleToUserMock.mockResolvedValue([
+      row({ url: "http://localhost:3000/mcp" }),
+    ]);
+
+    await postMcp({
+      transportType: "STREAMABLE_HTTP",
+      mcpServerUuid: ROW_UUID,
+    });
+
+    expect(streamableClientConstructions).toHaveLength(1);
+    expect(streamableClientConstructions[0].url.href).toBe(
+      "http://host.docker.internal:3000/mcp",
+    );
+  });
+
+  it.each([
+    [
+      "the row's OAuth access token",
+      { tokens: { access_token: "row-oauth-token" } },
+      "row-bearer-token",
+      "Bearer row-oauth-token",
+    ],
+    [
+      "the row's stored bearer",
+      undefined,
+      "row-bearer-token",
+      "Bearer row-bearer-token",
+    ],
+    [
+      "the browser's, when the row has none",
+      undefined,
+      null,
+      "Bearer browser-token",
+    ],
+  ])(
+    "authorizes with %s",
+    async (_name, oauthSession, bearerToken, expected) => {
+      findOAuthSessionMock.mockResolvedValue(oauthSession);
+      findAllAccessibleToUserMock.mockResolvedValue([row({ bearerToken })]);
+
+      await postMcp(
+        { transportType: "STREAMABLE_HTTP", mcpServerUuid: ROW_UUID },
+        CALLER,
+        { authorization: "Bearer browser-token" },
+      );
+      await sendThroughTransport(
+        "STREAMABLE_HTTP",
+        streamableClientConstructions,
+      );
+
+      expect(findOAuthSessionMock).toHaveBeenCalledWith(ROW_UUID);
+      expect(wireHeaders().get("authorization")).toBe(expected);
+    },
+  );
+
+  // Oracle: lib/m365/injected-fetch.ts invariants 1, 2 and 7. A backend named
+  // in M365_INJECTED_SERVER_NAMES takes Authorization only as a token the
+  // gateway minted for the request's user, and this path mints none.
+  it.each([
+    // The top-level beforeEach leaves the list unset, so the default applies.
+    ["the default list", "", "m365"],
+    ["a configured list", "m365, graph-broker", "graph-broker"],
+  ])(
+    "sends no Authorization from any source to a row on %s of m365-injected servers",
+    async (_name, injectedNames, rowName) => {
+      vi.stubEnv("M365_INJECTED_SERVER_NAMES", injectedNames);
+      process.env.GATEWAY_BACKEND_SECRET = GATEWAY_SECRET;
+      findOAuthSessionMock.mockResolvedValue({
+        tokens: { access_token: "row-oauth-token" },
+      });
+
+      for (const [type, rowUrl, send, built] of TRANSPORTS) {
+        findAllAccessibleToUserMock.mockResolvedValue([
+          row({
+            name: rowName,
+            type,
+            url: rowUrl,
+            bearerToken: "row-bearer-token",
+            headers: {
+              Authorization: "Bearer stored-header-token",
+              "x-vendor-api-key": "backend-key",
+            },
+          }),
+        ]);
+        undiciFetchMock.mockClear();
+
+        await send({ transportType: type, mcpServerUuid: ROW_UUID }, SESSION, {
+          authorization: "Bearer browser-token",
+        });
+        await sendThroughTransport(type, built);
+
+        const wire = wireHeaders();
+        expect(wire.has("authorization")).toBe(false);
+        expect(wire.get("x-gateway-auth")).toBe(GATEWAY_SECRET);
+        expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+      }
+    },
+  );
+
+  it("logs the SSE connection by row name and uuid, never by url", async () => {
+    findAllAccessibleToUserMock.mockResolvedValue([
+      row({ type: "SSE", url: `${BACKEND_SSE}?api_key=ROW-SECRET` }),
+    ]);
+
+    await getSse({ transportType: "SSE", mcpServerUuid: ROW_UUID });
+
+    const line = loggerInfo.mock.calls
+      .map((call) => String(call[0]))
+      .find((text) => text.startsWith("SSE transport:"));
+    expect(line).toContain(`server=backend (${ROW_UUID})`);
+    expect(line).not.toContain("mcp-backend.example.com");
+    expect(line).not.toContain("ROW-SECRET");
+  });
 });

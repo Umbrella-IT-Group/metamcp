@@ -38,6 +38,7 @@ import { useTranslations } from "@/hooks/useTranslations";
 import { trpc } from "@/lib/trpc";
 
 import { ToolManagement } from "./components/tool-management";
+import { toolsPanelView } from "./components/tools-panel-view";
 
 interface McpServerDetailPageProps {
   params: Promise<{
@@ -325,6 +326,10 @@ export default function McpServerDetailPage({
 
   const connectionInfo = getConnectionStatusInfo();
   const ConnectionIcon = connectionInfo.icon;
+  const toolsView = toolsPanelView(
+    server.error_status === McpServerErrorStatusEnum.enum.ERROR,
+    connection.connectionStatus,
+  );
 
   return (
     <div className="space-y-6">
@@ -692,7 +697,7 @@ export default function McpServerDetailPage({
             <h3 className="text-lg font-semibold mb-4">
               {t("mcp-servers:detail.toolsManagement")}
             </h3>
-            {server.error_status === McpServerErrorStatusEnum.enum.ERROR ? (
+            {toolsView === "server-error" ? (
               <div className="space-y-4">
                 <div className="rounded-lg border border-dashed p-8 text-center">
                   <div className="flex flex-col items-center justify-center mx-auto max-w-md">
@@ -709,17 +714,29 @@ export default function McpServerDetailPage({
                   </div>
                 </div>
               </div>
-            ) : connection.connectionStatus === "connected" ? (
+            ) : toolsView === "tools" ? (
               <ToolManagement
                 mcpServerUuid={uuid}
                 makeRequest={connection.makeRequest}
               />
+            ) : toolsView === "connection-error" ? (
+              <div className="rounded-lg border border-dashed p-8 text-center">
+                <div className="flex flex-col items-center justify-center mx-auto max-w-md">
+                  <Server className="size-12 text-red-400" />
+                  <h4 className="mt-4 text-lg font-semibold">
+                    {t("mcp-servers:detail.connectionError")}
+                  </h4>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {t("mcp-servers:detail.connectToManageTools")}
+                  </p>
+                </div>
+              </div>
             ) : (
               <div className="space-y-4">
                 <ToolManagementSkeleton />
                 <div className="flex justify-center">
                   <div className="text-sm text-muted-foreground">
-                    {connection.connectionStatus === "connecting"
+                    {toolsView === "connecting"
                       ? t("mcp-servers:detail.connectingToServer")
                       : t("mcp-servers:detail.connectToManageTools")}
                   </div>
