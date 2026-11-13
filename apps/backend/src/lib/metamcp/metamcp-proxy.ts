@@ -35,6 +35,12 @@ import {
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
 import {
+  buildServerMetadata,
+  effectivePresentation,
+  type SessionPresentation,
+  withoutOutputSchema,
+} from "./endpoint-presentation";
+import {
   getMcpServers,
   getNamespaceListingServers,
   type NamespaceListingServers,
@@ -120,7 +126,18 @@ export const createServer = async (
   namespaceUuid: string,
   sessionId: string,
   includeInactiveServers: boolean = false,
+  // What this session presents beyond the defaults (title, instructions,
+  // output-schema trim), resolved by the router at initialize from the
+  // endpoint's settings, or restored from the session's pin on lazy recovery.
+  // Omitted for every session that has none, which is then served exactly as
+  // before this parameter existed.
+  presentationInput?: SessionPresentation,
 ) => {
+  // Applied again here although the router already applied it: every path into
+  // this function, the admin Inspector and tests included, is then subject to
+  // the MCP_ENDPOINT_PRESENTATION kill switch. Applying it twice is harmless.
+  const presentation = effectivePresentation(presentationInput);
+  const omitOutputSchemas = presentation?.omitOutputSchemas === true;
   const toolToClient: Record<string, ConnectedClient> = {};
   const toolToServerUuid: Record<string, string> = {};
   // Which server first claimed each fully-qualified tool name, so a second
@@ -143,21 +160,27 @@ export const createServer = async (
     return false;
   };
 
-  const server = new Server(
-    {
-      name: `metamcp-unified-${namespaceUuid}`,
-      version: "1.0.0",
-    },
-    {
-      // Capabilities live in `gateway-capabilities.ts` as a single
-      // source of truth — the same object is hashed into
-      // `GATEWAY_CAPABILITY_HASH` (PR #23) and stamped onto every
-      // persisted session row, so lazy-recovery can refuse only when
-      // the advertised set actually changed across a restart. Mutate
-      // the constant, not this declaration.
-      capabilities: GATEWAY_CAPABILITIES,
-    },
-  );
+  // serverInfo and instructions go in through the constructor because it is
+  // the only clean carrier: the SDK reads `instructions` once, there, and
+  // keeps serverInfo as given. For a session with no presentation this is
+  // argument for argument the call this function always made: `name` is the
+  // same string (it never varies, the self-reference checks below compare it)
+  // and neither a `title` key nor `instructions` is present.
+  const metadata = buildServerMetadata(namespaceUuid, presentation);
+  const server = new Server(metadata.serverInfo, {
+    // Capabilities live in `gateway-capabilities.ts` as a single
+    // source of truth — the same object is hashed into
+    // `GATEWAY_CAPABILITY_HASH` (PR #23) and stamped onto every
+    // persisted session row, so lazy-recovery can refuse only when
+    // the advertised set actually changed across a restart. Mutate
+    // the constant, not this declaration. Presentation never touches it:
+    // neither a title nor instructions is a capability, so the hash, and
+    // with it every persisted session's recoverability, is unchanged.
+    capabilities: GATEWAY_CAPABILITIES,
+    ...(metadata.instructions !== undefined
+      ? { instructions: metadata.instructions }
+      : {}),
+  });
 
   // Subscribers we've registered on backend `ConnectedClient`s for this
   // upstream `Server`. We track them so the `server.onclose` hook below
@@ -1451,7 +1474,14 @@ export const createServer = async (
     })();
     clientListing = recorded;
     try {
-      return await recorded;
+      const result = await recorded;
+      // The trim applies to what the client receives only. The audit snapshot
+      // above was taken from the untrimmed result, and `withoutOutputSchema`
+      // copies, so the shared result objects the middleware cache keep are
+      // untouched. A session with no trim gets the very same object as before.
+      return omitOutputSchemas
+        ? { ...result, tools: result.tools.map(withoutOutputSchema) }
+        : result;
     } finally {
       if (clientListing === recorded) clientListing = undefined;
     }
