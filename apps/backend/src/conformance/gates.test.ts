@@ -27,8 +27,10 @@ describe("checkDatabaseUrl", () => {
       "postgresql://itest@127.0.0.1:5432/metamcp_test",
       "postgres://u:p@localhost/other_test",
       "postgresql://itest@[::1]:5432/conformance",
+      "postgresql://itest@[::1]:5432/conformance?host=::1&hostaddr=::1",
       "postgresql://x@localhost/conformance_run_4",
       "postgresql://postgres@localhost/metamcp_test?host=/tmp/some/socket/dir",
+      "postgresql://u@localhost/conformance_test?host=127.0.0.1&host=localhost&hostaddr=127.0.0.1&hostaddr=::1",
     ]) {
       expect(checkDatabaseUrl(url, strict), url).toEqual({ ok: true });
     }
@@ -65,6 +67,10 @@ describe("checkDatabaseUrl", () => {
       "host=db.example.com",
       "hostaddr=192.0.2.5",
       "host=relative/dir",
+      "host=127.0.0.1&host=db.example.com",
+      "host=db.example.com&host=127.0.0.1",
+      "hostaddr=127.0.0.1&hostaddr=192.0.2.5",
+      "hostaddr=192.0.2.5&hostaddr=127.0.0.1",
     ]) {
       const url = `postgresql://u@localhost/metamcp_test?${q}`;
       expect(checkDatabaseUrl(url, { allowAnyName: true }).ok, q).toBe(false);

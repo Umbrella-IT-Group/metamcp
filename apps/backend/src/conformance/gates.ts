@@ -6,7 +6,7 @@ import path from "node:path";
 
 export type GateResult = { ok: true } | { ok: false; reason: string };
 
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 const THROWAWAY_NAME = /(_test$|^conformance)/;
 
 /**
@@ -34,9 +34,10 @@ export function checkDatabaseUrl(
     return { ok: false, reason: "DATABASE_URL is not a postgres URL" };
   }
 
-  const hostParam = parsed.searchParams.get("host");
-  const hostaddrParam = parsed.searchParams.get("hostaddr");
-  if (hostParam !== null) {
+  // Both consumers can use a later duplicate parameter. Validate every value
+  // so an earlier loopback value cannot conceal a later remote destination.
+  const hostParams = parsed.searchParams.getAll("host");
+  for (const hostParam of hostParams) {
     const ok = path.isAbsolute(hostParam) || LOOPBACK_HOSTS.has(hostParam);
     if (!ok) {
       return {
@@ -46,15 +47,20 @@ export function checkDatabaseUrl(
       };
     }
   }
-  if (hostaddrParam !== null && !LOOPBACK_HOSTS.has(hostaddrParam)) {
-    return {
-      ok: false,
-      reason: "the hostaddr query parameter must be loopback",
-    };
+  for (const hostaddrParam of parsed.searchParams.getAll("hostaddr")) {
+    if (!LOOPBACK_HOSTS.has(hostaddrParam)) {
+      return {
+        ok: false,
+        reason: "the hostaddr query parameter must be loopback",
+      };
+    }
   }
 
+  const hostParam = hostParams.at(-1);
   const socketOnly =
-    parsed.hostname === "" && hostParam !== null && path.isAbsolute(hostParam);
+    parsed.hostname === "" &&
+    hostParam !== undefined &&
+    path.isAbsolute(hostParam);
   if (!socketOnly && !LOOPBACK_HOSTS.has(parsed.hostname)) {
     return {
       ok: false,

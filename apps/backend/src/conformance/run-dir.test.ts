@@ -106,6 +106,15 @@ describe("allocateRunDir", () => {
     expect(readdirSync(repoRoot)).toEqual([".git"]);
   });
 
+  it("refuses checkout children whose names start with two dots", () => {
+    for (const name of ["..cache", "..output/nested"]) {
+      expect(() =>
+        allocateRunDir({ parent: path.join(repoRoot, name), repoRoot }),
+      ).toThrow();
+    }
+    expect(readdirSync(repoRoot)).toEqual([".git"]);
+  });
+
   it("refuses a filesystem root or an empty parent", () => {
     expect(() => allocateRunDir({ parent: "/", repoRoot })).toThrow();
     expect(() => allocateRunDir({ parent: "", repoRoot })).toThrow();

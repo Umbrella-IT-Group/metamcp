@@ -163,6 +163,29 @@ const listMsg = (names: string[]) => ({
 });
 
 describe("request side", () => {
+  it("connects to an IPv6 loopback upstream accepted by the config parser", async () => {
+    const v6 = http.createServer((_req, res) => {
+      res.writeHead(200, json);
+      res.end('{"source":"ipv6"}');
+    });
+    const port = await new Promise<number>((resolve, reject) => {
+      v6.once("error", reject);
+      v6.listen(0, "::1", () => resolve((v6.address() as AddressInfo).port));
+    });
+    closed.push(
+      () =>
+        new Promise<void>((resolve) => {
+          v6.close(() => resolve());
+          v6.closeAllConnections();
+        }),
+    );
+    await proxy.close();
+    await startProxy({ upstream: `http://[::1]:${port}/metamcp/ns/mcp` });
+    const reply = await send({ headers: json, body: rpc(callMsg("a")) });
+    expect(reply.status).toBe(200);
+    expect(JSON.parse(reply.body.toString("utf8"))).toEqual({ source: "ipv6" });
+  });
+
   it("injects the key and replaces anything the client sent for authentication", async () => {
     await send({
       headers: {

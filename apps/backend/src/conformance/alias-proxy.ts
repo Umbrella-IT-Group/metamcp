@@ -115,7 +115,9 @@ export function createAliasProxy(opts: AliasProxyOptions): AliasProxy {
 
     const outbound = http.request(
       {
-        hostname: upstream.hostname,
+        // URL.hostname includes IPv6 brackets; node:http expects the bare
+        // address here or it tries to resolve "[::1]" as a DNS name.
+        hostname: upstream.hostname.replace(/^\[|\]$/g, ""),
         port: upstream.port || 80,
         path: `${upstream.pathname}${search}`,
         method: req.method,

@@ -20,6 +20,8 @@ import {
   type CallToolResult,
   CreateMessageResultSchema,
   ElicitResultSchema,
+  ErrorCode,
+  McpError,
   type ServerNotification,
   type ServerRequest,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -243,9 +245,14 @@ export function createFixtureHandlers(deps: {
         timeout: REQUEST_TIMEOUT_MS,
       })) as { action: string; content?: unknown };
       return text(format(result.action, result.content));
-    } catch {
-      // Always the case through the gateway: its backend client answers
-      // MethodNotFound. A fixed text keeps the failing-check snapshot stable.
+    } catch (error) {
+      // Normalise only the known unsupported-method gap. A timeout, closed
+      // connection or invalid result must change the failing-check snapshot.
+      if (
+        !(error instanceof McpError) ||
+        error.code !== ErrorCode.MethodNotFound
+      )
+        throw error;
       return unavailable(label);
     }
   }
@@ -366,7 +373,12 @@ export function createFixtureHandlers(deps: {
                 ? (result.content.text ?? "")
                 : JSON.stringify(result.content);
             return text(`LLM response: ${reply}`);
-          } catch {
+          } catch (error) {
+            if (
+              !(error instanceof McpError) ||
+              error.code !== ErrorCode.MethodNotFound
+            )
+              throw error;
             return unavailable("Sampling");
           }
         }

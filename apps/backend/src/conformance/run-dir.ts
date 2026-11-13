@@ -40,7 +40,13 @@ export class RunDirRefusal extends Error {}
 
 function contains(outer: string, inner: string): boolean {
   const rel = path.relative(outer, inner);
-  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  // Only a complete `..` path segment escapes; `..cache` is still a child.
+  return (
+    rel !== "" &&
+    rel !== ".." &&
+    !rel.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(rel)
+  );
 }
 
 /** realpath of the deepest existing ancestor, plus the not-yet-created tail. */
