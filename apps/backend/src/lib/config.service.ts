@@ -8,6 +8,17 @@ import {
   parseStoredGlobalPolicy,
 } from "./api-key-ip-policy";
 
+/**
+ * The cap on a backend call that keeps reporting progress (10 minutes). The
+ * SDK checks it only when a progress notification resets the per-request
+ * timer, not as an independent deadline: a call that reports progress can run
+ * until this cap plus at most one per-request timeout, and a call that never
+ * reports progress times out at the per-request timeout alone. It used to
+ * equal the per-request default (60 s), which made progress reporting
+ * pointless. An explicitly stored MCP_MAX_TOTAL_TIMEOUT row still wins.
+ */
+export const DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS = 600_000;
+
 export const configService = {
   async isSignupDisabled(): Promise<boolean> {
     const config = await configRepo.getConfig(
@@ -58,7 +69,12 @@ export const configService = {
     const config = await configRepo.getConfig(
       ConfigKeyEnum.enum.MCP_RESET_TIMEOUT_ON_PROGRESS,
     );
-    return config?.value === "true" || true;
+    // Only an explicit "false" turns it off. Absent or unparseable stays on
+    // (the default), and the setter stores `enabled.toString()`, so "true"
+    // and "false" are the only values it ever writes. This used to read
+    // `=== "true" || true`, which could never be false: the settings toggle
+    // was stored and ignored.
+    return config?.value !== "false";
   },
 
   async setMcpResetTimeoutOnProgress(enabled: boolean): Promise<void> {
@@ -86,7 +102,9 @@ export const configService = {
     const config = await configRepo.getConfig(
       ConfigKeyEnum.enum.MCP_MAX_TOTAL_TIMEOUT,
     );
-    return config?.value ? parseInt(config.value, 10) : 60000;
+    return config?.value
+      ? parseInt(config.value, 10)
+      : DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS;
   },
 
   async setMcpMaxTotalTimeout(timeout: number): Promise<void> {

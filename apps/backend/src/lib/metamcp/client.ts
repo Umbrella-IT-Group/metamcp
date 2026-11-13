@@ -21,6 +21,10 @@ import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { recordConnectBrokerFailure } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { ASSERTED_ACTOR_HEADER, withAssertedActor } from "./asserted-actor";
+import {
+  classifyBackendAuthRejection,
+  describeBackendAuthRejection,
+} from "./backend-auth-rejection";
 import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { resolveServerBearerToken } from "./server-bearer-crypto";
@@ -604,6 +608,15 @@ export const createMetaMcpClient = (
  */
 export interface ConnectMetaMcpClientDeps {
   createClient?: typeof createMetaMcpClient;
+  /**
+   * Called when a CONNECT attempt is rejected with HTTP 401 or 403, before the
+   * connect gives up. Connect-phase only: the handshake carries no caller
+   * identity, so a refusal there is about the credentials the gateway itself
+   * sends. A refusal of a later request is not reported here (it can be about
+   * one caller). A deps hook rather than a positional parameter, so the tests
+   * that mock this function keep their signature.
+   */
+  onBackendAuthRejected?: (info: { status: 401 | 403 }) => void;
 }
 
 /**
@@ -682,6 +695,9 @@ export const connectMetaMcpClient = async (
     // dropped socket (container replace) from a connect-time failure
     // (backend down) that the connect-attempt log already covers.
     let connectedAt: number | undefined;
+    // Whether this connection already announced an HTTP 401/403 answer to a
+    // POST (see transport.onerror): the first is one event, later ones debug.
+    let announcedPostRefusal = false;
 
     try {
       // Check if server is already in error state before attempting connection
@@ -830,6 +846,38 @@ export const connectMetaMcpClient = async (
             }
             return;
           }
+          // The backend answered one POST with HTTP 401 or 403 over a
+          // connection that is alive. Like the broker refusal above, that is
+          // an answer to one request, not a drop: the backend can refuse one
+          // caller per call (it sees the verified caller on each request),
+          // and running the drop path invalidated every session's pooled
+          // connection for the server and re-notified every consumer because
+          // of it. The caller still gets the error. Only the POST shapes
+          // qualify: a refused stream (an SseError, or "Failed to open SSE
+          // stream") means the channel is dead and keeps the drop path. A
+          // sustained refusal still converges: the active health ping gets the
+          // same answer, counts failures and invalidates, and the next
+          // connect then names the credentials rejection.
+          const postRefusal = classifyBackendAuthRejection(transportError);
+          if (postRefusal?.via === "post") {
+            // Fixed text and status only; the body is the backend's text.
+            const refusalText = `A request to the backend was answered with HTTP ${postRefusal.status}; the connection is alive, so it stays pooled`;
+            if (!announcedPostRefusal) {
+              announcedPostRefusal = true;
+              metamcpLogStore.record({
+                category: "connection",
+                serverName: serverParams.name,
+                serverUuid: serverParams.uuid,
+                level: "warn",
+                message: refusalText,
+              });
+            } else {
+              logger.debug(
+                `${refusalText}. Server ${serverParams.name} (${serverParams.uuid})`,
+              );
+            }
+            return;
+          }
           const age = formatConnectionAge(connectedAt);
           const detail = describeConnectError(transportError);
           logger.warn(
@@ -961,6 +1009,9 @@ export const connectMetaMcpClient = async (
       const nonRetryableBroker =
         brokerError !== undefined &&
         NON_RETRYABLE_M365_BROKER_CODES.has(brokerError.code);
+      const authRejection = brokerError
+        ? undefined
+        : classifyBackendAuthRejection(error);
 
       if (nonRetryableBroker) {
         // brokerError is narrowed non-undefined by nonRetryableBroker.
@@ -1006,6 +1057,29 @@ export const connectMetaMcpClient = async (
           message: `Connect attempt ${count + 1}/${maxAttempts} failed — M365 token mint failed (mint_failed): ${brokerError.message}`,
           error: brokerError,
         });
+      } else if (authRejection) {
+        // The backend answered the handshake with HTTP 401 or 403. The
+        // handshake carries no caller identity, so this is the credentials
+        // the gateway itself sends (static headers, bearer). Retrying the same
+        // credentials cannot change the answer and only produces a retry and
+        // backoff storm, so the connect stops after this attempt (below).
+        // Fixed text and the status only: the response body is the backend's
+        // text and stays out of the event, so no `error` is attached.
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "error",
+          message: `Connect attempt ${count + 1}/${maxAttempts} failed — ${describeBackendAuthRejection(authRejection.status, "connect")}; retrying cannot help, so this connect stops here`,
+        });
+        try {
+          deps.onBackendAuthRejected?.({ status: authRejection.status });
+        } catch (hookError) {
+          logger.warn(
+            `onBackendAuthRejected threw for server ${serverParams.name} (${serverParams.uuid}):`,
+            hookError,
+          );
+        }
       } else {
         // Unwrap undici's nested `.cause` so the log names the actionable
         // leaf (connect ECONNREFUSED 172.18.0.13:3000) rather than the
@@ -1045,8 +1119,12 @@ export const connectMetaMcpClient = async (
 
       // Non-retryable: one attempt only. The pool sees `undefined`
       // exactly as it does for any failed connect (unchanged contract);
-      // the latched enrollment prompt is what reaches the consumer.
-      if (nonRetryableBroker) {
+      // the latched enrollment prompt is what reaches the consumer. A
+      // credentials rejection stops here too, before the attempt counter and
+      // the backoff sleep. It never touches the error tracker: no ERROR
+      // status, no crash count, so the sticky breaker and its half-open probe
+      // cannot start flapping on a backend that simply refuses our key.
+      if (nonRetryableBroker || authRejection) {
         return undefined;
       }
 
