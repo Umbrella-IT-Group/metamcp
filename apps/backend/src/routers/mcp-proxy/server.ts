@@ -718,8 +718,11 @@ const registeredServerHeaders = async (
   transportType: string,
   server: DatabaseMcpServer,
 ): Promise<Record<string, string>> => {
+  // Strip legacy identity keys before Headers parses them. Reserved names
+  // with surrounding whitespace are invalid in a Headers initializer, so
+  // leaving their removal to the per-hop guard would break the connection.
   let headers = withoutHeader(
-    { ...(server.headers || {}), ...getHttpHeaders(req, transportType) },
+    { ...storedHeadersFor(server), ...getHttpHeaders(req, transportType) },
     ASSERTED_ACTOR_HEADER,
   );
 

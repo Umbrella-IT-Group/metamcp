@@ -1362,6 +1362,58 @@ describe("registered servers by uuid: the server page's own backends", () => {
     },
   );
 
+  it.each(TRANSPORTS)(
+    "drops whitespace-padded legacy identity header keys before normalizing %s headers",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({
+          type,
+          url: rowUrl,
+          headers: {
+            " X-Umbrella-User-Id ": "user-stored",
+            "\tx-umbrella-caller\t": "v1.stored",
+            "x-vendor-api-key": "backend-key",
+          },
+        }),
+      ]);
+
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+      await sendThroughTransport(type, built);
+
+      const wire = wireHeaders();
+      expect(wire.has("x-umbrella-user-id")).toBe(false);
+      expect(wire.has("x-umbrella-caller")).toBe(false);
+      expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+    },
+  );
+
+  it.each(TRANSPORTS)(
+    "strips identity headers supplied at the %s fetch boundary, after stored-header filtering",
+    async (type, rowUrl, send, built) => {
+      findAllAccessibleToUserMock.mockResolvedValue([
+        row({ type, url: rowUrl }),
+      ]);
+      await send({ transportType: type, mcpServerUuid: ROW_UUID });
+
+      // The SDK can supply request headers after connection-level headers
+      // were built. Only the guard can protect this final boundary.
+      await built[0].opts.fetch(rowUrl, {
+        method: "POST",
+        headers: {
+          "X-Umbrella-User-Id": "user-request",
+          "X-Umbrella-Caller": "v1.request",
+          "x-vendor-api-key": "backend-key",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+
+      const wire = wireHeaders();
+      expect(wire.has("x-umbrella-user-id")).toBe(false);
+      expect(wire.has("x-umbrella-caller")).toBe(false);
+      expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+    },
+  );
+
   it("replaces the browser's and the row's X-MCP-Actor with the session email", async () => {
     findAllAccessibleToUserMock.mockResolvedValue([
       row({ headers: { "X-MCP-Actor": "stored@example.com" } }),
