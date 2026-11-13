@@ -4,6 +4,7 @@ import type {
   GetEndpointPresentationResponse,
   PresentationTextProblem,
   SetEndpointPresentationRequest,
+  ToolListingMode,
 } from "@repo/zod-types";
 import { ENDPOINT_INSTRUCTIONS_MAX, ENDPOINT_TITLE_MAX } from "@repo/zod-types";
 import { useCallback, useEffect, useState } from "react";
@@ -11,6 +12,13 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
@@ -164,16 +172,18 @@ export function ReadyForm({
         </div>
       )}
 
-      {stored.tool_listing !== "full" && (
-        // A lean listing is stored (a gateway rolled back past the release that
-        // serves it, or a row written by hand). This form cannot show it, and
-        // saving always writes the full listing, which is how it is cleared.
-        <div className="p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
-          <p className="text-sm text-yellow-800 dark:text-yellow-200">
-            {t("endpoints:presentation.leanStoredNotServed")}
-          </p>
-        </div>
-      )}
+      {(stored.tool_listing === "lean" || form.toolListing === "lean") &&
+        !stored.effective.lean_enabled && (
+          // Lean is saved (or about to be) but this process serves the full
+          // list: the lean switch is narrower than the master one, so title,
+          // instructions and the trim still apply. Said outright for the same
+          // reason as the master banner above.
+          <div className="p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
+            <p className="text-sm text-yellow-800 dark:text-yellow-200">
+              {t("endpoints:presentation.leanKillSwitch")}
+            </p>
+          </div>
+        )}
 
       <div className="space-y-1">
         <label
@@ -242,13 +252,58 @@ export function ReadyForm({
         </div>
       </div>
 
+      <div className="space-y-1">
+        <label
+          className="text-sm font-medium"
+          htmlFor="endpoint-presentation-listing"
+        >
+          {t("endpoints:presentation.listingLabel")}
+        </label>
+        <Select
+          value={form.toolListing}
+          onValueChange={(value) =>
+            setForm({ ...form, toolListing: value as ToolListingMode })
+          }
+          disabled={saving}
+        >
+          <SelectTrigger id="endpoint-presentation-listing">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="full">
+              {t("endpoints:presentation.listingFull")}
+            </SelectItem>
+            <SelectItem value="lean">
+              {t("endpoints:presentation.listingLean")}
+            </SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-xs text-muted-foreground">
+          {t("endpoints:presentation.listingHelp")}
+        </p>
+        {form.toolListing === "lean" && (
+          // The consequences are spelled out where the choice is made: they are
+          // the ones an administrator cannot see from the gateway afterwards.
+          <div className="space-y-2 p-3 bg-yellow-50 dark:bg-yellow-950/20 border border-yellow-200 dark:border-yellow-800/30 rounded-md">
+            <p className="text-xs text-yellow-800 dark:text-yellow-200">
+              {t("endpoints:presentation.leanTradeoffs")}
+            </p>
+            <p className="text-xs text-yellow-800 dark:text-yellow-200">
+              {t("endpoints:presentation.leanTwin")}
+            </p>
+          </div>
+        )}
+      </div>
+
       <div className="flex items-center justify-between">
         <div className="space-y-0.5">
           <label className="text-sm font-medium">
             {t("endpoints:presentation.omitLabel")}
           </label>
           <p className="text-xs text-muted-foreground">
-            {t("endpoints:presentation.omitHelp")}
+            {form.toolListing === "lean"
+              ? t("endpoints:presentation.omitLeanNote")
+              : t("endpoints:presentation.omitHelp")}
           </p>
         </div>
         <Switch
@@ -256,7 +311,10 @@ export function ReadyForm({
           onCheckedChange={(checked) =>
             setForm({ ...form, omitOutputSchemas: checked })
           }
-          disabled={saving}
+          // The lean list carries no output schemas, so the trim has nothing to
+          // do while lean is chosen. Disabled rather than cleared: the value is
+          // kept for the day the endpoint goes back to the full list.
+          disabled={saving || form.toolListing === "lean"}
         />
       </div>
 
