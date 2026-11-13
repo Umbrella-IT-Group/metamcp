@@ -84,10 +84,7 @@ import {
   ToolArgSchemaRegistry,
   unambiguousAuditTools,
 } from "./tool-arg-keys";
-import {
-  isToolCallCancelledError,
-  ToolCallCancelledError,
-} from "./tool-call-cancelled";
+import { ToolCallCancelledError } from "./tool-call-cancelled";
 import {
   cancelAfterTotalTimeout,
   cancelPassthroughEnabled,
@@ -1342,10 +1339,6 @@ export const createServer = async (
       try {
         return (await callOnce(clientForTool)) as CallToolResult;
       } catch (error) {
-        if (isToolCallCancelledError(error)) {
-          noteCancelled();
-          throw error;
-        }
         // Replay a tools/call ONLY when the failure proves the backend never
         // ran it: an HTTP 404 "Session not found" answer to the POST, or a
         // transport already closed before the send. A tool call is not
@@ -1363,11 +1356,12 @@ export const createServer = async (
         if (isM365BrokerError(error)) {
           throw error;
         }
-        // A consumer cancel that the first attempt reported in another shape
-        // (the SDK's pre-send "Not connected" wins over its abort check, which
-        // is the exact shape the replay below accepts). A cancelled call is
-        // never recovered and never replayed; the reason is the typed class, not
-        // just `.aborted`, because a total-cap cancel aborts the controller too.
+        // A consumer cancel. The SDK rejects an aborted call with the typed
+        // reason, but its pre-send "Not connected" wins over its abort check
+        // (the exact shape the replay below accepts), so the abort reason is
+        // read here rather than the error. A cancelled call is never recovered
+        // and never replayed. The reason is the typed class, not just
+        // `.aborted`, because a total-cap cancel aborts the controller too.
         if (abortController.signal.reason instanceof ToolCallCancelledError) {
           noteCancelled();
           throw abortController.signal.reason;
@@ -1451,14 +1445,9 @@ export const createServer = async (
           // A cancel during the recovery: the second attempt's pre-send abort
           // check throws the typed reason. The recovery itself is shared with
           // sibling calls and is never aborted for one caller's cancel.
-          if (
-            isToolCallCancelledError(retryError) ||
-            abortController.signal.reason instanceof ToolCallCancelledError
-          ) {
+          if (abortController.signal.reason instanceof ToolCallCancelledError) {
             noteCancelled();
-            throw isToolCallCancelledError(retryError)
-              ? retryError
-              : abortController.signal.reason;
+            throw abortController.signal.reason;
           }
           // Same as above: a broker refusal on the retry is the user's own
           // state, answered by the outer catch, not an ERROR here.
