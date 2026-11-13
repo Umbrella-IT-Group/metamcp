@@ -134,6 +134,7 @@ import streamableHttpRouter, {
 
 const PROTOCOL_VERSION = "2025-06-18";
 const SAVED_SWITCH = process.env.MCP_ENDPOINT_PRESENTATION;
+const SAVED_LEAN_SWITCH = process.env.MCP_LEAN_LISTING;
 const TITLE = "Presentation test title";
 const INSTRUCTIONS = "Presentation test instructions, do not log me.";
 
@@ -275,6 +276,7 @@ beforeEach(() => {
   h.rows.clear();
   h.presentationRows.clear();
   delete process.env.MCP_ENDPOINT_PRESENTATION;
+  delete process.env.MCP_LEAN_LISTING;
   keyCounter += 1;
   rawKey = `presentation-test-key-${keyCounter}`;
   h.getServer.mockImplementation(async () => makeServerInstance());
@@ -288,6 +290,8 @@ beforeEach(() => {
 afterEach(() => {
   if (SAVED_SWITCH === undefined) delete process.env.MCP_ENDPOINT_PRESENTATION;
   else process.env.MCP_ENDPOINT_PRESENTATION = SAVED_SWITCH;
+  if (SAVED_LEAN_SWITCH === undefined) delete process.env.MCP_LEAN_LISTING;
+  else process.env.MCP_LEAN_LISTING = SAVED_LEAN_SWITCH;
 });
 
 describe("a new session", () => {
@@ -353,13 +357,61 @@ describe("a new session", () => {
     expect(persistedFor(sessionId)?.init_params).toEqual({});
   });
 
-  it("a stored lean row is served as the ordinary listing in this release: no presentation, no pin", async () => {
+  it("a stored lean row is served as the ordinary listing while the lean switch is off: no presentation, no pin", async () => {
+    process.env.MCP_LEAN_LISTING = "off";
     h.presentationRows.set("uuid-ep-1", storedRow({ tool_listing: "lean" }));
 
     const sessionId = await openSession("ep-1");
 
     expect(h.getServer.mock.calls[0]).toEqual([sessionId, "ns-ep-1"]);
     expect(persistedFor(sessionId)?.init_params).toEqual({});
+  });
+
+  it("a stored lean row is handed to the pool as a lean presentation and pinned as lean", async () => {
+    h.presentationRows.set(
+      "uuid-ep-1",
+      storedRow({ tool_listing: "lean", instructions: INSTRUCTIONS }),
+    );
+
+    const sessionId = await openSession("ep-1");
+
+    expect(h.getServer).toHaveBeenCalledWith(sessionId, "ns-ep-1", false, {
+      instructions: INSTRUCTIONS,
+      toolListing: "lean",
+      omitOutputSchemas: false,
+    });
+    expect(persistedFor(sessionId)?.init_params).toEqual({
+      presentation: { v: 1, lean: true, omit: false },
+    });
+    // Flags only, and the lean flag is one of them; the text is never logged.
+    const line = infoLines().find((l) =>
+      l.includes("presents custom settings"),
+    );
+    expect(line).toContain("lean listing: true");
+    expect(everyLogLine()).not.toContain(INSTRUCTIONS);
+  });
+
+  it("with only the lean switch off, a lean row still gives its title, instructions and trim", async () => {
+    process.env.MCP_LEAN_LISTING = "off";
+    h.presentationRows.set(
+      "uuid-ep-1",
+      storedRow({
+        tool_listing: "lean",
+        title: TITLE,
+        omit_output_schemas: true,
+      }),
+    );
+
+    const sessionId = await openSession("ep-1");
+
+    expect(h.getServer).toHaveBeenCalledWith(sessionId, "ns-ep-1", false, {
+      title: TITLE,
+      toolListing: "full",
+      omitOutputSchemas: true,
+    });
+    expect(persistedFor(sessionId)?.init_params).toEqual({
+      presentation: { v: 1, lean: false, omit: true },
+    });
   });
 
   it("a failure reading the settings still creates the session with the defaults and logs one WARN", async () => {
@@ -506,6 +558,42 @@ describe("lazy recovery", () => {
     await recover(sessionId);
 
     expect(h.getServer.mock.calls[0]).toEqual([sessionId, "ns-ep-1"]);
+  });
+
+  it("restores a lean pin as lean, even when the endpoint has since been set back to the full listing", async () => {
+    storeRow(sessionId, { presentation: { v: 1, lean: true, omit: false } });
+    h.presentationRows.set("uuid-ep-1", storedRow({ title: TITLE }));
+
+    const result = await recover(sessionId);
+
+    expect(result.status).toBe("recovered");
+    expect(h.getServer).toHaveBeenCalledWith(sessionId, "ns-ep-1", false, {
+      toolListing: "lean",
+      omitOutputSchemas: false,
+    });
+    expect(h.findPresentation).not.toHaveBeenCalled();
+  });
+
+  it("recovers a lean pin as an ordinary session while the lean switch is off, and as a trimmed one when the pin also carried the trim", async () => {
+    process.env.MCP_LEAN_LISTING = "off";
+    storeRow(sessionId, { presentation: { v: 1, lean: true, omit: false } });
+
+    await recover(sessionId);
+
+    expect(h.getServer.mock.calls[0]).toEqual([sessionId, "ns-ep-1"]);
+
+    publicSessionSweeper.forget(sessionId);
+    sessionId = `${sessionId}-trim`;
+    storeRow(sessionId, { presentation: { v: 1, lean: true, omit: true } });
+
+    await recover(sessionId);
+
+    expect(h.getServer.mock.calls[1]).toEqual([
+      sessionId,
+      "ns-ep-1",
+      false,
+      { toolListing: "full", omitOutputSchemas: true },
+    ]);
   });
 
   it("the kill switch wins over a pin", async () => {

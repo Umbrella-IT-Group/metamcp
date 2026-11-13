@@ -78,6 +78,7 @@ import sseRouter from "./sse";
 const KEY_UUID = "3f7f8a1e-0000-4000-8000-0000000000bb";
 const IDENTITY: SessionIdentity = { method: "api_key", credentialId: KEY_UUID };
 const SAVED_SWITCH = process.env.MCP_ENDPOINT_PRESENTATION;
+const SAVED_LEAN_SWITCH = process.env.MCP_LEAN_LISTING;
 
 let server: Server;
 let baseUrl = "";
@@ -154,6 +155,7 @@ afterAll(async () => {
 beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.MCP_ENDPOINT_PRESENTATION;
+  delete process.env.MCP_LEAN_LISTING;
   h.getServer.mockImplementation(async () => makeInstance());
   h.findPresentation.mockResolvedValue(undefined);
 });
@@ -161,6 +163,8 @@ beforeEach(() => {
 afterEach(async () => {
   if (SAVED_SWITCH === undefined) delete process.env.MCP_ENDPOINT_PRESENTATION;
   else process.env.MCP_ENDPOINT_PRESENTATION = SAVED_SWITCH;
+  if (SAVED_LEAN_SWITCH === undefined) delete process.env.MCP_LEAN_LISTING;
+  else process.env.MCP_LEAN_LISTING = SAVED_LEAN_SWITCH;
   for (const abort of opened.splice(0)) abort.abort();
   await vi.waitFor(() =>
     expect(countLiveSessionsForIdentity(IDENTITY)).toBe(0),
@@ -192,6 +196,29 @@ describe("GET /sse", () => {
         omitOutputSchemas: true,
       },
     );
+  });
+
+  it("hands a lean endpoint to the pool as a lean presentation, and as an ordinary session while the lean switch is off", async () => {
+    h.findPresentation.mockResolvedValue({
+      title: null,
+      instructions: null,
+      tool_listing: "lean",
+      omit_output_schemas: false,
+    });
+
+    expect(await openStream()).toBe(200);
+
+    expect(h.getServer).toHaveBeenLastCalledWith(
+      expect.any(String),
+      "ns-1",
+      false,
+      { toolListing: "lean", omitOutputSchemas: false },
+    );
+
+    process.env.MCP_LEAN_LISTING = "off";
+    expect(await openStream()).toBe(200);
+
+    expect(h.getServer.mock.calls[1]).toEqual([expect.any(String), "ns-1"]);
   });
 
   it("pin: an endpoint with no settings gets the two-argument getServer call", async () => {

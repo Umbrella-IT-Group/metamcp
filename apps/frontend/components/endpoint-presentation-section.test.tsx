@@ -67,7 +67,7 @@ const stored = (over: Record<string, unknown> = {}): Stored =>
     tool_listing: "full",
     omit_output_schemas: true,
     updated_at: "2026-11-12T10:00:00.000Z",
-    effective: { presentation_enabled: true, lean_enabled: false },
+    effective: { presentation_enabled: true, lean_enabled: true },
     ...over,
   }) as Stored;
 
@@ -91,9 +91,11 @@ interface FieldProps {
   type?: string;
   children?: unknown;
   disabled?: boolean;
+  value?: string;
   onClick: () => void;
   onKeyDown: (event: { key: string; preventDefault: () => void }) => void;
   onCheckedChange: (checked: boolean) => void;
+  onValueChange: (value: string) => void;
 }
 
 /** Every element in a tree of React elements, depth first. */
@@ -116,7 +118,12 @@ function fields(over: Partial<React.ComponentProps<typeof ReadyForm>> = {}) {
     stored: stored(),
     saving: false,
     onSave,
-    form: { title: "Desk", instructions: "Be brief.", omitOutputSchemas: true },
+    form: {
+      title: "Desk",
+      instructions: "Be brief.",
+      toolListing: "full",
+      omitOutputSchemas: true,
+    },
     setForm,
     ...over,
   });
@@ -137,6 +144,8 @@ function fields(over: Partial<React.ComponentProps<typeof ReadyForm>> = {}) {
       find((props) => props.type === "button" && props.children === label),
     trimSwitch: () =>
       find((props) => typeof props.onCheckedChange === "function"),
+    listingSelect: () =>
+      find((props) => typeof props.onValueChange === "function"),
   };
 }
 
@@ -198,7 +207,7 @@ describe("EndpointPresentationForm", () => {
   it("says outright when the kill switch makes saved settings inert", () => {
     const off = render({
       stored: stored({
-        effective: { presentation_enabled: false, lean_enabled: false },
+        effective: { presentation_enabled: false, lean_enabled: true },
       }),
     });
     expect(off).toContain("endpoint presentation turned off");
@@ -207,18 +216,44 @@ describe("EndpointPresentationForm", () => {
     expect(render()).not.toContain("endpoint presentation turned off");
   });
 
-  it("tells the administrator about a stored lean listing this gateway does not serve", () => {
-    const html = render({ stored: stored({ tool_listing: "lean" }) });
+  it("says outright when the lean switch makes a saved lean listing inert, and not otherwise", () => {
+    const off = render({
+      stored: stored({
+        tool_listing: "lean",
+        effective: { presentation_enabled: true, lean_enabled: false },
+      }),
+    });
+    expect(off).toContain("lean listing turned off");
+    expect(off).toContain("MCP_LEAN_LISTING");
+    expect(off).toContain("Title, instructions and the output-schema setting");
 
-    expect(html).toContain(
-      "A lean listing is stored for this endpoint, but this gateway version does not serve it. Saving resets it to the full list.",
+    // Lean is served: no banner. A full-list endpoint never gets one either.
+    expect(render({ stored: stored({ tool_listing: "lean" }) })).not.toContain(
+      "lean listing turned off",
     );
-    // Save stays available: it is how that row is cleared.
-    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>Save<\/button>/);
+    expect(
+      render({
+        stored: stored({
+          effective: { presentation_enabled: true, lean_enabled: false },
+        }),
+      }),
+    ).not.toContain("lean listing turned off");
   });
 
-  it("does not show the lean message for an ordinary stored state", () => {
-    expect(render()).not.toContain("lean listing is stored");
+  it("offers the full list and the lean list, with the stored mode selected", () => {
+    const full = render();
+    expect(full).toContain("Tool list");
+    expect(full).toContain("endpoint-presentation-listing");
+    expect(render({ stored: stored({ tool_listing: "lean" }) })).toContain(
+      "endpoint-presentation-listing",
+    );
+  });
+
+  it("describes the lean list in the help under the choice, and the trade-offs only once lean is chosen", () => {
+    const help = render();
+    expect(help).toContain("four tools");
+    expect(help).toContain("call_write_tool");
+    expect(help).not.toContain("see only call_tool or call_write_tool");
   });
 });
 
@@ -257,6 +292,7 @@ describe("the fields", () => {
       form: {
         title: "  New title ",
         instructions: "one\r\ntwo",
+        toolListing: "full",
         omitOutputSchemas: true,
       },
     });
@@ -272,7 +308,34 @@ describe("the fields", () => {
     });
   });
 
-  it("Save from a stored lean state writes the full listing, which clears it", () => {
+  it("Save sends the lean listing when lean is chosen", () => {
+    const { button, onSave } = fields({
+      stored: stored({
+        title: null,
+        instructions: null,
+        omit_output_schemas: false,
+      }),
+      form: {
+        title: "",
+        instructions: "",
+        toolListing: "lean",
+        omitOutputSchemas: false,
+      },
+    });
+
+    expect(button("Save").disabled).toBe(false);
+    button("Save").onClick();
+
+    expect(onSave).toHaveBeenCalledWith({
+      endpoint_uuid: UUID,
+      title: null,
+      instructions: null,
+      tool_listing: "lean",
+      omit_output_schemas: false,
+    });
+  });
+
+  it("Save from a stored lean state with the full list chosen writes the full listing, which clears the row", () => {
     const { button, onSave } = fields({
       stored: stored({
         title: null,
@@ -280,9 +343,15 @@ describe("the fields", () => {
         omit_output_schemas: false,
         tool_listing: "lean",
       }),
-      form: { title: "", instructions: "", omitOutputSchemas: false },
+      form: {
+        title: "",
+        instructions: "",
+        toolListing: "full",
+        omitOutputSchemas: false,
+      },
     });
 
+    expect(button("Save").disabled).toBe(false);
     button("Save").onClick();
 
     expect(onSave).toHaveBeenCalledWith({
@@ -303,6 +372,7 @@ describe("the fields", () => {
       form: {
         title: "Changed",
         instructions: "Be brief.",
+        toolListing: "full",
         omitOutputSchemas: true,
       },
     });
@@ -312,6 +382,7 @@ describe("the fields", () => {
       form: {
         title: "t".repeat(81),
         instructions: "",
+        toolListing: "full",
         omitOutputSchemas: true,
       },
     });
@@ -323,6 +394,7 @@ describe("the fields", () => {
       form: {
         title: "Changed",
         instructions: "Be brief.",
+        toolListing: "full",
         omitOutputSchemas: true,
       },
     });
@@ -340,6 +412,7 @@ describe("the fields", () => {
         form: {
           title: "t".repeat(81),
           instructions: "",
+          toolListing: "full",
           omitOutputSchemas: true,
         },
         setForm: vi.fn(),
@@ -353,6 +426,7 @@ describe("the fields", () => {
       form: {
         title: "Edited",
         instructions: "Edited",
+        toolListing: "full",
         omitOutputSchemas: false,
       },
     });
@@ -362,6 +436,7 @@ describe("the fields", () => {
     expect(setForm).toHaveBeenCalledWith({
       title: "Desk",
       instructions: "Be brief.",
+      toolListing: "full",
       omitOutputSchemas: true,
     });
   });
@@ -374,8 +449,134 @@ describe("the fields", () => {
     expect(setForm).toHaveBeenCalledWith({
       title: "Desk",
       instructions: "Be brief.",
+      toolListing: "full",
       omitOutputSchemas: false,
     });
+  });
+});
+
+describe("the tool list choice", () => {
+  const leanForm = {
+    title: "Desk",
+    instructions: "Be brief.",
+    toolListing: "lean" as const,
+    omitOutputSchemas: true,
+  };
+
+  it("shows the stored mode in the select and changes only the mode when another is picked", () => {
+    const { listingSelect, setForm } = fields();
+    expect(listingSelect().value).toBe("full");
+
+    listingSelect().onValueChange("lean");
+
+    expect(setForm).toHaveBeenCalledWith({
+      title: "Desk",
+      instructions: "Be brief.",
+      toolListing: "lean",
+      omitOutputSchemas: true,
+    });
+    expect(
+      fields({
+        stored: stored({ tool_listing: "lean" }),
+        form: leanForm,
+      }).listingSelect().value,
+    ).toBe("lean");
+  });
+
+  it("disables the trim switch while lean is chosen, says why, and keeps its value", () => {
+    const lean = fields({
+      stored: stored({ tool_listing: "lean" }),
+      form: leanForm,
+    });
+    expect(lean.trimSwitch().disabled).toBe(true);
+
+    const html = renderToStaticMarkup(
+      React.createElement(ReadyForm, {
+        endpointUuid: UUID,
+        t,
+        stored: stored({ tool_listing: "lean" }),
+        saving: false,
+        onSave: vi.fn(),
+        form: leanForm,
+        setForm: vi.fn(),
+      }),
+    );
+    expect(html).toContain("already leaves out output schemas");
+    // The held value is what a save sends, so full and back loses nothing.
+    const { button, onSave } = fields({
+      stored: stored({ tool_listing: "full", omit_output_schemas: false }),
+      form: leanForm,
+    });
+    button("Save").onClick();
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool_listing: "lean",
+        omit_output_schemas: true,
+      }),
+    );
+
+    expect(fields().trimSwitch().disabled).toBe(false);
+  });
+
+  it("states the lean trade-offs and the twin endpoint steps when lean is chosen, and not for the full list", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReadyForm, {
+        endpointUuid: UUID,
+        t,
+        stored: stored(),
+        saving: false,
+        onSave: vi.fn(),
+        form: leanForm,
+        setForm: vi.fn(),
+      }),
+    );
+    expect(html).toContain(
+      "Approval prompts, deny rules and hooks in the client that name a real tool see only call_tool or call_write_tool",
+    );
+    expect(html).toContain("about three requests");
+    expect(html).toContain("separate endpoint (a twin)");
+    for (const part of [
+      "authentication modes",
+      "scoped-key requirement",
+      "access-group links",
+      "rate settings",
+      "read both endpoints back",
+      "an unauthorized one is refused on both",
+    ]) {
+      expect(html).toContain(part);
+    }
+    expect(html).not.toMatch(/\u2014/);
+
+    const full = renderToStaticMarkup(
+      React.createElement(ReadyForm, {
+        endpointUuid: UUID,
+        t,
+        stored: stored(),
+        saving: false,
+        onSave: vi.fn(),
+        form: { ...leanForm, toolListing: "full" },
+        setForm: vi.fn(),
+      }),
+    );
+    expect(full).not.toContain("separate endpoint (a twin)");
+    expect(full).not.toContain("about three requests");
+  });
+
+  it("warns when lean is chosen but the lean switch is off, before the administrator saves", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReadyForm, {
+        endpointUuid: UUID,
+        t,
+        stored: stored({
+          effective: { presentation_enabled: true, lean_enabled: false },
+        }),
+        saving: false,
+        onSave: vi.fn(),
+        form: leanForm,
+        setForm: vi.fn(),
+      }),
+    );
+    expect(html).toContain("lean listing turned off");
   });
 });
 

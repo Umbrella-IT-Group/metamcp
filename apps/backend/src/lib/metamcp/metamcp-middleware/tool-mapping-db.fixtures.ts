@@ -49,6 +49,8 @@ export interface FakeMappingRow {
   toolName: string;
   status: "ACTIVE" | "INACTIVE";
   overrideName?: string | null;
+  /** namespace_tool_mappings.override_annotations; none when omitted. */
+  overrideAnnotations?: Record<string, unknown> | null;
 }
 
 export interface FakeToolMappingState {
@@ -157,7 +159,7 @@ const rowsFor = (
       "ntm.override_name": mapping.overrideName ?? null,
       "ntm.override_title": null,
       "ntm.override_description": null,
-      "ntm.override_annotations": null,
+      "ntm.override_annotations": mapping.overrideAnnotations ?? null,
       "tools.name": mapping.toolName,
       "servers.uuid": server?.uuid,
       "servers.name": server?.name,

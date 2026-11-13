@@ -211,3 +211,6 @@ export function presentationFromInitParams(
     env,
   );
 }
+
+/** Inert stub: the workflow paragraph arrives with the implementation. */
+export const LEAN_INSTRUCTIONS = "";
