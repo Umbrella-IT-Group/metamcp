@@ -17,6 +17,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { accessGroupsRepository } from "../db/repositories/access-groups.repo";
@@ -70,7 +71,7 @@ export const accessGroupsImplementations = {
         })),
       };
     } catch (error) {
-      logger.error("Error listing access groups:", error);
+      logger.error("Error listing access groups:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -102,7 +103,7 @@ export const accessGroupsImplementations = {
         },
       };
     } catch (error) {
-      logger.error("Error fetching access group:", error);
+      logger.error("Error fetching access group:", describeDbError(error));
       return {
         success: false as const,
         message: "Failed to fetch access group",
@@ -138,7 +139,10 @@ export const accessGroupsImplementations = {
         })),
       };
     } catch (error) {
-      logger.error("Error listing endpoints for access groups:", error);
+      logger.error(
+        "Error listing endpoints for access groups:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         data: [],
@@ -178,7 +182,7 @@ export const accessGroupsImplementations = {
         },
       };
     } catch (error) {
-      logger.error("Error fetching endpoint access:", error);
+      logger.error("Error fetching endpoint access:", describeDbError(error));
       return {
         success: false as const,
         message: "Failed to fetch endpoint access",
@@ -234,7 +238,7 @@ export const accessGroupsImplementations = {
         },
       };
     } catch (error) {
-      logger.error("Error creating access group:", error);
+      logger.error("Error creating access group:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -286,7 +290,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error updating access group:", error);
+      logger.error("Error updating access group:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -326,7 +330,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error deleting access group:", error);
+      logger.error("Error deleting access group:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -391,7 +395,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error adding access group member:", error);
+      logger.error("Error adding access group member:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -446,7 +450,10 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error removing access group member:", error);
+      logger.error(
+        "Error removing access group member:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         message:
@@ -510,7 +517,10 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error mapping endpoint to access group:", error);
+      logger.error(
+        "Error mapping endpoint to access group:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         message:
@@ -562,7 +572,10 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error unmapping endpoint from access group:", error);
+      logger.error(
+        "Error unmapping endpoint from access group:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         message:
@@ -624,7 +637,10 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
-      logger.error("Error setting endpoint restriction:", error);
+      logger.error(
+        "Error setting endpoint restriction:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         message:

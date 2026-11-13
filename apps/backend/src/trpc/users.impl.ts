@@ -13,6 +13,7 @@ import {
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { usersRepository } from "../db/repositories";
@@ -96,7 +97,7 @@ export const usersImplementations = {
         total,
       };
     } catch (error) {
-      logger.error("Error fetching users:", error);
+      logger.error("Error fetching users:", describeDbError(error));
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to fetch users",
@@ -118,7 +119,10 @@ export const usersImplementations = {
 
       return { found: true, email: target.email, impact };
     } catch (error) {
-      logger.error("Error previewing user delete impact:", error);
+      logger.error(
+        "Error previewing user delete impact:",
+        describeDbError(error),
+      );
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to preview delete impact",
@@ -184,7 +188,10 @@ export const usersImplementations = {
         disabled: updated.disabled,
       };
     } catch (error) {
-      logger.error("Error setting user disabled state:", error);
+      logger.error(
+        "Error setting user disabled state:",
+        describeDbError(error),
+      );
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to update account state",
@@ -267,7 +274,7 @@ export const usersImplementations = {
       // throw here means nothing was committed. Reporting failure is
       // therefore honest — the half-cut state that would make this message a
       // lie cannot exist.
-      logger.error("Error revoking user access:", error);
+      logger.error("Error revoking user access:", describeDbError(error));
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to revoke user access",
@@ -353,7 +360,7 @@ export const usersImplementations = {
 
       return { success: true, message: "User deleted successfully" };
     } catch (error) {
-      logger.error("Error deleting user:", error);
+      logger.error("Error deleting user:", describeDbError(error));
       // A fixed string, not `error.message`. A failed delete here is a driver
       // or constraint error, and the raw message carries table names and
       // internal hostnames — the same disclosure the tRPC errorFormatter

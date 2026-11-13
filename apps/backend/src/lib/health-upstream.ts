@@ -4,6 +4,7 @@ import { auth } from "../auth";
 import { usersRepository } from "../db/repositories";
 import { getBaseUrl } from "../routers/oauth/utils";
 import logger from "../utils/logger";
+import { describeDbError } from "./db-error-summary";
 
 /**
  * The two access decisions behind `GET /health/upstream`.
@@ -156,7 +157,10 @@ export async function isAdminHealthRequest(
     // Logged, not silently discarded: a session check that starts failing
     // would otherwise surface only as admins mysteriously losing the detail
     // half of this response, with nothing in the logs to explain it.
-    logger.error("Session check failed for /health/upstream:", error);
+    logger.error(
+      "Session check failed for /health/upstream:",
+      describeDbError(error),
+    );
     return false;
   }
 }

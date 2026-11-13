@@ -1,5 +1,6 @@
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { usersRepository } from "../db/repositories/users.repo";
@@ -75,7 +76,7 @@ export const requireEnabledMcpMiddleware = async (
     logger.error(
       `MCP proxy disabled gate failed closed for ${req.method} ${req.path} ` +
         `(user ${userId}):`,
-      error,
+      describeDbError(error),
     );
     return res.status(403).json(buildMcpProxyForbiddenBody());
   }

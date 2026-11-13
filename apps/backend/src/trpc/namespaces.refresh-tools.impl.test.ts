@@ -23,7 +23,12 @@
  * change the message afterwards.
  */
 
+import { format } from "node:util";
+
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import logger from "@/utils/logger";
 
 vi.mock("@/utils/logger", () => ({
   default: {
@@ -75,6 +80,10 @@ import {
   namespacesRepository,
   toolsRepository,
 } from "../db/repositories";
+import {
+  ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+  AdminAuditWriteError,
+} from "../lib/audit/admin-write";
 import { mapOverrideNameToOriginal } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
 import { namespacesImplementations } from "./namespaces.impl";
@@ -290,6 +299,84 @@ describe("namespaces.refreshTools implementation: tool policy", () => {
     const result = await refresh("admin-1", true);
 
     expect(result.success).toBe(false);
-    expect(result.message).toContain("not found");
+    expect(result.message).toBe("Failed to refresh namespace tools");
   });
+});
+
+describe("namespaces.refreshTools admin-plane audit failure", () => {
+  it("passes the fixed audit-failure sentence through, so the operator knows the refresh was rolled back", async () => {
+    vi.clearAllMocks();
+    vi.mocked(namespacesRepository.findByUuid).mockResolvedValue(
+      fakeNamespace({ user_id: "admin-1" }),
+    );
+    vi.mocked(mapOverrideNameToOriginal).mockImplementation(
+      async (name) => name,
+    );
+    vi.mocked(mcpServersRepository.findByName).mockResolvedValue({
+      uuid: "server-1",
+    } as never);
+    vi.mocked(toolsRepository.bulkUpsert).mockRejectedValueOnce(
+      new AdminAuditWriteError(),
+    );
+
+    const result = await refresh("admin-1", true);
+
+    expect(result).toEqual({
+      success: false,
+      message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+    });
+  });
+});
+
+describe("namespaces.refreshTools member error responses", () => {
+  it.each(["namespace read", "tool write"])(
+    "keeps a failed %s out of the response and log",
+    async (phase) => {
+      vi.clearAllMocks();
+      const secret = "fake-tool-secret-cccc3333";
+      const query = 'insert into "tools" ("description") values ($1)';
+      const failure = new DrizzleQueryError(
+        query,
+        [secret],
+        Object.assign(new Error(`rejected ${secret}`), {
+          code: "22001",
+          detail: `Failing row contains (${secret})`,
+        }),
+      );
+      vi.mocked(namespacesRepository.findByUuid).mockResolvedValue(
+        fakeNamespace({ user_id: "member-1" }),
+      );
+      if (phase === "namespace read") {
+        vi.mocked(namespacesRepository.findByUuid).mockRejectedValueOnce(
+          failure,
+        );
+      } else {
+        vi.mocked(mapOverrideNameToOriginal).mockImplementation(
+          async (name) => name,
+        );
+        vi.mocked(mcpServersRepository.findByName).mockResolvedValue({
+          uuid: "server-1",
+        } as never);
+        vi.mocked(toolsRepository.bulkUpsert).mockRejectedValueOnce(failure);
+      }
+
+      const result = await refresh("member-1", false);
+
+      expect(result).toEqual({
+        success: false,
+        message: "Failed to refresh namespace tools",
+      });
+      const logged = vi
+        .mocked(logger.error)
+        .mock.calls.map((args) => format(...args))
+        .join("\n");
+      for (const text of [JSON.stringify(result), logged]) {
+        expect(text).not.toContain(secret);
+        expect(text).not.toContain(query);
+        expect(text).not.toContain("Failing row contains");
+      }
+      expect(logged).toContain("DrizzleQueryError");
+      expect(logged).toContain("22001");
+    },
+  );
 });

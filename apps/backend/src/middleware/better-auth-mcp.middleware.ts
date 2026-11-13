@@ -2,6 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { auth } from "../auth";
@@ -65,7 +66,7 @@ export const betterAuthMcpMiddleware = async (
 
     next();
   } catch (error) {
-    logger.error("Better auth middleware error:", error);
+    logger.error("Better auth middleware error:", describeDbError(error));
     return res.status(500).json({
       error: "Authentication error",
       message: "Failed to verify authentication",

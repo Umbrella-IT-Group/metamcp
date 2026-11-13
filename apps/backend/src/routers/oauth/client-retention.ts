@@ -1,6 +1,8 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
+import { CIMD_UNUSED_RETENTION_DAYS } from "./cimd-config";
 
 /**
  * Retention sweep for self-registered OAuth clients that no administrator
@@ -96,7 +98,47 @@ export async function sweepUnapprovedDcrClients(): Promise<number> {
     }
     return removed;
   } catch (error) {
-    logger.error("Error sweeping unapproved OAuth clients:", error);
+    logger.error(
+      "Error sweeping unapproved OAuth clients:",
+      describeDbError(error),
+    );
+    return 0;
+  }
+}
+
+/**
+ * Run one sweep of client metadata document rows (source `cimd`, migration
+ * 0046). Returns the number of rows removed.
+ *
+ * What goes: a `cimd` row not refreshed for CIMD_UNUSED_RETENTION_DAYS that
+ * has no access token, authorization code or rotated-token marker. What
+ * stays: every row of any other source (this never touches the DCR sweep's
+ * rows, nor an admin-created or legacy row), and any `cimd` row somebody is
+ * connected through, because deleting its client would revoke those sessions.
+ * The sweep is only housekeeping: a still-listed client's row is written again
+ * by its next authorize, so nothing is lost by deleting an unused one.
+ *
+ * Not switched off by an empty allowlist: rows can outlive the entry that
+ * created them, and those are exactly the ones worth reaping.
+ *
+ * Never throws, for the reason sweepUnapprovedDcrClients gives.
+ */
+export async function sweepUnusedCimdClients(): Promise<number> {
+  try {
+    const removed = await oauthRepository.pruneUnusedCimdClients(
+      CIMD_UNUSED_RETENTION_DAYS,
+    );
+    if (removed > 0) {
+      logger.info(
+        `[oauth] swept ${removed} unused client metadata document client(s) not refreshed for ${CIMD_UNUSED_RETENTION_DAYS}d`,
+      );
+    }
+    return removed;
+  } catch (error) {
+    logger.error(
+      "Error sweeping unused client metadata document rows:",
+      describeDbError(error),
+    );
     return 0;
   }
 }

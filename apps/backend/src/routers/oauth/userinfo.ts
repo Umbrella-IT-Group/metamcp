@@ -7,6 +7,7 @@ import {
 } from "@/lib/audit/audit-emitter";
 import { authRateLimiter } from "@/lib/auth-rate-limiter";
 import { resolveClientIp } from "@/lib/client-ip";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository, usersRepository } from "../../db/repositories";
@@ -264,7 +265,7 @@ userinfoRouter.get("/oauth/userinfo", async (req, res) => {
       scope: tokenData.scope,
     });
   } catch (error) {
-    logger.error("Error in OAuth userinfo endpoint:", error);
+    logger.error("Error in OAuth userinfo endpoint:", describeDbError(error));
     res.status(500).json({
       error: "server_error",
       error_description: "Internal server error",

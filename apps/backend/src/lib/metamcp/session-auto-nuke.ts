@@ -74,6 +74,7 @@ import { isNotNull, sql } from "drizzle-orm";
 
 import { db } from "@/db";
 import { mcpSessionsTable } from "@/db/schema";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { GATEWAY_CAPABILITY_HASH } from "./gateway-boot-id";
@@ -182,6 +183,9 @@ export async function autoNukeStaleSessions(): Promise<void> {
     // Don't crash the gateway on a transient DB error. The PR #23
     // lazy-recovery refusal path is still in place, so the worst case
     // without the nuke is the pre-existing wedged-session behaviour.
-    logger.error("Auto-nuke: postgres error; skipping nuke this boot.", error);
+    logger.error(
+      "Auto-nuke: postgres error; skipping nuke this boot.",
+      describeDbError(error),
+    );
   }
 }

@@ -6,6 +6,7 @@ import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import express from "express";
 
 import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { resolveCallerContext } from "../../lib/metamcp/caller-context";
@@ -21,6 +22,13 @@ import {
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 
 const metamcpRouter = express.Router();
+
+// The Inspector's SDK includes response text in its error message. A fixed
+// message stays useful without serializing a query, its params or its cause.
+const PROXY_ERROR_BODY = {
+  error: "internal_server_error",
+  message: "MCP proxy request failed. Check the gateway logs for details.",
+} as const;
 
 /**
  * The session user, as `betterAuthMcpMiddleware` leaves it on the request —
@@ -135,8 +143,8 @@ metamcpRouter.get("/:uuid/mcp", async (req, res) => {
       await transport.handleRequest(req, res);
     }
   } catch (error) {
-    logger.error("Error in MetaMCP /mcp route:", error);
-    res.status(500).json(error);
+    logger.error("Error in MetaMCP /mcp route:", describeDbError(error));
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 
@@ -196,7 +204,10 @@ metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
             // route below, as it does on the single-server route
             // (./server.ts) and the public endpoint route.
           } catch (error) {
-            logger.error(`Error initializing session ${newSessionId}:`, error);
+            logger.error(
+              `Error initializing session ${newSessionId}:`,
+              describeDbError(error),
+            );
           }
         },
       });
@@ -210,8 +221,8 @@ metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
         ),
       );
     } catch (error) {
-      logger.error("Error in MetaMCP /mcp POST route:", error);
-      res.status(500).json(error);
+      logger.error("Error in MetaMCP /mcp POST route:", describeDbError(error));
+      res.status(500).json(PROXY_ERROR_BODY);
     }
   } else {
     // logger.info(
@@ -229,8 +240,8 @@ metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
         );
       }
     } catch (error) {
-      logger.error("Error in MetaMCP /mcp route:", error);
-      res.status(500).json(error);
+      logger.error("Error in MetaMCP /mcp route:", describeDbError(error));
+      res.status(500).json(PROXY_ERROR_BODY);
     }
   }
 });
@@ -248,8 +259,11 @@ metamcpRouter.delete("/:uuid/mcp", async (req, res) => {
       logger.info(`MetaMCP session ${sessionId} cleaned up successfully`);
       res.status(200).end();
     } catch (error) {
-      logger.error("Error in MetaMCP /mcp DELETE route:", error);
-      res.status(500).json(error);
+      logger.error(
+        "Error in MetaMCP /mcp DELETE route:",
+        describeDbError(error),
+      );
+      res.status(500).json(PROXY_ERROR_BODY);
     }
   } else {
     res.status(400).end("Missing sessionId");
@@ -292,8 +306,8 @@ metamcpRouter.get("/:uuid/sse", async (req, res) => {
 
     await mcpServerInstance.server.connect(webAppTransport);
   } catch (error) {
-    logger.error("Error in MetaMCP /sse route:", error);
-    res.status(500).json(error);
+    logger.error("Error in MetaMCP /sse route:", describeDbError(error));
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 
@@ -316,8 +330,8 @@ metamcpRouter.post("/:uuid/message", async (req, res) => {
       transport.handlePostMessage(req, res),
     );
   } catch (error) {
-    logger.error("Error in MetaMCP /message route:", error);
-    res.status(500).json(error);
+    logger.error("Error in MetaMCP /message route:", describeDbError(error));
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 

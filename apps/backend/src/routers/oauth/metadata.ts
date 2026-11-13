@@ -1,9 +1,11 @@
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../../db/repositories";
 import { matchPublicMcpResourcePath } from "../../lib/public-mcp-resource";
+import { isCimdEnabled } from "./cimd-config";
 import { getOAuthDcrMode } from "./dcr-mode";
 import {
   getBaseUrl,
@@ -206,7 +208,10 @@ const protectedResourceHandler: express.RequestHandler = async (req, res) => {
 
     return res.json(metadata);
   } catch (error) {
-    logger.error("Error generating OAuth protected resource metadata:", error);
+    logger.error(
+      "Error generating OAuth protected resource metadata:",
+      describeDbError(error),
+    );
     return res.status(500).json({
       error: "internal_server_error",
       error_description: "Failed to generate OAuth metadata",
@@ -254,6 +259,20 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
         : { registration_endpoint: `${baseUrl}/oauth/register` }),
       userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
 
+      // Advertised ONLY while OAUTH_CIMD_ALLOWED_CLIENTS lists something.
+      // The flag tells a client it may use an https URL as its client id
+      // instead of registering, and a client that sees it and has such a URL
+      // does exactly that and does not fall back to registration when the URL
+      // is refused (the MCP SDK client does not). So the flag is never
+      // advertised unconditionally: with no allowlist, a CIMD-capable client
+      // keeps registering as it does today. This document is served with a
+      // one-hour Cache-Control (below), so a client or an intermediary cache may
+      // keep the old value for up to an hour after the setting changes; a URL
+      // client id that is no longer listed is refused at authorize regardless.
+      ...(isCimdEnabled()
+        ? { client_id_metadata_document_supported: true }
+        : {}),
+
       // Supported response types (required by RFC 8414)
       response_types_supported: ["code"],
 
@@ -298,7 +317,7 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
   } catch (error) {
     logger.error(
       "Error generating OAuth authorization server metadata:",
-      error,
+      describeDbError(error),
     );
     return res.status(500).json({
       error: "server_error",

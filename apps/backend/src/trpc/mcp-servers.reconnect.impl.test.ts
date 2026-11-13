@@ -283,7 +283,7 @@ describe("mcpServers.reconnect implementation", () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.message).toBe("pool exploded");
+    expect(result.message).toBe("Failed to reconnect MCP server");
   });
 
   it("treats a namespace fan-out failure as best-effort — the reconnect still succeeds", async () => {

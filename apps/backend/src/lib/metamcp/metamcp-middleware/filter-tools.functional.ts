@@ -2,6 +2,7 @@ import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { NamespaceToolPolicy } from "@repo/zod-types";
 import { and, eq } from "drizzle-orm";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { db } from "../../../db/index";
@@ -358,7 +359,7 @@ async function filterActiveTools(
     // can be judged, so none is served.
     logger.error(
       `Error reading the tool policy of namespace ${namespaceUuid}; serving no tools:`,
-      error,
+      describeDbError(error),
     );
     return [];
   }
@@ -413,7 +414,10 @@ async function filterActiveTools(
           activeTools.push(tool);
         }
       } catch (error) {
-        logger.error(`Error checking tool status for ${tool.name}:`, error);
+        logger.error(
+          `Error checking tool status for ${tool.name}:`,
+          describeDbError(error),
+        );
         // FAIL CLOSED (operator decision 2026-09-02): a DB error must not
         // silently re-enable a disabled tool, so exclude it rather than
         // include. Was fail-open (include on error).
@@ -479,7 +483,7 @@ async function isToolAllowed(
   } catch (error) {
     logger.error(
       `Error checking if tool ${toolName} is allowed in namespace ${namespaceUuid}:`,
-      error,
+      describeDbError(error),
     );
     // FAIL CLOSED (operator decision 2026-09-02): deny on error rather than
     // allow, so a DB blip cannot let a call through to a tool that may be

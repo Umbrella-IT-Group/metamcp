@@ -2,6 +2,10 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import {
+  backendErrorTextForLogging,
+  classifyBackendAuthRejection,
+} from "./backend-auth-rejection";
 import { ConnectedClient } from "./client";
 import { isRecoverableBackendError } from "./session-error";
 
@@ -77,14 +81,19 @@ export async function requestWithSessionRecovery<T>(
   try {
     return await opts.attempt(opts.session);
   } catch (error) {
-    if (!isRecoverableBackendError(error)) {
+    // An HTTP refusal answers this request. Its body can quote the legacy
+    // session/transport-loss markers without proving the connection is dead.
+    if (
+      classifyBackendAuthRejection(error) ||
+      !isRecoverableBackendError(error)
+    ) {
       throw error;
     }
 
     logger.warn(
-      `Backend connection lost for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${
-        error instanceof Error ? error.message : String(error)
-      })`,
+      `Backend connection lost for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${backendErrorTextForLogging(
+        error,
+      )})`,
     );
 
     await opts.pool.invalidateServerConnection(opts.sessionId, opts.serverUuid);

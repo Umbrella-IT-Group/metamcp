@@ -8,6 +8,7 @@ import { and, desc, eq, isNotNull, isNull, like, not, or } from "drizzle-orm";
 import { DatabaseError } from "pg";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import {
   BEARER_ENVELOPE_PREFIX,
   encryptServerBearerToken,
@@ -46,7 +47,7 @@ function handleDatabaseError(
   operation: string,
   serverName?: string,
 ): never {
-  logger.error(`Database error in ${operation}:`, error);
+  logger.error(`Database error in ${operation}:`, describeDbError(error));
 
   // Extract the actual PostgreSQL error from Drizzle's error structure
   let pgError: DatabaseError | undefined;
@@ -322,7 +323,7 @@ export class McpServersRepository {
         }
       }
 
-      logger.error("Database error in bulk create:", error);
+      logger.error("Database error in bulk create:", describeDbError(error));
       throw new Error(
         "Failed to bulk create MCP servers. Please check your input and try again.",
       );

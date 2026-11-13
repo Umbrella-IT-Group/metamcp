@@ -6,6 +6,7 @@ import {
 } from "@/lib/audit/audit-emitter";
 import { emitAuthRelayEvent } from "@/lib/audit/auth-relay-audit";
 import { isCorsResponseHeader } from "@/lib/cors-policy";
+import { describeDbError } from "@/lib/db-error-summary";
 import { INTERNAL_ERROR_BODY } from "@/middleware/error-handler.middleware";
 import logger from "@/utils/logger";
 
@@ -118,7 +119,7 @@ export const authApiRelay = async (
     // error naming internal hosts, table and column names — and `/api/auth/*`
     // is unauthenticated by definition, so whoever provokes the failure needs
     // no credentials to read whatever came back.
-    logger.error("Auth route error:", error);
+    logger.error("Auth route error:", describeDbError(error));
     res.status(500).json(INTERNAL_ERROR_BODY);
   }
 };

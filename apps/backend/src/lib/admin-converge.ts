@@ -40,6 +40,7 @@
  * logged and the gateway starts with the roles it already had, which is
  * exactly the pre-change behaviour.
  */
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { usersRepository } from "../db/repositories";
@@ -180,7 +181,10 @@ export async function convergeConfiguredAdmins(
       );
     }
   } catch (err) {
-    logger.error("Admin converge: could not count administrators:", err);
+    logger.error(
+      "Admin converge: could not count administrators:",
+      describeDbError(err),
+    );
   }
 
   return result;
@@ -196,7 +200,7 @@ async function promoteNamedAccounts(
   } catch (err) {
     logger.error(
       `Admin converge: could not look up the accounts ${ADMIN_EMAIL_ENV} names; no promotions this boot:`,
-      err,
+      describeDbError(err),
     );
     return;
   }
@@ -270,7 +274,7 @@ async function promoteNamedAccounts(
       // One failed write must not stop the remaining promotions.
       logger.error(
         `Admin converge: failed to promote user ${account.id}:`,
-        err,
+        describeDbError(err),
       );
     }
   }

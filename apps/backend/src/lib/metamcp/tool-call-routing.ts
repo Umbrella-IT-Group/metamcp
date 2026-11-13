@@ -5,10 +5,12 @@ import {
   ServerParameters,
 } from "@repo/zod-types";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { namespacesRepository } from "../../db/repositories/namespaces.repo";
 import { configService } from "../config.service";
+import { backendErrorForLogging } from "./backend-auth-rejection";
 import {
   BackendUnavailableError,
   BackendUnavailableReason,
@@ -202,7 +204,7 @@ export async function routeUnmappedToolCall(
     } catch (error) {
       logger.error(
         `${logPrefix}tool lookup on server ${candidate.uuid} failed while routing ${display}:`,
-        error,
+        backendErrorForLogging(error),
       );
       return { kind: "lookup_failed" };
     }
@@ -222,7 +224,7 @@ export async function routeUnmappedToolCall(
       // rejection must still read as "no session", not escape the router.
       logger.error(
         `${logPrefix}session acquisition for server ${candidate.uuid} failed while routing ${display}:`,
-        error,
+        backendErrorForLogging(error),
       );
     }
     if (!session) {
@@ -315,7 +317,7 @@ export async function routeUnmappedToolCall(
     // noted still answers as unavailable rather than as an unknown tool.
     logger.error(
       `${logPrefix}routing fallback failed for tool ${display}:`,
-      error,
+      describeDbError(error),
     );
   }
 
@@ -369,7 +371,7 @@ async function unroutedToolError(options: {
   } catch (error) {
     logger.error(
       `${options.logPrefix}could not read the servers of namespace ${options.namespaceUuid} while routing ${JSON.stringify(toolName)}:`,
-      error,
+      describeDbError(error),
     );
     return new BackendUnavailableError(
       toolName,

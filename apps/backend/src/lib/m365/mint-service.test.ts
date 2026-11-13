@@ -1,6 +1,14 @@
 import { randomBytes } from "node:crypto";
+import { format } from "node:util";
 
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { afterEach, beforeEach, describe, expect, it, Mock, vi } from "vitest";
+
+import logger from "@/utils/logger";
+
+vi.mock("@/utils/logger", () => ({
+  default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
 
 // The mint service's default repo import pulls in the drizzle client,
 // which hard-requires DATABASE_URL at module load. Tests inject their
@@ -42,9 +50,16 @@ function activeRow(
 type RepoStub = M365TokensRepository & {
   findByUserId: Mock<(userId: string) => Promise<M365UserTokenRow | undefined>>;
   rotateRefreshToken: Mock<
-    (userId: string, rt: string, kekId: string) => Promise<boolean>
+    (
+      userId: string,
+      rt: string,
+      kekId: string,
+      expectedCiphertext: string,
+    ) => Promise<boolean>
   >;
-  markReauthRequired: Mock<(userId: string) => Promise<void>>;
+  markReauthRequired: Mock<
+    (userId: string, expectedCiphertext: string) => Promise<void>
+  >;
 };
 
 function makeRepo(row: M365UserTokenRow | undefined): RepoStub {
@@ -217,7 +232,8 @@ describe("M365MintService", () => {
   });
 
   it("maps invalid_grant to credential_expired and marks reauth_required", async () => {
-    const repo = makeRepo(activeRow());
+    const row = activeRow();
+    const repo = makeRepo(row);
     const fetchStub = vi.fn(async () =>
       tokenResponse(
         {
@@ -234,7 +250,12 @@ describe("M365MintService", () => {
       code: "credential_expired",
       enrollUrl: "https://mcp.example.com/m365/enroll",
     });
-    expect(repo.markReauthRequired).toHaveBeenCalledWith("user-1");
+    // The mark is conditional on the ciphertext that was read (the fixture
+    // row), so a rejection of an old grant cannot mark a re-enrolled row.
+    expect(repo.markReauthRequired).toHaveBeenCalledWith(
+      "user-1",
+      row.rt_ciphertext,
+    );
   });
 
   it("maps Conditional Access / MFA error codes to mfa_required", async () => {
@@ -295,6 +316,46 @@ describe("M365MintService", () => {
     await expect(service.getAccessToken("user-1")).rejects.toMatchObject({
       code: "mint_failed",
     });
+  });
+
+  it("keeps a failed grant read out of transport errors and remains retryable", async () => {
+    const secret = "fake-mint-row-secret-iiii9999";
+    const query = 'select * from "m365_user_tokens" where "user_id" = $1';
+    const repo = makeRepo(activeRow());
+    repo.findByUserId.mockRejectedValueOnce(
+      new DrizzleQueryError(
+        query,
+        [secret],
+        Object.assign(new Error(secret), {
+          code: "23514",
+          constraint: "m365_user_tokens_check",
+          detail: `Failing row contains (${secret})`,
+        }),
+      ),
+    );
+    const fetchStub = vi.fn(async () => tokenResponse(goodMintBody()));
+    const service = new M365MintService(repo, fetchStub as typeof fetch);
+    vi.mocked(logger.error).mockClear();
+
+    // The injected fetch hands this rejection to the SDK's transport error
+    // callbacks. It must already be safe before those callbacks log it.
+    const failure = await service.getAccessToken("user-1").catch((e) => e);
+    expect(format(failure)).not.toContain(secret);
+    expect(format(failure)).not.toContain(query);
+    expect(failure).toBeInstanceOf(M365BrokerError);
+    expect(failure).toMatchObject({ code: "mint_failed" });
+    expect(fetchStub).not.toHaveBeenCalled();
+
+    const logged = vi
+      .mocked(logger.error)
+      .mock.calls.map((args) => format(...args))
+      .join("\n");
+    expect(logged).not.toContain(secret);
+    expect(logged).not.toContain(query);
+    expect(logged).toContain("23514");
+    expect(logged).toContain("m365_user_tokens_check");
+
+    expect(await service.getAccessToken("user-1")).toBe("fresh-graph-at");
   });
 
   it("invalidateUser drops the cached AT", async () => {

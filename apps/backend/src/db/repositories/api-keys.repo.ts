@@ -19,6 +19,7 @@ import {
   type ValidatedMintRequest,
 } from "@/lib/api-key-mint-rules";
 import { configService } from "@/lib/config.service";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { db } from "../index";
@@ -517,7 +518,7 @@ export class ApiKeysRepository {
     } catch (error) {
       logger.debug(
         "Failed to update api_keys.last_used_at (non-fatal):",
-        error,
+        describeDbError(error),
       );
     }
   }

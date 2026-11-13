@@ -17,6 +17,7 @@ import {
   mcpSessionsRepository,
   type PersistedMcpSession,
 } from "@/db/repositories/mcp-sessions.repo";
+import { describeDbError } from "@/lib/db-error-summary";
 import {
   ApiKeyAuthenticatedRequest,
   authenticateApiKey,
@@ -42,6 +43,11 @@ import {
   registerSessionCounter,
   waitForEvictionTeardown,
 } from "../../lib/metamcp/credential-session-quota";
+import {
+  presentationFromInitParams,
+  presentationToInitParams,
+} from "../../lib/metamcp/endpoint-presentation";
+import { resolveSessionPresentation } from "../../lib/metamcp/endpoint-presentation-resolver";
 import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
@@ -252,7 +258,7 @@ export async function resolveDeletableSession(
   } catch (lookupError) {
     logger.warn(
       `mcp_sessions lookup failed during DELETE for session ${sessionId}; treating as not found.`,
-      lookupError,
+      describeDbError(lookupError),
     );
     stored = null;
   }
@@ -717,7 +723,7 @@ async function recoverPersistedSessionOnce(
     // a security event.
     logger.error(
       `mcp_sessions lookup failed for session ${sessionId}; treating as not-found.`,
-      error,
+      describeDbError(error),
     );
     return { status: "not_found" };
   }
@@ -881,10 +887,24 @@ async function rebuildRecoveredTransport(
 ): Promise<SessionRecoveryResult> {
   // Auth + scope match. Rebuild the transport with the stored sessionId
   // so the consumer's cached id stays valid across the rebuild.
-  const mcpServerInstance = await metaMcpServerPool.getServer(
-    sessionId,
-    stored.namespace_uuid,
-  );
+  //
+  // A session recovers as it was CREATED: what it pinned in init_params, never
+  // the endpoint's current settings (no database read, no resolver call here),
+  // so an administrator's edit cannot change a recovered session's shape under
+  // its client. A row with no pin (every row written before presentation
+  // existed, and every default session) recovers as it always did. The
+  // MCP_ENDPOINT_PRESENTATION kill switch still wins over a pin. Title and
+  // instructions are not restored: a recovered session skips `initialize`.
+  const pinned = presentationFromInitParams(stored.init_params);
+  const mcpServerInstance =
+    pinned === undefined
+      ? await metaMcpServerPool.getServer(sessionId, stored.namespace_uuid)
+      : await metaMcpServerPool.getServer(
+          sessionId,
+          stored.namespace_uuid,
+          false,
+          pinned,
+        );
   if (!mcpServerInstance) {
     logger.error(
       `Lazy recovery: failed to acquire MetaMCP server instance for namespace ${stored.namespace_uuid} (session ${sessionId}).`,
@@ -961,7 +981,7 @@ async function rebuildRecoveredTransport(
       .catch((error: unknown) =>
         logger.warn(
           `mcp_sessions touch failed for session ${sessionId}; pruner may reap prematurely.`,
-          error,
+          describeDbError(error),
         ),
       );
     logger.info(
@@ -1137,7 +1157,10 @@ const cleanupSessionInternal = async (
     if (eviction) {
       logger.error("Error during eviction cleanup; releasing in-memory state.");
     } else {
-      logger.error(`Error during cleanup of session ${sessionId}:`, error);
+      logger.error(
+        `Error during cleanup of session ${sessionId}:`,
+        describeDbError(error),
+      );
     }
     // Even if cleanup fails, remove the session from manager to prevent memory
     // leaks, unless the id now belongs to a newer transport (see above).
@@ -1189,7 +1212,7 @@ function deletePersistedSessionRow(sessionId: string): void {
   deleted.catch((error: unknown) =>
     logger.warn(
       `mcp_sessions delete failed for session ${sessionId}; will be reaped by pruner.`,
-      error,
+      describeDbError(error),
     ),
   );
 }
@@ -1265,7 +1288,10 @@ async function runMcpSessionPrune(): Promise<void> {
       );
     }
   } catch (error) {
-    logger.error("mcp_sessions pruner: postgres delete failed.", error);
+    logger.error(
+      "mcp_sessions pruner: postgres delete failed.",
+      describeDbError(error),
+    );
   }
 }
 
@@ -1381,7 +1407,10 @@ streamableHttpRouter.get("/health/sessions", async (req, res) => {
   try {
     isAdmin = await isAdminHealthRequest(req);
   } catch (error) {
-    logger.error("Admin check failed for /health/sessions:", error);
+    logger.error(
+      "Admin check failed for /health/sessions:",
+      describeDbError(error),
+    );
   }
 
   res.json(buildSessionsHealthPayload(isAdmin));
@@ -2058,11 +2087,35 @@ streamableHttpRouter.post(
           `Generated new session ID: ${newSessionId} for endpoint: ${endpointName}`,
         );
 
-        // Get or create MetaMCP server instance from the pool
-        const mcpServerInstance = await metaMcpServerPool.getServer(
-          newSessionId,
-          namespaceUuid,
+        // What this endpoint's settings say a new session presents (title,
+        // instructions, output-schema trim), read once here because the
+        // endpoint is known here and the proxy knows only the namespace. The
+        // session is pinned to the answer (persisted below); a later edit
+        // reaches only sessions that start afterwards. `undefined` for an
+        // endpoint with no settings, and on any failure: it never throws and
+        // never blocks initialize.
+        const presentation = await resolveSessionPresentation(
+          authReq.endpoint?.uuid,
         );
+        if (admissionClosed) return;
+        if (presentation !== undefined) {
+          // Flags only: the text is administrator-written and stays out of logs.
+          logger.info(
+            `Endpoint ${endpointName} presents custom settings to session ${newSessionId} (title: ${presentation.title !== undefined}, instructions: ${presentation.instructions !== undefined}, trimmed output schemas: ${presentation.omitOutputSchemas}, lean listing: ${presentation.toolListing === "lean"})`,
+          );
+        }
+
+        // Get or create MetaMCP server instance from the pool. The call keeps
+        // its two-argument shape for every session without a presentation.
+        const mcpServerInstance =
+          presentation === undefined
+            ? await metaMcpServerPool.getServer(newSessionId, namespaceUuid)
+            : await metaMcpServerPool.getServer(
+                newSessionId,
+                namespaceUuid,
+                false,
+                presentation,
+              );
         if (admissionClosed) {
           await cleanupAdmission(newSessionId);
           return;
@@ -2184,14 +2237,17 @@ streamableHttpRouter.post(
               endpoint_name: endpointName,
               auth_principal: principal,
               auth_method: authMethod,
-              init_params: {},
+              // `{}` for a session with no presentation, exactly what was
+              // always stored. Otherwise the behavioural pin that lazy
+              // recovery restores (see presentationToInitParams).
+              init_params: presentationToInitParams(presentation),
               gateway_boot_id: GATEWAY_BOOT_ID,
               capability_hash: GATEWAY_CAPABILITY_HASH,
             })
             .catch((error: unknown) =>
               logger.warn(
                 `mcp_sessions persist failed for session ${newSessionId}; lazy-recovery will be unavailable for this consumer until next init.`,
-                error,
+                describeDbError(error),
               ),
             )
             .finally(() => {
@@ -2433,7 +2489,10 @@ streamableHttpRouter.delete(
           sessionId: sessionId,
         });
       } catch (error) {
-        logger.error("Error in public endpoint /mcp DELETE route:", error);
+        logger.error(
+          "Error in public endpoint /mcp DELETE route:",
+          describeDbError(error),
+        );
         // Constant body via the terminal error handler; no error message or
         // session id in the client-facing response.
         return next(error);

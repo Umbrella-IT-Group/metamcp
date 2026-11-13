@@ -1,5 +1,6 @@
 import { McpServerErrorStatusEnum } from "@repo/zod-types";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories/index";
@@ -56,7 +57,7 @@ export class ServerErrorTracker {
     } catch (error) {
       logger.warn(
         "Failed to get MCP max attempts from config, using fallback:",
-        error,
+        describeDbError(error),
       );
       return this.fallbackMaxAttempts;
     }
@@ -107,7 +108,10 @@ export class ServerErrorTracker {
           crashInfo,
         );
       } catch (error) {
-        logger.error(`Failed to mark server ${serverUuid} as ERROR:`, error);
+        logger.error(
+          `Failed to mark server ${serverUuid} as ERROR:`,
+          describeDbError(error),
+        );
       }
     }
   }
@@ -125,7 +129,10 @@ export class ServerErrorTracker {
 
       logger.error(`Server ${serverUuid} marked as ERROR at server level`);
     } catch (error) {
-      logger.error(`Error marking server ${serverUuid} as ERROR:`, error);
+      logger.error(
+        `Error marking server ${serverUuid} as ERROR:`,
+        describeDbError(error),
+      );
     }
   }
 
@@ -172,7 +179,7 @@ export class ServerErrorTracker {
     } catch (error) {
       logger.error(
         `Error checking server error state for ${serverUuid}:`,
-        error,
+        describeDbError(error),
       );
       return false;
     }
@@ -196,7 +203,7 @@ export class ServerErrorTracker {
     } catch (error) {
       logger.error(
         `Error resetting error state for server ${serverUuid}:`,
-        error,
+        describeDbError(error),
       );
     }
   }

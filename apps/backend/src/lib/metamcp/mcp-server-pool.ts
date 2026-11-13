@@ -6,6 +6,7 @@ import {
 import { ServerParameters } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 // Import the specific repo file (not the ../../db/repositories barrel): the
@@ -14,7 +15,13 @@ import logger from "@/utils/logger";
 // fully mocked in that test, so this is the only live db import the pool has.
 import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
+import { backendErrorForLogging } from "./backend-auth-rejection";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
+import {
+  collectToolsListPages,
+  flattenToolPages,
+  reportToolsListTruncation,
+} from "./paginate-tools-list";
 import { serverErrorTracker } from "./server-error-tracker";
 import { toolsListRenotifyWatch } from "./tools-list-renotify";
 import { toolsSyncCache } from "./tools-sync-cache";
@@ -23,15 +30,6 @@ import { toolsSyncCache } from "./tools-sync-cache";
 // backend's re-list so a slow or mid-restart server can't stall the sweep;
 // the sweep already isolates per-server failures, this just caps the wait.
 const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
-
-// Hard backstop on tools/list pagination during a sweep. Paired with the
-// non-advancing-cursor check in listToolsForSweep: that check catches a
-// backend replaying the SAME cursor, this catches any other shape of
-// infinite/very-long pagination. Without a cap, an unbounded loop here
-// would wedge the sweep permanently — toolsSweepInProgress only clears in
-// sweepToolDefinitions's `finally`, so every future tick would be skipped
-// by the in-flight guard forever.
-const TOOLS_SWEEP_MAX_PAGES = 50;
 
 // Bound on the re-notify probe's tools/list (probeServerTools). A backend
 // that takes longer than this to list is not ready to be re-listed by every
@@ -107,6 +105,8 @@ export interface McpServerPoolStatus {
   // from one that simply hasn't been needed yet.
   lastConnectFailureAt?: Record<string, number>;
   lastConnectSuccessAt?: Record<string, number>;
+  // Servers whose most recent connect the backend rejected with HTTP 401/403.
+  backendAuthRejections?: Record<string, { at: number; status: 401 | 403 }>;
   pingFailures?: Record<string, number>;
 }
 
@@ -248,6 +248,20 @@ export class McpServerPool {
   // signal was `!in_error`. Surfaced via getPoolStatus for the
   // external uptime probe.
   private lastConnectFailureAt: Record<string, number> = {};
+
+  // A server whose most recent CONNECT was rejected with HTTP 401 or 403, since
+  // its last successful connect. Same lifecycle as lastConnectFailureAt: set
+  // by the connect hook, cleared by markServerSuccess, pruned with the
+  // registry. Connect-phase only on purpose: the handshake carries no caller
+  // identity, so a refusal there is about the credentials the gateway sends,
+  // while a refusal of a later request can be about one caller and sets no
+  // pool state. A late report from an older concurrent connect can leave a
+  // record next to a live connection; lastConnectFailureAt has the same
+  // property.
+  private backendAuthRejections: Record<
+    string,
+    { at: number; status: 401 | 403 }
+  > = {};
 
   // Time-since-success threshold (ms) for the recovery reset path.
   // Tunable via `MCP_RECOVERY_RESET_THRESHOLD_MS`; default 5 min.
@@ -728,7 +742,7 @@ export class McpServerPool {
             ).catch((error) => {
               logger.error(
                 `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
-                error,
+                describeDbError(error),
               );
             });
           } else {
@@ -741,7 +755,7 @@ export class McpServerPool {
             ).catch((error) => {
               logger.error(
                 `Error handling server crash for ${params.uuid} (no namespace):`,
-                error,
+                describeDbError(error),
               );
             });
           }
@@ -765,6 +779,12 @@ export class McpServerPool {
               );
             },
           );
+        },
+        {
+          // A connect the backend rejected with HTTP 401 or 403: remember it
+          // for the admin health view (see backendAuthRejections).
+          onBackendAuthRejected: (info) =>
+            this.noteBackendAuthRejection(params.uuid, info),
         },
       );
       connecting = false;
@@ -807,6 +827,16 @@ export class McpServerPool {
     }
   }
 
+  private noteBackendAuthRejection(
+    serverUuid: string,
+    info: { status: 401 | 403 },
+  ): void {
+    this.backendAuthRejections[serverUuid] = {
+      at: Date.now(),
+      status: info.status,
+    };
+  }
+
   private releaseConnectionReservation(reservation: ConnectReservation): void {
     if (!reservation.held) return;
     reservation.held = false;
@@ -824,6 +854,7 @@ export class McpServerPool {
   private markServerSuccess(serverUuid: string): void {
     this.serverLastSuccessAt[serverUuid] = Date.now();
     delete this.lastConnectFailureAt[serverUuid];
+    delete this.backendAuthRejections[serverUuid];
     serverErrorTracker.markSuccess(serverUuid);
     // A session whose tools/list left this server out is owed a
     // list_changed once it answers again: probe it now rather than on the
@@ -1267,6 +1298,7 @@ export class McpServerPool {
       maxConnectionsPerServer: this.maxConnectionsPerServer,
       lastConnectFailureAt: { ...this.lastConnectFailureAt },
       lastConnectSuccessAt: { ...this.serverLastSuccessAt },
+      backendAuthRejections: { ...this.backendAuthRejections },
       pingFailures: { ...this.activePingFailures },
     };
   }
@@ -1733,7 +1765,7 @@ export class McpServerPool {
       if (isPingAnsweredError(error)) return stillCurrent();
       logger.info(
         `tools/list re-notify probe: server ${params.name} (${serverUuid}) did not answer tools/list yet:`,
-        error,
+        backendErrorForLogging(error),
       );
       return false;
     }
@@ -1991,7 +2023,10 @@ export class McpServerPool {
         );
       }
     } catch (error) {
-      logger.error("Error during automatic session cleanup:", error);
+      logger.error(
+        "Error during automatic session cleanup:",
+        describeDbError(error),
+      );
     }
   }
 
@@ -2065,6 +2100,7 @@ export class McpServerPool {
           await this.cleanupIdleSession(serverUuid);
           delete this.lastErrorProbeAt[serverUuid];
           delete this.activePingFailures[serverUuid];
+          delete this.backendAuthRejections[serverUuid];
           // Same per-server-telemetry cleanup category as the two maps
           // above: a deregistered server's sweep baseline must not linger
           // and be compared against if the serverUuid is ever reused.
@@ -2076,7 +2112,7 @@ export class McpServerPool {
       } catch (error) {
         logger.warn(
           "Pool prune (registry reconciliation) skipped this sweep:",
-          error,
+          describeDbError(error),
         );
       }
     }
@@ -2310,7 +2346,7 @@ export class McpServerPool {
 
       for (const [serverUuid, client] of clientByServer) {
         try {
-          const tools = await this.listToolsForSweep(client);
+          const tools = await this.listToolsForSweep(client, serverUuid);
           swept++;
 
           // Pure hashing utility only — deliberately not toolsSyncCache's
@@ -2355,7 +2391,7 @@ export class McpServerPool {
           // callback.
           logger.debug(
             `Tool-definition sweep: iteration failed for ${serverUuid}, skipping this tick:`,
-            error,
+            backendErrorForLogging(error),
           );
         }
       }
@@ -2384,51 +2420,40 @@ export class McpServerPool {
    * the shared transport, so it multiplexes with in-flight tool calls
    * rather than blocking them.
    *
-   * Guarded against a misbehaving backend that never terminates pagination:
-   * a `nextCursor` identical to the cursor just requested stops the loop
-   * immediately (the exact "returns a constant nextCursor" failure shape),
-   * and TOOLS_SWEEP_MAX_PAGES is a backstop for any other infinite/very-long
-   * pagination shape. Without this, `toolsSweepInProgress` only clears in
-   * `sweepToolDefinitions`'s `finally` — an unbounded loop here would wedge
-   * the sweep permanently, with every future tick skipped by the in-flight
-   * guard.
+   * Guarded against a misbehaving backend that never terminates pagination
+   * by the one loop every tools/list site shares (paginate-tools-list.ts): a
+   * cursor the backend hands out a second time stops it (the "returns a
+   * constant nextCursor" shape and any longer cycle), and a page cap stops
+   * any other endless shape. Without this, `toolsSweepInProgress` only clears
+   * in `sweepToolDefinitions`'s `finally` — an unbounded loop here would
+   * wedge the sweep permanently, with every future tick skipped by the
+   * in-flight guard. A stopped listing is truncated, not failed, and is
+   * reported (once per server per window): the sweep must see the same set
+   * the proxy serves, or its hash would differ from what consumers receive
+   * and read as a change on every tick.
    */
-  private async listToolsForSweep(client: ConnectedClient): Promise<Tool[]> {
-    const pages: Tool[] = [];
-    let cursor: string | undefined = undefined;
-    let pageCount = 0;
-
-    do {
-      const result: z.infer<typeof ListToolsResultSchema> =
-        await client.client.request(
+  private async listToolsForSweep(
+    client: ConnectedClient,
+    serverUuid: string,
+  ): Promise<Tool[]> {
+    const collected = await collectToolsListPages(
+      (cursor): Promise<z.infer<typeof ListToolsResultSchema>> =>
+        client.client.request(
           { method: "tools/list", params: { cursor } },
           ListToolsResultSchema,
           { timeout: TOOLS_SWEEP_REQUEST_TIMEOUT_MS },
-        );
-
-      if (result.tools && result.tools.length > 0) {
-        pages.push(...result.tools);
-      }
-      pageCount++;
-
-      const nextCursor = result.nextCursor;
-      if (nextCursor !== undefined && nextCursor === cursor) {
-        logger.warn(
-          "Tool-definition sweep: backend returned a non-advancing tools/list cursor, stopping pagination early",
-        );
-        break;
-      }
-      if (pageCount >= TOOLS_SWEEP_MAX_PAGES) {
-        logger.warn(
-          `Tool-definition sweep: hit the ${TOOLS_SWEEP_MAX_PAGES}-page cap while paginating tools/list, stopping pagination early`,
-        );
-        break;
-      }
-
-      cursor = nextCursor;
-    } while (cursor);
-
-    return pages;
+        ),
+    );
+    if (collected.stopped) {
+      reportToolsListTruncation({
+        serverName: this.serverParamsCache[serverUuid]?.name || serverUuid,
+        serverUuid,
+        stopped: collected.stopped,
+        pages: collected.pages.length,
+        scope: "tool-definition sweep",
+      });
+    }
+    return flattenToolPages(collected);
   }
 
   /**

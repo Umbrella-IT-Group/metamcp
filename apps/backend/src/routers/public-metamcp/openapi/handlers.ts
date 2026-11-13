@@ -2,11 +2,14 @@ import { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import {
   CallToolResult,
   CompatibilityCallToolResultSchema,
+  ErrorCode,
   ListToolsResultSchema,
+  McpError,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { configService } from "../../../lib/config.service";
@@ -17,6 +20,11 @@ import {
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "../../../lib/metamcp/audit-listing-log";
+import {
+  backendErrorForLogging,
+  backendErrorTextForLogging,
+  classifyBackendAuthRejection,
+} from "../../../lib/metamcp/backend-auth-rejection";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
 import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
@@ -39,6 +47,11 @@ import {
   createToolOverridesListToolsMiddleware,
 } from "../../../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import {
+  collectToolsListPages,
+  flattenToolPages,
+  reportToolsListTruncation,
+} from "../../../lib/metamcp/paginate-tools-list";
+import {
   isRecoverableBackendError,
   isToolCallReplaySafeError,
 } from "../../../lib/metamcp/session-error";
@@ -51,8 +64,43 @@ import {
   ToolArgSchemaRegistry,
   unambiguousAuditTools,
 } from "../../../lib/metamcp/tool-arg-keys";
+import {
+  cancelAfterTotalTimeout,
+  cancelPassthroughEnabled,
+  NOOP_PROGRESS,
+  progressPassthroughEnabled,
+} from "../../../lib/metamcp/tool-call-extra";
 import { routeUnmappedToolCall } from "../../../lib/metamcp/tool-call-routing";
 import { sanitizeName } from "../../../lib/metamcp/utils";
+
+async function readOpenApiRequestOptions(
+  operation: "Tools-list" | "Tool-call",
+  { audit = false }: { audit?: boolean } = {},
+): Promise<RequestOptions> {
+  try {
+    return {
+      resetTimeoutOnProgress:
+        await configService.getMcpResetTimeoutOnProgress(),
+      timeout: await configService.getMcpTimeout(),
+      maxTotalTimeout: await configService.getMcpMaxTotalTimeout(),
+    };
+  } catch (error) {
+    // These reads can fail with query parameters in the error. Replace it at
+    // the DB boundary, before listing, auditing or HTTP response code sees it;
+    // backend failures outside this boundary keep their transport diagnostic.
+    const message = `OpenAPI bridge: ${operation} timeout configuration could not be read:`;
+    const detail = describeDbError(error);
+    // Background audits keep their one aggregate WARN; a configuration
+    // outage there must not add per-server ERROR lines to served-call panels.
+    if (audit) logger.debug(message, detail);
+    else logger.error(message, detail);
+    throw new McpError(
+      ErrorCode.InternalError,
+      `${operation} configuration could not be read. Retry shortly.`,
+      { retryable: true },
+    );
+  }
+}
 
 // Original List Tools Handler (adapted from metamcp-proxy.ts)
 //
@@ -144,34 +192,42 @@ export const createOriginalListToolsHandler = (
         }
 
         // Get configurable timeout values to bypass MCP SDK default enforcement
-        const resetTimeoutOnProgress =
-          await configService.getMcpResetTimeoutOnProgress();
-        const timeout = await configService.getMcpTimeout();
-        const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+        const mcpRequestOptions = await readOpenApiRequestOptions(
+          "Tools-list",
+          {
+            audit,
+          },
+        );
 
-        const mcpRequestOptions: RequestOptions = {
-          resetTimeoutOnProgress,
-          timeout,
-          maxTotalTimeout,
-        };
-
+        // Every page, through the one guarded loop (paginate-tools-list.ts).
+        // This listing used to read page one only and silently dropped the
+        // rest of a paginated backend's tools, unlike the MCP listing.
         const listOnce = (active: ConnectedClient) =>
-          active.client.request(
-            {
-              method: "tools/list",
-              params: { _meta: request.params?._meta },
-            },
-            ListToolsResultSchema,
-            mcpRequestOptions,
+          collectToolsListPages(
+            (cursor): Promise<z.infer<typeof ListToolsResultSchema>> =>
+              active.client.request(
+                {
+                  method: "tools/list",
+                  params: { cursor, _meta: request.params?._meta },
+                },
+                ListToolsResultSchema,
+                mcpRequestOptions,
+              ),
           );
 
         try {
           let activeSession = session;
-          let result: z.infer<typeof ListToolsResultSchema>;
+          let result: Awaited<ReturnType<typeof listOnce>>;
           try {
             result = await listOnce(activeSession);
           } catch (error) {
-            if (audit || !isRecoverableBackendError(error)) {
+            // The HTTP refusal takes precedence over connection-loss markers
+            // quoted in its body: it does not justify invalidation or replay.
+            if (
+              audit ||
+              classifyBackendAuthRejection(error) ||
+              !isRecoverableBackendError(error)
+            ) {
               throw error;
             }
             // Regression mirror — the OpenAPI tools/list
@@ -181,9 +237,9 @@ export const createOriginalListToolsHandler = (
             // the stale pool entry, re-acquire a fresh session, retry
             // once.
             logger.warn(
-              `OpenAPI bridge: backend connection lost for server ${mcpServerUuid} on tools/list; invalidating pool and retrying once. (envelope: ${
-                error instanceof Error ? error.message : String(error)
-              })`,
+              `OpenAPI bridge: backend connection lost for server ${mcpServerUuid} on tools/list; invalidating pool and retrying once. (envelope: ${backendErrorTextForLogging(
+                error,
+              )})`,
             );
             await mcpServerPool.invalidateServerConnection(
               context.sessionId,
@@ -204,21 +260,34 @@ export const createOriginalListToolsHandler = (
             result = await listOnce(activeSession);
           }
 
-          const toolsWithSource =
-            result.tools?.map((tool) => {
-              const toolName = `${sanitizeName(serverName)}__${tool.name}`;
-              return {
-                ...tool,
-                name: toolName,
-                description: tool.description,
-              };
-            }) || [];
+          if (!audit && result.stopped) {
+            // A cut-short listing is served as gathered and reported. This
+            // listing never writes the catalog, so there is no sync to guard.
+            reportToolsListTruncation({
+              serverName,
+              serverUuid: mcpServerUuid,
+              stopped: result.stopped,
+              pages: result.pages.length,
+              scope: "OpenAPI tools/list",
+            });
+          }
+          const toolsWithSource = flattenToolPages(result).map((tool) => {
+            const toolName = `${sanitizeName(serverName)}__${tool.name}`;
+            return {
+              ...tool,
+              name: toolName,
+              description: tool.description,
+            };
+          });
 
           allTools.push(...toolsWithSource);
         } catch (error) {
-          reportFailure(`Error fetching tools from: ${serverName}`, error);
+          reportFailure(
+            `Error fetching tools from: ${serverName}`,
+            backendErrorForLogging(error),
+          );
           noteAuditSkip(serverName || mcpServerUuid, () =>
-            describeListingFailure(error),
+            describeListingFailure(backendErrorForLogging(error)),
           );
           failedServers.push(serverName || mcpServerUuid);
         }
@@ -239,7 +308,9 @@ export const createOriginalListToolsHandler = (
       // provides its scrubbed cause; the served path needs the failure count
       // and marker, without inspecting or serializing an untrusted error.
       reportFailure(`Error preparing tools listing for: ${name}`);
-      noteAuditSkip(name, () => describeListingFailure(outcome.reason));
+      noteAuditSkip(name, () =>
+        describeListingFailure(backendErrorForLogging(outcome.reason)),
+      );
       failedServers.push(name);
     }
 
@@ -408,32 +479,51 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     const targetServerUuid = route.serverUuid;
 
     // Get configurable timeout values to bypass MCP SDK default enforcement
-    const resetTimeoutOnProgress =
-      await configService.getMcpResetTimeoutOnProgress();
-    const timeout = await configService.getMcpTimeout();
-    const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+    const requestOptions = await readOpenApiRequestOptions("Tool-call");
+
+    // Used only to send the backend a cancel when the total cap rejects the
+    // call (the SDK sends none). The HTTP request is deliberately NOT linked
+    // to it: a dropped HTTP connection is not an intentional cancel, the SDK
+    // does not abort a handler on a disconnect, and stopping a write midway
+    // on a network blip is worse than letting it finish.
+    const abortController = new AbortController();
+    const cancelOn = cancelPassthroughEnabled();
 
     const mcpRequestOptions: RequestOptions = {
-      resetTimeoutOnProgress,
-      timeout,
-      maxTotalTimeout,
+      ...requestOptions,
+      signal: abortController.signal,
     };
+    // The bridge answers one JSON body, so there is nobody to relay progress
+    // to. The one reset flag must still behave as it does on the MCP surface,
+    // and the SDK arms it only through a registered handler.
+    if (
+      mcpRequestOptions.resetTimeoutOnProgress &&
+      progressPassthroughEnabled()
+    ) {
+      mcpRequestOptions.onprogress = NOOP_PROGRESS;
+    }
 
-    const callOnce = (session: ConnectedClient) =>
-      session.client.request(
-        {
-          method: "tools/call",
-          params: {
-            name: originalToolName,
-            arguments: args || {},
-            _meta: {
-              progressToken: request.params._meta?.progressToken,
+    const callOnce = async (session: ConnectedClient) => {
+      try {
+        return await session.client.request(
+          {
+            method: "tools/call",
+            params: {
+              name: originalToolName,
+              arguments: args || {},
+              _meta: {
+                progressToken: request.params._meta?.progressToken,
+              },
             },
           },
-        },
-        CompatibilityCallToolResultSchema,
-        mcpRequestOptions,
-      );
+          CompatibilityCallToolResultSchema,
+          mcpRequestOptions,
+        );
+      } catch (error) {
+        if (cancelOn) cancelAfterTotalTimeout(error, abortController);
+        throw error;
+      }
+    };
 
     try {
       return (await callOnce(targetSession)) as CallToolResult;
@@ -466,7 +556,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
           `Error calling tool ${JSON.stringify(name)} through ${
             targetSession.client.getServerVersion()?.name || "unknown"
           }:`,
-          error,
+          backendErrorForLogging(error),
         );
         throw error;
       }
@@ -516,7 +606,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
           `OpenAPI bridge: error calling tool ${JSON.stringify(name)} through ${
             freshSession.client.getServerVersion()?.name || "unknown"
           } after session re-initialize:`,
-          retryError,
+          backendErrorForLogging(retryError),
         );
         throw retryError;
       }

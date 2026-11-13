@@ -11,6 +11,7 @@ import {
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -256,7 +257,7 @@ export const endpointsImplementations = {
             } catch (apiKeyError) {
               logger.error(
                 "Error getting API key for MCP server:",
-                apiKeyError,
+                describeDbError(apiKeyError),
               );
               // Do NOT fall through and create the server anyway. The endpoint
               // gates on an API key, so a server row carrying an empty bearer
@@ -283,7 +284,7 @@ export const endpointsImplementations = {
             });
           }
         } catch (mcpError) {
-          logger.error("Error creating MCP server:", mcpError);
+          logger.error("Error creating MCP server:", describeDbError(mcpError));
           // The endpoint stands — the companion server is a convenience, and
           // rolling back the primary resource because a convenience failed
           // would be the worse trade. But the caller is told, because a
@@ -300,7 +301,7 @@ export const endpointsImplementations = {
         ...(mcpServerWarning ? { warning: mcpServerWarning } : {}),
       };
     } catch (error) {
-      logger.error("Error creating endpoint:", error);
+      logger.error("Error creating endpoint:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -323,7 +324,7 @@ export const endpointsImplementations = {
         message: "Endpoints retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching endpoints:", error);
+      logger.error("Error fetching endpoints:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -344,7 +345,7 @@ export const endpointsImplementations = {
         message: "Endpoints retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching all endpoints:", error);
+      logger.error("Error fetching all endpoints:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -386,7 +387,7 @@ export const endpointsImplementations = {
         message: "Endpoint retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching endpoint:", error);
+      logger.error("Error fetching endpoint:", describeDbError(error));
       return {
         success: false as const,
         message: "Failed to fetch endpoint",
@@ -444,7 +445,7 @@ export const endpointsImplementations = {
         message: "Endpoint deleted successfully",
       };
     } catch (error) {
-      logger.error("Error deleting endpoint:", error);
+      logger.error("Error deleting endpoint:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -595,7 +596,7 @@ export const endpointsImplementations = {
         message: "Endpoint updated successfully",
       };
     } catch (error) {
-      logger.error("Error updating endpoint:", error);
+      logger.error("Error updating endpoint:", describeDbError(error));
       return {
         success: false as const,
         message:

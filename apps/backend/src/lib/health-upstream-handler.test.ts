@@ -233,10 +233,11 @@ describe("/health/upstream: anonymous body for a fixed snapshot", () => {
 
     expect(result.status).toBe(500);
     expect(result.bytes).toBe(ERROR_BYTES);
-    // Logged, not swallowed.
+    // Logged, not swallowed, and as the log-safe summary: a read error can
+    // quote the query it failed on.
     expect(h.loggerError).toHaveBeenCalledWith(
       "/health/upstream failed:",
-      expect.any(Error),
+      "Error",
     );
   });
 

@@ -13,6 +13,7 @@ import {
   getAdminKeyRateLimitIdentifier,
   trpcAdminKeyRateLimiter,
 } from "./lib/auth-rate-limiter";
+import { describeDbError } from "./lib/db-error-summary";
 import {
   ADMIN_KEY_RATE_LIMIT_MESSAGE,
   ADMIN_KEY_RATE_LIMIT_WINDOW_MS,
@@ -195,7 +196,10 @@ export const createContext = async ({
     }
   } catch (error) {
     // Log error but don't throw - we want to allow unauthenticated requests
-    logger.error("Error getting session in tRPC context:", error);
+    logger.error(
+      "Error getting session in tRPC context:",
+      describeDbError(error),
+    );
   }
 
   // An admin-plane key refused by its IP policy gets 403, not the 401 an

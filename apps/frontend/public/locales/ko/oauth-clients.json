@@ -63,6 +63,7 @@
   "statusUnknown": "승인되지 않음",
   "sourceDcr": "자체 등록",
   "sourceAdmin": "관리자가 생성",
+  "sourceCimd": "클라이언트 메타데이터 문서",
   "sourceLegacy": "출처 기록 이전에 생성",
   "registeredFromUnavailable": "알 수 없음",
   "registeredFromHelp": "자체 등록 요청이 들어온 네트워크 주소입니다. 특정 사람을 식별하지 않으며 클라이언트가 안전하다는 뜻도 아닙니다.",

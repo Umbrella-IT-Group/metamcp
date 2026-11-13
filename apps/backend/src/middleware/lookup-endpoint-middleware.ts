@@ -3,6 +3,7 @@ import express from "express";
 import type { AuditAttributedRequest } from "@/lib/audit/audit-emitter";
 import { sendAuthenticationRequiredChallenge } from "@/lib/auth-challenge";
 import { AuthRateLimiter } from "@/lib/auth-rate-limiter";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
@@ -191,7 +192,7 @@ export function createLookupEndpoint({
 
       next();
     } catch (error) {
-      logger.error("Error looking up endpoint:", error);
+      logger.error("Error looking up endpoint:", describeDbError(error));
       return res.status(500).json({
         error: "Internal server error",
         message: "Failed to lookup endpoint",

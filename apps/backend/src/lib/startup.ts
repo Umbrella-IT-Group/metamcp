@@ -2,6 +2,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import { mcpServersRepository, namespacesRepository } from "../db/repositories";
 import { initializeEnvironmentConfiguration } from "./bootstrap.service";
+import { describeDbError } from "./db-error-summary";
 import { metaMcpServerPool } from "./metamcp";
 import { serverErrorTracker } from "./metamcp/server-error-tracker";
 import {
@@ -34,7 +35,7 @@ export async function initializeOnStartup(): Promise<void> {
     } catch (err) {
       console.error(
         "❌ Error initializing environment-based configuration (ignored):",
-        err,
+        describeDbError(err),
       );
       if (failHard) {
         throw err;
@@ -132,7 +133,7 @@ export async function initializeIdleServers() {
       "✅ Successfully initialized idle servers for all namespaces and all MCP servers",
     );
   } catch (error) {
-    console.log("❌ Error initializing idle servers:", error);
+    console.log("❌ Error initializing idle servers:", describeDbError(error));
     // Don't exit the process, just log the error
     // The server should still start even if idle server initialization fails
   }

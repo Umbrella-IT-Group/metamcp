@@ -4,12 +4,21 @@ import logger from "@/utils/logger";
 
 import { isPerUserBrokerError } from "../../m365/errors";
 import {
+  classifyBackendAuthRejection,
+  describeBackendAuthRejection,
+} from "../backend-auth-rejection";
+import {
   BACKEND_UNAVAILABLE,
   isBackendUnavailableError,
 } from "../backend-unavailable";
 import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import type { ToolArgSchema } from "../tool-arg-keys";
+import {
+  isToolCallCancelledError,
+  TOOL_CALL_CANCELLED_CODE,
+  TOOL_CALL_OUTCOME_UNKNOWN_DETAIL,
+} from "../tool-call-cancelled";
 import { parseToolName } from "../tool-name-parser";
 import { isUnknownToolError } from "../unknown-tool";
 import {
@@ -331,6 +340,9 @@ function describeOutcome(
 }
 
 function errorCode(error: unknown): string {
+  // First, ahead of the numeric-code branch below: the typed cancel carries
+  // the in-process code -32800, and the row must read `cancelled`.
+  if (isToolCallCancelledError(error)) return TOOL_CALL_CANCELLED_CODE;
   // A thrown "Unknown tool: ..." is the gateway's own answer for a name nobody
   // serves. Record it as the class `unknown_tool` instead of the JS class name
   // `Error`, so unmapped or mistyped tool names are measurable too.
@@ -491,17 +503,35 @@ export function createAuditingMiddleware(
       // call as failed with the broker code. Operator-actionable broker
       // errors (not_configured, mint_failed) and everything else stay ERROR.
       const enrollmentRefusal = isPerUserBrokerError(error);
+      // The consumer cancelled this call. The backend may have finished the
+      // work before the cancel landed, so the row says the outcome is unknown
+      // (read as possibly executed in a security review) and the line is a
+      // WARN without the words the log-based dashboards count as failures.
+      // Never an ERROR: the consumer asked for it.
+      const cancelled = isToolCallCancelledError(error);
+      // A backend's HTTP 401/403 answer to this call. Named by status only:
+      // the response body is the backend's text and stays out of the log and
+      // the Live Logs entry. A call-time refusal can be about this one caller
+      // (the backend sees the verified caller on each request), so the
+      // wording is neutral about whose credentials were refused.
+      const rejection = cancelled
+        ? undefined
+        : classifyBackendAuthRejection(error);
       metamcpLogStore.record({
         category: "tool_call",
         serverName,
-        level: enrollmentRefusal ? "warn" : "error",
-        message: enrollmentRefusal
-          ? `${toolName} refused: the caller's Microsoft 365 enrollment is needed (${errorCode(error)}, ${durationMs}ms)`
-          : `${toolName} failed (${durationMs}ms)`,
+        level: enrollmentRefusal || cancelled ? "warn" : "error",
+        message: cancelled
+          ? `${toolName} cancelled by the caller; outcome unknown (${durationMs}ms)`
+          : enrollmentRefusal
+            ? `${toolName} refused: the caller's Microsoft 365 enrollment is needed (${errorCode(error)}, ${durationMs}ms)`
+            : rejection
+              ? `${toolName} failed: ${describeBackendAuthRejection(rejection.status, "request")} (${durationMs}ms)`
+              : `${toolName} failed (${durationMs}ms)`,
         toolName,
         durationMs,
         clientName,
-        ...(enrollmentRefusal ? {} : { error }),
+        ...(enrollmentRefusal || cancelled || rejection ? {} : { error }),
       });
       persist(
         {
@@ -513,6 +543,9 @@ export function createAuditingMiddleware(
           params_hash: paramsHash,
           success: false,
           error_code: errorCode(error),
+          ...(cancelled
+            ? { error_detail: TOOL_CALL_OUTCOME_UNKNOWN_DETAIL }
+            : {}),
           latency_ms: durationMs,
           args_shape: argsShape,
           ...caller,

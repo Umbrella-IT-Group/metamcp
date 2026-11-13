@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   resolve: {
@@ -14,6 +14,11 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
+    // The conformance harness's loopback-socket tests (SDK client and server
+    // pairs, a streaming proxy) run in the conformance job through
+    // `pnpm test:conformance`, so a flake there cannot block an unrelated merge
+    // in this required job. Its pure tests stay in the default run.
+    exclude: [...configDefaults.exclude, "src/conformance/**/*.net.test.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "json", "html"],

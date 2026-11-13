@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 
 import { checkAuditStorage } from "@/lib/audit-storage/tripwire";
+import { describeDbError } from "@/lib/db-error-summary";
 import { pruneGatewayEvents } from "@/lib/gateway-events/retention";
 import { TOOL_AUDIT_RETENTION_DAYS } from "@/lib/tool-audit-retention";
 import logger from "@/utils/logger";
@@ -11,7 +12,10 @@ import {
   toolCallAuditRepository,
 } from "../../db/repositories";
 import authorizationRouter from "./authorization";
-import { sweepUnapprovedDcrClients } from "./client-retention";
+import {
+  sweepUnapprovedDcrClients,
+  sweepUnusedCimdClients,
+} from "./client-retention";
 import metadataRouter from "./metadata";
 import registrationRouter from "./registration";
 import tokenRouter from "./token";
@@ -48,13 +52,16 @@ setInterval(
       await oauthRepository.cleanupExpired();
       logger.info("Cleaned up expired OAuth codes and tokens");
     } catch (error) {
-      logger.error("Error cleaning up expired OAuth entries:", error);
+      logger.error(
+        "Error cleaning up expired OAuth entries:",
+        describeDbError(error),
+      );
     }
     if (TOOL_AUDIT_RETENTION_DAYS > 0) {
       try {
         await toolCallAuditRepository.pruneOlderThan(TOOL_AUDIT_RETENTION_DAYS);
       } catch (error) {
-        logger.error("Error pruning tool_call_audit:", error);
+        logger.error("Error pruning tool_call_audit:", describeDbError(error));
       }
     }
     // Gateway activity history (migration 0031). Rides this interval for the
@@ -70,6 +77,9 @@ setInterval(
     // thing to reason about at shutdown. Errors are logged and swallowed here
     // deliberately — see sweepUnapprovedDcrClients, which never throws.
     await sweepUnapprovedDcrClients();
+    // Client metadata document rows (migration 0046) have their own sweep and
+    // rule; the DCR one above never matches them. Never throws.
+    await sweepUnusedCimdClients();
     // Audit-table growth tripwire. LAST on the tick, and that ordering is the
     // point: it reports what the estate looks like after the sweeps above have
     // run, not what it looked like a moment before they shrank it.

@@ -1,5 +1,5 @@
 {
-  "about": "Test vectors for the X-Umbrella-Caller header, format v1. The value is \"v1.\" followed by unpadded base64url of the UTF-8 bytes of `json`. `payload` is `json` parsed. `caller` is the gateway's request-scoped caller binding the value is built from (field names as in apps/backend/src/lib/metamcp/caller-context-store.ts). `user_id_header` is the X-Umbrella-User-Id value the gateway sends on the same request, or null. Vectors under `no_value` produce no X-Umbrella-Caller header. Only `uid` and `cred` identify the caller; `email`, `label` and `rid` are descriptive.",
+  "about": "Test vectors for the X-Umbrella-Caller header, format v1. The value is \"v1.\" followed by unpadded base64url of the UTF-8 bytes of `json`. `payload` is `json` parsed. `caller` is the gateway's request-scoped caller binding the value is built from (field names as in apps/backend/src/lib/metamcp/caller-context-store.ts). `user_id_header` is the X-Umbrella-User-Id value the gateway sends on the same request, or null. Vectors under `no_value` produce no X-Umbrella-Caller header. Only `uid` and `cred` identify the caller; `email`, `label` and `rid` are descriptive. For an OAuth client whose id is an https URL (a client metadata document client) `caller.oauthClientId` is that URL and `caller.oauthTokenFamilyId` is the access token's refresh-token family id; `cred` is then `oauth:cimd.` + the first 32 lowercase hex characters of the SHA-256 of the URL's UTF-8 bytes + `.` + the first 16 hex characters of the family id with its hyphens removed (see `url_client_credential`).",
   "header": "x-umbrella-caller",
   "user_id_header": "x-umbrella-user-id",
   "prefix": "v1.",
@@ -8,6 +8,12 @@
     "uid": "^[A-Za-z0-9_-]{1,64}$",
     "cred": "^(api_key:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|oauth:[A-Za-z0-9._-]{1,128}|session)$",
     "descriptive_forbidden_categories": ["Cc", "Cf", "Cs", "Zl", "Zp"]
+  },
+  "url_client_credential": {
+    "applies_when": "caller.authMethod is oauth, caller.oauthClientId does not match the oauth grammar above, and it matches ^https://\\S+$ with at most 512 characters",
+    "family_id_grammar": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    "cred": "oauth:cimd.<first 32 hex of sha256(url utf-8)>.<first 16 hex of family id without hyphens>",
+    "no_value_when": "the family id is missing or not a lowercase uuid, or the id is over 512 characters or not an https URL"
   },
   "limits": {
     "email": 254,
@@ -101,6 +107,75 @@
       },
       "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwM0FiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDMiLCJjcmVkIjoib2F1dGg6Y2xpZW50LnYyX0EtOSIsImVtYWlsIjpudWxsLCJsYWJlbCI6bnVsbCwicmlkIjpudWxsfQ",
       "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "OAuth client identified by a metadata URL: cred is cimd.<32 hex of sha256(url)>.<16 hex of the token family id>",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "https://app.example.com/oauth/client-metadata.json",
+        "oauthTokenFamilyId": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+        "email": "first.user@example.com",
+        "clientName": "Example MCP Client",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"oauth:cimd.aa320f3fbdab41c6cdca7453c4bf5412.6ba7b8109dad41d1\",\"email\":\"first.user@example.com\",\"label\":\"Example MCP Client\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "oauth:cimd.aa320f3fbdab41c6cdca7453c4bf5412.6ba7b8109dad41d1",
+        "email": "first.user@example.com",
+        "label": "Example MCP Client",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoib2F1dGg6Y2ltZC5hYTMyMGYzZmJkYWI0MWM2Y2RjYTc0NTNjNGJmNTQxMi42YmE3YjgxMDlkYWQ0MWQxIiwiZW1haWwiOiJmaXJzdC51c2VyQGV4YW1wbGUuY29tIiwibGFiZWwiOiJFeGFtcGxlIE1DUCBDbGllbnQiLCJyaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUifQ",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "same metadata URL, another token family: the URL half is the same and the family half differs",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "https://app.example.com/oauth/client-metadata.json",
+        "oauthTokenFamilyId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "email": "first.user@example.com",
+        "clientName": "Example MCP Client",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"oauth:cimd.aa320f3fbdab41c6cdca7453c4bf5412.f47ac10b58cc4372\",\"email\":\"first.user@example.com\",\"label\":\"Example MCP Client\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "oauth:cimd.aa320f3fbdab41c6cdca7453c4bf5412.f47ac10b58cc4372",
+        "email": "first.user@example.com",
+        "label": "Example MCP Client",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoib2F1dGg6Y2ltZC5hYTMyMGYzZmJkYWI0MWM2Y2RjYTc0NTNjNGJmNTQxMi5mNDdhYzEwYjU4Y2M0MzcyIiwiZW1haWwiOiJmaXJzdC51c2VyQGV4YW1wbGUuY29tIiwibGFiZWwiOiJFeGFtcGxlIE1DUCBDbGllbnQiLCJyaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUifQ",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "OAuth client metadata URL of exactly 512 characters is aliased",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "https://clients.example.com/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "oauthTokenFamilyId": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+        "email": "first.user@example.com",
+        "clientName": "Example MCP Client",
+        "requestId": "11111111-2222-4333-8444-555555555555"
+      },
+      "json": "{\"v\":1,\"uid\":\"usr01AbCdEfGhIjKlMnOpQrStUvWxYz01\",\"cred\":\"oauth:cimd.6a3ba33688d36ff1af237ba53bc21ecf.6ba7b8109dad41d1\",\"email\":\"first.user@example.com\",\"label\":\"Example MCP Client\",\"rid\":\"11111111-2222-4333-8444-555555555555\"}",
+      "payload": {
+        "v": 1,
+        "uid": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "cred": "oauth:cimd.6a3ba33688d36ff1af237ba53bc21ecf.6ba7b8109dad41d1",
+        "email": "first.user@example.com",
+        "label": "Example MCP Client",
+        "rid": "11111111-2222-4333-8444-555555555555"
+      },
+      "value": "v1.eyJ2IjoxLCJ1aWQiOiJ1c3IwMUFiQ2RFZkdoSWpLbE1uT3BRclN0VXZXeFl6MDEiLCJjcmVkIjoib2F1dGg6Y2ltZC42YTNiYTMzNjg4ZDM2ZmYxYWYyMzdiYTUzYmMyMWVjZi42YmE3YjgxMDlkYWQ0MWQxIiwiZW1haWwiOiJmaXJzdC51c2VyQGV4YW1wbGUuY29tIiwibGFiZWwiOiJFeGFtcGxlIE1DUCBDbGllbnQiLCJyaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUifQ",
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
     },
     {
       "name": "Inspector session: cred is session and the label names the Inspector",
@@ -678,6 +753,55 @@
         "oauthClientId": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       },
       "user_id_header": "usr03AbCdEfGhIjKlMnOpQrStUvWxYz03"
+    },
+    {
+      "name": "OAuth client metadata URL with no token family id",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "https://app.example.com/oauth/client-metadata.json"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "OAuth client metadata URL with a token family id that is not a lowercase uuid",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "https://app.example.com/oauth/client-metadata.json",
+        "oauthTokenFamilyId": "6BA7B810-9DAD-41D1-80B4-00C04FD430C8"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "OAuth client metadata URL over 512 characters",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "https://clients.example.com/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "oauthTokenFamilyId": "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "OAuth client id that is an http URL",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "http://app.example.com/oauth/client-metadata.json",
+        "oauthTokenFamilyId": "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
+    },
+    {
+      "name": "OAuth client id with a slash that is not a URL",
+      "caller": {
+        "authMethod": "oauth",
+        "userId": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01",
+        "oauthClientId": "app.example.com/client",
+        "oauthTokenFamilyId": "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+      },
+      "user_id_header": "usr01AbCdEfGhIjKlMnOpQrStUvWxYz01"
     },
     {
       "name": "Inspector session with no user",

@@ -1,5 +1,6 @@
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import { betterAuthMcpMiddleware } from "@/middleware/better-auth-mcp.middleware";
 import { INTERNAL_ERROR_BODY } from "@/middleware/error-handler.middleware";
 import { lookupEndpointAfterAuth } from "@/middleware/lookup-endpoint-middleware";
@@ -112,7 +113,10 @@ adminRouter.post(
       // Trigger idle server re-initialization to respawn connections
       // Run async — don't block the response
       initializeIdleServers().catch((err) => {
-        logger.error("Admin API: Error re-initializing idle servers:", err);
+        logger.error(
+          "Admin API: Error re-initializing idle servers:",
+          describeDbError(err),
+        );
       });
 
       res.json({
@@ -130,7 +134,10 @@ adminRouter.post(
       // whose body constant this is). The failures reachable here come from
       // the repository and the pool, so `error.message` routinely names
       // internal hosts, table names and server UUIDs.
-      logger.error("Admin API: Error resetting server errors:", error);
+      logger.error(
+        "Admin API: Error resetting server errors:",
+        describeDbError(error),
+      );
       res.status(500).json(INTERNAL_ERROR_BODY);
     }
   },
@@ -173,7 +180,10 @@ adminRouter.get(
         servers: serverStatuses,
       });
     } catch (error) {
-      logger.error("Admin API: Error fetching server statuses:", error);
+      logger.error(
+        "Admin API: Error fetching server statuses:",
+        describeDbError(error),
+      );
       res.status(500).json({
         success: false,
         error: "Failed to fetch server statuses",

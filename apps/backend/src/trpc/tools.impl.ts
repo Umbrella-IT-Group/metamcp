@@ -7,6 +7,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository, toolsRepository } from "../db/repositories";
@@ -60,7 +61,10 @@ export const toolsImplementations = {
         message: "Tools retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching tools by MCP server UUID:", error);
+      logger.error(
+        "Error fetching tools by MCP server UUID:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         data: [],
@@ -100,7 +104,7 @@ export const toolsImplementations = {
         message: `Successfully saved ${results.length} tools`,
       };
     } catch (error) {
-      logger.error("Error saving tools to database:", error);
+      logger.error("Error saving tools to database:", describeDbError(error));
       return {
         success: false as const,
         count: 0,
@@ -179,7 +183,7 @@ export const toolsImplementations = {
       // shares this cache, with "unchanged, skipped" although nothing was
       // written.
       toolsSyncCache.clear(input.mcpServerUuid);
-      console.error("Error syncing tools to database:", error);
+      console.error("Error syncing tools to database:", describeDbError(error));
       return {
         success: false as const,
         count: 0,
