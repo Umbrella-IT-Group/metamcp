@@ -353,7 +353,7 @@ describe("GET /m365/callback — happy path custody", () => {
  * 5.2.2 (a v2 envelope authenticates its context) for the "decrypts under this
  * user, not another" checks. The bound context is inlined on purpose.
  */
-describe("GET /m365/callback — envelope version", () => {
+describe("GET /m365/callback envelope version", () => {
   const KEK = Buffer.alloc(32, 7);
   const ctxFor = (userId: string) => `m365-refresh-token:${userId}`;
 

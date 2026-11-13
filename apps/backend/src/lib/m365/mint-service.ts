@@ -280,7 +280,7 @@ export class M365MintService {
         envelope: storedVersion,
       });
       logger.error(
-        `M365 broker: refresh-token decrypt failed for user ${userId} (kek_id=${row.kek_id}, envelope=${storedVersion ?? "unknown"}) — KEK mismatch, corrupted or foreign envelope, or a v1 envelope under M365_ENVELOPE_STRICT`,
+        `M365 broker: refresh-token decrypt failed for user ${userId} (kek_id=${row.kek_id}, envelope=${storedVersion ?? "unknown"}): KEK mismatch, corrupted or foreign envelope, or a v1 envelope under M365_ENVELOPE_STRICT`,
         error,
       );
       throw new M365BrokerError(
