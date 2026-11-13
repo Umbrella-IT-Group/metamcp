@@ -128,3 +128,63 @@ describe("consent screen warning", () => {
     },
   );
 });
+
+describe("a client identified by a published metadata document", () => {
+  const renderWithHost = (
+    host: string | undefined,
+    locale: (typeof LOCALES)[number] = "en",
+  ) =>
+    renderToStaticMarkup(
+      React.createElement(ConsentDecision, {
+        info: { ...INFO, client_id_host: host },
+        areq: "signed-request",
+        orgName: "Umbrella IT",
+        t: translatorFor(locale),
+      }),
+    );
+
+  it("says where the details were published, and keeps the whole existing warning", () => {
+    const html = renderWithHost("app.example.com");
+
+    expect(html).toContain("Client details published by app.example.com");
+    // Nothing the screen said before is removed or reworded for this client:
+    // the unverified-name note and every warning sentence stay.
+    expect(html).toContain("Name reported by the application, not verified");
+    expect(html).toContain(
+      "Approve only if you started this connection yourself.",
+    );
+    expect(html).toContain(
+      "The application name and the callback address above were supplied by whoever started this request. The gateway has not verified either of them.",
+    );
+    expect(html).toContain(
+      "Approving lets that application act as you on this gateway until the access is revoked.",
+    );
+  });
+
+  it("never claims the client is verified", () => {
+    for (const locale of LOCALES) {
+      const text = translatorFor(locale)(
+        "auth:consentClientDetailsPublishedBy",
+        { host: "app.example.com" },
+      );
+      expect(text).toContain("app.example.com");
+      expect(text.toLowerCase()).not.toContain("verified");
+      expect(text).not.toContain("—");
+    }
+    expect(renderWithHost("app.example.com").toLowerCase()).not.toContain(
+      "verified:",
+    );
+  });
+
+  it("renders a hostile host as text, never as markup", () => {
+    const html = renderWithHost(`x"><img src=x onerror=alert(1)>`);
+
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("x&quot;&gt;&lt;img src=x onerror=alert(1)&gt;");
+  });
+
+  it("leaves the screen exactly as it was for every other client", () => {
+    expect(renderWithHost(undefined)).toBe(render());
+    expect(render()).not.toContain("Client details published by");
+  });
+});

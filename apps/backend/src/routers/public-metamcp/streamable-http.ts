@@ -43,6 +43,11 @@ import {
   waitForEvictionTeardown,
 } from "../../lib/metamcp/credential-session-quota";
 import {
+  presentationFromInitParams,
+  presentationToInitParams,
+} from "../../lib/metamcp/endpoint-presentation";
+import { resolveSessionPresentation } from "../../lib/metamcp/endpoint-presentation-resolver";
+import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
   shouldRefuseRecovery,
@@ -881,10 +886,24 @@ async function rebuildRecoveredTransport(
 ): Promise<SessionRecoveryResult> {
   // Auth + scope match. Rebuild the transport with the stored sessionId
   // so the consumer's cached id stays valid across the rebuild.
-  const mcpServerInstance = await metaMcpServerPool.getServer(
-    sessionId,
-    stored.namespace_uuid,
-  );
+  //
+  // A session recovers as it was CREATED: what it pinned in init_params, never
+  // the endpoint's current settings (no database read, no resolver call here),
+  // so an administrator's edit cannot change a recovered session's shape under
+  // its client. A row with no pin (every row written before presentation
+  // existed, and every default session) recovers as it always did. The
+  // MCP_ENDPOINT_PRESENTATION kill switch still wins over a pin. Title and
+  // instructions are not restored: a recovered session skips `initialize`.
+  const pinned = presentationFromInitParams(stored.init_params);
+  const mcpServerInstance =
+    pinned === undefined
+      ? await metaMcpServerPool.getServer(sessionId, stored.namespace_uuid)
+      : await metaMcpServerPool.getServer(
+          sessionId,
+          stored.namespace_uuid,
+          false,
+          pinned,
+        );
   if (!mcpServerInstance) {
     logger.error(
       `Lazy recovery: failed to acquire MetaMCP server instance for namespace ${stored.namespace_uuid} (session ${sessionId}).`,
@@ -2058,11 +2077,35 @@ streamableHttpRouter.post(
           `Generated new session ID: ${newSessionId} for endpoint: ${endpointName}`,
         );
 
-        // Get or create MetaMCP server instance from the pool
-        const mcpServerInstance = await metaMcpServerPool.getServer(
-          newSessionId,
-          namespaceUuid,
+        // What this endpoint's settings say a new session presents (title,
+        // instructions, output-schema trim), read once here because the
+        // endpoint is known here and the proxy knows only the namespace. The
+        // session is pinned to the answer (persisted below); a later edit
+        // reaches only sessions that start afterwards. `undefined` for an
+        // endpoint with no settings, and on any failure: it never throws and
+        // never blocks initialize.
+        const presentation = await resolveSessionPresentation(
+          authReq.endpoint?.uuid,
         );
+        if (admissionClosed) return;
+        if (presentation !== undefined) {
+          // Flags only: the text is administrator-written and stays out of logs.
+          logger.info(
+            `Endpoint ${endpointName} presents custom settings to session ${newSessionId} (title: ${presentation.title !== undefined}, instructions: ${presentation.instructions !== undefined}, trimmed output schemas: ${presentation.omitOutputSchemas})`,
+          );
+        }
+
+        // Get or create MetaMCP server instance from the pool. The call keeps
+        // its two-argument shape for every session without a presentation.
+        const mcpServerInstance =
+          presentation === undefined
+            ? await metaMcpServerPool.getServer(newSessionId, namespaceUuid)
+            : await metaMcpServerPool.getServer(
+                newSessionId,
+                namespaceUuid,
+                false,
+                presentation,
+              );
         if (admissionClosed) {
           await cleanupAdmission(newSessionId);
           return;
@@ -2184,7 +2227,10 @@ streamableHttpRouter.post(
               endpoint_name: endpointName,
               auth_principal: principal,
               auth_method: authMethod,
-              init_params: {},
+              // `{}` for a session with no presentation, exactly what was
+              // always stored. Otherwise the behavioural pin that lazy
+              // recovery restores (see presentationToInitParams).
+              init_params: presentationToInitParams(presentation),
               gateway_boot_id: GATEWAY_BOOT_ID,
               capability_hash: GATEWAY_CAPABILITY_HASH,
             })

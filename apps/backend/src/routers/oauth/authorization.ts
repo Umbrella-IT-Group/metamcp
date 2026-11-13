@@ -11,6 +11,14 @@ import logger from "@/utils/logger";
 
 import { auth } from "../../auth";
 import { oauthRepository, usersRepository } from "../../db/repositories";
+import { resolveCimdClient } from "./cimd";
+import {
+  CIMD_CLIENT_REFUSED_ERROR,
+  cimdClientIdHost,
+  isCimdEnabled,
+  isCimdRowBlocked,
+  looksLikeCimdClientId,
+} from "./cimd-config";
 import {
   CLIENT_NOT_APPROVED_ERROR,
   CLIENT_NOT_APPROVED_HTTP_STATUS,
@@ -360,8 +368,47 @@ authorizationRouter.get("/oauth/authorize", rateLimitAuth, async (req, res) => {
     }
 
     // Validate client_id against registered clients
-    const clientData = await oauthRepository.getClient(client_id as string);
+    let clientData = await oauthRepository.getClient(client_id as string);
     const finalClientId = client_id as string; // Track which client_id to use
+
+    // Client ID Metadata Documents (migration 0046). Dormant unless an
+    // operator set OAUTH_CIMD_ALLOWED_CLIENTS: with the list empty and no
+    // `cimd` row stored, neither branch below runs and everything after this
+    // block is byte-identical to before.
+    //
+    // The row is read first and handed to the resolver, so the resolver never
+    // reads the table and a row that is NOT a `cimd` row (an admin client, a
+    // dynamic registration, a psql-seeded row that happens to have a URL-shaped
+    // id) never enters it and is never touched.
+    //
+    // Every refusal below answers with ONE fixed body whatever the reason: a
+    // distinct text per reason would tell an anonymous caller which URLs are
+    // allowlisted and which addresses this host can reach. The reason goes to
+    // the audit row and the log.
+    if (
+      isCimdEnabled() &&
+      looksLikeCimdClientId(client_id) &&
+      (!clientData || clientData.registration_source === "cimd")
+    ) {
+      const resolved = await resolveCimdClient(client_id, {
+        existing: clientData,
+        redirectUri: redirect_uri as string,
+        req,
+      });
+      if (!resolved.ok) {
+        return res.status(400).json(CIMD_CLIENT_REFUSED_ERROR);
+      }
+      clientData = resolved.client;
+    } else if (isCimdRowBlocked(clientData)) {
+      // A `cimd` row left behind after its allowlist entry was removed, or the
+      // list cleared: refused here, at consent info, at the decision and at the
+      // token endpoint, so clearing the list stops new authorizations and
+      // refreshes without deleting anything.
+      logger.warn(
+        `[oauth] authorize refused reason=cimd_not_admitted client=${JSON.stringify(finalClientId.slice(0, 200))}`,
+      );
+      return res.status(400).json(CIMD_CLIENT_REFUSED_ERROR);
+    }
 
     if (!clientData) {
       // Client not found. Point at self-registration only while it is
@@ -628,6 +675,16 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
       return res.status(403).json(CLIENT_NOT_APPROVED_ERROR);
     }
 
+    // A client metadata document row whose allowlist entry is gone behaves as
+    // a client that is no longer approved: the signed request predates the
+    // change, and the screen must not offer a usable consent.
+    if (isCimdRowBlocked(clientData)) {
+      logger.warn(
+        `[oauth] consent info withheld reason=cimd_not_admitted client=${JSON.stringify(consentRequest.client_id.slice(0, 200))} user=${userId}`,
+      );
+      return res.status(403).json(CLIENT_NOT_APPROVED_ERROR);
+    }
+
     res.json({
       client_id: consentRequest.client_id,
       client_name: (clientData.client_name || consentRequest.client_id).slice(
@@ -641,6 +698,15 @@ authorizationRouter.get("/oauth/consent/info", async (req, res) => {
       // only judge it if they see all of it.
       redirect_uri: consentRequest.redirect_uri,
       scope: consentRequest.scope,
+      // Only for a client metadata document row: the host the details were
+      // published from. It is the one thing the screen can say about such a
+      // client that it cannot say about a self-registered one, and it is
+      // all it says: the existing "approve only if you started this
+      // connection" warning, the unverified-name note and the full callback
+      // all stay. Other clients return exactly the keys above.
+      ...(clientData.registration_source === "cimd"
+        ? { client_id_host: cimdClientIdHost(clientData.client_id) }
+        : {}),
     });
   } catch (error) {
     logger.error("Error in OAuth consent info endpoint:", error);
@@ -778,6 +844,25 @@ authorizationRouter.post("/oauth/authorize/decision", async (req, res) => {
         redirectUri: consentRequest.redirect_uri,
         httpStatus: 403,
         reason: "client_not_approved",
+      });
+      clearConsentCookie(req, res, consentRequest.cid);
+      return res.status(403).json(CLIENT_NOT_APPROVED_ERROR);
+    }
+
+    // The allowlist gate for a client metadata document row, the analogue of
+    // the approval gate above: a request signed before the entry was removed
+    // mints no code for a client that is no longer listed.
+    if (isCimdRowBlocked(clientData)) {
+      logger.warn(
+        `[oauth] consent rejected reason=cimd_not_admitted client=${JSON.stringify(consentRequest.client_id.slice(0, 200))} user=${userId}`,
+      );
+      emitConsentDecision(req, {
+        granted: false,
+        userId,
+        clientId: consentRequest.client_id,
+        redirectUri: consentRequest.redirect_uri,
+        httpStatus: 403,
+        reason: "cimd_not_admitted",
       });
       clearConsentCookie(req, res, consentRequest.cid);
       return res.status(403).json(CLIENT_NOT_APPROVED_ERROR);

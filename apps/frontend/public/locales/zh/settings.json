@@ -11,7 +11,7 @@
   "disableBasicAuthDescription": "启用后，用户将无法使用邮箱/密码登录。仅提供 SSO/OIDC 身份验证。",
   "mcpSettings": "MCP 设置",
   "mcpSettingsDescription": "配置模型上下文协议超时和行为设置",
-  "mcpResetTimeoutOnProgress": "进度时重置超时 (开发中)",
+  "mcpResetTimeoutOnProgress": "进度时重置超时",
   "mcpResetTimeoutOnProgressDescription": "启用后，每次 MCP 请求有进展时超时都会重置",
   "mcpTimeout": "MCP 请求超时",
   "mcpTimeoutDescription": "单个 MCP 请求的超时时间（毫秒，1-86400 秒）",
