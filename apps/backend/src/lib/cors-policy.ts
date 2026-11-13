@@ -66,7 +66,7 @@ const LOOPBACK_HOSTNAMES = new Set([
  * sandboxed iframe or a privacy-redirected navigation sends, which is exactly
  * the caller a credentialed grant must never be handed to.
  */
-function normalizeOrigin(value: string | undefined): string | null {
+export function normalizeOrigin(value: string | undefined): string | null {
   if (!value) return null;
   try {
     const url = new URL(value.trim());
