@@ -35,12 +35,16 @@ import {
  * given for. The caller puts it on a per-call clone of the handler context
  * (`ClassifiedCallContext`), and the chain refuses the call if the name resolves
  * to another tool when it runs. It is part of the result, not state on the
- * prelude, so concurrent calls cannot share it.
+ * prelude, so concurrent calls cannot share it. The backend UUID and the
+ * snapshot's validity check travel with it; dispatch checks both immediately
+ * before sending, including after any asynchronous routing or recovery.
  */
 export interface LeanPreludeResult {
   answer?: CallToolResult;
   request?: CallToolRequest;
   classifiedTarget?: string;
+  classifiedServerUuid?: string;
+  classifiedTargetIsCurrent?: () => boolean;
 }
 
 export type LeanPrelude = (
@@ -133,14 +137,27 @@ export function createLeanPrelude(options: {
         // routing answer, which is true (call_write_tool runs it) and runs
         // nothing here.
         const classifiedTarget = listedTargetOf(listing, route.name);
-        if (classifiedTarget === undefined) {
+        const classifiedServerUuid =
+          classifiedTarget === undefined
+            ? undefined
+            : listing.serverUuids?.get(classifiedTarget);
+        if (
+          classifiedTarget === undefined ||
+          classifiedServerUuid === undefined ||
+          listing.isCurrent === undefined
+        ) {
           options.log(
             "warn",
             "lean listing: call_tool found no recorded tool for a read-only name",
           );
           return { answer: toolError(CALL_TOOL_ROUTING_ANSWER) };
         }
-        return { request: route.request, classifiedTarget };
+        return {
+          request: route.request,
+          classifiedTarget,
+          classifiedServerUuid,
+          classifiedTargetIsCurrent: listing.isCurrent,
+        };
       }
     }
   };

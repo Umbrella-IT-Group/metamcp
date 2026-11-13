@@ -1404,6 +1404,190 @@ describe("call_tool runs the tool it classified, and only that tool", () => {
     expect(after.tools[0].runs_with).toBe("call_write_tool");
   });
 
+  it("refuses a same-target annotation change while its catalog load is in flight, and does not cache the pre-change override", async () => {
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "read",
+      status: "ACTIVE",
+      overrideAnnotations: { readOnlyHint: true },
+    });
+    const lean = await connectConsumer("s-lean-inflight-hint", LEAN);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached!: () => void;
+    const held = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let readLookups = 0;
+    state.beforeQueryResult = async (query) => {
+      if (
+        query.table === "mappings" &&
+        query.where["tools.name"] === "read" &&
+        ++readLookups === 2
+      ) {
+        reached();
+        await gate;
+      }
+    };
+    const pending = meta(lean, "call_tool", { name: "desk__read" });
+    await held;
+    try {
+      const row = state.mappings.find((mapping) => mapping.toolName === "read");
+      if (!row) throw new Error("missing read mapping");
+      row.overrideAnnotations = { readOnlyHint: false };
+      clearOverrideCache(NS);
+    } finally {
+      release();
+    }
+    const result = await pending;
+    expect.soft(result.isError).toBe(true);
+    expect.soft(desk.calls).toEqual([]);
+    // The late read must not refill the persistent override cache either:
+    // the next call starts after the setter and has no stale catalog to use.
+    const next = await meta(lean, "call_tool", { name: "desk__read" });
+    expect(next.isError).toBe(true);
+    expect(desk.calls).toEqual([]);
+  });
+
+  it.each(["alias resolution", "policy filter"])(
+    "refuses a same-target annotation change after classification while %s waits",
+    async (stage) => {
+      const lean = await connectConsumer("s-lean-midcall-hint", LEAN);
+      await meta(lean, "search_tools");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let reached!: () => void;
+      const held = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      let armed = true;
+      state.beforeQueryResult = async (query) => {
+        if (
+          armed &&
+          query.table === "mappings" &&
+          (stage === "alias resolution"
+            ? query.where["ntm.override_name"] === "read"
+            : query.where["tools.name"] === "read")
+        ) {
+          armed = false;
+          reached();
+          await gate;
+        }
+      };
+      const pending = meta(lean, "call_tool", { name: "desk__read" });
+      await held;
+      try {
+        state.mappings.push({
+          namespaceUuid: NS,
+          serverUuid: DESK.uuid,
+          toolName: "read",
+          status: "ACTIVE",
+          overrideAnnotations: { readOnlyHint: false },
+        });
+        clearOverrideCache(NS);
+      } finally {
+        release();
+      }
+      expect((await pending).isError).toBe(true);
+      expect(desk.calls).toEqual([]);
+    },
+  );
+
+  it("refuses a replacement backend behind the same prefix and original tool name even without an invalidation event", async () => {
+    const lean = await connectConsumer("s-lean-replaced-server", LEAN);
+    await meta(lean, "describe_tool", { names: ["desk__read"] });
+    const replacementUuid = "replacement-server";
+    const replacement = await makeBackend("desk", [
+      { ...READ, annotations: { readOnlyHint: false } },
+    ]);
+    state.servers.push({ uuid: replacementUuid, name: "desk" });
+    state.mounts = [
+      { namespaceUuid: NS, serverUuid: replacementUuid, status: "ACTIVE" },
+    ];
+    sessionsByServer.set(replacementUuid, replacement.connected);
+    // A database write that did not signal this process. The live mount filter
+    // drops the old route and the dynamic router finds the replacement.
+    const result = await meta(lean, "call_tool", { name: "desk__read" });
+    expect(result.isError).toBe(true);
+    expect(replacement.calls).toEqual([]);
+    expect(desk.calls).toEqual([]);
+    const allowed = await meta(lean, "call_write_tool", { name: "desk__read" });
+    expect(allowed.isError).toBeFalsy();
+    expect(replacement.calls.map((call) => call.name)).toEqual(["read"]);
+  });
+
+  it.each([false, true])(
+    "rechecks the read-only verdict before recovery retries (invalidated: %s)",
+    async (invalidated) => {
+      const audit = auditRows();
+      const lean = await connectConsumer("s-lean-retry-proof", LEAN);
+      await meta(lean, "search_tools");
+      const fresh = await makeBackend("desk", [
+        { ...READ, annotations: { readOnlyHint: !invalidated } },
+      ]);
+      const send = vi
+        .spyOn(desk.connected.client, "request")
+        .mockRejectedValueOnce(new Error("Not connected"));
+      getSessionMock.mockImplementation(
+        async (_sessionId: string, serverUuid: string) => {
+          if (serverUuid !== DESK.uuid) return sessionsByServer.get(serverUuid);
+          if (invalidated) {
+            state.mappings.push({
+              namespaceUuid: NS,
+              serverUuid: DESK.uuid,
+              toolName: "read",
+              status: "ACTIVE",
+              overrideAnnotations: { readOnlyHint: false },
+            });
+            clearOverrideCache(NS);
+          }
+          return fresh.connected;
+        },
+      );
+      try {
+        const result = await meta(lean, "call_tool", { name: "desk__read" });
+        expect(desk.calls).toEqual([]);
+        if (invalidated) {
+          expect(result.isError).toBe(true);
+          expect(textOf(result)).toContain("changed");
+          expect(fresh.calls).toEqual([]);
+        } else {
+          expect(result.isError).toBeFalsy();
+          expect(fresh.calls.map((call) => call.name)).toEqual(["read"]);
+        }
+        await audit.arrived(1);
+        expect(audit.rows).toHaveLength(1);
+        expect(audit.rows[0]?.success).toBe(!invalidated);
+      } finally {
+        send.mockRestore();
+      }
+    },
+  );
+
+  it("does not infer read-only hints from a failed annotation-override lookup", async () => {
+    desk.tools = [READ];
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "read",
+      status: "ACTIVE",
+      overrideAnnotations: { readOnlyHint: false },
+    });
+    const lean = await connectConsumer("s-lean-override-unavailable", LEAN);
+    // Warm the policy filter, then lose only the annotation-override read.
+    await meta(lean, "describe_tool", { names: ["desk__read"] });
+    clearOverrideCache(NS);
+    state.failOn = { mappings: true };
+    const result = await meta(lean, "call_tool", { name: "desk__read" });
+    expect(result.isError).toBe(true);
+    expect(desk.calls).toEqual([]);
+  });
+
   it("shows search and describe an alias rebinding as soon as the setter ran, inside the snapshot's lifetime", async () => {
     const lean = await connectConsumer("s-lean-id6", LEAN);
     const before = json(await meta(lean, "search_tools", { limit: 25 }));

@@ -120,6 +120,8 @@ beforeEach(() => {
   clearOverrideCache();
   queries.length = 0;
   load(EMPTY);
+  state.beforeQueryResult = undefined;
+  state.failOn = undefined;
 });
 
 afterEach(() => {
@@ -180,6 +182,49 @@ describe("mapOverrideNameToOriginal: an alias resolves on its own server", () =>
     load(EMPTY);
 
     expect(await map("alpha__shared")).toBe("alpha__shared");
+  });
+
+  it("does not restore an old reverse mapping when a lookup finishes after a cache clear", async () => {
+    load(bothShareAnAlias());
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached!: () => void;
+    const held = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let armed = true;
+    state.beforeQueryResult = async (query) => {
+      if (
+        armed &&
+        query.table === "mappings" &&
+        query.where["ntm.override_name"] === "shared"
+      ) {
+        armed = false;
+        reached();
+        await gate;
+      }
+    };
+    const old = map("alpha__shared");
+    await held;
+    try {
+      const original = state.mappings[0];
+      if (!original) throw new Error("missing original mapping");
+      original.overrideName = "former";
+      state.mappings.push({
+        namespaceUuid: NS,
+        serverUuid: ALPHA.uuid,
+        toolName: "new_tool",
+        status: "ACTIVE",
+        overrideName: "shared",
+      });
+      clearOverrideCache(NS);
+    } finally {
+      release();
+    }
+    expect(await old).toBe("alpha__alpha_tool");
+    expect(await map("alpha__shared")).toBe("alpha__new_tool");
   });
 
   it("returns a name that is not an override unchanged", async () => {
@@ -354,7 +399,7 @@ describe("the listing records which tool each listed name stands for", () => {
     });
   });
 
-  it("records a name with no server prefix under itself, and a tool whose override lookup failed under its real name", async () => {
+  it("records a bare name under itself but no read-only identity when an override lookup failed", async () => {
     load(bothShareAnAlias());
     const sink = new Map<string, string[]>();
     state.failOn = { mappings: true };
@@ -368,7 +413,6 @@ describe("the listing records which tool each listed name stands for", () => {
 
     expect(Object.fromEntries(sink)).toEqual({
       bare_name: ["bare_name"],
-      alpha__alpha_tool: ["alpha__alpha_tool"],
     });
   });
 

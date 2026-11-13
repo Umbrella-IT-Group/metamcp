@@ -238,6 +238,10 @@ export interface LeanListing {
    * (`listedTargetOf`), so `call_tool` runs nothing from it.
    */
   readonly origins?: ReadonlyMap<string, readonly string[]>;
+  /** Backend UUID by original full name, captured by this listing, never a route read later. */
+  readonly serverUuids?: ReadonlyMap<string, string>;
+  /** False after an invalidation, including for an old load still returning to its waiters. */
+  readonly isCurrent?: () => boolean;
 }
 
 /**
@@ -1011,8 +1015,8 @@ export function runDescribe(
  * change shows it. A load that was running when it fired hands its result to
  * the callers that were already waiting but is not kept, and the next `get()`
  * starts fresh; those waiting callers hold a listing that may predate the
- * change, which is one more reason `call_tool` checks the tool's identity when
- * the call runs. The clock is injected so the tests need no real time.
+ * change. `captureValidity()` lets their calls reject revoked hints, even for
+ * the same target, immediately before backend dispatch. The clock is injected so the tests need no real time.
  */
 export class LeanCatalog {
   private snapshot: { value: LeanListing; at: number } | undefined;
@@ -1026,6 +1030,16 @@ export class LeanCatalog {
       ttlMs: number;
     },
   ) {}
+
+  /**
+   * Capture before loading: invalidation revokes hints already handed to a
+   * caller too. Identity alone cannot detect a same-target annotation change.
+   * Expiry still controls reuse through get(); this guard tracks changes.
+   */
+  captureValidity(): () => boolean {
+    const epoch = this.epoch;
+    return () => epoch === this.epoch;
+  }
 
   get(): Promise<LeanListing> {
     const startedAt = this.options.now();

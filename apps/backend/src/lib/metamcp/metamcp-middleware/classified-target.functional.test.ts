@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   type ClassifiedCallContext,
+  classifiedTargetRefusal,
   createClassifiedTargetMiddleware,
   TARGET_CHANGED_ANSWER,
 } from "./classified-target.functional";
@@ -32,6 +33,8 @@ function run(
   const full: ClassifiedCallContext = {
     namespaceUuid: "ns",
     sessionId: "s",
+    classifiedServerUuid: "desk-id",
+    classifiedTargetIsCurrent: () => true,
     ...context,
   };
   return { handler, result: wrapped(request(name), full), full };
@@ -97,6 +100,41 @@ describe("createClassifiedTargetMiddleware", () => {
     const { handler, result } = run("desk__write", { classifiedTarget: "" });
     expect((await result).isError).toBe(true);
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("refuses revoked or incomplete hints even when the resolved name is unchanged", async () => {
+    for (const context of [
+      { classifiedTargetIsCurrent: () => false },
+      { classifiedTargetIsCurrent: undefined },
+      { classifiedServerUuid: undefined },
+    ]) {
+      const { handler, result } = run("desk__legacy", {
+        classifiedTarget: "desk__legacy",
+        ...context,
+      });
+      expect((await result).isError).toBe(true);
+      expect(handler).not.toHaveBeenCalled();
+    }
+  });
+
+  it("checks the actual backend UUID at dispatch even if its prefix and tool name stayed the same", () => {
+    const context = {
+      namespaceUuid: "ns",
+      sessionId: "s",
+      classifiedTarget: "desk__legacy",
+      classifiedServerUuid: "original-id",
+      classifiedTargetIsCurrent: () => true,
+    };
+    expect(
+      classifiedTargetRefusal(request("desk__legacy"), context, "original-id"),
+    ).toBeUndefined();
+    expect(
+      classifiedTargetRefusal(
+        request("desk__legacy"),
+        context,
+        "replacement-id",
+      )?.isError,
+    ).toBe(true);
   });
 
   it("keeps two calls' verdicts apart: each is judged against its own context", async () => {

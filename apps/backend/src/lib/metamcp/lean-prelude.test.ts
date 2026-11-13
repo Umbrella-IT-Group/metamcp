@@ -56,6 +56,11 @@ const withOrigins = (
 ): LeanListing => ({
   tools: [READ, WRITE],
   unavailable: 0,
+  serverUuids: new Map([
+    ["desk__legacy", "desk-id"],
+    ["desk__write", "desk-id"],
+  ]),
+  isCurrent: () => true,
   ...(origins ? { origins: new Map(origins) } : {}),
 });
 
@@ -65,6 +70,8 @@ describe("call_tool", () => {
     const result = await run(call("call_tool", "desk__modern"));
     expect(result.answer).toBeUndefined();
     expect(result.classifiedTarget).toBe("desk__legacy");
+    expect(result.classifiedServerUuid).toBe("desk-id");
+    expect(result.classifiedTargetIsCurrent?.()).toBe(true);
     expect(result.request?.params.name).toBe("desk__modern");
   });
 
@@ -87,6 +94,19 @@ describe("call_tool", () => {
       const line = String(log.mock.calls[0]?.[1]);
       expect(line).not.toContain("desk__");
       expect(line).not.toMatch(/error|fail/i);
+    }
+  });
+
+  it("gives no verdict without the backend UUID or a snapshot validity check", async () => {
+    const listing = withOrigins([["desk__modern", ["desk__legacy"]]]);
+    for (const incomplete of [
+      { ...listing, serverUuids: undefined },
+      { ...listing, isCurrent: undefined },
+    ]) {
+      const { run } = prelude(incomplete);
+      const result = await run(call("call_tool", "desk__modern"));
+      expect(result.request).toBeUndefined();
+      expect(result.answer?.isError).toBe(true);
     }
   });
 

@@ -64,6 +64,7 @@ import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditingMiddleware } from "./metamcp-middleware/auditing.functional";
 import {
   type ClassifiedCallContext,
+  classifiedTargetRefusal,
   createClassifiedTargetMiddleware,
 } from "./metamcp-middleware/classified-target.functional";
 import {
@@ -921,6 +922,10 @@ export const createServer = async (
             }
             toolToClient[toolName] = activeSession;
             toolToServerUuid[toolName] = mcpServerUuid;
+            (context as ListingOriginsContext).listingServerUuids?.set(
+              toolName,
+              mcpServerUuid,
+            );
             toolsWithSource.push({
               ...tool,
               name: toolName,
@@ -1282,8 +1287,16 @@ export const createServer = async (
       maxTotalTimeout,
     };
 
-    const callOnce = (session: ConnectedClient) =>
-      session.client.request(
+    const callOnce = (session: ConnectedClient) => {
+      // The filter, dynamic routing, timeout config and recovery all await.
+      // Recheck immediately before each send, with the actual backend UUID:
+      // the prefix may have been reused, or same-target hints invalidated.
+      const refusal = classifiedTargetRefusal(request, context, serverUuid);
+      if (refusal) {
+        leanLog("warn", "lean listing: call_tool refused a tool that changed");
+        return Promise.resolve(refusal);
+      }
+      return session.client.request(
         {
           method: "tools/call",
           params: {
@@ -1295,6 +1308,7 @@ export const createServer = async (
         CompatibilityCallToolResultSchema,
         mcpRequestOptions,
       );
+    };
 
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
@@ -1557,15 +1571,18 @@ export const createServer = async (
   };
 
   if (lean) {
-    const catalog = new LeanCatalog({
+    const catalog: LeanCatalog = new LeanCatalog({
       load: async () => {
+        const isCurrent = catalog.captureValidity();
         // This listing's own sink, on its own clone of the context: the
         // overrides record into it which backend tool each listed name stands
         // for, so `call_tool` can tie its read-only verdict to that tool.
         const origins = new Map<string, string[]>();
+        const serverUuids = new Map<string, string>();
         const listingContext: ListingOriginsContext = {
           ...handlerContext,
           listingOrigins: origins,
+          listingServerUuids: serverUuids,
         };
         const listing = await listForClient(
           { method: "tools/list", params: {} },
@@ -1575,6 +1592,8 @@ export const createServer = async (
           tools: listing.tools,
           unavailable: lastListingUnavailableCount,
           origins,
+          serverUuids,
+          isCurrent,
         };
       },
       now: () => Date.now(),
@@ -1583,8 +1602,8 @@ export const createServer = async (
     leanCatalog = catalog;
     // The snapshot holds each tool's name, hints and identity as the overrides
     // had them, so an override change drops it: a search or describe after the
-    // setter shows the change. `call_tool` does not rely on this (it checks the
-    // tool's identity when the call runs); this keeps the answers honest.
+    // setter shows the change. Invalidation also revokes verdicts already in
+    // flight: a same-target annotation flip cannot be caught by identity alone.
     stopOverrideChangeListener = onOverrideCacheCleared(namespaceUuid, () =>
       catalog.invalidate(),
     );
@@ -1631,7 +1650,12 @@ export const createServer = async (
     const callContext: ClassifiedCallContext =
       prelude?.classifiedTarget === undefined
         ? handlerContext
-        : { ...handlerContext, classifiedTarget: prelude.classifiedTarget };
+        : {
+            ...handlerContext,
+            classifiedTarget: prelude.classifiedTarget,
+            classifiedServerUuid: prelude.classifiedServerUuid,
+            classifiedTargetIsCurrent: prelude.classifiedTargetIsCurrent,
+          };
     try {
       return await callToolWithMiddleware(request, callContext);
     } catch (error) {

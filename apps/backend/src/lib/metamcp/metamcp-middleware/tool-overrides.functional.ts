@@ -43,6 +43,8 @@ export interface ToolOverridesConfig {
  */
 export interface ListingOriginsContext extends MetaMCPHandlerContext {
   listingOrigins?: Map<string, string[]>;
+  /** Filled at route registration, before another listing can replace that route. */
+  listingServerUuids?: Map<string, string>;
 }
 
 /**
@@ -84,6 +86,7 @@ class ToolOverridesCache {
   private expiry = new Map<string, number>();
   private persistentKeys = new Set<string>(); // keys that never expire
   private ttl: number;
+  private generation = 0;
 
   constructor(ttl: number = 1000) {
     this.ttl = ttl;
@@ -196,7 +199,12 @@ class ToolOverridesCache {
     this.reverseNameCache.set(reverseKey, originalName);
   }
 
+  getGeneration(): number {
+    return this.generation;
+  }
+
   clear(namespaceUuid?: string): void {
+    this.generation += 1;
     if (namespaceUuid) {
       for (const key of this.overrideCache.keys()) {
         if (key.startsWith(`${namespaceUuid}:`)) {
@@ -231,7 +239,7 @@ async function getToolOverrides(
   toolName: string,
   useCache: boolean = true,
   isPersistent: boolean = false,
-): Promise<ToolOverride | null> {
+): Promise<ToolOverride | null | undefined> {
   // Check cache first
   if (useCache) {
     const cached = toolOverridesCache.get(namespaceUuid, serverName, toolName);
@@ -240,6 +248,7 @@ async function getToolOverrides(
     }
   }
 
+  const generation = toolOverridesCache.getGeneration();
   try {
     // The server this prefix means IN THIS NAMESPACE (upstream
     // metatool-ai/metamcp#364, see namespace-server-lookup.ts). Resolved by
@@ -301,7 +310,13 @@ async function getToolOverrides(
     };
 
     // Cache the result if found and caching is enabled
-    if (toolMapping && useCache) {
+    // A read already in flight when the setter clears must not resurrect its
+    // old annotations or aliases, especially in the persistent listing cache.
+    if (
+      toolMapping &&
+      useCache &&
+      generation === toolOverridesCache.getGeneration()
+    ) {
       toolOverridesCache.set(
         namespaceUuid,
         serverName,
@@ -317,7 +332,7 @@ async function getToolOverrides(
       `Error fetching tool overrides for ${toolName} in namespace ${namespaceUuid}:`,
       error,
     );
-    return null;
+    return undefined;
   }
 }
 
@@ -337,11 +352,13 @@ async function applyToolOverrides(
     return tools;
   }
 
+  const generation = toolOverridesCache.getGeneration();
   const overriddenTools: Tool[] = [];
   // Every tool leaves through here, so the sink (ListingOriginsContext) hears
   // of each one exactly once, under the name the listing shows it by.
-  const emit = (listed: Tool, originalName: string): void => {
+  const emit = (listed: Tool, originalName?: string): void => {
     overriddenTools.push(listed);
+    if (originalName === undefined) return;
     const known = origins?.get(listed.name);
     if (known) known.push(originalName);
     else origins?.set(listed.name, [originalName]);
@@ -366,8 +383,9 @@ async function applyToolOverrides(
         );
 
         if (!override) {
-          // No overrides found, include as-is
-          emit(tool, tool.name);
+          // Failed lookups keep the direct listing's fallback, but cannot
+          // establish effective hints for the read-only lean call tool.
+          emit(tool, override === undefined ? undefined : tool.name);
           return;
         }
 
@@ -421,7 +439,11 @@ async function applyToolOverrides(
         };
 
         // Update reverse mapping cache for the new full override name
-        if (override.overrideName && useCache) {
+        if (
+          override.overrideName &&
+          useCache &&
+          generation === toolOverridesCache.getGeneration()
+        ) {
           toolOverridesCache.setOriginalName(
             namespaceUuid,
             parsed.serverName,
@@ -433,8 +455,8 @@ async function applyToolOverrides(
         emit(overriddenTool, tool.name);
       } catch (error) {
         logger.error(`Error applying overrides for tool ${tool.name}:`, error);
-        // On error, include the tool as-is (fail-safe behavior)
-        emit(tool, tool.name);
+        // Preserve the ordinary listing, without a read-only identity proof.
+        emit(tool);
       }
     }),
   );
@@ -471,6 +493,7 @@ export async function mapOverrideNameToOriginal(
   }
 
   // If not found in cache or cache disabled, query database
+  const generation = toolOverridesCache.getGeneration();
   try {
     const [toolMapping] = await db
       .select({
@@ -498,7 +521,7 @@ export async function mapOverrideNameToOriginal(
       const originalFullName = `${toolMapping.serverName}__${toolMapping.originalName}`;
 
       // Cache the reverse mapping under the server prefix and the tool part
-      if (useCache) {
+      if (useCache && generation === toolOverridesCache.getGeneration()) {
         toolOverridesCache.setOriginalName(
           namespaceUuid,
           parsed.serverName,
