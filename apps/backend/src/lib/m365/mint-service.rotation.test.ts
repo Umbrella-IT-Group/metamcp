@@ -346,6 +346,79 @@ describe("a bound (v2) row", () => {
 // ------------------------------------------------- compare-and-swap results
 
 describe("rotation persist reconciliation", () => {
+  it.each([
+    { strict: "1", swap: 1 },
+    { strict: "1", swap: 2 },
+    { strict: "yes", swap: 1 },
+    { strict: "yes", swap: 2 },
+  ])(
+    "strict=$strict never binds a foreign v1 token planted before CAS attempt $swap",
+    async ({ strict, swap }) => {
+      vi.stubEnv("M365_ENVELOPE_STRICT", strict);
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+      const repo = new FakeTokensRepo(rowFor("OWN", "v2"));
+      const planted = encryptRefreshToken("FOREIGN", KEK, "k1");
+      repo.beforeRotate = () => {
+        // A same-grant rewrap makes the first CAS miss when the plant is
+        // scheduled for the retry. Neither miss may bind the foreign token.
+        repo.row =
+          repo.rotateCalls.length === swap
+            ? rowFor("unused", "v1", { rt_ciphertext: planted })
+            : rowFor("OWN", "v2");
+      };
+      const { sent, fetchStub } = entraChain();
+      const service = new M365MintService(repo.asRepo(), fetchStub);
+
+      expect(await service.getAccessToken("user-1")).toBe("at:OWN");
+      expect(repo.rotateCalls).toHaveLength(swap);
+      expect(repo.ciphertext()).toBe(planted);
+      expect(mintAudits()[0].rotation).toBe("skipped");
+      for (const { rt } of repo.rotateCalls) {
+        expect(versionOf(rt)).toBe("v2");
+        expect(decryptRefreshToken(rt, KEK, ctxFor("user-1"))).toBe("OWN>");
+      }
+      // No cache can hide the planted row, and its token is never redeemed.
+      await expect(service.getAccessToken("user-1")).rejects.toMatchObject({
+        code: "credential_missing",
+      });
+      expect(sent).toEqual(["OWN"]);
+      expect(repo.ciphertext()).toBe(planted);
+
+      // Restoring the trusted grant must not pick up a held successor from
+      // the skipped mint.
+      repo.beforeRotate = undefined;
+      repo.row = rowFor("OWN", "v2");
+      expect(await service.getAccessToken("user-1")).toBe("at:OWN");
+      expect(sent).toEqual(["OWN", "OWN"]);
+    },
+  );
+
+  it("strict reconciliation of a v1 copy of the validated grant seals only its freshly issued successor", async () => {
+    vi.stubEnv("M365_ENVELOPE_STRICT", "1");
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+    const repo = new FakeTokensRepo(rowFor("OWN", "v2"));
+    const legacy = rowFor("OWN", "v1");
+    const { sent, fetchStub } = entraChain({
+      onRedeem: () => {
+        repo.row = legacy;
+      },
+    });
+    const service = new M365MintService(repo.asRepo(), fetchStub);
+
+    // The v1 exception is a plaintext equality check against a grant already
+    // opened from this user's v2 row, never authority to redeem or bind it.
+    expect(await service.getAccessToken("user-1")).toBe("at:OWN");
+    expect(sent).toEqual(["OWN"]);
+    expect(repo.rotateCalls).toHaveLength(2);
+    expect(repo.rotateCalls[1].expected).toBe(legacy.rt_ciphertext);
+    expect(versionOf(repo.ciphertext())).toBe("v2");
+    expect(repo.stored()).toBe("OWN>");
+    expect(() =>
+      decryptRefreshToken(repo.ciphertext(), KEK, ctxFor("user-2")),
+    ).toThrow();
+    expect(mintAudits()[0].rotation).toBe("applied");
+  });
+
   it("does not apply, cache or hold a rotation when the row was replaced by a different grant", async () => {
     const repo = new FakeTokensRepo(rowFor("A"));
     const { sent, fetchStub } = entraChain({
@@ -968,6 +1041,21 @@ describe("envelope write policy", () => {
     expect(versionOf(repo.ciphertext())).toBe("v2");
     expect(errorSpy).not.toHaveBeenCalled();
   });
+
+  it.each(["1", "yes"])(
+    "strict=%s overrides an explicit write version of 1 during rotation",
+    async (strict) => {
+      vi.stubEnv("M365_ENVELOPE_STRICT", strict);
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+      const repo = await mintOnce(rowFor("OWN", "v2"));
+
+      expect(versionOf(repo.ciphertext())).toBe("v2");
+      expect(repo.stored()).toBe("OWN>");
+      expect(() =>
+        decryptRefreshToken(repo.ciphertext(), KEK, ctxFor("user-2")),
+      ).toThrow();
+    },
+  );
 });
 
 // -------------------------------------------------------------- audit line

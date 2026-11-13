@@ -439,6 +439,28 @@ describe("GET /m365/callback envelope version", () => {
     expect((await enroll()).startsWith("v2.")).toBe(true);
   });
 
+  it.each(["1", "yes"])(
+    "strict=%s with write version 1 replaces a planted v1 token with the fresh enrollment, bound as v2",
+    async (strict) => {
+      vi.stubEnv("M365_ENVELOPE_STRICT", strict);
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+      repoMock.findByUserId.mockResolvedValue({
+        ...existingRow("v1"),
+        rt_ciphertext: encryptRefreshToken("foreign-rt", KEK, "k1"),
+      });
+
+      const stored = await enroll();
+
+      expect(stored.startsWith("v2.")).toBe(true);
+      expect(decryptRefreshToken(stored, KEK, ctxFor("user-1"))).toBe(
+        "entra-rt-plaintext",
+      );
+      expect(() =>
+        decryptRefreshToken(stored, KEK, ctxFor("user-2")),
+      ).toThrow();
+    },
+  );
+
   it("a failed row lookup still enrolls, following the policy alone", async () => {
     vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "2");
     repoMock.findByUserId.mockRejectedValue(new Error("pg down"));
