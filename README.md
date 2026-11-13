@@ -115,6 +115,10 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 - **Per-server "Reconnect Server"** — a UI action that flushes a single backend's pooled connection without restarting the gateway.
 - **Re-notify after a backend restart**: a session whose `tools/list` could not reach a backend (typically one mid-restart, right after the gateway announced `list_changed` for it, or one held by its error gate) is sent `notifications/tools/list_changed` again once that backend answers `tools/list` (for an error-gated backend, only after its gate is reset), so a client that re-listed into the restart gets the tools back without reconnecting. A listing in which no server listed any tool while one could not be reached (an error-gated server counts as unreachable and is still never connected to) is a JSON-RPC error (`data.code: "backend_unavailable"`, `retryable: true`), never an empty tool list; so is a listing that could not read the namespace's servers (`data.reason: "namespace_lookup_failed"`). A session is re-notified at most 5 times in a row for one backend (each time it re-listed into a failure again); after that it keeps its reduced listing, with one WARN, until it reconnects or a listing reaches the backend (that resets the count). `MCP_TOOLS_LIST_RENOTIFY` turns the re-notify off and `MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS` sets the bound.
 
+### Per-endpoint presentation
+
+- **Endpoint presentation**: a title and a short instructions paragraph that every client receives at `initialize`, and an option to leave output schemas out of `tools/list`, set per endpoint by a human administrator from the endpoint's edit dialog. Ships inert: an endpoint with no settings is served exactly as before, and `MCP_ENDPOINT_PRESENTATION=off` turns the feature off for every endpoint. See [Endpoint presentation](#endpoint-presentation).
+
 ## Security
 
 This fork treats the gateway as an internet-facing, multi-user service and hardens it
@@ -372,6 +376,7 @@ Lazy recovery takes part in the ceiling under the rule "evict, never refuse" (ru
 | `MCP_ERROR_PROBE_INTERVAL_MS` | `300000` (5m) | Half-open probe interval for error-gated backends. |
 | `MCP_TOOLS_LIST_RENOTIFY` | on | Re-send `notifications/tools/list_changed` to a session whose `tools/list` left out a backend it could not reach, once that backend answers `tools/list` again (one shared probe per backend: 2 s, 4 s, 8 s, 15 s, 30 s, then every 60 s, and at once after any successful connect to it). `off`, `false` or `0` disables it; the error answer for a listing with no tools while a backend was unreachable stays either way. |
 | `MCP_TOOLS_LIST_RENOTIFY_MAX_ROUNDS` | 5 | How many times in a row one session is re-notified for one backend whose answer it then failed to re-list (a positive integer; anything else uses the default). At the bound the session keeps its reduced listing, with one WARN, until it reconnects or a listing reaches the backend, which resets the count. |
+| `MCP_ENDPOINT_PRESENTATION` | on | Per-endpoint presentation (title, instructions, output-schema trim; see [Endpoint presentation](#endpoint-presentation)). `off`, `false` or `0` makes every session, new or recovered, be served exactly as if no endpoint had settings, whatever is stored and whatever a persisted session pinned. It is read at call time but the environment only changes with a restart, and a client already holding a trimmed tool list keeps it until it reconnects. |
 | `MCP_RECONNECT_BACKOFF_INITIAL_MS` / `_MAX_MS` / `_MULTIPLIER` | `1000` / `30000` / `2` | Exponential reconnect backoff schedule (with jitter). |
 | `MCP_RECOVERY_RESET_THRESHOLD_MS` | `300000` (5m) | Recent-success window within which a transport drop resets the circuit breaker. |
 
@@ -458,6 +463,29 @@ The core model is unchanged from upstream.
 - **Endpoint** — a public surface bound to a namespace, hosted over **SSE**, **Streamable HTTP**, or **OpenAPI**, with **API-key** or **OAuth** auth. Multiple servers in the namespace are aggregated into one endpoint.
 - **Middleware** — intercepts and transforms MCP requests/responses at the namespace level (e.g. "filter inactive tools"). This fork adds a tool-call **auditing** middleware.
 - **Inspector** — the MCP inspector with saved server configs, for debugging your endpoints in place.
+
+### Endpoint presentation
+
+What a client is told when it connects to an endpoint, and how its tool list is shaped, can be set per endpoint, from a **Presentation** panel on the endpoint's edit dialog:
+
+- **Title**: one line, up to 80 characters, sent as `serverInfo.title`. It is display text only; the server `name` the gateway's own routing checks compare never changes.
+- **Instructions**: up to 1500 characters, TAB and line breaks allowed, sent as the `initialize` result's `instructions`. Models read it, so treat it as guidance you are publishing: no secrets, no client data.
+- **Leave output schemas out of the tool list**: `tools/list` omits each tool's `outputSchema`. On the largest namespaces most of the listing's bytes are output schemas, so a client that loads every tool up front gets a much smaller list. Tool results are not changed, and a client that validates results against an output schema it was shown has none to validate against.
+
+Control characters, text-direction overrides, zero-width characters and other invisible format characters are refused in both texts, and an empty text means none.
+
+Properties worth stating plainly:
+
+- **Only a human administrator can read or write these settings**, from a browser session. They are deliberately in neither admin-plane procedure set, so an admin-plane API key of either scope is refused (the same posture as tool overrides), and a member cannot open the panel.
+- **No settings means today's behaviour.** The settings live in their own table (`endpoint_presentation`, migration `0044`, one row per endpoint and only while something is non-default), so an endpoint that has none is served byte for byte as before, and clearing every setting deletes the row. Deleting an endpoint deletes its settings; a `BOOTSTRAP_RECREATE_USER` recreate removes the endpoints it owns and so resets them to the defaults along with them.
+- **A session keeps what it started with.** The settings are read once, when a session is created, and the part that changes behaviour (the trim) is stored with the session row, so a client that returns after a gateway restart recovers its session as it was created, whatever has been edited since. A save therefore reaches only sessions that start afterwards. Title and instructions are sent only at `initialize`, which a recovered session skips.
+- **Everything is audited, including the text.** Each save writes an `endpoint.presentation.set` row to the audit log with the previous and the new values, the instructions' length and a hash of them. The log is immutable, so the text stays there; that is why the panel says not to put anything secret in it. The text never goes to an ordinary log line.
+- **Reading the settings can never block a connection.** If the database read fails, the session is created with the defaults and one warning is logged.
+- **Two ways to turn it off.** Clearing or unticking in the panel stops new sessions from getting the setting and leaves running ones alone. `MCP_ENDPOINT_PRESENTATION=off` (then a restart) is the emergency lever: every session, recovered ones included, is served as if no endpoint had settings. A client that was already holding a trimmed tool list keeps it until it reconnects.
+- **MCP connections only.** The settings apply to the Streamable HTTP and SSE transports. The OpenAPI view of an endpoint and the admin Inspector are not affected.
+- **Capabilities do not change**, so the capability hash that gates lazy session recovery is untouched and no persisted session is invalidated by this feature.
+
+Rate limits are a property of the endpoint, not of presentation. An endpoint created through the admin UI (or `endpoints.create` with no explicit setting) gets a per-credential limiter by default, 600 requests per 60 seconds per credential, which counts HTTP requests of every kind, `tools/list` included; an endpoint whose limiter is switched off has none.
 
 ## Connect a client
 

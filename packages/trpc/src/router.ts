@@ -26,6 +26,9 @@ export const createAppRouter = (implementations: {
       // endpoints. Listed here for the reason stated above — wiring the
       // implementations into `createFrontendRouter` is NOT enough to mount it.
       accessGroups: frontendRouters.accessGroups,
+      // Per-endpoint presentation (migration 0044). Human administrator only:
+      // in neither admin-plane procedure set, so an admin-plane key is refused.
+      endpointPresentation: frontendRouters.endpointPresentation,
     }),
   });
 };
