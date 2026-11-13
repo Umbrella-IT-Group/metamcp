@@ -25,6 +25,7 @@ const UUID = "11111111-1111-4111-8111-111111111111";
 const EMPTY: PresentationFormState = {
   title: "",
   instructions: "",
+  toolListing: "full",
   omitOutputSchemas: false,
 };
 const STORED: StoredPresentation = {
@@ -51,8 +52,20 @@ describe("toFormState", () => {
     expect(toFormState(STORED)).toEqual({
       title: "Desk",
       instructions: "Be brief.",
+      toolListing: "full",
       omitOutputSchemas: true,
     });
+  });
+
+  it("copies a stored lean mode", () => {
+    expect(
+      toFormState({
+        title: null,
+        instructions: null,
+        omit_output_schemas: false,
+        tool_listing: "lean",
+      }).toolListing,
+    ).toBe("lean");
   });
 });
 
@@ -140,6 +153,7 @@ describe("isDirty", () => {
         {
           title: "  Desk ",
           instructions: "Be brief.\r\n",
+          toolListing: "full",
           omitOutputSchemas: true,
         },
         STORED,
@@ -159,26 +173,31 @@ describe("isDirty", () => {
     expect(isDirty({ ...base, instructions: "Other." }, STORED)).toBe(true);
     expect(isDirty({ ...base, omitOutputSchemas: false }, STORED)).toBe(true);
     expect(isDirty({ ...base, title: "" }, STORED)).toBe(true);
+    expect(isDirty({ ...base, toolListing: "lean" }, STORED)).toBe(true);
   });
 
-  it("is true for a stored lean mode even when the fields match, so it can be cleared", () => {
-    expect(
-      isDirty(EMPTY, {
-        title: null,
-        instructions: null,
-        omit_output_schemas: false,
-        tool_listing: "lean",
-      }),
-    ).toBe(true);
+  it("treats the listing mode as a field like the others: a stored lean mode is not a change until the form differs from it", () => {
+    const lean: StoredPresentation = {
+      title: null,
+      instructions: null,
+      omit_output_schemas: false,
+      tool_listing: "lean",
+    };
+    expect(isDirty(toFormState(lean), lean)).toBe(false);
+    // Switching a stored lean endpoint back to the full list is a change.
+    expect(isDirty(EMPTY, lean)).toBe(true);
+    // And choosing lean on an endpoint with nothing stored is one too.
+    expect(isDirty({ ...EMPTY, toolListing: "lean" }, undefined)).toBe(true);
   });
 });
 
 describe("toRequest", () => {
-  it("sends normalized text, the trim flag and the full listing", () => {
+  it("sends normalized text, the trim flag and the chosen listing", () => {
     expect(
       toRequest(UUID, {
         title: "  Helpdesk desk ",
         instructions: "one\r\ntwo\r\n",
+        toolListing: "full",
         omitOutputSchemas: true,
       }),
     ).toEqual({
@@ -186,6 +205,22 @@ describe("toRequest", () => {
       title: "Helpdesk desk",
       instructions: "one\ntwo",
       tool_listing: "full",
+      omit_output_schemas: true,
+    });
+  });
+
+  it("sends the lean listing when it is chosen, and keeps the trim flag as held", () => {
+    expect(
+      toRequest(UUID, {
+        ...EMPTY,
+        toolListing: "lean",
+        omitOutputSchemas: true,
+      }),
+    ).toEqual({
+      endpoint_uuid: UUID,
+      title: null,
+      instructions: null,
+      tool_listing: "lean",
       omit_output_schemas: true,
     });
   });

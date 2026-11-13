@@ -67,6 +67,7 @@ const ACTOR = {
 const ENDPOINT = { uuid: ENDPOINT_UUID, name: "desk", user_id: null };
 
 const SAVED_SWITCH = process.env.MCP_ENDPOINT_PRESENTATION;
+const SAVED_LEAN_SWITCH = process.env.MCP_LEAN_LISTING;
 
 let audit: AuditRow[];
 /** The audit sink runs on a promise chain; a macrotask drains it. */
@@ -94,6 +95,7 @@ const storedRow = (over: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.MCP_ENDPOINT_PRESENTATION;
+  delete process.env.MCP_LEAN_LISTING;
   audit = [];
   setAuditSinkForTesting(async (event) => {
     audit.push(event as AuditRow);
@@ -110,6 +112,8 @@ afterEach(() => {
   setAuditSinkForTesting(undefined);
   if (SAVED_SWITCH === undefined) delete process.env.MCP_ENDPOINT_PRESENTATION;
   else process.env.MCP_ENDPOINT_PRESENTATION = SAVED_SWITCH;
+  if (SAVED_LEAN_SWITCH === undefined) delete process.env.MCP_LEAN_LISTING;
+  else process.env.MCP_LEAN_LISTING = SAVED_LEAN_SWITCH;
 });
 
 describe("get", () => {
@@ -125,7 +129,7 @@ describe("get", () => {
         tool_listing: "full",
         omit_output_schemas: false,
         updated_at: null,
-        effective: { presentation_enabled: true, lean_enabled: false },
+        effective: { presentation_enabled: true, lean_enabled: true },
       },
     });
   });
@@ -157,6 +161,19 @@ describe("get", () => {
 
     expect(answer.data?.effective).toEqual({
       presentation_enabled: false,
+      lean_enabled: true,
+    });
+  });
+
+  it("reports the lean switch on its own, so the panel can say a saved lean listing is not applied", async () => {
+    process.env.MCP_LEAN_LISTING = "off";
+    findRowMock.mockResolvedValue(storedRow({ tool_listing: "lean" }));
+
+    const answer = await impl.get({ endpoint_uuid: ENDPOINT_UUID }, ADMIN);
+
+    expect(answer.data?.tool_listing).toBe("lean");
+    expect(answer.data?.effective).toEqual({
+      presentation_enabled: true,
       lean_enabled: false,
     });
   });
@@ -391,10 +408,7 @@ describe("set", () => {
     ["a newline in the title", { title: "a\nb" }],
     ["a control character", { instructions: "a\u0007b" }],
     ["a bidi override", { instructions: "a‮b" }],
-    [
-      "a lean listing, which this release does not serve",
-      { tool_listing: "lean" },
-    ],
+    ["a listing mode that does not exist", { tool_listing: "everything" }],
   ])(
     "refuses %s at the write boundary: nothing written, nothing audited",
     async (_label, over) => {
@@ -407,6 +421,28 @@ describe("set", () => {
       expect(audit).toEqual([]);
     },
   );
+
+  it("saves a lean listing, and audits the mode with the one it replaced", async () => {
+    findRowMock.mockResolvedValue(storedRow({ title: "Desk" }));
+
+    const answer = await impl.set(
+      request({ title: "Desk", tool_listing: "lean" }),
+      ADMIN,
+      ACTOR,
+    );
+    await settle();
+
+    expect(answer.success).toBe(true);
+    expect(upsertMock).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Desk", tool_listing: "lean" }),
+    );
+    expect(answer.data?.tool_listing).toBe("lean");
+    expect(audit).toHaveLength(1);
+    expect(audit[0]?.detail).toMatchObject({
+      tool_listing: "lean",
+      previous: { tool_listing: "full" },
+    });
+  });
 
   it("a database failure is a fixed failure message and no audit row", async () => {
     upsertMock.mockRejectedValue(new Error("connection refused: db-internal"));

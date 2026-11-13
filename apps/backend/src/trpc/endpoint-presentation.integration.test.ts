@@ -17,8 +17,9 @@
  *  - an out-of-bound or control-character text is refused with no row;
  *  - saving every setting back to default deletes the row, and an endpoint
  *    with no row reads as defaults with no update time;
- *  - a `lean` row written outside the app reads back without an error, and
- *    saving the full listing clears it.
+ *  - a `lean` listing saves, reads back as lean and is audited, a `lean` row
+ *    written outside the app reads back without an error, and saving the full
+ *    listing clears it.
  * The migration itself (its bounds, defaults, cascade and idempotence) is
  * src/db/repositories/endpoint-presentation-migration.integration.test.ts.
  *
@@ -224,7 +225,7 @@ describeIfDb(
           tool_listing: "full",
           omit_output_schemas: false,
           updated_at: null,
-          effective: { presentation_enabled: true, lean_enabled: false },
+          effective: { presentation_enabled: true, lean_enabled: true },
         });
       });
 
@@ -246,6 +247,41 @@ describeIfDb(
         expect(audited[0].detail).toMatchObject({
           previous: { title: "Temporary", omit_output_schemas: true },
         });
+      });
+
+      it("saves a lean listing, reads it back as lean and audits the mode", async () => {
+        const uuid = await fx.endpoint({ name: "pres-lean-save" });
+
+        const saved = await set(uuid, {
+          tool_listing: "lean",
+          title: "Lean desk",
+        });
+
+        expect((saved.data as SetResponse).success).toBe(true);
+        expect((saved.data as SetResponse).data?.tool_listing).toBe("lean");
+        const rows = await rowFor(uuid);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ tool_listing: "lean" });
+        const read = (await get(uuid)).data as GetResponse;
+        expect(read.data?.tool_listing).toBe("lean");
+        const audited = await fx.auditEventually(
+          `action = 'endpoint.presentation.set' AND target_id = $1 AND detail->>'tool_listing' = 'lean'`,
+          [uuid],
+        );
+        expect(audited[0].detail).toMatchObject({
+          previous: { tool_listing: "full" },
+        });
+      });
+
+      it("a lean row alone is not a row of defaults, so clearing the title keeps it", async () => {
+        const uuid = await fx.endpoint({ name: "pres-lean-keep" });
+        await set(uuid, { tool_listing: "lean", title: "Lean desk" });
+
+        await set(uuid, { tool_listing: "lean" });
+
+        const rows = await rowFor(uuid);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ tool_listing: "lean", title: null });
       });
 
       it("reads a lean row written outside the app without an error, and saving the full listing clears it", async () => {
@@ -301,7 +337,7 @@ describeIfDb(
         ],
         ["a control character", { instructions: "a\u0007b" }],
         ["a text-direction override", { title: "a‮b" }],
-        ["a lean listing", { tool_listing: "lean" }],
+        ["a listing mode that does not exist", { tool_listing: "everything" }],
       ])("refuses %s with 400 and writes no row", async (_label, over) => {
         const uuid = await fx.endpoint({ name: `pres-bad-${_label.length}` });
 
