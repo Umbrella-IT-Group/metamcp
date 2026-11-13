@@ -50,7 +50,7 @@ describe("translation keys used by the inspector tools", () => {
     expect(keysUsed).toContain("mcp-servers:toolListTruncated.pageCap");
   });
 
-  it.each(["en", "ko", "zh"])(
+  it.each(["en", "ko", "zh"] as const)(
     "every key resolves to text in %s",
     async (locale) => {
       const dictionary = await loadTranslations(locale);
@@ -64,7 +64,7 @@ describe("translation keys used by the inspector tools", () => {
     },
   );
 
-  it.each(["ko", "zh"])(
+  it.each(["ko", "zh"] as const)(
     "gives %s the English text for every new top-level object",
     async (locale) => {
       const english = await loadTranslations("en");
@@ -90,7 +90,7 @@ describe("translation keys used by the inspector tools", () => {
 // The reset-on-progress setting works (the SDK resets its timer on progress),
 // so its label no longer says it is under development.
 describe("the reset-on-progress label", () => {
-  it.each(["en", "ko", "zh"])(
+  it.each(["en", "ko", "zh"] as const)(
     "is not marked under development in %s",
     (locale) => {
       const settings = JSON.parse(
