@@ -709,10 +709,11 @@ export const apiKeysImplementations = {
       };
     } catch (error) {
       logger.error("Error deleting API key:", describeDbError(error));
+      // This is response data, so tRPC's error formatter cannot mask a
+      // database error's query and bound values here.
       return {
         success: false,
-        message:
-          error instanceof Error ? error.message : "Internal server error",
+        message: "Failed to delete API key",
       };
     }
   },

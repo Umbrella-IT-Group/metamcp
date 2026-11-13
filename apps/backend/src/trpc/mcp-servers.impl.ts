@@ -825,10 +825,11 @@ export const mcpServersImplementations = {
       };
     } catch (error) {
       logger.error("Error reconnecting MCP server:", describeDbError(error));
+      // Members receive this as response data, outside tRPC's error masking.
+      // The same try reaches repositories as well as the connection pool.
       return {
         success: false as const,
-        message:
-          error instanceof Error ? error.message : "Internal server error",
+        message: "Failed to reconnect MCP server",
       };
     }
   },

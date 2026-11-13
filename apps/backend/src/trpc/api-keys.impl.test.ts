@@ -28,6 +28,8 @@
  * code review — there is no live-DB test harness in this fork.
  */
 
+import { format } from "node:util";
+
 import {
   ApiKeyUpdateInputSchema,
   CreateApiKeyRequestSchema,
@@ -35,7 +37,10 @@ import {
   UpdateApiKeyRequestSchema,
   UpdateApiKeyResponseSchema,
 } from "@repo/zod-types";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import logger from "@/utils/logger";
 
 vi.mock("@/utils/logger", () => ({
   default: {
@@ -111,6 +116,45 @@ import { apiKeysImplementations } from "./api-keys.impl";
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+describe("apiKeys.delete member error response", () => {
+  it("returns a fixed message and logs only the database summary", async () => {
+    const secret = "fake-key-secret-bbbb2222";
+    const query = 'delete from "api_keys" where "uuid" = $1';
+    repoMock.delete.mockRejectedValueOnce(
+      new DrizzleQueryError(
+        query,
+        [secret],
+        Object.assign(new Error(`rejected ${secret}`), {
+          code: "23503",
+          constraint: "api_keys_owner_fk",
+          detail: `Failing row contains (${secret})`,
+        }),
+      ),
+    );
+
+    const result = await apiKeysImplementations.delete(
+      { uuid: "11111111-1111-4111-8111-111111111111" },
+      "member-1",
+      false,
+    );
+    expect(result).toEqual({
+      success: false,
+      message: "Failed to delete API key",
+    });
+    const logged = vi
+      .mocked(logger.error)
+      .mock.calls.map((args) => format(...args))
+      .join("\n");
+    for (const text of [JSON.stringify(result), logged]) {
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain(query);
+      expect(text).not.toContain("Failing row contains");
+    }
+    expect(logged).toContain("DrizzleQueryError");
+    expect(logged).toContain("23503");
+  });
 });
 
 describe("api-keys create — mint RBAC gate", () => {

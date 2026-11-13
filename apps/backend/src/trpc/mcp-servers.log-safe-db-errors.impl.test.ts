@@ -67,7 +67,10 @@ vi.mock("../lib/metamcp/utils", () => ({
   convertDbServerToParams: vi.fn(async () => undefined),
 }));
 
-import { mcpServersRepository } from "../db/repositories";
+import {
+  mcpServersRepository,
+  namespaceMappingsRepository,
+} from "../db/repositories";
 import { mcpServersImplementations } from "./mcp-servers.impl";
 
 // Obviously fake credentials: one in an environment variable, one in a header,
@@ -280,4 +283,40 @@ describe("mcpServers.get when the read fails", () => {
     expectLogIsFree(loggedText(), statement);
     expect(loggedText()).toContain("DrizzleQueryError");
   });
+});
+
+describe("mcpServers.reconnect member error responses", () => {
+  it.each(["server read", "namespace read"])(
+    "keeps a failed %s out of the response and log",
+    async (phase) => {
+      const statement = 'select "uuid" from "mcp_servers" where "uuid" = $1';
+      vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(
+        Object.assign({}, row, { user_id: "member-1" }) as never,
+      );
+      if (phase === "server read") {
+        vi.mocked(mcpServersRepository.findByUuid).mockRejectedValueOnce(
+          failedWrite(statement),
+        );
+      } else {
+        vi.mocked(
+          namespaceMappingsRepository.findNamespacesByServerUuid,
+        ).mockRejectedValueOnce(failedWrite(statement));
+      }
+
+      const result = await mcpServersImplementations.reconnect(
+        { uuid: UUID },
+        "member-1",
+        false,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        message: "Failed to reconnect MCP server",
+      });
+      expectLogIsFree(JSON.stringify(result), statement);
+      expectLogIsFree(loggedText(), statement);
+      expect(loggedText()).toContain("DrizzleQueryError");
+      expect(loggedText()).toContain("22001");
+    },
+  );
 });

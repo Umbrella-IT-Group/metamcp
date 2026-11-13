@@ -1208,10 +1208,11 @@ export const namespacesImplementations = {
       };
     } catch (error) {
       logger.error("Error refreshing namespace tools:", describeDbError(error));
+      // A member can reach the reads and writes above. Normal response data
+      // bypasses tRPC's error masking, so never echo a caught DB message.
       return {
         success: false as const,
-        message:
-          error instanceof Error ? error.message : "Internal server error",
+        message: "Failed to refresh namespace tools",
       };
     }
   },
