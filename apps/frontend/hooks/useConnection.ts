@@ -34,7 +34,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpServerType, McpServerTypeEnum } from "@repo/zod-types";
 import { useMemoizedFn } from "ahooks";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { z } from "zod";
 
@@ -42,6 +42,12 @@ import { SESSION_KEYS } from "@/lib/constants";
 
 import { ConnectionStatus } from "../lib/constants";
 import { getAppUrl } from "../lib/env";
+import {
+  reuseOrCreateStore,
+  RpcTrafficStore,
+} from "../lib/inspector/rpc-traffic/store";
+import { connectWithTraffic } from "../lib/inspector/rpc-traffic/transport-tap";
+import type { InspectorServerInfo } from "../lib/inspector/server-info";
 import { resolveRequestTimeouts } from "../lib/mcp-request-options";
 import {
   Notification,
@@ -67,6 +73,9 @@ interface UseConnectionOptions {
   isMetaMCP?: boolean;
   includeInactiveServers?: boolean;
   enabled?: boolean; // Skip hook execution when false
+  // Keep an in-memory JSON-RPC traffic log for this connection (the Inspector
+  // page shows it). Off for the detail pages, which do not.
+  captureTraffic?: boolean;
 }
 
 export function useConnection({
@@ -84,6 +93,7 @@ export function useConnection({
   isMetaMCP = false,
   includeInactiveServers = false,
   enabled = true,
+  captureTraffic = false,
 }: UseConnectionOptions) {
   const authProvider = createAuthProvider(mcpServerUuid, url);
   const [connectionStatus, setConnectionStatus] =
@@ -94,9 +104,14 @@ export function useConnection({
   const [clientTransport, setClientTransport] = useState<Transport | null>(
     null,
   );
-  const [requestHistory, setRequestHistory] = useState<
-    { request: string; response?: string }[]
-  >([]);
+  const [serverInfo, setServerInfo] = useState<InspectorServerInfo | null>(
+    null,
+  );
+  // The log belongs to the connection chain, not to a render: the ref lets a
+  // retry inside one connect() reach the store the failed attempt wrote to,
+  // and the state hands the same object to the page.
+  const rpcTrafficRef = useRef<RpcTrafficStore | null>(null);
+  const [rpcTraffic, setRpcTraffic] = useState<RpcTrafficStore | null>(null);
   const [completionsSupported, setCompletionsSupported] = useState(true);
 
   // Fetch timeout configurations from the database
@@ -112,16 +127,6 @@ export function useConnection({
     trpc.frontend.config.getMcpResetTimeoutOnProgress.useQuery(undefined, {
       enabled: enabled,
     });
-
-  const pushHistory = useMemoizedFn((request: object, response?: unknown) => {
-    setRequestHistory((prev) => [
-      ...prev,
-      {
-        request: JSON.stringify(request),
-        response: response !== undefined ? JSON.stringify(response) : undefined,
-      },
-    ]);
-  });
 
   // useMemoizedFn (ahooks) erases the generic <T> from the wrapped function's
   // type, collapsing makeRequest's return to Promise<unknown> and breaking
@@ -173,23 +178,7 @@ export function useConnection({
           };
         }
 
-        let response;
-        try {
-          response = await mcpClient.request(
-            request,
-            schema,
-            mcpRequestOptions,
-          );
-
-          pushHistory(request, response);
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : String(error);
-          pushHistory(request, { error: errorMessage });
-          throw error;
-        }
-
-        return response;
+        return await mcpClient.request(request, schema, mcpRequestOptions);
       } catch (e: unknown) {
         if (!options?.suppressToast) {
           const errorString = (e as Error).message ?? String(e);
@@ -257,13 +246,7 @@ export function useConnection({
 
       try {
         await mcpClient.notification(notification);
-        // Log successful notifications
-        pushHistory(notification);
       } catch (e: unknown) {
-        if (e instanceof McpError) {
-          // Log MCP protocol errors
-          pushHistory(notification, { error: e.message });
-        }
         toast.error(e instanceof Error ? e.message : String(e));
         throw e;
       }
@@ -358,6 +341,18 @@ export function useConnection({
           },
         },
       );
+
+      // Which log this attempt writes to. A retry inside this connect() call
+      // keeps the log the failed attempt wrote; a new connect starts an empty
+      // one, so a log never outlives the target it was recorded against.
+      const store = reuseOrCreateStore({
+        capture: captureTraffic,
+        previous: rpcTrafficRef.current,
+        retryCount,
+        create: () => new RpcTrafficStore(),
+      });
+      rpcTrafficRef.current = store;
+      setRpcTraffic(store);
 
       try {
         await checkProxyHealth();
@@ -574,20 +569,34 @@ export function useConnection({
                 })
               : new SSEClientTransport(mcpProxyServerUrl, transportOptions);
 
-          await client.connect(transport as Transport);
+          // The only place this hook connects: the traffic tap has to be on
+          // the transport before the SDK starts it (see transport-tap.ts).
+          await connectWithTraffic(
+            client,
+            transport as Transport,
+            store?.sink ?? null,
+          );
 
+          // The tap decorates this same object, so it is still the transport.
           setClientTransport(transport);
 
           capabilities = client.getServerCapabilities();
-          const initializeRequest = {
-            method: "initialize",
-          };
-          pushHistory(initializeRequest, {
+          // The protocol version comes from the captured initialize result:
+          // the SSE transport has no getter for it.
+          const protocolVersion = store?.initializeResult()?.protocolVersion;
+          setServerInfo({
+            implementation: client.getServerVersion(),
             capabilities,
-            serverInfo: client.getServerVersion(),
             instructions: client.getInstructions(),
+            protocolVersion:
+              typeof protocolVersion === "string" ? protocolVersion : undefined,
           });
         } catch (error) {
+          // A failed handshake is the case the log exists for. The same error
+          // can already be in it (the transport reports it and rejects with
+          // it); the store records one object once.
+          store?.publishTransportError(error);
+
           console.error(
             `Failed to connect to MCP Server via the MCP Inspector Proxy: ${mcpProxyServerUrl}:`,
             error,
@@ -664,6 +673,7 @@ export function useConnection({
       setConnectionStatus("disconnected");
       setCompletionsSupported(false);
       setServerCapabilities(null);
+      setServerInfo(null);
     }
   });
 
@@ -708,8 +718,9 @@ export function useConnection({
   return {
     connectionStatus,
     serverCapabilities,
+    serverInfo,
     mcpClient,
-    requestHistory,
+    rpcTraffic,
     makeRequest,
     sendNotification,
     handleCompletion,

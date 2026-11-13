@@ -243,7 +243,12 @@ describe("inspectorConnectionOptions", () => {
   it("maps a server exactly as the page always did", () => {
     const servers = [
       SERVER,
-      server({ command: null, args: undefined, type: "SSE", url: "https://x.test" }),
+      server({
+        command: null,
+        args: undefined,
+        type: "SSE",
+        url: "https://x.test",
+      }),
       server({ command: "", args: [], bearerToken: "secret" }),
       server({ type: "STREAMABLE_HTTP", url: "https://x.test/mcp", args: [] }),
     ];
