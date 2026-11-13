@@ -81,6 +81,24 @@ interface UseConnectionOptions {
   captureTraffic?: boolean;
 }
 
+// A transport belongs to the connection that created it, not to the current
+// target's options. End Streamable HTTP sessions before close() aborts their
+// controller, and still close the client if ending its session fails.
+async function closeConnection(client: Client, transport?: Transport) {
+  try {
+    if (transport instanceof StreamableHTTPClientTransport) {
+      await transport.terminateSession();
+    }
+  } catch (error) {
+    console.error("Error ending MCP session:", error);
+  }
+  try {
+    await client.close();
+  } catch (error) {
+    console.error("Error closing MCP connection:", error);
+  }
+}
+
 export function useConnection({
   mcpServerUuid,
   transportType,
@@ -104,9 +122,13 @@ export function useConnection({
   const [serverCapabilities, setServerCapabilities] =
     useState<ServerCapabilities | null>(null);
   const [mcpClient, setMcpClient] = useState<Client | null>(null);
-  const [clientTransport, setClientTransport] = useState<Transport | null>(
-    null,
-  );
+  // Detach ownership synchronously before an asynchronous close. A newer
+  // connect must neither close this pair again nor inherit the old client.
+  const activeConnectionRef = useRef<{
+    client: Client;
+    transport: Transport;
+  } | null>(null);
+  const mountedRef = useRef(true);
   const [serverInfo, setServerInfo] = useState<InspectorServerInfo | null>(
     null,
   );
@@ -122,13 +144,10 @@ export function useConnection({
   // unmount each move the counter on. An attempt that was waiting (on the
   // proxy health check, the handshake or a sign-in) finds out it was
   // superseded when it resumes, closes what it opened, and leaves the state,
-  // the traffic log and the sign-in flow alone. Without this the attempt that
-  // finishes last decides which connection the page holds, and a slow connect
+  // the traffic log and the hook's sign-in flow alone. Without this the attempt
+  // that finishes last decides which connection the page holds, and a slow connect
   // to the target the person just left replaces the one they selected.
   const attemptRef = useRef(0);
-  // The status the unload and unmount handlers read: they run long after the
-  // render that registered them.
-  const connectionStatusRef = useRef(connectionStatus);
 
   // Fetch timeout configurations from the database
   const { data: mcpTimeout } = trpc.frontend.config.getMcpTimeout.useQuery(
@@ -155,7 +174,10 @@ export function useConnection({
       schema: T,
       options?: RequestOptions & { suppressToast?: boolean },
     ): Promise<z.output<T>> => {
-      if (!mcpClient) {
+      // State can still expose the previous client while its close awaits a
+      // server response. Only the pair that still owns the connection may send.
+      const client = activeConnectionRef.current?.client;
+      if (!client) {
         throw new Error("MCP client not connected");
       }
       try {
@@ -185,7 +207,10 @@ export function useConnection({
         if (mcpRequestOptions.resetTimeoutOnProgress) {
           mcpRequestOptions.onprogress = (params: Progress) => {
             // Add progress notification to `Server Notification` window in the UI
-            if (onNotification) {
+            if (
+              onNotification &&
+              activeConnectionRef.current?.client === client
+            ) {
               onNotification({
                 method: "notification/progress",
                 params,
@@ -194,7 +219,7 @@ export function useConnection({
           };
         }
 
-        return await mcpClient.request(request, schema, mcpRequestOptions);
+        return await client.request(request, schema, mcpRequestOptions);
       } catch (e: unknown) {
         if (!options?.suppressToast) {
           const errorString = (e as Error).message ?? String(e);
@@ -254,14 +279,15 @@ export function useConnection({
 
   const sendNotification = useMemoizedFn(
     async (notification: ClientNotification) => {
-      if (!mcpClient) {
+      const client = activeConnectionRef.current?.client;
+      if (!client) {
         const error = new Error("MCP client not connected");
         toast.error(error.message);
         throw error;
       }
 
       try {
-        await mcpClient.notification(notification);
+        await client.notification(notification);
       } catch (e: unknown) {
         toast.error(e instanceof Error ? e.message : String(e));
         throw e;
@@ -324,6 +350,10 @@ export function useConnection({
 
   const connect = useMemoizedFn(
     async (_e?: unknown, retryCount: number = 0): Promise<void> => {
+      // A page can have queued disconnect().then(connect) before it unmounts.
+      // Invalidation alone cannot stop that later call taking a fresh token.
+      if (!mountedRef.current) return;
+
       // Taking the next number supersedes every earlier attempt, the ones
       // still in flight included, even when this call returns early below.
       attemptRef.current += 1;
@@ -352,6 +382,12 @@ export function useConnection({
       // The page reads this to show progress and to know a connect is under
       // way, so a second connect is not started for the same target.
       setConnectionStatus("connecting");
+      const previous = activeConnectionRef.current;
+      activeConnectionRef.current = null;
+      setMcpClient(null);
+      setServerCapabilities(null);
+      setServerInfo(null);
+      setCompletionsSupported(false);
 
       const client = new Client<Request, Notification, Result>(
         {
@@ -406,26 +442,18 @@ export function useConnection({
           }
         : null;
 
-      const abandon = async () => {
-        try {
-          if (transport instanceof StreamableHTTPClientTransport) {
-            await transport.terminateSession();
-          }
-        } catch (error) {
-          console.error(
-            "Error ending the session of a superseded connection attempt:",
-            error,
-          );
+      const abandon = () => closeConnection(client, transport);
+
+      // Direct connect() calls can replace an already published connection.
+      // Close it before opening another, including when the new attempt fails
+      // or the page unmounts while that attempt is still connecting.
+      if (previous) {
+        await closeConnection(previous.client, previous.transport);
+        if (!isCurrent()) {
+          await abandon();
+          return;
         }
-        try {
-          await client.close();
-        } catch (error) {
-          console.error(
-            "Error closing a superseded connection attempt:",
-            error,
-          );
-        }
-      };
+      }
 
       try {
         await checkProxyHealth();
@@ -628,13 +656,20 @@ export function useConnection({
             ToolListChangedNotificationSchema,
             PromptListChangedNotificationSchema,
           ].forEach((notificationSchema) => {
-            client.setNotificationHandler(notificationSchema, onNotification);
+            client.setNotificationHandler(
+              notificationSchema,
+              (notification) => {
+                // The SDK can deliver notifications before connect() resolves.
+                // A stale handshake must not write into the new target's panel.
+                if (isCurrent()) onNotification(notification);
+              },
+            );
           });
 
           client.fallbackNotificationHandler = (
             notification: Notification,
           ): Promise<void> => {
-            onNotification(notification);
+            if (isCurrent()) onNotification(notification);
             return Promise.resolve();
           };
         }
@@ -642,7 +677,9 @@ export function useConnection({
         if (onStdErrNotification) {
           client.setNotificationHandler(
             StdErrNotificationSchema,
-            onStdErrNotification,
+            (notification) => {
+              if (isCurrent()) onStdErrNotification(notification);
+            },
           );
         }
 
@@ -671,7 +708,7 @@ export function useConnection({
           published = true;
 
           // The tap decorates this same object, so it is still the transport.
-          setClientTransport(created);
+          activeConnectionRef.current = { client, transport: created };
 
           capabilities = client.getServerCapabilities();
           // The protocol version comes from the captured initialize result:
@@ -761,33 +798,29 @@ export function useConnection({
 
   const disconnect = useMemoizedFn(async () => {
     // An attempt still in flight must not finish into a hook that was told to
-    // disconnect.
-    attemptRef.current += 1;
+    // disconnect. A slow close owns only the connection it detached here.
+    const attempt = ++attemptRef.current;
+    const active = activeConnectionRef.current;
+    activeConnectionRef.current = null;
     try {
-      if (
-        transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP &&
-        clientTransport
-      ) {
-        await (
-          clientTransport as StreamableHTTPClientTransport
-        ).terminateSession();
+      if (active) {
+        await closeConnection(active.client, active.transport);
       }
-      if (mcpClient) {
-        await mcpClient.close();
-      }
-      if (enabled) {
-        // Only clear auth provider if hook is enabled (to avoid clearing when just disabled)
+      if (enabled && attemptRef.current === attempt) {
+        // A stale disconnect must not clear a newer attempt's credentials.
         authProvider.clear();
       }
     } catch (error) {
       console.error("Error during disconnect:", error);
     } finally {
-      setMcpClient(null);
-      setClientTransport(null);
-      setConnectionStatus("disconnected");
-      setCompletionsSupported(false);
-      setServerCapabilities(null);
-      setServerInfo(null);
+      // A new connect can publish while the old transport is closing.
+      if (mountedRef.current && attemptRef.current === attempt) {
+        setMcpClient(null);
+        setConnectionStatus("disconnected");
+        setCompletionsSupported(false);
+        setServerCapabilities(null);
+        setServerInfo(null);
+      }
     }
   });
 
@@ -822,31 +855,38 @@ export function useConnection({
     headerName,
     isMetaMCP,
     includeInactiveServers,
+    enabled,
   ]);
 
+  // Register once: status changes must not disconnect a reconnect that has
+  // just started. Unload also invalidates a handshake that is still pending.
   useEffect(() => {
-    connectionStatusRef.current = connectionStatus;
-  });
-
-  // Close a live connection when the page is left: on browser navigation, and
-  // on unmount. This runs once, not on every status change: a cleanup keyed on
-  // the status ran whenever the status left "connected", which now includes
-  // the move to "connecting" for a reconnect, and its disconnect() would
-  // supersede the attempt that had just started.
-  useEffect(() => {
-    const disconnectIfConnected = () => {
-      if (connectionStatusRef.current === "connected") {
-        disconnect();
+    mountedRef.current = true;
+    const handleDisconnect = () => {
+      if (activeConnectionRef.current) {
+        void disconnect();
+        return;
+      }
+      // OAuth can unload the page before a connection is published. Invalidate
+      // that attempt without clearing the code verifier its callback needs.
+      attemptRef.current += 1;
+      if (mountedRef.current) {
+        setMcpClient(null);
+        setConnectionStatus("disconnected");
+        setCompletionsSupported(false);
+        setServerCapabilities(null);
+        setServerInfo(null);
       }
     };
 
-    window.addEventListener("beforeunload", disconnectIfConnected);
-    window.addEventListener("unload", disconnectIfConnected);
+    window.addEventListener("beforeunload", handleDisconnect);
+    window.addEventListener("unload", handleDisconnect);
 
     return () => {
-      window.removeEventListener("beforeunload", disconnectIfConnected);
-      window.removeEventListener("unload", disconnectIfConnected);
-      disconnectIfConnected();
+      mountedRef.current = false;
+      window.removeEventListener("beforeunload", handleDisconnect);
+      window.removeEventListener("unload", handleDisconnect);
+      handleDisconnect();
     };
   }, [disconnect]);
 

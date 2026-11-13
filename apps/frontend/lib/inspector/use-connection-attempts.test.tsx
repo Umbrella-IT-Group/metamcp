@@ -2,6 +2,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  EmptyResultSchema,
+  LoggingMessageNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import * as React from "react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -38,10 +42,12 @@ vi.mock("@/lib/trpc", () => {
   };
 });
 
+const { clearAuth } = vi.hoisted(() => ({ clearAuth: vi.fn() }));
+
 vi.mock("@/lib/oauth-provider", () => ({
   createAuthProvider: () => ({
     tokens: async () => undefined,
-    clear: () => undefined,
+    clear: clearAuth,
   }),
 }));
 
@@ -61,6 +67,7 @@ vi.mock("@modelcontextprotocol/sdk/client/auth.js", async (importOriginal) => ({
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 
 import { useConnection } from "@/hooks/useConnection";
+import { StdErrNotificationSchema } from "@/lib/notificationTypes";
 
 import { RpcTrafficStore } from "./rpc-traffic/store";
 
@@ -112,6 +119,7 @@ const TARGET_B: Props = {
 function network() {
   const healthGates: Gate[] = [];
   const connectGates: Gate[] = [];
+  const closeGates: Gate[] = [];
   const attempts: { client: Client; transport: Transport }[] = [];
   const closed: Client[] = [];
   const order: string[] = [];
@@ -139,6 +147,8 @@ function network() {
   ) {
     closed.push(this);
     order.push("close");
+    const next = closeGates.shift();
+    if (next) await next.promise;
     // A real close ends the transport, which the tap records as a close.
     attempts.find((attempt) => attempt.client === this)?.transport.onclose?.();
   } as unknown as Client["close"]);
@@ -151,7 +161,16 @@ function network() {
   const sent = vi.spyOn(SSEClientTransport.prototype, "send");
   const notified = vi.spyOn(Client.prototype, "notification");
 
-  return { healthGates, connectGates, attempts, closed, order, sent, notified };
+  return {
+    healthGates,
+    connectGates,
+    closeGates,
+    attempts,
+    closed,
+    order,
+    sent,
+    notified,
+  };
 }
 
 // Mounts the real hook under a real React root and keeps the latest value it
@@ -221,6 +240,7 @@ async function mounted(props: Props) {
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(auth).mockReset();
+  clearAuth.mockClear();
 });
 
 afterEach(() => {
@@ -506,5 +526,297 @@ describe("the connection hook's attempts", () => {
     expect(hook.current.connectionStatus).toBe("connected");
     expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
     expect(net.closed).toEqual([net.attempts[0]?.client]);
+  });
+
+  it("keeps a newer connection when an earlier disconnect finishes last", async () => {
+    const net = network();
+    const hook = await mounted(TARGET_A);
+    await hook.run(() => hook.current.connect());
+    const close = gate();
+    net.closeGates.push(close);
+    const disconnecting = await hook.start(() => hook.current.disconnect());
+
+    await hook.render(TARGET_B);
+    await hook.run(() => hook.current.connect());
+    const newer = net.attempts[1]?.client;
+    expect(hook.current.mcpClient).toBe(newer);
+
+    await hook.complete(disconnecting, close.open);
+    expect(clearAuth).not.toHaveBeenCalled();
+    expect(hook.current.mcpClient).toBe(newer);
+    expect(hook.current.connectionStatus).toBe("connected");
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+    await hook.unmount();
+  });
+
+  it.each(["SSE", "STREAMABLE_HTTP"] as const)(
+    "closes the previous transport when the target changes to %s",
+    async (nextType) => {
+      const net = network();
+      const previousType = nextType === "SSE" ? "STREAMABLE_HTTP" : "SSE";
+      const hook = await mounted({
+        ...TARGET_A,
+        isMetaMCP: false,
+        transportType: previousType,
+      });
+      await hook.run(() => hook.current.connect());
+      await hook.render({
+        ...TARGET_B,
+        isMetaMCP: false,
+        transportType: nextType,
+      });
+      net.order.length = 0;
+
+      await hook.run(() => hook.current.disconnect());
+      expect(net.order).toEqual(
+        previousType === "STREAMABLE_HTTP"
+          ? ["terminateSession", "close"]
+          : ["close"],
+      );
+      expect(net.closed).toEqual([net.attempts[0]?.client]);
+      await hook.unmount();
+    },
+  );
+
+  it("closes a published connection before replacing it with another connect", async () => {
+    const net = network();
+    const hook = await mounted(TARGET_A);
+    await hook.run(() => hook.current.connect());
+    const handshake = gate();
+    net.connectGates.push(handshake);
+
+    const replacement = await hook.start(() => hook.current.connect());
+    expect(hook.current.connectionStatus).toBe("connecting");
+    expect(hook.current.mcpClient).toBeNull();
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+
+    await hook.complete(replacement, handshake.open);
+    expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
+    await hook.unmount();
+    expect(net.closed).toEqual(net.attempts.map(({ client }) => client));
+  });
+
+  it("does not run a queued reconnect after unmount", async () => {
+    const net = network();
+    const hook = await mounted(TARGET_A);
+    await hook.run(() => hook.current.connect());
+    const close = gate();
+    net.closeGates.push(close);
+    const reconnect = await hook.start(async () => {
+      await hook.current.disconnect();
+      await hook.current.connect();
+    });
+
+    await hook.unmount();
+    await hook.complete(reconnect, close.open);
+    expect(net.attempts).toHaveLength(1);
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+  });
+
+  it("invalidates a pending attempt as soon as the hook is disabled", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const hook = await mounted(TARGET_A);
+    const pending = await hook.start(() => hook.current.connect());
+
+    await hook.render({ ...TARGET_A, enabled: false });
+    expect(hook.current.connectionStatus).toBe("disconnected");
+    await hook.complete(pending, handshake.open);
+    expect(hook.current.mcpClient).toBeNull();
+    expect(hook.current.rpcTraffic?.exportEntries()).toEqual([]);
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+    await hook.unmount();
+  });
+
+  it("ignores late notifications from a superseded handshake", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const onNotification = vi.fn();
+    const onStdErrNotification = vi.fn();
+    const registered = vi.spyOn(Client.prototype, "setNotificationHandler");
+    const hook = await mounted({
+      ...TARGET_A,
+      onNotification,
+      onStdErrNotification,
+    });
+    const pending = await hook.start(() => hook.current.connect());
+    const first = net.attempts[0]?.client;
+    const handlers = registered.mock.calls
+      .filter(
+        ([schema], index) =>
+          registered.mock.contexts[index] === first &&
+          (schema === LoggingMessageNotificationSchema ||
+            schema === StdErrNotificationSchema),
+      )
+      .map(([, handler]) => handler);
+    expect(handlers).toHaveLength(2);
+    await hook.run(async () => {
+      for (const handler of handlers) {
+        await handler({ method: "notifications/test" });
+      }
+      await first?.fallbackNotificationHandler?.({
+        method: "notifications/test",
+      });
+    });
+    expect(onNotification).toHaveBeenCalledTimes(2);
+    expect(onStdErrNotification).toHaveBeenCalledOnce();
+    onNotification.mockClear();
+    onStdErrNotification.mockClear();
+
+    await hook.render({ ...TARGET_B, onNotification, onStdErrNotification });
+    await hook.run(() => hook.current.connect());
+    await hook.run(async () => {
+      for (const handler of handlers) {
+        await handler({ method: "notifications/test" });
+      }
+      await first?.fallbackNotificationHandler?.({
+        method: "notifications/test",
+      });
+    });
+
+    expect(onNotification).not.toHaveBeenCalled();
+    expect(onStdErrNotification).not.toHaveBeenCalled();
+    await hook.complete(pending, handshake.open);
+    await hook.unmount();
+  });
+
+  it.each(["request", "notification"] as const)(
+    "refuses a %s through a connection that is still closing",
+    async (kind) => {
+      const net = network();
+      const requested = vi
+        .spyOn(Client.prototype, "request")
+        .mockResolvedValue({});
+      net.notified.mockResolvedValue(undefined);
+      const hook = await mounted(TARGET_A);
+      await hook.run(() => hook.current.connect());
+      const close = gate();
+      net.closeGates.push(close);
+      const disconnecting = await hook.start(() => hook.current.disconnect());
+
+      await expect(
+        kind === "request"
+          ? hook.current.makeRequest({ method: "ping" }, EmptyResultSchema)
+          : hook.current.sendNotification({
+              method: "notifications/roots/list_changed",
+            }),
+      ).rejects.toThrow("MCP client not connected");
+      expect(requested).not.toHaveBeenCalled();
+      expect(net.notified).not.toHaveBeenCalled();
+      await hook.complete(disconnecting, close.open);
+      await hook.unmount();
+    },
+  );
+
+  it("ignores progress from a request on a connection that has been replaced", async () => {
+    const net = network();
+    const requested = vi
+      .spyOn(Client.prototype, "request")
+      .mockResolvedValue({});
+    const onNotification = vi.fn();
+    const hook = await mounted({ ...TARGET_A, onNotification });
+    await hook.run(() => hook.current.connect());
+    await hook.current.makeRequest({ method: "ping" }, EmptyResultSchema, {
+      resetTimeoutOnProgress: true,
+    });
+    const onprogress = requested.mock.calls[0]?.[2]?.onprogress;
+    expect(onprogress).toBeTypeOf("function");
+    onprogress?.({ progress: 1 });
+    expect(onNotification).toHaveBeenCalledOnce();
+    onNotification.mockClear();
+
+    const close = gate();
+    net.closeGates.push(close);
+    const disconnecting = await hook.start(() => hook.current.disconnect());
+    await hook.render({ ...TARGET_B, onNotification });
+    await hook.run(() => hook.current.connect());
+    onprogress?.({ progress: 2 });
+    expect(onNotification).not.toHaveBeenCalled();
+    await hook.complete(disconnecting, close.open);
+    await hook.unmount();
+  });
+
+  it("still closes a client when ending its streamable session fails", async () => {
+    const net = network();
+    const hook = await mounted({
+      ...TARGET_A,
+      isMetaMCP: false,
+      transportType: "STREAMABLE_HTTP",
+    });
+    await hook.run(() => hook.current.connect());
+    const failure = new Error("session DELETE refused");
+    vi.mocked(
+      StreamableHTTPClientTransport.prototype.terminateSession,
+    ).mockRejectedValueOnce(failure);
+
+    await hook.run(() => hook.current.disconnect());
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+    expect(console.error).toHaveBeenCalledWith(
+      "Error ending MCP session:",
+      failure,
+    );
+    expect(hook.current.connectionStatus).toBe("disconnected");
+    await hook.unmount();
+  });
+
+  it("keeps the sign-in verifier on unmount and ignores a late authorization result", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const signingIn = gate();
+    vi.mocked(auth).mockImplementation(async () => {
+      await signingIn.promise;
+      return "AUTHORIZED";
+    });
+    vi.stubGlobal("sessionStorage", {
+      setItem: vi.fn(),
+      getItem: vi.fn(),
+      removeItem: vi.fn(),
+    });
+    const hook = await mounted(TARGET_A);
+    const pending = await hook.start(() => hook.current.connect());
+    await hook.run(async () => {
+      handshake.fail(new Error("401 Unauthorized"));
+      await settle();
+    });
+    expect(auth).toHaveBeenCalledOnce();
+
+    // OAuth can navigate away while connect() is still awaiting auth().
+    // Clearing credentials here would delete the callback's code verifier.
+    await hook.unmount();
+    expect(clearAuth).not.toHaveBeenCalled();
+    await hook.complete(pending, signingIn.open);
+    expect(net.attempts).toHaveLength(1);
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+  });
+
+  it("leaves connecting after an unload cancels a pending handshake", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const registered = vi.spyOn(window, "addEventListener");
+    const hook = await mounted(TARGET_A);
+    const pending = await hook.start(() => hook.current.connect());
+    const beforeUnload = registered.mock.calls.find(
+      ([event]) => event === "beforeunload",
+    )?.[1];
+    expect(beforeUnload).toBeTypeOf("function");
+
+    // Navigation can be cancelled by another beforeunload listener. The page
+    // must then show disconnected instead of an attempt it has invalidated.
+    await hook.run(async () => {
+      if (typeof beforeUnload === "function") {
+        beforeUnload(new Event("beforeunload"));
+      }
+    });
+    expect(hook.current.connectionStatus).toBe("disconnected");
+    expect(clearAuth).not.toHaveBeenCalled();
+    await hook.complete(pending, handshake.open);
+    expect(hook.current.mcpClient).toBeNull();
+    expect(hook.current.connectionStatus).toBe("disconnected");
+    expect(net.closed).toEqual([net.attempts[0]?.client]);
+    await hook.unmount();
   });
 });
