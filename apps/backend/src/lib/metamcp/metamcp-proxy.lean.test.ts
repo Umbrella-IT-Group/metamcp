@@ -193,7 +193,10 @@ import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { type MetaMcpLogEntry, metamcpLogStore } from "./log-store";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { clearFilterCache } from "./metamcp-middleware/filter-tools.functional";
-import { clearOverrideCache } from "./metamcp-middleware/tool-overrides.functional";
+import {
+  clearOverrideCache,
+  overrideChangeListenerCount,
+} from "./metamcp-middleware/tool-overrides.functional";
 import { createServer } from "./metamcp-proxy";
 import {
   namespaceMountListenerCount,
@@ -1252,6 +1255,252 @@ describe("which call tool runs a tool", () => {
     const ran = await meta(lean, "call_write_tool", { name: "desk__read" });
     expect(ran.isError).toBeFalsy();
   });
+});
+
+describe("call_tool runs the tool it classified, and only that tool", () => {
+  /**
+   * The writer answers to `alias` from now on, with no cache clear and no
+   * event: a write to the table by a path that never told this process (another
+   * writer on the database), so nothing here invalidated the search snapshot.
+   * Alias resolution reads the table on a cache miss, so the very next call
+   * sees it. When `alias` is the name of a real read-only tool, a snapshot that
+   * says "read-only" is now describing a different tool than the call reaches.
+   */
+  const giveWriterTheAlias = (alias: string) =>
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "write",
+      status: "ACTIVE",
+      overrideName: alias,
+    });
+
+  /** What `namespaces.updateToolOverrides` does after it writes the rows. */
+  const rebindModernToWriter = () => {
+    const legacy = state.mappings.find((row) => row.toolName === "legacy");
+    if (!legacy) throw new Error("missing legacy mapping");
+    legacy.overrideName = "former";
+    giveWriterTheAlias("modern");
+    clearOverrideCache(NS);
+  };
+
+  it("refuses a name that now leads to another tool, though the snapshot still says read-only and nothing told this process, and the backend never sees a call", async () => {
+    const audit = auditRows();
+    const lean = await connectConsumer("s-lean-id1", LEAN);
+    const described = json(
+      await meta(lean, "describe_tool", { names: ["desk__read"] }),
+    );
+    expect(described.tools[0].runs_with).toBe("call_tool");
+
+    giveWriterTheAlias("read");
+
+    for (const attempt of [1, 2]) {
+      const refused = await meta(lean, "call_tool", {
+        name: "desk__read",
+        arguments: { ticket_id: "T-1", mode: "close" },
+      });
+      expect(refused.isError, `attempt ${attempt}`).toBe(true);
+      // The agent is told the tool changed and to look again. Not a routing
+      // answer to call_write_tool: it has not seen what the name means now.
+      expect(textOf(refused)).toContain("changed");
+      expect(textOf(refused)).toContain("search_tools");
+      expect(textOf(refused)).toContain("describe_tool");
+      expect(textOf(refused)).not.toContain("call_write_tool");
+      expect(textOf(refused)).not.toContain("desk__");
+    }
+    await flush();
+    // Nothing ran, and nothing was replayed.
+    expect(desk.calls).toEqual([]);
+    // Each refusal is an audit row, like any other refused call.
+    await audit.arrived(2);
+    expect(audit.rows).toHaveLength(2);
+    for (const row of audit.rows) {
+      expect(row).toMatchObject({
+        tool_name: "read",
+        success: false,
+        error_code: "tool_error",
+      });
+    }
+  });
+
+  it("runs the new target through call_write_tool, which may run any tool the session may run", async () => {
+    const lean = await connectConsumer("s-lean-id2", LEAN);
+    await meta(lean, "describe_tool", { names: ["desk__read"] });
+    giveWriterTheAlias("read");
+
+    const refused = await meta(lean, "call_tool", { name: "desk__read" });
+    expect(refused.isError).toBe(true);
+    expect(desk.calls).toEqual([]);
+
+    const ran = await meta(lean, "call_write_tool", { name: "desk__read" });
+    expect(ran.isError).toBeFalsy();
+    expect(textOf(ran)).toBe("ran write");
+    expect(desk.calls.map((c) => c.name)).toEqual(["write"]);
+  });
+
+  it("runs an alias's new writer through call_write_tool after the setter ran, and sends the same name to the routing answer through call_tool", async () => {
+    const lean = await connectConsumer("s-lean-id3", LEAN);
+    const described = json(
+      await meta(lean, "describe_tool", { names: ["desk__modern"] }),
+    );
+    expect(described.tools[0].runs_with).toBe("call_tool");
+    rebindModernToWriter();
+
+    const viaRead = await meta(lean, "call_tool", { name: "desk__modern" });
+    expect(viaRead.isError).toBe(true);
+    expect(desk.calls).toEqual([]);
+
+    const viaWrite = await meta(lean, "call_write_tool", {
+      name: "desk__modern",
+      arguments: { ticket_id: "T-2" },
+    });
+    expect(viaWrite.isError).toBeFalsy();
+    expect(desk.calls.map((c) => [c.name, c.args])).toEqual([
+      ["write", { ticket_id: "T-2" }],
+    ]);
+  });
+
+  it("still runs a read-only tool, by its real name and by an alias, when nothing changed since the snapshot", async () => {
+    const lean = await connectConsumer("s-lean-id4", LEAN);
+    await meta(lean, "search_tools", { limit: 25 });
+    expect(textOf(await meta(lean, "call_tool", { name: "desk__read" }))).toBe(
+      "ran read",
+    );
+    expect(
+      textOf(await meta(lean, "call_tool", { name: "desk__modern" })),
+    ).toBe("ran legacy");
+    expect(desk.listings()).toBe(1);
+    expect(desk.calls.map((c) => c.name)).toEqual(["read", "legacy"]);
+  });
+
+  it("makes an annotation override that turns the same target read-only into not read-only visible to call_tool as soon as the setter ran", async () => {
+    const lean = await connectConsumer("s-lean-id5", LEAN);
+    const before = json(
+      await meta(lean, "describe_tool", { names: ["desk__read"] }),
+    );
+    expect(before.tools[0].runs_with).toBe("call_tool");
+    const listingsBefore = desk.listings();
+
+    // Same target, same name: only the hint changes, so no identity check can
+    // see it. The snapshot is what must not outlive the setter.
+    state.mappings.push({
+      namespaceUuid: NS,
+      serverUuid: DESK.uuid,
+      toolName: "read",
+      status: "ACTIVE",
+      overrideAnnotations: { readOnlyHint: false },
+    });
+    clearOverrideCache(NS);
+
+    // No time has passed: the snapshot is inside its one-second lifetime.
+    const routed = await meta(lean, "call_tool", { name: "desk__read" });
+    expect(routed.isError).toBe(true);
+    expect(textOf(routed)).toContain("call_write_tool");
+    expect(desk.calls).toEqual([]);
+    expect(desk.listings()).toBeGreaterThan(listingsBefore);
+    const after = json(
+      await meta(lean, "describe_tool", { names: ["desk__read"] }),
+    );
+    expect(after.tools[0].runs_with).toBe("call_write_tool");
+  });
+
+  it("shows search and describe an alias rebinding as soon as the setter ran, inside the snapshot's lifetime", async () => {
+    const lean = await connectConsumer("s-lean-id6", LEAN);
+    const before = json(await meta(lean, "search_tools", { limit: 25 }));
+    const names = (found: Record<string, any>): string[] =>
+      found.results.map((r: { name: string }) => r.name);
+    expect(names(before)).toContain("desk__modern");
+    expect(names(before)).not.toContain("desk__former");
+
+    rebindModernToWriter();
+
+    const after = json(await meta(lean, "search_tools", { limit: 25 }));
+    expect(names(after)).toContain("desk__former");
+    const described = json(
+      await meta(lean, "describe_tool", { names: ["desk__modern"] }),
+    );
+    expect(described.tools[0].runs_with).toBe("call_write_tool");
+  });
+
+  it("drops the snapshot for the namespace whose overrides were cleared, and for a clear of every namespace, and for no other", async () => {
+    const lean = await connectConsumer("s-lean-id7", LEAN);
+    await meta(lean, "search_tools");
+    expect(desk.listings()).toBe(1);
+
+    clearOverrideCache("another-namespace");
+    await meta(lean, "search_tools");
+    expect(desk.listings()).toBe(1);
+
+    clearOverrideCache(NS);
+    await meta(lean, "search_tools");
+    expect(desk.listings()).toBe(2);
+
+    clearOverrideCache();
+    await meta(lean, "search_tools");
+    expect(desk.listings()).toBe(3);
+  });
+
+  it("listens for override changes only while a lean session is open: a session that is not lean never does", async () => {
+    expect(overrideChangeListenerCount(NS)).toBe(0);
+    const plain = await connectConsumer("s-plain-id9");
+    expect(overrideChangeListenerCount(NS)).toBe(0);
+    const one = await connectConsumer("s-lean-id9a", LEAN);
+    const two = await connectConsumer("s-lean-id9b", LEAN);
+    expect(overrideChangeListenerCount(NS)).toBe(2);
+    await one.close();
+    expect(overrideChangeListenerCount(NS)).toBe(1);
+    await two.close();
+    await plain.close();
+    expect(overrideChangeListenerCount(NS)).toBe(0);
+  });
+
+  it.each([
+    ["one session", false],
+    ["two sessions of the namespace", true],
+  ])(
+    "pin: keeps each concurrent call's recorded target to itself across %s",
+    async (_label, separateSessions) => {
+      const first = await connectConsumer("s-lean-id8a", LEAN);
+      const second = separateSessions
+        ? await connectConsumer("s-lean-id8b", LEAN)
+        : first;
+      // Hold the first call between its read-only verdict and its alias
+      // resolution. That resolution is the one lookup by alias name `read` the
+      // chain makes, so the hold sits exactly there.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let reached!: () => void;
+      const held = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      let armed = true;
+      state.beforeQueryResult = async (query) => {
+        if (
+          armed &&
+          query.table === "mappings" &&
+          query.where["ntm.override_name"] === "read"
+        ) {
+          armed = false;
+          reached();
+          await gate;
+        }
+      };
+
+      const slow = meta(first, "call_tool", { name: "desk__read" });
+      await held;
+      // While it waits, another call records a different target and finishes.
+      const fast = await meta(second, "call_tool", { name: "desk__modern" });
+      expect(textOf(fast)).toBe("ran legacy");
+      release();
+
+      // Had the recorded target been shared, this one would be compared with
+      // the other call's and refused.
+      expect(textOf(await slow)).toBe("ran read");
+      expect(desk.calls.map((c) => c.name)).toEqual(["legacy", "read"]);
+    },
+  );
 });
 
 describe("a direct real-name call in a lean session", () => {

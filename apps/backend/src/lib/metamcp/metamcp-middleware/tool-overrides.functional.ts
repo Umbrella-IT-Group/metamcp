@@ -13,6 +13,7 @@ import { parseToolName } from "../tool-name-parser";
 import {
   CallToolMiddleware,
   ListToolsMiddleware,
+  MetaMCPHandlerContext,
 } from "./functional-middleware";
 import { findNamespaceServerUuidsByName } from "./namespace-server-lookup";
 
@@ -23,6 +24,25 @@ export interface ToolOverridesConfig {
   cacheEnabled?: boolean;
   cacheTTL?: number; // milliseconds
   persistentCacheOnListTools?: boolean; // if true, cache never expires when set via list tools
+}
+
+/**
+ * A listing that must know which backend tool each listed name stands for
+ * passes a sink on its per-call context, and the list middleware below records
+ * into it: for every tool it lists, the listed name (the alias, when the tool
+ * is overridden) and the tool's ORIGINAL full name (`<server>__<tool>`, which
+ * carries both the backend server and the backend's own tool name).
+ *
+ * The lean tool listing is the one reader (lean-listing.ts): its read-only
+ * verdict is a statement about a tool, and the call chain later resolves a name
+ * to a tool of its own accord, so the verdict has to be tied to the tool it was
+ * given for. A per-call context field, never module or handler state, so two
+ * listings running at once (two sessions, or a client listing beside a search)
+ * cannot write into each other's sink. A name listed twice (two overrides that
+ * collide) has two entries, which the reader treats as unidentifiable.
+ */
+export interface ListingOriginsContext extends MetaMCPHandlerContext {
+  listingOrigins?: Map<string, string[]>;
 }
 
 /**
@@ -311,12 +331,21 @@ async function applyToolOverrides(
   namespaceUuid: string,
   useCache: boolean = true,
   isPersistent: boolean = false,
+  origins?: Map<string, string[]>,
 ): Promise<Tool[]> {
   if (!tools || tools.length === 0) {
     return tools;
   }
 
   const overriddenTools: Tool[] = [];
+  // Every tool leaves through here, so the sink (ListingOriginsContext) hears
+  // of each one exactly once, under the name the listing shows it by.
+  const emit = (listed: Tool, originalName: string): void => {
+    overriddenTools.push(listed);
+    const known = origins?.get(listed.name);
+    if (known) known.push(originalName);
+    else origins?.set(listed.name, [originalName]);
+  };
 
   await Promise.allSettled(
     tools.map(async (tool) => {
@@ -324,7 +353,7 @@ async function applyToolOverrides(
         const parsed = parseToolName(tool.name);
         if (!parsed) {
           // If tool name doesn't follow expected format, include as-is
-          overriddenTools.push(tool);
+          emit(tool, tool.name);
           return;
         }
 
@@ -338,7 +367,7 @@ async function applyToolOverrides(
 
         if (!override) {
           // No overrides found, include as-is
-          overriddenTools.push(tool);
+          emit(tool, tool.name);
           return;
         }
 
@@ -401,11 +430,11 @@ async function applyToolOverrides(
           );
         }
 
-        overriddenTools.push(overriddenTool);
+        emit(overriddenTool, tool.name);
       } catch (error) {
         logger.error(`Error applying overrides for tool ${tool.name}:`, error);
         // On error, include the tool as-is (fail-safe behavior)
-        overriddenTools.push(tool);
+        emit(tool, tool.name);
       }
     }),
   );
@@ -512,6 +541,7 @@ export function createToolOverridesListToolsMiddleware(
           context.namespaceUuid,
           useCache,
           isPersistent,
+          (context as ListingOriginsContext).listingOrigins,
         );
 
         return {
@@ -558,8 +588,71 @@ export function createToolOverridesCallToolMiddleware(
 }
 
 /**
- * Utility function to clear override cache
+ * Who wants to hear that a namespace's overrides changed: the lean tool
+ * listing's snapshot, which holds each tool's name, hints and identity as the
+ * overrides had them (lean-listing.ts).
+ */
+const overrideChangeListeners = new Map<string, Set<() => void>>();
+
+/**
+ * Run `listener` whenever the override cache of `namespaceUuid`, or of every
+ * namespace, is cleared. Returns the function that removes it.
+ */
+export function onOverrideCacheCleared(
+  namespaceUuid: string,
+  listener: () => void,
+): () => void {
+  let set = overrideChangeListeners.get(namespaceUuid);
+  if (!set) {
+    set = new Set();
+    overrideChangeListeners.set(namespaceUuid, set);
+  }
+  set.add(listener);
+  return () => {
+    const current = overrideChangeListeners.get(namespaceUuid);
+    if (!current) return;
+    current.delete(listener);
+    if (current.size === 0) overrideChangeListeners.delete(namespaceUuid);
+  };
+}
+
+/** Test seam: how many listeners a namespace holds. */
+export function overrideChangeListenerCount(namespaceUuid: string): number {
+  return overrideChangeListeners.get(namespaceUuid)?.size ?? 0;
+}
+
+/**
+ * Utility function to clear override cache.
+ *
+ * It is also the signal that overrides CHANGED: every path that writes an
+ * override name, a title, a description or an annotation override, or that
+ * adds, renames or removes the server the overrides belong to, already calls
+ * it after the write so alias resolution and the listing re-read the table
+ * (`namespaces.updateToolOverrides`, the namespace and server updates and
+ * deletions). Hanging the lean snapshot's drop on this one call covers all of
+ * them, and any path added later that clears the cache correctly, without a
+ * second list of setters to keep in step. It does not fire for a policy change
+ * (`clearFilterCache`): a snapshot may lag a policy change, and says so.
+ *
+ * A listener that throws is logged and does not stop the others or the caller,
+ * which is an admin write that has already committed.
  */
 export function clearOverrideCache(namespaceUuid?: string): void {
   toolOverridesCache.clear(namespaceUuid);
+  const heard =
+    namespaceUuid === undefined
+      ? Array.from(overrideChangeListeners.values()).flatMap((set) =>
+          Array.from(set),
+        )
+      : Array.from(overrideChangeListeners.get(namespaceUuid) ?? []);
+  for (const listener of heard) {
+    try {
+      listener();
+    } catch (error) {
+      logger.error(
+        "A live lean session failed to drop its tool snapshot after an override change; its next search may show the previous overrides until the snapshot expires:",
+        error,
+      );
+    }
+  }
 }

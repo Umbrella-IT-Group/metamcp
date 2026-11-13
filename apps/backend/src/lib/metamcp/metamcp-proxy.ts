@@ -63,6 +63,10 @@ import { metamcpLogStore } from "./log-store";
 import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditingMiddleware } from "./metamcp-middleware/auditing.functional";
 import {
+  type ClassifiedCallContext,
+  createClassifiedTargetMiddleware,
+} from "./metamcp-middleware/classified-target.functional";
+import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
   type ToolFilterCallContext,
@@ -78,6 +82,8 @@ import { createTimeoutHintMiddleware } from "./metamcp-middleware/timeout-hint.f
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
+  type ListingOriginsContext,
+  onOverrideCacheCleared,
 } from "./metamcp-middleware/tool-overrides.functional";
 import { onNamespaceMountChange } from "./namespace-mount-events";
 import {
@@ -155,6 +161,9 @@ export const createServer = async (
   // Declared up front, before any handler or listener that reads them, so no
   // later-running closure can reach them before they exist.
   let leanCatalog: LeanCatalog | undefined;
+  // Stops the lean snapshot hearing of override changes (set once the catalog
+  // exists, cleared when the session closes).
+  let stopOverrideChangeListener: (() => void) | undefined;
   // How many servers the last client-facing listing could not reach, for the
   // lean search's `unavailable_server_count`. A count and never names: a
   // server the policy hides from this caller can fail too.
@@ -417,6 +426,7 @@ export const createServer = async (
     registeredSubscriptions.clear();
     stopOwedServerWatches();
     stopMountChangeListener();
+    stopOverrideChangeListener?.();
   };
 
   /**
@@ -1447,6 +1457,21 @@ export const createServer = async (
     },
   });
 
+  // The lean listing's own log lines. System category (persisted and mirrored
+  // to stdout), never tool_call: a meta call executes nothing, so the tool-call
+  // views stay "who ran which real tool". Counts and durations only, and no
+  // name of a tool or a server.
+  const leanLog = (level: "info" | "warn", message: string): void => {
+    metamcpLogStore.record({
+      category: "system",
+      serverName: "gateway",
+      level,
+      message,
+      sessionId: handlerContext.sessionId,
+      clientName: getCallerContext()?.clientName ?? handlerContext.clientName,
+    });
+  };
+
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
     // A name this proxy holds no schema for is shaped after the call from its
@@ -1471,6 +1496,15 @@ export const createServer = async (
     // so the filter sees exactly the name it saw before; an alias call is
     // refused with the same text its real name gets (it names the real tool).
     createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // Directly after the alias resolution above, before anything that judges or
+    // runs the tool: a `call_tool` call (the lean listing's read-only door) is
+    // refused when the name now leads to another tool than the one its
+    // read-only verdict was given for. A call that carries no verdict passes
+    // untouched. See classified-target.functional.ts; do not move it.
+    createClassifiedTargetMiddleware({
+      onRefused: () =>
+        leanLog("warn", "lean listing: call_tool refused a tool that changed"),
+    }),
     // The mount status is part of this verdict: a public session's call to a
     // server whose mount is INACTIVE is refused here even when the session
     // still holds a route to it from an earlier listing, and the handler then
@@ -1498,11 +1532,12 @@ export const createServer = async (
   // of the same namespace would see.
   const listForClient = async (
     request: ListToolsRequest,
+    context: MetaMCPHandlerContext = handlerContext,
   ): Promise<ListToolsResult> => {
     const generation = ++toolSchemaGeneration;
     toolArgSchemas.replace([]);
     const recorded = (async () => {
-      const result = await listToolsWithMiddleware(request, handlerContext);
+      const result = await listToolsWithMiddleware(request, context);
       // Use final names after filters and overrides, and discard removed names.
       // Another proxy's listing cannot teach this routing instance a schema.
       // A notification or overlapping listing makes an older response unsafe
@@ -1522,20 +1557,37 @@ export const createServer = async (
   };
 
   if (lean) {
-    leanCatalog = new LeanCatalog({
+    const catalog = new LeanCatalog({
       load: async () => {
-        const listing = await listForClient({
-          method: "tools/list",
-          params: {},
-        });
+        // This listing's own sink, on its own clone of the context: the
+        // overrides record into it which backend tool each listed name stands
+        // for, so `call_tool` can tie its read-only verdict to that tool.
+        const origins = new Map<string, string[]>();
+        const listingContext: ListingOriginsContext = {
+          ...handlerContext,
+          listingOrigins: origins,
+        };
+        const listing = await listForClient(
+          { method: "tools/list", params: {} },
+          listingContext,
+        );
         return {
           tools: listing.tools,
           unavailable: lastListingUnavailableCount,
+          origins,
         };
       },
       now: () => Date.now(),
       ttlMs: LEAN_CATALOG_TTL_MS,
     });
+    leanCatalog = catalog;
+    // The snapshot holds each tool's name, hints and identity as the overrides
+    // had them, so an override change drops it: a search or describe after the
+    // setter shows the change. `call_tool` does not rely on this (it checks the
+    // tool's identity when the call runs); this keeps the answers honest.
+    stopOverrideChangeListener = onOverrideCacheCleared(namespaceUuid, () =>
+      catalog.invalidate(),
+    );
   }
 
   // Set up the handlers with middleware
@@ -1565,30 +1617,23 @@ export const createServer = async (
   // REAL tool name, like any other.
   const leanPrelude =
     lean && leanCatalog
-      ? createLeanPrelude({
-          catalog: leanCatalog,
-          // System category (persisted and mirrored to stdout), never
-          // tool_call: a meta call executes nothing, so the tool-call views
-          // stay "who ran which real tool". Counts and durations only.
-          log: (level, message) =>
-            metamcpLogStore.record({
-              category: "system",
-              serverName: "gateway",
-              level,
-              message,
-              sessionId: handlerContext.sessionId,
-              clientName:
-                getCallerContext()?.clientName ?? handlerContext.clientName,
-            }),
-        })
+      ? createLeanPrelude({ catalog: leanCatalog, log: leanLog })
       : undefined;
 
   server.setRequestHandler(CallToolRequestSchema, async (incoming) => {
     const prelude = leanPrelude ? await leanPrelude(incoming) : undefined;
     if (prelude?.answer) return prelude.answer;
     const request = prelude?.request ?? incoming;
+    // A `call_tool` call carries the tool its read-only verdict was given for,
+    // on a clone of the instance context made for this call alone (the filter
+    // does the same with its verdict). The instance context is shared by every
+    // concurrent call of the session, so the field never goes on it.
+    const callContext: ClassifiedCallContext =
+      prelude?.classifiedTarget === undefined
+        ? handlerContext
+        : { ...handlerContext, classifiedTarget: prelude.classifiedTarget };
     try {
-      return await callToolWithMiddleware(request, handlerContext);
+      return await callToolWithMiddleware(request, callContext);
     } catch (error) {
       // WARM path: a mint failure inside the injected fetch on the
       // tools/call request itself (no enrollment, expired grant, CA
@@ -1664,6 +1709,7 @@ export const createServer = async (
     // Idle and OpenAPI instances have no transport to fire server.onclose.
     // Unregister before awaiting backend cleanup, which can also fail.
     stopMountChangeListener();
+    stopOverrideChangeListener?.();
     // Cleanup is now handled by the pool
     await mcpServerPool.cleanupSession(sessionId);
   };

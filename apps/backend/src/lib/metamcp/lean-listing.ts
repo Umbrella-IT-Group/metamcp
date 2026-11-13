@@ -21,7 +21,11 @@ import type {
  * tools, overrides, the policy filter and the timeout hint judge the call live,
  * exactly as for a direct call. The one decision this module makes is which of
  * the two call meta tools a tool belongs to, and that is a routing answer for
- * the client (see `classifyCallTarget`), not an access verdict.
+ * the client (see `classifyCallTarget`), not an access verdict. That answer is
+ * about one tool, so the snapshot also says which tool each listed name stood
+ * for (`listedTargetOf`), and the call chain refuses a `call_tool` call whose
+ * name no longer leads to that tool (`classified-target.functional.ts`): a
+ * verdict is never spent on a different tool than it was given for.
  */
 
 export const SEARCH_TOOL = "search_tools";
@@ -226,6 +230,14 @@ function deepFreeze<T>(value: T): T {
 export interface LeanListing {
   readonly tools: readonly Tool[];
   readonly unavailable: number;
+  /**
+   * For each listed name, the ORIGINAL full name (`<server>__<tool>`: the
+   * backend server and the backend's own tool name) of each entry listed under
+   * it, as the overrides resolved it when this listing was built. Absent when
+   * the listing could not say, and then no name has an identity
+   * (`listedTargetOf`), so `call_tool` runs nothing from it.
+   */
+  readonly origins?: ReadonlyMap<string, readonly string[]>;
 }
 
 /**
@@ -262,10 +274,14 @@ export function runsWith(
  * through.
  *
  * This reads a snapshot that may be up to `LEAN_CATALOG_TTL_MS` old, the same
- * bound as every cache in the call chain. It decides which call tool a tool
- * belongs to and nothing else: a tool this lets through still faces the
- * chain's live policy filter, and the chain, not this function, is what
- * refuses a tool the namespace has switched off.
+ * bound as every cache in the call chain (and it is dropped when the
+ * namespace's overrides change). It decides which call tool a tool belongs to
+ * and nothing else: a tool this lets through still faces the chain's live
+ * policy filter, and the chain, not this function, is what refuses a tool the
+ * namespace has switched off. The hints it read belong to the tool the name
+ * stood for in the snapshot, which is why `call_tool` also records that tool
+ * (`listedTargetOf`) and the chain refuses the call if the name has since come
+ * to lead to another one.
  */
 export function classifyCallTarget(
   listing: LeanListing,
@@ -278,6 +294,24 @@ export function classifyCallTarget(
     if (!hintFlags(tool).read_only) return { readOnly: false };
   }
   return { readOnly: seen };
+}
+
+/**
+ * The tool a listed name stood for in this snapshot: its original full name
+ * (`<server>__<tool>`), or `undefined` when the snapshot cannot name exactly
+ * one tool for it (no origins recorded, the name not listed, or two entries
+ * listed under it).
+ *
+ * `call_tool` records this when it gives a read-only verdict and the call chain
+ * compares it with the tool the name resolves to when the call runs. A verdict
+ * without an identity is not given: the caller fails closed.
+ */
+export function listedTargetOf(
+  listing: LeanListing,
+  name: string,
+): string | undefined {
+  const entries = listing.origins?.get(name);
+  return entries?.length === 1 ? entries[0] : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -972,10 +1006,13 @@ export function runDescribe(
  *
  * Staleness is at most `ttlMs`, the policy filter's own cache lifetime, and the
  * snapshot is never what authorizes a call (see the header). `invalidate()` is
- * called on every list-changed and mount event; a load that was running when it
- * fired hands its result to the callers that were already waiting but is not
- * kept, and the next `get()` starts fresh. The clock is injected so the tests
- * need no real time.
+ * called on every list-changed and mount event and whenever the namespace's
+ * overrides change (`onOverrideCacheCleared`), so a search after an override
+ * change shows it. A load that was running when it fired hands its result to
+ * the callers that were already waiting but is not kept, and the next `get()`
+ * starts fresh; those waiting callers hold a listing that may predate the
+ * change, which is one more reason `call_tool` checks the tool's identity when
+ * the call runs. The clock is injected so the tests need no real time.
  */
 export class LeanCatalog {
   private snapshot: { value: LeanListing; at: number } | undefined;

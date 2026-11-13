@@ -37,6 +37,7 @@ import {
   LeanCatalog,
   type LeanListing,
   leanMetaTools,
+  listedTargetOf,
   rankTools,
   routeLeanCall,
   runDescribe,
@@ -1079,6 +1080,47 @@ describe("which call tool runs a tool", () => {
   it("answers a non-read-only target with a constant routing message that names call_write_tool", () => {
     expect(CALL_TOOL_ROUTING_ANSWER).toContain("call_write_tool");
     expect(CALL_TOOL_ROUTING_ANSWER).not.toMatch(/denied|refused|not allowed/i);
+  });
+});
+
+describe("the tool a listed name stood for", () => {
+  const read = mk("s__read", "r", {}, { annotations: { readOnlyHint: true } });
+  const withOrigins = (
+    entries: Array<[string, string[]]>,
+    tools: Tool[] = [read],
+  ): LeanListing => ({
+    tools,
+    unavailable: 0,
+    origins: new Map(entries),
+  });
+
+  it("names the original full name of the one entry listed under a name, which an alias keeps apart from the listed name", () => {
+    const listing = withOrigins([
+      ["s__read", ["s__read"]],
+      ["s__modern", ["s__legacy"]],
+    ]);
+    expect(listedTargetOf(listing, "s__read")).toBe("s__read");
+    expect(listedTargetOf(listing, "s__modern")).toBe("s__legacy");
+  });
+
+  it("names nothing when the listing recorded no origins, the name is not listed, or two entries share the name", () => {
+    expect(listedTargetOf(listingOf([read]), "s__read")).toBeUndefined();
+    const listing = withOrigins([
+      ["s__read", ["s__read"]],
+      ["s__shared", ["s__one", "s__two"]],
+      ["s__empty", []],
+    ]);
+    expect(listedTargetOf(listing, "s__missing")).toBeUndefined();
+    expect(listedTargetOf(listing, "s__shared")).toBeUndefined();
+    expect(listedTargetOf(listing, "s__empty")).toBeUndefined();
+  });
+
+  it("is a lookup in the listing's own origins and holds no state between listings", () => {
+    const first = withOrigins([["s__read", ["s__old"]]]);
+    const second = withOrigins([["s__read", ["s__new"]]]);
+    expect(listedTargetOf(first, "s__read")).toBe("s__old");
+    expect(listedTargetOf(second, "s__read")).toBe("s__new");
+    expect(listedTargetOf(first, "s__read")).toBe("s__old");
   });
 });
 

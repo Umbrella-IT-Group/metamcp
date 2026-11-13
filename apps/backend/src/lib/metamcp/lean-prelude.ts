@@ -12,6 +12,7 @@ import {
   classifyCallTarget,
   type LeanCatalog,
   type LeanListing,
+  listedTargetOf,
   routeLeanCall,
   runDescribe,
   runSearch,
@@ -28,10 +29,18 @@ import {
  * tool, or `undefined` for a direct real-name call, which runs as sent. The
  * prelude never executes a tool itself, so the chain stays the only way
  * anything runs.
+ *
+ * `classifiedTarget` accompanies the request of a `call_tool` call and of no
+ * other call: the original full name of the tool the read-only verdict was
+ * given for. The caller puts it on a per-call clone of the handler context
+ * (`ClassifiedCallContext`), and the chain refuses the call if the name resolves
+ * to another tool when it runs. It is part of the result, not state on the
+ * prelude, so concurrent calls cannot share it.
  */
 export interface LeanPreludeResult {
   answer?: CallToolResult;
   request?: CallToolRequest;
+  classifiedTarget?: string;
 }
 
 export type LeanPrelude = (
@@ -119,7 +128,19 @@ export function createLeanPrelude(options: {
           );
           return { answer: toolError(CALL_TOOL_ROUTING_ANSWER) };
         }
-        return { request: route.request };
+        // The verdict is about the tool this name stood for in the snapshot.
+        // A verdict that cannot name its tool is not given: fail closed to the
+        // routing answer, which is true (call_write_tool runs it) and runs
+        // nothing here.
+        const classifiedTarget = listedTargetOf(listing, route.name);
+        if (classifiedTarget === undefined) {
+          options.log(
+            "warn",
+            "lean listing: call_tool found no recorded tool for a read-only name",
+          );
+          return { answer: toolError(CALL_TOOL_ROUTING_ANSWER) };
+        }
+        return { request: route.request, classifiedTarget };
       }
     }
   };

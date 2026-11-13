@@ -22,6 +22,7 @@ import type {
   FakeQuery,
   FakeToolMappingState,
 } from "./tool-mapping-db.fixtures";
+import type { ListingOriginsContext } from "./tool-overrides.functional";
 
 const { state, queries } = vi.hoisted(() => ({
   state: {
@@ -57,6 +58,8 @@ const {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
   mapOverrideNameToOriginal,
+  onOverrideCacheCleared,
+  overrideChangeListenerCount,
 } = await import("./tool-overrides.functional");
 
 const NS = "ns-1";
@@ -309,5 +312,177 @@ describe("#364: the listing's override lookup is scoped to the namespace's mount
     });
 
     expect(await listIn(NS)).toEqual(["github__read"]);
+  });
+});
+
+describe("the listing records which tool each listed name stands for", () => {
+  const list = async (
+    names: string[],
+    sink?: Map<string, string[]>,
+  ): Promise<string[]> => {
+    const callContext: ListingOriginsContext = {
+      ...context,
+      ...(sink === undefined ? {} : { listingOrigins: sink }),
+    };
+    const listed = await createToolOverridesListToolsMiddleware({
+      cacheEnabled: false,
+    })(async () => ({ tools: names.map(tool) }))(
+      { method: "tools/list", params: {} },
+      callContext,
+    );
+    return listed.tools.map((t) => t.name);
+  };
+
+  it("records the original full name under the alias for an overridden tool and under its own name for the rest", async () => {
+    load(bothShareAnAlias());
+    const sink = new Map<string, string[]>();
+
+    const names = await list(
+      ["alpha__alpha_tool", "beta__beta_tool", "alpha__plain"],
+      sink,
+    );
+
+    expect(names.sort()).toEqual([
+      "alpha__plain",
+      "alpha__shared",
+      "beta__shared",
+    ]);
+    expect(Object.fromEntries(sink)).toEqual({
+      alpha__shared: ["alpha__alpha_tool"],
+      beta__shared: ["beta__beta_tool"],
+      alpha__plain: ["alpha__plain"],
+    });
+  });
+
+  it("records a name with no server prefix under itself, and a tool whose override lookup failed under its real name", async () => {
+    load(bothShareAnAlias());
+    const sink = new Map<string, string[]>();
+    state.failOn = { mappings: true };
+    try {
+      expect(await list(["bare_name", "alpha__alpha_tool"], sink)).toEqual(
+        expect.arrayContaining(["bare_name", "alpha__alpha_tool"]),
+      );
+    } finally {
+      state.failOn = undefined;
+    }
+
+    expect(Object.fromEntries(sink)).toEqual({
+      bare_name: ["bare_name"],
+      alpha__alpha_tool: ["alpha__alpha_tool"],
+    });
+  });
+
+  it("lists a name twice, one entry each, when two overrides collide, so the reader cannot take it for one tool", async () => {
+    load({
+      ...bothShareAnAlias(),
+      mappings: [
+        ...bothShareAnAlias().mappings,
+        {
+          namespaceUuid: NS,
+          serverUuid: ALPHA.uuid,
+          toolName: "second",
+          status: "ACTIVE",
+          overrideName: "shared",
+        },
+      ],
+    });
+    const sink = new Map<string, string[]>();
+
+    await list(["alpha__alpha_tool", "alpha__second"], sink);
+
+    expect(sink.get("alpha__shared")?.sort()).toEqual([
+      "alpha__alpha_tool",
+      "alpha__second",
+    ]);
+  });
+
+  it("fills only the sink of its own call, and none when the call passed none", async () => {
+    load(bothShareAnAlias());
+    const first = new Map<string, string[]>();
+    const second = new Map<string, string[]>();
+
+    await Promise.all([
+      list(["alpha__alpha_tool"], first),
+      list(["beta__beta_tool"], second),
+      list(["alpha__alpha_tool", "beta__beta_tool"]),
+    ]);
+
+    expect(Object.fromEntries(first)).toEqual({
+      alpha__shared: ["alpha__alpha_tool"],
+    });
+    expect(Object.fromEntries(second)).toEqual({
+      beta__shared: ["beta__beta_tool"],
+    });
+  });
+});
+
+describe("clearOverrideCache tells the listeners of the namespace whose overrides changed", () => {
+  it("runs a namespace's listeners for a clear of that namespace and for a clear of all, and no other namespace's", () => {
+    const mine = vi.fn();
+    const theirs = vi.fn();
+    const stopMine = onOverrideCacheCleared(NS, mine);
+    const stopTheirs = onOverrideCacheCleared("ns-other", theirs);
+
+    clearOverrideCache(NS);
+    expect([mine.mock.calls.length, theirs.mock.calls.length]).toEqual([1, 0]);
+
+    clearOverrideCache("ns-other");
+    expect([mine.mock.calls.length, theirs.mock.calls.length]).toEqual([1, 1]);
+
+    clearOverrideCache();
+    expect([mine.mock.calls.length, theirs.mock.calls.length]).toEqual([2, 2]);
+
+    clearOverrideCache("ns-unheard");
+    expect([mine.mock.calls.length, theirs.mock.calls.length]).toEqual([2, 2]);
+    stopMine();
+    stopTheirs();
+  });
+
+  it("stops running a listener once it is removed, and removes the namespace's entry with its last listener", () => {
+    const listener = vi.fn();
+    const other = vi.fn();
+    const stop = onOverrideCacheCleared(NS, listener);
+    const stopOther = onOverrideCacheCleared(NS, other);
+    expect(overrideChangeListenerCount(NS)).toBe(2);
+
+    stop();
+    stop();
+    clearOverrideCache(NS);
+    expect(listener).not.toHaveBeenCalled();
+    expect(other).toHaveBeenCalledTimes(1);
+    expect(overrideChangeListenerCount(NS)).toBe(1);
+
+    stopOther();
+    expect(overrideChangeListenerCount(NS)).toBe(0);
+  });
+
+  it("clears the cache first, then tells the listeners, and a listener that throws stops neither the others nor the clear", async () => {
+    load(bothShareAnAlias());
+    expect(await map("alpha__shared")).toBe("alpha__alpha_tool");
+    load(EMPTY);
+
+    let cachedWhenTold: string | undefined;
+    const first = vi.fn(() => {
+      throw new Error("listener fault");
+    });
+    const second = vi.fn();
+    const stopFirst = onOverrideCacheCleared(NS, first);
+    const stopSecond = onOverrideCacheCleared(NS, second);
+    const stopProbe = onOverrideCacheCleared(NS, () => {
+      // The alias is gone from the cache and the table, so it resolves to itself.
+      void map("alpha__shared").then((resolved) => {
+        cachedWhenTold = resolved;
+      });
+    });
+
+    expect(() => clearOverrideCache(NS)).not.toThrow();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    // The probe's lookup goes to the (empty) table: let it settle.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(cachedWhenTold).toBe("alpha__shared");
+    stopFirst();
+    stopSecond();
+    stopProbe();
   });
 });
