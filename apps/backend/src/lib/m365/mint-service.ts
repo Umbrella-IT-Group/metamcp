@@ -247,8 +247,23 @@ export class M365MintService {
     const startedAt = Date.now();
     const config = getM365BrokerConfig();
 
-    const repo = await this.getRepo();
-    const row = await repo.findByUserId(userId);
+    let row: M365UserTokenRow | undefined;
+    try {
+      const repo = await this.getRepo();
+      row = await repo.findByUserId(userId);
+    } catch (error) {
+      // This rejection flows through the injected fetch into SDK transport
+      // callbacks and tool-call logs. Only the typed, fixed message may leave
+      // the broker; a raw query error would carry its params to those logs.
+      logger.error(
+        `M365 broker: could not read the stored grant for user ${userId}:`,
+        describeDbError(error),
+      );
+      throw new M365BrokerError(
+        "mint_failed",
+        "Could not read your Microsoft 365 connection. Try again shortly.",
+      );
+    }
     // An invalidation can land while the read is in flight. This retired mint
     // has redeemed nothing yet, and its read may now return the NEW grant. Join
     // the current generation before using the row so two generations cannot

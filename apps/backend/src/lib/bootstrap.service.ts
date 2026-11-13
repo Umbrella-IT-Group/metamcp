@@ -349,21 +349,34 @@ function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input, "utf8").digest("hex");
 }
 
-function parseJsonArray<T>(envVar: string | undefined, defaultValue: T[]): T[] {
+function parseJsonArray<T>(envName: string, defaultValue: T[]): T[] {
+  const envVar = process.env[envName];
   if (!envVar) return defaultValue;
 
   try {
     const parsed = JSON.parse(envVar);
     if (!Array.isArray(parsed)) {
-      console.warn(
-        `⚠️ Environment variable is not an array, using default: ${envVar.slice(0, 50)}...`,
-      );
+      console.warn(`⚠️ ${envName} must be a JSON array; using default`);
       return defaultValue;
     }
     return parsed as T[];
   } catch (err) {
+    // V8 can quote the input, including a password or key, in a parse error.
+    // Keep only the class and a numeric offset from its fixed suffix.
+    const errorClass = err instanceof SyntaxError ? "SyntaxError" : "Error";
+    const position =
+      err instanceof SyntaxError
+        ? Number(
+            /\bat position (\d+)(?: \(line \d+ column \d+\))?$/.exec(
+              err.message,
+            )?.[1],
+          )
+        : NaN;
+    const location = Number.isSafeInteger(position)
+      ? ` at position ${position}`
+      : "";
     console.warn(
-      `⚠️ Failed to parse JSON array from environment variable: ${err}`,
+      `⚠️ Failed to parse ${envName} as a JSON array (${errorClass}${location}); using default`,
     );
     return defaultValue;
   }
@@ -382,10 +395,7 @@ function getOwnerEmail(config: {
 
 function parseEnvConfig(): EnvConfig {
   // Parse users array
-  const usersArray = parseJsonArray<UserConfig>(
-    process.env.BOOTSTRAP_USERS,
-    [],
-  );
+  const usersArray = parseJsonArray<UserConfig>("BOOTSTRAP_USERS", []);
 
   // If single user config exists and users array is empty, add it to array
   const singleUserEmail = nonEmpty(process.env.BOOTSTRAP_USER_EMAIL);
@@ -463,15 +473,9 @@ function parseEnvConfig(): EnvConfig {
     ),
 
     // Array configurations
-    apiKeys: parseJsonArray<ApiKeyConfig>(process.env.BOOTSTRAP_API_KEYS, []),
-    namespaces: parseJsonArray<NamespaceConfig>(
-      process.env.BOOTSTRAP_NAMESPACES,
-      [],
-    ),
-    endpoints: parseJsonArray<EndpointConfig>(
-      process.env.BOOTSTRAP_ENDPOINTS,
-      [],
-    ),
+    apiKeys: parseJsonArray<ApiKeyConfig>("BOOTSTRAP_API_KEYS", []),
+    namespaces: parseJsonArray<NamespaceConfig>("BOOTSTRAP_NAMESPACES", []),
+    endpoints: parseJsonArray<EndpointConfig>("BOOTSTRAP_ENDPOINTS", []),
   };
 }
 

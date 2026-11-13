@@ -258,7 +258,7 @@ describe("terminal error handler over a real socket", () => {
     expectNoInternals(raw);
   });
 
-  it("answers a synchronous throw with a constant 500 and logs the real error", async () => {
+  it("answers a synchronous throw with a constant 500 and logs a safe summary", async () => {
     const response = await fetch(`${baseUrl}/boom/sync`);
     const raw = await response.text();
 
@@ -267,11 +267,12 @@ describe("terminal error handler over a real socket", () => {
     expect(raw).not.toContain("pg://");
     expectNoInternals(raw);
 
-    // The detail is not lost — it goes to the operator, not the caller.
+    // SPEC: terminal failures can be repository errors. The summary contract
+    // keeps the route and class, never an arbitrary message or the raw Error.
     expect(loggerMock.error).toHaveBeenCalledTimes(1);
     const logged = loggerMock.error.mock.calls[0];
     expect(String(logged?.[0])).toContain("/boom/sync");
-    expect((logged?.[1] as Error).message).toContain("pg://");
+    expect(logged?.[1]).toBe("Error");
   });
 
   it("answers an async rejection with a constant 500 rather than hanging", async () => {

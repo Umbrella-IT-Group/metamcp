@@ -1,5 +1,6 @@
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 /**
@@ -33,8 +34,10 @@ import logger from "@/utils/logger";
  *    (413), but the BODY is the same two keys either way. A status code
  *    carries no internals; a message can, and body-parser's messages quote
  *    the offending input back.
- *  - anything else: a fixed 500. The full error goes to the server log,
- *    where the operator who needs the stack can read it, and nowhere else.
+ *  - anything else: a fixed 500. The server log keeps the route, error class
+ *    and database codes. Uncaught repository rejections reach this handler
+ *    from /m365/status and /m365/disconnect, so logging the full error would
+ *    copy the query and bound row values into the log.
  *
  * Registered LAST in `index.ts`, after every route mount, because Express
  * dispatches error middleware in registration order — one registered before
@@ -150,6 +153,9 @@ export const errorHandler = (
     return res.status(status).json(BAD_REQUEST_BODY);
   }
 
-  logger.error(`Unhandled error on ${req.method} ${req.path}:`, err);
+  logger.error(
+    `Unhandled error on ${req.method} ${req.path}:`,
+    describeDbError(err),
+  );
   return res.status(500).json(INTERNAL_ERROR_BODY);
 };

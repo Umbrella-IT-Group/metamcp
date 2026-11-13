@@ -1,6 +1,14 @@
 import { randomBytes } from "node:crypto";
+import { format } from "node:util";
 
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { afterEach, beforeEach, describe, expect, it, Mock, vi } from "vitest";
+
+import logger from "@/utils/logger";
+
+vi.mock("@/utils/logger", () => ({
+  default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
 
 // The mint service's default repo import pulls in the drizzle client,
 // which hard-requires DATABASE_URL at module load. Tests inject their
@@ -308,6 +316,46 @@ describe("M365MintService", () => {
     await expect(service.getAccessToken("user-1")).rejects.toMatchObject({
       code: "mint_failed",
     });
+  });
+
+  it("keeps a failed grant read out of transport errors and remains retryable", async () => {
+    const secret = "fake-mint-row-secret-iiii9999";
+    const query = 'select * from "m365_user_tokens" where "user_id" = $1';
+    const repo = makeRepo(activeRow());
+    repo.findByUserId.mockRejectedValueOnce(
+      new DrizzleQueryError(
+        query,
+        [secret],
+        Object.assign(new Error(secret), {
+          code: "23514",
+          constraint: "m365_user_tokens_check",
+          detail: `Failing row contains (${secret})`,
+        }),
+      ),
+    );
+    const fetchStub = vi.fn(async () => tokenResponse(goodMintBody()));
+    const service = new M365MintService(repo, fetchStub as typeof fetch);
+    vi.mocked(logger.error).mockClear();
+
+    // The injected fetch hands this rejection to the SDK's transport error
+    // callbacks. It must already be safe before those callbacks log it.
+    const failure = await service.getAccessToken("user-1").catch((e) => e);
+    expect(format(failure)).not.toContain(secret);
+    expect(format(failure)).not.toContain(query);
+    expect(failure).toBeInstanceOf(M365BrokerError);
+    expect(failure).toMatchObject({ code: "mint_failed" });
+    expect(fetchStub).not.toHaveBeenCalled();
+
+    const logged = vi
+      .mocked(logger.error)
+      .mock.calls.map((args) => format(...args))
+      .join("\n");
+    expect(logged).not.toContain(secret);
+    expect(logged).not.toContain(query);
+    expect(logged).toContain("23514");
+    expect(logged).toContain("m365_user_tokens_check");
+
+    expect(await service.getAccessToken("user-1")).toBe("fresh-graph-at");
   });
 
   it("invalidateUser drops the cached AT", async () => {

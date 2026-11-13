@@ -442,6 +442,13 @@ const getHttpHeaders = (
 
 const serverRouter = express.Router();
 
+// The Inspector's SDK includes response text in its error message. A fixed
+// message stays useful without serializing a query, its params or its cause.
+const PROXY_ERROR_BODY = {
+  error: "internal_server_error",
+  message: "MCP proxy request failed. Check the gateway logs for details.",
+} as const;
+
 // Auth (session) and authorization (admin-only) are applied once by the
 // parent router in `routers/mcp-proxy.ts`, so every route below is already
 // admin-gated by the time it runs. Do NOT mount this router anywhere else:
@@ -778,8 +785,8 @@ serverRouter.get("/mcp", async (req, res) => {
       await transport.handleRequest(req, res);
     }
   } catch (error) {
-    logger.error("Error in /mcp route:", error);
-    res.status(500).json(error);
+    logger.error("Error in /mcp route:", describeDbError(error));
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 
@@ -906,7 +913,7 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
       }
       // A throw after the response started cannot be answered with a status.
       if (!res.headersSent) {
-        res.status(500).json(error);
+        res.status(500).json(PROXY_ERROR_BODY);
       }
     }
   } else {
@@ -924,8 +931,8 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
         );
       }
     } catch (error) {
-      logger.error("Error in /mcp route:", error);
-      res.status(500).json(error);
+      logger.error("Error in /mcp route:", describeDbError(error));
+      res.status(500).json(PROXY_ERROR_BODY);
     }
   }
 });
@@ -961,8 +968,8 @@ serverRouter.delete("/mcp", async (req, res) => {
       );
       res.status(200).end();
     } catch (error) {
-      logger.error("Error in /mcp DELETE route:", error);
-      res.status(500).json(error);
+      logger.error("Error in /mcp DELETE route:", describeDbError(error));
+      res.status(500).json(PROXY_ERROR_BODY);
     }
   } else {
     res.status(400).end("Missing sessionId");
@@ -1133,7 +1140,7 @@ serverRouter.get("/stdio", async (req, res) => {
     });
   } catch (error) {
     logger.error("Error in /stdio route:", describeDbError(error));
-    res.status(500).json(error);
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 
@@ -1162,8 +1169,11 @@ serverRouter.get("/sse", async (req, res) => {
         res.status(404).json(error);
         return;
       } else if (JSON.stringify(error).includes("ECONNREFUSED")) {
-        logger.error("Connection refused. Is the MCP server running?");
-        res.status(500).json(error);
+        logger.error(
+          "Connection refused. Is the MCP server running?",
+          describeDbError(error),
+        );
+        res.status(500).json(PROXY_ERROR_BODY);
       } else {
         throw error;
       }
@@ -1212,7 +1222,7 @@ serverRouter.get("/sse", async (req, res) => {
     }
   } catch (error) {
     logger.error("Error in /sse route:", describeDbError(error));
-    res.status(500).json(error);
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 
@@ -1230,8 +1240,8 @@ serverRouter.post("/message", async (req, res) => {
     }
     await transport.handlePostMessage(req, res);
   } catch (error) {
-    logger.error("Error in /message route:", error);
-    res.status(500).json(error);
+    logger.error("Error in /message route:", describeDbError(error));
+    res.status(500).json(PROXY_ERROR_BODY);
   }
 });
 
