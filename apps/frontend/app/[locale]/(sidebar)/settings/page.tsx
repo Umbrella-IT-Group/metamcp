@@ -18,6 +18,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useTranslations } from "@/hooks/useTranslations";
+import {
+  DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS,
+  DEFAULT_MCP_TIMEOUT_MS,
+} from "@/lib/mcp-request-options";
 import { trpc } from "@/lib/trpc";
 
 export default function SettingsPage() {
@@ -34,9 +38,11 @@ export default function SettingsPage() {
   // Form setup
   const form = useForm<SettingsFormData>({
     resolver: zodResolver(SettingsFormSchema),
+    // Placeholders until the stored settings load (the effects below replace
+    // them with the stored values, which are never overridden by these).
     defaultValues: {
-      mcpTimeout: 60000,
-      mcpMaxTotalTimeout: 60000,
+      mcpTimeout: DEFAULT_MCP_TIMEOUT_MS,
+      mcpMaxTotalTimeout: DEFAULT_MCP_MAX_TOTAL_TIMEOUT_MS,
       mcpMaxAttempts: 1,
       sessionLifetime: null, // Default to infinite (null)
     },

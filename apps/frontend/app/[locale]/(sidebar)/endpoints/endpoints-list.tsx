@@ -17,6 +17,7 @@ import {
   Link,
   MoreHorizontal,
   Package,
+  Plug,
   Search,
   Trash2,
 } from "lucide-react";
@@ -25,6 +26,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { EditEndpoint } from "@/components/edit-endpoint";
+import { InstallClientDialog } from "@/components/install-client-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -67,6 +69,9 @@ export function EndpointsList({ onRefresh }: EndpointsListProps) {
     useState<EndpointWithNamespace | null>(null);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [endpointToEdit, setEndpointToEdit] =
+    useState<EndpointWithNamespace | null>(null);
+  const [installDialogOpen, setInstallDialogOpen] = useState(false);
+  const [endpointToInstall, setEndpointToInstall] =
     useState<EndpointWithNamespace | null>(null);
   const router = useRouter();
 
@@ -111,6 +116,11 @@ export function EndpointsList({ onRefresh }: EndpointsListProps) {
   const handleEditEndpoint = (endpoint: EndpointWithNamespace) => {
     setEndpointToEdit(endpoint);
     setEditDialogOpen(true);
+  };
+
+  const handleInstallEndpoint = (endpoint: EndpointWithNamespace) => {
+    setEndpointToInstall(endpoint);
+    setInstallDialogOpen(true);
   };
 
   const handleEditSuccess = (_updatedEndpoint: EndpointWithNamespace) => {
@@ -382,6 +392,10 @@ export function EndpointsList({ onRefresh }: EndpointsListProps) {
                 <Edit className="mr-2 h-4 w-4" />
                 {t("endpoints:list.editEndpoint")}
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => handleInstallEndpoint(endpoint)}>
+                <Plug className="mr-2 h-4 w-4" />
+                {t("inspector:installClient.action")}
+              </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => navigator.clipboard.writeText(endpoint.uuid)}
               >
@@ -582,6 +596,14 @@ export function EndpointsList({ onRefresh }: EndpointsListProps) {
           setEndpointToEdit(null);
         }}
         onSuccess={handleEditSuccess}
+      />
+
+      {/* Add to client: snippets for this endpoint. The endpoint is kept
+          after a close so the dialog does not lose its title mid-animation. */}
+      <InstallClientDialog
+        endpoint={endpointToInstall}
+        isOpen={installDialogOpen}
+        onClose={() => setInstallDialogOpen(false)}
       />
 
       {/* Delete Confirmation Dialog */}

@@ -18,6 +18,7 @@ import type { Server } from "node:http";
 import express from "express";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -44,7 +45,7 @@ import { auth } from "@/auth";
 import { m365TokensRepository } from "@/db/repositories/m365-tokens.repo";
 import { usersRepository } from "@/db/repositories/users.repo";
 
-import { decryptRefreshToken } from "../lib/m365/crypto";
+import { decryptRefreshToken, encryptRefreshToken } from "../lib/m365/crypto";
 import m365Router, { escapeHtml } from "./m365";
 
 // A stable 32-byte KEK for the whole suite.
@@ -341,6 +342,154 @@ describe("GET /m365/callback — happy path custody", () => {
     expect(await response.text()).toContain("offline_access");
     expect(repoMock.upsertEnrollment).not.toHaveBeenCalled();
   });
+});
+
+/**
+ * Which envelope version an enrollment writes. The stored value is bound to the
+ * ENROLLING user (v2) only when the operator turned binding on; with the flag
+ * unset a re-enrollment must never lower a row that is already bound, because an
+ * image rollback after binding is what forces every user to re-enroll. Oracle:
+ * the operator rule that only an explicit `1` lowers a row, plus NIST SP 800-38D
+ * 5.2.2 (a v2 envelope authenticates its context) for the "decrypts under this
+ * user, not another" checks. The bound context is inlined on purpose.
+ */
+describe("GET /m365/callback envelope version", () => {
+  const KEK = Buffer.alloc(32, 7);
+  const ctxFor = (userId: string) => `m365-refresh-token:${userId}`;
+
+  async function enroll(): Promise<string> {
+    signInAs("user-1");
+    const state = await startEnrollment();
+    entraExchange.mockResolvedValue(
+      new Response(JSON.stringify(goodExchangeBody()), { status: 200 }),
+    );
+    const response = await realFetch(
+      `${baseUrl}/m365/callback?code=c&state=${encodeURIComponent(state)}`,
+    );
+    expect(response.status).toBe(200);
+    return repoMock.upsertEnrollment.mock.calls[0][0].rt_ciphertext as string;
+  }
+
+  function existingRow(version: "v1" | "v2") {
+    return {
+      user_id: "user-1",
+      entra_oid: "oid-abc",
+      rt_ciphertext: encryptRefreshToken(
+        "old-rt",
+        KEK,
+        "k1",
+        version === "v2" ? ctxFor("user-1") : undefined,
+      ),
+    };
+  }
+
+  beforeEach(() => {
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "");
+    vi.stubEnv("M365_ENVELOPE_STRICT", "");
+  });
+  afterEach(() => {
+    // Do not leak a policy flag into the describes that follow.
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "");
+    vi.stubEnv("M365_ENVELOPE_STRICT", "");
+  });
+
+  it("with the write version 2 stores a v2 envelope that opens under this user and not another", async () => {
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "2");
+    const stored = await enroll();
+
+    expect(stored.startsWith("v2.")).toBe(true);
+    expect(decryptRefreshToken(stored, KEK, ctxFor("user-1"))).toBe(
+      "entra-rt-plaintext",
+    );
+    expect(() => decryptRefreshToken(stored, KEK, ctxFor("user-2"))).toThrow();
+  });
+
+  it("with the flag unset, re-enrolling over an existing v2 row stays v2", async () => {
+    repoMock.findByUserId.mockResolvedValue(existingRow("v2"));
+    const stored = await enroll();
+
+    expect(stored.startsWith("v2.")).toBe(true);
+    expect(decryptRefreshToken(stored, KEK, ctxFor("user-1"))).toBe(
+      "entra-rt-plaintext",
+    );
+  });
+
+  it("with the flag unset, a first enrollment or a v1 row stays v1", async () => {
+    expect((await enroll()).startsWith("v1.")).toBe(true);
+    repoMock.upsertEnrollment.mockClear();
+    repoMock.findByUserId.mockResolvedValue(existingRow("v1"));
+    expect((await enroll()).startsWith("v1.")).toBe(true);
+  });
+
+  it("an explicit write version of 1 stores v1 even over a v2 row", async () => {
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+    repoMock.findByUserId.mockResolvedValue(existingRow("v2"));
+    expect((await enroll()).startsWith("v1.")).toBe(true);
+  });
+
+  it("an unrecognised write version never lowers a bound row", async () => {
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "bogus-router-flag");
+    repoMock.findByUserId.mockResolvedValue(existingRow("v2"));
+    expect((await enroll()).startsWith("v2.")).toBe(true);
+  });
+
+  it("strict stores v2 whatever the row held", async () => {
+    vi.stubEnv("M365_ENVELOPE_STRICT", "1");
+    repoMock.findByUserId.mockResolvedValue(existingRow("v1"));
+    expect((await enroll()).startsWith("v2.")).toBe(true);
+  });
+
+  it.each(["1", "yes"])(
+    "strict=%s with write version 1 replaces a planted v1 token with the fresh enrollment, bound as v2",
+    async (strict) => {
+      vi.stubEnv("M365_ENVELOPE_STRICT", strict);
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+      repoMock.findByUserId.mockResolvedValue({
+        ...existingRow("v1"),
+        rt_ciphertext: encryptRefreshToken("foreign-rt", KEK, "k1"),
+      });
+
+      const stored = await enroll();
+
+      expect(stored.startsWith("v2.")).toBe(true);
+      expect(decryptRefreshToken(stored, KEK, ctxFor("user-1"))).toBe(
+        "entra-rt-plaintext",
+      );
+      expect(() =>
+        decryptRefreshToken(stored, KEK, ctxFor("user-2")),
+      ).toThrow();
+    },
+  );
+
+  it("a failed row lookup still enrolls, following the policy alone", async () => {
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "2");
+    repoMock.findByUserId.mockRejectedValue(new Error("pg down"));
+    expect((await enroll()).startsWith("v2.")).toBe(true);
+  });
+
+  it.each(["", "unrecognised-version"])(
+    "does not overwrite an unknown row version after a failed lookup in keep mode (%j)",
+    async (writeVersion) => {
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", writeVersion);
+      signInAs("user-1");
+      const state = await startEnrollment();
+      entraExchange.mockResolvedValue(
+        new Response(JSON.stringify(goodExchangeBody()), { status: 200 }),
+      );
+      // A failed read does not establish that there is no bound row. Defaulting
+      // it to v1 would turn a transient read failure into an implicit rollback.
+      repoMock.findByUserId.mockRejectedValue(
+        new Error("read connection lost"),
+      );
+
+      const response = await realFetch(
+        `${baseUrl}/m365/callback?code=c&state=${encodeURIComponent(state)}`,
+      );
+
+      expect(response.status).toBe(500);
+      expect(repoMock.upsertEnrollment).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("status + disconnect", () => {

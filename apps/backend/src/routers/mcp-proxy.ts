@@ -19,6 +19,18 @@ mcpProxyRouter.use(helmet());
 // falsy origin with the literal `*` beside `credentials: true`, while a
 // trailing slash makes the string comparison miss and drops CORS for the app's
 // own frontend. See ../lib/cors-policy.
+//
+// `exposedHeaders` is set here, through the cors package, and not by a
+// separate middleware: a trusted origin needs `mcp-session-id` to be readable,
+// and the package emits `Access-Control-Expose-Headers` only when it grants an
+// origin. This used to be three `res.header("Access-Control-Expose-Headers",
+// ...)` calls in a row, and `res.header` is `res.set`, which REPLACES the
+// header, so only the last value (`last-event-id`, a request header that
+// exposes nothing) ever survived, `mcp-session-id` was the one lost, and it was
+// sent for every origin including ones the allowlist refused.
+// `mcp-protocol-version` is allowed because the 2025-11-25 transport spec has a
+// client send it on every request after initialize and it is not
+// CORS-safelisted.
 mcpProxyRouter.use(
   cors({
     origin: credentialedCorsOrigin,
@@ -27,21 +39,15 @@ mcpProxyRouter.use(
       "Content-Type",
       "Authorization",
       "mcp-session-id",
+      "mcp-protocol-version",
       "x-custom-auth-header",
       "last-event-id",
     ],
+    exposedHeaders: ["mcp-session-id"],
   }),
 );
 
 // Basic authentication disabled for easier OAuth integration
-
-// Apply additional headers
-mcpProxyRouter.use((req, res, next) => {
-  res.header("Access-Control-Expose-Headers", "mcp-session-id");
-  res.header("Access-Control-Expose-Headers", "authorization");
-  res.header("Access-Control-Expose-Headers", "last-event-id");
-  next();
-});
 
 // Authentication, then account validity, then authorization for the WHOLE
 // proxy surface. All three live here at the parent router rather than inside
