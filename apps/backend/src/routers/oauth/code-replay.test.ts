@@ -11,20 +11,18 @@
  * What is pinned here:
  *
  *  1. The first redemption records a spent code in the SAME transaction as the
- *     token pair, carrying the pair's family (R1), and a failed record write
- *     fails the grant rather than issuing a pair nothing could be tied back to
- *     (R10).
+ *     token pair, carrying the pair's family, and a failed record write fails
+ *     the grant rather than issuing a pair nothing could be tied back to.
  *  2. A replay that proves possession of the original exchange (same client,
  *     same redirect, a verifier matching the stored challenge, and the secret
  *     for a confidential client) is audited and, under OAUTH_CODE_REPLAY=revoke,
- *     revokes the family. The caller's answer is the unchanged invalid_grant
- *     (R2, R2b, R6).
+ *     revokes the family. The caller's answer is the unchanged invalid_grant.
  *  3. A presentation that does NOT prove that possession changes nothing and
- *     writes nothing (R3, R4, R8): a code in a redirect URL is something an
- *     observer can have, and detection must not become a way to log someone out.
- *  4. One compromised code writes one audit row however often it is replayed
- *     (R5). The default mode audits without revoking (R7). `off` touches no
- *     table and writes no row (R11).
+ *     writes nothing: a code in a redirect URL is something an observer can
+ *     have, and detection must not become a way to log someone out.
+ *  4. One compromised code writes one audit row however often it is replayed.
+ *     The default mode audits without revoking. `off` touches no table and
+ *     writes no row.
  *
  * Same harness as token.test.ts and refresh-token-reuse.test.ts: the router is
  * driven as express middleware against fake req/res, the repository is mocked
@@ -388,7 +386,7 @@ describe("OAUTH_CODE_REPLAY resolution", () => {
   });
 });
 
-describe("first redemption records the spent code (R1, R10)", () => {
+describe("first redemption records the spent code", () => {
   beforeEach(() => {
     oauthRepositoryMock.getAuthCode.mockResolvedValue(liveCodeRow());
   });
@@ -459,7 +457,7 @@ describe("first redemption records the spent code (R1, R10)", () => {
     );
   });
 
-  it("leaves a code alone when the verifier is wrong, and a later correct redemption works (R8)", async () => {
+  it("leaves a code alone when the verifier is wrong, and a later correct redemption works", async () => {
     // Characterization of the standing policy that a refused redemption does
     // not burn the code. Proven by the injected defect, not by red on parent.
     const refused = await postToken(
@@ -475,7 +473,7 @@ describe("first redemption records the spent code (R1, R10)", () => {
   });
 });
 
-describe("a replay that proves possession is audited and, in revoke mode, revokes (R2, R2b)", () => {
+describe("a replay that proves possession is audited and, in revoke mode, revokes", () => {
   beforeEach(() => {
     armReplay();
     process.env.OAUTH_CODE_REPLAY = "revoke";
@@ -572,7 +570,7 @@ describe("a replay that proves possession is audited and, in revoke mode, revoke
   });
 });
 
-describe("a presentation that does not prove possession changes nothing (R3, R4)", () => {
+describe("a presentation that does not prove possession changes nothing", () => {
   beforeEach(() => {
     armReplay();
     process.env.OAUTH_CODE_REPLAY = "revoke";
@@ -636,7 +634,7 @@ describe("a presentation that does not prove possession changes nothing (R3, R4)
   });
 });
 
-describe("one compromised code produces one audit row (R5)", () => {
+describe("one compromised code produces one audit row", () => {
   it("a second validated replay finds the record consumed and acts on nothing", async () => {
     armReplay();
     process.env.OAUTH_CODE_REPLAY = "revoke";
@@ -658,7 +656,7 @@ describe("one compromised code produces one audit row (R5)", () => {
   });
 });
 
-describe("a replay that lost the race for the live code (R6)", () => {
+describe("a replay that lost the race for the live code", () => {
   beforeEach(() => {
     armReplay();
     // This request read the live code and passed every check; another request
@@ -701,7 +699,7 @@ describe("a replay that lost the race for the live code (R6)", () => {
   });
 });
 
-describe("the default mode audits without revoking (R7)", () => {
+describe("the default mode audits without revoking", () => {
   beforeEach(() => {
     armReplay();
   });
@@ -752,7 +750,7 @@ describe("the default mode audits without revoking (R7)", () => {
   });
 });
 
-describe("OAUTH_CODE_REPLAY=off touches nothing (R11)", () => {
+describe("OAUTH_CODE_REPLAY=off touches nothing", () => {
   beforeEach(() => {
     armReplay();
     process.env.OAUTH_CODE_REPLAY = "off";
