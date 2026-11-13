@@ -2,6 +2,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import { backendErrorTextForLogging } from "./backend-auth-rejection";
 import { ConnectedClient } from "./client";
 import { isRecoverableBackendError } from "./session-error";
 
@@ -82,9 +83,9 @@ export async function requestWithSessionRecovery<T>(
     }
 
     logger.warn(
-      `Backend connection lost for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${
-        error instanceof Error ? error.message : String(error)
-      })`,
+      `Backend connection lost for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${backendErrorTextForLogging(
+        error,
+      )})`,
     );
 
     await opts.pool.invalidateServerConnection(opts.sessionId, opts.serverUuid);

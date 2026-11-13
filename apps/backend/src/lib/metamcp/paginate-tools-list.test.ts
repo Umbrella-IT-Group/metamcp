@@ -143,6 +143,38 @@ describe("collectToolsListPages", () => {
   });
 });
 
+describe("a backend that answers every request with the same page and an empty cursor", () => {
+  it("is fetched twice, stopped as a repeat, and flattened to each tool once", async () => {
+    const { fetchPage, requested } = backend({
+      "": { tools: [{ name: "a" }, { name: "b" }], nextCursor: "" },
+    });
+
+    const result = await collectToolsListPages(fetchPage);
+
+    // The first page is asked for twice (no cursor, then ""), so the gathered
+    // pages hold its tools twice; the stopped listing keeps the first of each.
+    expect(requested).toEqual([undefined, ""]);
+    expect(result.pages).toHaveLength(2);
+    expect(result.stopped).toBe("cursor_repeat");
+    expect(flattenToolPages(result).map((t) => t.name)).toEqual(["a", "b"]);
+  });
+
+  it("keeps distinct pages behind a real empty cursor, in order (control)", async () => {
+    const result = await collectToolsListPages(async (cursor) =>
+      cursor === undefined
+        ? { tools: [{ name: "a" }], nextCursor: "" }
+        : { tools: [{ name: "b" }, { name: "c" }] },
+    );
+
+    expect(result.stopped).toBeUndefined();
+    expect(flattenToolPages(result).map((t) => t.name)).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+  });
+});
+
 describe("flattenToolPages", () => {
   it("de-duplicates by name only when the listing was stopped (first wins)", () => {
     const pages: Page[] = [

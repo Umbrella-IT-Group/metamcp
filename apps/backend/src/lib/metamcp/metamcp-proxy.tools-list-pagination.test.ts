@@ -19,6 +19,7 @@
 import { inspect } from "node:util";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
@@ -272,6 +273,30 @@ describe("a backend whose cursors cycle", () => {
     expect(truncationEvents()).toHaveLength(0);
   });
 
+  it("serves each tool once, writes no catalog rows and reports once when every page carries an empty cursor", async () => {
+    // An opaque cursor can be "", so the loop follows it. A backend that
+    // answers every request with the same page and nextCursor "" is asked for
+    // that page twice before the repeat guard stops, and the gathered pages
+    // hold its tools twice.
+    const target = await pagedBackend({
+      "": { tools: ["a", "b"], next: "" },
+    });
+    const warn = vi.mocked(logger.warn);
+    warn.mockClear();
+    const update = vi.spyOn(toolsSyncCache, "update");
+
+    const names = await listNames(await consumer());
+
+    expect(names).toEqual(["ninja__a", "ninja__b"]);
+    expect(target.requests()).toBe(2);
+    expect(syncToolsMock).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(truncationEvents()).toHaveLength(1);
+    // The repeats were dropped as one listing's duplicates, not through the
+    // cross-server collision path (which warns about two servers).
+    expect(inspect(warn.mock.calls)).not.toContain("collision");
+  });
+
   it("still writes a complete multi-page listing (control)", async () => {
     await pagedBackend({
       "": { tools: ["a"], next: "p2" },
@@ -323,6 +348,32 @@ describe("a tool lookup on a listing it cannot finish", () => {
     expect(truncationEvents()[0].message).toContain("(tool lookup)");
   });
 
+  it("stops after two requests when every page carries an empty cursor, routes a listed name and reports once", async () => {
+    const target = await pagedBackend({ "": { tools: ["a", "b"], next: "" } });
+
+    const result = await (
+      await consumer()
+    ).request(
+      { method: "tools/call", params: { name: "ninja__b", arguments: {} } },
+      CallToolResultSchema,
+    );
+
+    expect(result.content).toEqual([{ type: "text", text: "ran b" }]);
+    expect(target.requests()).toBe(2);
+    expect(truncationEvents()).toHaveLength(1);
+    expect(truncationEvents()[0].message).toContain("(tool lookup)");
+  });
+
+  it("answers backend unavailable for a name missing from a listing that repeats an empty cursor", async () => {
+    await pagedBackend({ "": { tools: ["a", "b"], next: "" } });
+
+    const error = await callError(await consumer(), "ninja__z");
+
+    expect(error.message).not.toContain("Unknown tool");
+    expect(error.message).toContain("tool_lookup_failed");
+    expect(truncationEvents()).toHaveLength(1);
+  });
+
   it("still says Unknown tool when a complete listing lacks the name (control)", async () => {
     await pagedBackend({ "": { tools: ["a"] } });
 
@@ -367,5 +418,84 @@ describe("refused backend listing logs", () => {
     expect(messages).toContain(`HTTP ${status}`);
     expect(messages).not.toContain(body);
     expect(inspect(record.mock.calls, { depth: null })).not.toContain(body);
+  });
+});
+
+describe("a refusal met while recovering or acquiring a session", () => {
+  const body = "private-backend-listing-response";
+  const refusal = (status: number) =>
+    new StreamableHTTPError(status, `Error POSTing to endpoint: ${body}`);
+  const allLogs = () =>
+    [logger.error, logger.warn, logger.info, logger.debug].map((fn) =>
+      vi.mocked(fn),
+    );
+  const logged = () =>
+    inspect(
+      allLogs().flatMap((fn) => fn.mock.calls),
+      { depth: null },
+    );
+
+  it.each([401, 403] as const)(
+    "keeps the HTTP %s body out of the lookup's recovery line when the body reads as a lost connection",
+    async (status) => {
+      // The lost-connection detector matches body text, so a refusal quoting
+      // "Not connected" is retried, and the retry line used to quote the body.
+      const target = await makeHttpRefusingBackend([status], {
+        body: `Not connected ${body}`,
+      });
+      cleanups.push(() => target.close());
+      getSessionMock.mockResolvedValue(target.session);
+      allLogs().forEach((fn) => fn.mockClear());
+
+      const error = await callError(await consumer(), "ninja__z");
+
+      expect(error.message).toContain("tool_lookup_failed");
+      // The recovery ran, so the line under test was built.
+      expect(target.requests).toEqual(["tools/list", "tools/list"]);
+      expect(logged()).toContain(`HTTP ${status}`);
+      expect(logged()).not.toContain(body);
+    },
+  );
+
+  it.each([401, 403] as const)(
+    "keeps the HTTP %s body out of the log when re-acquiring the session rejects with it",
+    async (status) => {
+      const target = await makeHttpRefusingBackend([status], {
+        body: `Not connected ${body}`,
+      });
+      cleanups.push(() => target.close());
+      getSessionMock
+        .mockResolvedValueOnce(target.session)
+        .mockRejectedValue(refusal(status));
+      allLogs().forEach((fn) => fn.mockClear());
+
+      const error = await callError(await consumer(), "ninja__z");
+
+      expect(error.message).toContain("no_session");
+      expect(logged()).toContain(`HTTP ${status}`);
+      expect(logged()).not.toContain(body);
+    },
+  );
+
+  it.each([401, 403] as const)(
+    "keeps the HTTP %s body out of the listing log when acquiring the session rejects with it",
+    async (status) => {
+      getSessionMock.mockRejectedValue(refusal(status));
+      allLogs().forEach((fn) => fn.mockClear());
+
+      await listNames(await consumer()).catch(() => undefined);
+
+      expect(logged()).toContain(`HTTP ${status}`);
+      expect(logged()).not.toContain(body);
+    },
+  );
+
+  it("keeps the diagnostic when acquiring the session rejects with a 502 (negative control)", async () => {
+    getSessionMock.mockRejectedValue(refusal(502));
+    allLogs().forEach((fn) => fn.mockClear());
+
+    await listNames(await consumer()).catch(() => undefined);
+
+    expect(logged()).toContain(body);
   });
 });

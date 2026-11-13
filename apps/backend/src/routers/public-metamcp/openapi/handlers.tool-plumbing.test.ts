@@ -113,9 +113,14 @@ async function backend(onCall: Parameters<typeof makeBackend>[0]) {
   return made;
 }
 
-/** A backend whose tools/list pages by `pages[cursor ?? ""]`. */
+/**
+ * A backend whose tools/list pages by `pages[cursor ?? firstPageKey]`. The
+ * first request carries no cursor, so a listing whose second page sits behind
+ * a real "" cursor names its first page with `firstPageKey`.
+ */
 async function pagedBackend(
   pages: Record<string, { tools: string[]; next?: string }>,
+  firstPageKey = "",
 ) {
   let requests = 0;
   const server = new Server(
@@ -127,7 +132,7 @@ async function pagedBackend(
     // Tripwire: after 200 requests the listing simply ends, so an unguarded
     // loop finishes and fails the request-count assertions instead of hanging.
     if (requests > 200) return { tools: [] };
-    const page = pages[request.params?.cursor ?? ""];
+    const page = pages[request.params?.cursor ?? firstPageKey];
     return {
       tools: page.tools.map((name) => ({
         name,
@@ -355,6 +360,41 @@ describe("OpenAPI bridge refused listing logs", () => {
   );
 });
 
+describe("OpenAPI bridge listing recovery line for a refusal", () => {
+  it.each([401, 403] as const)(
+    "keeps the HTTP %s body out of the recovery WARN when the body reads as a lost connection",
+    async (status) => {
+      // The lost-connection detector matches body text, so a refusal quoting
+      // "Not connected" is retried, and the retry line used to quote the body.
+      const made = await makeHttpRefusingBackend([status], {
+        serverName: "autotask",
+        body: `Not connected ${BODY_SECRET}`,
+      });
+      cleanups.push(() => made.close());
+      getSessionMock.mockResolvedValue(made.session);
+      const logs = [logger.error, logger.warn, logger.info, logger.debug].map(
+        (fn) => vi.mocked(fn),
+      );
+      logs.forEach((fn) => fn.mockClear());
+
+      const result = await createOriginalListToolsHandler()(
+        { method: "tools/list", params: {} },
+        context,
+      );
+
+      expect(result.tools).toEqual([]);
+      // The recovery ran (a second request), so the line under test was built.
+      expect(made.requests).toHaveLength(2);
+      const messages = inspect(
+        logs.flatMap((fn) => fn.mock.calls),
+        { depth: null },
+      );
+      expect(messages).toContain(`HTTP ${status}`);
+      expect(messages).not.toContain(BODY_SECRET);
+    },
+  );
+});
+
 describe("OpenAPI bridge tools/list paging", () => {
   const list = () =>
     createOriginalListToolsHandler()(
@@ -371,6 +411,41 @@ describe("OpenAPI bridge tools/list paging", () => {
     const names = (await list()).tools.map((t) => t.name).sort();
 
     expect(names).toEqual(["autotask__a", "autotask__b"]);
+  });
+
+  it("serves each tool once and reports once when every page carries an empty cursor", async () => {
+    const record = vi
+      .spyOn(metamcpLogStore, "record")
+      .mockImplementation(() => undefined);
+    const target = await pagedBackend({ "": { tools: ["a", "b"], next: "" } });
+
+    const names = (await list()).tools.map((t) => t.name).sort();
+
+    expect(names).toEqual(["autotask__a", "autotask__b"]);
+    expect(target.requests()).toBe(2);
+    const truncations = record.mock.calls
+      .map(([entry]) => entry)
+      .filter((entry) => entry.message.startsWith("Tool listing for server"));
+    expect(truncations).toHaveLength(1);
+  });
+
+  it("still lists every page behind a real empty cursor, with no report (control)", async () => {
+    const record = vi
+      .spyOn(metamcpLogStore, "record")
+      .mockImplementation(() => undefined);
+    const target = await pagedBackend(
+      {
+        start: { tools: ["a"], next: "" },
+        "": { tools: ["b"] },
+      },
+      "start",
+    );
+
+    const names = (await list()).tools.map((t) => t.name).sort();
+
+    expect(names).toEqual(["autotask__a", "autotask__b"]);
+    expect(target.requests()).toBe(2);
+    expect(record).not.toHaveBeenCalled();
   });
 
   it("stops on a repeated cursor, serves what it gathered, and reports it", async () => {

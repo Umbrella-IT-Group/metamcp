@@ -1764,7 +1764,7 @@ export class McpServerPool {
       if (isPingAnsweredError(error)) return stillCurrent();
       logger.info(
         `tools/list re-notify probe: server ${params.name} (${serverUuid}) did not answer tools/list yet:`,
-        error,
+        backendErrorForLogging(error),
       );
       return false;
     }

@@ -123,3 +123,15 @@ export function backendErrorForLogging(error: unknown): unknown {
     ? describeBackendAuthRejection(rejection.status, "request")
     : error;
 }
+
+/**
+ * The same value as text, for a log line that quotes the failure inline (the
+ * "envelope" of a recovery WARN) instead of passing the error as a log
+ * argument. The lost-connection detectors match their markers anywhere in the
+ * message, so a refusal whose body happens to mention one is retried and its
+ * line is built: this keeps the body out of that line too.
+ */
+export function backendErrorTextForLogging(error: unknown): string {
+  const safe = backendErrorForLogging(error);
+  return safe instanceof Error ? safe.message : String(safe);
+}

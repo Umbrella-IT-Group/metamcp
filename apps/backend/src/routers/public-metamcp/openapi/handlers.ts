@@ -17,7 +17,10 @@ import {
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "../../../lib/metamcp/audit-listing-log";
-import { backendErrorForLogging } from "../../../lib/metamcp/backend-auth-rejection";
+import {
+  backendErrorForLogging,
+  backendErrorTextForLogging,
+} from "../../../lib/metamcp/backend-auth-rejection";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
 import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
 import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
@@ -199,9 +202,9 @@ export const createOriginalListToolsHandler = (
             // the stale pool entry, re-acquire a fresh session, retry
             // once.
             logger.warn(
-              `OpenAPI bridge: backend connection lost for server ${mcpServerUuid} on tools/list; invalidating pool and retrying once. (envelope: ${
-                error instanceof Error ? error.message : String(error)
-              })`,
+              `OpenAPI bridge: backend connection lost for server ${mcpServerUuid} on tools/list; invalidating pool and retrying once. (envelope: ${backendErrorTextForLogging(
+                error,
+              )})`,
             );
             await mcpServerPool.invalidateServerConnection(
               context.sessionId,

@@ -34,6 +34,7 @@ import {
 } from "./audit-listing-log";
 import {
   backendErrorForLogging,
+  backendErrorTextForLogging,
   classifyBackendAuthRejection,
   describeBackendAuthRejection,
 } from "./backend-auth-rejection";
@@ -940,7 +941,7 @@ export const createServer = async (
       if (!audit) {
         logger.error(
           `Error preparing tools listing for: ${params.name || mcpServerUuid}`,
-          outcome.reason,
+          backendErrorForLogging(outcome.reason),
         );
       }
       noteAuditSkip(
@@ -1102,9 +1103,9 @@ export const createServer = async (
         return { kind: "lookup_failed" };
       }
       logger.warn(
-        `Backend connection lost for server ${candidate.uuid} on dynamic tools/list while routing tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${
-          error instanceof Error ? error.message : String(error)
-        })`,
+        `Backend connection lost for server ${candidate.uuid} on dynamic tools/list while routing tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${backendErrorTextForLogging(
+          error,
+        )})`,
       );
       let fresh: ConnectedClient | undefined;
       try {
@@ -1125,7 +1126,7 @@ export const createServer = async (
       } catch (recoveryError) {
         logger.error(
           `Failed to re-initialize session for server ${candidate.uuid} after backend session loss during dynamic tool routing:`,
-          recoveryError,
+          backendErrorForLogging(recoveryError),
         );
         return { kind: "no_session" };
       }
@@ -1266,7 +1267,9 @@ export const createServer = async (
     // not. Linked here, after routing: a cancel that arrived while the call
     // was being routed is already aborted at this point, and the SDK then
     // refuses the request before anything is sent (shared/protocol.js,
-    // `signal.throwIfAborted()` ahead of the send).
+    // `signal.throwIfAborted()` ahead of the send). The SDK ignores a cancel
+    // for request id 0, which a tools/call never has from the TypeScript and
+    // Python SDKs (see linkCallerSignal for the known limitation).
     const unlink =
       cancelOn && callExtra
         ? linkCallerSignal(
@@ -1652,10 +1655,12 @@ export const createServer = async (
       }
       throw error;
     } finally {
-      // After the chain settles and before the SDK sends the result, so every
-      // relayed notification precedes the result on the same stream. Bounded
-      // and never rejects; it also closes the relay (nothing is written after
-      // the result).
+      // After the chain settles and before the SDK sends the result, so
+      // relayed notifications precede the result on the same stream for up to
+      // five seconds; after that queued progress is dropped and at most one
+      // send already in flight can arrive after the result (the exact
+      // guarantee is in tool-progress-relay.ts). Never rejects; it also closes
+      // the relay, so nothing queued or arriving later is written.
       await relay?.flush();
     }
   });

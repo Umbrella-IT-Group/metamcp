@@ -65,6 +65,7 @@ type Internals = {
   }) => Promise<unknown>;
   checkIdleSessionHealth: () => Promise<void>;
   sweepToolDefinitions: () => Promise<void>;
+  toolsSweepLastHash: Record<string, string>;
 };
 
 let pool: McpServerPool;
@@ -185,6 +186,34 @@ describe("tool-definition sweep pagination guard", () => {
     expect(truncations[0].message).toContain("tool-definition sweep");
   });
 
+  it("hashes each tool once when every page carries an empty cursor", async () => {
+    const record = vi
+      .spyOn(metamcpLogStore, "record")
+      .mockImplementation(() => undefined);
+    const tools = [
+      { name: "a", description: "d", inputSchema: {} },
+      { name: "b", description: "d", inputSchema: {} },
+    ];
+    const client = stuckClient();
+    client.client.request.mockResolvedValue({ tools, nextCursor: "" });
+    internals.activeSessions["session-A"] = { "server-1": client };
+    internals.serverParamsCache["server-1"] = { name: "ninja" };
+
+    await internals.sweepToolDefinitions();
+
+    // The proxy serves a, b once; the sweep must hash that same set, or every
+    // tick would read a backend with this shape as changed.
+    expect(client.client.request).toHaveBeenCalledTimes(2);
+    expect(internals.toolsSweepLastHash["server-1"]).toBe(
+      toolsSyncCache.hashTools(tools),
+    );
+    expect(
+      record.mock.calls.filter(([entry]) =>
+        entry.message.startsWith("Tool listing for server"),
+      ),
+    ).toHaveLength(1);
+  });
+
   it.each([401, 403] as const)(
     "keeps a refused sweep's HTTP %s body out of debug logs",
     async (status) => {
@@ -203,6 +232,26 @@ describe("tool-definition sweep pagination guard", () => {
       expect(client.client.request).toHaveBeenCalledTimes(1);
       expect(inspect(debug.mock.calls)).toContain(`HTTP ${status}`);
       expect(inspect(debug.mock.calls)).not.toContain(body);
+    },
+  );
+
+  it.each([401, 403] as const)(
+    "keeps a refused re-notify probe's HTTP %s body out of the log",
+    async (status) => {
+      const body = "private-probe-response";
+      const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+      const client = stuckClient();
+      client.client.request.mockRejectedValue(
+        new StreamableHTTPError(status, `Error POSTing to endpoint: ${body}`),
+      );
+      internals.idleSessions["server-1"] = client;
+
+      await expect(
+        pool.probeServerTools({ uuid: "server-1", name: "ninja" } as never),
+      ).resolves.toBe(false);
+
+      expect(inspect(info.mock.calls)).toContain(`HTTP ${status}`);
+      expect(inspect(info.mock.calls)).not.toContain(body);
     },
   );
 

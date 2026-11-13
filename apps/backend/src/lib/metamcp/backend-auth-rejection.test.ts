@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   backendErrorForLogging,
+  backendErrorTextForLogging,
   classifyBackendAuthRejection,
   describeBackendAuthRejection,
 } from "./backend-auth-rejection";
@@ -225,5 +226,24 @@ describe("backendErrorForLogging", () => {
   it("preserves the diagnostic error for other failures", async () => {
     const error = await postError(502, "bad gateway");
     expect(backendErrorForLogging(error)).toBe(error);
+  });
+});
+
+describe("backendErrorTextForLogging", () => {
+  it.each([401, 403] as const)(
+    "is the fixed text for an HTTP %s answer, even when its body reads as a lost connection",
+    async (status) => {
+      const error = await postError(status, "Not connected private body");
+      expect(backendErrorTextForLogging(error)).toBe(
+        `the backend answered the request with HTTP ${status}`,
+      );
+    },
+  );
+
+  it("is the message of any other Error, and the string form of anything else", async () => {
+    const error = await postError(502, "bad gateway");
+    expect(backendErrorTextForLogging(error)).toBe(error.message);
+    expect(backendErrorTextForLogging("plain")).toBe("plain");
+    expect(backendErrorTextForLogging(undefined)).toBe("undefined");
   });
 });

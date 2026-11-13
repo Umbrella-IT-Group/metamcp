@@ -1,5 +1,10 @@
+import { inspect } from "node:util";
+
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ServerParameters } from "@repo/zod-types";
 import { describe, expect, it, vi } from "vitest";
+
+import logger from "@/utils/logger";
 
 import { ConnectedClient } from "./client";
 import {
@@ -146,5 +151,51 @@ describe("requestWithSessionRecovery", () => {
       requestWithSessionRecovery({ ...baseOpts(pool, stale), attempt }),
     ).rejects.toBe(secondFailure);
     expect(attempt).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("requestWithSessionRecovery envelope line for a backend refusal", () => {
+  // A refusal whose body happens to read as a lost connection is still
+  // recoverable (the detector matches the body text), so the recovery runs and
+  // its WARN quotes the failure. The status stays, the backend's text does not.
+  const BODY_SECRET = "backend-body-text-that-must-not-be-logged";
+  const refusal = (status: number, body: string) =>
+    new StreamableHTTPError(status, `Error POSTing to endpoint: ${body}`);
+
+  it.each([401, 403] as const)(
+    "names HTTP %s and keeps the response body out of the line",
+    async (status) => {
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+      const attempt = vi
+        .fn()
+        .mockRejectedValueOnce(refusal(status, `Not connected ${BODY_SECRET}`))
+        .mockResolvedValueOnce(["tool-a"]);
+
+      await requestWithSessionRecovery({
+        ...baseOpts(makePool(makeSession("fresh")), makeSession("stale")),
+        attempt,
+      });
+
+      expect(attempt).toHaveBeenCalledTimes(2);
+      expect(inspect(warn.mock.calls)).toContain(`HTTP ${status}`);
+      expect(inspect(warn.mock.calls)).not.toContain(BODY_SECRET);
+      warn.mockRestore();
+    },
+  );
+
+  it("keeps the diagnostic text for a non-refusal envelope (negative control)", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const attempt = vi
+      .fn()
+      .mockRejectedValueOnce(sessionLostError())
+      .mockResolvedValueOnce(["tool-a"]);
+
+    await requestWithSessionRecovery({
+      ...baseOpts(makePool(makeSession("fresh")), makeSession("stale")),
+      attempt,
+    });
+
+    expect(inspect(warn.mock.calls)).toContain("Session not found");
+    warn.mockRestore();
   });
 });
