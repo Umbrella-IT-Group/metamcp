@@ -317,6 +317,12 @@ const postMcp = (
   user: SessionUserDouble | null = CALLER,
   headers: Record<string, string> = {},
 ) => drive("POST", "/mcp", query, user, headers);
+/** GET /stdio reaches `createTransport` for any transport type it is given. */
+const getStdio = (
+  query: Record<string, string>,
+  user: SessionUserDouble | null = CALLER,
+  headers: Record<string, string> = {},
+) => drive("GET", "/stdio", query, user, headers);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -330,6 +336,10 @@ beforeEach(() => {
   );
   resolvesTo(PUBLIC_V4);
   delete process.env.MCP_PROXY_URL_ALLOWED_HOSTS;
+  // The client module's real transformDockerUrl is in use (see its mock
+  // above), and the compose files and example.env turn the transform on. Off
+  // here, so every case reads the url it names; a case that needs it sets it.
+  vi.stubEnv("TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL", "");
   // The default m365-injected list (`m365`), whatever the shell exports; the
   // rows here are not on it unless a case says so.
   vi.stubEnv("M365_INJECTED_SERVER_NAMES", "");
@@ -1139,13 +1149,17 @@ describe("registered servers by uuid: the server page's own backends", () => {
         [ROW_UUID, null],
       ];
       const answers: Array<{ status: number; body: unknown }> = [];
-      for (const [mcpServerUuid, user] of misses) {
-        lastJsonBody = undefined;
-        const status = await send(
-          { transportType: type, mcpServerUuid, url: rowUrl },
-          user,
-        );
-        answers.push({ status, body: lastJsonBody });
+      // The transport's own route, and GET /stdio, which reaches the same
+      // resolver for a remote transport type.
+      for (const route of [send, getStdio]) {
+        for (const [mcpServerUuid, user] of misses) {
+          lastJsonBody = undefined;
+          const status = await route(
+            { transportType: type, mcpServerUuid, url: rowUrl },
+            user,
+          );
+          answers.push({ status, body: lastJsonBody });
+        }
       }
 
       expect(built).toEqual([]);
