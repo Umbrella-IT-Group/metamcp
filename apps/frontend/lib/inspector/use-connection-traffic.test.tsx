@@ -17,7 +17,8 @@ vi.mock("@/lib/trpc", () => {
   };
 });
 
-vi.mock("@/lib/oauth-provider", () => ({
+vi.mock("@/lib/oauth-provider", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/oauth-provider")>()),
   createAuthProvider: () => ({ tokens: async () => undefined }),
 }));
 

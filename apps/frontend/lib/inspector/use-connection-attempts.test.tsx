@@ -4,7 +4,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   EmptyResultSchema,
+  ErrorCode,
   LoggingMessageNotificationSchema,
+  McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import * as React from "react";
 import { act } from "react";
@@ -42,11 +44,28 @@ vi.mock("@/lib/trpc", () => {
   };
 });
 
-const { clearAuth } = vi.hoisted(() => ({ clearAuth: vi.fn() }));
+const { clearAuth, redirectAuth, saveVerifier } = vi.hoisted(() => ({
+  clearAuth: vi.fn(),
+  redirectAuth: vi.fn(),
+  saveVerifier: vi.fn(),
+}));
 
-vi.mock("@/lib/oauth-provider", () => ({
+vi.mock("@/lib/oauth-provider", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/oauth-provider")>()),
   createAuthProvider: () => ({
+    redirectUrl: "https://gateway.example.test/fe-oauth/callback",
+    clientMetadata: {
+      redirect_uris: ["https://gateway.example.test/fe-oauth/callback"],
+    },
+    clientInformation: async () => ({
+      client_id: "inspector",
+      issuer: "https://login.example.test",
+    }),
     tokens: async () => undefined,
+    codeVerifier: async () => "saved-verifier",
+    saveTokens: vi.fn(),
+    redirectToAuthorization: redirectAuth,
+    saveCodeVerifier: saveVerifier,
     clear: clearAuth,
   }),
 }));
@@ -241,6 +260,12 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(auth).mockReset();
   clearAuth.mockClear();
+  redirectAuth.mockReset().mockImplementation((authorizationUrl: URL) => {
+    window.location.href = authorizationUrl.href;
+  });
+  saveVerifier.mockReset().mockImplementation((verifier: string) => {
+    sessionStorage.setItem("test-code-verifier", verifier);
+  });
 });
 
 afterEach(() => {
@@ -399,6 +424,142 @@ describe("the connection hook's attempts", () => {
       expect(hook.current.connectionStatus).toBe("connected");
       expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
     });
+  });
+
+  it.each(["STDIO", "STREAMABLE_HTTP"] as const)(
+    "blocks SDK-managed sign-in after a late %s handshake 401",
+    async (transportType) => {
+      const realConnect = Client.prototype.connect;
+      const net = network();
+      // The first attempt uses the real SDK handshake and OAuth path. The
+      // replacement connects immediately through network()'s normal stub.
+      vi.mocked(Client.prototype.connect).mockImplementationOnce(
+        async function (this: Client, transport: Transport) {
+          net.attempts.push({ client: this, transport });
+          await realConnect.call(this, transport);
+        },
+      );
+      const unauthorized = gate();
+      const requested = gate();
+      const target: Props = {
+        ...TARGET_A,
+        transportType,
+        isMetaMCP: false,
+        url: "https://backend-a.example.test/mcp",
+      };
+      const resourcePath =
+        transportType === "STDIO"
+          ? "/mcp-proxy/server/stdio"
+          : "/mcp-proxy/server/mcp";
+      const location = { href: "https://gateway.example.test/inspector" };
+      vi.stubGlobal("window", { ...window, location });
+      const stored = new Map<string, string>();
+      vi.stubGlobal("sessionStorage", {
+        setItem: (key: string, value: string) => stored.set(key, value),
+        getItem: (key: string) => stored.get(key) ?? null,
+        removeItem: (key: string) => stored.delete(key),
+      });
+      const discovery = vi.fn();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          const url = new URL(
+            input instanceof Request ? input.url : String(input),
+          );
+          if (url.pathname === "/mcp-proxy/server/health") {
+            return new Response(JSON.stringify({ status: "ok" }));
+          }
+          if (url.pathname === resourcePath) {
+            requested.open();
+            await unauthorized.promise;
+            return new Response("Unauthorized", { status: 401 });
+          }
+          if (
+            url.pathname.startsWith("/.well-known/oauth-protected-resource")
+          ) {
+            discovery();
+            return Response.json({
+              resource: `https://gateway.example.test${resourcePath}`,
+              authorization_servers: ["https://login.example.test"],
+            });
+          }
+          if (
+            url.href ===
+            "https://login.example.test/.well-known/oauth-authorization-server"
+          ) {
+            return Response.json({
+              issuer: "https://login.example.test",
+              authorization_endpoint: "https://login.example.test/authorize",
+              token_endpoint: "https://login.example.test/token",
+              response_types_supported: ["code"],
+              code_challenge_methods_supported: ["S256"],
+            });
+          }
+          throw new Error(`Unexpected request: ${url.href}`);
+        }),
+      );
+      const hook = await mounted(target);
+      const pending = await hook.start(() => hook.current.connect());
+      await requested.promise;
+      expect(hook.current.connectionStatus).toBe("connecting");
+
+      await hook.render({
+        ...target,
+        url: "https://backend-b.example.test/mcp",
+      });
+      await hook.run(() => hook.current.connect());
+      await hook.complete(pending, unauthorized.open);
+
+      expect(discovery).toHaveBeenCalled();
+      expect(auth).not.toHaveBeenCalled();
+      expect(redirectAuth).not.toHaveBeenCalled();
+      expect(saveVerifier).not.toHaveBeenCalled();
+      expect(location.href).toBe("https://gateway.example.test/inspector");
+      expect(stored.has("test-code-verifier")).toBe(false);
+      expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
+      expect(hook.current.connectionStatus).toBe("connected");
+      await hook.unmount();
+    },
+  );
+
+  it("blocks hook-managed sign-in that becomes stale during authorization", async () => {
+    const net = network();
+    const handshake = gate();
+    net.connectGates.push(handshake);
+    const signingIn = gate();
+    vi.mocked(auth).mockImplementation(async (provider) => {
+      await signingIn.promise;
+      await provider.saveCodeVerifier("stale-verifier");
+      await provider.redirectToAuthorization(
+        new URL("https://login.example.test/authorize"),
+      );
+      return "REDIRECT";
+    });
+    vi.stubGlobal("sessionStorage", {
+      setItem: vi.fn(),
+      getItem: vi.fn(),
+      removeItem: vi.fn(),
+    });
+    vi.stubGlobal("window", {
+      ...window,
+      location: { href: "https://gateway.example.test/inspector" },
+    });
+    const hook = await mounted(TARGET_A);
+    const pending = await hook.start(() => hook.current.connect());
+    await hook.run(async () => {
+      handshake.fail(new Error("401 Unauthorized"));
+      await settle();
+    });
+    expect(auth).toHaveBeenCalledOnce();
+    await hook.render(TARGET_B);
+    await hook.run(() => hook.current.connect());
+    await hook.complete(pending, signingIn.open);
+
+    expect(saveVerifier).not.toHaveBeenCalled();
+    expect(redirectAuth).not.toHaveBeenCalled();
+    expect(hook.current.mcpClient).toBe(net.attempts[1]?.client);
+    expect(hook.current.connectionStatus).toBe("connected");
+    await hook.unmount();
   });
 
   it("still retries once after a sign-in and keeps the failed attempt's log", async () => {
@@ -735,6 +896,38 @@ describe("the connection hook's attempts", () => {
     onprogress?.({ progress: 2 });
     expect(onNotification).not.toHaveBeenCalled();
     await hook.complete(disconnecting, close.open);
+    await hook.unmount();
+  });
+
+  it("keeps completions enabled when the previous connection reports MethodNotFound", async () => {
+    network();
+    const completion = gate();
+    const requested = vi
+      .spyOn(Client.prototype, "request")
+      .mockImplementationOnce(async () => {
+        await completion.promise;
+        return { completion: { values: [] } };
+      })
+      .mockResolvedValue({ completion: { values: ["current"] } });
+    const hook = await mounted(TARGET_A);
+    await hook.run(() => hook.current.connect());
+    const ref = { type: "ref/prompt" as const, name: "prompt" };
+    let oldResult: string[] | undefined;
+    const pending = await hook.start(async () => {
+      oldResult = await hook.current.handleCompletion(ref, "argument", "old");
+    });
+    await hook.render(TARGET_B);
+    await hook.run(() => hook.current.connect());
+    await hook.complete(pending, () =>
+      completion.fail(new McpError(ErrorCode.MethodNotFound, "unsupported")),
+    );
+
+    expect(oldResult).toEqual([]);
+    expect(hook.current.completionsSupported).toBe(true);
+    await expect(
+      hook.current.handleCompletion(ref, "argument", "new"),
+    ).resolves.toEqual(["current"]);
+    expect(requested).toHaveBeenCalledTimes(2);
     await hook.unmount();
   });
 

@@ -1,4 +1,7 @@
-import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  auth,
+  type OAuthClientProvider,
+} from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   SSEClientTransport,
@@ -56,7 +59,10 @@ import {
   Notification,
   StdErrNotificationSchema,
 } from "../lib/notificationTypes";
-import { createAuthProvider } from "../lib/oauth-provider";
+import {
+  createAuthProvider,
+  scopeAuthProviderToAttempt,
+} from "../lib/oauth-provider";
 import { trpc } from "../lib/trpc";
 
 interface UseConnectionOptions {
@@ -241,7 +247,8 @@ export function useConnection({
       value: string,
       signal?: AbortSignal,
     ): Promise<string[]> => {
-      if (!mcpClient || !completionsSupported) {
+      const client = activeConnectionRef.current?.client;
+      if (!client || !completionsSupported) {
         return [];
       }
 
@@ -266,7 +273,10 @@ export function useConnection({
         // Disable completions silently if the server doesn't support them.
         // See https://github.com/modelcontextprotocol/specification/discussions/122
         if (e instanceof McpError && e.code === ErrorCode.MethodNotFound) {
-          setCompletionsSupported(false);
+          // This answer describes only the connection that sent the request.
+          if (activeConnectionRef.current?.client === client) {
+            setCompletionsSupported(false);
+          }
           return [];
         }
 
@@ -335,18 +345,20 @@ export function useConnection({
     );
   });
 
-  const handleAuthError = useMemoizedFn(async (error: unknown) => {
-    if (is401Error(error)) {
-      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
-      sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
+  const handleAuthError = useMemoizedFn(
+    async (error: unknown, attemptAuthProvider: OAuthClientProvider) => {
+      if (is401Error(error)) {
+        sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
+        sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
 
-      const result = await auth(authProvider, {
-        serverUrl: url || "",
-      });
-      return result === "AUTHORIZED";
-    }
-    return false;
-  });
+        const result = await auth(attemptAuthProvider, {
+          serverUrl: url || "",
+        });
+        return result === "AUTHORIZED";
+      }
+      return false;
+    },
+  );
 
   const connect = useMemoizedFn(
     async (_e?: unknown, retryCount: number = 0): Promise<void> => {
@@ -359,6 +371,10 @@ export function useConnection({
       attemptRef.current += 1;
       const attempt = attemptRef.current;
       const isCurrent = () => attemptRef.current === attempt;
+      const attemptAuthProvider = scopeAuthProviderToAttempt(
+        authProvider,
+        isCurrent,
+      );
 
       // Skip connection if hook is disabled
       if (!enabled) {
@@ -480,7 +496,7 @@ export function useConnection({
 
         // Use manually provided bearer token if available, otherwise use OAuth tokens
         const token =
-          bearerToken || (await authProvider.tokens())?.access_token;
+          bearerToken || (await attemptAuthProvider.tokens())?.access_token;
         if (!isCurrent()) {
           await abandon();
           return;
@@ -553,7 +569,7 @@ export function useConnection({
               mcpProxyServerUrl.searchParams.append("command", command);
               mcpProxyServerUrl.searchParams.append("args", args);
               transportOptions = {
-                authProvider: authProvider,
+                authProvider: attemptAuthProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -612,7 +628,7 @@ export function useConnection({
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
               mcpProxyServerUrl.searchParams.append("url", url);
               transportOptions = {
-                authProvider: authProvider,
+                authProvider: attemptAuthProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -748,7 +764,7 @@ export function useConnection({
             return;
           }
 
-          const shouldRetry = await handleAuthError(error);
+          const shouldRetry = await handleAuthError(error, attemptAuthProvider);
           // Superseded while signing in: no retry, which would also reuse the
           // newer attempt's traffic log (see reuseOrCreateStore).
           if (!isCurrent()) {
