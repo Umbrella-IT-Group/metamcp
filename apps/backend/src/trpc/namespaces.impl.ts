@@ -33,7 +33,7 @@ import {
 } from "../db/repositories";
 import { NamespacesSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
-import { withAdminAudit } from "../lib/audit/admin-write";
+import { AdminAuditWriteError, withAdminAudit } from "../lib/audit/admin-write";
 import { clearFilterCache } from "../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   clearOverrideCache,
@@ -1210,9 +1210,14 @@ export const namespacesImplementations = {
       logger.error("Error refreshing namespace tools:", describeDbError(error));
       // A member can reach the reads and writes above. Normal response data
       // bypasses tRPC's error masking, so never echo a caught DB message.
+      // The one exception is the admin-plane audit failure: its sentence is
+      // fixed and tells the operator the refresh was rolled back.
       return {
         success: false as const,
-        message: "Failed to refresh namespace tools",
+        message:
+          error instanceof AdminAuditWriteError
+            ? error.message
+            : "Failed to refresh namespace tools",
       };
     }
   },

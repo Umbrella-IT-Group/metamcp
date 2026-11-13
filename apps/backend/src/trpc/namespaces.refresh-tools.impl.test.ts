@@ -80,6 +80,10 @@ import {
   namespacesRepository,
   toolsRepository,
 } from "../db/repositories";
+import {
+  ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+  AdminAuditWriteError,
+} from "../lib/audit/admin-write";
 import { mapOverrideNameToOriginal } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
 import { namespacesImplementations } from "./namespaces.impl";
@@ -296,6 +300,31 @@ describe("namespaces.refreshTools implementation: tool policy", () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toBe("Failed to refresh namespace tools");
+  });
+});
+
+describe("namespaces.refreshTools admin-plane audit failure", () => {
+  it("passes the fixed audit-failure sentence through, so the operator knows the refresh was rolled back", async () => {
+    vi.clearAllMocks();
+    vi.mocked(namespacesRepository.findByUuid).mockResolvedValue(
+      fakeNamespace({ user_id: "admin-1" }),
+    );
+    vi.mocked(mapOverrideNameToOriginal).mockImplementation(
+      async (name) => name,
+    );
+    vi.mocked(mcpServersRepository.findByName).mockResolvedValue({
+      uuid: "server-1",
+    } as never);
+    vi.mocked(toolsRepository.bulkUpsert).mockRejectedValueOnce(
+      new AdminAuditWriteError(),
+    );
+
+    const result = await refresh("admin-1", true);
+
+    expect(result).toEqual({
+      success: false,
+      message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+    });
   });
 });
 
