@@ -195,8 +195,8 @@ async function postToken(
     auditRequestId: "req-code-replay",
     auditClientIp: "203.0.113.20",
     headers: { "user-agent": "Claude/1.0", ...headers },
-    ip: `10.7.0.${ipCounter}`,
-    socket: { remoteAddress: `10.7.0.${ipCounter}` },
+    ip: `198.51.100.${ipCounter}`,
+    socket: { remoteAddress: `198.51.100.${ipCounter}` },
   } as unknown as express.Request;
   const res = makeRes();
   let error: unknown;
