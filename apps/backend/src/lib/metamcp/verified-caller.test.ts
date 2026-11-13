@@ -1284,3 +1284,143 @@ describe("verified-caller-v1-vectors.json", () => {
     },
   );
 });
+
+/**
+ * The credential for an OAuth client whose id is an https URL (a client
+ * metadata document client). Without it the id fails the wire grammar, the
+ * request carries no `X-Umbrella-Caller`, and a backend that binds to it
+ * cannot serve a valid client.
+ *
+ * Oracle for every expected string: SHA-256 of the URL's UTF-8 bytes, computed
+ * outside this code base (`sha256sum` and Python `hashlib` agree) over URLs of
+ * `https://clients.example.com/` followed by the letter c up to the stated
+ * length; the first 32 hex characters, then the first 16 hex characters of the
+ * family uuid with its hyphens removed. The wire bytes of whole headers are in
+ * verified-caller-v1-vectors.json, computed the same way.
+ */
+describe("verifiedCallerCredential for a URL client id", () => {
+  const FAMILY_A = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
+  const FAMILY_B = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+  const urlOf = (length: number) => {
+    const prefix = "https://clients.example.com/";
+    return prefix + "c".repeat(length - prefix.length);
+  };
+  const oauth = (oauthClientId: string, oauthTokenFamilyId?: string) =>
+    ({
+      authMethod: "oauth",
+      oauthClientId,
+      oauthTokenFamilyId,
+    }) as CallerContext;
+
+  // The proposed pattern `^https://\S{1,500}$` stopped at 508 characters while
+  // the client id check admits 512; every id up to the limit must be aliased.
+  it.each([
+    [508, "4c7ed3b8549530f03d1f6eccef6a76ef"],
+    [509, "5aea74de8b153340a47764df6bcfadd0"],
+    [512, "6a3ba33688d36ff1af237ba53bc21ecf"],
+  ])("aliases a %i-character URL as cimd.<hash>.<family>", (length, hash) => {
+    expect(verifiedCallerCredential(oauth(urlOf(length), FAMILY_A))).toBe(
+      `oauth:cimd.${hash}.6ba7b8109dad41d1`,
+    );
+  });
+
+  it("gives no credential for a 513-character URL", () => {
+    expect(
+      verifiedCallerCredential(oauth(urlOf(513), FAMILY_A)),
+    ).toBeUndefined();
+  });
+
+  it("stays inside the 128-character grammar a reader accepts", () => {
+    const credential = verifiedCallerCredential(oauth(urlOf(512), FAMILY_A));
+    expect(credential).toMatch(/^oauth:[A-Za-z0-9._-]{1,128}$/);
+    expect(credential?.length).toBeLessThanOrEqual("oauth:".length + 128);
+  });
+
+  it("separates two connections of one client, and two clients of one connection", () => {
+    const first = verifiedCallerCredential(oauth(urlOf(512), FAMILY_A));
+    const second = verifiedCallerCredential(oauth(urlOf(512), FAMILY_B));
+    const other = verifiedCallerCredential(oauth(urlOf(509), FAMILY_A));
+
+    expect(first).toBe(
+      "oauth:cimd.6a3ba33688d36ff1af237ba53bc21ecf.6ba7b8109dad41d1",
+    );
+    expect(second).toBe(
+      "oauth:cimd.6a3ba33688d36ff1af237ba53bc21ecf.f47ac10b58cc4372",
+    );
+    expect(other).toBe(
+      "oauth:cimd.5aea74de8b153340a47764df6bcfadd0.6ba7b8109dad41d1",
+    );
+  });
+
+  it("is the same for every refresh of one connection (the family id does not change)", () => {
+    const url = "https://app.example.com/oauth/client-metadata.json";
+    expect(verifiedCallerCredential(oauth(url, FAMILY_A))).toBe(
+      verifiedCallerCredential(oauth(url, FAMILY_A)),
+    );
+  });
+
+  it("leaves a client id inside the grammar exactly as before, family or not", () => {
+    expect(verifiedCallerCredential(oauth("mcp_client_abc", FAMILY_A))).toBe(
+      "oauth:mcp_client_abc",
+    );
+    expect(verifiedCallerCredential(oauth("mcp_client_abc"))).toBe(
+      "oauth:mcp_client_abc",
+    );
+  });
+
+  it.each([
+    ["no family id", oauth(urlOf(512))],
+    ["a family id that is not a uuid", oauth(urlOf(512), "family-one")],
+    ["an uppercase family id", oauth(urlOf(512), FAMILY_A.toUpperCase())],
+    ["an http URL", oauth("http://app.example.com/c", FAMILY_A)],
+    [
+      "a value with a slash that is not a URL",
+      oauth("app.example.com/c", FAMILY_A),
+    ],
+    [
+      "a URL containing whitespace",
+      oauth("https://app.example.com/a b", FAMILY_A),
+    ],
+    [
+      "an API-key caller that carries a URL client id",
+      {
+        authMethod: "api_key",
+        oauthClientId: urlOf(512),
+        oauthTokenFamilyId: FAMILY_A,
+      },
+    ],
+  ] as Array<[string, CallerContext]>)(
+    "gives no credential for %s",
+    (_name, caller) => {
+      expect(verifiedCallerCredential(caller)).toBeUndefined();
+    },
+  );
+
+  it("carries the alias into the X-Umbrella-Caller value", () => {
+    const value = encodeVerifiedCaller({
+      authMethod: "oauth",
+      userId: "usr01",
+      oauthClientId: urlOf(512),
+      oauthTokenFamilyId: FAMILY_A,
+    });
+    expect(value).toBeDefined();
+    const payload = JSON.parse(
+      Buffer.from((value as string).replace(/^v1\./, ""), "base64url").toString(
+        "utf8",
+      ),
+    ) as { cred: string };
+    expect(payload.cred).toBe(
+      "oauth:cimd.6a3ba33688d36ff1af237ba53bc21ecf.6ba7b8109dad41d1",
+    );
+  });
+
+  it("repeats the client id length limit that the registration side enforces", async () => {
+    // verified-caller.ts may not import the router, so the number is repeated
+    // there; this keeps the two from drifting apart.
+    const { CIMD_CLIENT_ID_MAX_LENGTH } = await import(
+      "../../routers/oauth/cimd-config"
+    );
+    const { URL_CLIENT_ID_MAX_LENGTH } = await import("./verified-caller");
+    expect(URL_CLIENT_ID_MAX_LENGTH).toBe(CIMD_CLIENT_ID_MAX_LENGTH);
+  });
+});

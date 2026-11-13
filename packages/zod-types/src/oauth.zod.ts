@@ -37,9 +37,14 @@ export const OAuthTokensSchema = z.object({
  *
  * "dcr"   — the anonymous RFC 7591 `POST /oauth/register` endpoint.
  * "admin" — an authenticated administrator through the OAuth Clients UI.
+ * "cimd"  - a client metadata document the gateway fetched for an allowlisted
+ *           https client id (migration 0046). The row is a cache of that
+ *           document, not a registration: it is rewritten from the document,
+ *           never approved or rejected by an administrator, and swept by its
+ *           own rule (never by the DCR one).
  *
- * This exists ONLY so the retention sweep can tell the two apart, and it has
- * to exist because nothing else can. Both paths call the same
+ * This exists ONLY so the retention sweep can tell the paths apart, and it has
+ * to exist because nothing else can. The first two call the same
  * `buildClientRegistration` core and therefore the same
  * `generateSecureClientId()`, so every client_id from either door reads
  * `mcp_client_<random>` — the prefix is not a discriminator. An admin who
@@ -47,7 +52,11 @@ export const OAuthTokensSchema = z.object({
  * that is legitimately unused, and deleting it is a support incident, so the
  * sweep must never guess.
  */
-export const OAuthClientRegistrationSourceEnum = z.enum(["dcr", "admin"]);
+export const OAuthClientRegistrationSourceEnum = z.enum([
+  "dcr",
+  "admin",
+  "cimd",
+]);
 
 /**
  * Whether an `oauth_clients` row may be used to authorize anyone (migration
@@ -412,8 +421,8 @@ export const OAuthClientListItemSchema = z.object({
   // out-of-set value is shown as-is instead of failing the whole listing; the
   // gates treat anything but "approved" as refused.
   approval_status: z.string(),
-  // Which door created the row: "dcr", "admin", or null for rows that predate
-  // migration 0029.
+  // Which door created the row: "dcr", "admin", "cimd" (a fetched client
+  // metadata document), or null for rows that predate migration 0029.
   registration_source: OAuthClientRegistrationSourceEnum.nullable(),
   approved_by: z.string().nullable(),
   approved_at: z.date().nullable(),

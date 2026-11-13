@@ -102,6 +102,11 @@ jobs:
   # admin-plane key, or lets a write commit without its audit row, would pass
   # `test-and-typecheck`. This job runs them.
   #
+  # The list also carries the OAuth credential suites (the per-user credential
+  # lock, refresh-token families, client approval and retention, and
+  # authorization-code replay): their claims are about transactions, locks and
+  # cascades, which a mocked repository cannot make.
+  #
   # A SEPARATE job on purpose, not steps in `test-and-typecheck`: the decision
   # recorded above (a database is not smuggled in behind the unit-test gate)
   # stands, so this one is visible by name and can be made a required check in

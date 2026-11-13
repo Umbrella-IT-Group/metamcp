@@ -11,6 +11,7 @@
  * a validator can be perfectly correct and still be wired to nothing.
  */
 
+import type { Agent } from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/logger", () => ({
@@ -766,6 +767,59 @@ describe("createGuardedFetch — the connection is pinned to the validated addre
     expect(dispatchers[0]).toBeDefined();
   });
 
+  it("bounds an opted-in dispatcher cache, reuses recent pins and closes the evicted agent", async () => {
+    const dispatchers: Agent[] = [];
+    const baseFetch = vi.fn(
+      async (_url: URL, _init: RequestInit, dispatcher?: Agent) => {
+        if (!dispatcher) throw new Error("expected a pinned dispatcher");
+        dispatchers.push(dispatcher);
+        return new Response(null, { status: 200 });
+      },
+    );
+    const lookup = vi
+      .fn()
+      .mockResolvedValueOnce([PUBLIC_V4])
+      .mockResolvedValueOnce(["1.1.1.1"])
+      .mockResolvedValueOnce([PUBLIC_V4])
+      .mockResolvedValueOnce(["8.8.8.8"])
+      .mockResolvedValueOnce(["1.1.1.1"]);
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup,
+      maxPinnedAgents: 2,
+    });
+
+    try {
+      for (let i = 0; i < 4; i += 1) {
+        await guarded("https://changing.example.com/client.json");
+      }
+      expect(dispatchers[2]).toBe(dispatchers[0]);
+      expect(dispatchers[0].closed).toBe(false);
+      expect(dispatchers[1].closed).toBe(true);
+      expect(dispatchers[3].closed).toBe(false);
+
+      // A pin that was evicted can be used again with a new, open agent.
+      await guarded("https://changing.example.com/client.json");
+      expect(dispatchers[4]).not.toBe(dispatchers[1]);
+      expect(dispatchers[4].closed).toBe(false);
+    } finally {
+      await Promise.all(
+        [...new Set(dispatchers)]
+          .filter((agent) => !agent.closed)
+          .map((agent) => agent.close()),
+      );
+    }
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses an invalid pinned-agent bound (%s)",
+    (maxPinnedAgents) => {
+      expect(() => createGuardedFetch({ maxPinnedAgents })).toThrow(
+        "maxPinnedAgents must be a positive integer",
+      );
+    },
+  );
+
   it("does NOT pin an allowlisted host, which is trusted by name", async () => {
     const dispatchers: unknown[] = [];
     const baseFetch = vi.fn(
@@ -1001,6 +1055,91 @@ describe("createGuardedFetch: refuseCrossOriginRedirect (pooled posture)", () =>
       CROSS_ORIGIN_REDIRECT_REFUSED,
     );
     expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createGuardedFetch: followRedirects false", () => {
+  const redirect = (status: number, location: string) =>
+    new Response(null, { status, headers: { location } });
+
+  // The OAuth client metadata document fetch treats any redirect as a refusal
+  // (mcp-use clients.ts `redirect: "manual"` plus `status !== 200`). The
+  // guard's own same-origin follow is what this option turns off, so the
+  // caller sees the 3xx and no second request is sent.
+  it.each([301, 302, 303, 307, 308])(
+    "returns a %s to the caller and sends no second request, even to the same origin",
+    async (status) => {
+      const baseFetch = vi
+        .fn()
+        .mockResolvedValueOnce(redirect(status, "https://meta.example.com/b"))
+        .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+      const guarded = createGuardedFetch({
+        baseFetch,
+        lookup: resolvesTo(PUBLIC_V4),
+        followRedirects: false,
+      });
+
+      const response = await guarded("https://meta.example.com/a");
+
+      expect(response.status).toBe(status);
+      expect(response.headers.get("location")).toBe(
+        "https://meta.example.com/b",
+      );
+      expect(baseFetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("does not validate or resolve the Location it declines to follow", async () => {
+    const lookup = resolvesTo(PUBLIC_V4);
+    const baseFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        redirect(302, "http://169.254.169.254/latest/meta-data/"),
+      );
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup,
+      followRedirects: false,
+    });
+
+    const response = await guarded("https://meta.example.com/a");
+
+    expect(response.status).toBe(302);
+    // Only the first hop was ever resolved.
+    expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it("still refuses an internal first hop before any connection", async () => {
+    const baseFetch = vi.fn(async () => new Response("ok"));
+    const guarded = createGuardedFetch({
+      baseFetch,
+      lookup: resolvesTo("10.0.0.5"),
+      followRedirects: false,
+    });
+
+    await expect(guarded("https://meta.example.com/a")).rejects.toThrow(
+      NOT_A_PERMITTED_TARGET,
+    );
+    expect(baseFetch).not.toHaveBeenCalled();
+  });
+
+  it("leaves the default alone: a same-origin redirect is followed when the option is omitted or true", async () => {
+    for (const options of [{}, { followRedirects: true }]) {
+      const baseFetch = vi
+        .fn()
+        .mockResolvedValueOnce(redirect(302, "https://meta.example.com/b"))
+        .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+      const guarded = createGuardedFetch({
+        baseFetch,
+        lookup: resolvesTo(PUBLIC_V4),
+        ...options,
+      });
+
+      const response = await guarded("https://meta.example.com/a");
+
+      expect(response.status).toBe(200);
+      expect(baseFetch).toHaveBeenCalledTimes(2);
+    }
   });
 });
 

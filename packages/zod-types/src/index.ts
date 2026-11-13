@@ -10,3 +10,4 @@ export * from "./metamcp.zod";
 export * from "./api-keys.zod";
 export * from "./config.zod";
 export * from "./users.zod";
+export * from "./endpoint-presentation.zod";
