@@ -1013,3 +1013,56 @@ describe("the connection hook's attempts", () => {
     await hook.unmount();
   });
 });
+
+// The fake here is the network itself (fetch): the real transports build the
+// proxy request, and the proxy answers the way it refuses a server.
+describe("which server the hook asks the proxy to open", () => {
+  const REGISTERED = "dddddddd-4444-4444-8444-dddddddddddd";
+
+  it.each([
+    ["STREAMABLE_HTTP", "/mcp-proxy/server/mcp"],
+    ["SSE", "/mcp-proxy/server/sse"],
+  ] as const)(
+    "names a registered %s server by uuid alone, and a refusal ends in error",
+    async (transportType, path) => {
+      const requested: URL[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          const url = new URL(
+            input instanceof Request ? input.url : String(input),
+          );
+          requested.push(url);
+          if (url.pathname === "/mcp-proxy/server/health") {
+            return new Response(JSON.stringify({ status: "ok" }));
+          }
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32000, message: "refused" },
+              id: null,
+            }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          );
+        }),
+      );
+      const hook = await mounted({
+        mcpServerUuid: REGISTERED,
+        transportType,
+        command: "",
+        args: "",
+        url: "http://mcp-backend.example.com:3000/mcp?api_key=ROW-SECRET",
+      });
+
+      await hook.run(() => hook.current.connect());
+
+      const proxy = requested.find((url) => url.pathname === path);
+      expect(proxy?.searchParams.get("mcpServerUuid")).toBe(REGISTERED);
+      expect(proxy?.searchParams.get("transportType")).toBe(transportType);
+      expect(proxy?.searchParams.has("url")).toBe(false);
+      expect(proxy?.href).not.toContain("ROW-SECRET");
+      expect(hook.current.connectionStatus).toBe("error");
+      await hook.unmount();
+    },
+  );
+});
