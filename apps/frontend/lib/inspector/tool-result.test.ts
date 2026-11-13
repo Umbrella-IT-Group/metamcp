@@ -1,4 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
@@ -139,6 +140,17 @@ describe("classifyCallResult: content", () => {
     expect(blocks).toHaveLength(2);
     expect(blocks[0]).toHaveProperty("prettyJson");
     expect(blocks[1]).not.toHaveProperty("prettyJson");
+  });
+
+  it.each([
+    '{"id":9007199254740993}',
+    '{"nested":[-9007199254740993]}',
+    '{"value":1e309}',
+  ])("keeps %s as text instead of offering a lossy formatter", (text) => {
+    const [block] = classifyCallResult({
+      content: [{ type: "text", text }],
+    }).blocks;
+    expect(block).toEqual({ kind: "text", text });
   });
 
   it("describes image and audio blocks without playing or fetching them", () => {
@@ -284,11 +296,66 @@ describe("classifyCallFailure", () => {
     ).toEqual({
       status: "protocol_error",
       message: "plain",
-      outcomeUnknown: false,
+      outcomeUnknown: true,
     });
     expect(
       classifyCallFailure("thrown text", { stoppedByUser: false }).message,
     ).toBe("thrown text");
+  });
+
+  it("marks a failed HTTP response after dispatch as an unknown outcome", async () => {
+    let writes = 0;
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(
+      new URL("https://example.invalid/mcp"),
+      {
+        fetch: async (_url, init) => {
+          if (init?.method === "GET") {
+            return new Response(null, { status: 405 });
+          }
+          const request = JSON.parse(String(init?.body)) as {
+            id?: number;
+            method: string;
+          };
+          if (request.method === "initialize") {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "test-server", version: "1.0.0" },
+              },
+            });
+          }
+          if (request.method === "notifications/initialized") {
+            return new Response(null, { status: 202 });
+          }
+          // The write happened, but fetch rejects before its answer arrives.
+          writes += 1;
+          throw new TypeError("Failed to fetch");
+        },
+      },
+    );
+    try {
+      await client.connect(transport);
+      const error = await client
+        .request(
+          { method: "tools/call", params: { name: "write", arguments: {} } },
+          CompatibilityCallToolResultSchema,
+        )
+        .then(
+          () => null,
+          (failure: unknown) => failure,
+        );
+      expect(writes).toBe(1);
+      expect(error).toBeInstanceOf(TypeError);
+      expect(
+        classifyCallFailure(error, { stoppedByUser: false }),
+      ).toMatchObject({ status: "protocol_error", outcomeUnknown: true });
+    } finally {
+      await client.close();
+    }
   });
 });
 

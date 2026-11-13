@@ -17,7 +17,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { copyToClipboard } from "@/lib/inspector/clipboard";
-import { parseObjectFromPaste } from "@/lib/inspector/schema-utils";
+import { parsePastedObject } from "@/lib/inspector/schema-utils";
 import {
   applyPastedObject,
   type BuildResult,
@@ -43,8 +43,12 @@ const CUSTOM = "__custom__";
 const WARNING_KEY = {
   notNumber: "inspector:inspectorForm.warnNotNumber",
   notInteger: "inspector:inspectorForm.warnNotInteger",
-  unsafeInteger: "inspector:inspectorForm.warnUnsafeInteger",
   notBoolean: "inspector:inspectorForm.warnNotBoolean",
+} as const;
+
+const ERROR_KEY = {
+  invalidJson: "inspector:inspectorForm.errInvalidJson",
+  unsafeNumber: "inspector:inspectorForm.errUnsafeNumber",
 } as const;
 
 interface ToolArgumentFormProps {
@@ -276,7 +280,7 @@ function FieldRow({
       )}
       {error !== undefined && (
         <p className="text-xs text-red-600 dark:text-red-400">
-          {t("inspector:inspectorForm.errInvalidJson")}
+          {t(ERROR_KEY[error.reason])}
         </p>
       )}
     </div>
@@ -301,12 +305,20 @@ export function ToolArgumentForm({
   const preview = payloadText(build.args);
 
   const applyFill = () => {
-    const pasted = parseObjectFromPaste(fillText);
-    if (pasted === null) {
-      setFillError(t("inspector:inspectorForm.notAnObject"));
+    const pasted = parsePastedObject(fillText);
+    if (!pasted.ok) {
+      // Nothing is filled: the numbers that were pasted are not the ones
+      // JSON.parse would hand over.
+      setFillError(
+        pasted.reason === "unsafeNumber"
+          ? t("inspector:inspectorForm.errUnsafeNumberPaste", {
+              value: pasted.token,
+            })
+          : t("inspector:inspectorForm.notAnObject"),
+      );
       return;
     }
-    const result = applyPastedObject(specs, state, pasted);
+    const result = applyPastedObject(specs, state, pasted.value);
     onStateChange(result.state);
     setFillError(null);
     setFillOpen(false);

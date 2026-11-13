@@ -1,3 +1,4 @@
+import { findUnsafeNumber, isUnsafeNumberText } from "./json-numbers";
 import {
   coerceTextInputValueByType,
   extractEnumOptions,
@@ -64,12 +65,17 @@ export type FormState = Map<string, FieldInput>;
 
 export interface FieldError {
   key: string;
-  reason: "invalidJson";
+  /**
+   * invalidJson: the text does not parse. unsafeNumber: it holds a number the
+   * browser cannot carry exactly (see json-numbers.ts), and sending the
+   * rounded one would send a value nobody typed.
+   */
+  reason: "invalidJson" | "unsafeNumber";
 }
 
 export interface FieldWarning {
   key: string;
-  reason: "notNumber" | "notInteger" | "unsafeInteger" | "notBoolean";
+  reason: "notNumber" | "notInteger" | "notBoolean";
 }
 
 export interface BuildResult {
@@ -295,8 +301,12 @@ export function setBoolean(
  * What the form sends, in schema order. See the module comment for the rule.
  * Text that does not fit a number or boolean field is sent as typed, as a
  * string, with a warning, because the tester's job is often to see the server
- * refuse it; only a JSON field that does not parse blocks, since no value can
- * be formed from it.
+ * refuse it. Two things block: a JSON field that does not parse (no value can
+ * be formed from it), and a number the browser cannot carry exactly (a whole
+ * number past Number.MAX_SAFE_INTEGER, or one that overflows). The second is
+ * the same rule as the first: a rounded number is a value nobody typed, and
+ * sending it as a string would be a change nobody chose, so the call waits
+ * for the person to quote it themselves if the tool takes a string.
  */
 export function buildArguments(
   specs: FieldSpec[],
@@ -325,6 +335,11 @@ export function buildArguments(
         break;
       case "number":
       case "integer": {
+        // Before anything is converted: Number() would round the typed digits.
+        if (isUnsafeNumberText(text)) {
+          errors.push({ key: spec.key, reason: "unsafeNumber" });
+          break;
+        }
         const coerced = coerceTextInputValueByType(text, spec.kind);
         if (typeof coerced !== "number") {
           entries.push([spec.key, text]);
@@ -332,10 +347,6 @@ export function buildArguments(
         } else if (spec.kind === "integer" && !Number.isInteger(coerced)) {
           entries.push([spec.key, coerced]);
           warnings.push({ key: spec.key, reason: "notInteger" });
-        } else if (spec.kind === "integer" && !Number.isSafeInteger(coerced)) {
-          // A JSON number cannot carry this exactly; the typed digits can.
-          entries.push([spec.key, text]);
-          warnings.push({ key: spec.key, reason: "unsafeInteger" });
         } else {
           entries.push([spec.key, coerced]);
         }
@@ -350,13 +361,22 @@ export function buildArguments(
         }
         break;
       case "enum":
-      case "json":
+      case "json": {
+        let parsed: unknown;
         try {
-          entries.push([spec.key, JSON.parse(text)]);
+          parsed = JSON.parse(text);
         } catch {
           errors.push({ key: spec.key, reason: "invalidJson" });
+          break;
         }
+        // JSON.parse has already rounded such a number, so the text is read.
+        if (findUnsafeNumber(text) !== null) {
+          errors.push({ key: spec.key, reason: "unsafeNumber" });
+          break;
+        }
+        entries.push([spec.key, parsed]);
         break;
+      }
     }
   }
 

@@ -7,6 +7,7 @@ import {
   extractEnumOptions,
   getToolPropertyType,
   parseObjectFromPaste,
+  parsePastedObject,
   resolveRef,
   resolveToolPropertySchema,
 } from "./schema-utils";
@@ -255,6 +256,32 @@ describe("resolveToolPropertySchema on real pydantic output", () => {
     expect(getToolPropertyType({ type: ["null"] }, {})).toBeUndefined();
   });
 
+  it("does not guess between non-null types in a type array", () => {
+    for (const type of [
+      ["string", "integer"],
+      ["null", "integer", "string"],
+    ]) {
+      expect(getToolPropertyType({ type }, {})).toBeUndefined();
+      expect(
+        getToolPropertyType({ anyOf: [{ type }, { type: "string" }] }, {}),
+      ).toBeUndefined();
+    }
+  });
+
+  it("keeps nullability from a type array inside a same-type union", () => {
+    expect(
+      resolveToolPropertySchema(
+        {
+          anyOf: [
+            { type: ["string", "null"] },
+            { type: "string", format: "date" },
+          ],
+        },
+        {},
+      ),
+    ).toMatchObject({ type: "string", nullable: true });
+  });
+
   it("does not guess between two different non-null types", () => {
     const resolved = resolveToolPropertySchema(
       { anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }] },
@@ -380,5 +407,84 @@ describe("parseObjectFromPaste", () => {
     expect(parsed).not.toBeNull();
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     expect(Object.keys(parsed as object)).toEqual(["__proto__"]);
+  });
+});
+
+// Number.MAX_SAFE_INTEGER (ECMAScript) is 9007199254740991. JSON.parse would
+// turn 9007199254740993 into 9007199254740992 before any field sees it, so a
+// paste holding a number past the boundary is refused whole.
+describe("parseObjectFromPaste and numbers that cannot be sent exactly", () => {
+  const UNSAFE = [
+    '{"n": 9007199254740993}',
+    '{"n": 9007199254740992}',
+    '{"n": -9007199254740993}',
+    '{"j": {"a": [1, {"b": 9007199254740993}]}}',
+    '{"n": 9.007199254740993e15}',
+    '{"n": 90071992547409930e-1}',
+    '{"n": 1e16}',
+    '{"n": 1e400}',
+    '{"n": -1e400}',
+  ];
+
+  it.each(UNSAFE)("refuses %s", (text) => {
+    expect(parseObjectFromPaste(text)).toBeNull();
+    expect(parsePastedObject(text).ok).toBe(false);
+  });
+
+  it("refuses them inside the JavaScript object syntax fallback too", () => {
+    const text = '{"a": `say "hi"`, "n": 9007199254740993}';
+    expect(parseObjectFromPaste(text)).toBeNull();
+    expect(parsePastedObject(text)).toEqual({
+      ok: false,
+      reason: "unsafeNumber",
+      token: "9007199254740993",
+    });
+  });
+
+  it("names the number it refused, apart from text that is not an object", () => {
+    expect(parsePastedObject('{"a": 1, "n": 9007199254740993}')).toEqual({
+      ok: false,
+      reason: "unsafeNumber",
+      token: "9007199254740993",
+    });
+    for (const text of ["[1, 2]", "5", "", "{not json", "  "]) {
+      expect(parsePastedObject(text)).toEqual({
+        ok: false,
+        reason: "notAnObject",
+      });
+    }
+    expect(parsePastedObject('{"a": 1}')).toEqual({
+      ok: true,
+      value: { a: 1 },
+    });
+  });
+
+  it("accepts the safe boundary in both directions and floats", () => {
+    expect(
+      parseObjectFromPaste(
+        '{"hi": 9007199254740991, "lo": -9007199254740991, "f": 1.5, "g": 0.1, "e": 2.5e3}',
+      ),
+    ).toEqual({
+      hi: 9007199254740991,
+      lo: -9007199254740991,
+      f: 1.5,
+      g: 0.1,
+      e: 2500,
+    });
+    expect(
+      parseObjectFromPaste('{"a": `say "hi"`, "n": 9007199254740991}'),
+    ).toEqual({ a: 'say "hi"', n: 9007199254740991 });
+  });
+
+  it("ignores numbers inside strings, in JSON and in backtick strings", () => {
+    expect(
+      parseObjectFromPaste('{"id": "9007199254740993", "x": "1e400"}'),
+    ).toEqual({ id: "9007199254740993", x: "1e400" });
+    expect(parseObjectFromPaste('{"id": `9007199254740993`}')).toEqual({
+      id: "9007199254740993",
+    });
+    expect(
+      parseObjectFromPaste('{"id": `quoted "9007199254740993" inside`}'),
+    ).toEqual({ id: 'quoted "9007199254740993" inside' });
   });
 });

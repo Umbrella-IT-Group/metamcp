@@ -144,6 +144,25 @@ describe("describeFields", () => {
     ]);
   });
 
+  it("lets a type-array union send each permitted JSON type", () => {
+    const { specs, state } = formFor({
+      choice: { type: ["string", "integer", "null"] },
+    });
+    expect(specOf(specs, "choice")).toMatchObject({
+      kind: "json",
+      nullable: true,
+    });
+    expect(
+      buildArguments(specs, typeInto(specs, state, "choice", "42")).args,
+    ).toEqual({ choice: 42 });
+    expect(
+      buildArguments(specs, typeInto(specs, state, "choice", '"42"')).args,
+    ).toEqual({ choice: "42" });
+    expect(buildArguments(specs, setNull(state, "choice", true)).args).toEqual({
+      choice: null,
+    });
+  });
+
   it("returns no fields for a schema without properties", () => {
     expect(describeFields({ inputSchema: { type: "object" } })).toEqual([]);
     expect(describeFields({})).toEqual([]);
@@ -281,10 +300,16 @@ describe("buildArguments: numbers", () => {
     expect(built.warnings).toEqual([{ key: "i", reason: "notInteger" }]);
   });
 
-  it("sends an integer beyond the safe range as typed text, with a warning", () => {
+  // SPEC edit (the foreman's decision that no silently changed number is sent):
+  // a typed integer beyond Number.MAX_SAFE_INTEGER (9007199254740991) used to
+  // go out as its typed digits in a string, with a warning; it now blocks the
+  // call with a field error, because a string is not what a number field
+  // asked for and the person decides whether to quote it.
+  it("refuses an integer beyond the safe range and sends the boundary", () => {
     const built = build("i", "9007199254740993");
-    expect(built.args).toEqual({ i: "9007199254740993" });
-    expect(built.warnings).toEqual([{ key: "i", reason: "unsafeInteger" }]);
+    expect(built.args).toEqual({});
+    expect(built.errors).toEqual([{ key: "i", reason: "unsafeNumber" }]);
+    expect(built.warnings).toEqual([]);
     expect(build("i", "9007199254740991").args).toEqual({
       i: 9007199254740991,
     });
@@ -470,6 +495,175 @@ describe("applyPastedObject", () => {
     expect(result.ignored).toEqual(["__proto__"]);
     expect(result.filled).toEqual(["s"]);
     expect(({} as Record<string, unknown>).x).toBeUndefined();
+  });
+});
+
+// Number.MAX_SAFE_INTEGER (ECMAScript) is 9007199254740991. A JSON number past
+// it cannot be sent exactly, so the form refuses it instead of sending a
+// rounded one: 9007199254740993 would go out as 9007199254740992.
+describe("numbers that cannot be sent exactly", () => {
+  const UNSAFE_TEXT = [
+    "9007199254740992",
+    "9007199254740993",
+    "-9007199254740992",
+    "-9007199254740993",
+    "9.007199254740993e15",
+    "90071992547409930e-1",
+    "1e16",
+    "1e400",
+    "-1e400",
+    "0x20000000000001",
+  ];
+
+  describe("in number and integer fields", () => {
+    const { specs, state } = formFor({
+      n: { type: "number" },
+      i: { type: "integer" },
+      s: { type: "string" },
+    });
+
+    it.each(UNSAFE_TEXT)("refuses %s as a field error", (text) => {
+      for (const key of ["n", "i"]) {
+        const built = buildArguments(specs, typeInto(specs, state, key, text));
+        expect(built.errors).toEqual([{ key, reason: "unsafeNumber" }]);
+        expect(built.args).toEqual({});
+        expect(built.sentKeys).toEqual([]);
+        expect(built.warnings).toEqual([]);
+      }
+    });
+
+    it("sends the safe boundary in both directions and ordinary floats", () => {
+      for (const key of ["n", "i"]) {
+        expect(
+          buildArguments(specs, typeInto(specs, state, key, "9007199254740991"))
+            .args,
+        ).toEqual({ [key]: 9007199254740991 });
+        expect(
+          buildArguments(
+            specs,
+            typeInto(specs, state, key, "-9007199254740991"),
+          ).args,
+        ).toEqual({ [key]: -9007199254740991 });
+      }
+      for (const text of ["1.5", "0.1", "2.5e3"]) {
+        const built = buildArguments(specs, typeInto(specs, state, "n", text));
+        expect(built.args).toEqual({ n: Number(text) });
+        expect(built.errors).toEqual([]);
+      }
+    });
+
+    it("blocks only the field it names and still builds the others", () => {
+      let next = typeInto(specs, state, "s", "kept");
+      next = typeInto(specs, next, "i", "9007199254740993");
+      const built = buildArguments(specs, next);
+      expect(built.errors).toEqual([{ key: "i", reason: "unsafeNumber" }]);
+      expect(built.args).toEqual({ s: "kept" });
+    });
+
+    it("still tells text that is not a number from a number that is too big", () => {
+      const built = buildArguments(specs, typeInto(specs, state, "n", "abc"));
+      expect(built.errors).toEqual([]);
+      expect(built.warnings).toEqual([{ key: "n", reason: "notNumber" }]);
+    });
+  });
+
+  describe("in JSON and enum fields", () => {
+    const { specs, state } = formFor({
+      j: { type: "object" },
+      list: { type: "array" },
+      e: { enum: ["a", "b"] },
+    });
+
+    it("refuses an unsafe number anywhere in the JSON", () => {
+      const texts = [
+        '{"id": 9007199254740993}',
+        '{"a": {"b": [1, [9007199254740992]]}}',
+        '{"id": 1e400}',
+        '{"id": -9007199254740993}',
+        '{"id": 9.007199254740993e15}',
+      ];
+      for (const text of texts) {
+        const built = buildArguments(specs, typeInto(specs, state, "j", text));
+        expect(built.errors).toEqual([{ key: "j", reason: "unsafeNumber" }]);
+        expect(built.args).toEqual({});
+      }
+      const array = buildArguments(
+        specs,
+        typeInto(specs, state, "list", "[1, 9007199254740993]"),
+      );
+      expect(array.errors).toEqual([{ key: "list", reason: "unsafeNumber" }]);
+    });
+
+    it("refuses an unsafe number typed into an enum field's custom value", () => {
+      const built = buildArguments(
+        specs,
+        typeInto(specs, state, "e", "9007199254740993"),
+      );
+      expect(built.errors).toEqual([{ key: "e", reason: "unsafeNumber" }]);
+      expect(built.args).toEqual({});
+    });
+
+    it("sends exact numbers, and numbers inside strings untouched", () => {
+      const text =
+        '{"id": 9007199254740991, "low": -9007199254740991, "f": 1.5, "g": 0.1, "s": "9007199254740993", "k": "1e400"}';
+      const built = buildArguments(specs, typeInto(specs, state, "j", text));
+      expect(built.errors).toEqual([]);
+      expect(built.args).toEqual({
+        j: {
+          id: 9007199254740991,
+          low: -9007199254740991,
+          f: 1.5,
+          g: 0.1,
+          s: "9007199254740993",
+          k: "1e400",
+        },
+      });
+    });
+
+    it("keeps reporting text that is not JSON as invalid JSON", () => {
+      const built = buildArguments(
+        specs,
+        typeInto(specs, state, "j", '{"id": 9007199254740993'),
+      );
+      expect(built.errors).toEqual([{ key: "j", reason: "invalidJson" }]);
+    });
+  });
+
+  describe("after a paste", () => {
+    const { specs, state } = formFor({
+      i: { type: "integer" },
+      j: { type: "object" },
+      s: { type: "string" },
+    });
+
+    it("sends pasted numbers on the safe boundary exactly", () => {
+      const pasted = parseObjectFromPaste(
+        '{"i": 9007199254740991, "j": {"a": [-9007199254740991, 1.5]}}',
+      );
+      expect(pasted).not.toBeNull();
+      const result = applyPastedObject(specs, state, pasted ?? {});
+      const built = buildArguments(specs, result.state);
+      expect(built.errors).toEqual([]);
+      expect(built.args).toEqual({
+        i: 9007199254740991,
+        j: { a: [-9007199254740991, 1.5] },
+      });
+      expect(payloadText(built.args)).toContain("9007199254740991");
+    });
+
+    it("refuses a value that was already rounded before it got here", () => {
+      // 2 ** 53 is what 9007199254740992 and 9007199254740993 both parse to.
+      const result = applyPastedObject(specs, state, {
+        i: 2 ** 53,
+        j: { a: [2 ** 53] },
+      });
+      const built = buildArguments(specs, result.state);
+      expect(built.errors).toEqual([
+        { key: "i", reason: "unsafeNumber" },
+        { key: "j", reason: "unsafeNumber" },
+      ]);
+      expect(built.args).toEqual({});
+    });
   });
 });
 
