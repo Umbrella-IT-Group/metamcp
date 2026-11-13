@@ -18,15 +18,32 @@
  *    the version counts, which is the baseline `v1=N v2=M` an operator reads
  *    before flipping anything. A typo or a dropped variable therefore can never
  *    lower a bound row.
- * Strict (`M365_ENVELOPE_STRICT`) forces the target to v2, so a strict boot
- * binds whatever is still v1 instead of leaving it for a user to re-enroll.
  *
- * TRUST ON FIRST BINDING. Binding a v1 row binds WHATEVER ciphertext sits in it
- * to that row's user. A swap by a database writer that predates the converge
- * (user A's ciphertext copied into user B's row) becomes permanent and cannot be
- * detected without an Entra call, because the converge faithfully rewraps what it
- * finds. Strict plus the converge closes LATER swaps only. An operator who
- * suspects an earlier swap has the affected users re-enroll.
+ * STRICT NEVER REWRAPS. While `M365_ENVELOPE_STRICT` is on (including an
+ * unrecognised value, which resolves to strict) the converge makes no write at
+ * all and never opens a row: it does not read a v1 row's plaintext and never
+ * writes a v2 envelope from one. A v1 ciphertext carries no proof of whose token
+ * it is, and a refresh token that was rotated away is not necessarily dead (the
+ * identity platform does not invalidate a token the moment it is redeemed), so a
+ * ciphertext copied from one user's row into another's, from a backup or from
+ * the pre-binding snapshot, is a live credential. Rewrapping it under strict
+ * would turn that unproven ciphertext into a trusted v2 envelope bound to the
+ * wrong user, which is the exact downgrade strict exists to close. So strict
+ * leaves every v1 row untouched, counts it as `needs_reenroll` (the same rows
+ * strict already refuses to read on a mint) and logs that count. Binding v1 rows
+ * is the job of the migration window, which is strict OFF with the write version
+ * at 2; strict is turned on only after that pass reports `v1_remaining=0`. Strict
+ * together with an explicit write version of 1 is therefore a no-op, never a
+ * silent downgrade (the policy logs that at boot); a rollback needs strict
+ * cleared first.
+ *
+ * TRUST ON FIRST BINDING. In the migration window (strict off) binding a v1 row
+ * binds WHATEVER ciphertext sits in it to that row's user. A swap by a database
+ * writer that predates the converge (user A's ciphertext copied into user B's
+ * row) becomes permanent and cannot be detected without an Entra call, because
+ * the converge faithfully rewraps what it finds. That is the documented cost of
+ * the migration. Strict closes swaps made AFTER the window only, and an operator
+ * who suspects an earlier swap has the affected users re-enroll.
  *
  * NEVER THROWS, and never blocks the gateway from starting: a missing or
  * malformed KEK, a failed list and a failed row are each logged and the pass
@@ -126,8 +143,12 @@ async function converge(repoOverride?: EnvelopeConvergeRepo): Promise<void> {
     return;
   }
 
+  // THE GUARD (see "STRICT NEVER REWRAPS" above). `resolveEnvelopePolicy` forces
+  // `mode` to v2 under strict, so without the strict test here a strict boot
+  // would target v2 and bind whatever a v1 row holds. With a null target the
+  // loop below only counts versions: no row is opened, rewrapped or written.
   const target: EnvelopeVersion | null =
-    policy.mode === "keep" ? null : policy.mode;
+    policy.strict || policy.mode === "keep" ? null : policy.mode;
 
   let v1 = 0;
   let v2 = 0;
@@ -181,8 +202,12 @@ async function converge(repoOverride?: EnvelopeConvergeRepo): Promise<void> {
     }
   }
 
+  // Under strict every v1 row is refused on read and, by the guard above, never
+  // rewrapped: those users must re-enroll. Outside strict a v1 row still works.
+  const needsReenroll = policy.strict ? v1 : 0;
+
   logger.info(
-    `[m365] envelope converge: ${posture} scanned=${rows.length} rewrapped=${rewrapped} already=${already} skipped_changed=${skippedChanged} failed=${failed} v1_remaining=${v1} v2_remaining=${v2} unreadable=${unreadable}`,
+    `[m365] envelope converge: ${posture} scanned=${rows.length} rewrapped=${rewrapped} already=${already} skipped_changed=${skippedChanged} failed=${failed} v1_remaining=${v1} v2_remaining=${v2} unreadable=${unreadable} needs_reenroll=${needsReenroll}`,
   );
 
   if (target === null && rows.length === 0) {
@@ -201,9 +226,9 @@ async function converge(repoOverride?: EnvelopeConvergeRepo): Promise<void> {
     );
   }
 
-  if (policy.strict && v1 > 0) {
+  if (needsReenroll > 0) {
     logger.warn(
-      `[m365] envelope converge: M365_ENVELOPE_STRICT is on and ${v1} v1 row(s) could not be bound; those users will be asked to re-enroll. ${posture}`,
+      `[m365] envelope converge: M365_ENVELOPE_STRICT is on, so ${needsReenroll} v1 row(s) are never rewrapped and are refused on read; those users will be asked to re-enroll. To bind them instead, turn strict off, converge with M365_ENVELOPE_WRITE_VERSION=2, confirm v1_remaining=0, then turn strict on. ${posture}`,
     );
   }
   if (unreadable > 0) {

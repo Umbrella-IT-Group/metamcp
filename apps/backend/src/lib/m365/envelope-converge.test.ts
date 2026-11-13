@@ -8,7 +8,11 @@
  *
  * Oracle for the target rules: the operator rule that ONLY an explicit
  * `M365_ENVELOPE_WRITE_VERSION=1` ever lowers a row (so `keep`, from unset or
- * any invalid value, writes nothing at all), and that strict forces v2.
+ * any invalid value, writes nothing at all), and the foreman ruling on the
+ * first review round: the converge may rewrap a v1 row into a bound v2 envelope
+ * ONLY while strict is off (the planned migration window). A v1 ciphertext
+ * carries no proof of which user it belongs to, so under strict the converge
+ * must never read one and never write a v2 envelope from it.
  */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -25,9 +29,20 @@ const loggerMock = vi.hoisted(() => ({
 }));
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 
+// A pass-through spy on the real decrypt, so the strict tests can assert that
+// the converge never opened a v1 row at all (not merely that it did not write).
+vi.mock("./crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./crypto")>();
+  return {
+    ...actual,
+    decryptRefreshToken: vi.fn(actual.decryptRefreshToken),
+  };
+});
+
 import { decryptRefreshToken, encryptRefreshToken } from "./crypto";
 import {
   __resetEnvelopePolicyLogsForTesting,
+  openUserRefreshToken,
   peekEnvelopeVersion,
   refreshTokenContext,
 } from "./envelope";
@@ -316,16 +331,17 @@ describe("keep (unset or invalid write version): no write at all", () => {
 });
 
 describe("strict", () => {
-  it("prints strict=on with the effective write version and binds what is still v1", async () => {
+  it("prints strict=on with the effective write version and leaves a v1 row exactly as it was", async () => {
     vi.stubEnv("M365_ENVELOPE_STRICT", "1");
     const repo = new MemoryRepo();
-    repo.rows.set("user-a", v1("rt-a"));
+    const legacy = v1("rt-a");
+    repo.rows.set("user-a", legacy);
 
     await convergeM365Envelopes(repo);
 
-    expect(peekEnvelopeVersion(repo.rows.get("user-a"))).toBe("v2");
+    expect(repo.rows.get("user-a")).toBe(legacy);
     expect(summary()).toContain("mode=v2 strict=on write_version=v2");
-    expect(summary()).toContain("v1_remaining=0");
+    expect(summary()).toContain("v1_remaining=1");
   });
 
   it("warns that users will be asked to re-enroll when v1 rows could not be bound", async () => {
@@ -352,7 +368,181 @@ describe("strict", () => {
       "M365_ENVELOPE_STRICT",
     );
     expect(summary()).toContain("strict=on");
-    expect(peekEnvelopeVersion(repo.rows.get("user-a"))).toBe("v2");
+    expect(peekEnvelopeVersion(repo.rows.get("user-a"))).toBe("v1");
+  });
+});
+
+/**
+ * THE FINDING FROM CODE REVIEW ROUND 1. Bind users A and B in the migration
+ * window, copy A's retained (pre-binding) v1 ciphertext into B's row, then boot
+ * with strict on. Before the fix the converge targeted v2 under strict, opened
+ * the planted v1 ciphertext, and sealed A's token into a v2 envelope bound to B,
+ * so B's mint opened to A's token. Redeeming A's token at Entra does not
+ * invalidate a token retained from before the rotation, so the planted copy is
+ * live: the rewrap turned an unproven v1 ciphertext into a trusted bound one.
+ */
+async function bindThenPlant(repo: MemoryRepo): Promise<string> {
+  const retainedA = v1("rt-a");
+  repo.rows.set("user-a", retainedA);
+  repo.rows.set("user-b", v1("rt-b"));
+
+  // The migration window: write version 2, strict off. Both users are bound.
+  vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "2");
+  vi.stubEnv("M365_ENVELOPE_STRICT", "");
+  await convergeM365Envelopes(repo);
+  expect(peekEnvelopeVersion(repo.rows.get("user-a"))).toBe("v2");
+  expect(peekEnvelopeVersion(repo.rows.get("user-b"))).toBe("v2");
+
+  // The plant: a database writer copies A's retained v1 ciphertext into B.
+  repo.rows.set("user-b", retainedA);
+
+  repo.replaceCalls.length = 0;
+  vi.clearAllMocks();
+  __resetEnvelopePolicyLogsForTesting();
+  return retainedA;
+}
+
+describe("strict: a v1 row is never read or rewrapped (the planted-ciphertext finding)", () => {
+  it.each<[string, { strict: string; write: string }]>([
+    ["strict=1 with write version 2", { strict: "1", write: "2" }],
+    ["strict=1 alone", { strict: "1", write: "" }],
+    [
+      "an unrecognised strict value (resolves to strict) with write version 2",
+      { strict: "yes", write: "2" },
+    ],
+    [
+      "strict=1 with an explicit write version of 1",
+      { strict: "1", write: "1" },
+    ],
+  ])(
+    "%s: B's planted v1 row stays v1 and unreadable, and A's token never lands in a v2 envelope under B",
+    async (_label, flags) => {
+      const repo = new MemoryRepo();
+      const retainedA = await bindThenPlant(repo);
+      vi.stubEnv("M365_ENVELOPE_STRICT", flags.strict);
+      vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", flags.write);
+
+      await convergeM365Envelopes(repo);
+
+      // No row was written, so B's row is byte-identical to the planted copy.
+      expect(repo.replaceCiphertextIfUnchanged).not.toHaveBeenCalled();
+      expect(repo.rows.get("user-b")).toBe(retainedA);
+      expect(peekEnvelopeVersion(repo.rows.get("user-b"))).toBe("v1");
+      // The converge never opened any row, v1 or v2: a v1 ciphertext carries no
+      // proof of whose token it is, so it is not read at all under strict.
+      expect(decryptRefreshToken).not.toHaveBeenCalled();
+      // Strict refuses to read B's row (the user re-enrolls)...
+      expect(() =>
+        openUserRefreshToken(envelopeOf(repo, "user-b"), KEK, "user-b"),
+      ).toThrow(/strict/i);
+      // ...and no stored envelope, anywhere, is a v2 envelope that opens to
+      // A's token under B's own context.
+      for (const [, stored] of repo.rows) {
+        if (peekEnvelopeVersion(stored) !== "v2") continue;
+        expect(() =>
+          decryptRefreshToken(stored, KEK, refreshTokenContext("user-b")),
+        ).toThrow();
+      }
+      // A's own bound row is untouched.
+      expect(
+        decryptRefreshToken(
+          envelopeOf(repo, "user-a"),
+          KEK,
+          refreshTokenContext("user-a"),
+        ),
+      ).toBe("rt-a");
+    },
+  );
+
+  it("strict off, write version 2: the same planted row IS bound to B (the documented migration behaviour, trust on first binding)", async () => {
+    // Documented, not a defect: during the planned migration window the
+    // converge binds WHATEVER a v1 row holds to that row, because a v1
+    // ciphertext cannot be told apart from a genuine one without an Entra call.
+    // A swap that predates the converge therefore becomes permanent; that is why
+    // strict (which never rewraps) is turned on only after `v1_remaining=0`, and
+    // why an operator who suspects an earlier swap has the user re-enroll.
+    const repo = new MemoryRepo();
+    await bindThenPlant(repo);
+    vi.stubEnv("M365_ENVELOPE_STRICT", "");
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "2");
+
+    await convergeM365Envelopes(repo);
+
+    const stored = envelopeOf(repo, "user-b");
+    expect(peekEnvelopeVersion(stored)).toBe("v2");
+    expect(
+      decryptRefreshToken(stored, KEK, refreshTokenContext("user-b")),
+    ).toBe("rt-a");
+    expect(summary()).toContain("rewrapped=1");
+  });
+
+  it("counts the v1 rows as needing re-enrollment in the summary, and logs that count", async () => {
+    vi.stubEnv("M365_ENVELOPE_STRICT", "1");
+    const repo = new MemoryRepo();
+    repo.rows.set("user-a", v1("rt-a"));
+    repo.rows.set("user-b", v1("rt-b"));
+    repo.rows.set("user-c", v2("user-c", "rt-c"));
+
+    await convergeM365Envelopes(repo);
+
+    expect(summary()).toContain(
+      "scanned=3 rewrapped=0 already=0 skipped_changed=0 failed=0 v1_remaining=2 v2_remaining=1 unreadable=0 needs_reenroll=2",
+    );
+    const note = warnings().find((w) => w.includes("asked to re-enroll"));
+    expect(note).toBeDefined();
+    expect(note).toContain("2 v1 row(s)");
+    expect(note).toContain("never rewrapped");
+    expect(repo.replaceCiphertextIfUnchanged).not.toHaveBeenCalled();
+    expect(decryptRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it("strict with only bound rows has nothing to re-enroll and no warning", async () => {
+    vi.stubEnv("M365_ENVELOPE_STRICT", "1");
+    const repo = new MemoryRepo();
+    repo.rows.set("user-a", v2("user-a", "rt-a"));
+
+    await convergeM365Envelopes(repo);
+
+    expect(summary()).toContain("v1_remaining=0 v2_remaining=1");
+    expect(summary()).toContain("needs_reenroll=0");
+    expect(warnings()).toEqual([]);
+    expect(repo.replaceCiphertextIfUnchanged).not.toHaveBeenCalled();
+  });
+
+  it("strict with an explicit write version of 1 is a no-op that says so: no row is lowered", async () => {
+    vi.stubEnv("M365_ENVELOPE_STRICT", "1");
+    vi.stubEnv("M365_ENVELOPE_WRITE_VERSION", "1");
+    const repo = new MemoryRepo();
+    const bound = v2("user-a", "rt-a");
+    const legacy = v1("rt-b");
+    repo.rows.set("user-a", bound);
+    repo.rows.set("user-b", legacy);
+
+    await convergeM365Envelopes(repo);
+
+    expect(repo.replaceCiphertextIfUnchanged).not.toHaveBeenCalled();
+    expect(repo.rows.get("user-a")).toBe(bound);
+    expect(repo.rows.get("user-b")).toBe(legacy);
+    const boot = warnings().find((w) =>
+      w.includes("M365_ENVELOPE_WRITE_VERSION=1"),
+    );
+    expect(boot).toBeDefined();
+    expect(boot).toMatch(/no rollback/i);
+    expect(boot).toContain("M365_ENVELOPE_STRICT");
+  });
+
+  it("strict counts an unreadable row without throwing, rewrapping or reporting a failure", async () => {
+    vi.stubEnv("M365_ENVELOPE_STRICT", "1");
+    const repo = new MemoryRepo();
+    repo.rows.set("user-junk", "not-an-envelope");
+    repo.rows.set("user-a", v1("rt-a"));
+
+    await expect(convergeM365Envelopes(repo)).resolves.toBeUndefined();
+
+    expect(summary()).toContain("failed=0");
+    expect(summary()).toContain("unreadable=1");
+    expect(repo.replaceCiphertextIfUnchanged).not.toHaveBeenCalled();
+    expect(decryptRefreshToken).not.toHaveBeenCalled();
   });
 });
 

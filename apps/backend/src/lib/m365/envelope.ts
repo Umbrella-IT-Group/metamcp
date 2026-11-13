@@ -25,7 +25,11 @@
  *    nothing here can stop the gateway from starting or serving anything else.
  *
  * The write path never produces a row this gateway's own strict read refuses:
- * strict forces `v2`.
+ * strict forces `v2`. Strict also turns the boot converge into a read-only
+ * census (`./envelope-converge`): a v1 ciphertext is never rewrapped into a
+ * bound v2 envelope while strict is on, because that would bind an unproven
+ * ciphertext to whichever row holds it. Legacy rows are bound in the migration
+ * window (strict off, write version 2) and strict is turned on afterwards.
  */
 import logger from "@/utils/logger";
 
@@ -112,7 +116,7 @@ export function resolveEnvelopePolicy(
       logOnce(
         "warn",
         "strict-over-v1",
-        "[m365] M365_ENVELOPE_STRICT is on and M365_ENVELOPE_WRITE_VERSION=1: strict wins, envelopes are written as v2 (a strict gateway never writes rows it would refuse).",
+        "[m365] M365_ENVELOPE_STRICT is on and M365_ENVELOPE_WRITE_VERSION=1: strict wins. No rollback to v1 is performed (the boot converge makes no write while strict is on) and envelopes are written as v2, because a strict gateway never writes rows it would refuse. To roll back, clear M365_ENVELOPE_STRICT first.",
       );
     }
     mode = "v2";

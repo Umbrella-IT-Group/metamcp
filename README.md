@@ -157,8 +157,11 @@ across the management and OAuth surfaces:
   introspection, and consent protection on the authorize flow.
 - **Bound M365 refresh-token envelopes, with safe rotation.** A user's stored Microsoft 365
   refresh token can be sealed so the ciphertext only opens in that user's own row
-  (`M365_ENVELOPE_WRITE_VERSION=2`, then `M365_ENVELOPE_STRICT=1` to refuse unbound ones;
-  nothing is bound until an operator sets a flag, and only an explicit `1` ever lowers a row).
+  (`M365_ENVELOPE_WRITE_VERSION=2` with strict off binds existing rows at boot; once the boot
+  line reports `v1_remaining=0`, `M365_ENVELOPE_STRICT=1` refuses unbound ones. Strict never
+  rewraps: a legacy row still unbound when strict is turned on is left as it is and its user
+  re-enrolls. Nothing is bound until an operator sets a flag, and only an explicit `1` ever
+  lowers a row).
   Rotation and the re-authorization mark are compare-and-swap writes, so a re-enrollment,
   disconnect or revoke that lands while a token is being refreshed wins instead of being
   overwritten. See `example.env` for the staged rollout and rollback.

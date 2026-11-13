@@ -184,8 +184,10 @@ async function start(): Promise<void> {
 
   // Converge the M365 refresh-token envelopes toward the explicit target in
   // M365_ENVELOPE_WRITE_VERSION (unset keeps every row as it is and only logs
-  // the version counts), and log the envelope posture (strict on/off, effective
-  // write version) so it is legible in the boot log. Before listening, so no
+  // the version counts; while M365_ENVELOPE_STRICT is on it rewraps nothing and
+  // only counts the v1 rows that need re-enrollment), and log the envelope
+  // posture (strict on/off, effective write version) so it is legible in the
+  // boot log. Before listening, so no
   // request of this process mints against a half-converged table. Makes no Entra
   // call and never throws; the outer guard is defence-in-depth, same shape as
   // its neighbour. See ./lib/m365/envelope-converge.
