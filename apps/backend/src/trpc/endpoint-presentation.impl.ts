@@ -111,7 +111,10 @@ export const endpointPresentationImplementations = {
         },
       };
     } catch (error) {
-      logger.error("Error reading endpoint presentation:", error);
+      logger.error(
+        "Error reading endpoint presentation:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         message: "Failed to read endpoint presentation",

@@ -13,7 +13,10 @@
  * request is ignored) and the audit recorder row contract in
  * auditing.functional.ts. A real SDK cancel drives everything.
  */
+import { format } from "node:util";
+
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import {
   afterEach,
   beforeEach,
@@ -24,6 +27,9 @@ import {
   vi,
 } from "vitest";
 
+import logger from "@/utils/logger";
+
+import { configService } from "../config.service";
 import {
   connectGateway,
   flush,
@@ -229,4 +235,49 @@ describe("a cancelled call, audited", () => {
     expect(written[0].error_code).toBeUndefined();
     expect(written[0].error_detail).toBeUndefined();
   });
+});
+
+describe("tool-call configuration failures, audited", () => {
+  it.each([
+    "getMcpResetTimeoutOnProgress",
+    "getMcpTimeout",
+    "getMcpMaxTotalTimeout",
+  ] as const)(
+    "keeps a failed %s read out of logs and the reply",
+    async (getter) => {
+      const secret = "fake-timeout-row-secret-jjjj0000";
+      const target = await backend(async () => OK);
+      getSessionMock.mockResolvedValue(target.session);
+      const gw = await gateway();
+      vi.mocked(logger.error).mockClear();
+      const read = vi
+        .spyOn(configService, getter)
+        .mockRejectedValueOnce(
+          new DrizzleQueryError(
+            'select * from "config" where "id" = $1',
+            [secret],
+            Object.assign(new Error(secret), { code: "08006" }),
+          ),
+        );
+      try {
+        const failure = await call(gw).catch((e) => e);
+        const logged = vi
+          .mocked(logger.error)
+          .mock.calls.map((args) => format(...args))
+          .join("\n");
+        expect(logged).not.toContain(secret);
+        expect(logged).not.toContain("select *");
+        expect(logged).toContain("08006");
+        expect(format(failure)).not.toContain(secret);
+        expect(format(failure)).toContain("configuration could not be read");
+        expect(target.calls).toHaveLength(0);
+
+        // The failed preflight must not leave the tool or its connection stuck.
+        expect(await call(gw)).toEqual(OK);
+        expect(target.calls).toHaveLength(1);
+      } finally {
+        read.mockRestore();
+      }
+    },
+  );
 });

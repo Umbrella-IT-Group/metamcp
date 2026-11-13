@@ -19,6 +19,14 @@
  * not evidence that a message is safe: JSON encoding can fail before the
  * query exists, and wrappers can copy a query error into their own message.
  * Network failures remain diagnosable by their errno code.
+ *
+ * Where it is used: a log call whose try block can reach a repository, Drizzle
+ * or the pg pool logs its caught error through this function, never as it is,
+ * because the logger formats its arguments with util.format and that prints a
+ * query error's message, `params` and `cause`. A catch that can only see
+ * transport, MCP-client or in-memory failures keeps the raw error, since there
+ * the message is the diagnosis. The tRPC implementations are held to this by
+ * trpc/log-safe-db-errors.guard.test.ts.
  */
 
 const IDENTIFIER = /^[A-Za-z0-9_.$-]{1,64}$/;

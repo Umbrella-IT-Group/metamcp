@@ -1,6 +1,7 @@
 import cors from "cors";
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
@@ -179,7 +180,7 @@ publicEndpointsRouter.get("/", async (req, res) => {
 
     res.json(buildPublicEndpointsBody(publicEndpoints));
   } catch (error) {
-    logger.error("Error listing public endpoints:", error);
+    logger.error("Error listing public endpoints:", describeDbError(error));
     res.status(500).json({
       error: "Internal server error",
       message: "Failed to list endpoints",

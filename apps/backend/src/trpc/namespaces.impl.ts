@@ -22,6 +22,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -32,7 +33,7 @@ import {
 } from "../db/repositories";
 import { NamespacesSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
-import { withAdminAudit } from "../lib/audit/admin-write";
+import { AdminAuditWriteError, withAdminAudit } from "../lib/audit/admin-write";
 import { clearFilterCache } from "../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   clearOverrideCache,
@@ -142,7 +143,7 @@ export const namespacesImplementations = {
         message: "Namespace created successfully",
       };
     } catch (error) {
-      logger.error("Error creating namespace:", error);
+      logger.error("Error creating namespace:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -165,7 +166,7 @@ export const namespacesImplementations = {
         message: "Namespaces retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching namespaces:", error);
+      logger.error("Error fetching namespaces:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -186,7 +187,7 @@ export const namespacesImplementations = {
         message: "Namespaces retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching all namespaces:", error);
+      logger.error("Error fetching all namespaces:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -237,7 +238,7 @@ export const namespacesImplementations = {
         message: "Namespace retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching namespace:", error);
+      logger.error("Error fetching namespace:", describeDbError(error));
       return {
         success: false as const,
         message: "Failed to fetch namespace",
@@ -283,7 +284,7 @@ export const namespacesImplementations = {
         message: "Namespace tools retrieved successfully",
       };
     } catch (error) {
-      logger.error("Error fetching namespace tools:", error);
+      logger.error("Error fetching namespace tools:", describeDbError(error));
       return {
         success: false as const,
         data: [],
@@ -363,7 +364,7 @@ export const namespacesImplementations = {
         message: "Namespace deleted successfully",
       };
     } catch (error) {
-      logger.error("Error deleting namespace:", error);
+      logger.error("Error deleting namespace:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -514,7 +515,7 @@ export const namespacesImplementations = {
         message: "Namespace updated successfully",
       };
     } catch (error) {
-      logger.error("Error updating namespace:", error);
+      logger.error("Error updating namespace:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -619,7 +620,7 @@ export const namespacesImplementations = {
         message: "Server status updated successfully",
       };
     } catch (error) {
-      logger.error("Error updating server status:", error);
+      logger.error("Error updating server status:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -697,7 +698,7 @@ export const namespacesImplementations = {
         message: "Tool status updated successfully",
       };
     } catch (error) {
-      logger.error("Error updating tool status:", error);
+      logger.error("Error updating tool status:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -776,7 +777,7 @@ export const namespacesImplementations = {
         message: "Tool overrides updated successfully",
       };
     } catch (error) {
-      logger.error("Error updating tool overrides:", error);
+      logger.error("Error updating tool overrides:", describeDbError(error));
       return {
         success: false as const,
         message:
@@ -854,7 +855,10 @@ export const namespacesImplementations = {
         data: NamespacesSerializer.serializeNamespace(result.namespace),
       };
     } catch (error) {
-      logger.error("Error setting namespace tool policy:", error);
+      logger.error(
+        "Error setting namespace tool policy:",
+        describeDbError(error),
+      );
       return {
         success: false as const,
         message:
@@ -970,7 +974,7 @@ export const namespacesImplementations = {
           // If mapping fails, continue with the parsed name (it's likely an original tool)
           logger.warn(
             `Failed to map override name for tool "${toolName}":`,
-            error,
+            describeDbError(error),
           );
         }
 
@@ -1203,11 +1207,17 @@ export const namespacesImplementations = {
         mappingsCreated: totalMappingsCreated,
       };
     } catch (error) {
-      logger.error("Error refreshing namespace tools:", error);
+      logger.error("Error refreshing namespace tools:", describeDbError(error));
+      // A member can reach the reads and writes above. Normal response data
+      // bypasses tRPC's error masking, so never echo a caught DB message.
+      // The one exception is the admin-plane audit failure: its sentence is
+      // fixed and tells the operator the refresh was rolled back.
       return {
         success: false as const,
         message:
-          error instanceof Error ? error.message : "Internal server error",
+          error instanceof AdminAuditWriteError
+            ? error.message
+            : "Failed to refresh namespace tools",
       };
     }
   },

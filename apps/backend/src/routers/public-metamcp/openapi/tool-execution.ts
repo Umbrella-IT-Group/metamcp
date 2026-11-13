@@ -1,4 +1,4 @@
-import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequest, McpError } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
 import logger from "@/utils/logger";
@@ -92,8 +92,8 @@ export const executeToolWithMiddleware = async (
     // rethrown backend error as the handlers left it, so a backend's HTTP
     // 401/403 would otherwise put its response body in this line even though
     // the handler and audit lines keep it out. A refusal logs its status only;
-    // any other failure keeps its diagnostic. The consumer's reply below is
-    // unchanged.
+    // any other failure keeps its diagnostic. Configuration failures are
+    // replaced with a fixed error at their DB boundary in handlers.ts.
     logger.error(
       `Error executing tool ${JSON.stringify(toolName)}:`,
       backendErrorForLogging(error),
@@ -126,6 +126,13 @@ export const executeToolWithMiddleware = async (
       return res.status(500).json({
         error: "Tool execution failed",
         message: error.message,
+        ...(error instanceof McpError &&
+        typeof error.data === "object" &&
+        error.data !== null &&
+        "retryable" in error.data &&
+        error.data.retryable === true
+          ? { retryable: true }
+          : {}),
         timestamp: new Date().toISOString(),
       });
     }

@@ -1,3 +1,4 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
@@ -97,7 +98,10 @@ export async function sweepUnapprovedDcrClients(): Promise<number> {
     }
     return removed;
   } catch (error) {
-    logger.error("Error sweeping unapproved OAuth clients:", error);
+    logger.error(
+      "Error sweeping unapproved OAuth clients:",
+      describeDbError(error),
+    );
     return 0;
   }
 }
@@ -131,7 +135,10 @@ export async function sweepUnusedCimdClients(): Promise<number> {
     }
     return removed;
   } catch (error) {
-    logger.error("Error sweeping unused client metadata document rows:", error);
+    logger.error(
+      "Error sweeping unused client metadata document rows:",
+      describeDbError(error),
+    );
     return 0;
   }
 }

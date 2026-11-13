@@ -20,6 +20,7 @@ import {
 import { McpServerErrorStatusEnum, ServerParameters } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
@@ -548,7 +549,7 @@ export const createServer = async (
       if (!audit) {
         logger.error(
           `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
-          error,
+          describeDbError(error),
         );
       }
       throw new McpError(
@@ -918,7 +919,7 @@ export const createServer = async (
           } catch (dbError) {
             logger.error(
               `Error syncing tools to database for server ${serverName}:`,
-              dbError,
+              describeDbError(dbError),
             );
           }
 
@@ -1382,10 +1383,27 @@ export const createServer = async (
 
     try {
       // Get configurable timeout values
-      const resetTimeoutOnProgress =
-        await configService.getMcpResetTimeoutOnProgress();
-      const timeout = await configService.getMcpTimeout();
-      const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+      let resetTimeoutOnProgress: boolean;
+      let timeout: number;
+      let maxTotalTimeout: number;
+      try {
+        resetTimeoutOnProgress =
+          await configService.getMcpResetTimeoutOnProgress();
+        timeout = await configService.getMcpTimeout();
+        maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+      } catch (error) {
+        // The auditing middleware logs any rejection from this handler.
+        // Separate DB preflight from the backend call so transport failures
+        // keep their diagnosis without sending a query error to that logger.
+        logger.error(
+          "Tool-call timeout configuration could not be read:",
+          describeDbError(error),
+        );
+        throw new McpError(
+          ErrorCode.InternalError,
+          "Tool-call configuration could not be read. Retry shortly.",
+        );
+      }
 
       const mcpRequestOptions: RequestOptions = {
         signal: abortController.signal,

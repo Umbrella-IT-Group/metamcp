@@ -1,5 +1,6 @@
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../../db/repositories";
@@ -207,7 +208,10 @@ const protectedResourceHandler: express.RequestHandler = async (req, res) => {
 
     return res.json(metadata);
   } catch (error) {
-    logger.error("Error generating OAuth protected resource metadata:", error);
+    logger.error(
+      "Error generating OAuth protected resource metadata:",
+      describeDbError(error),
+    );
     return res.status(500).json({
       error: "internal_server_error",
       error_description: "Failed to generate OAuth metadata",
@@ -313,7 +317,7 @@ const authorizationServerHandler: express.RequestHandler = async (req, res) => {
   } catch (error) {
     logger.error(
       "Error generating OAuth authorization server metadata:",
-      error,
+      describeDbError(error),
     );
     return res.status(500).json({
       error: "server_error",

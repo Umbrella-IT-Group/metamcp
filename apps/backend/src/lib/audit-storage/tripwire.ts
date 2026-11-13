@@ -1,4 +1,5 @@
 import type { AuditTableStats } from "@/db/repositories/audit-storage.repo";
+import { describeDbError } from "@/lib/db-error-summary";
 import { metamcpLogStore } from "@/lib/metamcp/log-store";
 import logger from "@/utils/logger";
 
@@ -343,6 +344,6 @@ export async function checkAuditStorage(): Promise<void> {
       report(stats, thresholdBytes);
     }
   } catch (error) {
-    logger.error("Error checking audit table storage:", error);
+    logger.error("Error checking audit table storage:", describeDbError(error));
   }
 }

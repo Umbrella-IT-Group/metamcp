@@ -1,5 +1,6 @@
 import { endpointsRepository } from "../db/repositories";
 import logger from "../utils/logger";
+import { describeDbError } from "./db-error-summary";
 
 /**
  * Boot-time check for the restricted => require_scoped_api_key pairing.
@@ -65,7 +66,10 @@ export async function warnOnUnpairedRestrictedEndpoints(): Promise<
     }
     return unpaired;
   } catch (err) {
-    logger.error("Endpoint pairing check failed (continuing):", err);
+    logger.error(
+      "Endpoint pairing check failed (continuing):",
+      describeDbError(err),
+    );
     return [];
   }
 }

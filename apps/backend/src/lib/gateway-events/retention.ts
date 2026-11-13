@@ -1,3 +1,4 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 /**
@@ -118,6 +119,6 @@ export async function pruneGatewayEvents(): Promise<void> {
     const prune = await resolvePruner();
     await prune?.(GATEWAY_EVENTS_RETENTION_DAYS);
   } catch (error) {
-    logger.error("Error pruning gateway_events:", error);
+    logger.error("Error pruning gateway_events:", describeDbError(error));
   }
 }

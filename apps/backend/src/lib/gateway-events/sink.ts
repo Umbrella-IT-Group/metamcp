@@ -1,3 +1,4 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -158,7 +159,7 @@ function reportGatewayEventDrop(stage: "write" | "emit", error: unknown): void {
   lastGatewayEventFailureReportAt = now;
   logger.warn(
     `[gateway-events] ${stage} failed, ${gatewayEventFailuresTotal} event row(s) lost since startup (request unaffected):`,
-    error,
+    describeDbError(error),
   );
 }
 

@@ -39,6 +39,7 @@
  *    proxy layer can answer the consumer with an actionable, typed tool
  *    error (+ enrollment elicitation) instead of an opaque 500.
  */
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 // TYPE-ONLY import: the drizzle client behind the repository throws at
@@ -246,8 +247,23 @@ export class M365MintService {
     const startedAt = Date.now();
     const config = getM365BrokerConfig();
 
-    const repo = await this.getRepo();
-    const row = await repo.findByUserId(userId);
+    let row: M365UserTokenRow | undefined;
+    try {
+      const repo = await this.getRepo();
+      row = await repo.findByUserId(userId);
+    } catch (error) {
+      // This rejection flows through the injected fetch into SDK transport
+      // callbacks and tool-call logs. Only the typed, fixed message may leave
+      // the broker; a raw query error would carry its params to those logs.
+      logger.error(
+        `M365 broker: could not read the stored grant for user ${userId}:`,
+        describeDbError(error),
+      );
+      throw new M365BrokerError(
+        "mint_failed",
+        "Could not read your Microsoft 365 connection. Try again shortly.",
+      );
+    }
     // An invalidation can land while the read is in flight. This retired mint
     // has redeemed nothing yet, and its read may now return the NEW grant. Join
     // the current generation before using the row so two generations cannot
@@ -490,7 +506,7 @@ export class M365MintService {
         .catch((persistError) => {
           logger.warn(
             `M365 broker: failed to mark reauth_required for user ${userId}:`,
-            persistError,
+            describeDbError(persistError),
           );
         });
 
@@ -591,7 +607,7 @@ export class M365MintService {
       } catch (error) {
         logger.warn(
           `M365 broker: rotation persist attempt ${attempt + 1}/2 failed for user ${userId}:`,
-          error,
+          describeDbError(error),
         );
       }
     }
@@ -645,7 +661,7 @@ export class M365MintService {
     } catch (error) {
       logger.warn(
         `M365 broker: could not re-read the row for user ${userId} to reconcile a rotation:`,
-        error,
+        describeDbError(error),
       );
       return "failed";
     }
@@ -695,7 +711,7 @@ export class M365MintService {
     } catch (error) {
       logger.warn(
         `M365 broker: reconcile re-seal for user ${userId} failed:`,
-        error,
+        describeDbError(error),
       );
       return "failed";
     }

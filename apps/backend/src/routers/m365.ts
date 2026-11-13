@@ -36,6 +36,7 @@ import express from "express";
 import { auth } from "@/auth";
 import { m365TokensRepository } from "@/db/repositories/m365-tokens.repo";
 import { usersRepository } from "@/db/repositories/users.repo";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import {
@@ -128,7 +129,10 @@ async function getSessionUser(
       return { id: session.user.id, email: session.user.email };
     }
   } catch (error) {
-    logger.warn("M365 broker: better-auth session lookup failed:", error);
+    logger.warn(
+      "M365 broker: better-auth session lookup failed:",
+      describeDbError(error),
+    );
   }
   return undefined;
 }
@@ -403,7 +407,7 @@ m365Router.get("/m365/callback", async (req, res) => {
     const mustKeepVersion = resolveEnvelopePolicy().mode === "keep";
     logger.warn(
       `M365 broker: pre-enrollment row lookup failed for user ${user.id} (${mustKeepVersion ? "enrollment stopped to preserve the stored envelope version" : "continuing under an explicit envelope policy"}):`,
-      lookupError,
+      describeDbError(lookupError),
     );
     if (mustKeepVersion) {
       sendHtml(
@@ -435,7 +439,7 @@ m365Router.get("/m365/callback", async (req, res) => {
   } catch (dbError) {
     logger.error(
       `M365 broker: failed to persist enrollment for user ${user.id}:`,
-      dbError,
+      describeDbError(dbError),
     );
     sendHtml(
       res,

@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 
 import { emit } from "@/lib/audit/audit-emitter";
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { auditPool } from "./audit-db";
@@ -166,7 +167,7 @@ export async function verifyRuntimeDatabaseRole(): Promise<void> {
     if (result.status === "rejected") {
       logger.error(
         `Runtime DB role check (${checks[index][0]}) failed:`,
-        result.reason,
+        describeDbError(result.reason),
       );
     }
   });

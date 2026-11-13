@@ -6,6 +6,7 @@ import {
 import { ServerParameters } from "@repo/zod-types";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 // Import the specific repo file (not the ../../db/repositories barrel): the
@@ -741,7 +742,7 @@ export class McpServerPool {
             ).catch((error) => {
               logger.error(
                 `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
-                error,
+                describeDbError(error),
               );
             });
           } else {
@@ -754,7 +755,7 @@ export class McpServerPool {
             ).catch((error) => {
               logger.error(
                 `Error handling server crash for ${params.uuid} (no namespace):`,
-                error,
+                describeDbError(error),
               );
             });
           }
@@ -2022,7 +2023,10 @@ export class McpServerPool {
         );
       }
     } catch (error) {
-      logger.error("Error during automatic session cleanup:", error);
+      logger.error(
+        "Error during automatic session cleanup:",
+        describeDbError(error),
+      );
     }
   }
 
@@ -2108,7 +2112,7 @@ export class McpServerPool {
       } catch (error) {
         logger.warn(
           "Pool prune (registry reconciliation) skipped this sweep:",
-          error,
+          describeDbError(error),
         );
       }
     }

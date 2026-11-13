@@ -2,11 +2,14 @@ import { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import {
   CallToolResult,
   CompatibilityCallToolResultSchema,
+  ErrorCode,
   ListToolsResultSchema,
+  McpError,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { configService } from "../../../lib/config.service";
@@ -69,6 +72,35 @@ import {
 } from "../../../lib/metamcp/tool-call-extra";
 import { routeUnmappedToolCall } from "../../../lib/metamcp/tool-call-routing";
 import { sanitizeName } from "../../../lib/metamcp/utils";
+
+async function readOpenApiRequestOptions(
+  operation: "Tools-list" | "Tool-call",
+  { audit = false }: { audit?: boolean } = {},
+): Promise<RequestOptions> {
+  try {
+    return {
+      resetTimeoutOnProgress:
+        await configService.getMcpResetTimeoutOnProgress(),
+      timeout: await configService.getMcpTimeout(),
+      maxTotalTimeout: await configService.getMcpMaxTotalTimeout(),
+    };
+  } catch (error) {
+    // These reads can fail with query parameters in the error. Replace it at
+    // the DB boundary, before listing, auditing or HTTP response code sees it;
+    // backend failures outside this boundary keep their transport diagnostic.
+    const message = `OpenAPI bridge: ${operation} timeout configuration could not be read:`;
+    const detail = describeDbError(error);
+    // Background audits keep their one aggregate WARN; a configuration
+    // outage there must not add per-server ERROR lines to served-call panels.
+    if (audit) logger.debug(message, detail);
+    else logger.error(message, detail);
+    throw new McpError(
+      ErrorCode.InternalError,
+      `${operation} configuration could not be read. Retry shortly.`,
+      { retryable: true },
+    );
+  }
+}
 
 // Original List Tools Handler (adapted from metamcp-proxy.ts)
 //
@@ -160,16 +192,12 @@ export const createOriginalListToolsHandler = (
         }
 
         // Get configurable timeout values to bypass MCP SDK default enforcement
-        const resetTimeoutOnProgress =
-          await configService.getMcpResetTimeoutOnProgress();
-        const timeout = await configService.getMcpTimeout();
-        const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
-
-        const mcpRequestOptions: RequestOptions = {
-          resetTimeoutOnProgress,
-          timeout,
-          maxTotalTimeout,
-        };
+        const mcpRequestOptions = await readOpenApiRequestOptions(
+          "Tools-list",
+          {
+            audit,
+          },
+        );
 
         // Every page, through the one guarded loop (paginate-tools-list.ts).
         // This listing used to read page one only and silently dropped the
@@ -451,10 +479,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     const targetServerUuid = route.serverUuid;
 
     // Get configurable timeout values to bypass MCP SDK default enforcement
-    const resetTimeoutOnProgress =
-      await configService.getMcpResetTimeoutOnProgress();
-    const timeout = await configService.getMcpTimeout();
-    const maxTotalTimeout = await configService.getMcpMaxTotalTimeout();
+    const requestOptions = await readOpenApiRequestOptions("Tool-call");
 
     // Used only to send the backend a cancel when the total cap rejects the
     // call (the SDK sends none). The HTTP request is deliberately NOT linked
@@ -465,15 +490,16 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     const cancelOn = cancelPassthroughEnabled();
 
     const mcpRequestOptions: RequestOptions = {
+      ...requestOptions,
       signal: abortController.signal,
-      resetTimeoutOnProgress,
-      timeout,
-      maxTotalTimeout,
     };
     // The bridge answers one JSON body, so there is nobody to relay progress
     // to. The one reset flag must still behave as it does on the MCP surface,
     // and the SDK arms it only through a registered handler.
-    if (resetTimeoutOnProgress && progressPassthroughEnabled()) {
+    if (
+      mcpRequestOptions.resetTimeoutOnProgress &&
+      progressPassthroughEnabled()
+    ) {
       mcpRequestOptions.onprogress = NOOP_PROGRESS;
     }
 

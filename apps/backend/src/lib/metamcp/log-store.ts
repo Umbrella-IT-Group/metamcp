@@ -1,3 +1,4 @@
+import { describeDbError } from "@/lib/db-error-summary";
 import { recordGatewayEvent } from "@/lib/gateway-events/sink";
 import logger from "@/utils/logger";
 
@@ -154,7 +155,7 @@ class MetaMcpLogStore {
       // Logged rather than swallowed: reaching here means the sink's own
       // guarantees are broken, which is a real defect worth seeing, just not
       // one worth breaking a reconnect over.
-      logger.error("Error persisting gateway event:", err);
+      logger.error("Error persisting gateway event:", describeDbError(err));
     }
   }
 

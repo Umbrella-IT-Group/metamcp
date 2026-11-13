@@ -22,6 +22,7 @@
  * successful pass, the common case, since the census found no rows carrying a
  * bearer token.
  */
+import { describeDbError } from "@/lib/db-error-summary";
 import { getTokenKek } from "@/lib/m365/config";
 import logger from "@/utils/logger";
 
@@ -66,7 +67,7 @@ export async function convergeServerBearerTokens(): Promise<void> {
       // while others remain plaintext.
       logger.error(
         `Bearer-token converge: failed to encrypt bearer token for server ${server.uuid}:`,
-        err,
+        describeDbError(err),
       );
     }
   }

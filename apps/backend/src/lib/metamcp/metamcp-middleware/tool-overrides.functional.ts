@@ -1,6 +1,7 @@
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { and, eq } from "drizzle-orm";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { db } from "../../../db/index";
@@ -330,7 +331,7 @@ async function getToolOverrides(
   } catch (error) {
     logger.error(
       `Error fetching tool overrides for ${toolName} in namespace ${namespaceUuid}:`,
-      error,
+      describeDbError(error),
     );
     return undefined;
   }
@@ -454,7 +455,10 @@ async function applyToolOverrides(
 
         emit(overriddenTool, tool.name);
       } catch (error) {
-        logger.error(`Error applying overrides for tool ${tool.name}:`, error);
+        logger.error(
+          `Error applying overrides for tool ${tool.name}:`,
+          describeDbError(error),
+        );
         // Preserve the ordinary listing, without a read-only identity proof.
         emit(tool);
       }
@@ -535,7 +539,7 @@ export async function mapOverrideNameToOriginal(
   } catch (error) {
     logger.error(
       `Error mapping override name ${toolName} to original in namespace ${namespaceUuid}:`,
-      error,
+      describeDbError(error),
     );
   }
 

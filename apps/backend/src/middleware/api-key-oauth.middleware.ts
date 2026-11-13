@@ -1,6 +1,7 @@
 import { DatabaseEndpoint } from "@repo/zod-types";
 import express from "express";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { ApiKeysRepository } from "../db/repositories/api-keys.repo";
@@ -170,7 +171,7 @@ async function validateOAuthToken(token: string): Promise<{
     // Token is not a recognized MCP token format
     return { valid: false, error: "Unsupported token format" };
   } catch (error) {
-    logger.error("Error validating OAuth token:", error);
+    logger.error("Error validating OAuth token:", describeDbError(error));
     return { valid: false, error: "OAuth validation failed" };
   }
 }
@@ -1079,7 +1080,7 @@ export const authenticateApiKey = async (
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    logger.error("Error in authentication middleware:", error);
+    logger.error("Error in authentication middleware:", describeDbError(error));
     return res.status(500).json({
       error: "Internal server error",
       message: "Failed to validate authentication",

@@ -5,6 +5,7 @@ import {
   ServerParameters,
 } from "@repo/zod-types";
 
+import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { namespacesRepository } from "../../db/repositories/namespaces.repo";
@@ -316,7 +317,7 @@ export async function routeUnmappedToolCall(
     // noted still answers as unavailable rather than as an unknown tool.
     logger.error(
       `${logPrefix}routing fallback failed for tool ${display}:`,
-      backendErrorForLogging(error),
+      describeDbError(error),
     );
   }
 
@@ -370,7 +371,7 @@ async function unroutedToolError(options: {
   } catch (error) {
     logger.error(
       `${options.logPrefix}could not read the servers of namespace ${options.namespaceUuid} while routing ${JSON.stringify(toolName)}:`,
-      error,
+      describeDbError(error),
     );
     return new BackendUnavailableError(
       toolName,
