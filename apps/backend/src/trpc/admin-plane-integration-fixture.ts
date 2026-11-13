@@ -3,8 +3,9 @@
  * stack against a real Postgres (api-key-mint.integration.test.ts,
  * admin-write.integration.test.ts and key-owner-groups.integration.test.ts):
  * users, admin-plane keys of both scopes, the express app around the real tRPC
- * router, access groups, data-plane keys of a chosen owner and scope, and the
- * audit-fault trigger.
+ * router, access groups, data-plane keys of a chosen owner and scope, the
+ * audit-fault trigger, and the readers that find a detached audit row (see
+ * `auditEventually`).
  *
  * Test support only: nothing in the shipped backend imports it, and tsup's
  * only entry is `src/index.ts`. The two suites call `vi.mock` for the logger
@@ -60,11 +61,43 @@ export interface Fixture {
     where: string,
     params: unknown[],
   ) => Promise<Array<Record<string, unknown>>>;
-  /** Same, polling briefly for a row `emit()` writes after the response. */
+  /**
+   * Same, polling briefly for a row `emit()` writes after the response, then
+   * letting every audit write still in flight land and reading once more, so a
+   * request that wrote its row twice reads as two rows, not one.
+   *
+   * SCOPE `where` BY SOMETHING ONLY THE REQUEST UNDER TEST CARRIES (its own
+   * `uniqueIp()`, a uuid it created), NEVER BY A TIME WINDOW. A detached write
+   * is stamped by the database when it STARTS, which can be after the response
+   * and after any timestamp a test takes next, so `occurred_at >= <now>` also
+   * matches the late rows of earlier requests (and can pass on one of them).
+   */
   auditEventually: (
     where: string,
     params: unknown[],
   ) => Promise<Array<Record<string, unknown>>>;
+  /**
+   * Resolve once every audit write emitted so far has landed: the audit pool
+   * has no checked-out connection and nobody waiting for one. After it, a row
+   * the request wrote is visible to `auditNow` with no polling. Throws if the
+   * writes are still in flight after 5 s.
+   */
+  auditSettled: () => Promise<void>;
+  /**
+   * An address, from the RFC 5737 documentation range 192.0.2.0/24, that no
+   * other request of the suite sends (`ip` option of `trpc`), so the audit rows
+   * it writes are identified by `actor_ip`.
+   */
+  uniqueIp: () => string;
+  /**
+   * Hold every audit_log INSERT until the returned `release` is called, so a
+   * test can stage the case the detached writer makes possible: the response
+   * is back and the row is not. Keep it short: a write that waits for an audit
+   * pool connection (two of them, 1 s checkout timeout) for longer than a
+   * second is dropped, so stall one request's writes, not a burst. `close()`
+   * releases it if the test did not.
+   */
+  stallAuditWrites: () => Promise<() => Promise<void>>;
   endpoint: (over: {
     name: string;
     userId?: string | null;
@@ -117,6 +150,16 @@ export interface Fixture {
 
 const APP_ORIGIN = "http://127.0.0.1:1";
 
+/** How long `auditSettled` waits for the audit writes in flight before it throws. */
+const AUDIT_SETTLE_TIMEOUT_MS = 5_000;
+
+/**
+ * Advisory-lock key of the audit stall (`stallAuditWrites`). A second key,
+ * distinct from INTEGRATION_DB_LOCK_KEY, held only by the suite's own session
+ * and only while a test has the stall closed.
+ */
+const AUDIT_STALL_LOCK_KEY = 987_201_432;
+
 export async function createFixture(
   databaseUrl: string,
   label: string,
@@ -132,6 +175,9 @@ export async function createFixture(
   await suiteLock.query(`SELECT pg_advisory_lock(${INTEGRATION_DB_LOCK_KEY})`);
 
   const { db } = await import("../db/index");
+  // The pool every `emit()` write goes through (db/audit-db), the one this
+  // process shares with the app under test, read by `auditSettled`.
+  const { auditPool } = await import("../db/audit-db");
   const schema = await import("../db/schema");
   const { eq } = await import("drizzle-orm");
   const { ApiKeysRepository } = await import(
@@ -225,6 +271,14 @@ export async function createFixture(
   let ipCounter = 0;
   const nextIp = () => `198.51.100.${(++ipCounter % 250) + 1}`;
 
+  // A separate range from `nextIp` (which wraps and so repeats), and a throw
+  // rather than a wrap: an address that is not unique is the bug it prevents.
+  let uniqueIpCounter = 0;
+  const uniqueIp = () => {
+    if (uniqueIpCounter >= 254) throw new Error("uniqueIp: range exhausted");
+    return `192.0.2.${++uniqueIpCounter}`;
+  };
+
   async function trpc(
     procedure: string,
     input: unknown,
@@ -278,13 +332,41 @@ export async function createFixture(
     return rows;
   }
 
+  // `emit()` hands its write to the audit pool and returns, so a request is
+  // answered before its audit rows exist. Every write it started is, from the
+  // moment the response reaches the test, either holding one of the pool's
+  // connections or waiting for one (the code between `emit()` and the pool
+  // checkout is microtasks, which finish before the response is delivered), so
+  // a pool that is entirely idle means every row emitted so far is committed.
+  // The sink is resolved by the suite's first request, long before any test
+  // calls this.
+  async function auditSettled() {
+    const deadline = Date.now() + AUDIT_SETTLE_TIMEOUT_MS;
+    while (
+      auditPool.waitingCount > 0 ||
+      auditPool.idleCount < auditPool.totalCount
+    ) {
+      if (Date.now() > deadline) {
+        throw new Error(
+          `audit writes still in flight after ${AUDIT_SETTLE_TIMEOUT_MS} ms`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
   async function auditEventually(where: string, params: unknown[]) {
     const deadline = Date.now() + 5_000;
     for (;;) {
       const rows = await auditNow(where, params);
-      if (rows.length > 0 || Date.now() > deadline) return rows;
+      if (rows.length > 0 || Date.now() > deadline) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    // The first row is in. Read again once nothing is in flight: a request
+    // that wrote the row twice must read as two, and a poll that returns at
+    // the first row would not see the second.
+    await auditSettled();
+    return auditNow(where, params);
   }
 
   async function endpoint(over: {
@@ -481,8 +563,52 @@ export async function createFixture(
     await suiteLock.query(`DROP TABLE IF EXISTS itest_fail_key_names`);
   }
 
+  // A BEFORE INSERT trigger that waits for a shared advisory lock this
+  // session holds exclusively while the stall is closed. The wait is in the
+  // database, not the app, so the app under test is untouched, and a test that
+  // dies with the stall closed frees it by ending the session. The lock is
+  // taken and dropped again at once, so the writes pass the moment it is
+  // released. `occurred_at` is not delayed by it (the default is evaluated when
+  // the statement starts), which is why the tests that use it identify rows by
+  // address and not by time.
+  let releaseStall: (() => Promise<void>) | null = null;
+
+  async function stallAuditWrites() {
+    if (releaseStall) throw new Error("audit writes are already stalled");
+    await suiteLock.query(`
+      CREATE OR REPLACE FUNCTION itest_stall_audit() RETURNS trigger AS $$
+      BEGIN
+        PERFORM pg_advisory_lock_shared(${AUDIT_STALL_LOCK_KEY});
+        PERFORM pg_advisory_unlock_shared(${AUDIT_STALL_LOCK_KEY});
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`);
+    await suiteLock.query(
+      `DROP TRIGGER IF EXISTS itest_stall_audit_trg ON audit_log`,
+    );
+    await suiteLock.query(
+      `CREATE TRIGGER itest_stall_audit_trg BEFORE INSERT ON audit_log
+         FOR EACH ROW EXECUTE FUNCTION itest_stall_audit()`,
+    );
+    await suiteLock.query(`SELECT pg_advisory_lock(${AUDIT_STALL_LOCK_KEY})`);
+    const release = async () => {
+      if (releaseStall !== release) return;
+      releaseStall = null;
+      // Unlock first: DROP TRIGGER needs a lock the stalled INSERTs hold.
+      await suiteLock.query(
+        `SELECT pg_advisory_unlock(${AUDIT_STALL_LOCK_KEY})`,
+      );
+      await suiteLock.query(
+        `DROP TRIGGER IF EXISTS itest_stall_audit_trg ON audit_log`,
+      );
+      await suiteLock.query(`DROP FUNCTION IF EXISTS itest_stall_audit()`);
+    };
+    releaseStall = release;
+    return release;
+  }
+
   async function close() {
     await new Promise((resolve) => server?.close(resolve));
+    await releaseStall?.();
     await suiteLock.query(
       `DROP TRIGGER IF EXISTS itest_fail_audit_trg ON audit_log`,
     );
@@ -531,6 +657,9 @@ export async function createFixture(
     trpc,
     auditNow,
     auditEventually,
+    auditSettled,
+    uniqueIp,
+    stallAuditWrites,
     endpoint,
     group,
     dataKey,
