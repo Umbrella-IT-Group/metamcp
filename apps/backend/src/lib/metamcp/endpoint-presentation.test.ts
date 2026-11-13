@@ -22,6 +22,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildServerMetadata,
   effectivePresentation,
+  LEAN_INSTRUCTIONS,
+  leanListingEnabled,
   presentationEnabled,
   presentationFromInitParams,
   presentationToInitParams,
@@ -216,15 +218,20 @@ describe("characters refused in both texts", () => {
 });
 
 describe("the set request", () => {
-  it("only accepts the full listing in this release", () => {
-    const refused = SetEndpointPresentationRequestSchema.safeParse({
-      endpoint_uuid: UUID,
-      title: null,
-      instructions: null,
-      tool_listing: "lean",
-      omit_output_schemas: false,
-    });
-    expect(refused.success).toBe(false);
+  it("accepts both listing modes and refuses any other", () => {
+    const parseMode = (tool_listing: unknown) =>
+      SetEndpointPresentationRequestSchema.safeParse({
+        endpoint_uuid: UUID,
+        title: null,
+        instructions: null,
+        tool_listing,
+        omit_output_schemas: false,
+      });
+    expect(parseMode("full").success).toBe(true);
+    expect(parseMode("lean").success).toBe(true);
+    for (const other of ["", "Lean", "FULL", "lean ", "off", null, 1]) {
+      expect(parseMode(other).success).toBe(false);
+    }
   });
 
   it("requires an endpoint uuid", () => {
@@ -276,6 +283,53 @@ describe("buildServerMetadata", () => {
     expect("title" in metadata.serverInfo).toBe(false);
   });
 
+  it("starts a lean session's instructions with the workflow paragraph, and puts the administrator's text after a blank line", () => {
+    expect(
+      buildServerMetadata("ns-1", {
+        toolListing: "lean",
+        omitOutputSchemas: false,
+      }).instructions,
+    ).toBe(LEAN_INSTRUCTIONS);
+    expect(
+      buildServerMetadata("ns-1", {
+        instructions: "Prefer read-only tools.",
+        toolListing: "lean",
+        omitOutputSchemas: false,
+      }).instructions,
+    ).toBe(`${LEAN_INSTRUCTIONS}\n\nPrefer read-only tools.`);
+  });
+
+  it("adds no paragraph for a session that is not lean", () => {
+    expect(
+      buildServerMetadata("ns-1", {
+        title: "Desk",
+        toolListing: "full",
+        omitOutputSchemas: true,
+      }),
+    ).toEqual({
+      serverInfo: {
+        name: "metamcp-unified-ns-1",
+        version: "1.0.0",
+        title: "Desk",
+      },
+    });
+  });
+
+  it("keeps the workflow paragraph and the longest administrator text under the 2048 characters some clients keep of instructions", () => {
+    expect(
+      LEAN_INSTRUCTIONS.length + 2 + ENDPOINT_INSTRUCTIONS_MAX,
+    ).toBeLessThanOrEqual(2048);
+    expect(LEAN_INSTRUCTIONS).not.toContain("\u2014");
+    for (const name of [
+      "search_tools",
+      "describe_tool",
+      "call_tool",
+      "call_write_tool",
+    ]) {
+      expect(LEAN_INSTRUCTIONS).toContain(name);
+    }
+  });
+
   it("never lets the title change the server name", () => {
     const metadata = buildServerMetadata("ns-2", {
       title: "metamcp-unified-other",
@@ -304,6 +358,37 @@ describe("MCP_ENDPOINT_PRESENTATION", () => {
       );
     },
   );
+});
+
+describe("MCP_LEAN_LISTING", () => {
+  it.each(["off", "false", "0", "OFF", "False", "  off  "])(
+    "%j turns the lean listing off",
+    (value) => {
+      expect(leanListingEnabled({ MCP_LEAN_LISTING: value })).toBe(false);
+    },
+  );
+
+  it.each([undefined, "", "on", "true", "1", "enabled"])(
+    "%j leaves the lean listing on",
+    (value) => {
+      expect(leanListingEnabled({ MCP_LEAN_LISTING: value })).toBe(true);
+    },
+  );
+
+  it("is independent of the master switch: it is read on its own", () => {
+    expect(
+      leanListingEnabled({
+        MCP_ENDPOINT_PRESENTATION: "off",
+        MCP_LEAN_LISTING: "on",
+      }),
+    ).toBe(true);
+    expect(
+      presentationEnabled({
+        MCP_ENDPOINT_PRESENTATION: "on",
+        MCP_LEAN_LISTING: "off",
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("effectivePresentation", () => {
@@ -344,19 +429,73 @@ describe("effectivePresentation", () => {
     expect(effectivePresentation(once, {})).toEqual(once);
   });
 
-  it("serves a stored lean listing as the full listing in this release, and a lean-only input as none", () => {
+  it("serves a lean listing as the full listing while the lean switch is off, and a lean-only input as none", () => {
+    const leanOff = { MCP_LEAN_LISTING: "off" };
     expect(
       effectivePresentation(
         { toolListing: "lean", omitOutputSchemas: false },
-        {},
+        leanOff,
       ),
     ).toBeUndefined();
     expect(
       effectivePresentation(
         { title: "Desk", toolListing: "lean", omitOutputSchemas: false },
-        {},
+        leanOff,
       ),
     ).toEqual({ title: "Desk", toolListing: "full", omitOutputSchemas: false });
+  });
+
+  it("serves a lean listing as lean by default, with or without any text, and applying it twice changes nothing", () => {
+    const leanOnly = effectivePresentation(
+      { toolListing: "lean", omitOutputSchemas: false },
+      {},
+    );
+    expect(leanOnly).toEqual({ toolListing: "lean", omitOutputSchemas: false });
+    expect(effectivePresentation(leanOnly, {})).toEqual(leanOnly);
+    expect(
+      effectivePresentation(
+        {
+          title: "Desk",
+          instructions: "Be brief.",
+          toolListing: "lean",
+          omitOutputSchemas: true,
+        },
+        {},
+      ),
+    ).toEqual({
+      title: "Desk",
+      instructions: "Be brief.",
+      toolListing: "lean",
+      omitOutputSchemas: true,
+    });
+  });
+
+  it("keeps the title, the instructions and the trim when only the lean switch is off", () => {
+    expect(
+      effectivePresentation(
+        {
+          title: "Desk",
+          instructions: "Be brief.",
+          toolListing: "lean",
+          omitOutputSchemas: true,
+        },
+        { MCP_LEAN_LISTING: "off" },
+      ),
+    ).toEqual({
+      title: "Desk",
+      instructions: "Be brief.",
+      toolListing: "full",
+      omitOutputSchemas: true,
+    });
+  });
+
+  it("is undefined for a lean session when the master switch is off, whatever the lean switch says", () => {
+    expect(
+      effectivePresentation(
+        { toolListing: "lean", omitOutputSchemas: false },
+        { MCP_ENDPOINT_PRESENTATION: "off", MCP_LEAN_LISTING: "on" },
+      ),
+    ).toBeUndefined();
   });
 
   it("is undefined whatever the content when the kill switch is off", () => {
@@ -404,11 +543,40 @@ describe("the init_params pin", () => {
     ).toBeUndefined();
   });
 
-  it("reads a lean pin as the full listing in this release", () => {
+  it("reads a lean pin as the full listing while the lean switch is off", () => {
     expect(
       presentationFromInitParams(
         { presentation: { v: 1, lean: true, omit: false } },
-        {},
+        { MCP_LEAN_LISTING: "off" },
+      ),
+    ).toBeUndefined();
+    // With a trim pinned as well, the trim survives the lean switch.
+    expect(
+      presentationFromInitParams(
+        { presentation: { v: 1, lean: true, omit: true } },
+        { MCP_LEAN_LISTING: "off" },
+      ),
+    ).toEqual({ toolListing: "full", omitOutputSchemas: true });
+  });
+
+  it("writes and reads a lean pin back as lean by default", () => {
+    const lean: SessionPresentation = {
+      toolListing: "lean",
+      omitOutputSchemas: false,
+    };
+    expect(presentationToInitParams(lean)).toEqual({
+      presentation: { v: 1, lean: true, omit: false },
+    });
+    expect(
+      presentationFromInitParams(presentationToInitParams(lean), {}),
+    ).toEqual(lean);
+  });
+
+  it("lets the master switch win over a lean pin", () => {
+    expect(
+      presentationFromInitParams(
+        { presentation: { v: 1, lean: true, omit: false } },
+        { MCP_ENDPOINT_PRESENTATION: "off" },
       ),
     ).toBeUndefined();
   });

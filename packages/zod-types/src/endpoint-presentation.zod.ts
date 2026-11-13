@@ -167,16 +167,17 @@ export const GetEndpointPresentationRequestSchema = z.object({
  * a field that is not sent is not "left alone", and the request can never carry
  * half of an earlier edit forward.
  *
- * `tool_listing` is the literal `full` in this release so nothing can be
- * stored that the gateway does not serve; the read side still accepts both
- * modes (see ToolListingModeSchema). A release that serves `lean` widens this
- * one line.
+ * `tool_listing` accepts both modes now that the gateway serves the lean
+ * listing. (The first release of this table accepted only `full` on the way
+ * in, so nothing could be stored that the gateway did not serve, while the
+ * read side already took both.) Whether a saved `lean` takes effect also
+ * depends on the process-level switch, which `effective` reports below.
  */
 export const SetEndpointPresentationRequestSchema = z.object({
   endpoint_uuid: z.string().uuid(),
   title: EndpointTitleSchema,
   instructions: EndpointInstructionsSchema,
-  tool_listing: z.literal("full"),
+  tool_listing: ToolListingModeSchema,
   omit_output_schemas: z.boolean(),
 });
 

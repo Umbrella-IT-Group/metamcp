@@ -6,6 +6,7 @@ import {
   type PresentationTextProblem,
   presentationTextProblem,
   type SetEndpointPresentationRequest,
+  type ToolListingMode,
 } from "@repo/zod-types";
 
 /**
@@ -21,6 +22,7 @@ import {
 export interface PresentationFormState {
   title: string;
   instructions: string;
+  toolListing: ToolListingMode;
   omitOutputSchemas: boolean;
 }
 
@@ -36,6 +38,7 @@ export function toFormState(
   return {
     title: stored?.title ?? "",
     instructions: stored?.instructions ?? "",
+    toolListing: stored?.tool_listing ?? "full",
     omitOutputSchemas: stored?.omit_output_schemas ?? false,
   };
 }
@@ -44,23 +47,17 @@ export function toFormState(
  * Does saving this form change anything? Texts are compared in their
  * normalized form, so a trailing newline or CRLF line ends do not light up
  * Save, and the stored value (already normalized by the server) is compared
- * as it is.
- *
- * A stored `lean` mode counts as a change: this form cannot represent it and
- * always saves the full listing, so Save has to stay available for an
- * administrator to clear a lean row this gateway version does not serve.
+ * as it is. The listing mode is a field of the form like the others.
  */
 export function isDirty(
   form: PresentationFormState,
   stored: StoredPresentation | undefined,
 ): boolean {
-  if (stored?.tool_listing !== undefined && stored.tool_listing !== "full") {
-    return true;
-  }
   return (
     normalizePresentationText(form.title) !== (stored?.title ?? null) ||
     normalizePresentationText(form.instructions) !==
       (stored?.instructions ?? null) ||
+    form.toolListing !== (stored?.tool_listing ?? "full") ||
     form.omitOutputSchemas !== (stored?.omit_output_schemas ?? false)
   );
 }
@@ -99,9 +96,10 @@ export function hasProblems(problems: PresentationFormProblems): boolean {
 }
 
 /**
- * The request for the current form. Always the full listing: this gateway
- * version does not serve any other mode. Texts are sent normalized, so what
- * the server stores is what the counter showed.
+ * The request for the current form. Texts are sent normalized, so what the
+ * server stores is what the counter showed. The trim flag is sent as held even
+ * while the lean listing is chosen (the switch is disabled then, not cleared),
+ * so choosing lean and back to full does not lose it.
  */
 export function toRequest(
   endpointUuid: string,
@@ -111,7 +109,7 @@ export function toRequest(
     endpoint_uuid: endpointUuid,
     title: normalizePresentationText(form.title),
     instructions: normalizePresentationText(form.instructions),
-    tool_listing: "full",
+    tool_listing: form.toolListing,
     omit_output_schemas: form.omitOutputSchemas,
   };
 }
