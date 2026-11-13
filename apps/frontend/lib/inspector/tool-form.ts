@@ -302,11 +302,12 @@ export function setBoolean(
  * Text that does not fit a number or boolean field is sent as typed, as a
  * string, with a warning, because the tester's job is often to see the server
  * refuse it. Two things block: a JSON field that does not parse (no value can
- * be formed from it), and a number the browser cannot carry exactly (a whole
- * number past Number.MAX_SAFE_INTEGER, or one that overflows). The second is
- * the same rule as the first: a rounded number is a value nobody typed, and
- * sending it as a string would be a change nobody chose, so the call waits
- * for the person to quote it themselves if the tool takes a string.
+ * be formed from it), and a number the browser cannot carry exactly (past
+ * Number.MAX_SAFE_INTEGER, nonfinite, or a decimal whose value changes during
+ * JSON serialization). The second is the same rule as the first: a rounded
+ * number is a value nobody typed, and sending it as a string would be a change
+ * nobody chose, so the call waits for the person to quote it themselves if
+ * the tool takes a string.
  */
 export function buildArguments(
   specs: FieldSpec[],

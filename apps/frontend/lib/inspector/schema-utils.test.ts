@@ -441,6 +441,26 @@ describe("parseObjectFromPaste and numbers that cannot be sent exactly", () => {
     });
   });
 
+  it("refuses decimals rounded within the safe range in both paste formats", () => {
+    for (const text of [
+      '{"n": 9007199254740990.5}',
+      '{"a": {"n": 0.10000000000000001}}',
+      '{"a": `say "hi"`, "n": 1.0000000000000001}',
+    ]) {
+      expect(parsePastedObject(text)).toMatchObject({
+        ok: false,
+        reason: "unsafeNumber",
+      });
+      expect(parseObjectFromPaste(text)).toBeNull();
+    }
+    expect(
+      parsePastedObject('{"n": 1.2300, "a": `0.10000000000000001`}'),
+    ).toEqual({
+      ok: true,
+      value: { n: 1.23, a: "0.10000000000000001" },
+    });
+  });
+
   it("names the number it refused, apart from text that is not an object", () => {
     expect(parsePastedObject('{"a": 1, "n": 9007199254740993}')).toEqual({
       ok: false,
