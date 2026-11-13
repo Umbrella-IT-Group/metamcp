@@ -97,6 +97,17 @@ describe("title rules", () => {
     }
   });
 
+  it.each(["\u2028", "\u2029"])(
+    "refuses Unicode line and paragraph separators (%j) in a title",
+    (separator) => {
+      const refused = parse(`a${separator}b`, null);
+      expect(refused.success).toBe(false);
+      expect(messageOf(refused)).toBe("Must be a single line.");
+      // Multi-line guidance may still contain these ordinary separators.
+      expect(parse(null, `a${separator}b`).success).toBe(true);
+    },
+  );
+
   it("refuses TAB, which a single line does not allow", () => {
     const refused = parse("a\tb", null);
     expect(refused.success).toBe(false);

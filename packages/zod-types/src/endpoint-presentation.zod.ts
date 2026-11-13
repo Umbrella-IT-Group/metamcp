@@ -88,7 +88,10 @@ export function presentationTextProblem(
   normalized: string,
   options: { max: number; singleLine: boolean },
 ): PresentationTextProblem | null {
-  if (options.singleLine && /[\n\r]/.test(normalized)) return "newline";
+  // Unicode line and paragraph separators also break a display title across
+  // lines, although they are neither C0/C1 controls nor format characters.
+  if (options.singleLine && /[\n\r\u2028\u2029]/.test(normalized))
+    return "newline";
   const control = options.singleLine ? CONTROL_SINGLE_LINE : CONTROL_MULTILINE;
   if (control.test(normalized)) return "control";
   if (FORMAT_CHARACTER.test(normalized)) return "format";
