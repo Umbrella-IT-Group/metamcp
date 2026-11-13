@@ -284,8 +284,11 @@ export class OAuthRepository {
   // the old exact-value lookup matched. The returned row's `code` is the hash;
   // callers that re-address the row (consume/delete) pass the plaintext again
   // and it re-hashes, so no caller ever handles the stored digest directly.
-  async getAuthCode(code: string): Promise<OAuthAuthorizationCode | null> {
-    const result = await db
+  async getAuthCode(
+    code: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<OAuthAuthorizationCode | null> {
+    const result = await executor
       .select()
       .from(oauthAuthorizationCodesTable)
       .where(eq(oauthAuthorizationCodesTable.code, hashApiKey(code)))
@@ -797,12 +800,17 @@ export class OAuthRepository {
       db
         .delete(oauthRotatedRefreshTokensTable)
         .where(lt(oauthRotatedRefreshTokensTable.expires_at, now)),
-      // Spent-code records (migration 0045) live about fifteen minutes. Reaped
-      // whatever OAUTH_CODE_REPLAY says, so rows written before the mode was
-      // switched to `off` do not linger.
-      db
-        .delete(oauthSpentAuthorizationCodesTable)
-        .where(lt(oauthSpentAuthorizationCodesTable.expires_at, now)),
+      // `off` also bypasses this table in the periodic sweep: it is the full
+      // rollback when the table is missing or broken. Existing records are
+      // reaped once the feature is enabled again. Every other value keeps the
+      // sweep, matching the token endpoint's fallback to `log`.
+      ...(process.env.OAUTH_CODE_REPLAY?.trim().toLowerCase() === "off"
+        ? []
+        : [
+            db
+              .delete(oauthSpentAuthorizationCodesTable)
+              .where(lt(oauthSpentAuthorizationCodesTable.expires_at, now)),
+          ]),
     ]);
   }
 }

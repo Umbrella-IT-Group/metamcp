@@ -699,6 +699,89 @@ describe("a replay that lost the race for the live code", () => {
   });
 });
 
+describe("a replay crossing the live code's expiry", () => {
+  it.each([
+    ["log", "before the initial read"],
+    ["revoke", "before the initial read"],
+    ["log", "while waiting for the user lock"],
+    ["revoke", "while waiting for the user lock"],
+  ])(
+    "still handles the replay in %s mode when expiry passes %s",
+    async (mode, timing) => {
+      armReplay();
+      process.env.OAUTH_CODE_REPLAY = mode;
+      // A concurrent winner's uncommitted delete leaves the live row visible to
+      // the first read. Once its lock is granted, this request sees the committed
+      // delete and the still-actionable spent record. Its five-minute margin
+      // applies even though the code itself has expired in the meantime.
+      oauthRepositoryMock.getAuthCode
+        .mockResolvedValueOnce(liveCodeRow())
+        .mockResolvedValue(null);
+      const afterExpiry = new Date(NOW.getTime() + CODE_TTL_MS + 1);
+      if (timing === "before the initial read") {
+        vi.setSystemTime(afterExpiry);
+      } else {
+        oauthRepositoryMock.withUserLock.mockImplementationOnce(
+          async (_userId, fn) => {
+            vi.setSystemTime(afterExpiry);
+            return fn(FAKE_OAUTH_TX);
+          },
+        );
+      }
+
+      const { res } = await postToken(exchangeBody());
+
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toEqual(LEGACY_REPLAY_BODY);
+      expect(oauthRepositoryMock.withUserLock).toHaveBeenCalledTimes(1);
+      expect(oauthRepositoryMock.getAuthCode).toHaveBeenCalledWith(
+        CODE,
+        FAKE_OAUTH_TX,
+      );
+      expect(oauthRepositoryMock.consumeSpentCode).toHaveBeenCalledWith(
+        CODE,
+        FAKE_OAUTH_TX,
+      );
+      expect(oauthRepositoryMock.getClient).toHaveBeenCalledWith(
+        CLIENT_ID,
+        FAKE_OAUTH_TX,
+      );
+      expect(oauthRepositoryMock.revokeFamily).toHaveBeenCalledTimes(
+        mode === "revoke" ? 1 : 0,
+      );
+      expect(onlyReuseRow().detail).toMatchObject({
+        mode,
+        tokens_live: 1,
+        family_revoked: mode === "revoke",
+      });
+      expect(rows.filter((row) => row.action === "oauth.token.issue")).toEqual(
+        [],
+      );
+      expect(oauthRepositoryMock.deleteAuthCode).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.consumeAuthCode).not.toHaveBeenCalled();
+      expect(oauthRepositoryMock.setAccessToken).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not consume the record when an expired-code race presents the wrong verifier", async () => {
+    armReplay();
+    process.env.OAUTH_CODE_REPLAY = "revoke";
+    oauthRepositoryMock.getAuthCode
+      .mockResolvedValueOnce(liveCodeRow())
+      .mockResolvedValue(null);
+    vi.setSystemTime(new Date(NOW.getTime() + CODE_TTL_MS + 1));
+
+    const { res } = await postToken(
+      exchangeBody({ code_verifier: "x".repeat(43) }),
+    );
+
+    expect(res.body).toEqual(LEGACY_REPLAY_BODY);
+    expect(oauthRepositoryMock.consumeSpentCode).not.toHaveBeenCalled();
+    expect(oauthRepositoryMock.revokeFamily).not.toHaveBeenCalled();
+    expect(rows).toEqual([]);
+  });
+});
+
 describe("the default mode audits without revoking", () => {
   beforeEach(() => {
     armReplay();

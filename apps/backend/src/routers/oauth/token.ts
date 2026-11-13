@@ -665,6 +665,12 @@ async function handleAuthorizationCodeGrant(
   // Read once per request (see resolveCodeReplayMode): the lookup below, the
   // lock callback and the replay handling must all agree on the mode.
   const replayMode = resolveCodeReplayMode();
+  const presentedCode = {
+    code,
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeVerifier: code_verifier,
+  };
 
   // Look up the authorization code
   const codeData = await oauthRepository.getAuthCode(code);
@@ -675,12 +681,7 @@ async function handleAuthorizationCodeGrant(
     // it finds, the caller gets the same answer it always did, so a holder of a
     // spent code learns nothing about whether detection fired.
     if (replayMode !== "off") {
-      await handleSpentCodePresentation(req, replayMode, {
-        code,
-        clientId: client_id,
-        redirectUri: redirect_uri,
-        codeVerifier: code_verifier,
-      });
+      await handleSpentCodePresentation(req, replayMode, presentedCode);
     }
     return res.status(400).json({
       error: "invalid_grant",
@@ -712,6 +713,27 @@ async function handleAuthorizationCodeGrant(
   // Check if code has expired (the lifetime is set when it is minted, see
   // authorizationCodeTtlMs in ./authorization).
   if (Date.now() > codeData.expires_at.getTime()) {
+    if (replayMode !== "off") {
+      // The first read can see a winner's uncommitted delete even after the
+      // code expires. Wait for its lock and distinguish that redeemed code
+      // from an expired live one: the spent record's margin still applies.
+      const wasRedeemed = await oauthRepository.withUserLock(
+        codeData.user_id,
+        async (tx) => {
+          if (await oauthRepository.getAuthCode(code, tx)) {
+            return false;
+          }
+          await handleSpentCodePresentation(req, replayMode, presentedCode, tx);
+          return true;
+        },
+      );
+      if (wasRedeemed) {
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Invalid or expired authorization code",
+        });
+      }
+    }
     emitCodeExpired();
     await oauthRepository.deleteAuthCode(code);
     return res.status(400).json({
@@ -859,6 +881,15 @@ async function handleAuthorizationCodeGrant(
       // disable. Re-check both here before consuming it; a disabled account
       // keeps its code so re-enabling it within the TTL restores the flow.
       if (Date.now() > codeData.expires_at.getTime()) {
+        // Expiry of the stale live row must not bypass replay detection when
+        // a winner committed while this request waited for the lock.
+        if (
+          replayMode !== "off" &&
+          !(await oauthRepository.getAuthCode(code, tx))
+        ) {
+          await handleSpentCodePresentation(req, replayMode, presentedCode, tx);
+          return null;
+        }
         emitCodeExpired();
         await oauthRepository.consumeAuthCode(code, tx);
         return null;
@@ -1179,8 +1210,11 @@ async function handleSpentCodePresentation(
     redirectUri: unknown;
     codeVerifier: unknown;
   },
+  // An expiry check may already hold the owner's lock. Reuse its transaction
+  // for every read and write instead of opening a lock that waits on itself.
+  tx?: OAuthTx,
 ): Promise<void> {
-  const spent = await oauthRepository.getSpentCode(presented.code);
+  const spent = await oauthRepository.getSpentCode(presented.code, tx);
   if (!spent) {
     return;
   }
@@ -1196,7 +1230,7 @@ async function handleSpentCodePresentation(
   ) {
     return;
   }
-  const client = await oauthRepository.getClient(spent.client_id);
+  const client = await oauthRepository.getClient(spent.client_id, tx);
   if (!client) {
     return;
   }
@@ -1206,9 +1240,13 @@ async function handleSpentCodePresentation(
   }
   // The same per-user credential lock every mint and revoke takes, so the
   // family cannot gain a member between the count and the revoke below.
-  await oauthRepository.withUserLock(spent.user_id, (tx) =>
-    revokeSpentCodeFamilyLocked(req, tx, presented.code, mode),
-  );
+  if (tx) {
+    await revokeSpentCodeFamilyLocked(req, tx, presented.code, mode);
+  } else {
+    await oauthRepository.withUserLock(spent.user_id, (lockedTx) =>
+      revokeSpentCodeFamilyLocked(req, lockedTx, presented.code, mode),
+    );
+  }
 }
 
 /**
