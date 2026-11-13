@@ -21,6 +21,7 @@ import {
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { clampAuditText } from "../lib/audit/audit-emitter";
+import { describeDbError } from "../lib/db-error-summary";
 import {
   leanListingEnabled,
   presentationEnabled,
@@ -225,7 +226,12 @@ export const endpointPresentationImplementations = {
         data: toWire(endpoint.uuid, saved),
       };
     } catch (error) {
-      logger.error("Error saving endpoint presentation:", error);
+      // Drizzle errors include bound values in their message and params, so
+      // only the error class and the database's own identifiers are logged:
+      // the failure stays diagnosable without copying administrator text.
+      logger.error(
+        `Error saving endpoint presentation: ${describeDbError(error)}`,
+      );
       return {
         success: false as const,
         message: "Failed to save endpoint presentation",

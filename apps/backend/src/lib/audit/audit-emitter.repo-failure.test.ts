@@ -214,9 +214,14 @@ describe("MCP bearer path with a failing audit_log", () => {
     // A bare "write failed" cannot be triaged. The count is what separates a
     // recycled connection from the sink being down for the whole incident.
     expect(loggerMock.warn.mock.calls[0]?.[0]).toContain("audit row(s) lost");
-    // And it must still carry the underlying error, or the line says something
-    // broke without saying what.
-    expect(loggerMock.warn.mock.calls[0]?.[1]).toBeInstanceOf(Error);
+    // And it must still name the underlying error, or the line says something
+    // broke without saying what. It is carried as a log-safe summary in the
+    // message, never as the raw error object, whose query error would copy
+    // the lost row's bound values into the log (audit-emitter.redaction.test).
+    expect(loggerMock.warn.mock.calls[0]?.[0]).toContain(
+      "Error: audit_log INSERT failed",
+    );
+    expect(loggerMock.warn.mock.calls[0]).toHaveLength(1);
   });
 });
 
