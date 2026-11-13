@@ -40,6 +40,13 @@ const oauthRepositoryMock = {
   getAuthCode: vi.fn(),
   deleteAuthCode: vi.fn(),
   consumeAuthCode: vi.fn(),
+  // Spent-code record (migration 0045): the handler writes one on a first
+  // redemption and reads one for an unknown code; a bare mock answers "nothing
+  // there", which is the pre-0045 behaviour these suites were written against.
+  recordSpentCode: vi.fn(),
+  getSpentCode: vi.fn(),
+  consumeSpentCode: vi.fn(),
+  countFamilyAccessTokens: vi.fn(),
   getClient: vi.fn(),
   getByRefreshToken: vi.fn(),
   setAccessToken: vi.fn(),

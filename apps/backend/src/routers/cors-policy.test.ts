@@ -872,3 +872,127 @@ describe("every credentialed cors() in the backend uses the shared allowlist", (
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Header lists: what a browser client of the MCP transport needs
+// ---------------------------------------------------------------------------
+
+/** A comma-separated header value as a list of lower-cased names. */
+function headerList(value: string | null): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item !== "");
+}
+
+describe("/metamcp lists the headers the MCP transport uses", () => {
+  it("allows MCP-Protocol-Version and Last-Event-ID on a preflight from the app's origin", async () => {
+    // The 2025-11-25 transport spec has the client send `MCP-Protocol-Version`
+    // on every request after initialize and resume a stream with a GET that
+    // carries `Last-Event-ID`. Neither is CORS-safelisted, so a preflight that
+    // omitted them failed a browser client before its first call.
+    const response = await probe(
+      "OPTIONS",
+      "/metamcp/some-endpoint/mcp",
+      APP_ORIGIN,
+    );
+    const allowed = headerList(
+      response.headers.get("access-control-allow-headers"),
+    );
+
+    expect(allowed).toContain("mcp-protocol-version");
+    expect(allowed).toContain("last-event-id");
+    // ...without dropping what was already allowed.
+    for (const name of [
+      "content-type",
+      "mcp-session-id",
+      "authorization",
+      "x-api-key",
+    ]) {
+      expect(allowed).toContain(name);
+    }
+  });
+
+  it("exposes the session, challenge and re-initialize headers to the app's origin", async () => {
+    // `Mcp-Session-Id` (spec: the server assigns it on the initialize
+    // response), `WWW-Authenticate` and the fork's lazy-recovery
+    // `Mcp-Session-Reinitialize-Required` are not on the Fetch Standard's
+    // CORS-safelisted response-header list (Cache-Control, Content-Language,
+    // Content-Length, Content-Type, Expires, Last-Modified, Pragma), so a
+    // cross-origin reader cannot see them without an Expose-Headers entry.
+    const response = await probe(
+      "GET",
+      "/metamcp/some-endpoint/mcp",
+      APP_ORIGIN,
+    );
+    const exposed = headerList(
+      response.headers.get("access-control-expose-headers"),
+    );
+
+    expect(exposed).toEqual(
+      expect.arrayContaining([
+        "mcp-session-id",
+        "www-authenticate",
+        "mcp-session-reinitialize-required",
+      ]),
+    );
+  });
+
+  it("exposes nothing to an untrusted origin or to a request with no Origin", async () => {
+    // The Expose-Headers value belongs to a grant. Without one it would only
+    // tell a caller that was refused which response headers exist.
+    for (const origin of [UNTRUSTED_ORIGIN, undefined]) {
+      const response = await probe("GET", "/metamcp/some-endpoint/mcp", origin);
+
+      expect(
+        response.headers.get("access-control-expose-headers"),
+        String(origin),
+      ).toBeNull();
+    }
+  });
+});
+
+describe("/mcp-proxy exposes mcp-session-id to a trusted origin, once", () => {
+  it("exposes mcp-session-id, and only that, to the app's origin", async () => {
+    // Express `res.header` is `res.set`, which replaces the header. Three calls
+    // in a row (mcp-session-id, authorization, last-event-id) left only the
+    // last, a request header that exposes nothing, so `mcp-session-id` was the
+    // one a browser reader could not see.
+    const response = await probe("GET", "/mcp-proxy/server/mcp", APP_ORIGIN);
+
+    expect(
+      headerList(response.headers.get("access-control-expose-headers")),
+    ).toEqual(["mcp-session-id"]);
+  });
+
+  it("exposes nothing to an untrusted origin or to a request with no Origin", async () => {
+    // The old middleware ran for every request, including ones the allowlist
+    // refused, so it put a value on responses that carried no grant at all.
+    for (const origin of [UNTRUSTED_ORIGIN, undefined]) {
+      const response = await probe("GET", "/mcp-proxy/server/mcp", origin);
+
+      expect(
+        response.headers.get("access-control-expose-headers"),
+        String(origin),
+      ).toBeNull();
+    }
+  });
+
+  it("allows MCP-Protocol-Version on a preflight from the app's origin", async () => {
+    const response = await probe(
+      "OPTIONS",
+      "/mcp-proxy/metamcp/some-uuid/mcp",
+      APP_ORIGIN,
+    );
+
+    expect(
+      headerList(response.headers.get("access-control-allow-headers")),
+    ).toEqual(
+      expect.arrayContaining([
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "last-event-id",
+      ]),
+    );
+  });
+});

@@ -1,5 +1,10 @@
+import { inspect } from "node:util";
+
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ServerParameters } from "@repo/zod-types";
 import { describe, expect, it, vi } from "vitest";
+
+import logger from "@/utils/logger";
 
 import { ConnectedClient } from "./client";
 import {
@@ -146,5 +151,74 @@ describe("requestWithSessionRecovery", () => {
       requestWithSessionRecovery({ ...baseOpts(pool, stale), attempt }),
     ).rejects.toBe(secondFailure);
     expect(attempt).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("requestWithSessionRecovery does not recover a backend refusal", () => {
+  // A transport-shaped refusal is an answer to this request, even if the
+  // body quotes the substring markers used by the lost-connection detectors.
+  const BODY_SECRET = "backend-body-text-that-must-not-be-logged";
+  const refusals = [401, 403].flatMap((status) => [
+    {
+      status,
+      via: "Streamable HTTP",
+      error: new StreamableHTTPError(
+        status,
+        `Error POSTing to endpoint: Not connected ${BODY_SECRET}`,
+      ),
+    },
+    {
+      status,
+      via: "a wrapped SSE POST",
+      error: new Error("request failed", {
+        cause: new Error(
+          `Error POSTing to endpoint (HTTP ${status}): HTTP 404 Session not found ${BODY_SECRET}`,
+        ),
+      }),
+    },
+  ]);
+
+  it.each(refusals)(
+    "does not invalidate or retry HTTP $status via $via, or report a lost connection",
+    async ({ error }) => {
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+      const pool = makePool(makeSession("fresh"));
+      const onFreshSession = vi.fn();
+      const attempt = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValueOnce(["tool-a"]);
+
+      await expect(
+        requestWithSessionRecovery({
+          ...baseOpts(pool, makeSession("stale")),
+          attempt,
+          onFreshSession,
+        }),
+      ).rejects.toBe(error);
+
+      expect(attempt).toHaveBeenCalledTimes(1);
+      expect(pool.invalidateServerConnection).not.toHaveBeenCalled();
+      expect(pool.getSession).not.toHaveBeenCalled();
+      expect(onFreshSession).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    },
+  );
+
+  it("keeps the diagnostic text for a non-refusal envelope (negative control)", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const attempt = vi
+      .fn()
+      .mockRejectedValueOnce(sessionLostError())
+      .mockResolvedValueOnce(["tool-a"]);
+
+    await requestWithSessionRecovery({
+      ...baseOpts(makePool(makeSession("fresh")), makeSession("stale")),
+      attempt,
+    });
+
+    expect(inspect(warn.mock.calls)).toContain("Session not found");
+    warn.mockRestore();
   });
 });

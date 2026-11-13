@@ -12,6 +12,7 @@ import { createContext } from "../trpc";
 import { accessGroupsImplementations } from "../trpc/access-groups.impl";
 import { apiKeysImplementations } from "../trpc/api-keys.impl";
 import { configImplementations } from "../trpc/config.impl";
+import { endpointPresentationImplementations } from "../trpc/endpoint-presentation.impl";
 import { endpointsImplementations } from "../trpc/endpoints.impl";
 import { logsImplementations } from "../trpc/logs.impl";
 import { mcpServersImplementations } from "../trpc/mcp-servers.impl";
@@ -46,6 +47,7 @@ const appRouter = createAppRouter({
     config: configImplementations,
     logs: logsImplementations,
     accessGroups: accessGroupsImplementations,
+    endpointPresentation: endpointPresentationImplementations,
   },
 });
 

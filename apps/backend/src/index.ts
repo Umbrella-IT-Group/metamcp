@@ -13,12 +13,14 @@ import {
   globalBodyParser,
 } from "./lib/global-body-parser";
 import { createUpstreamHealthHandler } from "./lib/health-upstream-handler";
+import { convergeM365Envelopes } from "./lib/m365/envelope-converge";
 import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { warnIfStdioServersAllowed } from "./lib/metamcp/stdio-policy";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
 import { assertVerifiedCallerConfig } from "./lib/metamcp/verified-caller";
+import { logOriginPolicyBootState } from "./lib/origin-policy";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
@@ -181,6 +183,21 @@ async function start(): Promise<void> {
     logger.error("Bearer-token converge: unexpected error (ignored):", err);
   }
 
+  // Converge the M365 refresh-token envelopes toward the explicit target in
+  // M365_ENVELOPE_WRITE_VERSION (unset keeps every row as it is and only logs
+  // the version counts; while M365_ENVELOPE_STRICT is on it rewraps nothing and
+  // only counts the v1 rows that need re-enrollment), and log the envelope
+  // posture (strict on/off, effective write version) so it is legible in the
+  // boot log. Before listening, so no
+  // request of this process mints against a half-converged table. Makes no Entra
+  // call and never throws; the outer guard is defence-in-depth, same shape as
+  // its neighbour. See ./lib/m365/envelope-converge.
+  try {
+    await convergeM365Envelopes();
+  } catch (err) {
+    logger.error("M365 envelope converge: unexpected error (ignored):", err);
+  }
+
   // Auto-nuke pre-deploy `mcp_sessions` rows ONLY when the advertised
   // MCP server-capability set has changed since the last boot.
   // Capability-neutral restarts (OAuth fixes, dep bumps, transport-
@@ -255,6 +272,12 @@ async function start(): Promise<void> {
   // ALLOW_STDIO_SERVERS=true, so a deployment that can start child processes
   // in this container says so in its boot log (see lib/metamcp/stdio-policy).
   warnIfStdioServersAllowed();
+
+  // One boot-time line for the Origin policy on /metamcp (MCP_ORIGIN_POLICY:
+  // off | audit | enforce, default audit), so the posture is legible from the
+  // boot log. An unrecognised value is an ERROR line here and runs as audit,
+  // never as off. See lib/origin-policy.
+  logOriginPolicyBootState();
 
   // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
   // boot log records whether password login is on. Reads the DB-backed setting,
