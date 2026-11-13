@@ -709,7 +709,9 @@ const registeredServerToken = async (
  *    never the browser's value or a stored one. None is sent without one. The
  *    guard drops it on any hop that is not internal.
  *  - Authorization is the row's own credential (registeredServerToken); the
- *    browser's passthrough is used only when the row yields none.
+ *    browser's passthrough is used only when the row yields none. For a row
+ *    named in M365_INJECTED_SERVER_NAMES the guard deletes it on every hop
+ *    (NO_CALLER_CREDENTIALS), so none is sent.
  */
 const registeredServerHeaders = async (
   req: express.Request,
