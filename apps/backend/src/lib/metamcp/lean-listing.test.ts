@@ -363,6 +363,32 @@ describe("ranking", () => {
     ).toEqual(["a__three"]);
   });
 
+  it("indexes at most the first 256 characters of a name and of a parameter key, and 256 parameters, so a pathological listing cannot stall a search", () => {
+    const filler = "filler_".repeat(40);
+    const properties: Record<string, unknown> = {
+      [`${filler}latekey`]: { type: "string" },
+      [`${"filler_".repeat(5)}earlykey`]: { type: "string" },
+    };
+    for (let i = 0; i < 300; i++) properties[`p${i}`] = { type: "string" };
+    const tools = [
+      mk(`a__${filler}latename`, "One", properties),
+      mk(`a__${"filler_".repeat(5)}earlyname`, "Two"),
+    ];
+    // Past 256 characters nothing is indexed; before it, everything is.
+    expect(rankTools(tools, "latename")).toEqual([]);
+    expect(rankTools(tools, "earlyname").map((r) => r.tool.name)).toEqual([
+      `a__${"filler_".repeat(5)}earlyname`,
+    ]);
+    expect(rankTools(tools, "latekey")).toEqual([]);
+    expect(rankTools(tools, "earlykey")).toHaveLength(1);
+    // The first 256 parameters are indexed (the two keys above count), not the rest.
+    expect(rankTools(tools, "p253")).toHaveLength(1);
+    expect(rankTools(tools, "p254")).toEqual([]);
+    // And a very long uppercase run, the quadratic case, still answers.
+    const hostile = [mk(`a__${"A".repeat(40_000)}`, "Hostile")];
+    expect(rankTools(hostile, "anything")).toEqual([]);
+  });
+
   it("returns every tool by name in browse mode, and nothing for a query with no words", () => {
     const names = rankTools(DESK, "").map((r) => r.tool.name);
     expect(names).toEqual([

@@ -292,6 +292,14 @@ const STOPWORDS: ReadonlySet<string> = new Set(
 const TOKEN_MAX_LENGTH = 64;
 const QUERY_TOKEN_MAX = 16;
 const DESCRIPTION_INDEX_CHARS = 2000;
+/**
+ * What is indexed of a tool's name, prefix and each parameter key, and how many
+ * parameters. The camelCase split is quadratic in the length of an uppercase
+ * run, and a listing is backend-supplied, so one pathological tool name would
+ * otherwise stall every search of the session. Real names are far shorter.
+ */
+const INDEX_NAME_CHARS = 256;
+const MAX_INDEXED_PROPERTIES = 256;
 const DESCRIPTION_INDEX_TOKENS = 400;
 const PARAM_VALUES_PER_PROPERTY = 64;
 const PARAM_VALUE_MAX_CHARS = 48;
@@ -406,8 +414,11 @@ function buildDocument(tool: Tool): SearchDocument {
   const properties = (tool.inputSchema as { properties?: unknown } | undefined)
     ?.properties;
   if (typeof properties === "object" && properties !== null) {
-    for (const [key, schema] of Object.entries(properties)) {
-      params.push(...tokenize(key));
+    for (const [key, schema] of Object.entries(properties).slice(
+      0,
+      MAX_INDEXED_PROPERTIES,
+    )) {
+      params.push(...tokenize(key.slice(0, INDEX_NAME_CHARS)));
       for (const value of propertyValues(schema)) {
         params.push(...tokenize(value));
       }
@@ -418,8 +429,8 @@ function buildDocument(tool: Tool): SearchDocument {
   ).slice(0, DESCRIPTION_INDEX_TOKENS);
   const document = {
     tool,
-    prefix: tokenize(prefix),
-    name: tokenize(name),
+    prefix: tokenize(prefix.slice(0, INDEX_NAME_CHARS)),
+    name: tokenize(name.slice(0, INDEX_NAME_CHARS)),
     params,
     description,
   };
