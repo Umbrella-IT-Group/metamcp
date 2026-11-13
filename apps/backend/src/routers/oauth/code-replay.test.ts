@@ -309,6 +309,12 @@ function reuseRows(): AuditRow[] {
   return rows.filter((row) => row.action === "oauth.token.reuse");
 }
 
+/** The one replay row, asserted present so a missing row is a failed assertion. */
+function onlyReuseRow(): AuditRow {
+  expect(reuseRows()).toHaveLength(1);
+  return reuseRows()[0];
+}
+
 /** Nothing about a replay was recorded, consumed or revoked. */
 function expectReplayIgnored() {
   expect(oauthRepositoryMock.consumeSpentCode).not.toHaveBeenCalled();
@@ -503,7 +509,7 @@ describe("a replay that proves possession is audited and, in revoke mode, revoke
     );
 
     expect(reuseRows()).toHaveLength(1);
-    expect(reuseRows()[0]).toMatchObject({
+    expect(onlyReuseRow()).toMatchObject({
       action: "oauth.token.reuse",
       outcome: "denied",
       http_status: 400,
@@ -559,7 +565,7 @@ describe("a replay that proves possession is audited and, in revoke mode, revoke
 
     await postToken(exchangeBody());
 
-    expect(reuseRows()[0].detail).toMatchObject({
+    expect(onlyReuseRow().detail).toMatchObject({
       tokens_live: 0,
       family_revoked: false,
     });
@@ -711,7 +717,7 @@ describe("the default mode audits without revoking (R7)", () => {
     expect(reuseRows()).toHaveLength(1);
     // tokens_live above zero is the baseline signal: a replay that, under
     // revoke, would have ended a live session.
-    expect(reuseRows()[0].detail).toMatchObject({
+    expect(onlyReuseRow().detail).toMatchObject({
       mode: "log",
       tokens_live: 1,
       family_revoked: false,
@@ -724,7 +730,7 @@ describe("the default mode audits without revoking (R7)", () => {
     await postToken(exchangeBody());
 
     expect(oauthRepositoryMock.revokeFamily).not.toHaveBeenCalled();
-    expect(reuseRows()[0].detail).toMatchObject({
+    expect(onlyReuseRow().detail).toMatchObject({
       mode: "log",
       family_revoked: false,
     });
@@ -739,7 +745,7 @@ describe("the default mode audits without revoking (R7)", () => {
     await postToken(exchangeBody());
 
     expect(oauthRepositoryMock.revokeFamily).toHaveBeenCalledTimes(1);
-    expect(reuseRows()[0].detail).toMatchObject({
+    expect(onlyReuseRow().detail).toMatchObject({
       mode: "revoke",
       family_revoked: true,
     });
