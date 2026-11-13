@@ -18,6 +18,7 @@
     "test:integration": "vitest run --no-file-parallelism --testTimeout=90000 --hookTimeout=180000 src/db/repositories/api-key-admin-plane-scope.integration.test.ts src/db/repositories/api-key-admin-plane.integration.test.ts src/db/repositories/api-key-ip-allowlist.integration.test.ts src/trpc/admin-plane-scope.integration.test.ts src/trpc/admin-write.integration.test.ts src/trpc/api-key-mint.integration.test.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:conformance": "vitest run --config vitest.conformance.config.ts",
     "db:generate": "dotenv -e ../../.env -- drizzle-kit generate",
     "db:generate:dev": "dotenv -e ../../.env.local -- drizzle-kit generate",
     "db:migrate": "dotenv -e ../../.env -- drizzle-kit migrate",

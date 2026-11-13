@@ -1,0 +1,32 @@
+name: Umbrella MCP Conformance (umbrella branch)
+
+# Stub committed first so the workflow guard tests fail on assertions. This is
+# the shape of the original design, with its known defects, and is replaced by
+# the real workflow in the next commit.
+
+on:
+  pull_request:
+    branches: [umbrella]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@b906affcce14559ae1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 20, cache: pnpm }
+      - run: bash .github/conformance/run.sh
+      - if: always()
+        run: bash .github/conformance/scan-artifacts.sh "$CONFORMANCE_OUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: conformance-results
+          path: ${{ runner.temp }}/conformance
