@@ -5,14 +5,19 @@
  * `lib/m365/crypto.ts` — this repository never sees plaintext tokens.
  *
  * The mint service's rotate-and-persist path calls `rotateRefreshToken`
- * IMMEDIATELY after a successful refresh grant (Entra invalidates the
- * old RT on redemption, so losing the new one strands the user into
- * re-enrollment). Callers serialize per-user via the mint service's
- * single-flight lock; there is no cross-process contention in the
- * single-container deployment (documented multi-instance follow-up:
- * advisory lock).
+ * immediately after a successful refresh grant to preserve the newest issued
+ * token. Entra does not revoke the old token merely because it was redeemed
+ * (see the protocol note in `lib/m365/mint-service.ts`). Callers serialize
+ * per-user via the mint service's
+ * single-flight lock, which is in-process only: the deployment runs exactly
+ * one gateway process per database (see the single-flight note in
+ * `lib/m365/mint-service.ts`; more than one replica reopens a documented
+ * advisory-lock follow-up). Within that process every write that follows a
+ * read is a compare-and-swap on the ciphertext that was read, so an
+ * enrollment, a disconnect, a revoke or a boot rewrap that lands while a mint
+ * is in flight wins instead of being overwritten.
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 
 import { db } from "../index";
 import { m365UserTokensTable } from "../schema";
@@ -90,32 +95,110 @@ export class M365TokensRepository {
     return row as M365UserTokenRow;
   }
 
-  /** Atomic rotate-and-persist after a successful refresh grant. */
+  /**
+   * Compare-and-swap rotate-and-persist after a successful refresh grant.
+   *
+   * The write applies only while the row still holds the ciphertext the mint
+   * READ (`expectedCiphertext`) and is still `active`, in ONE statement. The
+   * ciphertext is both the generation of the grant and the version of its
+   * rotation: a re-enrollment, a disconnect-and-reconnect, another writer's
+   * rotation or a rewrap all change it, so a mint that was in flight across any
+   * of them can no longer overwrite the newer state. Postgres re-evaluates the
+   * WHERE clause against the committed row when a concurrent update commits
+   * (Read Committed), so two rotations built from one read cannot both apply.
+   *
+   * `status` is deliberately NOT in the SET. A rotation used to write
+   * `status = 'active'`, which silently reactivated a row an operator, or
+   * `usersRepository.revokeAccess`, had set to `reauth_required` while the mint
+   * was in flight. The `status = 'active'` predicate makes that revoke win
+   * instead, and only `upsertEnrollment` (an interactive sign-in) reactivates.
+   *
+   * Returns false when nothing matched. That is a DEFINITE answer, not an
+   * error: the caller reconciles against a fresh read rather than retrying.
+   */
   async rotateRefreshToken(
     userId: string,
     rtCiphertext: string,
     kekId: string,
+    expectedCiphertext: string,
   ): Promise<boolean> {
     const rows = await db
       .update(m365UserTokensTable)
       .set({
         rt_ciphertext: rtCiphertext,
         kek_id: kekId,
-        status: "active",
         rotated_at: new Date(),
         last_used_at: new Date(),
       })
-      .where(eq(m365UserTokensTable.user_id, userId))
+      .where(
+        and(
+          eq(m365UserTokensTable.user_id, userId),
+          eq(m365UserTokensTable.rt_ciphertext, expectedCiphertext),
+          eq(m365UserTokensTable.status, "active"),
+        ),
+      )
       .returning({ uuid: m365UserTokensTable.uuid });
     return rows.length > 0;
   }
 
-  /** Mark a grant as needing interactive re-auth (refresh rejected). */
-  async markReauthRequired(userId: string): Promise<void> {
+  /**
+   * Mark a grant as needing interactive re-auth (refresh rejected), but only
+   * while the row still holds the ciphertext whose redemption was rejected. A
+   * rejection that arrives after a re-enrollment concerns the OLD grant and
+   * must not mark the fresh one.
+   */
+  async markReauthRequired(
+    userId: string,
+    expectedCiphertext: string,
+  ): Promise<void> {
     await db
       .update(m365UserTokensTable)
       .set({ status: "reauth_required" })
-      .where(eq(m365UserTokensTable.user_id, userId));
+      .where(
+        and(
+          eq(m365UserTokensTable.user_id, userId),
+          eq(m365UserTokensTable.rt_ciphertext, expectedCiphertext),
+        ),
+      );
+  }
+
+  /**
+   * Every row's owner and envelope, in any status, for the boot converge. Two
+   * columns only: nothing else about a row is needed to rewrap it.
+   */
+  async listEnvelopes(): Promise<{ user_id: string; rt_ciphertext: string }[]> {
+    return await db
+      .select({
+        user_id: m365UserTokensTable.user_id,
+        rt_ciphertext: m365UserTokensTable.rt_ciphertext,
+      })
+      .from(m365UserTokensTable);
+  }
+
+  /**
+   * Replace a row's envelope with a re-sealed copy of the SAME refresh token,
+   * only while it still holds `expectedCiphertext`. Touches neither `status`,
+   * `rotated_at` nor `last_used_at`: a rewrap is not a rotation, and the row's
+   * lifecycle (including a `reauth_required` mark) is not this method's to
+   * change. False means the row moved on; the converge counts it and leaves it.
+   */
+  async replaceCiphertextIfUnchanged(
+    userId: string,
+    expectedCiphertext: string,
+    nextCiphertext: string,
+    kekId: string,
+  ): Promise<boolean> {
+    const rows = await db
+      .update(m365UserTokensTable)
+      .set({ rt_ciphertext: nextCiphertext, kek_id: kekId })
+      .where(
+        and(
+          eq(m365UserTokensTable.user_id, userId),
+          eq(m365UserTokensTable.rt_ciphertext, expectedCiphertext),
+        ),
+      )
+      .returning({ uuid: m365UserTokensTable.uuid });
+    return rows.length > 0;
   }
 
   async touchLastUsed(userId: string): Promise<void> {

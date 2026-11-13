@@ -480,7 +480,7 @@ const allowedHostsFromEnv = (): ReadonlySet<string> =>
  * itself; `dns.resolve*` queries DNS directly and would happily call a host
  * public that the hosts file points at an internal address.
  */
-const resolveHost = async (hostname: string): Promise<string[]> => {
+export const resolveHost = async (hostname: string): Promise<string[]> => {
   const records = await dnsLookup(hostname, { all: true, verbatim: true });
   return records.map((record) => record.address);
 };
@@ -492,6 +492,13 @@ export interface McpUrlGuardOptions {
   allowedHosts?: Iterable<string>;
   /** Transport seam for `createGuardedFetch`. Production uses undici's fetch. */
   baseFetch?: PinnedFetch;
+  /**
+   * Optional positive-integer bound for cached pinned agents. A process-wide
+   * fetcher can see indefinitely many DNS address sets, even for one URL;
+   * evict its least-recently-used agent with a graceful close so active
+   * responses finish. Omitted keeps existing transport lifetimes unchanged.
+   */
+  maxPinnedAgents?: number;
   /**
    * The ONE origin at which an allowlist entry may apply — the URL the
    * operator typed, already validated by the route. Every other destination
@@ -526,6 +533,17 @@ export interface McpUrlGuardOptions {
    * mid-session) with credentials dropped.
    */
   refuseCrossOriginRedirect?: boolean;
+  /**
+   * Follow redirects at all. Defaults to true; `false` hands a 3xx answer back
+   * to the caller unfollowed (no second request, no re-validation of a
+   * Location, the body still capped). For a fetch whose only legitimate answer
+   * is the document at the URL it was given: the OAuth client metadata
+   * document fetch treats any redirect as a refusal, because a redirect is the
+   * cheapest way to make an allowlisted URL name some other host's content.
+   * `refuseCrossOriginRedirect` cannot express that, it still follows
+   * same-origin hops. Every other transport keeps the default.
+   */
+  followRedirects?: boolean;
   /**
    * Headers that speak for the caller of ONE executing request, deleted when a
    * redirect rewrites that request into a bodyless GET (a 303, or a 301 or 302
@@ -1186,9 +1204,17 @@ export const createGuardedFetch = (
     headersTimeout: timeoutMs,
     bodyTimeout: timeoutMs,
   };
+  const agentLimit = options.maxPinnedAgents;
+  if (
+    agentLimit !== undefined &&
+    (!Number.isInteger(agentLimit) || agentLimit < 1)
+  ) {
+    throw new Error("maxPinnedAgents must be a positive integer");
+  }
 
   /**
-   * One dispatcher per validated address set, for the life of this transport.
+   * One dispatcher per cached validated address set, for the life of this
+   * transport unless `maxPinnedAgents` evicts it.
    * Rebuilding an Agent per request would throw away connection reuse, which
    * on the streamable-HTTP transport is a TLS handshake for every JSON-RPC
    * message. Keyed by the addresses, so a host that legitimately moves gets a
@@ -1202,7 +1228,19 @@ export const createGuardedFetch = (
     let agent = agents.get(key);
     if (!agent) {
       agent = createPinnedAgent(addresses, timeouts);
-      agents.set(key, agent);
+    }
+    // A hit becomes most recent too: a DNS answer that alternates between
+    // common pins should retain their pools instead of evicting a hot one.
+    agents.delete(key);
+    agents.set(key, agent);
+    if (agentLimit !== undefined && agents.size > agentLimit) {
+      const oldest = agents.entries().next().value;
+      if (oldest) {
+        agents.delete(oldest[0]);
+        void oldest[1].close().catch((error: unknown) => {
+          logger.warn("MCP proxy pinned agent could not be closed:", error);
+        });
+      }
     }
     return agent;
   };
@@ -1265,8 +1303,10 @@ export const createGuardedFetch = (
         ? response.headers.get("location")
         : null;
       // Only the final (non-redirect) body is capped; redirect bodies are
-      // drained below.
-      if (!location) {
+      // drained below. With `followRedirects: false` the 3xx itself is the
+      // final answer, so it is returned (and capped) like any other response
+      // and the caller sees the status.
+      if (!location || options.followRedirects === false) {
         return capResponseBody(response, maxBytes, () => controller.abort());
       }
 

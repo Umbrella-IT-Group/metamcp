@@ -218,5 +218,9 @@
     "noToolsFromMcp": "No tools found on MCP server",
     "failedToFetchTools": "Failed to fetch tools from MCP server",
     "failedToSaveTools": "Failed to save tools"
+  },
+  "toolListTruncated": {
+    "repeatedCursor": "The server returned a page cursor it had already returned, so only the first {{count}} tools were read. The saved tool list was not changed.",
+    "pageCap": "The server's tool list ran past {{pages}} pages, so only the first {{count}} tools were read. The saved tool list was not changed."
   }
 }

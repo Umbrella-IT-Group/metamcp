@@ -63,6 +63,7 @@
   "statusUnknown": "Not approved",
   "sourceDcr": "Self-registered",
   "sourceAdmin": "Created by an administrator",
+  "sourceCimd": "Client metadata document",
   "sourceLegacy": "Created before sources were recorded",
   "registeredFromUnavailable": "Unavailable",
   "registeredFromHelp": "The network address the self-registration came from. It does not identify a person and does not show that the client is safe.",

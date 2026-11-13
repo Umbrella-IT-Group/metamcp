@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import logger from "@/utils/logger";
@@ -93,7 +95,16 @@ import { getCallerContext } from "./caller-context-store";
  *   uid    the same user id `X-Umbrella-User-Id` carries.
  *   cred   the credential that authenticated the request:
  *          `api_key:<api_keys.uuid>`, `oauth:<oauth client id>`, or
- *          `session` for the Inspector's signed-in admin.
+ *          `session` for the Inspector's signed-in admin. For an OAuth client
+ *          whose id is an https URL (a client metadata document client, whose
+ *          id cannot fit this grammar) the client id is replaced by
+ *          `cimd.<32 hex>.<16 hex>`: the first 32 hex characters of the
+ *          SHA-256 of the URL's UTF-8 bytes, then the first 16 hex characters
+ *          of the access token's family id (its uuid without hyphens). The
+ *          family id is per grant, so two installs of one product stay two
+ *          credentials, the way two dynamically registered clients are. The
+ *          value is a binding key, not a label: a backend cannot recover the
+ *          URL from it.
  *   email  the account email of `uid`, or null when it could not be read.
  *   label  the gateway's display label for the credential, or null.
  *   rid    the gateway's audit request id for this request, or null.
@@ -126,6 +137,24 @@ const UID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const API_KEY_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OAUTH_CLIENT_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * The URL-shaped client ids that get an alias in place of themselves.
+ *
+ * `URL_CLIENT_ID_MAX_LENGTH` is the longest client metadata URL the OAuth
+ * server stores (`CIMD_CLIENT_ID_MAX_LENGTH` in `routers/oauth/cimd-config`;
+ * this module may not import the router, so the number is repeated here and a
+ * test pins the two equal). Every id the registration side admits has to be
+ * covered by the alias, or a valid client would silently lose its
+ * `X-Umbrella-Caller` header: a narrower pattern here once stopped at 508
+ * characters while the id check allowed 512.
+ */
+export const URL_CLIENT_ID_MAX_LENGTH = 512;
+const URL_CLIENT_ID_PATTERN = /^https:\/\/\S+$/;
+/** Hex characters kept from the SHA-256 of the client id URL. */
+export const URL_CLIENT_ID_HASH_LENGTH = 32;
+/** Hex characters kept from the token family id (a uuid without hyphens). */
+export const URL_CLIENT_FAMILY_LENGTH = 16;
 
 /**
  * Length limits for the descriptive fields, in Unicode code points (what a
@@ -267,6 +296,44 @@ export function verifiedCallerUserId(
 }
 
 /**
+ * The credential id for an OAuth client whose id is an https URL:
+ * `cimd.<sha256(url) prefix>.<token family id prefix>`, 54 characters, inside
+ * the 128-character grammar a reader accepts, or undefined.
+ *
+ * Undefined when the id is not URL-shaped, is over `URL_CLIENT_ID_MAX_LENGTH`,
+ * or no family id came with it: the caller then carries no credential, as for
+ * any other malformed id. A real access token always has a family id (the
+ * column is NOT NULL), so for a valid client this never takes that branch.
+ *
+ * Both halves are one-way and stable. The URL half is the client's identity;
+ * the family half is the grant, constant across refreshes of one connection
+ * and different for every new connection, so a backend that binds a session
+ * to `cred` keeps two installs of the same product apart. A DCR or admin id
+ * cannot contain `:` or `/`, so a URL id cannot collide with one of them.
+ */
+function urlClientCredentialId(
+  clientId: string,
+  familyId: unknown,
+): string | undefined {
+  if (
+    clientId.length > URL_CLIENT_ID_MAX_LENGTH ||
+    !URL_CLIENT_ID_PATTERN.test(clientId) ||
+    typeof familyId !== "string" ||
+    !API_KEY_UUID_PATTERN.test(familyId)
+  ) {
+    return undefined;
+  }
+  const urlHash = createHash("sha256")
+    .update(clientId, "utf8")
+    .digest("hex")
+    .slice(0, URL_CLIENT_ID_HASH_LENGTH);
+  const family = familyId
+    .replaceAll("-", "")
+    .slice(0, URL_CLIENT_FAMILY_LENGTH);
+  return `cimd.${urlHash}.${family}`;
+}
+
+/**
  * The credential a caller binding authenticated with, as `X-Umbrella-Caller`
  * names it, or undefined.
  *
@@ -288,10 +355,10 @@ export function verifiedCallerCredential(
     }
     case "oauth": {
       const clientId = caller.oauthClientId;
-      return typeof clientId === "string" &&
-        OAUTH_CLIENT_ID_PATTERN.test(clientId)
-        ? `oauth:${clientId}`
-        : undefined;
+      if (typeof clientId !== "string") return undefined;
+      if (OAUTH_CLIENT_ID_PATTERN.test(clientId)) return `oauth:${clientId}`;
+      const alias = urlClientCredentialId(clientId, caller.oauthTokenFamilyId);
+      return alias === undefined ? undefined : `oauth:${alias}`;
     }
     case "session":
       return "session";

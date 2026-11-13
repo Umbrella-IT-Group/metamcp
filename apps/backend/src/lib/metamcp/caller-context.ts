@@ -64,6 +64,10 @@ import { verifiedCallerUserId } from "./verified-caller";
  *                   was issued to. Not an audit column; with `authMethod` and
  *                   `apiKeyUuid` it names the credential in the verified
  *                   caller header (`verified-caller.ts`).
+ *   oauthTokenFamilyId <- `authenticateApiKey`: the refresh-token family of
+ *                   that access token. Not an audit column; it separates two
+ *                   connections of one URL-identified client in the same
+ *                   credential.
  *   email        <- `callerBinding`, from the router's consumer lookup, only
  *                   when that lookup answered for the same effective user id.
  *                   Not an audit column; descriptive data in the verified
@@ -93,6 +97,7 @@ export interface CallerContextSource extends AuditRequestFields {
   apiKeyActsAsUserId?: string;
   oauthUserId?: string;
   oauthClientId?: string;
+  oauthTokenFamilyId?: string;
   authMethod?: string;
 }
 
@@ -123,6 +128,10 @@ export function resolveCallerContext(req: CallerContextSource): CallerContext {
     // credential it describes is decided by `authMethod`, not by its presence
     // (`verifiedCallerCredential`).
     oauthClientId: req.oauthClientId,
+    // Stamped beside `oauthClientId`, by the same two branches. Used only to
+    // tell two connections of a URL-identified client apart in the verified
+    // caller credential.
+    oauthTokenFamilyId: req.oauthTokenFamilyId,
     // Prefer the value `auditContextMiddleware` already stamped — it is what
     // `audit_log.actor_ip` records for this same request, and reading it here
     // means the two tables cannot silently disagree about where a request came
