@@ -26,6 +26,7 @@ interface SeenRequest {
   caller: string | null;
   authorization: string | null;
   custom: string | null;
+  gatewayAuth: string | null;
 }
 
 const { undiciFetch, seen, getAccessToken } = vi.hoisted(() => {
@@ -57,6 +58,7 @@ const { undiciFetch, seen, getAccessToken } = vi.hoisted(() => {
       caller: headers.get("x-umbrella-caller"),
       authorization: headers.get("authorization"),
       custom: headers.get("x-custom-tenant"),
+      gatewayAuth: headers.get("x-gateway-auth"),
     });
     if (httpMethod === "DELETE") return new Response(null, { status: 200 });
     // No standalone stream: the SDK treats 405 as "not offered".
@@ -130,6 +132,7 @@ const ENV_KEYS = [
   "VERIFIED_CALLER_SERVER_NAMES",
   "M365_INJECTED_SERVER_NAMES",
   "TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL",
+  "GATEWAY_BACKEND_SECRET",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -833,6 +836,69 @@ describe("a stored X-Umbrella-User-Id or X-Umbrella-Caller never reaches a backe
         pair: pairSeen(toolCall),
         authorization: toolCall.authorization,
       }).toEqual(expected);
+    },
+  );
+
+  it.each([
+    ["STREAMABLE_HTTP", 307],
+    ["STREAMABLE_HTTP", 308],
+    ["SSE", 307],
+    ["SSE", 308],
+  ] as const)(
+    "%s: no stored identity reaches either hop of a %i with no named servers",
+    async (type, status) => {
+      process.env.VERIFIED_CALLER_SERVER_NAMES = "";
+      const gatewaySecret = "g".repeat(32);
+      process.env.GATEWAY_BACKEND_SECRET = gatewaySecret;
+      if (type === "SSE") answerNextWithSseEndpoint();
+      const { transport } = createMetaMcpClient(
+        asParams({
+          name: "other",
+          type,
+          url: type === "SSE" ? INTERNAL_SSE_URL : INTERNAL_URL,
+          headers: STORED_WITH_IDENTITY,
+        }),
+      );
+      if (!transport) throw new Error("no transport built");
+
+      await transport.start();
+      try {
+        // Queue after start so the SSE GET advertises the real message
+        // endpoint first. Its POST, like Streamable HTTP's, then redirects.
+        const record = undiciFetch.getMockImplementation();
+        if (!record) throw new Error("no recording fetch installed");
+        undiciFetch.mockImplementationOnce(async (url, init) => {
+          await record(url, init);
+          return new Response(null, {
+            status,
+            headers: { location: "/redirected" },
+          });
+        });
+        await runWithCallerContext(
+          { authMethod: "oauth", userId: "user-1", oauthClientId: CLIENT_ONE },
+          () => transport.send(TOOL_CALL),
+        );
+      } finally {
+        await transport.close();
+      }
+
+      expect(seen.map((r) => [r.httpMethod, new URL(r.url).pathname])).toEqual(
+        type === "SSE"
+          ? [
+              ["GET", "/sse"],
+              ["POST", "/messages"],
+              ["POST", "/redirected"],
+            ]
+          : [
+              ["POST", "/mcp"],
+              ["POST", "/redirected"],
+            ],
+      );
+      for (const r of seen) {
+        expect([r.userId, r.caller]).toEqual([null, null]);
+        expect(r.custom).toBe("tenant-a");
+        expect(r.gatewayAuth).toBe(gatewaySecret);
+      }
     },
   );
 });
