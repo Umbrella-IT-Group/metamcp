@@ -107,23 +107,27 @@ export function buildInspectorConnectionKey(
  *                error states: after a failed connect the failure belongs to
  *                the previous server or settings, so a changed key is a reason
  *                to try again. It cannot loop, because a failed connect does
- *                not change the key.
- *   "none"       a connect is reported as in flight; leave it alone.
+ *                not change the key. It also includes "connecting": the hook
+ *                reports it for the whole of a connect, so a changed key means
+ *                the attempt in flight was started for the previous server or
+ *                settings. The new connect() supersedes it (the hook closes
+ *                what the old attempt opened and ignores its result), where
+ *                leaving it alone would let it finish as the connection the
+ *                page holds while the new selection is on screen.
  *
  * Kept as a pure function so the error branch has a regression test: the page
  * effect itself is not unit tested.
  */
 export function inspectorConnectAction(
   status: ConnectionStatus,
-): "reconnect" | "connect" | "none" {
+): "reconnect" | "connect" {
   switch (status) {
     case "connected":
       return "reconnect";
     case "disconnected":
     case "error":
     case "error-connecting-to-proxy":
-      return "connect";
     case "connecting":
-      return "none";
+      return "connect";
   }
 }

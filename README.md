@@ -509,7 +509,7 @@ The core model is unchanged from upstream.
 - **Namespace** — a group of MCP servers. Enable/disable servers or individual tools, apply middleware, and override tool names/titles/descriptions or attach annotations per namespace.
 - **Endpoint** — a public surface bound to a namespace, hosted over **SSE**, **Streamable HTTP**, or **OpenAPI**, with **API-key** or **OAuth** auth. Multiple servers in the namespace are aggregated into one endpoint.
 - **Middleware** — intercepts and transforms MCP requests/responses at the namespace level (e.g. "filter inactive tools"). This fork adds a tool-call **auditing** middleware.
-- **Inspector** — the MCP inspector with saved server configs, for debugging your endpoints in place.
+- **Inspector** — the MCP inspector with saved server configs, for debugging your endpoints in place. Administrators can also point it at a namespace, or at an endpoint, which previews that endpoint's namespace through the admin session: the endpoint's own presentation, authentication, access groups and rate limits are not applied, and tool calls are real and audited as admin session calls. A JSON-RPC traffic panel shows the messages on the current connection. It lives in the browser tab only (the server does not save it), and its download leaves params and results out unless you turn that off.
 
 ### Endpoint presentation
 
