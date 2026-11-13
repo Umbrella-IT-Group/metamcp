@@ -330,6 +330,13 @@ beforeEach(() => {
   );
   resolvesTo(PUBLIC_V4);
   delete process.env.MCP_PROXY_URL_ALLOWED_HOSTS;
+  // The default m365-injected list (`m365`), whatever the shell exports; the
+  // rows here are not on it unless a case says so.
+  vi.stubEnv("M365_INJECTED_SERVER_NAMES", "");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("GET /mcp-proxy/server/sse — where the SSE branch will connect", () => {
@@ -1399,6 +1406,50 @@ describe("registered servers by uuid: the server page's own backends", () => {
 
       expect(findOAuthSessionMock).toHaveBeenCalledWith(ROW_UUID);
       expect(wireHeaders().get("authorization")).toBe(expected);
+    },
+  );
+
+  // Oracle: lib/m365/injected-fetch.ts invariants 1, 2 and 7. A backend named
+  // in M365_INJECTED_SERVER_NAMES takes Authorization only as a token the
+  // gateway minted for the request's user, and this path mints none.
+  it.each([
+    // The top-level beforeEach leaves the list unset, so the default applies.
+    ["the default list", "", "m365"],
+    ["a configured list", "m365, graph-broker", "graph-broker"],
+  ])(
+    "sends no Authorization from any source to a row on %s of m365-injected servers",
+    async (_name, injectedNames, rowName) => {
+      vi.stubEnv("M365_INJECTED_SERVER_NAMES", injectedNames);
+      process.env.GATEWAY_BACKEND_SECRET = GATEWAY_SECRET;
+      findOAuthSessionMock.mockResolvedValue({
+        tokens: { access_token: "row-oauth-token" },
+      });
+
+      for (const [type, rowUrl, send, built] of TRANSPORTS) {
+        findAllAccessibleToUserMock.mockResolvedValue([
+          row({
+            name: rowName,
+            type,
+            url: rowUrl,
+            bearerToken: "row-bearer-token",
+            headers: {
+              Authorization: "Bearer stored-header-token",
+              "x-vendor-api-key": "backend-key",
+            },
+          }),
+        ]);
+        undiciFetchMock.mockClear();
+
+        await send({ transportType: type, mcpServerUuid: ROW_UUID }, SESSION, {
+          authorization: "Bearer browser-token",
+        });
+        await sendThroughTransport(type, built);
+
+        const wire = wireHeaders();
+        expect(wire.has("authorization")).toBe(false);
+        expect(wire.get("x-gateway-auth")).toBe(GATEWAY_SECRET);
+        expect(wire.get("x-vendor-api-key")).toBe("backend-key");
+      }
     },
   );
 

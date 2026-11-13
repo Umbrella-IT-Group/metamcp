@@ -36,6 +36,7 @@ import {
   mcpServersRepository,
   oauthSessionsRepository,
 } from "../../db/repositories";
+import { getInjectedServerNames } from "../../lib/m365/config";
 import mcpProxy from "../../lib/mcp-proxy";
 import {
   ASSERTED_ACTOR_HEADER,
@@ -564,18 +565,45 @@ const NO_VERIFIED_CALLER: InternalOnlyCredentials = Object.freeze({
 });
 
 /**
+ * NO_VERIFIED_CALLER plus `Authorization`, for a row named in
+ * M365_INJECTED_SERVER_NAMES (`getInjectedServerNames`). A backend named there
+ * takes Authorization on a gateway-trusted request as the per-user Graph token
+ * the gateway mints inside the guard for the request's user, and nothing else
+ * (`createM365Credentials`, lib/m365/injected-fetch.ts, invariants 1, 2 and
+ * 7). This path mints no such token, so it sends no Authorization at all: not
+ * the browser's, not the row's OAuth token or stored bearer, not one in the
+ * row's stored headers. The guard deletes it on every hop. Such a backend
+ * lists its tools without one and refuses to execute a tool, which fails
+ * closed.
+ */
+const NO_CALLER_CREDENTIALS: InternalOnlyCredentials = Object.freeze({
+  headerNames: [
+    "authorization",
+    VERIFIED_CALLER_HEADER,
+    VERIFIED_CALLER_IDENTITY_HEADER,
+  ],
+  forInternalHop: async () => undefined,
+});
+
+/**
  * The guard posture for a registered row opened by uuid: the pooled data
- * plane's own (POOL_GUARD_OPTIONS in client.ts), so the admin UI reaches a
- * row exactly as the gateway's pool already does. It permits the private
- * ranges the gateway's backends live on, pins every socket to the addresses it
+ * plane's own (POOL_GUARD_OPTIONS in client.ts). It permits the private ranges
+ * the gateway's backends live on, pins every socket to the addresses it
  * validated, refuses the never-a-backend ranges (metadata, CGNAT, multicast,
  * reserved) and every cross-origin redirect, and sends X-Gateway-Auth and
  * X-MCP-Actor only to an internal destination, so a third-party server
- * someone registered gets neither. On top of it, NO_VERIFIED_CALLER.
+ * someone registered gets neither.
+ *
+ * On top of it, the caller headers the guard deletes on every hop and never
+ * sets (NO_VERIFIED_CALLER, or NO_CALLER_CREDENTIALS for an m365-injected row).
  */
-const registeredServerGuardOptions = (): McpUrlGuardOptions => ({
+const registeredServerGuardOptions = (
+  server: DatabaseMcpServer,
+): McpUrlGuardOptions => ({
   ...POOL_GUARD_OPTIONS,
-  internalOnlyCredentials: NO_VERIFIED_CALLER,
+  internalOnlyCredentials: getInjectedServerNames().has(server.name)
+    ? NO_CALLER_CREDENTIALS
+    : NO_VERIFIED_CALLER,
 });
 
 /**
@@ -696,7 +724,7 @@ const openRegisteredServer = async (
 ): Promise<RemoteConnection> => {
   const { server, url } = await findRegisteredRemoteServer(req, transportType);
   const label = `server=${server.name} (${server.uuid})`;
-  const options = registeredServerGuardOptions();
+  const options = registeredServerGuardOptions(server);
 
   let target: ValidatedMcpTarget;
   try {
