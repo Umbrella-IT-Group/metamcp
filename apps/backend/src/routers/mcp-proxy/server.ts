@@ -48,6 +48,14 @@ import {
   transformDockerUrl,
 } from "../../lib/metamcp/client";
 import {
+  beginInspectorOpen,
+  bindInspectorSession,
+  finishInspectorOpen,
+  forgetInspectorSession,
+  inspectorSessionBelongsToCaller,
+  isInspectorOpenUsable,
+} from "../../lib/metamcp/inspector-sessions";
+import {
   MCP_REQUEST_BODY_LIMIT_BYTES,
   refuseDeclaredOversize,
 } from "../../lib/metamcp/mcp-request-body-limit";
@@ -331,6 +339,16 @@ export const resolveStdioSpawnParams = async (
 const resolvedStdioParams = new WeakMap<express.Request, StdioSpawnParams>();
 
 /**
+ * The registered row THIS request's transport was built from, when there is
+ * one: the STDIO row, the remote row named by uuid, or the remote row whose
+ * url the request matched (its stored headers were merged). Set by
+ * `createTransport`; read when the session is registered, so the session
+ * closes with its row (lib/metamcp/inspector-sessions). An unregistered url
+ * has no row and so no entry.
+ */
+const openedServerUuid = new WeakMap<express.Request, string>();
+
+/**
  * Refusal for a remote-transport request whose caller cannot be identified.
  * Same wording discipline as NO_SUCH_SERVER above: it describes nothing about
  * the estate.
@@ -502,6 +520,8 @@ interface RemoteConnection {
   headers: Record<string, string>;
   /** How the connect log names the destination. Never carries a query string. */
   logTarget: string;
+  /** The registered row the connection was built from; none for a bare url. */
+  serverUuid?: string;
 }
 
 /**
@@ -775,6 +795,7 @@ const openRegisteredServer = async (
     fetch: pinnedToOrigin(target.url.origin, createGuardedFetch(options)),
     headers: await registeredServerHeaders(req, transportType, server),
     logTarget: label,
+    serverUuid: server.uuid,
   };
 };
 
@@ -833,6 +854,7 @@ const openByUrl = async (
     // JSON.stringify'd because the value is caller-supplied, and an embedded
     // newline forges log lines.
     logTarget: `url=${JSON.stringify(target.url.origin + target.url.pathname)}`,
+    serverUuid: matchingServer?.uuid,
   };
 };
 
@@ -872,12 +894,21 @@ const PROXY_ERROR_BODY = {
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by web app sessionId
 const serverTransports: Map<string, Transport> = new Map<string, Transport>(); // Server Transports by web app sessionId
 
-// Session cleanup function
+// Session cleanup function. The session is forgotten and both of its map
+// entries are detached before the first await, so no request is routed to a
+// session that is closing, and a transport callback that re-enters this
+// function (closing one side closes the other, see lib/mcp-proxy) finds
+// nothing left to close. Each close is attempted even if the other fails.
 const cleanupSession = async (sessionId: string) => {
+  forgetInspectorSession(sessionId);
+  const webAppTransport = webAppTransports.get(sessionId);
+  webAppTransports.delete(sessionId);
+  const serverTransport = serverTransports.get(sessionId);
+  serverTransports.delete(sessionId);
+
   logger.info(`Cleaning up proxy session ${sessionId}`);
 
   // Clean up web app transport
-  const webAppTransport = webAppTransports.get(sessionId);
   if (webAppTransport) {
     try {
       await webAppTransport.close();
@@ -887,11 +918,9 @@ const cleanupSession = async (sessionId: string) => {
         error,
       );
     }
-    webAppTransports.delete(sessionId);
   }
 
   // Clean up server transport
-  const serverTransport = serverTransports.get(sessionId);
   if (serverTransport) {
     try {
       await serverTransport.close();
@@ -901,52 +930,92 @@ const cleanupSession = async (sessionId: string) => {
         error,
       );
     }
-    serverTransports.delete(sessionId);
   }
 
   logger.info(`Session ${sessionId} cleanup completed`);
 };
 
 /**
- * Tear down a POST /mcp session whose first request the transport answered
- * without initializing it: a body over the limit found while reading it (a
- * declared oversize never gets this far, see refuseDeclaredOversize),
- * invalid JSON, or a first request that is not an `initialize`. The client got
- * no session id, so nothing could ever reach this session again, and without
- * this its upstream transport (a STDIO child, an SSE stream) stayed open.
- * `cleanupSession` cannot do it: its maps are filled by `onsessioninitialized`,
- * which never ran.
+ * The transport `map` holds for `sessionId`, when the session belongs to the
+ * signed-in user on `req`, else undefined. Every route answers undefined as
+ * an unknown session, so another user's session id, or a request with no
+ * user, gets exactly the answer an id that was never issued gets on that
+ * route, and nothing is sent upstream or closed for it.
+ */
+const ownedTransport = (
+  req: express.Request,
+  sessionId: unknown,
+  map: Map<string, Transport>,
+): Transport | undefined =>
+  typeof sessionId === "string" &&
+  inspectorSessionBelongsToCaller(sessionId, req)
+    ? map.get(sessionId)
+    : undefined;
+
+/**
+ * Tear down a session that never became usable, so its id never reached the
+ * client and nothing could ever close it afterwards:
+ *  - a POST /mcp session whose first request the transport answered without
+ *    initializing it: a body over the limit found while reading it (a
+ *    declared oversize never gets this far, see refuseDeclaredOversize),
+ *    invalid JSON, or a first request that is not an `initialize`;
+ *  - an open on any of the three routes that could not register its session
+ *    (lib/metamcp/inspector-sessions): its row changed, or its request
+ *    ended, while the connection was opening.
+ * Without this its upstream transport (a STDIO child, an SSE stream) stayed
+ * open. `cleanupSession` cannot do it: its maps are filled only once the
+ * session is registered.
  *
  * The server transport goes first. Its close reaches the proxy wiring
- * (lib/mcp-proxy), which marks the server side closed and closes the client
- * transport itself, so the client transport's close below is normally a no-op
- * (the SDK transport ignores a second close) rather than the wiring's cue to
- * close the upstream a second time. It is there for when the wiring did not
- * run.
+ * (lib/mcp-proxy), when it is set up, which marks the server side closed and
+ * closes the client transport itself, so the client transport's close below
+ * is normally a no-op (the SDK transport ignores a second close) rather than
+ * the wiring's cue to close the upstream a second time. It is there for when
+ * the wiring did not run.
  */
 const closeUninitializedSession = async (
-  sessionId: string,
   webAppTransport: Transport | undefined,
   serverTransport: Transport,
 ) => {
-  logger.info(
-    `Proxy session ${sessionId} was not initialized; closing its transports`,
-  );
+  logger.info("Proxy session was not opened; closing its transports");
   try {
     await serverTransport.close();
   } catch (error) {
     logger.error(
-      `Error closing server transport for uninitialized session ${sessionId}:`,
-      error,
+      "Error closing the server transport of a session that was not opened:",
+      describeDbError(error),
     );
   }
   try {
     await webAppTransport?.close();
   } catch (error) {
     logger.error(
-      `Error closing web app transport for uninitialized session ${sessionId}:`,
-      error,
+      "Error closing the web app transport of a session that was not opened:",
+      describeDbError(error),
     );
+  }
+};
+
+/**
+ * The answer to an open that could not register its session because its row
+ * was changed or deleted while the connection was opening (see
+ * lib/metamcp/inspector-sessions). A constant, JSON-RPC shaped, and the same
+ * on every route, like STDIO_DISABLED_BODY. A request that already ended has
+ * nobody left to read it, so nothing is written for one.
+ */
+const SESSION_NOT_OPENED_BODY = Object.freeze({
+  jsonrpc: "2.0",
+  error: {
+    code: -32000,
+    message:
+      "This connection was not opened because the server changed while it was opening. Connect again.",
+  },
+  id: null,
+});
+
+const answerSessionNotOpened = (res: express.Response) => {
+  if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+    res.status(409).json(SESSION_NOT_OPENED_BODY);
   }
 };
 
@@ -1036,6 +1105,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     const spawnParams = await resolveStdioSpawnParams(req);
     const { cmd, args, env } = spawnParams;
     resolvedStdioParams.set(req, spawnParams);
+    openedServerUuid.set(req, spawnParams.serverUuid);
 
     // Check if this command is in cooldown
     if (isStdioInCooldown(cmd, args, env)) {
@@ -1091,7 +1161,9 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       fetch: guardedFetch,
       headers,
       logTarget,
+      serverUuid,
     } = await openRemoteServer(req, transportType);
+    if (serverUuid) openedServerUuid.set(req, serverUuid);
 
     // Header NAMES only. `headers` is the row's stored `headers` jsonb merged
     // with the request's passthrough `authorization`, so stringifying the whole
@@ -1131,7 +1203,9 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       url,
       fetch: guardedFetch,
       headers,
+      serverUuid,
     } = await openRemoteServer(req, transportType);
+    if (serverUuid) openedServerUuid.set(req, serverUuid);
 
     // Covers the transport's own reconnects and every redirect hop, which the
     // one-shot check cannot reach.
@@ -1153,8 +1227,10 @@ serverRouter.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string;
   // logger.info(`Received GET message for sessionId ${sessionId}`);
   try {
-    const transport = webAppTransports.get(
+    const transport = ownedTransport(
+      req,
       sessionId,
+      webAppTransports,
     ) as StreamableHTTPServerTransport;
     if (!transport) {
       res.status(404).end("Session not found");
@@ -1176,6 +1252,11 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
   let newSessionId: string | undefined;
   let webAppTransport: StreamableHTTPServerTransport | undefined;
   if (!sessionId) {
+    // Held from before the row lookup until the session is registered or the
+    // open gives up; a request that ends first cannot register a session
+    // (lib/metamcp/inspector-sessions).
+    const openToken = beginInspectorOpen();
+    res.on("close", () => finishInspectorOpen(openToken));
     try {
       logger.info("New StreamableHttp connection request");
       try {
@@ -1200,6 +1281,16 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
       }
 
       logger.info("Created StreamableHttp server transport");
+
+      // The row changed, or the request ended, while the transport opened.
+      // Registration below checks again; this stops before anything else is
+      // built around a transport that can never be used.
+      if (!isInspectorOpenUsable(openToken, openedServerUuid.get(req))) {
+        await closeUninitializedSession(undefined, serverTransport);
+        answerSessionNotOpened(res);
+        return;
+      }
+      const upstreamTransport = serverTransport;
 
       // Set up crash detection for STDIO transports in StreamableHttp route
       if (serverTransport instanceof ProcessManagedStdioTransport) {
@@ -1237,11 +1328,27 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
         sessionIdGenerator: () => sessionIdForRequest,
         // See lib/metamcp/mcp-request-body-limit for the value and why.
         maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
-        onsessioninitialized: (sessionId) => {
-          webAppTransports.set(sessionId, transportToClient);
-          if (serverTransport) {
-            serverTransports.set(sessionId, serverTransport);
+        onsessioninitialized: async (sessionId) => {
+          // Registered before the maps are filled and before the SDK sends
+          // the id. A refused registration closes what this request started,
+          // and the SDK then answers the initialize as an unknown session.
+          if (
+            !bindInspectorSession(
+              sessionId,
+              req,
+              () => cleanupSession(sessionId),
+              openedServerUuid.get(req),
+              openToken,
+            )
+          ) {
+            await closeUninitializedSession(
+              transportToClient,
+              upstreamTransport,
+            );
+            return;
           }
+          webAppTransports.set(sessionId, transportToClient);
+          serverTransports.set(sessionId, upstreamTransport);
           logger.info("Client <-> Proxy  sessionId: " + sessionId);
         },
       });
@@ -1266,11 +1373,7 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
       // Answered without initializing: no session id went out, so close what
       // this request started. An initialized session is left as it is.
       if (transportToClient.sessionId === undefined) {
-        await closeUninitializedSession(
-          sessionIdForRequest,
-          transportToClient,
-          serverTransport,
-        );
+        await closeUninitializedSession(transportToClient, serverTransport);
       }
     } catch (error) {
       logger.error("Error in /mcp POST route:", describeDbError(error));
@@ -1286,22 +1389,22 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
         newSessionId &&
         webAppTransports.get(newSessionId) !== webAppTransport
       ) {
-        await closeUninitializedSession(
-          newSessionId,
-          webAppTransport,
-          serverTransport,
-        );
+        await closeUninitializedSession(webAppTransport, serverTransport);
       }
       // A throw after the response started cannot be answered with a status.
       if (!res.headersSent) {
         res.status(500).json(PROXY_ERROR_BODY);
       }
+    } finally {
+      finishInspectorOpen(openToken);
     }
   } else {
     // logger.info(`Received POST message for sessionId ${sessionId}`);
     try {
-      const transport = webAppTransports.get(
+      const transport = ownedTransport(
+        req,
         sessionId,
+        webAppTransports,
       ) as StreamableHTTPServerTransport;
       if (!transport) {
         res.status(404).end("Transport not found for sessionId " + sessionId);
@@ -1327,8 +1430,10 @@ serverRouter.delete("/mcp", async (req, res) => {
 
   if (sessionId) {
     try {
-      const serverTransport = serverTransports.get(
+      const serverTransport = ownedTransport(
+        req,
         sessionId,
+        serverTransports,
       ) as StreamableHTTPClientTransport;
       if (!serverTransport) {
         res.status(404).end("Transport not found for sessionId " + sessionId);
@@ -1358,6 +1463,9 @@ serverRouter.delete("/mcp", async (req, res) => {
 });
 
 serverRouter.get("/stdio", async (req, res) => {
+  // See POST /mcp: held until the session is registered or the open gives up.
+  const openToken = beginInspectorOpen();
+  res.on("close", () => finishInspectorOpen(openToken));
   try {
     logger.info("New STDIO connection request");
     let serverTransport: Transport | undefined;
@@ -1387,6 +1495,22 @@ serverRouter.get("/stdio", async (req, res) => {
       res,
     );
     logger.info("Created client transport");
+
+    // Registered before the maps are filled and before start() sends the
+    // endpoint event that carries the id.
+    if (
+      !bindInspectorSession(
+        webAppTransport.sessionId,
+        req,
+        () => cleanupSession(webAppTransport.sessionId),
+        openedServerUuid.get(req),
+        openToken,
+      )
+    ) {
+      await closeUninitializedSession(undefined, serverTransport);
+      answerSessionNotOpened(res);
+      return;
+    }
 
     webAppTransports.set(webAppTransport.sessionId, webAppTransport);
     serverTransports.set(webAppTransport.sessionId, serverTransport);
@@ -1525,10 +1649,15 @@ serverRouter.get("/stdio", async (req, res) => {
   } catch (error) {
     logger.error("Error in /stdio route:", describeDbError(error));
     res.status(500).json(PROXY_ERROR_BODY);
+  } finally {
+    finishInspectorOpen(openToken);
   }
 });
 
 serverRouter.get("/sse", async (req, res) => {
+  // See POST /mcp: held until the session is registered or the open gives up.
+  const openToken = beginInspectorOpen();
+  res.on("close", () => finishInspectorOpen(openToken));
   try {
     logger.info(
       "New SSE connection request. NOTE: The sse transport is deprecated and has been replaced by StreamableHttp",
@@ -1571,6 +1700,21 @@ serverRouter.get("/sse", async (req, res) => {
         "/mcp-proxy/server/message",
         res,
       );
+      // Registered before the maps are filled and before start() sends the
+      // endpoint event that carries the id.
+      if (
+        !bindInspectorSession(
+          webAppTransport.sessionId,
+          req,
+          () => cleanupSession(webAppTransport.sessionId),
+          openedServerUuid.get(req),
+          openToken,
+        )
+      ) {
+        await closeUninitializedSession(undefined, serverTransport);
+        answerSessionNotOpened(res);
+        return;
+      }
       webAppTransports.set(webAppTransport.sessionId, webAppTransport);
       logger.info("Created client transport");
       if (serverTransport) {
@@ -1610,6 +1754,8 @@ serverRouter.get("/sse", async (req, res) => {
   } catch (error) {
     logger.error("Error in /sse route:", describeDbError(error));
     res.status(500).json(PROXY_ERROR_BODY);
+  } finally {
+    finishInspectorOpen(openToken);
   }
 });
 
@@ -1618,8 +1764,10 @@ serverRouter.post("/message", async (req, res) => {
     const sessionId = req.query.sessionId;
     // logger.info(`Received POST message for sessionId ${sessionId}`);
 
-    const transport = webAppTransports.get(
-      sessionId as string,
+    const transport = ownedTransport(
+      req,
+      sessionId,
+      webAppTransports,
     ) as SSEServerTransport;
     if (!transport) {
       res.status(404).end("Session not found");

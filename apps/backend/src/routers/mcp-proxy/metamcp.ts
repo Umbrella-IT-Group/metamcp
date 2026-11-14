@@ -16,6 +16,11 @@ import {
 } from "../../lib/metamcp/caller-context-store";
 import { createServer } from "../../lib/metamcp/index";
 import {
+  bindInspectorSession,
+  forgetInspectorSession,
+  inspectorSessionBelongsToCaller,
+} from "../../lib/metamcp/inspector-sessions";
+import {
   MCP_REQUEST_BODY_LIMIT_BYTES,
   refuseDeclaredOversize,
 } from "../../lib/metamcp/mcp-request-body-limit";
@@ -90,6 +95,22 @@ const metamcpServers: Map<
   }
 > = new Map(); // MetaMCP servers by sessionId
 
+/**
+ * The transport for `sessionId` when the session belongs to the signed-in
+ * user on `req` (lib/metamcp/inspector-sessions), else undefined. Every route
+ * answers undefined as an unknown session, so another user's session id, or
+ * a request with no user, gets exactly the answer an id that was never issued
+ * gets on that route.
+ */
+const ownedTransport = (
+  req: express.Request,
+  sessionId: unknown,
+): Transport | undefined =>
+  typeof sessionId === "string" &&
+  inspectorSessionBelongsToCaller(sessionId, req)
+    ? webAppTransports.get(sessionId)
+    : undefined;
+
 // Create a MetaMCP server instance
 const createMetaMcpServer = async (
   namespaceUuid: string,
@@ -104,26 +125,47 @@ const createMetaMcpServer = async (
   return { server, cleanup };
 };
 
-// Cleanup function for a specific session
+/**
+ * Close a namespace session's transport, its MetaMCP server instance and its
+ * pooled connections, attempting each even when an earlier one fails. Never
+ * throws; a failure is logged by a fixed label and its error class.
+ */
+const closeSessionResources = async (
+  sessionId: string,
+  transport: Transport | undefined,
+  serverInstance: { cleanup: () => Promise<void> } | undefined,
+) => {
+  const phases: Array<[string, () => Promise<void> | undefined]> = [
+    ["transport", () => transport?.close()],
+    ["server instance", () => serverInstance?.cleanup()],
+    ["pooled connections", () => mcpServerPool.cleanupSession(sessionId)],
+  ];
+  for (const [phase, run] of phases) {
+    try {
+      await run();
+    } catch (error) {
+      logger.error(
+        `Closing the ${phase} of a namespace Inspector session failed:`,
+        describeDbError(error),
+      );
+    }
+  }
+};
+
+// Cleanup function for a specific session. The session is forgotten and both
+// of its map entries are detached before the first await, so no request is
+// routed to a session that is closing, and a close callback that re-enters
+// this function finds nothing left to close.
 const cleanupSession = async (sessionId: string) => {
+  forgetInspectorSession(sessionId);
+  const transport = webAppTransports.get(sessionId);
+  webAppTransports.delete(sessionId);
+  const serverInstance = metamcpServers.get(sessionId);
+  metamcpServers.delete(sessionId);
+
   logger.info(`Cleaning up session ${sessionId}`);
 
-  // Clean up transport
-  const transport = webAppTransports.get(sessionId);
-  if (transport) {
-    webAppTransports.delete(sessionId);
-    await transport.close();
-  }
-
-  // Clean up server instance
-  const serverInstance = metamcpServers.get(sessionId);
-  if (serverInstance) {
-    metamcpServers.delete(sessionId);
-    await serverInstance.cleanup();
-  }
-
-  // Clean up session connections
-  await mcpServerPool.cleanupSession(sessionId);
+  await closeSessionResources(sessionId, transport, serverInstance);
 };
 
 metamcpRouter.get("/:uuid/mcp", async (req, res) => {
@@ -133,7 +175,8 @@ metamcpRouter.get("/:uuid/mcp", async (req, res) => {
   //   `Received GET message for MetaMCP namespace ${namespaceUuid} sessionId ${sessionId}`,
   // );
   try {
-    const transport = webAppTransports.get(
+    const transport = ownedTransport(
+      req,
       sessionId,
     ) as StreamableHTTPServerTransport;
     if (!transport) {
@@ -187,6 +230,23 @@ metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
               `Created MetaMCP server instance for session ${newSessionId}`,
             );
 
+            // Registered before the maps are filled and before the SDK sends
+            // the id. A refused registration closes what was opened, and the
+            // closed transport makes the SDK answer the initialize as an
+            // unknown session instead of completing it.
+            if (
+              !bindInspectorSession(newSessionId, req, () =>
+                cleanupSession(newSessionId),
+              )
+            ) {
+              await closeSessionResources(
+                newSessionId,
+                webAppTransport,
+                mcpServerInstance,
+              );
+              return;
+            }
+
             webAppTransports.set(newSessionId, webAppTransport);
             metamcpServers.set(newSessionId, mcpServerInstance);
 
@@ -229,7 +289,8 @@ metamcpRouter.post("/:uuid/mcp", refuseDeclaredOversize, async (req, res) => {
     //   `Received POST message for MetaMCP namespace ${namespaceUuid} sessionId ${sessionId}`,
     // );
     try {
-      const transport = webAppTransports.get(
+      const transport = ownedTransport(
+        req,
         sessionId,
       ) as StreamableHTTPServerTransport;
       if (!transport) {
@@ -255,7 +316,11 @@ metamcpRouter.delete("/:uuid/mcp", async (req, res) => {
 
   if (sessionId) {
     try {
-      await cleanupSession(sessionId);
+      // 200 for any id, as before, so an unknown id and another user's get
+      // the same answer; only the opener's session is cleaned up.
+      if (inspectorSessionBelongsToCaller(sessionId, req)) {
+        await cleanupSession(sessionId);
+      }
       logger.info(`MetaMCP session ${sessionId} cleaned up successfully`);
       res.status(200).end();
     } catch (error) {
@@ -295,6 +360,16 @@ metamcpRouter.get("/:uuid/sse", async (req, res) => {
     );
     logger.info(`Created MetaMCP server instance for session ${sessionId}`);
 
+    // Registered before the maps are filled and before connect() starts the
+    // transport, which sends the endpoint event that carries the id.
+    if (
+      !bindInspectorSession(sessionId, req, () => cleanupSession(sessionId))
+    ) {
+      await closeSessionResources(sessionId, undefined, mcpServerInstance);
+      res.status(500).json(PROXY_ERROR_BODY);
+      return;
+    }
+
     webAppTransports.set(sessionId, webAppTransport);
     metamcpServers.set(sessionId, mcpServerInstance);
 
@@ -319,9 +394,7 @@ metamcpRouter.post("/:uuid/message", async (req, res) => {
     //   `Received POST message for MetaMCP namespace ${namespaceUuid} sessionId ${sessionId}`,
     // );
 
-    const transport = webAppTransports.get(
-      sessionId as string,
-    ) as SSEServerTransport;
+    const transport = ownedTransport(req, sessionId) as SSEServerTransport;
     if (!transport) {
       res.status(404).end("Session not found");
       return;

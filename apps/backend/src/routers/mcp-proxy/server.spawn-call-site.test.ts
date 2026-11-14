@@ -28,8 +28,8 @@ vi.mock("@/utils/logger", () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { spawnCalls, findAllAccessibleToUserMock, findByUuidMock } = vi.hoisted(
-  () => ({
+const { spawnCalls, findAllAccessibleToUserMock, findByUuidMock, stdio } =
+  vi.hoisted(() => ({
     /** Every ProcessManagedStdioTransport construction, in order. */
     spawnCalls: [] as Array<{
       command: string;
@@ -38,8 +38,9 @@ const { spawnCalls, findAllAccessibleToUserMock, findByUuidMock } = vi.hoisted(
     }>,
     findAllAccessibleToUserMock: vi.fn(),
     findByUuidMock: vi.fn(),
-  }),
-);
+    /** Closes of those transports, and a gate each start waits on when set. */
+    stdio: { closed: 0, startGate: undefined as Promise<void> | undefined },
+  }));
 
 // THE ASSERTION SURFACE. Captures what would have been spawned and starts
 // nothing: a real one forks a process, which on a test that deliberately sends
@@ -56,8 +57,12 @@ vi.mock("../../lib/stdio-transport/process-managed-transport", () => ({
     }) {
       spawnCalls.push(params);
     }
-    async start() {}
-    async close() {}
+    async start() {
+      if (stdio.startGate) await stdio.startGate;
+    }
+    async close() {
+      stdio.closed += 1;
+    }
     async send() {}
   },
 }));
@@ -103,6 +108,12 @@ vi.mock("../../db/repositories", () => ({
 vi.mock("../../db/index", () => ({ db: {}, pool: {} }));
 
 const { default: serverRouter } = await import("./server");
+const {
+  closeInspectorSessionsForServer,
+  forgetInspectorSession,
+  inspectorOpensPending,
+  inspectorSessionBelongsToCaller,
+} = await import("../../lib/metamcp/inspector-sessions");
 
 const SERVER_UUID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 const OWNER_ID = "user-owner";
@@ -196,6 +207,9 @@ beforeEach(() => {
   // the opt-in the "spawns NOTHING" cases below would pass for the wrong
   // reason. Scoped to this file and restored after each case.
   vi.stubEnv("ALLOW_STDIO_SERVERS", "true");
+  // The SSE transport stand-in names every session "test-session".
+  forgetInspectorSession("test-session");
+  stdio.startGate = undefined;
 });
 
 afterEach(() => {
@@ -342,5 +356,188 @@ describe("GET /mcp-proxy/server/stdio — what reaches the transport", () => {
     expect(spawnCalls[0].env.BETTER_AUTH_SECRET).toBeUndefined();
     expect(spawnCalls[0].env.DATABASE_URL).toBeUndefined();
     expect(spawnCalls[0].env.FILESYSTEM_TOKEN).toBe("s3cret");
+  });
+});
+
+/**
+ * GET /stdio driven like `getStdio`, as `userId`, keeping the answer and the
+ * response listeners the route registered.
+ */
+async function driveStdio(
+  query: Record<string, string>,
+  userId: string = OWNER_ID,
+) {
+  const search = new URLSearchParams(query).toString();
+  const req = {
+    method: "GET",
+    url: `/stdio?${search}`,
+    originalUrl: `/mcp-proxy/server/stdio?${search}`,
+    baseUrl: "",
+    query: Object.fromEntries(new URLSearchParams(search)),
+    headers: {},
+    user: { id: userId, role: "admin" },
+  } as unknown as express.Request;
+
+  const answer = { status: 200, body: undefined as unknown };
+  const listeners: Record<string, Array<() => void>> = {};
+  const res = {
+    statusCode: 200,
+    headersSent: false,
+    status(code: number) {
+      answer.status = code;
+      return res;
+    },
+    json(body: unknown) {
+      answer.body = body;
+      return res;
+    },
+    end() {
+      return res;
+    },
+    on(event: string, listener: () => void) {
+      (listeners[event] ??= []).push(listener);
+      return res;
+    },
+    setHeader() {
+      return res;
+    },
+    writeHead() {
+      return res;
+    },
+    write() {
+      return true;
+    },
+    flushHeaders() {},
+  };
+
+  const done = new Promise<void>((resolve, reject) => {
+    (serverRouter as unknown as express.RequestHandler)(
+      req,
+      res as unknown as express.Response,
+      (err?: unknown) => (err ? reject(err) : resolve()),
+    );
+    setTimeout(resolve, 50);
+  });
+
+  return { answer, listeners, done };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+const OTHER_SERVER_UUID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+describe("GET /mcp-proxy/server/stdio — the session it opens", () => {
+  it("belongs to the user who opened it and closes with its row", async () => {
+    const pendingBefore = inspectorOpensPending();
+    const { done } = await driveStdio({
+      transportType: "STDIO",
+      mcpServerUuid: SERVER_UUID,
+    });
+    await done;
+
+    expect(spawnCalls).toHaveLength(1);
+    // The stream stays open (this response double never closes), but the
+    // open itself is over.
+    expect(inspectorOpensPending()).toBe(pendingBefore);
+    expect(
+      inspectorSessionBelongsToCaller("test-session", {
+        user: { id: OWNER_ID },
+      } as never),
+    ).toBe(true);
+    expect(
+      inspectorSessionBelongsToCaller("test-session", {
+        user: { id: "someone-else" },
+      } as never),
+    ).toBe(false);
+
+    const closedBefore = stdio.closed;
+    expect(await closeInspectorSessionsForServer(OTHER_SERVER_UUID)).toBe(0);
+    expect(await closeInspectorSessionsForServer(SERVER_UUID)).toBe(1);
+    expect(stdio.closed).toBeGreaterThan(closedBefore);
+    expect(
+      inspectorSessionBelongsToCaller("test-session", {
+        user: { id: OWNER_ID },
+      } as never),
+    ).toBe(false);
+  });
+
+  it("is not opened when its row changes while the process starts, and the process is closed", async () => {
+    const gate = deferred();
+    stdio.startGate = gate.promise;
+    const pendingBefore = inspectorOpensPending();
+
+    const { answer, done } = await driveStdio({
+      transportType: "STDIO",
+      mcpServerUuid: SERVER_UUID,
+    });
+    await vi.waitFor(() => expect(spawnCalls).toHaveLength(1));
+    await closeInspectorSessionsForServer(SERVER_UUID);
+    const closedBefore = stdio.closed;
+    gate.resolve();
+    await done;
+
+    await vi.waitFor(() => expect(stdio.closed).toBeGreaterThan(closedBefore));
+    await vi.waitFor(() => expect(answer.status).toBe(409));
+    expect(
+      inspectorSessionBelongsToCaller("test-session", {
+        user: { id: OWNER_ID },
+      } as never),
+    ).toBe(false);
+    expect(inspectorOpensPending()).toBe(pendingBefore);
+  });
+
+  it("opens when another row changes while the process starts (control)", async () => {
+    const gate = deferred();
+    stdio.startGate = gate.promise;
+
+    const { answer, done } = await driveStdio({
+      transportType: "STDIO",
+      mcpServerUuid: SERVER_UUID,
+    });
+    await vi.waitFor(() => expect(spawnCalls).toHaveLength(1));
+    await closeInspectorSessionsForServer(OTHER_SERVER_UUID);
+    gate.resolve();
+    await done;
+
+    await vi.waitFor(() =>
+      expect(
+        inspectorSessionBelongsToCaller("test-session", {
+          user: { id: OWNER_ID },
+        } as never),
+      ).toBe(true),
+    );
+    expect(answer.status).toBe(200);
+  });
+
+  it("is not opened when the request ends while the process starts, and the process is closed", async () => {
+    const gate = deferred();
+    stdio.startGate = gate.promise;
+    const pendingBefore = inspectorOpensPending();
+
+    const { listeners, done } = await driveStdio({
+      transportType: "STDIO",
+      mcpServerUuid: SERVER_UUID,
+    });
+    await vi.waitFor(() => expect(spawnCalls).toHaveLength(1));
+    expect(inspectorOpensPending()).toBe(pendingBefore + 1);
+    for (const listener of listeners.close ?? []) listener();
+    expect(inspectorOpensPending()).toBe(pendingBefore);
+    const closedBefore = stdio.closed;
+    gate.resolve();
+    await done;
+
+    await vi.waitFor(() => expect(stdio.closed).toBeGreaterThan(closedBefore));
+    expect(
+      inspectorSessionBelongsToCaller("test-session", {
+        user: { id: OWNER_ID },
+      } as never),
+    ).toBe(false);
+    expect(await closeInspectorSessionsForServer(SERVER_UUID)).toBe(0);
   });
 });
