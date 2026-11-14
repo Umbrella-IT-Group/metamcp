@@ -28,6 +28,7 @@ import { McpServersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { withAdminAudit } from "../lib/audit/admin-write";
 import { clampAuditTextList } from "../lib/audit/audit-emitter";
+import { closeInspectorSessionsForServer } from "../lib/metamcp/inspector-sessions";
 import { mcpServerPool } from "../lib/metamcp/mcp-server-pool";
 import { clearOverrideCache } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
@@ -508,6 +509,11 @@ export const mcpServersImplementations = {
         };
       }
 
+      // The row is gone, so the Inspector sessions opened from it (and any
+      // still opening on it) end now, before the other post-delete work.
+      // This never throws, so it cannot turn the delete into a failure.
+      await closeInspectorSessionsForServer(deletedServer.uuid);
+
       // Invalidate idle MetaMCP servers for all affected namespaces (async)
       if (affectedNamespaceUuids.length > 0) {
         metaMcpServerPool
@@ -654,6 +660,24 @@ export const mcpServersImplementations = {
         };
       }
       const updatedServer = result.server;
+
+      // Inspector sessions opened from this row (and any still opening on it)
+      // hold a transport built from the row as it was. Close them, first and
+      // whatever the pooled invalidation below does, when the write changed
+      // where the gateway connects or what it presents there; when the row is
+      // a stdio row, whose command, args and env that report does not cover;
+      // or when the locked write changed the owner, who decides who may see
+      // the row. A re-save that changed none of this (the sync's routine one,
+      // made for every row on every run) leaves them open, as the pool does.
+      // This never throws, so it cannot turn the committed write into a
+      // failure.
+      if (
+        result.destinationOrCredentialChanged ||
+        updatedServer.type === McpServerTypeEnum.enum.STDIO ||
+        result.ownershipChanged
+      ) {
+        await closeInspectorSessionsForServer(updatedServer.uuid);
+      }
 
       // A changed URL, type, bearer or headers: retire every pooled
       // connection still built from the old values (active and idle, all

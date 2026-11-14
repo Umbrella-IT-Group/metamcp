@@ -1018,6 +1018,7 @@ describe("mcpserver.create / .update — vendor credentials must never land", ()
     mcpServersRepositoryMock.updateReportingChange.mockResolvedValue({
       server: serverRow,
       destinationOrCredentialChanged: true,
+      ownershipChanged: false,
     });
     namespaceMappingsRepositoryMock.findNamespacesByServerUuid.mockResolvedValue(
       [],

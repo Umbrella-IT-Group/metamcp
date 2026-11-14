@@ -11,7 +11,9 @@
  *     racing an update that moved the server and set a new token, is judged
  *     against the committed URL and refused, instead of moving the server
  *     back with the new token still attached;
- *   - the change report the tRPC layer uses to retire pooled connections.
+ *   - the change report the tRPC layer uses to retire pooled connections;
+ *   - the owner report, compared with the row as it was immediately before
+ *     the write (under the lock), not with an earlier read.
  *
  * GATING: opt-in via TEST_DATABASE_URL, never DATABASE_URL, because this suite
  * TRUNCATEs. Run it against a throwaway database:
@@ -68,17 +70,30 @@ afterAll(async () => {
   if (!TEST_DATABASE_URL || !db) return;
   await db.execute(`TRUNCATE TABLE mcp_servers CASCADE` as never);
   await db.execute(
+    `DELETE FROM "users" WHERE "id" IN ('${OWNER_1}', '${OWNER_2}')` as never,
+  );
+  await db.execute(
     `SELECT pg_advisory_unlock(${INTEGRATION_DB_LOCK_KEY})` as never,
   );
   await pool.end();
 });
 
+const OWNER_1 = "itest-owner-1";
+const OWNER_2 = "itest-owner-2";
+
 beforeEach(async () => {
   if (!TEST_DATABASE_URL) return;
   await db.execute(`TRUNCATE TABLE mcp_servers CASCADE` as never);
+  await db.execute(
+    `DELETE FROM "users" WHERE "id" IN ('${OWNER_1}', '${OWNER_2}')` as never,
+  );
+  await db.insert(schema.usersTable).values([
+    { id: OWNER_1, name: "itest owner 1", email: `${OWNER_1}@example.test` },
+    { id: OWNER_2, name: "itest owner 2", email: `${OWNER_2}@example.test` },
+  ]);
 });
 
-async function seed() {
+async function seed(userId: string | null = null) {
   return await repo.create({
     name: "vendor",
     description: "Vendor tools",
@@ -86,7 +101,7 @@ async function seed() {
     url: OLD_URL,
     bearerToken: "stored-bearer-value",
     headers: STORED_HEADERS,
-    user_id: null,
+    user_id: userId,
   });
 }
 
@@ -300,6 +315,78 @@ describeIfDb("server update and stored credentials (Postgres)", () => {
       )?.destinationOrCredentialChanged,
     ).toBe(false);
   });
+
+  it("the owner report: a changed owner counts, an unchanged one does not", async () => {
+    const seeded = await seed(OWNER_1);
+    const ownerReport = async (userId: string | null | undefined) =>
+      (
+        await repo.updateReportingChange({
+          uuid: seeded.uuid,
+          description: "edited",
+          ...(userId === undefined ? {} : { user_id: userId }),
+        })
+      )?.ownershipChanged;
+
+    expect(await ownerReport(undefined)).toBe(false);
+    expect(await ownerReport(OWNER_1)).toBe(false);
+    expect(await ownerReport(OWNER_2)).toBe(true);
+    expect(await ownerReport(null)).toBe(true);
+    expect(await ownerReport(null)).toBe(false);
+    expect(await ownerReport(OWNER_1)).toBe(true);
+    expect((await read(seeded.uuid)).user_id).toBe(OWNER_1);
+    // Owner changes leave the destination and credential report alone.
+    expect(
+      (
+        await repo.updateReportingChange({
+          uuid: seeded.uuid,
+          user_id: OWNER_2,
+        })
+      )?.destinationOrCredentialChanged,
+    ).toBe(false);
+  });
+
+  it.each([
+    ["writes back the owner an earlier read saw", OWNER_1, true, OWNER_1],
+    ["writes the owner the queued change committed", OWNER_2, false, OWNER_2],
+  ])(
+    "the owner report of an update queued behind an owner change that %s is judged against the committed owner",
+    async (_label, writtenOwner, expectedReport, finalOwner) => {
+      const seeded = await seed(OWNER_1);
+
+      // Connection 1: an update holding the row while it moves the owner to
+      // OWNER_2. The queued update below was prepared from an earlier read
+      // that still showed OWNER_1.
+      const first = await pool.connect();
+      try {
+        await first.query("BEGIN");
+        await first.query(
+          "SELECT uuid FROM mcp_servers WHERE uuid = $1 FOR UPDATE",
+          [seeded.uuid],
+        );
+        await first.query(
+          "UPDATE mcp_servers SET user_id = $2 WHERE uuid = $1",
+          [seeded.uuid, OWNER_2],
+        );
+
+        const second = repo.updateReportingChange({
+          uuid: seeded.uuid,
+          description: "queued edit",
+          user_id: writtenOwner,
+        });
+        await untilSomeoneWaitsOnALock();
+        await first.query("COMMIT");
+
+        const result = await second;
+        expect(result?.ownershipChanged).toBe(expectedReport);
+        expect(result?.server.user_id).toBe(finalOwner);
+        expect(result?.destinationOrCredentialChanged).toBe(false);
+      } finally {
+        first.release();
+      }
+
+      expect((await read(seeded.uuid)).user_id).toBe(finalOwner);
+    },
+  );
 
   it("an unknown server answers undefined and writes nothing", async () => {
     expect(
