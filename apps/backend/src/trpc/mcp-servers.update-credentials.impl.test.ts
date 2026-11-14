@@ -134,6 +134,7 @@ describe("mcpServers.update and the stored credentials", () => {
     vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
       server: row({ bearerToken: null }),
       destinationOrCredentialChanged: true,
+      ownershipChanged: false,
     });
     await update({ url: "http://mcp-other:3000/mcp", clearBearerToken: true });
     expect(mcpServersRepository.updateReportingChange).toHaveBeenCalledWith(
@@ -149,6 +150,7 @@ describe("mcpServers.update and the stored credentials", () => {
     vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
       server: row({ url: "http://mcp-other:3000/mcp", bearerToken: null }),
       destinationOrCredentialChanged: true,
+      ownershipChanged: false,
     });
 
     const result = await update({
@@ -170,6 +172,7 @@ describe("mcpServers.update and the stored credentials", () => {
     vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
       server: row({ description: "Vendor tools" }),
       destinationOrCredentialChanged: false,
+      ownershipChanged: false,
     });
 
     const result = await update({ description: "Vendor tools" });

@@ -131,6 +131,7 @@ beforeEach(() => {
     async (input: Record<string, unknown>) => ({
       server: row({ ...input }),
       destinationOrCredentialChanged: false,
+      ownershipChanged: false,
     }),
   );
   repo.findByUuid.mockResolvedValue(row());

@@ -224,6 +224,13 @@ export class McpServersRepository {
    * same transaction, against the locked row, so a concurrent update cannot
    * make the answer stale. The caller uses it to retire pooled connections
    * still built from the old values.
+   *
+   * `ownershipChanged` is reported the same way: the owner (`user_id`) the
+   * locked row had immediately before this write, against the one written.
+   * An owner read before the lock can be overtaken by an update queued ahead
+   * of this one, so comparing with that read could miss a change. The caller
+   * closes the row's Inspector sessions on it, since the owner decides who
+   * may see the row.
    */
   async updateReportingChange(
     input: McpServerUpdateInput,
@@ -235,6 +242,7 @@ export class McpServersRepository {
     | {
         server: DatabaseMcpServer;
         destinationOrCredentialChanged: boolean;
+        ownershipChanged: boolean;
       }
     | undefined
   > {
@@ -248,6 +256,7 @@ export class McpServersRepository {
             url: mcpServersTable.url,
             bearerToken: mcpServersTable.bearerToken,
             headers: mcpServersTable.headers,
+            user_id: mcpServersTable.user_id,
           })
           .from(mcpServersTable)
           .where(eq(mcpServersTable.uuid, uuid))
@@ -270,6 +279,8 @@ export class McpServersRepository {
               (updatedServer.bearerToken ?? null) ||
             JSON.stringify(current.headers ?? {}) !==
               JSON.stringify(updatedServer.headers ?? {}),
+          ownershipChanged:
+            (current.user_id ?? null) !== (updatedServer.user_id ?? null),
         };
       });
     } catch (error: unknown) {
