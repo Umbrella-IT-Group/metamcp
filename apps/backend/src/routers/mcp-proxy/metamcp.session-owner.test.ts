@@ -9,7 +9,10 @@
  *    nothing. DELETE keeps its existing answers: 200 for any id, cleaning up
  *    only the opener's session, and 400 without an id.
  *  - Cleanup forgets the session first and runs every phase even when an
- *    earlier one fails.
+ *    earlier one fails; the opener's DELETE then answers 500, as it did
+ *    before every phase was attempted.
+ *  - An open with no signed-in user issues no session id and closes what it
+ *    created without connecting the namespace server.
  *
  * Driven over a real socket through the real router, real SDK transports, a
  * real SDK `Server` and the real session registry; only the namespace server
@@ -18,6 +21,7 @@
  * an `x-test-user` header; no header means no user.
  */
 import type { Server as HttpServer } from "node:http";
+import { inspect } from "node:util";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -39,11 +43,13 @@ vi.mock("@/utils/logger", () => ({
 vi.mock("@/db", () => ({ db: {}, pool: { on: vi.fn() } }));
 vi.mock("@/db/audit-db", () => ({ auditDb: {}, auditPool: { on: vi.fn() } }));
 
-const { created, behaviour } = vi.hoisted(() => ({
+const { created, behaviour, FAILURE_DETAIL } = vi.hoisted(() => ({
   /** Each namespace server the route creates, in order. */
   created: [] as {
     cleanup: ReturnType<typeof vi.fn>;
     toolListings: number;
+    /** How many times the route connected it to a transport. */
+    connects: number;
   }[],
   /** Failures the next created server's cleanup phases produce. */
   behaviour: {
@@ -52,18 +58,23 @@ const { created, behaviour } = vi.hoisted(() => ({
     /** When set, the server cleanup waits for it. */
     cleanupGate: undefined as Promise<void> | undefined,
   },
+  /** Text a failing phase's error carries, which no log line may repeat. */
+  FAILURE_DETAIL: "at https://vendor.example.test/mcp for session",
 }));
 
 vi.mock("../../lib/metamcp/index", () => ({
-  createServer: vi.fn(async () => {
+  createServer: vi.fn(async (_namespaceUuid: string, sessionId: string) => {
     const record = {
       cleanup: vi.fn(async () => {
         if (behaviour.cleanupGate) await behaviour.cleanupGate;
         if (behaviour.failServerCleanup) {
-          throw new Error("server cleanup failed");
+          throw new Error(
+            `server cleanup failed ${FAILURE_DETAIL} ${sessionId}`,
+          );
         }
       }),
       toolListings: 0,
+      connects: 0,
     };
     const real = new Server(
       { name: "session-owner-namespace", version: "0.0.0" },
@@ -78,11 +89,14 @@ vi.mock("../../lib/metamcp/index", () => ({
     const failClose = behaviour.failTransportClose;
     const server = {
       connect: async (transport: Transport) => {
+        record.connects += 1;
         if (failClose) {
           const close = transport.close.bind(transport);
           transport.close = async () => {
             await close();
-            throw new Error("transport close failed");
+            throw new Error(
+              `transport close failed ${FAILURE_DETAIL} ${sessionId}`,
+            );
           };
         }
         await real.connect(transport);
@@ -95,6 +109,8 @@ vi.mock("../../lib/metamcp/index", () => ({
 vi.mock("../../lib/metamcp/mcp-server-pool", () => ({
   mcpServerPool: { cleanupSession: vi.fn().mockResolvedValue(undefined) },
 }));
+
+import logger from "@/utils/logger";
 
 import { createServer } from "../../lib/metamcp/index";
 import { inspectorSessionBelongsToCaller } from "../../lib/metamcp/inspector-sessions";
@@ -176,17 +192,15 @@ async function getStream(user: string | null, sessionId: string) {
   return answer;
 }
 
+const initializeBody = () =>
+  rpc("initialize", {
+    protocolVersion: PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: "inspector", version: "0.0.0" },
+  });
+
 async function initialize(user: string): Promise<string> {
-  const response = await send(
-    "POST",
-    user,
-    undefined,
-    rpc("initialize", {
-      protocolVersion: PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: { name: "inspector", version: "0.0.0" },
-    }),
-  );
+  const response = await send("POST", user, undefined, initializeBody());
   expect(response.status).toBe(200);
   await response.text();
   const sessionId = response.headers.get("mcp-session-id") ?? "";
@@ -468,4 +482,140 @@ describe("namespace session cleanup", () => {
       await after.text();
     },
   );
+});
+
+describe("the opener's DELETE when a cleanup phase fails", () => {
+  it.each([
+    ["closing the transport", "failTransportClose"],
+    ["cleaning up the server", "failServerCleanup"],
+    ["releasing the pooled connections", "failPool"],
+  ] as const)(
+    "answers 500 after every phase ran when %s fails",
+    async (_label, failure) => {
+      if (failure === "failPool") {
+        vi.mocked(mcpServerPool.cleanupSession).mockRejectedValueOnce(
+          new Error(`pool cleanup failed ${FAILURE_DETAIL}`),
+        );
+      } else {
+        behaviour[failure] = true;
+      }
+      const sessionId = await initialize(USER_A);
+
+      const deleted = await send("DELETE", USER_A, sessionId);
+
+      expect(deleted.status).toBe(500);
+      expect(await deleted.json()).toEqual({
+        error: "internal_server_error",
+        message:
+          "MCP proxy request failed. Check the gateway logs for details.",
+      });
+      expect(created[0].cleanup).toHaveBeenCalledTimes(1);
+      expect(mcpServerPool.cleanupSession).toHaveBeenCalledWith(sessionId);
+      expect(
+        inspectorSessionBelongsToCaller(sessionId, {
+          user: { id: USER_A },
+        } as never),
+      ).toBe(false);
+      const after = await listTools(USER_A, sessionId);
+      expect(after.status).toBe(404);
+      await after.text();
+    },
+  );
+
+  it("another user's and an unknown id's DELETE still answer 200 and clean up nothing", async () => {
+    behaviour.failTransportClose = true;
+    behaviour.failServerCleanup = true;
+    const sessionId = await initialize(USER_A);
+
+    const foreign = await answerOf(
+      await send("DELETE", USER_B, sessionId),
+      sessionId,
+    );
+    const unknown = await answerOf(
+      await send("DELETE", USER_A, NEVER_ISSUED),
+      NEVER_ISSUED,
+    );
+
+    expect(foreign.status).toBe(200);
+    expect(foreign).toEqual(unknown);
+    expect(created[0].cleanup).not.toHaveBeenCalled();
+    expect(mcpServerPool.cleanupSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["closing the transport", "failTransportClose"],
+    ["cleaning up the server", "failServerCleanup"],
+  ] as const)(
+    "logs a failure in %s by a fixed label, without its error text, url or session id",
+    async (_label, failure) => {
+      behaviour[failure] = true;
+      const sessionId = await initialize(USER_A);
+      const errorsBefore = vi.mocked(logger.error).mock.calls.length;
+
+      const deleted = await send("DELETE", USER_A, sessionId);
+      await deleted.text();
+
+      const phaseLogs = vi
+        .mocked(logger.error)
+        .mock.calls.slice(errorsBefore)
+        .filter(([label]) =>
+          String(label).includes("of a namespace Inspector session failed"),
+        );
+      expect(phaseLogs).toHaveLength(1);
+      const rendered = phaseLogs
+        .flat()
+        .map((part) => (typeof part === "string" ? part : inspect(part)))
+        .join(" ");
+      expect(rendered).not.toContain("failed at");
+      expect(rendered).not.toContain("vendor.example.test");
+      expect(rendered).not.toContain(sessionId);
+    },
+  );
+});
+
+describe("a namespace open with no signed-in user", () => {
+  /** The session id the route created its namespace server for. */
+  const createdFor = () => vi.mocked(createServer).mock.calls[0][1];
+
+  it("POST issues no session id, closes what it created and does not connect the server", async () => {
+    const response = await send("POST", null, undefined, initializeBody());
+
+    expect(response.headers.get("mcp-session-id")).toBeNull();
+    expect(response.status).toBe(404);
+    await response.text();
+    expect(created).toHaveLength(1);
+    expect(created[0].connects).toBe(0);
+    expect(created[0].cleanup).toHaveBeenCalledTimes(1);
+    expect(mcpServerPool.cleanupSession).toHaveBeenCalledWith(createdFor());
+    expect(
+      inspectorSessionBelongsToCaller(createdFor(), {
+        user: { id: USER_A },
+      } as never),
+    ).toBe(false);
+  });
+
+  it("GET /sse issues no session id, closes what it created and does not connect the server", async () => {
+    const response = await fetch(`${baseUrl}${BASE}/sse`, {
+      headers: { accept: "text/event-stream" },
+    });
+
+    // Status first: a usable SSE session's body never ends.
+    expect(response.status).toBe(500);
+    const body = await response.text();
+    expect(body).not.toContain("event: endpoint");
+    expect(JSON.parse(body)).toEqual({
+      error: "internal_server_error",
+      message: "MCP proxy request failed. Check the gateway logs for details.",
+    });
+    await settle();
+    expect(created).toHaveLength(1);
+    expect(created[0].connects).toBe(0);
+    expect(created[0].cleanup).toHaveBeenCalledTimes(1);
+    expect(mcpServerPool.cleanupSession).toHaveBeenCalledWith(createdFor());
+    expect(
+      inspectorSessionBelongsToCaller(createdFor(), {
+        user: { id: USER_A },
+      } as never),
+    ).toBe(false);
+  });
 });

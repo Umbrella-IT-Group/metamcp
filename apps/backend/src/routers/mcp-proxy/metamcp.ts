@@ -125,38 +125,49 @@ const createMetaMcpServer = async (
   return { server, cleanup };
 };
 
+/** The first error a namespace session's cleanup met, when one failed. */
+type CleanupFailure = { error: unknown };
+
 /**
  * Close a namespace session's transport, its MetaMCP server instance and its
  * pooled connections, attempting each even when an earlier one fails. Never
- * throws; a failure is logged by a fixed label and its error class.
+ * throws; a failure is logged by a fixed label and its error class. Returns
+ * the first failure, or undefined when every phase closed, so a caller that
+ * answers a request can still report it.
  */
 const closeSessionResources = async (
   sessionId: string,
   transport: Transport | undefined,
   serverInstance: { cleanup: () => Promise<void> } | undefined,
-) => {
+): Promise<CleanupFailure | undefined> => {
   const phases: Array<[string, () => Promise<void> | undefined]> = [
     ["transport", () => transport?.close()],
     ["server instance", () => serverInstance?.cleanup()],
     ["pooled connections", () => mcpServerPool.cleanupSession(sessionId)],
   ];
+  let firstFailure: CleanupFailure | undefined;
   for (const [phase, run] of phases) {
     try {
       await run();
     } catch (error) {
+      firstFailure ??= { error };
       logger.error(
         `Closing the ${phase} of a namespace Inspector session failed:`,
         describeDbError(error),
       );
     }
   }
+  return firstFailure;
 };
 
 // Cleanup function for a specific session. The session is forgotten and both
 // of its map entries are detached before the first await, so no request is
 // routed to a session that is closing, and a close callback that re-enters
-// this function finds nothing left to close.
-const cleanupSession = async (sessionId: string) => {
+// this function finds nothing left to close. Resolves to the first failure,
+// if any phase failed (see closeSessionResources); it never rejects.
+const cleanupSession = async (
+  sessionId: string,
+): Promise<CleanupFailure | undefined> => {
   forgetInspectorSession(sessionId);
   const transport = webAppTransports.get(sessionId);
   webAppTransports.delete(sessionId);
@@ -165,7 +176,7 @@ const cleanupSession = async (sessionId: string) => {
 
   logger.info(`Cleaning up session ${sessionId}`);
 
-  await closeSessionResources(sessionId, transport, serverInstance);
+  return closeSessionResources(sessionId, transport, serverInstance);
 };
 
 metamcpRouter.get("/:uuid/mcp", async (req, res) => {
@@ -317,9 +328,12 @@ metamcpRouter.delete("/:uuid/mcp", async (req, res) => {
   if (sessionId) {
     try {
       // 200 for any id, as before, so an unknown id and another user's get
-      // the same answer; only the opener's session is cleaned up.
+      // the same answer; only the opener's session is cleaned up. Every
+      // cleanup phase runs, and when one failed the opener still gets the 500
+      // a failed cleanup answered before the phases were made independent.
       if (inspectorSessionBelongsToCaller(sessionId, req)) {
-        await cleanupSession(sessionId);
+        const failure = await cleanupSession(sessionId);
+        if (failure) throw failure.error;
       }
       logger.info(`MetaMCP session ${sessionId} cleaned up successfully`);
       res.status(200).end();
