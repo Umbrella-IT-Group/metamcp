@@ -331,7 +331,9 @@ metamcpRouter.delete("/:uuid/mcp", async (req, res) => {
       // the same answer; only the opener's session is cleaned up. Every
       // cleanup phase runs, and when one failed the opener still gets the 500
       // a failed cleanup answered before the phases were made independent.
-      if (inspectorSessionBelongsToCaller(sessionId, req)) {
+      // The registry also holds single-server Inspector sessions. Require
+      // this router's transport so their registration cannot be removed here.
+      if (ownedTransport(req, sessionId)) {
         const failure = await cleanupSession(sessionId);
         if (failure) throw failure.error;
       }

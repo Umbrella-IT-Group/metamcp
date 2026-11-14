@@ -113,7 +113,12 @@ vi.mock("../../lib/metamcp/mcp-server-pool", () => ({
 import logger from "@/utils/logger";
 
 import { createServer } from "../../lib/metamcp/index";
-import { inspectorSessionBelongsToCaller } from "../../lib/metamcp/inspector-sessions";
+import {
+  bindInspectorSession,
+  closeInspectorSessionsForServer,
+  forgetInspectorSession,
+  inspectorSessionBelongsToCaller,
+} from "../../lib/metamcp/inspector-sessions";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import metamcpRouter from "./metamcp";
 
@@ -333,6 +338,32 @@ describe("namespace Streamable HTTP session: who it answers", () => {
     const listed = await listTools(USER_A, sessionId);
     expect(listed.status).toBe(200);
     await listed.text();
+  });
+
+  it("leaves the opener's single-server Inspector session registered and closable with its row", async () => {
+    // The registry is shared by both routers. An id absent from this router's
+    // transport map is unknown here even when this user owns it elsewhere.
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const serverUuid = "22222222-2222-4222-8222-222222222222";
+    const opener = { user: { id: USER_A } } as never;
+    const close = vi.fn();
+    expect(bindInspectorSession(sessionId, opener, close, serverUuid)).toBe(
+      true,
+    );
+
+    try {
+      const deleted = await send("DELETE", USER_A, sessionId);
+
+      expect(deleted.status).toBe(200);
+      await deleted.text();
+      expect(inspectorSessionBelongsToCaller(sessionId, opener)).toBe(true);
+      expect(mcpServerPool.cleanupSession).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+      expect(await closeInspectorSessionsForServer(serverUuid)).toBe(1);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      forgetInspectorSession(sessionId);
+    }
   });
 
   it("the opener's DELETE releases the session", async () => {
