@@ -18,9 +18,12 @@
  * registry. The upstream end is a stand-in client transport that answers each
  * request and counts starts, sends and closes; the destination guard, the
  * database and the pool are faked. The signed-in user is chosen per request by
- * an `x-test-user` header; no header means no user.
+ * an `x-test-user` header; no header means no user. An `x-test-numeric-user`
+ * header signs in a user whose id is a number, which the registry does not
+ * accept as a user id.
  */
 import type { Server as HttpServer } from "node:http";
+import { inspect } from "node:util";
 
 import express from "express";
 import {
@@ -47,6 +50,10 @@ const { upstream, UpstreamStandIn } = vi.hoisted(() => {
     startGate: undefined as Promise<void> | undefined,
     /** When set, every close waits for it after counting. */
     closeGate: undefined as Promise<void> | undefined,
+    /** When set, every close fails with this message after counting. */
+    closeFailure: undefined as string | undefined,
+    /** The most recently built stand-in. */
+    latest: undefined as { onmessage?: unknown } | undefined,
   };
   /**
    * The upstream MCP server, reduced to a transport that answers every
@@ -58,6 +65,9 @@ const { upstream, UpstreamStandIn } = vi.hoisted(() => {
     onclose?: () => void;
     onerror?: (error: Error) => void;
     sessionId = "upstream-session";
+    constructor() {
+      upstream.latest = this;
+    }
     async start() {
       upstream.started += 1;
       if (upstream.startGate) await upstream.startGate;
@@ -65,6 +75,7 @@ const { upstream, UpstreamStandIn } = vi.hoisted(() => {
     async close() {
       upstream.closed += 1;
       if (upstream.closeGate) await upstream.closeGate;
+      if (upstream.closeFailure) throw new Error(upstream.closeFailure);
       this.onclose?.();
     }
     async send(message: { id?: unknown; method?: string }) {
@@ -126,6 +137,7 @@ vi.mock("../../lib/metamcp/client", () => ({
   POOL_GUARD_OPTIONS: {},
 }));
 
+const { default: logger } = await import("@/utils/logger");
 const { mcpServersRepository } = await import("../../db/repositories");
 const { closeInspectorSessionsForServer, inspectorOpensPending } = await import(
   "../../lib/metamcp/inspector-sessions"
@@ -201,6 +213,9 @@ const initializeBody = () =>
 
 const userHeader = (user: string | null): Record<string, string> =>
   user ? { "x-test-user": user } : {};
+
+/** A signed-in user whose id the registry does not accept (a number). */
+const NUMERIC_USER = { "x-test-numeric-user": "42" };
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void;
@@ -354,6 +369,16 @@ beforeAll(async () => {
         user: { id, role: "admin", email: `${id}@example.test` },
       });
     }
+    const numericId = req.headers["x-test-numeric-user"];
+    if (typeof numericId === "string") {
+      Object.assign(req, {
+        user: {
+          id: Number(numericId),
+          role: "admin",
+          email: "numeric@example.test",
+        },
+      });
+    }
     next();
   });
   app.use("/mcp-proxy/server", serverRouter);
@@ -374,6 +399,7 @@ afterAll(async () => {
 beforeEach(async () => {
   upstream.startGate = undefined;
   upstream.closeGate = undefined;
+  upstream.closeFailure = undefined;
   vi.mocked(mcpServersRepository.findAllAccessibleToUser).mockReset();
   vi.mocked(mcpServersRepository.findAllAccessibleToUser).mockResolvedValue(
     ROWS as never,
@@ -747,6 +773,74 @@ describe("a row change while a connection is opening", () => {
     await expectNothingUsable(await opening, before, pendingBefore);
   });
 
+  it("POST /mcp: a change committed while the initialize body is still arriving leaves no usable session", async () => {
+    // The change lands after the check that follows the transport open, so
+    // registering the session is what refuses it.
+    const before = { ...upstream };
+    const pendingBefore = inspectorOpensPending();
+    const infoBefore = vi.mocked(logger.info).mock.calls.length;
+    upstream.latest = undefined;
+    const body = new TextEncoder().encode(initializeBody());
+    const rest = deferred();
+    let firstSent = false;
+    const heldBody = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (!firstSent) {
+          firstSent = true;
+          controller.enqueue(body.subarray(0, 16));
+          return;
+        }
+        await rest.promise;
+        controller.enqueue(body.subarray(16));
+        controller.close();
+      },
+    });
+
+    const opening = fetch(
+      `${baseUrl}/mcp-proxy/server/mcp?${new URLSearchParams(byUuid(ROW_A))}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          ...userHeader(USER_A),
+        },
+        body: heldBody,
+        duplex: "half",
+      } as RequestInit,
+    );
+    // The upstream transport is open and wired to the client transport, so
+    // the route is past the post-open check and waiting on the body.
+    await vi.waitFor(() =>
+      expect(upstream.latest?.onmessage).toBeTypeOf("function"),
+    );
+    await closeInspectorSessionsForServer(ROW_A.uuid);
+    rest.resolve();
+
+    const response = await opening;
+    expect(response.status).toBe(404);
+    expect(response.headers.get("mcp-session-id")).toBeNull();
+    expect(JSON.parse(await response.text())).toMatchObject({
+      jsonrpc: "2.0",
+      error: { message: "Session not found" },
+    });
+    await vi.waitFor(() =>
+      expect(upstream.closed - before.closed).toBeGreaterThanOrEqual(
+        upstream.started - before.started,
+      ),
+    );
+    expect(upstream.started - before.started).toBe(1);
+    await vi.waitFor(() => expect(inspectorOpensPending()).toBe(pendingBefore));
+    expect(await closeInspectorSessionsForServer(ROW_A.uuid)).toBe(0);
+    // Nothing routes to the refused session: it never went live.
+    expect(
+      vi
+        .mocked(logger.info)
+        .mock.calls.slice(infoBefore)
+        .filter(([message]) => String(message).startsWith("Client <-> Proxy")),
+    ).toEqual([]);
+  });
+
   it("a change to another row lets the open finish (control)", async () => {
     const gate = deferred();
     upstream.startGate = gate.promise;
@@ -784,6 +878,99 @@ describe("a row change while a connection is opening", () => {
     expect(response.status).toBe(200);
     await response.text();
     expect(response.headers.get("mcp-session-id")).toBeTruthy();
+  });
+});
+
+describe("an open by a request with no usable user id", () => {
+  it.each([
+    ["GET /sse", "no signed-in user", {}, 400, 0],
+    ["GET /sse", "a user whose id is a number", NUMERIC_USER, 409, 1],
+    ["POST /mcp", "no signed-in user", {}, 400, 0],
+    ["POST /mcp", "a user whose id is a number", NUMERIC_USER, 404, 1],
+  ])(
+    "%s with %s issues no session id and leaves nothing open",
+    async (route, _label, headers, status, started) => {
+      const before = { ...upstream };
+      const pendingBefore = inspectorOpensPending();
+      const infoBefore = vi.mocked(logger.info).mock.calls.length;
+      const query = new URLSearchParams(byUuid(ROW_A));
+
+      const response =
+        route === "GET /sse"
+          ? await fetch(`${baseUrl}/mcp-proxy/server/sse?${query}`, {
+              headers: { accept: "text/event-stream", ...headers },
+            })
+          : await fetch(`${baseUrl}/mcp-proxy/server/mcp?${query}`, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                accept: "application/json, text/event-stream",
+                ...headers,
+              },
+              body: initializeBody(),
+            });
+
+      // Status first: a usable SSE session's body never ends.
+      expect(response.status).toBe(status);
+      expect(response.headers.get("mcp-session-id")).toBeNull();
+      expect(await response.text()).not.toContain("event: endpoint");
+      expect(upstream.started - before.started).toBe(started);
+      await vi.waitFor(() =>
+        expect(inspectorOpensPending()).toBe(pendingBefore),
+      );
+      // Each transport the open started is closed, once: nothing else took
+      // the refused session in and closed it again.
+      await settle();
+      expect(upstream.closed - before.closed).toBe(started);
+      expect(await closeInspectorSessionsForServer(ROW_A.uuid)).toBe(0);
+      expect(
+        vi
+          .mocked(logger.info)
+          .mock.calls.slice(infoBefore)
+          .filter(([message]) =>
+            String(message).startsWith("Client <-> Proxy"),
+          ),
+      ).toEqual([]);
+    },
+  );
+});
+
+describe("what a refused open logs", () => {
+  it("a failed upstream close is logged by a fixed label, without its error text, url or session id", async () => {
+    const idInError = "11111111-9999-4999-8999-111111111111";
+    const gate = deferred();
+    upstream.startGate = gate.promise;
+    upstream.closeFailure = `close failed for https://vendor.example.test/mcp?mcp-session-id=${idInError}`;
+    const before = { ...upstream };
+    const errorsBefore = vi.mocked(logger.error).mock.calls.length;
+
+    const opening = postMcp(USER_A, { query: byUuid(ROW_A) });
+    await vi.waitFor(() => expect(upstream.started).toBe(before.started + 1));
+    await closeInspectorSessionsForServer(ROW_A.uuid);
+    gate.resolve();
+    const response = await opening;
+    expect(response.status).toBe(409);
+    await response.text();
+    await vi.waitFor(() =>
+      expect(upstream.closed).toBeGreaterThan(before.closed),
+    );
+
+    const closeLogs = vi
+      .mocked(logger.error)
+      .mock.calls.slice(errorsBefore)
+      .filter(([label]) =>
+        String(label).includes("of a session that was not opened"),
+      );
+    expect(closeLogs.map(([label]) => label)).toEqual([
+      "Error closing the server transport of a session that was not opened:",
+    ]);
+    const rendered = closeLogs
+      .flat()
+      .map((part) => (typeof part === "string" ? part : inspect(part)))
+      .join(" ");
+    expect(rendered).not.toContain("close failed");
+    expect(rendered).not.toContain("vendor.example.test");
+    expect(rendered).not.toContain(idInError);
   });
 });
 

@@ -108,6 +108,7 @@ vi.mock("../../db/repositories", () => ({
 vi.mock("../../db/index", () => ({ db: {}, pool: {} }));
 
 const { default: serverRouter } = await import("./server");
+const { default: mcpProxy } = await import("../../lib/mcp-proxy");
 const {
   closeInspectorSessionsForServer,
   forgetInspectorSession,
@@ -360,12 +361,16 @@ describe("GET /mcp-proxy/server/stdio — what reaches the transport", () => {
 });
 
 /**
- * GET /stdio driven like `getStdio`, as `userId`, keeping the answer and the
- * response listeners the route registered.
+ * GET /stdio driven like `getStdio`, as `user` (the session user the gates
+ * leave on the request; null for none), keeping the answer and the response
+ * listeners the route registered.
  */
 async function driveStdio(
   query: Record<string, string>,
-  userId: string = OWNER_ID,
+  user: { id: unknown; role: string } | null = {
+    id: OWNER_ID,
+    role: "admin",
+  },
 ) {
   const search = new URLSearchParams(query).toString();
   const req = {
@@ -375,7 +380,7 @@ async function driveStdio(
     baseUrl: "",
     query: Object.fromEntries(new URLSearchParams(search)),
     headers: {},
-    user: { id: userId, role: "admin" },
+    user: user ?? undefined,
   } as unknown as express.Request;
 
   const answer = { status: 200, body: undefined as unknown };
@@ -432,7 +437,7 @@ function deferred() {
 
 const OTHER_SERVER_UUID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 
-describe("GET /mcp-proxy/server/stdio — the session it opens", () => {
+describe("GET /mcp-proxy/server/stdio: the session it opens", () => {
   it("belongs to the user who opened it and closes with its row", async () => {
     const pendingBefore = inspectorOpensPending();
     const { done } = await driveStdio({
@@ -540,4 +545,36 @@ describe("GET /mcp-proxy/server/stdio — the session it opens", () => {
     ).toBe(false);
     expect(await closeInspectorSessionsForServer(SERVER_UUID)).toBe(0);
   });
+});
+
+describe("GET /mcp-proxy/server/stdio: an open with no usable user id", () => {
+  it.each([
+    ["no signed-in user", null, 0, 500],
+    ["a user whose id is a number", { id: 42, role: "admin" }, 1, 409],
+  ])(
+    "with %s issues no session id and leaves no process open",
+    async (_label, user, spawned, status) => {
+      const pendingBefore = inspectorOpensPending();
+      const closedBefore = stdio.closed;
+
+      const { answer, done } = await driveStdio(
+        { transportType: "STDIO", mcpServerUuid: SERVER_UUID },
+        user,
+      );
+      await done;
+
+      await vi.waitFor(() => expect(answer.status).toBe(status));
+      expect(spawnCalls).toHaveLength(spawned);
+      expect(stdio.closed - closedBefore).toBe(spawned);
+      // The refused open is never wired to the client.
+      expect(mcpProxy).not.toHaveBeenCalled();
+      expect(inspectorOpensPending()).toBe(pendingBefore);
+      expect(
+        inspectorSessionBelongsToCaller("test-session", {
+          user: { id: OWNER_ID },
+        } as never),
+      ).toBe(false);
+      expect(await closeInspectorSessionsForServer(SERVER_UUID)).toBe(0);
+    },
+  );
 });
