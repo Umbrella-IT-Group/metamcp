@@ -22,6 +22,7 @@ import {
   closeInspectorSessionsForServer,
   finishInspectorOpen,
   forgetInspectorSession,
+  INSPECTOR_SESSION_CLOSE_TIMEOUT_MS,
   inspectorOpensPending,
   inspectorSessionBelongsToCaller,
   isInspectorOpenUsable,
@@ -271,6 +272,57 @@ describe("closeInspectorSessionsForServer", () => {
   });
 });
 
+describe("closeInspectorSessionsForServer and a close that never settles", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stops waiting for it at the close limit, logs it as a failed close by fixed labels and still runs the others", async () => {
+    vi.useFakeTimers();
+    const { session, rowA } = fresh();
+    const hanging = vi.fn(() => new Promise<never>(() => {}));
+    const fine = vi.fn(async () => undefined);
+    bind(`${session}-hangs`, USER_A, hanging, rowA);
+    bind(`${session}-fine`, USER_A, fine, rowA);
+
+    let detached: number | undefined;
+    const closing = closeInspectorSessionsForServer(rowA).then((count) => {
+      detached = count;
+    });
+
+    await vi.advanceTimersByTimeAsync(INSPECTOR_SESSION_CLOSE_TIMEOUT_MS - 1);
+    expect(detached).toBeUndefined();
+    expect(hanging).toHaveBeenCalledTimes(1);
+    expect(fine).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(detached).toBe(2);
+    await closing;
+
+    expect(inspectorSessionBelongsToCaller(`${session}-hangs`, USER_A)).toBe(
+      false,
+    );
+    expect(await closeInspectorSessionsForServer(rowA)).toBe(0);
+    expect(loggerMock.error).toHaveBeenCalledTimes(1);
+    expect(loggerMock.error).toHaveBeenCalledWith(
+      "Closing an Inspector session failed:",
+      `no answer within ${INSPECTOR_SESSION_CLOSE_TIMEOUT_MS} ms`,
+    );
+    expect(JSON.stringify(loggerMock.error.mock.calls)).not.toContain(session);
+  });
+
+  it("a close that settles within the limit leaves no timer behind", async () => {
+    vi.useFakeTimers();
+    const { session, rowA } = fresh();
+    bind(session, USER_A, async () => undefined, rowA);
+
+    expect(await closeInspectorSessionsForServer(rowA)).toBe(1);
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(loggerMock.error).not.toHaveBeenCalled();
+  });
+});
+
 describe("pending opens", () => {
   it("a row change marks a pending open even when no session is bound yet", async () => {
     const { session, rowA, rowB } = fresh();
@@ -324,6 +376,33 @@ describe("pending opens", () => {
       finishInspectorOpen(open);
     }
   });
+
+  it.each([
+    ["its row changed while it was pending", "changed"],
+    ["it was released", "released"],
+  ] as const)(
+    "an open refused because %s leaves no entry behind",
+    async (_label, reason) => {
+      const { session, rowA } = fresh();
+      const open = beginInspectorOpen();
+      try {
+        if (reason === "changed") {
+          await closeInspectorSessionsForServer(rowA);
+        } else {
+          finishInspectorOpen(open);
+        }
+        const close = vi.fn();
+
+        expect(bind(session, USER_A, close, rowA, open)).toBe(false);
+
+        expect(inspectorSessionBelongsToCaller(session, USER_A)).toBe(false);
+        expect(await closeInspectorSessionsForServer(rowA)).toBe(0);
+        expect(close).not.toHaveBeenCalled();
+      } finally {
+        finishInspectorOpen(open);
+      }
+    },
+  );
 
   it("a released open cannot register a session", () => {
     const { session, rowA } = fresh();

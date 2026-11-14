@@ -10,7 +10,9 @@
  *   - a refused, missing, denied, failed or rolled-back mutation closes
  *     nothing and leaves a connection that is still opening alone;
  *   - the close runs right after the write is confirmed, before the pooled
- *     invalidation, and a failing close does not change the result.
+ *     invalidation, and a failing close does not change the result; a close
+ *     that never settles holds neither the reply nor the invalidation past
+ *     the registry's close limit.
  *
  * Repositories and pools are mocked so the unit needs no postgres (the
  * harness of mcp-servers.update-credentials.impl.test.ts).
@@ -90,6 +92,7 @@ import {
   bindInspectorSession,
   finishInspectorOpen,
   forgetInspectorSession,
+  INSPECTOR_SESSION_CLOSE_TIMEOUT_MS,
   inspectorSessionBelongsToCaller,
   isInspectorOpenUsable,
 } from "../lib/metamcp/inspector-sessions";
@@ -325,6 +328,39 @@ describe("mcpServers.update closes the row's Inspector sessions", () => {
     expect(throwing.close).toHaveBeenCalledTimes(1);
     expect(rejecting.close).toHaveBeenCalledTimes(1);
     expect(mcpServerPool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("and a close that never settles holds the reply and the pooled invalidation no longer than the close limit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const hanging = openSession(UUID, () => {
+        order.push(`inspector:${UUID}`);
+        return new Promise<never>(() => {});
+      });
+      vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue(
+        reported(row({ bearerToken: "enc:v1:rotated" }), {
+          destinationOrCredentialChanged: true,
+        }),
+      );
+
+      let result: { success: boolean } | undefined;
+      const updating = update({ bearerToken: "rotated" }).then((value) => {
+        result = value;
+      });
+      await vi.advanceTimersByTimeAsync(INSPECTOR_SESSION_CLOSE_TIMEOUT_MS - 1);
+      expect(hanging.close).toHaveBeenCalledTimes(1);
+      expect(result).toBeUndefined();
+      expect(mcpServerPool.invalidateServerConnection).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(result?.success).toBe(true));
+      await updating;
+      expect(mcpServerPool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+      expect(order).toEqual([`inspector:${UUID}`, "pool"]);
+      expect(stillOpen(hanging.sessionId)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a connection still opening on the row is refused after a change and allowed after a re-save", async () => {

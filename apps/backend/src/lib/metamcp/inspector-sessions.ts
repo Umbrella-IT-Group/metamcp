@@ -2,11 +2,11 @@
  * Who opened each admin Inspector session, and which server row it came from.
  *
  * The Inspector routers (routers/mcp-proxy/server.ts and metamcp.ts) keep
- * their sessions in memory, keyed by a session id. A session id is not a
- * credential: the signed-in user is. So a session records the better-auth
- * user id (`req.user.id`, which `betterAuthMcpMiddleware` sets) of the request
- * that opened it, and its routes answer only that user. A fresh login of the
- * same account keeps its sessions, because the id is the account's, not the
+ * their sessions in memory, keyed by a session id. A session answers the
+ * signed-in user who opened it: it records the better-auth user id
+ * (`req.user.id`, which `betterAuthMcpMiddleware` sets) of the request that
+ * opened it, and its routes answer only that user. A fresh login of the same
+ * account keeps its sessions, because the id is the account's, not the
  * login's or the cookie's.
  *
  * A session opened from a registered row also records the row's uuid. Its
@@ -142,10 +142,51 @@ export function forgetInspectorSession(sessionId: string): void {
 }
 
 /**
+ * How long `closeInspectorSessionsForServer` waits for one session's close.
+ *
+ * Why a bound: the row mutations await these closes after their write commits
+ * and before they reply and invalidate the row's pooled connections. A close
+ * that never settles (a stdio child that does not exit, an upstream that
+ * does not answer) would otherwise hold both for as long as it hangs. A
+ * transport close normally settles well within five seconds. A close still
+ * running at the limit is no longer awaited and counts as a failed close; its
+ * session was detached before it started, so no request can reach it.
+ */
+export const INSPECTOR_SESSION_CLOSE_TIMEOUT_MS = 5_000;
+
+/** The rejection of a close that was still running at the limit. */
+class InspectorCloseTimedOut extends Error {}
+
+/**
+ * Run one close and settle with it, or reject once the limit passes. The
+ * `async () => close()` wrapper turns a synchronous throw into a rejection,
+ * so a throwing close is isolated like a rejecting one.
+ */
+function closeWithinLimit(close: () => unknown): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new InspectorCloseTimedOut()),
+      INSPECTOR_SESSION_CLOSE_TIMEOUT_MS,
+    );
+    (async () => close())().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
  * Close every Inspector session opened from `serverUuid`, and refuse any open
  * of that row still pending. Returns how many sessions it detached, closes
- * that failed included. Never throws: it runs after a committed write, and a
- * close problem must not turn that write into an error.
+ * that failed or timed out included. Never throws: it runs after a committed
+ * write, and a close problem must not turn that write into an error. Each
+ * close is awaited for at most INSPECTOR_SESSION_CLOSE_TIMEOUT_MS.
  *
  * The matching entries are detached before any close runs, so a close that
  * re-enters the registry, or an overlapping call, does not run one twice.
@@ -166,16 +207,15 @@ export async function closeInspectorSessionsForServer(
   }
 
   try {
-    // `async () => close()` turns a synchronous throw into a rejection, so
-    // every close is attempted and allSettled sees each outcome.
-    const outcomes = await Promise.allSettled(
-      closing.map((close) => (async () => close())()),
-    );
+    // Every close is attempted and allSettled sees each outcome.
+    const outcomes = await Promise.allSettled(closing.map(closeWithinLimit));
     for (const outcome of outcomes) {
       if (outcome.status === "rejected") {
         logger.error(
           "Closing an Inspector session failed:",
-          describeDbError(outcome.reason),
+          outcome.reason instanceof InspectorCloseTimedOut
+            ? `no answer within ${INSPECTOR_SESSION_CLOSE_TIMEOUT_MS} ms`
+            : describeDbError(outcome.reason),
         );
       }
     }
