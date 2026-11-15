@@ -193,7 +193,10 @@ export class AdminPlaneOwnerIneligible extends Error {
 /** Largest number of entries a created key's policy may carry. */
 export const MINT_MAX_CIDRS = 8;
 
-const NAME_PATTERN = /^[a-zA-Z0-9_\s-]+$/;
+// A literal space, not `\s`: the name rule promises letters, numbers, spaces,
+// underscores and hyphens, and `\s` would also admit a newline, a tab, a
+// no-break space and a line separator.
+const NAME_PATTERN = /^[a-zA-Z0-9_ -]+$/;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

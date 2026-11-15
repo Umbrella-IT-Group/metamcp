@@ -33,13 +33,18 @@ import type { DbTransaction } from "./db-executor";
  *  5. Endpoint rows (FOR UPDATE for a write, FOR SHARE for a key mint or a
  *     key re-activation).
  *  6. Access group rows (FOR UPDATE for a group delete).
- *  7. API key rows (FOR UPDATE for a policy change, a deactivation, a
+ *  7. API key name locks (`lockApiKeyName`, advisory, `metamcp.api_key.name`,
+ *     one per owner and name): a rename takes the lock of the name it is
+ *     taking before the uniqueness check, so two renames to one name are
+ *     judged one after the other. Held by renames only.
+ *  8. API key rows (FOR UPDATE for a policy change, a deactivation, a
  *     re-activation, a rename or a removal). A re-activation reads its key
  *     once without a lock to learn which owner and endpoint rows to lock
- *     first, then locks the key here and refuses if those have changed.
- *  8. MCP server rows (FOR UPDATE, in uuid order, for an error reset). No
+ *     first, then locks the key here and refuses if those have changed; a
+ *     rename does the same to learn the owner whose name lock to take.
+ *  9. MCP server rows (FOR UPDATE, in uuid order, for an error reset). No
  *     transaction that holds one takes a lock listed above it.
- *  9. The audit row insert, last, in the same transaction.
+ * 10. The audit row insert, last, in the same transaction.
  *
  * Every lock here is transaction-scoped (released at COMMIT or ROLLBACK, never
  * leaked past a process that dies mid-request) and database-wide, so separate
@@ -51,6 +56,9 @@ export const ADMIN_PLANE_BUDGET_LOCK_NAMESPACE = "metamcp.admin_plane.budget";
 
 /** Advisory-lock namespace of the per-namespace endpoint gate (position 3). */
 export const ENDPOINT_NAMESPACE_LOCK_NAMESPACE = "metamcp.endpoint.namespace";
+
+/** Advisory-lock namespace of the per-owner API key name (position 7). */
+export const API_KEY_NAME_LOCK_NAMESPACE = "metamcp.api_key.name";
 
 /**
  * Take the change budget lock of one admin-plane key for the rest of `tx`.
@@ -83,6 +91,26 @@ export async function lockEndpointNamespaces(
       sql`SELECT pg_advisory_xact_lock(hashtext(${ENDPOINT_NAMESPACE_LOCK_NAMESPACE}), hashtext(${namespaceUuid}))`,
     );
   }
+}
+
+/**
+ * Take the lock of one key name of one owner (`null` for the public keys) for
+ * the rest of `tx`. The database's per-owner unique rule covers a name taken
+ * by an owner's keys, not by public keys (a NULL owner is distinct to it), and
+ * a check made before a concurrent rename commits sees neither row: under this
+ * lock the second rename's check runs after the first has committed.
+ */
+export async function lockApiKeyName(
+  tx: DbTransaction,
+  ownerId: string | null,
+  name: string,
+): Promise<void> {
+  // A newline cannot be in an owner id or in a name that passed the name
+  // rule, so two different pairs never share a lock text.
+  const subject = `${ownerId ?? ""}\n${ownerId === null ? "public" : "owner"}\n${name}`;
+  await tx.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${API_KEY_NAME_LOCK_NAMESPACE}), hashtext(${subject}))`,
+  );
 }
 
 /** A user row as the account rails judge it, read under its row lock. */

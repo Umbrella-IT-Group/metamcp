@@ -435,12 +435,15 @@ export const ResetMcpServerErrorsRequestSchema = z.object({
  * row. `recovery` is what happened afterwards, when the gateway tried to
  * reconnect those servers: it never undoes `reset`, and a recovery that is
  * still running when the call answers is `pending` (read the server's status
- * back with `mcpServers.list`). Names and uuids only, never error text.
+ * back with `mcpServers.list`). A server with nothing to connect (its row is
+ * gone, or a stdio server is disabled) is `skipped`, and a call whose servers
+ * were all skipped answers `skipped`, not `succeeded`. Names and uuids only,
+ * never error text.
  */
 export const ResetMcpServerErrorsResponseSchema = z.object({
   reset: z.array(z.object({ uuid: z.string(), name: z.string() })),
   recovery: z.object({
-    status: z.enum(["not_needed", "succeeded", "failed", "pending"]),
+    status: z.enum(["not_needed", "succeeded", "failed", "pending", "skipped"]),
     servers: z.array(
       z.object({
         uuid: z.string(),

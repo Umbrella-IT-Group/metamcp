@@ -36,7 +36,9 @@ import {
  *    with `apiKeys.setIpPolicy`). The owner, endpoint and grant are read in
  *    the write's transaction, under the locks the mint takes.
  *  - rename: a name of the mint's shape, unused by any other key of the same
- *    owner (inactive keys included). A rename changes no access.
+ *    owner (inactive keys included) and not the name of any admin-plane key,
+ *    so a data-plane key cannot be made to look like the key a person would
+ *    contain. A rename changes no access.
  *  - remove: leaf-only. The key must already be inactive, so every removal
  *    follows a reversible, audited deactivation; nothing in the database
  *    references a key row, so deleting it cascades to nothing. The caller
@@ -62,6 +64,7 @@ export type KeyLifecycleRule =
   | "ip_policy_disabled"
   | "name_invalid"
   | "name_taken"
+  | "name_admin_plane"
   | "key_active"
   | "confirm_name_mismatch"
   | "impact_changed"
@@ -117,6 +120,11 @@ export const KEY_LIFECYCLE_REFUSALS: Readonly<
     code: "BAD_REQUEST",
     message:
       "name is already used by a key of this owner (inactive keys count). Use a new name.",
+  },
+  name_admin_plane: {
+    code: "BAD_REQUEST",
+    message:
+      "name is used by an admin-plane API key. Use a different name, so that no key can be mistaken for one.",
   },
   key_active: {
     code: "CONFLICT",
@@ -210,8 +218,13 @@ export function assertReactivationPolicy(
   }
 }
 
-/** The mint's name rule (api-key-mint-rules rule 6), as a lifecycle refusal. */
-const NAME_PATTERN = /^[a-zA-Z0-9_\s-]+$/;
+/**
+ * The mint's name rule (api-key-mint-rules rule 6), as a lifecycle refusal.
+ * A literal space, not `\s`: the refusal sentence promises letters, numbers,
+ * spaces, underscores and hyphens, and `\s` would also admit a newline, a tab,
+ * a no-break space and a line separator.
+ */
+const NAME_PATTERN = /^[a-zA-Z0-9_ -]+$/;
 
 export function assertRenameName(name: string): void {
   if (

@@ -186,6 +186,21 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
     return created.uuid;
   }
 
+  /** Another operator-scope key (its own change budget) of the same owner. */
+  async function freshOperatorKey() {
+    const { ApiKeysRepository } = await import(
+      "../db/repositories/api-keys.repo"
+    );
+    const created = await new ApiKeysRepository().create({
+      name: uniq("operator-key"),
+      user_id: fx.ownerId,
+      admin_plane: true,
+      admin_plane_scope: "operator",
+      is_active: true,
+    });
+    return { key: created.key, uuid: created.uuid };
+  }
+
   /** Resolve once `n` backends of this database are waiting on a lock. */
   async function waitForLockWaiters(n: number) {
     const deadline = Date.now() + 10_000;
@@ -586,6 +601,92 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
       expect((await keyRow(uuid))?.name).toBe(othersName);
     });
 
+    it.each([
+      ["a newline", "line1\nline2"],
+      ["a tab", "tab\there"],
+      ["a no-break space", "no-break\u00a0space"],
+      ["a line separator", "line\u2028separator"],
+    ])("refuses a name with %s and changes nothing", async (_label, name) => {
+      const uuid = await dataKey({ stem: "ren-ws", active: true });
+      const before = (await keyRow(uuid))?.name;
+      const reply = await rename(uuid, name);
+      expect({ status: reply.status, code: reply.code }).toEqual({
+        status: 400,
+        code: "BAD_REQUEST",
+      });
+      expect((await keyRow(uuid))?.name).toBe(before);
+      expect(
+        (await deniedRows(uuid, "apikey.update")).map(
+          (row) => (row.detail as { rule?: unknown }).rule,
+        ),
+      ).toContain("name_invalid");
+    });
+
+    it("refuses a name that is an admin-plane key's, whoever owns either, and says so with a denied row", async () => {
+      const adminPlane = await adminPlaneKey("ren-op", true);
+      const inactiveAdminPlane = await adminPlaneKey("ren-op-off", false);
+      const uuid = await dataKey({
+        stem: "ren-lookalike",
+        ownerId: fx.otherMemberId,
+        active: true,
+      });
+      const before = (await keyRow(uuid))?.name;
+      for (const target of [adminPlane, inactiveAdminPlane]) {
+        const name = (await keyRow(target))?.name as string;
+        const reply = await rename(uuid, name);
+        expect({ status: reply.status, code: reply.code }).toEqual({
+          status: 400,
+          code: "BAD_REQUEST",
+        });
+      }
+      expect((await keyRow(uuid))?.name).toBe(before);
+      expect(
+        (await deniedRows(uuid, "apikey.update")).map(
+          (row) => (row.detail as { rule?: unknown }).rule,
+        ),
+      ).toEqual(["name_admin_plane", "name_admin_plane"]);
+    });
+
+    it("lets exactly one of two callers rename two public keys to one name at the same moment", async () => {
+      // The database's per-owner unique rule does not cover public keys (a
+      // NULL owner is distinct to it), so two renames that both read the name
+      // as free would both commit. A test-only trigger holds each rename just
+      // before its write until the barrier opens, so both have made their
+      // check by then if nothing orders them; the name lock orders them.
+      const first = await freshOperatorKey();
+      const second = await freshOperatorKey();
+      const a = await dataKey({ stem: "ren-pub-a", ownerId: null });
+      const b = await dataKey({ stem: "ren-pub-b", ownerId: null });
+      const name = uniq("ren-pub-same");
+      const barrierKey = "hashtext('itest.rename.barrier')";
+      await one(`CREATE OR REPLACE FUNCTION itest_rename_barrier() RETURNS trigger AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(${barrierKey}); RETURN NEW; END $$ LANGUAGE plpgsql`);
+      await one(`DROP TRIGGER IF EXISTS itest_rename_barrier_trg ON api_keys`);
+      await one(`CREATE TRIGGER itest_rename_barrier_trg
+        BEFORE UPDATE OF name ON api_keys
+        FOR EACH ROW EXECUTE FUNCTION itest_rename_barrier()`);
+      try {
+        const [one1, two] = await raceBehind(
+          `SELECT pg_advisory_lock(${barrierKey})`,
+          `SELECT pg_advisory_unlock(${barrierKey})`,
+          () => rename(a, name, first.key),
+          () => rename(b, name, second.key),
+        );
+        expect([one1.status, two.status].sort()).toEqual([200, 400]);
+        expect(
+          await one(
+            `SELECT count(*)::int AS n FROM api_keys WHERE user_id IS NULL AND name = $1`,
+            [name],
+          ),
+        ).toEqual([{ n: 1 }]);
+      } finally {
+        await one(
+          `DROP TRIGGER IF EXISTS itest_rename_barrier_trg ON api_keys`,
+        );
+        await one(`DROP FUNCTION IF EXISTS itest_rename_barrier()`);
+      }
+    });
+
     it("never renames an admin-plane key", async () => {
       const ci = await adminPlaneKey("ren-ci", true);
       const before = (await keyRow(ci))?.name;
@@ -768,6 +869,71 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
           (row) => (row.detail as { rule?: unknown }).rule,
         ),
       ).toEqual(["impact_changed"]);
+    });
+
+    it("orders a removal and a reactivation of one key by its row lock, in both orders, across two callers", async () => {
+      // Two operator keys (each with its own change budget) so nothing but
+      // the key row orders them. The audit write of whichever goes first is
+      // stalled until the second is queued, so it still holds the key row; the
+      // second then waits on it (with the row lock) or reads the row as it was
+      // (without), and removes a key the first has just made active.
+      const reactivator = await freshOperatorKey();
+      const remover = await freshOperatorKey();
+      const prepare = async (stem: string) => {
+        const ep = await fx.endpoint({ name: uniq(`${stem}-ep`) });
+        const uuid = await dataKey({ stem, endpointUuid: ep });
+        const impact = (await operatorRead("apiKeys.removalImpact", { uuid }))
+          .data as { name: string; impact_fingerprint: string };
+        return { uuid, impact };
+      };
+      const reactivate = (uuid: string) =>
+        operator("apiKeys.reactivate", { uuid }, reactivator.key);
+      const removeKey = (target: Awaited<ReturnType<typeof prepare>>) =>
+        operator(
+          "apiKeys.remove",
+          {
+            uuid: target.uuid,
+            confirm_name: target.impact.name,
+            impact_fingerprint: target.impact.impact_fingerprint,
+          },
+          remover.key,
+        );
+      const stalled = async (
+        first: () => Promise<Reply>,
+        second: () => Promise<Reply>,
+      ): Promise<[Reply, Reply]> => {
+        const release = await fx.stallAuditWrites();
+        try {
+          const a = first();
+          await waitForLockWaiters(1);
+          const b = second();
+          await waitForLockWaiters(2);
+          await release();
+          return [await a, await b];
+        } catch (error) {
+          await release();
+          throw error;
+        }
+      };
+
+      // The reactivation first: the key is active when the removal looks, so
+      // the removal is refused and the key stays.
+      const a = await prepare("race-react-first");
+      const [reactivated, refused] = await stalled(
+        () => reactivate(a.uuid),
+        () => removeKey(a),
+      );
+      expect([reactivated.status, refused.code]).toEqual([200, "CONFLICT"]);
+      expect((await keyRow(a.uuid))?.is_active).toBe(true);
+
+      // The removal first: the reactivation finds no key.
+      const b = await prepare("race-remove-first");
+      const [removed, gone] = await stalled(
+        () => removeKey(b),
+        () => reactivate(b.uuid),
+      );
+      expect([removed.status, gone.code]).toEqual([200, "NOT_FOUND"]);
+      expect(await keyRow(b.uuid)).toBeUndefined();
     });
 
     it("never removes an admin-plane key, even an inactive one", async () => {
@@ -1117,6 +1283,44 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
         { cookie: fx.ownerCookie },
       );
       expect(JSON.stringify(asPerson.data)).toContain("hunter2");
+    });
+
+    it("refuses a search term, which would match the unredacted text a character at a time, and still lets a person search", async () => {
+      const serverName = uniq("diag-search").replace(/[^A-Za-z0-9_-]/g, "_");
+      await one(
+        `INSERT INTO gateway_events (category, level, server_name, message)
+         VALUES ('connection', 'error', $1, 'connect failed token=ZxQ-secret-9981-tail')`,
+        [serverName],
+      );
+
+      // The redacted page does not show the value, and a search for a prefix
+      // of it would still tell a caller whether the prefix is there.
+      for (const search of ["ZxQ-secret-99", "ZxQ-secret-98"]) {
+        const reply = await operatorRead("logs.history", {
+          serverName,
+          search,
+        });
+        expect({ search, status: reply.status, code: reply.code }).toEqual({
+          search,
+          status: 400,
+          code: "BAD_REQUEST",
+        });
+        expect(reply.message ?? "").not.toContain("ZxQ");
+      }
+      // Without a search the row is read, redacted.
+      const page = await operatorRead("logs.history", { serverName });
+      expect(page.status).toBe(200);
+      expect(JSON.stringify(page.data)).not.toContain("ZxQ-secret");
+
+      // A person's session searches as before.
+      const asPerson = await fx.trpc(
+        "frontend.logs.history",
+        { serverName, search: "ZxQ-secret-99" },
+        "query",
+        { cookie: fx.ownerCookie },
+      );
+      expect(asPerson.status).toBe(200);
+      expect((asPerson.data as { data: unknown[] }).data).toHaveLength(1);
     });
 
     it("is not available to a sync-scope key", async () => {

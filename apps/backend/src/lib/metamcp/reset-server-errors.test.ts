@@ -283,13 +283,79 @@ describe("resetServerErrors", () => {
     finish();
   });
 
-  it("skips a stored stdio server while stdio servers are disabled, without calling it a failure", async () => {
+  it("skips a stored stdio server while stdio servers are disabled, without calling it a failure or a success", async () => {
     h.findByUuid.mockResolvedValue({ uuid: S1, name: "alpha", type: "STDIO" });
     const result = await resetServerErrors({ serverUuid: S1 }, actor);
+    // TEST-EDIT (SPEC): a recovery in which nothing was connected is reported
+    // as `skipped`, not `succeeded`; the per-server entry is unchanged.
     expect(result.recovery).toEqual({
-      status: "succeeded",
+      status: "skipped",
       servers: [{ uuid: S1, name: "alpha", status: "skipped" }],
     });
     expect(h.ensureIdleSessionForNewServer).not.toHaveBeenCalled();
+  });
+
+  it("does not count a connection still being made as connected", async () => {
+    // The pool's per-server count includes a connect in flight, so a count
+    // without an idle connection says only that something is under way.
+    h.getPoolStatus.mockReturnValue({
+      idleServerUuids: [],
+      perServerCounts: { [S1]: 1 },
+    });
+    const result = await resetServerErrors({ serverUuid: S1 }, actor);
+    expect(result.recovery).toEqual({
+      status: "pending",
+      servers: [{ uuid: S1, name: "alpha", status: "pending" }],
+    });
+  });
+
+  describe("with several servers reset", () => {
+    beforeEach(() => {
+      h.clearErrorStatus.mockResolvedValue({
+        status: "ok",
+        reset: [
+          { uuid: S1, name: "alpha" },
+          { uuid: S2, name: "beta" },
+        ],
+      });
+      h.findByUuid.mockImplementation(async (uuid: string) => ({
+        uuid,
+        name: uuid === S1 ? "alpha" : "beta",
+        type: uuid === S2 ? "STDIO" : "STREAMABLE_HTTP",
+      }));
+    });
+
+    it("names the skipped server and still reports the connected one, so the call is succeeded only because one connected", async () => {
+      const result = await resetServerErrors({}, actor);
+      expect(result.recovery).toEqual({
+        status: "succeeded",
+        servers: [
+          { uuid: S1, name: "alpha", status: "connected" },
+          { uuid: S2, name: "beta", status: "skipped" },
+        ],
+      });
+    });
+
+    it("reports every server skipped as skipped, and a failure beside a skip as failed", async () => {
+      h.findByUuid.mockResolvedValue(undefined);
+      const allSkipped = await resetServerErrors({}, actor);
+      expect(allSkipped.recovery.status).toBe("skipped");
+      expect(allSkipped.recovery.servers.map((s) => s.status)).toEqual([
+        "skipped",
+        "skipped",
+      ]);
+
+      h.findByUuid.mockImplementation(async (uuid: string) =>
+        uuid === S1
+          ? { uuid, name: "alpha", type: "STREAMABLE_HTTP" }
+          : undefined,
+      );
+      h.getPoolStatus.mockReturnValue({
+        idleServerUuids: [],
+        perServerCounts: {},
+      });
+      const failedBesideSkip = await resetServerErrors({}, actor);
+      expect(failedBesideSkip.recovery.status).toBe("failed");
+    });
   });
 });

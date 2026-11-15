@@ -1631,7 +1631,7 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
         mutations: string[];
         reason: { required_for_operator_scope: boolean };
       };
-      // TEST-EDIT (plan 1B): the key powers raise the contract to 3 and the
+      // TEST-EDIT (key powers): the key powers raise the contract to 3 and the
       // operator set from 38 procedures (21 mutations) to 44 (25).
       expect(caps.contract_version).toBe(3);
       expect(caps.caller_scope).toBe("operator");

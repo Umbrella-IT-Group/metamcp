@@ -120,16 +120,27 @@ describe("assertReactivationPolicy", () => {
 });
 
 describe("assertRenameName", () => {
-  it("accepts the mint's name shape", () => {
-    expect(ruleOf(() => assertRenameName("n8n poller_2-b"))).toBeNull();
+  it("accepts the mint's name shape, spaces included", () => {
+    expect(ruleOf(() => assertRenameName("metrics poller_2-b"))).toBeNull();
   });
 
-  it.each(["", "x".repeat(101), "semi;colon", "slash/name", "dot.name"])(
-    "refuses %j",
-    (name) => {
-      expect(ruleOf(() => assertRenameName(name))).toBe("name_invalid");
-    },
-  );
+  it.each([
+    "",
+    "x".repeat(101),
+    "semi;colon",
+    "slash/name",
+    "dot.name",
+    "line1\nline2",
+    "tab\there",
+    "carriage\rreturn",
+    "no-break\u00a0space",
+    "line\u2028separator",
+    "paragraph\u2029separator",
+    "thin\u2009space",
+    "trailing newline\n",
+  ])("refuses %j", (name) => {
+    expect(ruleOf(() => assertRenameName(name))).toBe("name_invalid");
+  });
 });
 
 describe("removal", () => {

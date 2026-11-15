@@ -35,6 +35,7 @@ import logger from "@/utils/logger";
 import { db } from "../index";
 import { apiKeysTable, endpointsTable, usersTable } from "../schema";
 import { accessGroupsRepository } from "./access-groups.repo";
+import { lockApiKeyName } from "./admin-plane-locks";
 import { shouldTouchLastUsed } from "./api-keys.last-used";
 import type { DbExecutor, DbTransaction } from "./db-executor";
 
@@ -1084,10 +1085,20 @@ export class ApiKeysRepository {
         after: LifecycleKeyRow;
       }
   > {
+    // Read once without a lock to learn the owner whose name lock to take (a
+    // key's owner has no setter), refusing an admin-plane target or a bad name
+    // before any lock is held; judged again on the locked row below.
+    const first = await this.readLifecycleTarget(uuid, tx);
+    if (!first) return { status: "not_found" };
+    assertLifecycleTarget(first, "rename");
+    assertRenameName(name);
+    await lockApiKeyName(tx, first.user_id, name);
     const before = await this.lockLifecycleTarget(tx, uuid);
     if (!before) return { status: "not_found" };
+    if (before.user_id !== first.user_id) {
+      throw new ApiKeyLifecycleRefusal("key_changed");
+    }
     assertLifecycleTarget(before, "rename");
-    assertRenameName(name);
     if (name === before.name) {
       return { status: "unchanged", before, after: before };
     }
@@ -1105,6 +1116,16 @@ export class ApiKeysRepository {
       )
       .limit(1);
     if (sameName) throw new ApiKeyLifecycleRefusal("name_taken");
+    // No data-plane key may take an admin-plane key's name, whoever owns
+    // either: a person containing the operator or CI key looks for it by name.
+    const [adminPlaneName] = await tx
+      .select({ uuid: apiKeysTable.uuid })
+      .from(apiKeysTable)
+      .where(
+        and(eq(apiKeysTable.admin_plane, true), eq(apiKeysTable.name, name)),
+      )
+      .limit(1);
+    if (adminPlaneName) throw new ApiKeyLifecycleRefusal("name_admin_plane");
     let after: LifecycleKeyRow | undefined;
     try {
       [after] = await tx

@@ -65,7 +65,7 @@ const EXPECTED_SYNC = [
 // verification reads, `audit.list` and `apiKeys.operatorCapabilities`, pinned
 // here by name (36 to 38). The sync set is unchanged.
 //
-// TEST-EDIT (full-management plan 1B, key powers): the operator set gains the
+// TEST-EDIT (key powers): the operator set gains the
 // narrow key lifecycle procedures (reactivate, rename, remove and the removal
 // impact read), the server error reset and the bounded diagnostic history
 // read, pinned here by name (38 to 44). The sync set is unchanged.
@@ -122,7 +122,7 @@ const EXPECTED_OPERATOR = [...EXPECTED_SYNC, ...EXPECTED_OPERATOR_EXTRA];
 const VALID_INPUTS: Record<string, unknown> = {
   "frontend.audit.list": undefined,
   "frontend.apiKeys.operatorCapabilities": undefined,
-  // TEST-EDIT (plan 1B): valid inputs for the six procedures 1B adds.
+  // TEST-EDIT (key powers): valid inputs for the six procedures the key powers add.
   "frontend.apiKeys.reactivate": { reason: "unit test", uuid: UUID_B },
   "frontend.apiKeys.rename": {
     reason: "unit test",
@@ -387,7 +387,7 @@ describe("the two procedure sets", () => {
     expect(ADMIN_PLANE_SYNC_PROCEDURES.size).toBe(10);
   });
 
-  // TEST-EDIT (plan 1B): 28 to 34 more, 38 to 44 in all.
+  // TEST-EDIT (key powers): 28 to 34 more, 38 to 44 in all.
   it("pins the operator set to exactly those 10 plus 34 more, 44 in all", () => {
     expect([...ADMIN_PLANE_OPERATOR_PROCEDURES].sort()).toEqual(
       [...EXPECTED_OPERATOR].sort(),

@@ -140,7 +140,7 @@ describe("classification", () => {
       ADMIN_PLANE_OPERATOR_PROCEDURES.size +
         ADMIN_PLANE_HUMAN_ONLY_PROCEDURES.size,
     );
-    // TEST-EDIT (plan 1B): five procedures added (apiKeys.reactivate, rename,
+    // TEST-EDIT (key powers): five procedures added (apiKeys.reactivate, rename,
     // remove and removalImpact, mcpServers.resetErrors), 89 to 94.
     expect(ALL).toHaveLength(94);
   });
@@ -150,7 +150,7 @@ describe("classification", () => {
       .filter((p) => PROCEDURES[p]._def.type === "mutation")
       .sort();
     expect([...ADMIN_PLANE_OPERATOR_MUTATIONS].sort()).toEqual(fromRouter);
-    // TEST-EDIT (plan 1B): four operator mutations added, 21 to 25.
+    // TEST-EDIT (key powers): four operator mutations added, 21 to 25.
     expect(fromRouter).toHaveLength(25);
   });
 
@@ -336,11 +336,19 @@ describe("budget classes", () => {
     "namespace.tool_overrides",
   ];
 
+  // Modules, beside the implementation files, that write an operator
+  // mutation's audit row because two entry points share the implementation. A
+  // shared module that writes an operator mutation's audit row must be listed
+  // here (the budget table check below fails when an action it classifies is
+  // no longer found).
+  const SHARED_IMPLEMENTATION_FILES = ["../lib/metamcp/reset-server-errors.ts"];
+
   /**
    * Every audit action named in the implementation files that host the
    * operator mutations, read from the source: the files are derived from the
-   * mutation list (router `x` is implemented in `x.impl.ts`, kebab-cased), and
-   * an action is any `action: "name"` literal outside comments.
+   * mutation list (router `x` is implemented in `x.impl.ts`, kebab-cased) and
+   * the shared modules above, and an action is any `action: "name"` literal
+   * outside comments.
    */
   const scanImplementationActions = () => {
     const routers = [
@@ -349,8 +357,14 @@ describe("budget classes", () => {
       ),
     ].sort();
     const found = new Map<string, string[]>();
-    for (const router of routers) {
-      const file = `${router.replace(/([A-Z])/g, "-$1").toLowerCase()}.impl.ts`;
+    const files = [
+      ...routers.map(
+        (router) =>
+          `${router.replace(/([A-Z])/g, "-$1").toLowerCase()}.impl.ts`,
+      ),
+      ...SHARED_IMPLEMENTATION_FILES,
+    ];
+    for (const file of files) {
       const source = readFileSync(
         path.resolve(import.meta.dirname, file),
         "utf8",

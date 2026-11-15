@@ -11,8 +11,11 @@
  *
  *  - URLs keep their scheme, host and path; user info is dropped, and a query
  *    string or fragment becomes `?[redacted]`.
- *  - A gateway API key (`sk_mt_...`), a `Bearer` or `Basic` value, a JSON web
- *    token, the value of a secret-named `key=value` or `key: value` pair, and
+ *  - A gateway API key (`sk_mt_...`), the value of an `Authorization` header
+ *    (any scheme, `Bearer`, `Basic` and `Token` included, in any letter case),
+ *    a `Cookie` or `Set-Cookie` line, a JSON web token, an AWS access key id,
+ *    a PEM block, the value of a secret-named pair (`key=value`, `key: value`
+ *    or the JSON form `"key": "value"`), a 32-character or longer hex run and
  *    any long opaque run of letters and digits are replaced by `[redacted]`.
  *  - `metadata` keeps only a text `error`, itself redacted; the session id is
  *    left out.
@@ -30,12 +33,32 @@ const REDACTED = "[redacted]";
 const URL_PATTERN =
   /\b([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/?#@"'<>]*@)?([^\s/?#"'<>]*)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
 const GATEWAY_KEY_PATTERN = /\bsk_mt_[A-Za-z0-9]+/g;
-const AUTH_SCHEME_PATTERN =
-  /\b(Bearer|bearer|Basic|basic)\s+[A-Za-z0-9._~+/=-]+/g;
+// An Authorization header (or its proxy form), in plain or JSON-quoted form.
+// A known scheme word before the value is kept and the value goes; with no
+// known scheme the first word after the name is the value. "Token" is only a
+// scheme here, after the header name, so the word in ordinary prose is left
+// alone.
+const AUTH_HEADER_PATTERN =
+  /\b(proxy-authorization|authorization)(["']?\s*[:=]\s*["']?)(?:(bearer|basic|token|digest|negotiate|ntlm|apikey|api-key|oauth|bot)\s+)?[^\s",;]+/gi;
+const COOKIE_LINE_PATTERN = /\b(set-cookie|cookie)\s*:[^\r\n]*/gi;
+const AUTH_SCHEME_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi;
 const JWT_PATTERN =
   /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g;
+const AWS_KEY_ID_PATTERN =
+  /\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[A-Z0-9]{16}\b/g;
+// A PEM block, through its END line or, when the text was cut short, to the
+// end of the text.
+const PEM_BLOCK_PATTERN =
+  /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
+// A secret-named pair: `name=value`, `name: value` and the JSON form
+// `"name": "value"`, the value a quoted string or a run up to a delimiter. A
+// value already replaced is not matched again.
 const SECRET_PAIR_PATTERN =
-  /\b(client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|secret)\s*[:=]\s*"?[^\s",;&]+"?/gi;
+  /["']?\b(client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?(?:id|token)|private[_-]?key|set[_-]?cookie|cookie|token|password|passwd|secret)["']?\s*[:=]\s*(?!\[redacted\])(?:"[^"]*"|'[^']*'|[^\s",;&}\]]+)/gi;
+// A hex run of 32 or more characters holding a digit and a letter (an md5,
+// sha1 or sha256 digest, or a hex-encoded secret). A dashed uuid is broken by
+// its dashes and stays readable.
+const HEX_RUN_PATTERN = /\b[0-9a-fA-F]{32,}\b/g;
 // 40 or more of the characters an opaque token is made of, holding at least
 // one letter and one digit (so a long hyphenated name is left alone). A uuid
 // is 36 and stays readable.
@@ -44,6 +67,7 @@ const OPAQUE_RUN_PATTERN = /[A-Za-z0-9_-]{40,}/g;
 /** Replace credential-shaped substrings of diagnostic text. */
 export function redactDiagnosticText(text: string): string {
   return text
+    .replace(PEM_BLOCK_PATTERN, REDACTED)
     .replace(
       URL_PATTERN,
       (
@@ -57,15 +81,27 @@ export function redactDiagnosticText(text: string): string {
         `${scheme}${host}${path}${query !== undefined || fragment !== undefined ? `?${REDACTED}` : ""}`,
     )
     .replace(
+      AUTH_HEADER_PATTERN,
+      (_match, name: string, _separator: string, scheme?: string) =>
+        `${name}: ${scheme ? `${scheme} ` : ""}${REDACTED}`,
+    )
+    .replace(
+      COOKIE_LINE_PATTERN,
+      (_match, name: string) => `${name}: ${REDACTED}`,
+    )
+    .replace(
       AUTH_SCHEME_PATTERN,
       (_match, scheme: string) => `${scheme} ${REDACTED}`,
     )
     .replace(GATEWAY_KEY_PATTERN, `sk_mt_${REDACTED}`)
     .replace(JWT_PATTERN, REDACTED)
-    .replace(SECRET_PAIR_PATTERN, (match) => {
-      const name = /^[A-Za-z_-]+/.exec(match)?.[0] ?? "secret";
+    .replace(AWS_KEY_ID_PATTERN, REDACTED)
+    .replace(SECRET_PAIR_PATTERN, (_match, name: string) => {
       return `${name}=${REDACTED}`;
     })
+    .replace(HEX_RUN_PATTERN, (run) =>
+      /[a-fA-F]/.test(run) && /[0-9]/.test(run) ? REDACTED : run,
+    )
     .replace(OPAQUE_RUN_PATTERN, (run) =>
       /[A-Za-z]/.test(run) && /[0-9]/.test(run) ? REDACTED : run,
     );

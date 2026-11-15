@@ -5,6 +5,7 @@ import {
   GetLogsRequestSchema,
   GetLogsResponseSchema,
 } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import { describeDbError } from "@/lib/db-error-summary";
@@ -32,6 +33,15 @@ import { metamcpLogStore } from "../lib/metamcp/log-store";
  */
 const DEFAULT_HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * What an admin-plane key is told when it asks the history to search. The
+ * search runs against the message as stored, so which rows it returns would
+ * show, a character at a time, text the redacted response hides. Fixed; names
+ * no search term.
+ */
+export const HISTORY_SEARCH_REFUSAL =
+  "An admin-plane API key cannot search the diagnostic history, because a search matches text that the response redacts. Filter by category, level, server or client instead.";
+
 export const logsImplementations = {
   getLogs: async (
     input: z.infer<typeof GetLogsRequestSchema>,
@@ -55,13 +65,23 @@ export const logsImplementations = {
    * One page of the durable history. `redactForAdminPlane` is set by the
    * router from the verified origin of the request: an admin-plane key reads
    * each row through lib/diagnostic-redaction (credential-shaped text
-   * replaced, metadata reduced to the error text, no session id); a person's
-   * session reads the rows as stored.
+   * replaced, metadata reduced to the error text, no session id) and may not
+   * search, since a search matches the text as stored; a person's session
+   * reads the rows as stored and may search.
    */
   getHistory: async (
     input: z.infer<typeof GetGatewayEventsRequestSchema>,
     options: { redactForAdminPlane: boolean } = { redactForAdminPlane: false },
   ): Promise<z.infer<typeof GetGatewayEventsResponseSchema>> => {
+    // Before the read, and outside the try whose catch-all would turn it into
+    // a 500: a search term is refused for an admin-plane caller, because the
+    // match is made on the unredacted text (see HISTORY_SEARCH_REFUSAL).
+    if (options.redactForAdminPlane && input.search) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: HISTORY_SEARCH_REFUSAL,
+      });
+    }
     try {
       // The contract carries ISO strings (no tRPC data transformer is
       // configured — see GatewayEventSchema); the driver wants Dates.

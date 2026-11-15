@@ -39,7 +39,14 @@ import { convertDbServerToParams } from "./utils";
  *     namespace that mounts one). No other server's status or counter is
  *     touched.
  *  3. Recovery is reported apart from the reset: waited for up to
- *     `recoveryWaitMs`, then `succeeded`, `failed` or `pending` per server. A
+ *     `recoveryWaitMs`, then `connected`, `failed`, `pending` or `skipped` per
+ *     server (`skipped`: nothing to connect, the row is gone or a stdio server
+ *     is disabled). `connected` means the pool holds an idle connection for
+ *     the server; a connect that is still being made, or a count that only
+ *     includes one, is `pending`, never `connected`. The call's own status
+ *     is `failed` if any server failed, else `pending` if any is, else
+ *     `skipped` when no server was connected at all, else `succeeded` (at
+ *     least one connected; read `servers` for any that were skipped). A
  *     recovery failure never turns the committed reset into a failure, is
  *     never retried here, and the reset is never rolled back for it.
  *
@@ -66,7 +73,7 @@ export interface ResetServerErrorsResult {
   reset: Array<{ uuid: string; name: string }>;
   /** After the commit: what reconnecting them came to. */
   recovery: {
-    status: "not_needed" | "succeeded" | "failed" | "pending";
+    status: "not_needed" | "succeeded" | "failed" | "pending" | "skipped";
     servers: Array<{
       uuid: string;
       name: string;
@@ -96,16 +103,20 @@ function resetEvent(
   };
 }
 
-/** Is there a pooled connection for this server now? */
-function poolHasConnection(serverUuid: string): boolean {
+/**
+ * What the pool holds for this server after its idle session was asked for:
+ * `connected` only when an idle connection exists. The per-server count also
+ * includes a connection still being made, so a count without an idle
+ * connection is `pending` (not yet usable, or in use elsewhere), and no count
+ * at all means the connect did not happen.
+ */
+function poolState(serverUuid: string): "connected" | "pending" | "failed" {
   const status = mcpServerPool.getPoolStatus() as {
     idleServerUuids?: string[];
     perServerCounts?: Record<string, number>;
   };
-  return (
-    (status.idleServerUuids ?? []).includes(serverUuid) ||
-    (status.perServerCounts?.[serverUuid] ?? 0) > 0
-  );
+  if ((status.idleServerUuids ?? []).includes(serverUuid)) return "connected";
+  return (status.perServerCounts?.[serverUuid] ?? 0) > 0 ? "pending" : "failed";
 }
 
 /** Rebuild one reset server's idle session; never throws. */
@@ -124,7 +135,7 @@ async function recoverOne(server: {
     const params = await convertDbServerToParams(row);
     if (!params) return "skipped";
     await mcpServerPool.ensureIdleSessionForNewServer(server.uuid, params);
-    return poolHasConnection(server.uuid) ? "connected" : "failed";
+    return poolState(server.uuid);
   } catch (error) {
     // The type only: a connection error can carry an upstream URL.
     logger.warn(
@@ -236,6 +247,8 @@ export async function resetServerErrors(
     ? "failed"
     : servers.some((server) => server.status === "pending")
       ? "pending"
-      : "succeeded";
+      : servers.some((server) => server.status === "connected")
+        ? "succeeded"
+        : "skipped";
   return { reset, recovery: { status, servers } };
 }

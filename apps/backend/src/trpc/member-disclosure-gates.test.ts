@@ -81,7 +81,7 @@ const buildMcpServersRouter = () => {
     delete: okImpl({ success: true } as never),
     update: okImpl({ success: true } as never),
     reconnect: okImpl({ success: true } as never),
-    // TEST-EDIT (full-management plan 1B): the router's new resetErrors
+    // TEST-EDIT (key powers): the router's new resetErrors
     // implementation, stubbed like its siblings so the router type-checks.
     resetErrors: okImpl({
       reset: [],

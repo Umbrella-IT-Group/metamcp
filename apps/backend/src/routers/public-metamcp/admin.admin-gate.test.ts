@@ -116,7 +116,7 @@ vi.mock("../../lib/startup", () => ({
   initializeIdleServers: h.initializeIdleServers,
 }));
 
-// TEST-EDIT (full-management plan 1B, resetErrors): the reset route now calls
+// TEST-EDIT (error reset): the reset route now calls
 // the implementation it shares with the tRPC procedure instead of resetting
 // through the error tracker itself, so that is the seam a denial must leave
 // uncalled.
@@ -213,7 +213,7 @@ describe("/metamcp/:endpoint_name/admin/* — the role gate", () => {
     const response = await fetch(`${baseUrl}${path}`, { method });
 
     expect(response.status).toBe(200);
-    // TEST-EDIT (plan 1B): the reset route reaches the shared reset, which
+    // TEST-EDIT (key powers): the reset route reaches the shared reset, which
     // selects the servers itself; the status route still lists them.
     if (path === RESET_PATH) {
       expect(h.resetServerErrors).toHaveBeenCalledTimes(1);
@@ -348,7 +348,7 @@ describe("/metamcp/:endpoint_name/admin/* — lookup runs behind the gate", () =
 });
 
 describe("POST reset-errors — the admin path still works", () => {
-  // TEST-EDIT (plan 1B): the route hands the request to the reset it shares
+  // TEST-EDIT (key powers): the route hands the request to the reset it shares
   // with the tRPC procedure (status change and audit row in one transaction,
   // then recovery of the reset servers only), so this asserts that hand-off
   // and the unchanged response shape instead of the old in-route sweep.
@@ -400,7 +400,7 @@ describe("POST reset-errors — the admin path still works", () => {
 
   it("answers a failure with the constant body, never the error text", async () => {
     signInAs("admin");
-    // TEST-EDIT (plan 1B): the failure now comes from the shared reset, which
+    // TEST-EDIT (key powers): the failure now comes from the shared reset, which
     // propagates database and audit errors instead of swallowing them.
     h.resetServerErrors.mockRejectedValue(
       new Error('connect ECONNREFUSED postgres-internal:5432 db "metamcp"'),

@@ -177,6 +177,10 @@ describe("rule 6: a name of the usual shape", () => {
     ["101 characters", "a".repeat(101)],
     ["with a slash", "bad/name"],
     ["with a dot", "bad.name"],
+    ["with a newline", "line1\nline2"],
+    ["with a tab", "tab\there"],
+    ["with a no-break space", "no-break\u00a0space"],
+    ["with a line separator", "line\u2028separator"],
     ["a number", 7],
   ])("refuses a name that is %s", (_label, value) => {
     expect(refusalOf({ ...valid(), name: value })).toBe("name_invalid");
