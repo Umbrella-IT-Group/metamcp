@@ -42,8 +42,14 @@ import type { DbTransaction } from "./db-executor";
  *     once without a lock to learn which owner and endpoint rows to lock
  *     first, then locks the key here and refuses if those have changed; a
  *     rename does the same to learn the owner whose name lock to take.
- *  9. MCP server rows (FOR UPDATE, in uuid order, for an error reset). No
- *     transaction that holds one takes a lock listed above it.
+ *  9. a. MCP server name locks (`lockMcpServerName`, advisory,
+ *        `metamcp.mcp_server.name`, one per name): a create, the full update
+ *        and a rename take the lock of the name they would hold, before the
+ *        server row, so two writers of one name are judged one after the
+ *        other.
+ *     b. MCP server rows (FOR UPDATE, in uuid order, for an error reset; one
+ *        row for an update or a rename, after its name lock). No transaction
+ *        that holds one takes a lock listed above it.
  * 10. The audit row insert, last, in the same transaction.
  *
  * Every lock here is transaction-scoped (released at COMMIT or ROLLBACK, never
@@ -59,6 +65,9 @@ export const ENDPOINT_NAMESPACE_LOCK_NAMESPACE = "metamcp.endpoint.namespace";
 
 /** Advisory-lock namespace of the per-owner API key name (position 7). */
 export const API_KEY_NAME_LOCK_NAMESPACE = "metamcp.api_key.name";
+
+/** Advisory-lock namespace of the MCP server name (position 9a). */
+export const MCP_SERVER_NAME_LOCK_NAMESPACE = "metamcp.mcp_server.name";
 
 /**
  * Take the change budget lock of one admin-plane key for the rest of `tx`.
@@ -110,6 +119,24 @@ export async function lockApiKeyName(
   const subject = `${ownerId ?? ""}\n${ownerId === null ? "public" : "owner"}\n${name}`;
   await tx.execute(
     sql`SELECT pg_advisory_xact_lock(hashtext(${API_KEY_NAME_LOCK_NAMESPACE}), hashtext(${subject}))`,
+  );
+}
+
+/**
+ * Take the lock of one MCP server name for the rest of `tx`, whatever the
+ * owner. The database's unique rule on (name, owner) does not cover a NULL
+ * owner, so a check for another server of the same name made before a
+ * concurrent write commits sees neither row: under this lock the second
+ * writer's check runs after the first has committed. One lock per name, not
+ * per name and owner, so a write that changes a server's owner needs no
+ * knowledge of the owner it is leaving.
+ */
+export async function lockMcpServerName(
+  tx: DbTransaction,
+  name: string,
+): Promise<void> {
+  await tx.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${MCP_SERVER_NAME_LOCK_NAMESPACE}), hashtext(${name}))`,
   );
 }
 

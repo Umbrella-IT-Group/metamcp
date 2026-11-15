@@ -1,4 +1,4 @@
-import type { AuditActor } from "@repo/trpc";
+import type { AuditActor, ServerDetailLevel } from "@repo/trpc";
 import {
   CreateNamespaceRequestSchema,
   CreateNamespaceResponseSchema,
@@ -32,6 +32,7 @@ import {
   namespacesRepository,
   toolsRepository,
 } from "../db/repositories";
+import { writeCallerOf } from "../db/repositories/write-caller";
 import { NamespacesSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { AdminAuditWriteError, withAdminAudit } from "../lib/audit/admin-write";
@@ -47,6 +48,24 @@ import {
 } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
 import { notifyNamespaceMountChange } from "../lib/metamcp/namespace-mount-events";
+
+/**
+ * How many servers a namespace update mounts that the namespace did not have,
+ * from the server list locked in the write and the list the request carried.
+ * A request without a list changes no mount.
+ */
+function mountsAdded(
+  previousServerUuids: readonly string[],
+  requested: readonly string[] | undefined,
+): number {
+  if (!requested) return 0;
+  const had = new Set(previousServerUuids.map((uuid) => uuid.toLowerCase()));
+  return new Set(
+    requested
+      .map((uuid) => uuid.toLowerCase())
+      .filter((uuid) => !had.has(uuid)),
+  ).size;
+}
 
 export const namespacesImplementations = {
   create: async (
@@ -210,7 +229,7 @@ export const namespacesImplementations = {
       uuid: string;
     },
     userId: string,
-    isAdmin: boolean,
+    detail: ServerDetailLevel,
   ): Promise<z.infer<typeof GetNamespaceResponseSchema>> => {
     try {
       const namespaceWithServers =
@@ -239,10 +258,11 @@ export const namespacesImplementations = {
         success: true as const,
         // protectedProcedure: the embedded server objects carry the same
         // credential + internal-URL fields the mcpServers router redacts,
-        // so they follow the same rule here.
+        // so they follow the same rule here, at the level the router decided
+        // from the verified caller.
         data: NamespacesSerializer.serializeNamespaceWithServers(
           namespaceWithServers,
-          isAdmin,
+          detail,
         ),
         message: "Namespace retrieved successfully",
       };
@@ -466,6 +486,8 @@ export const namespacesImplementations = {
               user_id: input.user_id,
               mcpServerUuids: input.mcpServerUuids,
             },
+            // An admin-plane key's unmount keeps the server's tool rows.
+            writeCallerOf(actor),
             ...tx,
           ),
         ({ namespace: updated, previous, previousServerUuids }) => ({
@@ -475,6 +497,13 @@ export const namespacesImplementations = {
           detail: {
             name: updated.name,
             mcp_server_count: input.mcpServerUuids?.length ?? 0,
+            // Servers this write mounted that the namespace did not have,
+            // read against the list locked in the write. It is what the
+            // change budget classes the write by (loosen when above zero).
+            mounts_added: mountsAdded(
+              previousServerUuids,
+              input.mcpServerUuids,
+            ),
             // The previous and new value of each field this write changed,
             // read under the namespace's row lock; the server list is
             // compared as a set, and only when the request carried one.
@@ -1135,6 +1164,7 @@ export const namespacesImplementations = {
         async (...tx) => {
           let toolsCreated = 0;
           let mappingsCreated = 0;
+          let activeRowsWritten = 0;
           // The policy the mapping writes followed, as each write read it under
           // its own lock (see bulkUpsertNamespaceToolMappings).
           let allowlist = false;
@@ -1171,16 +1201,23 @@ export const namespacesImplementations = {
               status: "ACTIVE" as const,
             }));
 
+            // An admin-plane key's refresh never changes a row that exists:
+            // it inserts the rows that do not, with the status the namespace
+            // policy gives a new row, and reports exactly those.
             const { mappings: createdMappings, toolPolicy } =
               await namespaceMappingsRepository.bulkUpsertNamespaceToolMappings(
                 {
                   namespaceUuid: input.namespaceUuid,
                   toolMappings,
                 },
+                writeCallerOf(actor),
                 ...tx,
               );
 
             mappingsCreated += createdMappings.length;
+            activeRowsWritten += createdMappings.filter(
+              (mapping) => mapping.status === "ACTIVE",
+            ).length;
             if (toolPolicy !== undefined && toolPolicy !== "allow_all") {
               allowlist = true;
             }
@@ -1189,7 +1226,12 @@ export const namespacesImplementations = {
               `Processed ${tools.length} tools for server "${serverName}" (${serverUuid})`,
             );
           }
-          return { toolsCreated, mappingsCreated, allowlist };
+          return {
+            toolsCreated,
+            mappingsCreated,
+            activeRowsWritten,
+            allowlist,
+          };
         },
         // Only for an admin-plane key. A refresh has never been audited for a
         // human session, and the namespace page's own connection can send one
@@ -1205,6 +1247,9 @@ export const namespacesImplementations = {
                   server_count: Object.keys(toolsByServerName).length,
                   tools_written: written.toolsCreated,
                   mappings_written: written.mappingsCreated,
+                  // Rows this refresh wrote that serve a tool (status
+                  // ACTIVE): what the change budget classes it by.
+                  active_rows_written: written.activeRowsWritten,
                 },
               }
             : null,

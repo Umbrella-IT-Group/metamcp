@@ -45,10 +45,15 @@ const currentRow = {
   bearerToken: null,
   headers: {},
 };
+// TEST-EDIT (SPEC): create() and a rename or owner change now run in a
+// transaction that takes the name's lock and looks for another server holding
+// the name (db/repositories/mcp-server-name-rule), so the stand-in transaction
+// gains `execute` (the lock), `insert` and a `limit` that finds no holder.
 const selectChain = {
   from: vi.fn().mockReturnThis(),
   where: vi.fn().mockReturnThis(),
   for: vi.fn(async () => [currentRow]),
+  limit: vi.fn(async () => []),
 };
 
 vi.mock("../index", () => ({
@@ -59,6 +64,8 @@ vi.mock("../index", () => ({
       run({
         select: vi.fn(() => selectChain),
         update: vi.fn(() => updateChain),
+        insert: vi.fn(() => insertChain),
+        execute: vi.fn(async () => ({ rows: [] })),
       }),
     ),
   },

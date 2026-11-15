@@ -1,9 +1,10 @@
-import type { AuditActor } from "@repo/trpc";
+import type { AuditActor, ServerDetailLevel } from "@repo/trpc";
 import {
   BulkImportMcpServersRequestSchema,
   BulkImportMcpServersResponseSchema,
   CreateMcpServerRequestSchema,
   CreateMcpServerResponseSchema,
+  type DatabaseMcpServer,
   DeleteMcpServerResponseSchema,
   GetMcpServerResponseSchema,
   ListMcpServersResponseSchema,
@@ -12,7 +13,8 @@ import {
   ReconnectMcpServerResponseSchema,
   ResetMcpServerErrorsRequestSchema,
   ResetMcpServerErrorsResponseSchema,
-  UpdateMcpServerRequestSchema,
+  UpdateMcpServerAnyRequestSchema,
+  UpdateMcpServerMetadataRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
 import { TRPCError } from "@trpc/server";
@@ -25,12 +27,18 @@ import {
   mcpServersRepository,
   namespaceMappingsRepository,
 } from "../db/repositories";
+import {
+  SERVER_NAME_TAKEN_MESSAGE,
+  ServerNameTakenError,
+} from "../db/repositories/mcp-server-name-rule";
 import { ServerCredentialRetentionError } from "../db/repositories/mcp-server-update-plan";
 import { McpServersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import {
   ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
   AdminAuditWriteError,
+  AdminRuleRefusal,
+  recordDenialAfterRollback,
   withAdminAudit,
 } from "../lib/audit/admin-write";
 import { clampAuditTextList } from "../lib/audit/audit-emitter";
@@ -163,12 +171,154 @@ function refuseStoredIdentityHeadersInBulkImport(
   });
 }
 
+/**
+ * The detail level a `create` or `update` reply carries, from the actor the
+ * router built from the verified request context (`auditActor(ctx)`). Both
+ * procedures are administrator-only, so an actor without admin-plane
+ * provenance is a person signed in as an administrator, who sees the values
+ * they just submitted. An admin-plane actor gets names only, and so does an
+ * actor missing altogether (a direct call that did not come through a router):
+ * no reply carries a stored connection by omission.
+ */
+function replyDetailFor(actor: AuditActor | undefined): ServerDetailLevel {
+  return actor && !actor.admin_plane ? "full" : "names_only";
+}
+
+/**
+ * The coded refusals of an operator-scope admin-plane key's attempt to create
+ * a server or to change a server's connection. A server's address, command and
+ * credentials are declared in the reviewed servers file and applied by the
+ * configuration sync (sync scope); the operator scope keeps rename and
+ * description (the metadata-only update variant). Fixed sentences, naming no
+ * server and no value.
+ */
+export const OPERATOR_SERVER_REFUSALS = {
+  operator_server_create: {
+    code: "FORBIDDEN",
+    message:
+      "An operator-scope admin-plane API key cannot create an MCP server. A server is declared in the reviewed servers file and registered by the configuration sync.",
+  },
+  operator_server_connection_change: {
+    code: "FORBIDDEN",
+    message:
+      "An operator-scope admin-plane API key can only rename a server or change its description. Send the metadata-only update (metadata_only true, with a name and/or a description). A server's address and connection are declared in the reviewed servers file and applied by the configuration sync.",
+  },
+} as const;
+
+/**
+ * Refuse an operator-scope admin-plane key the named rule, before any write:
+ * one `denied` audit row naming the rule (awaited, so the read-back sees it),
+ * then the coded error. The scope is the verified one on the actor (anything
+ * but the literal `operator` reads as the sync scope, which keeps both
+ * powers). Called before each method's `try`, whose catch would otherwise
+ * turn the refusal into `success: false` inside an HTTP 200. Nothing is read
+ * from the row: the answer depends on who asks and which variant they sent.
+ */
+async function refuseOperatorScope(
+  actor: AuditActor | undefined,
+  rule: keyof typeof OPERATOR_SERVER_REFUSALS,
+  action: "mcpserver.create" | "mcpserver.update",
+  targetId?: string,
+): Promise<void> {
+  if (actor?.admin_plane?.scope !== "operator") return;
+  await recordDenialAfterRollback(actor, {
+    action,
+    target_type: "mcp_server",
+    ...(targetId !== undefined ? { target_id: targetId } : {}),
+    outcome: "denied",
+    detail: { rule },
+  });
+  const { code, message } = OPERATOR_SERVER_REFUSALS[rule];
+  throw new TRPCError({ code, message });
+}
+
+/**
+ * Run a server write inside `withAdminAudit` and turn the repository's refusal
+ * of a taken name (ServerNameTakenError, thrown after the name's lock is held
+ * and nothing is written) into the coded CONFLICT every caller gets. For an
+ * admin-plane key the refusal is thrown inside the audited transaction, which
+ * rolls back, records one `denied` row naming the rule and answers with the
+ * coded error; a person's write has no audited transaction, so the caller's
+ * catch (`codedRefusalOf`) turns it into the same coded error without a row.
+ * Fixed sentence, naming no server and no owner.
+ */
+async function refusingTakenName<T>(
+  action: "mcpserver.create" | "mcpserver.update",
+  targetId: string | undefined,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (error) {
+    if (!(error instanceof ServerNameTakenError)) throw error;
+    throw new AdminRuleRefusal("CONFLICT", SERVER_NAME_TAKEN_MESSAGE, {
+      action,
+      target_type: "mcp_server",
+      ...(targetId !== undefined ? { target_id: targetId } : {}),
+      detail: { rule: "server_name_taken" },
+    });
+  }
+}
+
+/**
+ * The coded error a refusal that reached a person's write (no audited
+ * transaction to convert it) stands for, or undefined for any other error.
+ */
+function codedRefusalOf(error: unknown): TRPCError | undefined {
+  return error instanceof AdminRuleRefusal
+    ? new TRPCError({ code: error.code, message: error.message })
+    : undefined;
+}
+
+type MetadataUpdateRequest = z.infer<
+  typeof UpdateMcpServerMetadataRequestSchema
+>;
+
+/** The strict metadata-only variant (the schema requires the marker). */
+function isMetadataOnly(
+  input: z.infer<typeof UpdateMcpServerAnyRequestSchema>,
+): input is MetadataUpdateRequest {
+  return (input as { metadata_only?: unknown }).metadata_only === true;
+}
+
+/** The audit event of a server update, either variant. */
+function serverUpdateEvent(written: {
+  server: DatabaseMcpServer;
+  previous: DatabaseMcpServer;
+}) {
+  return {
+    action: "mcpserver.update" as const,
+    target_type: "mcp_server" as const,
+    target_id: written.server.uuid,
+    detail: {
+      name: written.server.name,
+      type: written.server.type,
+      // Which fields this write changed and the previous and new value of
+      // each that cannot hold a credential. The connection fields (command,
+      // args, url, env, bearer token, headers) are named when changed and
+      // never recorded by value.
+      ...describeUpdate(
+        written.previous,
+        written.server,
+        MCP_SERVER_UPDATE_FIELDS,
+      ),
+    },
+  };
+}
+
 export const mcpServersImplementations = {
   create: async (
     input: z.infer<typeof CreateMcpServerRequestSchema>,
     userId: string,
     actor?: AuditActor,
   ): Promise<z.infer<typeof CreateMcpServerResponseSchema>> => {
+    // First, and whatever the request says: an operator-scope key does not
+    // create servers (the sync scope does, from the reviewed declaration).
+    await refuseOperatorScope(
+      actor,
+      "operator_server_create",
+      "mcpserver.create",
+    );
     refuseStdioServerUnlessAllowed(input.type);
     refuseStoredIdentityHeaders(input.headers);
     try {
@@ -189,12 +339,14 @@ export const mcpServersImplementations = {
       const createdServer = await withAdminAudit(
         actor,
         (...tx) =>
-          mcpServersRepository.create(
-            {
-              ...input,
-              user_id: effectiveUserId,
-            },
-            ...tx,
+          refusingTakenName("mcpserver.create", undefined, () =>
+            mcpServersRepository.create(
+              {
+                ...input,
+                user_id: effectiveUserId,
+              },
+              ...tx,
+            ),
           ),
         (created) =>
           created
@@ -238,15 +390,21 @@ export const mcpServersImplementations = {
 
       return {
         success: true as const,
-        // create is adminProcedure — the caller is an admin by construction,
-        // and the dialog echoes the values it just submitted.
-        data: McpServersSerializer.serializeMcpServer(createdServer, true),
+        // create is adminProcedure, so the caller is an administrator by
+        // construction: a person's dialog echoes the values it just submitted;
+        // an admin-plane key gets the names only (replyDetailFor).
+        data: McpServersSerializer.serializeMcpServer(
+          createdServer,
+          replyDetailFor(actor),
+        ),
         message: "MCP server created successfully",
       };
     } catch (error) {
       // A coded refusal (the change budget, a rule) reaches the caller as
       // itself, never as `success: false` inside an HTTP 200.
       if (error instanceof TRPCError) throw error;
+      const refusal = codedRefusalOf(error);
+      if (refusal) throw refusal;
       logger.error("Error creating MCP server:", describeDbError(error));
       return {
         success: false as const,
@@ -258,7 +416,7 @@ export const mcpServersImplementations = {
 
   list: async (
     userId: string,
-    isAdmin: boolean,
+    detail: ServerDetailLevel,
   ): Promise<z.infer<typeof ListMcpServersResponseSchema>> => {
     try {
       // Find servers accessible to user (public + user's own)
@@ -269,8 +427,9 @@ export const mcpServersImplementations = {
         success: true as const,
         // protectedProcedure: members reach this. Redaction, not an RBAC
         // gate — the member dashboard still lists every server it could
-        // before, minus the connection URL and credential material.
-        data: McpServersSerializer.serializeMcpServerList(servers, isAdmin),
+        // before, minus the connection URL and credential material. The
+        // level is the router's decision from the verified caller.
+        data: McpServersSerializer.serializeMcpServerList(servers, detail),
         message: "MCP servers retrieved successfully",
       };
     } catch (error) {
@@ -289,16 +448,20 @@ export const mcpServersImplementations = {
   // already have through `list`, whose public-plus-own filter is unchanged.
   listAll: async (
     userId: string,
+    detail: ServerDetailLevel,
   ): Promise<z.infer<typeof ListMcpServersResponseSchema>> => {
     try {
       const servers = await mcpServersRepository.findAll();
 
       return {
         success: true as const,
+        // Another owner's private row is redacted whatever the caller's level.
         data: servers.map((server) =>
           McpServersSerializer.serializeMcpServer(
             server,
-            server.user_id === null || server.user_id === userId,
+            server.user_id === null || server.user_id === userId
+              ? detail
+              : "redacted",
           ),
         ),
         message: "MCP servers retrieved successfully",
@@ -443,7 +606,7 @@ export const mcpServersImplementations = {
       uuid: string;
     },
     userId: string,
-    isAdmin: boolean,
+    detail: ServerDetailLevel,
   ): Promise<z.infer<typeof GetMcpServerResponseSchema>> => {
     try {
       const server = await mcpServersRepository.findByUuid(input.uuid);
@@ -467,7 +630,7 @@ export const mcpServersImplementations = {
       return {
         success: true as const,
         // protectedProcedure — same redaction contract as `list` above.
-        data: McpServersSerializer.serializeMcpServer(server, isAdmin),
+        data: McpServersSerializer.serializeMcpServer(server, detail),
         message: "MCP server retrieved successfully",
       };
     } catch (error) {
@@ -590,15 +753,27 @@ export const mcpServersImplementations = {
   },
 
   update: async (
-    input: z.infer<typeof UpdateMcpServerRequestSchema>,
+    input: z.infer<typeof UpdateMcpServerAnyRequestSchema>,
     userId: string,
     actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateMcpServerResponseSchema>> => {
     // Before the existence and ownership reads as well as the write: the
-    // answer does not depend on the row. An existing stdio row can still be
-    // switched to Streamable HTTP or SSE, and deleted, with the flag off.
-    refuseStdioServerUnlessAllowed(input.type);
-    refuseStoredIdentityHeaders(input.headers);
+    // answer does not depend on the row. An operator-scope key may send only
+    // the metadata-only variant; the full variant (the one that carries a
+    // connection) is refused whatever it holds. The stdio and identity-header
+    // gates apply to the full variant, the only one with those fields.
+    if (!isMetadataOnly(input)) {
+      await refuseOperatorScope(
+        actor,
+        "operator_server_connection_change",
+        "mcpserver.update",
+        input.uuid,
+      );
+      // An existing stdio row can still be switched to Streamable HTTP or
+      // SSE, and deleted, with the flag off.
+      refuseStdioServerUnlessAllowed(input.type);
+      refuseStoredIdentityHeaders(input.headers);
+    }
     try {
       // Check if server exists and user has permission to update it
       const server = await mcpServersRepository.findByUuid(input.uuid);
@@ -618,63 +793,86 @@ export const mcpServersImplementations = {
         };
       }
 
-      // Determine user ownership based on input.user_id or keep existing ownership
-      const effectiveUserId =
-        input.user_id !== undefined ? input.user_id : server.user_id;
-
-      // The repository judges the update against the row it locks, and
-      // refuses a URL change that does not decide what happens to the stored
-      // bearer token and headers (planServerUpdate in mcp-servers.repo.ts).
-      // A refusal writes nothing.
       let result: Awaited<
         ReturnType<typeof mcpServersRepository.updateReportingChange>
       >;
-      try {
-        // Same credential ban as `create` above: an update is the call that
-        // ROTATES a vendor token, so it is the likeliest place for one to leak
-        // into a log. For an admin-plane key the row and its audit row are one
-        // transaction.
-        result = await withAdminAudit(
+      if (isMetadataOnly(input)) {
+        // The rename path: only the name and the description are written, and
+        // the owner rule is judged again on the row the write locks. No
+        // connection field is read or written, so none of the destination and
+        // credential bookkeeping below applies (it is reported as unchanged).
+        const written = await withAdminAudit(
           actor,
           (...tx) =>
-            mcpServersRepository.updateReportingChange(
-              {
-                ...input,
-                user_id: effectiveUserId,
-              },
-              ...tx,
+            refusingTakenName("mcpserver.update", input.uuid, () =>
+              mcpServersRepository.updateMetadataReportingChange(
+                {
+                  uuid: input.uuid,
+                  name: input.name,
+                  description: input.description,
+                },
+                userId,
+                ...tx,
+              ),
             ),
-          (written) =>
-            written
-              ? {
-                  action: "mcpserver.update",
-                  target_type: "mcp_server",
-                  target_id: written.server.uuid,
-                  detail: {
-                    name: written.server.name,
-                    type: written.server.type,
-                    // Which fields this write changed and the previous and
-                    // new value of each that cannot hold a credential. The
-                    // connection fields (command, args, url, env, bearer
-                    // token, headers) are named when changed and never
-                    // recorded by value.
-                    ...describeUpdate(
-                      written.previous,
-                      written.server,
-                      MCP_SERVER_UPDATE_FIELDS,
-                    ),
-                  },
-                }
-              : null,
+          (outcome) =>
+            outcome.kind === "updated" ? serverUpdateEvent(outcome) : null,
         );
-      } catch (error) {
-        if (error instanceof ServerCredentialRetentionError) {
-          logger.info(
-            `Refused an update of MCP server ${server.uuid}: it changes the URL without replacing or clearing the stored credentials`,
-          );
-          return { success: false as const, message: error.message };
+        if (written.kind === "not_found") {
+          return {
+            success: false as const,
+            message: "MCP server not found",
+          };
         }
-        throw error;
+        if (written.kind === "not_owner") {
+          return {
+            success: false as const,
+            message: "Access denied: You can only update servers you own",
+          };
+        }
+        result = {
+          server: written.server,
+          previous: written.previous,
+          destinationOrCredentialChanged: false,
+          ownershipChanged: false,
+        };
+      } else {
+        // Determine user ownership based on input.user_id or keep existing ownership
+        const effectiveUserId =
+          input.user_id !== undefined ? input.user_id : server.user_id;
+
+        // The repository judges the update against the row it locks, and
+        // refuses a URL change that does not decide what happens to the stored
+        // bearer token and headers (planServerUpdate in mcp-servers.repo.ts).
+        // A refusal writes nothing.
+        try {
+          // Same credential ban as `create` above: an update is the call that
+          // ROTATES a vendor token, so it is the likeliest place for one to
+          // leak into a log. For an admin-plane key the row and its audit row
+          // are one transaction.
+          result = await withAdminAudit(
+            actor,
+            (...tx) =>
+              refusingTakenName("mcpserver.update", input.uuid, () =>
+                mcpServersRepository.updateReportingChange(
+                  {
+                    ...input,
+                    user_id: effectiveUserId,
+                  },
+                  ...tx,
+                ),
+              ),
+            (written) => (written ? serverUpdateEvent(written) : null),
+          );
+        } catch (error) {
+          if (error instanceof ServerCredentialRetentionError) {
+            logger.info(
+              `Refused an update of MCP server ${server.uuid}: it changes the URL without replacing or clearing the stored credentials`,
+            );
+            return { success: false as const, message: error.message };
+          }
+          throw error;
+        }
       }
 
       if (!result) {
@@ -797,14 +995,19 @@ export const mcpServersImplementations = {
 
       return {
         success: true as const,
-        // update is adminProcedure — see the note on `create`.
-        data: McpServersSerializer.serializeMcpServer(updatedServer, true),
+        // update is adminProcedure: see the note on `create`.
+        data: McpServersSerializer.serializeMcpServer(
+          updatedServer,
+          replyDetailFor(actor),
+        ),
         message: "MCP server updated successfully",
       };
     } catch (error) {
       // A coded refusal (the change budget, a rule) reaches the caller as
       // itself, never as `success: false` inside an HTTP 200.
       if (error instanceof TRPCError) throw error;
+      const refusal = codedRefusalOf(error);
+      if (refusal) throw refusal;
       logger.error("Error updating MCP server:", describeDbError(error));
       return {
         success: false as const,

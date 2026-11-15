@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
   ENDPOINT_GATE_REFUSALS,
   isOwnRecentRestriction,
+  judgeEndpointAuthPosture,
   judgeEndpointCreate,
   judgeEndpointMove,
   judgeEndpointUnrestrict,
@@ -221,6 +222,52 @@ describe("isOwnRecentRestriction", () => {
       false,
     );
     expect(isOwnRecentRestriction(marked, null)).toBe(false);
+  });
+});
+
+describe("the admin-plane auth posture", () => {
+  const posture = (
+    over: Partial<Parameters<typeof judgeEndpointAuthPosture>[0]>,
+  ) =>
+    judgeEndpointAuthPosture({
+      adminPlane: true,
+      enableApiKeyAuth: true,
+      enableOauth: true,
+      ...over,
+    });
+
+  it("refuses an admin-plane key a posture with both authentication modes off", () => {
+    expect(posture({ enableApiKeyAuth: false, enableOauth: false })).toBe(
+      "admin_plane_auth_off",
+    );
+  });
+
+  it.each([
+    [
+      "API-key authentication only",
+      { enableApiKeyAuth: true, enableOauth: false },
+    ],
+    ["OAuth only", { enableApiKeyAuth: false, enableOauth: true }],
+    ["both", { enableApiKeyAuth: true, enableOauth: true }],
+  ])("lets an admin-plane key leave %s on", (_label, over) => {
+    expect(posture(over)).toBeNull();
+  });
+
+  it("never refuses a person, who may leave both off", () => {
+    expect(
+      posture({
+        adminPlane: false,
+        enableApiKeyAuth: false,
+        enableOauth: false,
+      }),
+    ).toBeNull();
+  });
+
+  it("answers FORBIDDEN with a fixed sentence that names no endpoint", () => {
+    expect(ENDPOINT_GATE_REFUSALS.admin_plane_auth_off.code).toBe("FORBIDDEN");
+    expect(ENDPOINT_GATE_REFUSALS.admin_plane_auth_off.message).not.toBe(
+      ENDPOINT_GATE_REFUSALS.admin_plane_unrestrict.message,
+    );
   });
 });
 

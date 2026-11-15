@@ -2,6 +2,7 @@ import {
   ADMIN_PLANE_FORBIDDEN_MESSAGE,
   ADMIN_PLANE_OPERATOR_CONFIRMATIONS,
   ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+  ADMIN_PLANE_OPERATOR_MARKERS,
   ADMIN_PLANE_OPERATOR_MUTATIONS,
   ADMIN_PLANE_OPERATOR_PROCEDURES,
   type AuditActor,
@@ -1171,6 +1172,7 @@ export const apiKeysImplementations = {
           ([procedure, fields]) => [procedure, [...fields]],
         ),
       ),
+      markers: [...ADMIN_PLANE_OPERATOR_MARKERS],
       budget: {
         window_seconds: budget.windowSeconds,
         operator: { ...budget.operator },
