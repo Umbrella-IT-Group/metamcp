@@ -1,5 +1,7 @@
+import { TRPCError } from "@trpc/server";
 import express from "express";
 
+import { auditRequestContext } from "@/lib/audit/audit-emitter";
 import { describeDbError } from "@/lib/db-error-summary";
 import { betterAuthMcpMiddleware } from "@/middleware/better-auth-mcp.middleware";
 import { INTERNAL_ERROR_BODY } from "@/middleware/error-handler.middleware";
@@ -9,8 +11,8 @@ import { requireEnabledMcpMiddleware } from "@/middleware/require-enabled-mcp.mi
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
+import { resetServerErrors } from "../../lib/metamcp/reset-server-errors";
 import { serverErrorTracker } from "../../lib/metamcp/server-error-tracker";
-import { initializeIdleServers } from "../../lib/startup";
 
 const adminRouter = express.Router();
 
@@ -67,12 +69,19 @@ adminRouter.use(express.json());
 /**
  * POST /metamcp/admin/reset-errors
  *
- * Resets ERROR state for MCP servers without requiring a full backend restart.
- * Optionally targets a specific server by UUID, or resets all if no UUID given.
+ * Clears the ERROR state of one MCP server (`serverUuid`) or of every server
+ * in ERROR, without a restart. The implementation is the one the tRPC
+ * procedure `mcpServers.resetErrors` uses (lib/metamcp/reset-server-errors):
+ * the status change and its audit row (attributed to the signed-in person)
+ * commit in one transaction, an unknown server answers 404, a database
+ * failure answers 500, and connection recovery runs after the commit for the
+ * reset servers only and is reported in `recovery`.
  *
  * Body: { "serverUuid": "optional-specific-uuid" }
  * Auth: better-auth session cookie, enabled account, admin role — see the
- * block above.
+ * block above. Deliberately not reachable with an admin-plane key's bearer:
+ * that key reaches the same action through tRPC, where the scope sets, the
+ * change reason and the change budget apply.
  */
 adminRouter.post(
   "/:endpoint_name/admin/reset-errors",
@@ -82,53 +91,41 @@ adminRouter.post(
   lookupEndpointAfterAuth,
   async (req, res) => {
     try {
-      const { serverUuid } = req.body || {};
-      const resetResults: string[] = [];
-
-      if (serverUuid) {
-        // Reset specific server
-        await serverErrorTracker.resetServerErrorState(serverUuid);
-        resetResults.push(serverUuid);
-        logger.info(`Admin API: Reset error state for server ${serverUuid}`);
-      } else {
-        // Reset all servers in ERROR state
-        const allServers = await mcpServersRepository.findAll();
-        const errorServers = allServers.filter(
-          (s) => s.error_status === "ERROR",
-        );
-
-        for (const server of errorServers) {
-          await serverErrorTracker.resetServerErrorState(server.uuid);
-          resetResults.push(server.name || server.uuid);
-        }
-
-        // Also clear all in-memory crash counters
-        serverErrorTracker.resetAllAttempts();
-
-        logger.info(
-          `Admin API: Reset ${resetResults.length} servers from ERROR state: ${resetResults.join(", ")}`,
-        );
-      }
-
-      // Trigger idle server re-initialization to respawn connections
-      // Run async — don't block the response
-      initializeIdleServers().catch((err) => {
-        logger.error(
-          "Admin API: Error re-initializing idle servers:",
-          describeDbError(err),
-        );
-      });
+      const { serverUuid } = (req.body || {}) as { serverUuid?: unknown };
+      const user = (req as { user?: { id?: unknown; email?: unknown } }).user;
+      const result = await resetServerErrors(
+        {
+          serverUuid:
+            serverUuid === undefined || serverUuid === null || serverUuid === ""
+              ? undefined
+              : String(serverUuid),
+        },
+        {
+          actor_id: typeof user?.id === "string" ? user.id : null,
+          actor_label: typeof user?.email === "string" ? user.email : null,
+          ...auditRequestContext(req),
+        },
+      );
+      const servers = result.reset.map((server) => server.name || server.uuid);
+      logger.info(
+        `Admin API: Reset ${servers.length} server(s) from ERROR state; recovery ${result.recovery.status}`,
+      );
 
       res.json({
         success: true,
-        reset: resetResults.length,
-        servers: resetResults,
+        reset: servers.length,
+        servers,
+        recovery: result.recovery,
         message:
-          resetResults.length > 0
-            ? `Reset ${resetResults.length} server(s). Idle session re-initialization triggered.`
+          servers.length > 0
+            ? `Reset ${servers.length} server(s). Connection recovery: ${result.recovery.status}.`
             : "No servers were in ERROR state.",
       });
     } catch (error) {
+      if (error instanceof TRPCError && error.code === "NOT_FOUND") {
+        res.status(404).json({ success: false, error: "MCP server not found" });
+        return;
+      }
       // The detail goes to the server log and nowhere else, the same rule
       // the terminal handler follows (@/middleware/error-handler.middleware,
       // whose body constant this is). The failures reachable here come from

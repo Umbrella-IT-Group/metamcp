@@ -4,9 +4,11 @@
  *
  * Two scopes (migration 0043). `sync` is what a CI credential holds: exactly
  * the 10 procedures the configuration-sync tooling calls. `operator` is those
- * 10 plus 26 more for the operator's tooling, 36 in all: the 16 of the key,
- * policy and provisioning tooling, and 10 that let it manage access groups,
- * the `restricted` switch and a namespace's tool policy. `apiKeys.create`
+ * 10 plus 34 more for the operator's tooling, 44 in all (the list below says
+ * which): the key, policy and provisioning tooling, the access groups, the
+ * `restricted` switch and a namespace's tool policy, the narrow key lifecycle
+ * procedures, the server error reset and the verification and diagnostic
+ * reads. `apiKeys.create`
  * (which reaches the implementation's narrow agent-mint branch) is among the
  * operator's and never the sync set's.
  *
@@ -62,9 +64,20 @@ const EXPECTED_SYNC = [
 // TEST-EDIT (verification reads): the operator set gains its two
 // verification reads, `audit.list` and `apiKeys.operatorCapabilities`, pinned
 // here by name (36 to 38). The sync set is unchanged.
+//
+// TEST-EDIT (full-management plan 1B, key powers): the operator set gains the
+// narrow key lifecycle procedures (reactivate, rename, remove and the removal
+// impact read), the server error reset and the bounded diagnostic history
+// read, pinned here by name (38 to 44). The sync set is unchanged.
 const EXPECTED_OPERATOR_EXTRA = [
   "frontend.audit.list",
   "frontend.apiKeys.operatorCapabilities",
+  "frontend.apiKeys.reactivate",
+  "frontend.apiKeys.rename",
+  "frontend.apiKeys.remove",
+  "frontend.apiKeys.removalImpact",
+  "frontend.mcpServers.resetErrors",
+  "frontend.logs.history",
   "frontend.accessGroups.addEndpoint",
   "frontend.accessGroups.addMember",
   "frontend.accessGroups.create",
@@ -109,6 +122,25 @@ const EXPECTED_OPERATOR = [...EXPECTED_SYNC, ...EXPECTED_OPERATOR_EXTRA];
 const VALID_INPUTS: Record<string, unknown> = {
   "frontend.audit.list": undefined,
   "frontend.apiKeys.operatorCapabilities": undefined,
+  // TEST-EDIT (plan 1B): valid inputs for the six procedures 1B adds.
+  "frontend.apiKeys.reactivate": { reason: "unit test", uuid: UUID_B },
+  "frontend.apiKeys.rename": {
+    reason: "unit test",
+    uuid: UUID_B,
+    name: "renamed poller",
+  },
+  "frontend.apiKeys.remove": {
+    reason: "unit test",
+    uuid: UUID_B,
+    confirm_name: "old poller",
+    impact_fingerprint: `sha256:${"a".repeat(64)}`,
+  },
+  "frontend.apiKeys.removalImpact": { uuid: UUID_B },
+  "frontend.mcpServers.resetErrors": {
+    reason: "unit test",
+    serverUuid: UUID_C,
+  },
+  "frontend.logs.history": { limit: 10 },
   "frontend.accessGroups.addEndpoint": {
     reason: "unit test",
     group_uuid: UUID_A,
@@ -355,11 +387,12 @@ describe("the two procedure sets", () => {
     expect(ADMIN_PLANE_SYNC_PROCEDURES.size).toBe(10);
   });
 
-  it("pins the operator set to exactly those 10 plus 28 more, 38 in all", () => {
+  // TEST-EDIT (plan 1B): 28 to 34 more, 38 to 44 in all.
+  it("pins the operator set to exactly those 10 plus 34 more, 44 in all", () => {
     expect([...ADMIN_PLANE_OPERATOR_PROCEDURES].sort()).toEqual(
       [...EXPECTED_OPERATOR].sort(),
     );
-    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(38);
+    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(44);
   });
 
   it("gives the operator the access-group and tool-policy procedures and the sync set none of them", () => {

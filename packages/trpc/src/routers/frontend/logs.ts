@@ -6,7 +6,7 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, router } from "../../trpc";
+import { adminPlaneOrigin, adminProcedure, router } from "../../trpc";
 
 // Define the logs router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -18,6 +18,7 @@ export const createLogsRouter = (
     ) => Promise<z.infer<typeof GetLogsResponseSchema>>;
     getHistory: (
       input: z.infer<typeof GetGatewayEventsRequestSchema>,
+      options: { redactForAdminPlane: boolean },
     ) => Promise<z.infer<typeof GetGatewayEventsResponseSchema>>;
   },
 ) =>
@@ -53,10 +54,20 @@ export const createLogsRouter = (
     // in the database (migration 0031 refuses UPDATE and TRUNCATE outright and
     // DELETE inside the window), and an application path that appeared to empty
     // it would either fail loudly or, worse, look like it worked.
+    //
+    // On the operator scope's set as the bounded diagnostic read (at most 200
+    // rows a page, a pinned window to page). The rows carry text no part of
+    // this gateway wrote (upstream error text, backend output), so for an
+    // admin-plane key the implementation redacts credential-shaped text in the
+    // message and the error, drops every other metadata key and the session
+    // id. Decided from the verified origin, never from the request. A person's
+    // session reads the rows as stored.
     history: adminProcedure
       .input(GetGatewayEventsRequestSchema)
       .output(GetGatewayEventsResponseSchema)
-      .query(async ({ input }) => {
-        return await implementations.getHistory(input);
+      .query(async ({ input, ctx }) => {
+        return await implementations.getHistory(input, {
+          redactForAdminPlane: adminPlaneOrigin(ctx) !== null,
+        });
       }),
   });

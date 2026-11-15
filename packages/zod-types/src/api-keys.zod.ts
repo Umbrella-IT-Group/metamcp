@@ -345,6 +345,93 @@ export const DeactivateApiKeyResponseSchema = z.object({
   changed: z.boolean(),
 });
 
+// The narrow key lifecycle procedures (reactivate, rename, remove), reachable
+// by an operator-scope admin-plane key and an administrator's session. Each
+// acts on one DATA-plane key by uuid and refuses an admin-plane key; the
+// rules are the backend's (lib/api-key-lifecycle-rules), the same for every
+// caller. The broad `update` and `delete` above stay a person's procedures.
+// The change `reason` and `run_id` are read from the raw input by the
+// procedure base (@repo/trpc `changeContextOf`), not by these schemas.
+
+// Re-activate one inactive data-plane key whose owner, endpoint and own IP
+// policy still meet the agent mint's rules.
+export const ReactivateApiKeyRequestSchema = z.object({
+  uuid: z.string().uuid(),
+});
+
+export const ReactivateApiKeyResponseSchema = DeactivateApiKeyResponseSchema;
+
+// Rename one data-plane key. The name's shape (the mint's: letters, numbers,
+// spaces, underscores and hyphens) and its uniqueness for the key's owner are
+// judged by the implementation, so a refusal is one fixed sentence.
+export const RenameApiKeyRequestSchema = z.object({
+  uuid: z.string().uuid(),
+  name: z.string().min(1).max(100),
+});
+
+export const RenameApiKeyResponseSchema = z.object({
+  uuid: z.string().uuid(),
+  name: z.string(),
+  previous_name: z.string(),
+  key_prefix: z.string(),
+  is_active: z.boolean(),
+  changed: z.boolean(),
+});
+
+// What is recorded of a key a removal deletes: identifying metadata only.
+// Never the key, its hash or anything else on the row. Timestamps are ISO
+// strings so the audit row and the response carry the same text.
+export const ApiKeySnapshotSchema = z.object({
+  name: z.string(),
+  key_prefix: z.string(),
+  owner_user_id: z.string().nullable(),
+  endpoint_uuid: z.string().nullable(),
+  acts_as_user_id: z.string().nullable(),
+  is_active: z.boolean(),
+  admin_plane: z.boolean(),
+  allowed_cidrs: z.array(z.string()).nullable(),
+  ip_policy_mode: z.string(),
+  created_at: z.string(),
+  last_used_at: z.string().nullable(),
+});
+
+/** `sha256:` and 64 lower-case hex digits. */
+export const ApiKeyImpactFingerprintSchema = z
+  .string()
+  .regex(/^sha256:[0-9a-f]{64}$/);
+
+// The read a removal is prepared from: whether the key may be removed (and
+// the rule that stops it when not), its snapshot and the fingerprint of its
+// current state, which `remove` must be sent back.
+export const ApiKeyRemovalImpactRequestSchema = z.object({
+  uuid: z.string().uuid(),
+});
+
+export const ApiKeyRemovalImpactResponseSchema = z.object({
+  uuid: z.string().uuid(),
+  name: z.string(),
+  removable: z.boolean(),
+  blocked_by: z.enum(["target_admin_plane", "key_active"]).nullable(),
+  impact_fingerprint: ApiKeyImpactFingerprintSchema,
+  snapshot: ApiKeySnapshotSchema,
+});
+
+// Remove one key, leaf-only: an inactive data-plane key, confirmed by its
+// current name and by the fingerprint `removalImpact` returned for its
+// current state.
+export const RemoveApiKeyRequestSchema = z.object({
+  uuid: z.string().uuid(),
+  confirm_name: z.string().min(1).max(100),
+  impact_fingerprint: ApiKeyImpactFingerprintSchema,
+});
+
+export const RemoveApiKeyResponseSchema = z.object({
+  uuid: z.string().uuid(),
+  name: z.string(),
+  removed: z.literal(true),
+  snapshot: ApiKeySnapshotSchema,
+});
+
 // Member-facing key list: the caller's own keys plus every public
 // ('everyone') key. Deliberately omits the full `key` secret and carries only
 // a non-reversible prefix, exactly like the admin view below.
@@ -518,6 +605,23 @@ export type DeactivateApiKeyRequest = z.infer<
 export type DeactivateApiKeyResponse = z.infer<
   typeof DeactivateApiKeyResponseSchema
 >;
+export type ReactivateApiKeyRequest = z.infer<
+  typeof ReactivateApiKeyRequestSchema
+>;
+export type ReactivateApiKeyResponse = z.infer<
+  typeof ReactivateApiKeyResponseSchema
+>;
+export type RenameApiKeyRequest = z.infer<typeof RenameApiKeyRequestSchema>;
+export type RenameApiKeyResponse = z.infer<typeof RenameApiKeyResponseSchema>;
+export type ApiKeySnapshot = z.infer<typeof ApiKeySnapshotSchema>;
+export type ApiKeyRemovalImpactRequest = z.infer<
+  typeof ApiKeyRemovalImpactRequestSchema
+>;
+export type ApiKeyRemovalImpactResponse = z.infer<
+  typeof ApiKeyRemovalImpactResponseSchema
+>;
+export type RemoveApiKeyRequest = z.infer<typeof RemoveApiKeyRequestSchema>;
+export type RemoveApiKeyResponse = z.infer<typeof RemoveApiKeyResponseSchema>;
 export type AdminPlaneScope = z.infer<typeof AdminPlaneScopeSchema>;
 export type CreateApiKeyIpPolicy = z.infer<typeof CreateApiKeyIpPolicySchema>;
 export type ListApiKeysResponse = z.infer<typeof ListApiKeysResponseSchema>;
@@ -568,6 +672,12 @@ export const OperatorCapabilitiesResponseSchema = z.object({
     max_length: z.number().int(),
     run_id_max_length: z.number().int(),
   }),
+  /**
+   * The confirmation fields a change must carry beyond its reason, by
+   * procedure (contract 3): `apiKeys.remove` needs `confirm_name` and the
+   * `impact_fingerprint` read from `apiKeys.removalImpact`.
+   */
+  confirmations: z.record(z.string(), z.array(z.string())),
   budget: z.object({
     window_seconds: z.number().int(),
     operator: z.object({

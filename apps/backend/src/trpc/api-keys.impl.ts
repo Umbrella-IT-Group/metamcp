@@ -1,5 +1,6 @@
 import {
   ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  ADMIN_PLANE_OPERATOR_CONFIRMATIONS,
   ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
   ADMIN_PLANE_OPERATOR_MUTATIONS,
   ADMIN_PLANE_OPERATOR_PROCEDURES,
@@ -8,6 +9,8 @@ import {
   CHANGE_RUN_ID_MAX_LENGTH,
 } from "@repo/trpc";
 import {
+  ApiKeyRemovalImpactRequestSchema,
+  ApiKeyRemovalImpactResponseSchema,
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
   DeactivateApiKeyRequestSchema,
@@ -18,6 +21,12 @@ import {
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
   OperatorCapabilitiesResponseSchema,
+  ReactivateApiKeyRequestSchema,
+  ReactivateApiKeyResponseSchema,
+  RemoveApiKeyRequestSchema,
+  RemoveApiKeyResponseSchema,
+  RenameApiKeyRequestSchema,
+  RenameApiKeyResponseSchema,
   SetApiKeyIpPolicyRequestSchema,
   SetApiKeyIpPolicyResponseSchema,
   SetGlobalIpPolicyRequestSchema,
@@ -47,6 +56,12 @@ import {
   isAnyIpExemption,
   normalizeCidrList,
 } from "../lib/api-key-ip-policy";
+import {
+  ApiKeyLifecycleRefusal,
+  apiKeyRemovalFingerprint,
+  apiKeySnapshot,
+  removalBlocker,
+} from "../lib/api-key-lifecycle-rules";
 import {
   AdminPlaneOwnerIneligible,
   ApiKeyMintRefusal,
@@ -302,6 +317,45 @@ function mintFailure(error: unknown, actor: AuditActor): TRPCError {
     message: "The API key could not be created.",
   });
 }
+
+/**
+ * Run a key lifecycle repository call inside a change's write, turning a rule
+ * refusal into the `AdminRuleRefusal` the audited transaction understands: it
+ * rolls the transaction back, records a `denied` row for `action` naming the
+ * rule after the rollback, and answers with the rule's code and sentence.
+ */
+async function lifecycleWrite<T>(
+  action: "apikey.reactivate" | "apikey.update" | "apikey.delete",
+  uuid: string,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (error) {
+    if (error instanceof ApiKeyLifecycleRefusal) {
+      throw new AdminRuleRefusal(error.code, error.message, {
+        action,
+        target_type: "api_key",
+        target_id: uuid,
+        detail: { rule: error.rule },
+      });
+    }
+    throw error;
+  }
+}
+
+/** An audit write failure as the fixed error every key write answers with. */
+function auditFailureAsTrpc(error: unknown): unknown {
+  if (error instanceof AdminAuditWriteError) {
+    return new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+    });
+  }
+  return error;
+}
+
+const API_KEY_NOT_FOUND = "API key not found";
 
 export const apiKeysImplementations = {
   create: async (
@@ -822,8 +876,9 @@ export const apiKeysImplementations = {
    * The calling key is refused (the uuid is compared lowercased, since
    * Postgres reads a uuid case-insensitively and an upper-case spelling of the
    * caller's own uuid must not slip past): a key that locks itself out is not
-   * containment. Re-activation stays an administrator's act in the UI, so what
-   * an agent deactivates only a human can undo.
+   * containment. Re-activation is `reactivate` below, which only takes back a
+   * DATA-plane key the agent mint could create today; an admin-plane key a
+   * key deactivates is re-activated by a person in the UI.
    *
    * The state change and its `apikey.revoke` audit row (the verb the UI's
    * deactivation writes, with `detail.via = "deactivate"`) are one transaction
@@ -880,6 +935,209 @@ export const apiKeysImplementations = {
   },
 
   /**
+   * Re-activate one inactive DATA-plane key (`apiKeys.reactivate`). The rules
+   * are lib/api-key-lifecycle-rules, judged against the owner, endpoint and
+   * key rows the repository locks in this transaction, for every caller: never
+   * an admin-plane key or a key that acts as a user; an existing, enabled
+   * owner; an endpoint (or gateway-wide reach) the agent mint would allow that
+   * owner; and the key's own policy already a narrow enforce list. The policy
+   * is not touched. The state change and its `apikey.reactivate` row (the
+   * verb the UI's re-activation writes, with `detail.via = "reactivate"`) are
+   * one transaction, charged to an admin-plane caller's budget as `loosen`. An
+   * already-active key answers `changed: false` and records nothing.
+   */
+  reactivate: async (
+    input: z.infer<typeof ReactivateApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof ReactivateApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    let outcome: Awaited<
+      ReturnType<typeof apiKeysRepository.reactivateDataPlaneKey>
+    >;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) =>
+          lifecycleWrite("apikey.reactivate", uuid, () =>
+            apiKeysRepository.reactivateDataPlaneKey(tx, uuid),
+          ),
+        (written) =>
+          written.status === "reactivated"
+            ? {
+                action: "apikey.reactivate",
+                target_type: "api_key",
+                target_id: written.key.uuid,
+                detail: {
+                  name: written.key.name,
+                  owner_user_id: written.key.user_id,
+                  endpoint_uuid: written.key.endpoint_uuid,
+                  all_endpoints: written.key.endpoint_uuid === null,
+                  is_active: true,
+                  via: "reactivate",
+                  ip_policy: {
+                    mode: written.key.ip_policy_mode,
+                    allowed_cidrs: written.key.allowed_cidrs,
+                  },
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      throw auditFailureAsTrpc(error);
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    return ApiKeysSerializer.serializeDeactivatedApiKey(
+      outcome.key,
+      outcome.status === "reactivated",
+    );
+  },
+
+  /**
+   * Rename one DATA-plane key (`apiKeys.rename`): a name of the mint's shape,
+   * unused by the key's owner. The rename and its `apikey.update` row
+   * (`detail.via = "rename"`, with the old and new names) are one
+   * transaction. The current name answers `changed: false` and records
+   * nothing.
+   */
+  rename: async (
+    input: z.infer<typeof RenameApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof RenameApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    let outcome: Awaited<
+      ReturnType<typeof apiKeysRepository.renameDataPlaneKey>
+    >;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) =>
+          lifecycleWrite("apikey.update", uuid, () =>
+            apiKeysRepository.renameDataPlaneKey(tx, uuid, input.name),
+          ),
+        (written) =>
+          written.status === "renamed"
+            ? {
+                action: "apikey.update",
+                target_type: "api_key",
+                target_id: written.after.uuid,
+                detail: {
+                  via: "rename",
+                  previous_name: written.before.name,
+                  name: written.after.name,
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      throw auditFailureAsTrpc(error);
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    return {
+      uuid: outcome.after.uuid,
+      name: outcome.after.name,
+      previous_name: outcome.before.name,
+      key_prefix: ApiKeysSerializer.keyPrefix(outcome.after.last4),
+      is_active: outcome.after.is_active,
+      changed: outcome.status === "renamed",
+    };
+  },
+
+  /**
+   * The read a removal is prepared from: whether `apiKeys.remove` would accept
+   * this key now (and the rule that stops it when not), its snapshot and the
+   * fingerprint of its current state. Nothing here is credential material.
+   */
+  removalImpact: async (
+    input: z.infer<typeof ApiKeyRemovalImpactRequestSchema>,
+  ): Promise<z.infer<typeof ApiKeyRemovalImpactResponseSchema>> => {
+    let key;
+    try {
+      key = await apiKeysRepository.readLifecycleTarget(
+        input.uuid.toLowerCase(),
+      );
+    } catch (error) {
+      logger.error("Error reading an API key:", describeDbError(error));
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Internal server error",
+      });
+    }
+    if (!key) {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    const blockedBy = removalBlocker(key);
+    return {
+      uuid: key.uuid,
+      name: key.name,
+      removable: blockedBy === null,
+      blocked_by: blockedBy,
+      impact_fingerprint: apiKeyRemovalFingerprint(key),
+      snapshot: apiKeySnapshot(key),
+    };
+  },
+
+  /**
+   * Remove one key (`apiKeys.remove`), leaf-only: an inactive DATA-plane key,
+   * confirmed by its current name and by the fingerprint `removalImpact` read,
+   * both judged against the row locked in this transaction. The delete and
+   * its `apikey.delete` row (`detail.via = "remove"`, with the snapshot and
+   * the fingerprint) are one transaction, charged to an admin-plane caller's
+   * budget as `destroy`.
+   */
+  remove: async (
+    input: z.infer<typeof RemoveApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof RemoveApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    let outcome: Awaited<
+      ReturnType<typeof apiKeysRepository.removeDataPlaneKey>
+    >;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) =>
+          lifecycleWrite("apikey.delete", uuid, () =>
+            apiKeysRepository.removeDataPlaneKey(
+              tx,
+              uuid,
+              input.confirm_name,
+              input.impact_fingerprint,
+            ),
+          ),
+        (written) =>
+          written.status === "removed"
+            ? {
+                action: "apikey.delete",
+                target_type: "api_key",
+                target_id: written.key.uuid,
+                detail: {
+                  via: "remove",
+                  name: written.key.name,
+                  impact_fingerprint: input.impact_fingerprint,
+                  snapshot: apiKeySnapshot(written.key),
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      throw auditFailureAsTrpc(error);
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    return {
+      uuid: outcome.key.uuid,
+      name: outcome.key.name,
+      removed: true as const,
+      snapshot: apiKeySnapshot(outcome.key),
+    };
+  },
+
+  /**
    * What an operator-scope admin-plane key may call and the rules its changes
    * must meet, derived from the scope sets in @repo/trpc and the budget the
    * deploy environment configures. Nothing here is stored or caller-supplied,
@@ -899,6 +1157,11 @@ export const apiKeysImplementations = {
         max_length: CHANGE_REASON_MAX_LENGTH,
         run_id_max_length: CHANGE_RUN_ID_MAX_LENGTH,
       },
+      confirmations: Object.fromEntries(
+        Object.entries(ADMIN_PLANE_OPERATOR_CONFIRMATIONS).map(
+          ([procedure, fields]) => [procedure, [...fields]],
+        ),
+      ),
       budget: {
         window_seconds: budget.windowSeconds,
         operator: { ...budget.operator },

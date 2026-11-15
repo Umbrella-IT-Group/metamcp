@@ -27,7 +27,9 @@ vi.mock("@/utils/logger", () => ({
   default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-const { BUDGETED_ACTIONS } = await import("../lib/admin-plane-budget");
+const { BUDGETED_ACTIONS, budgetClassOf } = await import(
+  "../lib/admin-plane-budget"
+);
 const { buildAdminAuditEvent } = await import("../lib/audit/admin-event");
 const { projectAuditDetail } = await import("../lib/audit/audit-read");
 
@@ -138,7 +140,9 @@ describe("classification", () => {
       ADMIN_PLANE_OPERATOR_PROCEDURES.size +
         ADMIN_PLANE_HUMAN_ONLY_PROCEDURES.size,
     );
-    expect(ALL).toHaveLength(89);
+    // TEST-EDIT (plan 1B): five procedures added (apiKeys.reactivate, rename,
+    // remove and removalImpact, mcpServers.resetErrors), 89 to 94.
+    expect(ALL).toHaveLength(94);
   });
 
   it("lists as operator mutations exactly the operator procedures that are mutations", () => {
@@ -146,7 +150,8 @@ describe("classification", () => {
       .filter((p) => PROCEDURES[p]._def.type === "mutation")
       .sort();
     expect([...ADMIN_PLANE_OPERATOR_MUTATIONS].sort()).toEqual(fromRouter);
-    expect(fromRouter).toHaveLength(21);
+    // TEST-EDIT (plan 1B): four operator mutations added, 21 to 25.
+    expect(fromRouter).toHaveLength(25);
   });
 
   it.each([...ADMIN_PLANE_OPERATOR_MUTATIONS])(
@@ -298,6 +303,11 @@ describe("budget classes", () => {
     "frontend.accessGroups.update": ["group.update"],
     "frontend.apiKeys.create": ["apikey.create"],
     "frontend.apiKeys.deactivate": ["apikey.revoke"],
+    // TEST-EDIT (key powers): the actions the four new mutations write.
+    "frontend.apiKeys.reactivate": ["apikey.reactivate"],
+    "frontend.apiKeys.rename": ["apikey.update"],
+    "frontend.apiKeys.remove": ["apikey.delete"],
+    "frontend.mcpServers.resetErrors": ["mcpserver.errors.reset"],
     "frontend.apiKeys.setGlobalIpPolicy": ["config.api_key_ip_policy.set"],
     "frontend.apiKeys.setIpPolicy": ["apikey.ip_policy.set"],
     "frontend.endpoints.create": ["endpoint.create"],
@@ -318,7 +328,6 @@ describe("budget classes", () => {
   // this list fails the test, so a new action must be decided one way or the
   // other when it is added.
   const WRITTEN_BY_HUMAN_ONLY_PROCEDURES: readonly string[] = [
-    "apikey.delete",
     "endpoint.delete",
     "mcpserver.bulk_import",
     "mcpserver.delete",
@@ -356,6 +365,13 @@ describe("budget classes", () => {
     }
     return { routers, found };
   };
+
+  it("counts a reactivation as loosen, a removal as destroy, and a rename or error reset as an ordinary change", () => {
+    expect(budgetClassOf("apikey.reactivate", {})).toBe("loosen");
+    expect(budgetClassOf("apikey.delete", {})).toBe("destroy");
+    expect(budgetClassOf("apikey.update", {})).toBe("change");
+    expect(budgetClassOf("mcpserver.errors.reset", {})).toBe("change");
+  });
 
   it("covers every operator mutation and gives each of its actions a class", () => {
     expect(Object.keys(ACTIONS_BY_MUTATION).sort()).toEqual(
@@ -403,6 +419,40 @@ describe("budget classes", () => {
 });
 
 describe("the audit read", () => {
+  it("returns the detail the key powers write: a rename's old name, a removal's snapshot and fingerprint, an error reset's servers", () => {
+    const { detail, omitted } = projectAuditDetail({
+      via: "remove",
+      previous_name: "old",
+      impact_fingerprint: `sha256:${"a".repeat(64)}`,
+      snapshot: {
+        name: "poller",
+        key_prefix: "sk_mt_…wxyz",
+        allowed_cidrs: ["203.0.113.0/24"],
+        is_active: false,
+      },
+      selection: "all_in_error",
+      server_uuids: ["11111111-1111-4111-8111-111111111111"],
+      server_names: ["alpha"],
+      reset_count: 1,
+    });
+    expect(detail).toEqual({
+      via: "remove",
+      previous_name: "old",
+      impact_fingerprint: `sha256:${"a".repeat(64)}`,
+      snapshot: {
+        name: "poller",
+        key_prefix: "sk_mt_…wxyz",
+        allowed_cidrs: ["203.0.113.0/24"],
+        is_active: false,
+      },
+      selection: "all_in_error",
+      server_uuids: ["11111111-1111-4111-8111-111111111111"],
+      server_names: ["alpha"],
+      reset_count: 1,
+    });
+    expect(omitted).toBe(0);
+  });
+
   it("returns whitelisted detail keys only, reduced, and counts what it dropped", () => {
     const { detail, omitted } = projectAuditDetail({
       reason: "why",

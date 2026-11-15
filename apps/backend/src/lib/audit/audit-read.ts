@@ -58,6 +58,17 @@ export const AUDIT_LIST_DETAIL_KEYS: ReadonlySet<string> = new Set([
   "ip_policy",
   "members",
   "mappings",
+  // The key lifecycle procedures: a rename's old name, a removal's
+  // fingerprint and snapshot (identifying metadata only, see
+  // lib/api-key-lifecycle-rules `apiKeySnapshot`).
+  "previous_name",
+  "impact_fingerprint",
+  "snapshot",
+  // A server error reset: which servers, by uuid and name, and how many.
+  "selection",
+  "server_uuids",
+  "server_names",
+  "reset_count",
 ]);
 
 /** Keys whose value may be one level of object, itself reduced. */
@@ -66,6 +77,7 @@ const NESTED_DETAIL_KEYS: ReadonlySet<string> = new Set([
   "old_value",
   "new_value",
   "ip_policy",
+  "snapshot",
 ]);
 
 const NESTED_KEY = /^[a-z][a-z0-9_]{0,39}$/;

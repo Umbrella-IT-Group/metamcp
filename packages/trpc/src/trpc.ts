@@ -209,7 +209,8 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    the implementations (a key cannot lock itself out).
  *  - `apiKeys.listAll` and `apiKeys.deactivate`: inventory and containment.
  *    `deactivate` refuses the calling key and cannot re-activate, rename or
- *    delete (those stay a human administrator's act in the UI).
+ *    delete; those are the narrow lifecycle procedures below, for data-plane
+ *    keys only.
  *  - `apiKeys.create`: reaches the implementation's agent-mint branch, which
  *    only ever creates an endpoint-scoped or gateway-wide DATA-plane key for
  *    one existing enabled user, locked to a narrow IP list at creation. Every
@@ -231,8 +232,21 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    on /trpc and depend on no MCP endpoint.
  *  - Two reads for the operator's own verification: `audit.list` (its audit
  *    trail, safe fields only) and `apiKeys.operatorCapabilities` (what this
- *    scope may call, the reason contract and the change budget), which the
- *    tooling checks before it sends a change.
+ *    scope may call, the reason contract, the confirmations and the change
+ *    budget), which the tooling checks before it sends a change.
+ *  - The narrow key lifecycle procedures, for DATA-plane keys only:
+ *    `apiKeys.reactivate` (the owner, the endpoint and the key's own narrow
+ *    enforce policy re-checked against locked rows, by the agent mint's
+ *    rules), `apiKeys.rename` (a valid name unused by the key's owner) and
+ *    `apiKeys.remove` (leaf-only: an inactive key, confirmed by its name and
+ *    by the fingerprint `apiKeys.removalImpact` read). Each refuses an
+ *    admin-plane key, the calling key included; the broad `apiKeys.update`
+ *    and `.delete` stay human-only.
+ *  - `mcpServers.resetErrors`, the twin of the cookie-only REST reset route
+ *    and sharing its implementation: the ERROR status change and its audit
+ *    row commit together, and connection recovery starts after the commit.
+ *  - `logs.history`, the bounded (paged, at most 200 rows) diagnostic
+ *    history, with credential-shaped text redacted for an admin-plane key.
  *
  * Every change an operator key makes carries a `reason` (see
  * `changeContextOf`), is counted against the key's change budget and is
@@ -245,6 +259,12 @@ export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
   ...ADMIN_PLANE_SYNC_PROCEDURES,
   "frontend.audit.list",
   "frontend.apiKeys.operatorCapabilities",
+  "frontend.apiKeys.reactivate",
+  "frontend.apiKeys.removalImpact",
+  "frontend.apiKeys.remove",
+  "frontend.apiKeys.rename",
+  "frontend.logs.history",
+  "frontend.mcpServers.resetErrors",
   "frontend.accessGroups.addEndpoint",
   "frontend.accessGroups.addMember",
   "frontend.accessGroups.create",
@@ -291,11 +311,15 @@ export const ADMIN_PLANE_OPERATOR_MUTATIONS: ReadonlySet<string> = new Set([
   "frontend.accessGroups.update",
   "frontend.apiKeys.create",
   "frontend.apiKeys.deactivate",
+  "frontend.apiKeys.reactivate",
+  "frontend.apiKeys.remove",
+  "frontend.apiKeys.rename",
   "frontend.apiKeys.setGlobalIpPolicy",
   "frontend.apiKeys.setIpPolicy",
   "frontend.endpoints.create",
   "frontend.endpoints.update",
   "frontend.mcpServers.create",
+  "frontend.mcpServers.resetErrors",
   "frontend.mcpServers.update",
   "frontend.namespaces.create",
   "frontend.namespaces.refreshTools",
@@ -342,7 +366,6 @@ export const ADMIN_PLANE_HUMAN_ONLY_PROCEDURES: ReadonlySet<string> = new Set([
   "frontend.endpoints.get",
   "frontend.endpoints.listAll",
   "frontend.logs.get",
-  "frontend.logs.history",
   "frontend.mcpServers.bulkImport",
   "frontend.mcpServers.delete",
   "frontend.mcpServers.get",
@@ -372,8 +395,25 @@ export const ADMIN_PLANE_HUMAN_ONLY_PROCEDURES: ReadonlySet<string> = new Set([
  * Raised whenever the operator set, the reason contract or the meaning of a
  * refusal changes, so the operator's tooling can refuse to send a change to a
  * gateway whose contract it does not know.
+ *
+ *  - 2: the rails, the reason field, the change budget, `audit.list`.
+ *  - 3: the key lifecycle procedures (reactivate, rename, removalImpact,
+ *    remove), `mcpServers.resetErrors`, `logs.history`, and the
+ *    `confirmations` field (ADMIN_PLANE_OPERATOR_CONFIRMATIONS).
  */
-export const ADMIN_PLANE_OPERATOR_CONTRACT_VERSION = 2;
+export const ADMIN_PLANE_OPERATOR_CONTRACT_VERSION = 3;
+
+/**
+ * The fields beyond `reason` an operator change must carry, by procedure,
+ * reported by `apiKeys.operatorCapabilities` so the tooling can build the
+ * request. A mistake guard, checked by the implementation against rows it
+ * locks; the rule behind it (for a removal, leaf-only) holds without it.
+ */
+export const ADMIN_PLANE_OPERATOR_CONFIRMATIONS: Readonly<
+  Record<string, readonly string[]>
+> = {
+  "frontend.apiKeys.remove": ["confirm_name", "impact_fingerprint"],
+};
 
 /** One constant refusal for every procedure outside the list. */
 export const ADMIN_PLANE_FORBIDDEN_MESSAGE =

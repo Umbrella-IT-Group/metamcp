@@ -63,7 +63,8 @@ export interface AdminPlaneBudgetConfig {
  *    mapped) and the keys created for it.
  *  - operator destroy: deletions are rare and leaf-only. None was measured, so
  *    the peak is taken as one and the limit is three times that; a limit of
- *    zero would make a leaf deletion impossible for an agent.
+ *    zero would make a leaf deletion impossible for an agent. A group delete
+ *    and a key removal (apiKeys.remove) share it.
  *  - sync total: the configuration sync re-saves every registered server on
  *    each run, and several runs can land in one hour.
  *  - sync loosen and destroy 0: the sync scope has no procedure in either
@@ -205,9 +206,17 @@ const ACTION_CLASSES: Readonly<
   "group.member.remove": "tighten",
   "group.endpoint.add": "loosen",
   "group.endpoint.remove": "tighten",
-  // A new credential is new access.
+  // A new credential is new access, and so is one taken back into use.
   "apikey.create": "loosen",
+  "apikey.reactivate": "loosen",
   "apikey.revoke": "tighten",
+  // A rename (apiKeys.rename) changes no access.
+  "apikey.update": "change",
+  // A removal (apiKeys.remove, leaf-only) cannot be undone.
+  "apikey.delete": "destroy",
+  // Clearing a server's ERROR status lets the gateway connect to it again;
+  // it grants no caller anything.
+  "mcpserver.errors.reset": "change",
   "apikey.ip_policy.set": "change",
   "config.api_key_ip_policy.set": "change",
 };

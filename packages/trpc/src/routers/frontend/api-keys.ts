@@ -1,4 +1,6 @@
 import {
+  ApiKeyRemovalImpactRequestSchema,
+  ApiKeyRemovalImpactResponseSchema,
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
   DeactivateApiKeyRequestSchema,
@@ -9,6 +11,12 @@ import {
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
   OperatorCapabilitiesResponseSchema,
+  ReactivateApiKeyRequestSchema,
+  ReactivateApiKeyResponseSchema,
+  RemoveApiKeyRequestSchema,
+  RemoveApiKeyResponseSchema,
+  RenameApiKeyRequestSchema,
+  RenameApiKeyResponseSchema,
   SetApiKeyIpPolicyRequestSchema,
   SetApiKeyIpPolicyResponseSchema,
   SetGlobalIpPolicyRequestSchema,
@@ -78,6 +86,21 @@ export const createApiKeysRouter = (implementations: {
     input: z.infer<typeof DeactivateApiKeyRequestSchema>,
     actor: AuditActor,
   ) => Promise<z.infer<typeof DeactivateApiKeyResponseSchema>>;
+  reactivate: (
+    input: z.infer<typeof ReactivateApiKeyRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof ReactivateApiKeyResponseSchema>>;
+  rename: (
+    input: z.infer<typeof RenameApiKeyRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof RenameApiKeyResponseSchema>>;
+  removalImpact: (
+    input: z.infer<typeof ApiKeyRemovalImpactRequestSchema>,
+  ) => Promise<z.infer<typeof ApiKeyRemovalImpactResponseSchema>>;
+  remove: (
+    input: z.infer<typeof RemoveApiKeyRequestSchema>,
+    actor: AuditActor,
+  ) => Promise<z.infer<typeof RemoveApiKeyResponseSchema>>;
   operatorCapabilities: (
     callerScope: "sync" | "operator" | null,
   ) => Promise<z.infer<typeof OperatorCapabilitiesResponseSchema>>;
@@ -202,15 +225,62 @@ export const createApiKeysRouter = (implementations: {
       }),
 
     // Admin only: deactivate one key (containment). Input is the uuid alone: it
-    // cannot rename, re-activate or delete, it refuses the key that is calling,
-    // and re-activation stays an administrator's act in the admin UI. On an
-    // operator-scope admin-plane key's set; the state change and its audit row
-    // are one transaction (see the implementation).
+    // cannot rename, re-activate or delete (those are the narrow procedures
+    // below, data-plane keys only), and it refuses the key that is calling. On
+    // an operator-scope admin-plane key's set; the state change and its audit
+    // row are one transaction (see the implementation).
     deactivate: adminProcedure
       .input(DeactivateApiKeyRequestSchema)
       .output(DeactivateApiKeyResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return implementations.deactivate(input, auditActor(ctx));
+      }),
+
+    // The narrow key lifecycle procedures. Admin only, on the operator scope's
+    // set, and for DATA-plane keys only: each refuses an admin-plane key (the
+    // calling key included) whoever calls, so an admin-plane key's
+    // re-activation, rename and deletion stay a person's act through the broad
+    // `update` and `delete` above. Each change and its audit row are one
+    // transaction, with the rules judged against rows locked in it (see the
+    // implementations and lib/api-key-lifecycle-rules).
+    //
+    // reactivate: an inactive key whose owner is an enabled user, whose
+    // endpoint (or gateway-wide reach) the agent mint would allow that owner,
+    // which acts as nobody, and whose own IP policy is already a narrow
+    // enforce list. An already-active key answers `changed: false`.
+    reactivate: adminProcedure
+      .input(ReactivateApiKeyRequestSchema)
+      .output(ReactivateApiKeyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.reactivate(input, auditActor(ctx));
+      }),
+
+    // rename: a name of the mint's shape, unused by any key of the same owner
+    // (inactive keys included). The audit row carries the old and new names.
+    rename: adminProcedure
+      .input(RenameApiKeyRequestSchema)
+      .output(RenameApiKeyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.rename(input, auditActor(ctx));
+      }),
+
+    // removalImpact: a read. Whether `remove` would accept the key now, its
+    // snapshot (identifying metadata, never credential material) and the
+    // fingerprint of its current state that `remove` must be sent back.
+    removalImpact: adminProcedure
+      .input(ApiKeyRemovalImpactRequestSchema)
+      .output(ApiKeyRemovalImpactResponseSchema)
+      .query(async ({ input }) => {
+        return implementations.removalImpact(input);
+      }),
+
+    // remove: leaf-only. An inactive key, confirmed by its current name and
+    // the fingerprint read above; the snapshot goes into the audit row.
+    remove: adminProcedure
+      .input(RemoveApiKeyRequestSchema)
+      .output(RemoveApiKeyResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return implementations.remove(input, auditActor(ctx));
       }),
 
     // Admin only, and on the operator scope's set: what an operator-scope key

@@ -11,6 +11,7 @@ import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { gatewayEventsRepository } from "../db/repositories/gateway-events.repo";
+import { projectGatewayEventForAdminPlane } from "../lib/diagnostic-redaction";
 import { metamcpLogStore } from "../lib/metamcp/log-store";
 
 // Read-only by design. `clearLogs` was removed with migration 0028's
@@ -50,8 +51,16 @@ export const logsImplementations = {
     }
   },
 
+  /**
+   * One page of the durable history. `redactForAdminPlane` is set by the
+   * router from the verified origin of the request: an admin-plane key reads
+   * each row through lib/diagnostic-redaction (credential-shaped text
+   * replaced, metadata reduced to the error text, no session id); a person's
+   * session reads the rows as stored.
+   */
   getHistory: async (
     input: z.infer<typeof GetGatewayEventsRequestSchema>,
+    options: { redactForAdminPlane: boolean } = { redactForAdminPlane: false },
   ): Promise<z.infer<typeof GetGatewayEventsResponseSchema>> => {
     try {
       // The contract carries ISO strings (no tRPC data transformer is
@@ -118,18 +127,23 @@ export const logsImplementations = {
 
       return {
         success: true as const,
-        data: page.map((row) => ({
-          uuid: row.uuid,
-          occurredAt: row.occurred_at.toISOString(),
-          category: row.category,
-          level: row.level,
-          serverUuid: row.server_uuid,
-          serverName: row.server_name,
-          clientName: row.client_name,
-          sessionId: row.session_id,
-          message: row.message,
-          metadata: row.metadata,
-        })),
+        data: page.map((row) => {
+          const event = {
+            uuid: row.uuid,
+            occurredAt: row.occurred_at.toISOString(),
+            category: row.category,
+            level: row.level,
+            serverUuid: row.server_uuid,
+            serverName: row.server_name,
+            clientName: row.client_name,
+            sessionId: row.session_id,
+            message: row.message,
+            metadata: row.metadata as Record<string, unknown> | null,
+          };
+          return options.redactForAdminPlane
+            ? projectGatewayEventForAdminPlane(event)
+            : event;
+        }),
         nextCursor,
         serverNames,
       };

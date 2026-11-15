@@ -28,12 +28,18 @@ import type { DbTransaction } from "./db-executor";
  *        db/repositories/oauth-user-lock), taken by users.revokeAccess before
  *        the user row.
  *     b. User rows: the enabled administrators FOR UPDATE ordered by id, then
- *        the target account FOR UPDATE (`lockAccountTarget`); a key mint takes
- *        its owner row FOR SHARE.
- *  5. Endpoint rows (FOR UPDATE for a write, FOR SHARE for a key mint).
+ *        the target account FOR UPDATE (`lockAccountTarget`); a key mint and
+ *        a key re-activation take the key owner's row FOR SHARE.
+ *  5. Endpoint rows (FOR UPDATE for a write, FOR SHARE for a key mint or a
+ *     key re-activation).
  *  6. Access group rows (FOR UPDATE for a group delete).
- *  7. API key rows (FOR UPDATE for a policy change or deactivation).
- *  8. The audit row insert, last, in the same transaction.
+ *  7. API key rows (FOR UPDATE for a policy change, a deactivation, a
+ *     re-activation, a rename or a removal). A re-activation reads its key
+ *     once without a lock to learn which owner and endpoint rows to lock
+ *     first, then locks the key here and refuses if those have changed.
+ *  8. MCP server rows (FOR UPDATE, in uuid order, for an error reset). No
+ *     transaction that holds one takes a lock listed above it.
+ *  9. The audit row insert, last, in the same transaction.
  *
  * Every lock here is transaction-scoped (released at COMMIT or ROLLBACK, never
  * leaked past a process that dies mid-request) and database-wide, so separate

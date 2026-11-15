@@ -1,7 +1,7 @@
 import { isIP } from "node:net";
 
 import { ApiKeyCreateInput, ApiKeyUpdateInput } from "@repo/zod-types";
-import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { customAlphabet } from "nanoid";
 
@@ -12,6 +12,15 @@ import {
   type GlobalIpPolicy,
   type IpPolicyMode,
 } from "@/lib/api-key-ip-policy";
+import {
+  ApiKeyLifecycleRefusal,
+  assertLifecycleTarget,
+  assertReactivationPolicy,
+  assertRemovalConfirmed,
+  assertRenameName,
+  type LifecycleKeyRow,
+  removalBlocker,
+} from "@/lib/api-key-lifecycle-rules";
 import {
   AdminPlaneOwnerIneligible,
   ApiKeyMintRefusal,
@@ -56,6 +65,25 @@ function postgresFailure(error: unknown): {
 
 /** The unique constraint that makes a name unique per owner (schema.ts). */
 const NAME_PER_USER_CONSTRAINT = "api_keys_name_per_user_idx";
+
+/**
+ * The columns the key lifecycle rules read and a removal records
+ * (lib/api-key-lifecycle-rules `LifecycleKeyRow`). Never `key_hash`.
+ */
+const LIFECYCLE_COLUMNS = {
+  uuid: apiKeysTable.uuid,
+  name: apiKeysTable.name,
+  last4: apiKeysTable.last4,
+  is_active: apiKeysTable.is_active,
+  admin_plane: apiKeysTable.admin_plane,
+  user_id: apiKeysTable.user_id,
+  endpoint_uuid: apiKeysTable.endpoint_uuid,
+  acts_as_user_id: apiKeysTable.acts_as_user_id,
+  allowed_cidrs: apiKeysTable.allowed_cidrs,
+  ip_policy_mode: apiKeysTable.ip_policy_mode,
+  created_at: apiKeysTable.created_at,
+  last_used_at: apiKeysTable.last_used_at,
+};
 
 /**
  * The global IP policy, read live (one config query) only when a key with no
@@ -892,6 +920,238 @@ export class ApiKeysRepository {
       .where(eq(apiKeysTable.uuid, uuid))
       .for("update");
     return target ?? null;
+  }
+
+  /**
+   * One key as the lifecycle rules read it (lib/api-key-lifecycle-rules),
+   * without a lock: for the removal impact read, and for the first read of a
+   * re-activation, which learns which owner and endpoint rows to lock before
+   * it locks the key (the lock order in ./admin-plane-locks puts user and
+   * endpoint rows before key rows). Never the key's hash. Null when no key
+   * has that uuid.
+   */
+  async readLifecycleTarget(
+    uuid: string,
+    executor?: DbExecutor,
+  ): Promise<LifecycleKeyRow | null> {
+    const [row] = await (executor ?? db)
+      .select(LIFECYCLE_COLUMNS)
+      .from(apiKeysTable)
+      .where(eq(apiKeysTable.uuid, uuid));
+    return row ?? null;
+  }
+
+  /** The same row, locked FOR UPDATE in the caller's transaction. */
+  async lockLifecycleTarget(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<LifecycleKeyRow | null> {
+    const [row] = await tx
+      .select(LIFECYCLE_COLUMNS)
+      .from(apiKeysTable)
+      .where(eq(apiKeysTable.uuid, uuid))
+      .for("update");
+    return row ?? null;
+  }
+
+  /**
+   * Re-activate one DATA-plane key (`apiKeys.reactivate`), inside the caller's
+   * transaction, judged by lib/api-key-lifecycle-rules against rows locked
+   * here in the documented order: the owner's user row FOR SHARE and the
+   * endpoint row FOR SHARE (as the agent mint takes them, so a concurrent
+   * disable of the owner or change of the endpoint's restriction is ordered
+   * against this write), then the key row FOR UPDATE. The owner and endpoint
+   * of a key have no setter, so the first, unlocked read names the right rows;
+   * a locked row that names others is refused as a retryable conflict.
+   *
+   * Throws ApiKeyLifecycleRefusal for each rule. `unchanged` (the key is
+   * already active) writes nothing, so the caller records no event for it.
+   */
+  async reactivateDataPlaneKey(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<
+    | { status: "not_found" }
+    | { status: "unchanged" | "reactivated"; key: LifecycleKeyRow }
+  > {
+    const first = await this.readLifecycleTarget(uuid, tx);
+    if (!first) return { status: "not_found" };
+    // Judged before any lock is taken, so an admin-plane target never holds
+    // its owner's row; judged again on the locked row below.
+    assertLifecycleTarget(first, "reactivate");
+
+    const owner = first.user_id
+      ? ((
+          await tx
+            .select({
+              id: usersTable.id,
+              role: usersTable.role,
+              disabled: usersTable.disabled,
+            })
+            .from(usersTable)
+            .where(eq(usersTable.id, first.user_id))
+            .for("share")
+        )[0] ?? null)
+      : null;
+    const endpoint = first.endpoint_uuid
+      ? ((
+          await tx
+            .select({
+              uuid: endpointsTable.uuid,
+              user_id: endpointsTable.user_id,
+              restricted: endpointsTable.restricted,
+            })
+            .from(endpointsTable)
+            .where(eq(endpointsTable.uuid, first.endpoint_uuid))
+            .for("share")
+        )[0] ?? null)
+      : null;
+
+    const key = await this.lockLifecycleTarget(tx, uuid);
+    if (!key) return { status: "not_found" };
+    if (
+      key.user_id !== first.user_id ||
+      key.endpoint_uuid !== first.endpoint_uuid
+    ) {
+      throw new ApiKeyLifecycleRefusal("key_changed");
+    }
+    assertLifecycleTarget(key, "reactivate");
+    if (key.is_active) return { status: "unchanged", key };
+
+    // The agent mint's rules 3 and 4 (lib/api-key-mint-rules), re-run on the
+    // locked rows with the mint's own predicates.
+    if (!owner || owner.disabled !== false) {
+      throw new ApiKeyLifecycleRefusal("owner_ineligible");
+    }
+    try {
+      if (key.endpoint_uuid !== null) {
+        if (!endpoint)
+          throw new ApiKeyLifecycleRefusal("endpoint_not_eligible");
+        const ownerIsMappedMember =
+          endpoint.user_id === null && endpoint.restricted
+            ? await accessGroupsRepository.hasEndpointGrant(
+                owner.id,
+                endpoint.uuid,
+                tx,
+              )
+            : false;
+        assertEndpointEligible(endpoint, ownerIsMappedMember);
+      } else {
+        assertGatewayWideOwnerAllowed(owner);
+      }
+    } catch (error) {
+      if (error instanceof ApiKeyMintRefusal) {
+        throw new ApiKeyLifecycleRefusal(
+          error.rule === "gateway_wide_admin_owner"
+            ? "gateway_wide_admin_owner"
+            : "endpoint_not_eligible",
+        );
+      }
+      throw error;
+    }
+    // Rule 5: the key's own policy is already narrow, and the kill switch is
+    // off. Re-activation never changes the policy.
+    assertReactivationPolicy(key);
+
+    const [updated] = await tx
+      .update(apiKeysTable)
+      .set({ is_active: true })
+      .where(eq(apiKeysTable.uuid, uuid))
+      .returning(LIFECYCLE_COLUMNS);
+    if (!updated) return { status: "not_found" };
+    return { status: "reactivated", key: updated };
+  }
+
+  /**
+   * Rename one DATA-plane key (`apiKeys.rename`), inside the caller's
+   * transaction, with the key row locked FOR UPDATE. The name must be of the
+   * mint's shape and unused by any other key of the same owner, inactive keys
+   * included; for a public key (no owner) it is judged against the other
+   * public keys. The per-owner unique constraint backs the check against a
+   * concurrent rename to the same name; it does not cover public keys (a NULL
+   * owner is distinct to it), so for those this check is the only one.
+   * `unchanged` writes nothing.
+   */
+  async renameDataPlaneKey(
+    tx: DbTransaction,
+    uuid: string,
+    name: string,
+  ): Promise<
+    | { status: "not_found" }
+    | {
+        status: "unchanged" | "renamed";
+        before: LifecycleKeyRow;
+        after: LifecycleKeyRow;
+      }
+  > {
+    const before = await this.lockLifecycleTarget(tx, uuid);
+    if (!before) return { status: "not_found" };
+    assertLifecycleTarget(before, "rename");
+    assertRenameName(name);
+    if (name === before.name) {
+      return { status: "unchanged", before, after: before };
+    }
+    const [sameName] = await tx
+      .select({ uuid: apiKeysTable.uuid })
+      .from(apiKeysTable)
+      .where(
+        and(
+          before.user_id === null
+            ? isNull(apiKeysTable.user_id)
+            : eq(apiKeysTable.user_id, before.user_id),
+          eq(apiKeysTable.name, name),
+          ne(apiKeysTable.uuid, before.uuid),
+        ),
+      )
+      .limit(1);
+    if (sameName) throw new ApiKeyLifecycleRefusal("name_taken");
+    let after: LifecycleKeyRow | undefined;
+    try {
+      [after] = await tx
+        .update(apiKeysTable)
+        .set({ name })
+        .where(eq(apiKeysTable.uuid, uuid))
+        .returning(LIFECYCLE_COLUMNS);
+    } catch (error) {
+      const failure = postgresFailure(error);
+      if (
+        failure.code === "23505" &&
+        failure.constraint === NAME_PER_USER_CONSTRAINT
+      ) {
+        throw new ApiKeyLifecycleRefusal("name_taken");
+      }
+      throw error;
+    }
+    if (!after) return { status: "not_found" };
+    return { status: "renamed", before, after };
+  }
+
+  /**
+   * Remove one key (`apiKeys.remove`), leaf-only, inside the caller's
+   * transaction: the key row locked FOR UPDATE, then refused unless it is an
+   * inactive DATA-plane key whose current name and state fingerprint the
+   * caller confirmed (lib/api-key-lifecycle-rules). No table references a key
+   * row, so the delete cascades to nothing. Returns the row as it was.
+   */
+  async removeDataPlaneKey(
+    tx: DbTransaction,
+    uuid: string,
+    confirmName: string,
+    fingerprint: string,
+  ): Promise<
+    { status: "not_found" } | { status: "removed"; key: LifecycleKeyRow }
+  > {
+    const key = await this.lockLifecycleTarget(tx, uuid);
+    if (!key) return { status: "not_found" };
+    const blocker = removalBlocker(key);
+    if (blocker) throw new ApiKeyLifecycleRefusal(blocker);
+    assertRemovalConfirmed(key, confirmName, fingerprint);
+    const [deleted] = await tx
+      .delete(apiKeysTable)
+      .where(eq(apiKeysTable.uuid, uuid))
+      .returning({ uuid: apiKeysTable.uuid });
+    if (!deleted) return { status: "not_found" };
+    return { status: "removed", key };
   }
 
   /**
