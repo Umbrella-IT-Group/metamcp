@@ -59,7 +59,7 @@ const EXPECTED_SYNC = [
   "frontend.tools.getByMcpServerUuid",
 ];
 
-// TEST-EDIT (full-management plan 1A item 6): the operator set gains its two
+// TEST-EDIT (verification reads): the operator set gains its two
 // verification reads, `audit.list` and `apiKeys.operatorCapabilities`, pinned
 // here by name (36 to 38). The sync set is unchanged.
 const EXPECTED_OPERATOR_EXTRA = [
@@ -99,10 +99,13 @@ const EXPECTED_OPERATOR = [...EXPECTED_SYNC, ...EXPECTED_OPERATOR_EXTRA];
 // tooling sends, so input validation passes and the scope check is what
 // decides.
 //
-// TEST-EDIT (change reason, full-management plan 1A item 5): every mutation
+// TEST-EDIT (change reason): every mutation
 // input carries a `reason`, as the operator's tooling now sends it: an
 // operator-scope key's change without one is refused before it runs, which
-// is pinned in admin-plane-change-context.test.ts, not here.
+// is pinned in admin-plane-classification.test.ts ("refuses an operator-scope
+// key's change without a reason, before it runs") and in the "refuses an
+// operator change without a reason" case of
+// admin-plane-rails.integration.test.ts, not here.
 const VALID_INPUTS: Record<string, unknown> = {
   "frontend.audit.list": undefined,
   "frontend.apiKeys.operatorCapabilities": undefined,
@@ -288,7 +291,7 @@ const appRouter = createAppRouter({
     config: stubRouter(),
     logs: stubRouter(),
     accessGroups: stubRouter(),
-    // TEST-EDIT (plan 1A item 6): the new audit router's stub, so the
+    // TEST-EDIT (verification reads): the new audit router's stub, so the
     // operator's audit.list read reaches it like every other allowed call.
     audit: stubRouter(),
   } as unknown as Parameters<typeof createAppRouter>[0]["frontend"],

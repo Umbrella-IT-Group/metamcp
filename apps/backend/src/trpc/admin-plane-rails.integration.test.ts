@@ -21,6 +21,8 @@
  * then lets go. Postgres grants a queued lock in arrival order, so the first
  * request sent is the first served.
  */
+import { randomBytes } from "node:crypto";
+
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -47,6 +49,7 @@ vi.mock("../lib/metamcp/metamcp-server-pool", () => ({
   metaMcpServerPool: {
     ensureIdleServerForNewNamespace: vi.fn().mockResolvedValue(undefined),
     cleanupIdleServer: vi.fn().mockResolvedValue(undefined),
+    invalidateIdleServer: vi.fn().mockResolvedValue(undefined),
     invalidateIdleServers: vi.fn().mockResolvedValue(undefined),
     invalidateOpenApiSessions: vi.fn().mockResolvedValue(undefined),
   },
@@ -397,6 +400,162 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
         expect({ who, code: reply.code }).toEqual({ who, code: "CONFLICT" });
       }
       expect((await row(mover)).namespace_uuid).toBe(otherNs);
+    });
+
+    it("judges an operator key's move of a restricted endpoint out of its namespace as opening that namespace", async () => {
+      // The guard of a namespace moved out is the same loss of protection as
+      // un-restricting it: afterwards an open create over the namespace would
+      // be allowed. Refused unless another restricted endpoint stays behind or
+      // the key's own recent restriction applies, exactly as for the literal
+      // un-restrict.
+      const source = await fx.namespace(uniq("move-out"));
+      const target = await fx.namespace(uniq("move-out-target"));
+      const guard = await fx.endpoint({
+        name: uniq("guard"),
+        restricted: true,
+        namespaceUuid: source,
+      });
+      const refused = await move("operator", guard, target);
+      expect({ status: refused.status, code: refused.code }).toEqual({
+        status: 403,
+        code: "FORBIDDEN",
+      });
+      expect(refused.message).toBe(
+        "An admin-plane API key can open an endpoint only to roll back a restriction it made itself in the last 24 hours. Do this in the admin UI.",
+      );
+      expect((await row(guard)).namespace_uuid).toBe(source);
+      const denied = await fx.auditNow(
+        `action = 'endpoint.update' AND outcome = 'denied' AND target_id = $1`,
+        [guard],
+      );
+      expect(denied.at(-1)?.detail).toMatchObject({
+        rule: "admin_plane_unrestrict",
+      });
+      // The namespace is still guarded, so the follow-up open create over it
+      // stays refused for the key and for a person.
+      for (const who of ["operator", "human"] as const) {
+        const open = uniq(`follow-up-${who}`);
+        expect((await create(who, open, source)).code).toBe("CONFLICT");
+        expect(await byName(open)).toBeUndefined();
+      }
+    });
+
+    it("lets an operator key move a restricted endpoint out while another restricted endpoint keeps the namespace guarded", async () => {
+      const source = await fx.namespace(uniq("move-out-pair"));
+      const target = await fx.namespace(uniq("move-out-pair-target"));
+      const stays = await fx.endpoint({
+        name: uniq("stays"),
+        restricted: true,
+        namespaceUuid: source,
+      });
+      const leaves = await fx.endpoint({
+        name: uniq("leaves"),
+        restricted: true,
+        namespaceUuid: source,
+      });
+      expect(ok(await move("operator", leaves, target))).toBe(true);
+      expect((await row(leaves)).namespace_uuid).toBe(target);
+      expect((await row(stays)).namespace_uuid).toBe(source);
+      const open = uniq("follow-up");
+      expect((await create("operator", open, source)).code).toBe("CONFLICT");
+      expect(await byName(open)).toBeUndefined();
+      // Now `stays` is the only guard left: it may not leave.
+      const elsewhere = await fx.namespace(uniq("move-out-pair-elsewhere"));
+      expect((await move("operator", stays, elsewhere)).code).toBe("FORBIDDEN");
+      expect((await row(stays)).namespace_uuid).toBe(source);
+    });
+
+    it("lets an operator key move an open endpoint out of a namespace, and a person move any endpoint out", async () => {
+      const source = await fx.namespace(uniq("move-out-open"));
+      const target = await fx.namespace(uniq("move-out-open-target"));
+      const open = await fx.endpoint({
+        name: uniq("open"),
+        namespaceUuid: source,
+      });
+      expect(ok(await move("operator", open, target))).toBe(true);
+      expect((await row(open)).namespace_uuid).toBe(target);
+
+      const guarded = await fx.namespace(uniq("move-out-person"));
+      const away = await fx.namespace(uniq("move-out-person-target"));
+      const guard = await fx.endpoint({
+        name: uniq("guard"),
+        restricted: true,
+        namespaceUuid: guarded,
+      });
+      expect(ok(await move("human", guard, away))).toBe(true);
+      expect((await row(guard)).namespace_uuid).toBe(away);
+    });
+
+    it("applies the key's own 24-hour provenance to a move out exactly as to un-restricting", async () => {
+      const restrictedByKey = async (stem: string) => {
+        const ns = await fx.namespace(uniq(stem));
+        const ep = await fx.endpoint({ name: uniq(stem), namespaceUuid: ns });
+        expect(ok(await restrict("operator", ep, true))).toBe(true);
+        return { ns, ep };
+      };
+
+      // Its own fresh restriction: the move out is allowed and the marker goes
+      // with it, so the key cannot roll the endpoint back over the new place.
+      const fresh = await restrictedByKey("prov-fresh");
+      const freshTarget = await fx.namespace(uniq("prov-fresh-target"));
+      expect(ok(await move("operator", fresh.ep, freshTarget))).toBe(true);
+      expect(await row(fresh.ep)).toMatchObject({
+        namespace_uuid: freshTarget,
+        restricted: true,
+        restricted_by_api_key_uuid: null,
+      });
+
+      // Older than 24 hours: refused.
+      const old = await restrictedByKey("prov-old");
+      await one(
+        `UPDATE endpoints SET restricted_at = now() - interval '25 hours' WHERE uuid = $1`,
+        [old.ep],
+      );
+      const oldTarget = await fx.namespace(uniq("prov-old-target"));
+      expect((await move("operator", old.ep, oldTarget)).code).toBe(
+        "FORBIDDEN",
+      );
+      expect((await row(old.ep)).namespace_uuid).toBe(old.ns);
+
+      // The key's restriction repeated by a person is the person's: refused.
+      const taken = await restrictedByKey("prov-taken");
+      expect(ok(await restrict("human", taken.ep, true))).toBe(true);
+      const takenTarget = await fx.namespace(uniq("prov-taken-target"));
+      expect((await move("operator", taken.ep, takenTarget)).code).toBe(
+        "FORBIDDEN",
+      );
+      expect((await row(taken.ep)).namespace_uuid).toBe(taken.ns);
+    });
+
+    it("judges a move out against the source namespace as a person's concurrent move left it", async () => {
+      // Two guards over one namespace, one moved out by a person while the
+      // key moves the other: whichever commits first decides what the second
+      // sees under the namespace lock.
+      const source = await fx.namespace(uniq("move-race"));
+      const targetA = await fx.namespace(uniq("move-race-a"));
+      const targetB = await fx.namespace(uniq("move-race-b"));
+      const personsGuard = await fx.endpoint({
+        name: uniq("persons"),
+        restricted: true,
+        namespaceUuid: source,
+      });
+      const keysGuard = await fx.endpoint({
+        name: uniq("keys"),
+        restricted: true,
+        namespaceUuid: source,
+      });
+      const lock = `SELECT pg_advisory_lock(hashtext('metamcp.endpoint.namespace'), hashtext('${source}'))`;
+      const unlock = `SELECT pg_advisory_unlock(hashtext('metamcp.endpoint.namespace'), hashtext('${source}'))`;
+      const [persons, keys] = await raceBehind(
+        lock,
+        unlock,
+        () => move("human", personsGuard, targetA),
+        () => move("operator", keysGuard, targetB),
+      );
+      expect(ok(persons)).toBe(true);
+      expect(keys.code).toBe("FORBIDDEN");
+      expect((await row(keysGuard)).namespace_uuid).toBe(source);
+      expect((await row(personsGuard)).namespace_uuid).toBe(targetA);
     });
 
     it("refuses opening an endpoint while a sibling stays restricted, and lets a person open the last one", async () => {
@@ -852,6 +1011,360 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
           [ep],
         ),
       ).toHaveLength(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe("group delete against a grant being added", () => {
+    it("waits for a member or mapping insert in flight, then refuses the delete with the group and the new row intact", async () => {
+      // The delete counts what it would cascade to under a row lock on the
+      // group: an insert whose foreign key check is already holding the group
+      // row waits the delete out, so the delete sees the committed row. Without
+      // that lock the count is read as it was before the insert committed, the
+      // delete statement then waits for it and cascades it away, and the key's
+      // delete succeeds over a grant it never saw.
+      const ep = await fx.endpoint({
+        name: uniq("barrier-ep"),
+        namespaceUuid: await fx.namespace(uniq("barrier")),
+      });
+      const inserts = [
+        {
+          label: "member",
+          insert: `INSERT INTO access_group_members (group_uuid, user_id) VALUES ($1, $2)`,
+          other: fx.memberId,
+          present: `SELECT 1 FROM access_group_members WHERE group_uuid = $1`,
+        },
+        {
+          label: "mapping",
+          insert: `INSERT INTO access_group_endpoints (group_uuid, endpoint_uuid) VALUES ($1, $2)`,
+          other: ep,
+          present: `SELECT 1 FROM access_group_endpoints WHERE group_uuid = $1`,
+        },
+      ];
+      for (const step of inserts) {
+        const group = await fx.group({ name: uniq(`barrier-${step.label}`) });
+        const writer = new Client({ connectionString: TEST_DATABASE_URL });
+        await writer.connect();
+        let pending: Promise<Reply>;
+        try {
+          await writer.query("BEGIN");
+          await writer.query(step.insert, [group, step.other]);
+          pending = operator("accessGroups.delete", { uuid: group });
+          await waitForLockWaiters(1);
+          await writer.query("COMMIT");
+        } catch (error) {
+          await writer.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        } finally {
+          await writer.end();
+        }
+        const reply = await pending;
+        expect({
+          step: step.label,
+          status: reply.status,
+          code: reply.code,
+        }).toEqual({ step: step.label, status: 409, code: "CONFLICT" });
+        expect(
+          await one(`SELECT 1 FROM access_groups WHERE uuid = $1`, [group]),
+        ).toHaveLength(1);
+        expect(await one(step.present, [group])).toHaveLength(1);
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe("the before-state of an update", () => {
+    const CREDENTIALS = {
+      envOld: "SENTINEL-ENV-OLD-6e1b",
+      envNew: "SENTINEL-ENV-NEW-41c8",
+      headerOld: "SENTINEL-HDR-OLD-93ac",
+      headerNew: "SENTINEL-HDR-NEW-5d07",
+      bearerOld: "SENTINEL-BEARER-OLD-2d70",
+      bearerNew: "SENTINEL-BEARER-NEW-8b3f",
+      argOld: "SENTINEL-ARG-OLD-b514",
+      argNew: "SENTINEL-ARG-NEW-17e9",
+      urlOld: "sentinel-old-7c0e.example.test",
+      urlNew: "sentinel-new-a3f6.example.test",
+    };
+    const serverUuids: string[] = [];
+    let priorKek: string | undefined;
+
+    beforeAll(() => {
+      // The server's bearer token is encrypted at rest under this key.
+      priorKek = process.env.M365_TOKEN_KEK;
+      process.env.M365_TOKEN_KEK = randomBytes(32).toString("base64");
+    });
+    afterAll(async () => {
+      if (priorKek === undefined) delete process.env.M365_TOKEN_KEK;
+      else process.env.M365_TOKEN_KEK = priorKek;
+      for (const uuid of serverUuids) {
+        await one(`DELETE FROM mcp_servers WHERE uuid = $1`, [uuid]);
+      }
+    });
+
+    const newServer = async () => {
+      const name = uniq("bs-server");
+      const [row] = await one(
+        `INSERT INTO mcp_servers (name, type, url, args, env, headers, bearer_token)
+         VALUES ($1, 'STREAMABLE_HTTP', $2, $3, $4::jsonb, $5::jsonb, $6)
+         RETURNING uuid`,
+        [
+          name,
+          `https://${CREDENTIALS.urlOld}/mcp`,
+          [CREDENTIALS.argOld],
+          JSON.stringify({ TOKEN: CREDENTIALS.envOld }),
+          JSON.stringify({ Authorization: `Bearer ${CREDENTIALS.headerOld}` }),
+          CREDENTIALS.bearerOld,
+        ],
+      );
+      serverUuids.push(row.uuid as string);
+      return { uuid: row.uuid as string, name };
+    };
+
+    /** The one success row of an action on a target, read through audit.list. */
+    const rowThroughAuditList = async (action: string, targetId: string) => {
+      const reply = await fx.trpc(
+        "frontend.audit.list",
+        { action, target_id: targetId, outcome: "success" },
+        "query",
+      );
+      expect(reply.status).toBe(200);
+      const rows = (
+        reply.data as {
+          rows: Array<{ detail: Record<string, unknown> }>;
+        }
+      ).rows;
+      expect(rows).toHaveLength(1);
+      return rows[0].detail;
+    };
+
+    it("records the previous value of each changed field of an endpoint update, a move included", async () => {
+      const from = await fx.namespace(uniq("bs-from"));
+      const to = await fx.namespace(uniq("bs-to"));
+      const ep = await fx.endpoint({
+        name: uniq("bs-ep"),
+        namespaceUuid: from,
+      });
+      const name = await (async () =>
+        (await one(`SELECT name FROM endpoints WHERE uuid = $1`, [ep]))[0]
+          .name as string)();
+      const reply = await operator("endpoints.update", {
+        uuid: ep,
+        name,
+        description: "a described endpoint",
+        namespaceUuid: to,
+        enableApiKeyAuth: true,
+        requireScopedApiKey: true,
+        enableMaxRate: false,
+        enableClientMaxRate: false,
+        enableOauth: false,
+      });
+      expect(ok(reply)).toBe(true);
+      const detail = await rowThroughAuditList("endpoint.update", ep);
+      expect(detail).toMatchObject({
+        changed_fields: [
+          "description",
+          "namespace_uuid",
+          "require_scoped_api_key",
+        ],
+        old_value: {
+          description: null,
+          namespace_uuid: from,
+          require_scoped_api_key: false,
+        },
+        new_value: {
+          description: "a described endpoint",
+          namespace_uuid: to,
+          require_scoped_api_key: true,
+        },
+      });
+      // A field the write left alone is not in the pair.
+      expect(
+        (detail.old_value as Record<string, unknown>).enable_oauth,
+      ).toBeUndefined();
+    });
+
+    it("records the previous name, description and server list of a namespace update, the list compared as a set", async () => {
+      const [a, b] = [await newServer(), await newServer()];
+      const ns = await fx.namespace(uniq("bs-ns"));
+      await one(
+        `INSERT INTO namespace_server_mappings (namespace_uuid, mcp_server_uuid, status) VALUES ($1, $2, 'ACTIVE')`,
+        [ns, a.uuid],
+      );
+      const before = (
+        await one(`SELECT name FROM namespaces WHERE uuid = $1`, [ns])
+      )[0].name as string;
+      const renamed = uniq("bs-ns-renamed");
+      expect(
+        ok(
+          await operator("namespaces.update", {
+            uuid: ns,
+            name: renamed,
+            description: "now described",
+            mcpServerUuids: [b.uuid, a.uuid],
+          }),
+        ),
+      ).toBe(true);
+      const detail = await rowThroughAuditList("namespace.update", ns);
+      expect(detail).toMatchObject({
+        changed_fields: ["description", "name", "server_uuids"],
+        old_value: {
+          name: before,
+          description: null,
+          server_uuids: [a.uuid],
+        },
+        new_value: {
+          name: renamed,
+          description: "now described",
+          server_uuids: [a.uuid, b.uuid].sort(),
+        },
+      });
+
+      // The same list in another order, and a list left out, change nothing.
+      expect(
+        ok(
+          await operator("namespaces.update", {
+            uuid: ns,
+            name: renamed,
+            description: "now described",
+            mcpServerUuids: [a.uuid, b.uuid],
+          }),
+        ),
+      ).toBe(true);
+      expect(
+        ok(
+          await operator("namespaces.update", {
+            uuid: ns,
+            name: renamed,
+            description: "now described",
+          }),
+        ),
+      ).toBe(true);
+      const rows = (
+        await fx.trpc(
+          "frontend.audit.list",
+          { action: "namespace.update", target_id: ns, outcome: "success" },
+          "query",
+        )
+      ).data as { rows: Array<{ detail: Record<string, unknown> }> };
+      const noops = rows.rows.filter(
+        (row) => (row.detail.changed_fields as string[]).length === 0,
+      );
+      expect(noops).toHaveLength(2);
+    });
+
+    it("records the previous name and description of an access group update", async () => {
+      const group = await fx.group({ name: uniq("bs-group") });
+      const before = (
+        await one(`SELECT name FROM access_groups WHERE uuid = $1`, [group])
+      )[0].name as string;
+      const renamed = uniq("bs-group-renamed");
+      expect(
+        ok(
+          await operator("accessGroups.update", {
+            uuid: group,
+            name: renamed,
+            description: "who may read the books",
+          }),
+        ),
+      ).toBe(true);
+      expect(await rowThroughAuditList("group.update", group)).toMatchObject({
+        changed_fields: ["description", "name"],
+        old_value: { name: before, description: null },
+        new_value: { name: renamed, description: "who may read the books" },
+      });
+    });
+
+    it("records the previous status of a tool a namespace update turned off", async () => {
+      const server = await newServer();
+      const ns = await fx.namespace(uniq("bs-tool-ns"));
+      const [tool] = await one(
+        `INSERT INTO tools (name, mcp_server_uuid, tool_schema) VALUES ($1, $2, '{"type":"object"}'::jsonb) RETURNING uuid`,
+        [uniq("bs-tool"), server.uuid],
+      );
+      await one(
+        `INSERT INTO namespace_tool_mappings (namespace_uuid, tool_uuid, mcp_server_uuid, status) VALUES ($1, $2, $3, 'ACTIVE')`,
+        [ns, tool.uuid, server.uuid],
+      );
+      expect(
+        ok(
+          await operator("namespaces.updateToolStatus", {
+            namespaceUuid: ns,
+            toolUuid: tool.uuid,
+            serverUuid: server.uuid,
+            status: "INACTIVE",
+          }),
+        ),
+      ).toBe(true);
+      expect(
+        await rowThroughAuditList("namespace.tool_status", ns),
+      ).toMatchObject({
+        changed_fields: ["status"],
+        old_value: { status: "ACTIVE" },
+        new_value: { status: "INACTIVE" },
+      });
+    });
+
+    it("names a changed server credential field and stores no credential value, old or new, in the row or its read-back", async () => {
+      const server = await newServer();
+      const reply = await operator("mcpServers.update", {
+        uuid: server.uuid,
+        name: server.name,
+        description: "a described server",
+        type: "STREAMABLE_HTTP",
+        url: `https://${CREDENTIALS.urlNew}/mcp`,
+        args: [CREDENTIALS.argNew],
+        env: { TOKEN: CREDENTIALS.envNew },
+        headers: { Authorization: `Bearer ${CREDENTIALS.headerNew}` },
+        bearerToken: CREDENTIALS.bearerNew,
+      });
+      expect(ok(reply)).toBe(true);
+
+      const detail = await rowThroughAuditList("mcpserver.update", server.uuid);
+      expect(detail).toMatchObject({
+        changed_fields: [
+          "args",
+          "bearer_token",
+          "description",
+          "env",
+          "headers",
+          "url",
+        ],
+        old_value: { description: null },
+        new_value: { description: "a described server" },
+      });
+      // Only the plain field is a value; no credential field is in the pair.
+      for (const pair of ["old_value", "new_value"] as const) {
+        expect(Object.keys(detail[pair] as object)).toEqual(["description"]);
+      }
+
+      // The stored row, in full, and the read-back both hold no value.
+      const [stored] = await one(
+        `SELECT detail::text AS text FROM audit_log
+          WHERE action = 'mcpserver.update' AND target_id = $1`,
+        [server.uuid],
+      );
+      for (const value of Object.values(CREDENTIALS)) {
+        expect(stored.text).not.toContain(value);
+        expect(JSON.stringify(detail)).not.toContain(value);
+      }
+      // The ciphertext the bearer token is stored as is not recorded either.
+      expect(stored.text).not.toContain("enc:v1");
+    });
+
+    it("records a credential field cleared as changed and an untouched credential as not", async () => {
+      const server = await newServer();
+      const reply = await operator("mcpServers.update", {
+        uuid: server.uuid,
+        name: server.name,
+        type: "STREAMABLE_HTTP",
+        url: `https://${CREDENTIALS.urlOld}/mcp`,
+        clearBearerToken: true,
+      });
+      expect(ok(reply)).toBe(true);
+      const detail = await rowThroughAuditList("mcpserver.update", server.uuid);
+      expect(detail.changed_fields).toEqual(["bearer_token"]);
+      expect(JSON.stringify(detail)).not.toContain(CREDENTIALS.bearerOld);
     });
   });
 

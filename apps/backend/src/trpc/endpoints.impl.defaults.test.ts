@@ -59,7 +59,7 @@ vi.mock("../lib/audit/admin-event", () => ({
   emitAdminEvent: vi.fn(),
 }));
 
-// TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2): every
+// TEST-EDIT (endpoint namespace gate): every
 // endpoint create and update now runs in one transaction for every actor and
 // asks the gate under the namespace lock (db/repositories/endpoint-gate.repo).
 // The stand-ins answer as a namespace with no other restricted or private

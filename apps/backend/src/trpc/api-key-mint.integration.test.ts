@@ -349,8 +349,7 @@ describeIfDb(
           target_type: "api_key",
           outcome: "success",
         });
-        // TEST-EDIT (change reason and budget, full-management plan 1A items
-        // 4 and 5): every admin-plane change's row now also carries the
+        // TEST-EDIT (change reason and budget): every admin-plane change's row now also carries the
         // caller's reason and the budget class it was counted in.
         expect(rows[0].detail).toEqual({
           name,
@@ -1565,7 +1564,7 @@ describeIfDb(
             ).status,
           ).toBe(403);
         } finally {
-          // TEST-EDIT (IP rail, full-management plan 1A item 1): an
+          // TEST-EDIT (IP rail): an
           // admin-plane key may now only NARROW an admin-plane key's policy,
           // its own included, so the key's own attempt to go back to following
           // the global policy is refused and changes nothing. The suite then
@@ -1650,7 +1649,7 @@ describeIfDb(
           // staged over HTTP, because the gateway would refuse the call itself;
           // api-keys.impl.rails.test.ts covers it.)
           //
-          // TEST-EDIT (IP rail, full-management plan 1A item 1): following the
+          // TEST-EDIT (IP rail): following the
           // global policy is no longer a change an admin-plane key may make to
           // an admin-plane key's policy, even one that already follows it, so
           // this step is now refused, with nothing written.
@@ -1804,7 +1803,7 @@ describeIfDb(
             target_id: null,
             outcome: "denied",
           });
-          // TEST-EDIT (change reason, full-management plan 1A item 5): the
+          // TEST-EDIT (change reason): the
           // caller's reason now rides on its denied row too, so the trail
           // says why a refused change was attempted. Still nothing of the
           // request itself.
@@ -2013,7 +2012,7 @@ describeIfDb(
         });
       });
 
-      // TEST-EDIT (IP rail, full-management plan 1A item 1, a deliberate
+      // TEST-EDIT (IP rail, a deliberate
       // reversal of part of this case): it pinned that an admin-plane key
       // could set an admin-plane key's policy to anything, the any-IP
       // exemption and following the global policy included. An admin-plane
@@ -2174,7 +2173,7 @@ describeIfDb(
         const name = `clone-${fx.run}`;
         const reply = await createEndpoint(name, fx.publicNamespaceUuid);
 
-        // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2):
+        // TEST-EDIT (endpoint namespace gate):
         // the refusal is now a coded CONFLICT (HTTP 409), not `success: false`
         // inside an HTTP 200, which a caller's tooling cannot tell from an
         // unknown outcome. The namespace holds a restricted endpoint, so the
@@ -2219,8 +2218,7 @@ describeIfDb(
           "mutation",
         );
 
-        // TEST-EDIT (endpoint namespace gate, full-management plan 1A item
-        // 2): a coded CONFLICT, not `success: false` inside an HTTP 200.
+        // TEST-EDIT (endpoint namespace gate): a coded CONFLICT, not `success: false` inside an HTTP 200.
         expect({ status: reply.status, code: reply.code }).toEqual({
           status: 409,
           code: "CONFLICT",
@@ -2228,7 +2226,7 @@ describeIfDb(
         expect((await endpointRow(name))?.namespace_uuid).toBe(freshNamespace);
       });
 
-      // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2,
+      // TEST-EDIT (endpoint namespace gate,
       // a deliberate reversal): this case pinned that an administrator's
       // session was not held to the rule. The gate now applies to every
       // writer, a person's session included, because the race it closes is

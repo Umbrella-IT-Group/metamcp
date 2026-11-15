@@ -25,8 +25,13 @@ import { EndpointsSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { AdminRuleRefusal, withAdminAuditTx } from "../lib/audit/admin-write";
 import {
+  describeUpdate,
+  ENDPOINT_UPDATE_FIELDS,
+} from "../lib/audit/before-state";
+import {
   ENDPOINT_GATE_REFUSALS,
   type EndpointGateRule,
+  isOwnRecentRestriction,
   judgeEndpointCreate,
   judgeEndpointMove,
 } from "../lib/endpoint-namespace-gate";
@@ -611,12 +616,27 @@ export const endpointsImplementations = {
                     input.uuid,
                   )
                 : false;
+            // The source side, asked only when an admin-plane key moves a
+            // restricted endpoint: does the namespace it leaves stay guarded?
+            const sourceRestrictedSibling =
+              Boolean(actor?.admin_plane) && locked.restricted
+                ? await endpointGateRepository.restrictedSiblingExists(
+                    tx,
+                    locked.namespace_uuid,
+                    input.uuid,
+                  )
+                : false;
             const rule = judgeEndpointMove({
               restricted: locked.restricted,
               isPublic,
               adminPlane: Boolean(actor?.admin_plane),
               restrictedSibling,
               gatedSibling,
+              sourceRestrictedSibling,
+              rollbackEligible: isOwnRecentRestriction(
+                locked,
+                actor?.admin_plane?.key_uuid ?? null,
+              ),
             });
             if (rule) throw gateRefusal(rule, "endpoint.update", input.uuid);
           }
@@ -646,20 +666,22 @@ export const endpointsImplementations = {
           if (isMove) {
             await endpointGateRepository.clearRestrictionKey(tx, input.uuid);
           }
-          return { updated, moved: isMove };
+          return { updated, previous: locked.row };
         },
-        ({ updated, moved: isMove }) => ({
+        ({ updated, previous }) => ({
           action: "endpoint.update",
           target_type: "endpoint",
           target_id: updated.uuid,
           detail: {
             name: updated.name,
             namespace_uuid: input.namespaceUuid,
-            // Before and after, so a move is visible from this row alone.
-            ...(isMove ? { previous_namespace_uuid: fromNamespace } : {}),
             enable_api_key_auth: input.enableApiKeyAuth,
             require_scoped_api_key: requireScopedApiKey,
             enable_oauth: input.enableOauth,
+            // The previous and new value of every field this write changed
+            // (a move included, as `namespace_uuid`), read under the
+            // endpoint's row lock.
+            ...describeUpdate(previous, updated, ENDPOINT_UPDATE_FIELDS),
           },
         }),
       );

@@ -79,7 +79,7 @@ vi.mock("../db/index", () => ({
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: txAudit.record,
 }));
-// TEST-EDIT (change budget, full-management plan 1A item 4): an admin-plane
+// TEST-EDIT (change budget): an admin-plane
 // change now opens the key's change budget inside its transaction (a lock and
 // a count statement), which this suite's stand-in transaction cannot run. The
 // budget is pinned in admin-plane-budget.test.ts and against Postgres in
@@ -367,7 +367,7 @@ describe("setIpPolicy outside the rail", () => {
     await setPolicy(OTHER_UUID, ["198.51.100.0/24"], "enforce", actor());
 
     expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
-    // TEST-EDIT (IP rail, full-management plan 1A item 1): the global
+    // TEST-EDIT (IP rail): the global
     // policy is now read under its shared config locks for EVERY admin-plane
     // policy change, before the target's row lock, so the lock order holds
     // whatever the target turns out to be (db/repositories/admin-plane-locks).
@@ -493,7 +493,7 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
     expect(uuid).toBe(OTHER_UUID);
   });
 
-  // TEST-EDIT (IP rail, full-management plan 1A item 1, a deliberate
+  // TEST-EDIT (IP rail, a deliberate
   // reversal): these cases pinned that an admin-plane key could leave an
   // admin-plane key's policy anything at all. It may now only NARROW one:
   // the any-IP exemption, mode off and following the global policy are
@@ -548,7 +548,7 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
-  // TEST-EDIT (IP rail, full-management plan 1A item 1, a deliberate
+  // TEST-EDIT (IP rail, a deliberate
   // reversal): the calling key's own row is now locked and read, because the
   // rail judges its own change against its current policy. It is locked AFTER
   // the config locks (the global policy is read first), which is the order

@@ -31,9 +31,14 @@ import {
   withAdminAuditTx,
 } from "../lib/audit/admin-write";
 import { clampAuditText } from "../lib/audit/audit-emitter";
+import {
+  ACCESS_GROUP_UPDATE_FIELDS,
+  describeUpdate,
+} from "../lib/audit/before-state";
 import { invalidateEndpointAccessCache } from "../lib/endpoint-access-control";
 import {
   ENDPOINT_GATE_REFUSALS,
+  isOwnRecentRestriction,
   judgeEndpointUnrestrict,
 } from "../lib/endpoint-namespace-gate";
 
@@ -292,7 +297,7 @@ export const accessGroupsImplementations = {
       const updated = await withAdminAudit(
         actor,
         (...tx) =>
-          accessGroupsRepository.update(
+          accessGroupsRepository.updateReportingPrevious(
             {
               uuid: input.uuid,
               name: input.name,
@@ -300,13 +305,22 @@ export const accessGroupsImplementations = {
             },
             ...tx,
           ),
-        (group) =>
-          group
+        (written) =>
+          written
             ? {
                 action: "group.update",
                 target_type: "access_group",
-                target_id: group.uuid,
-                detail: { name: clampAuditText(group.name, 100) },
+                target_id: written.group.uuid,
+                detail: {
+                  name: clampAuditText(written.group.name, 100),
+                  // The previous and new value of each field this write
+                  // changed, read under the group's row lock.
+                  ...describeUpdate(
+                    written.previous,
+                    written.group,
+                    ACCESS_GROUP_UPDATE_FIELDS,
+                  ),
+                },
               }
             : null,
       );
@@ -703,11 +717,7 @@ export const accessGroupsImplementations = {
             const rule = judgeEndpointUnrestrict({
               adminPlane: actorKeyUuid !== null,
               restrictedSibling,
-              rollbackEligible:
-                actorKeyUuid !== null &&
-                locked.restricted_by_api_key_uuid?.toLowerCase() ===
-                  actorKeyUuid &&
-                locked.restriction_recent === true,
+              rollbackEligible: isOwnRecentRestriction(locked, actorKeyUuid),
             });
             if (rule) {
               const { code, message } = ENDPOINT_GATE_REFUSALS[rule];

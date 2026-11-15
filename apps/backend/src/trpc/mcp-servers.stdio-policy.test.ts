@@ -142,6 +142,8 @@ beforeEach(() => {
   repo.updateReportingChange.mockImplementation(
     async (input: Record<string, unknown>) => ({
       server: row({ ...input }),
+      // TEST-EDIT (SPEC): the locked write also reports the row as it was, for the audit row's before-state.
+      previous: row(),
       destinationOrCredentialChanged: false,
       ownershipChanged: false,
     }),

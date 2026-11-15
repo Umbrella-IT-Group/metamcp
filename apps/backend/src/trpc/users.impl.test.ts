@@ -43,7 +43,7 @@ vi.mock("../db/repositories", () => ({
   usersRepository: usersRepoMock,
 }));
 
-// TEST-EDIT (account rails, full-management plan 1A item 3): an account
+// TEST-EDIT (account rails): an account
 // change now runs in one transaction that locks the enabled administrators
 // and the target first and judges the rails on them. The stand-ins below
 // answer as the rows would for an enabled member target with two enabled
@@ -206,7 +206,7 @@ describe("usersImplementations.setDisabled", () => {
       ADMIN_ID,
     );
 
-    // TEST-EDIT (account rails, full-management plan 1A item 3): the write
+    // TEST-EDIT (account rails): the write
     // now also receives the transaction the rails ran in (the last argument).
     expect(usersRepoMock.setDisabled).toHaveBeenCalledWith(
       TARGET_ID,
@@ -232,7 +232,7 @@ describe("usersImplementations.setDisabled", () => {
       ADMIN_ID,
     );
 
-    // TEST-EDIT (account rails, full-management plan 1A item 3): the write
+    // TEST-EDIT (account rails): the write
     // now also receives the transaction the rails ran in (the last argument).
     expect(usersRepoMock.setDisabled).toHaveBeenCalledWith(
       TARGET_ID,
@@ -280,7 +280,7 @@ describe("usersImplementations.revokeAccess", () => {
       ADMIN_ID,
     );
 
-    // TEST-EDIT (account rails, full-management plan 1A item 3): the write
+    // TEST-EDIT (account rails): the write
     // now also receives the transaction the rails ran in (the last argument).
     expect(usersRepoMock.revokeAccess).toHaveBeenCalledWith(TARGET_ID, {
       id: "tx",
@@ -350,7 +350,7 @@ describe("usersImplementations.delete", () => {
       ADMIN_ID,
     );
 
-    // TEST-EDIT (account rails, full-management plan 1A item 3): the write
+    // TEST-EDIT (account rails): the write
     // now also receives the transaction the rails ran in (the last argument).
     expect(usersRepoMock.deleteById).toHaveBeenCalledWith(TARGET_ID, {
       id: "tx",

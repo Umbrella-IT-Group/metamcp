@@ -140,6 +140,9 @@ const reported = (
 ) =>
   ({
     server,
+    // TEST-EDIT (SPEC): the locked write also reports the row as it was, for
+    // the audit row's before-state; these cases do not look at it.
+    previous: server,
     destinationOrCredentialChanged: false,
     ownershipChanged: false,
     ...changes,

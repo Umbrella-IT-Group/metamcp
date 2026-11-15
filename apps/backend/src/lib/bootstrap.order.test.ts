@@ -125,7 +125,7 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
   });
 
   const dbMock = {
-    // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2):
+    // TEST-EDIT (endpoint namespace gate):
     // each bootstrap endpoint is now written in its own transaction under the
     // gate (lib/bootstrap-endpoint-gate). The stand-in runs the callback on
     // this same double, so the endpoint insert lands in the same statement

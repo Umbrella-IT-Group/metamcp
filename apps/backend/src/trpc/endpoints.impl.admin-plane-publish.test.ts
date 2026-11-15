@@ -15,11 +15,11 @@
  * whole sequence is pinned in api-key-mint.integration.test.ts and
  * admin-plane-rails.integration.test.ts.
  *
- * TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2): the
+ * TEST-EDIT (endpoint namespace gate): the
  * rule is now judged inside the write's transaction, under the namespace lock,
- * through the gate repository (doubled below so its "restricted or private
- * sibling" question is the one this suite always asked of
- * hasGatedEndpointOnNamespace), and a refusal is a coded CONFLICT instead of
+ * through the gate repository (doubled below, its "restricted or private
+ * sibling" question answered by `gatedSiblingQuery`, which this suite always
+ * asked of the repository), and a refusal is a coded CONFLICT instead of
  * `success: false` inside an HTTP 200. The two human cases now also pin that a
  * person's session is held to the namespace gate.
  */
@@ -36,11 +36,13 @@ const { endpointsRepositoryMock, namespacesRepositoryMock } = vi.hoisted(
       create: vi.fn(),
       findByUuidWithNamespace: vi.fn(),
       update: vi.fn(),
-      hasGatedEndpointOnNamespace: vi.fn(),
     },
     namespacesRepositoryMock: { findByUuid: vi.fn() },
   }),
 );
+const { gatedSiblingQuery } = vi.hoisted(() => ({
+  gatedSiblingQuery: vi.fn(),
+}));
 
 vi.mock("../db/repositories", () => ({
   ApiKeysRepository: class {
@@ -73,20 +75,27 @@ vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
   openBudget: vi.fn(async () => null),
 }));
 const { gateMock } = vi.hoisted(() => ({
-  gateMock: { restrictedSibling: false },
+  gateMock: {
+    /** Another endpoint over the namespace being moved TO is restricted. */
+    restrictedSibling: false,
+    /** Another endpoint over the namespace being moved FROM is restricted. */
+    sourceRestrictedSibling: false,
+  },
 }));
 vi.mock("../db/repositories/endpoint-gate.repo", () => ({
   endpointGateRepository: {
     lockNamespaces: vi.fn(async () => undefined),
-    restrictedSiblingExists: vi.fn(async () => gateMock.restrictedSibling),
+    restrictedSiblingExists: vi.fn(
+      async (_tx: unknown, namespaceUuid: string) =>
+        namespaceUuid === OLD_NAMESPACE
+          ? gateMock.sourceRestrictedSibling
+          : gateMock.restrictedSibling,
+    ),
     gatedSiblingExists: vi.fn(
       async (_tx: unknown, namespaceUuid: string, exceptUuid?: string) =>
         exceptUuid === undefined
-          ? endpointsRepositoryMock.hasGatedEndpointOnNamespace(namespaceUuid)
-          : endpointsRepositoryMock.hasGatedEndpointOnNamespace(
-              namespaceUuid,
-              exceptUuid,
-            ),
+          ? gatedSiblingQuery(namespaceUuid)
+          : gatedSiblingQuery(namespaceUuid, exceptUuid),
     ),
     lockEndpoint: vi.fn(async (_tx: unknown, uuid: string) => {
       const row = await endpointsRepositoryMock.findByUuidWithNamespace(uuid);
@@ -99,6 +108,9 @@ vi.mock("../db/repositories/endpoint-gate.repo", () => ({
             restricted: row.restricted ?? false,
             restricted_by_api_key_uuid: null,
             restriction_recent: false,
+            // TEST-EDIT (SPEC): the lock read also returns the row as locked,
+            // for the update's audit row (its before-state).
+            row: { ...row },
           }
         : null;
     }),
@@ -168,6 +180,7 @@ const REFUSAL =
 beforeEach(() => {
   vi.clearAllMocks();
   gateMock.restrictedSibling = false;
+  gateMock.sourceRestrictedSibling = false;
   endpointsRepositoryMock.findByName.mockResolvedValue(undefined);
   endpointsRepositoryMock.create.mockResolvedValue({
     uuid: ENDPOINT_UUID,
@@ -177,7 +190,7 @@ beforeEach(() => {
     uuid: ENDPOINT_UUID,
     name: "reporting",
   });
-  endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(false);
+  gatedSiblingQuery.mockResolvedValue(false);
   endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
     uuid: ENDPOINT_UUID,
     name: "reporting",
@@ -196,18 +209,14 @@ describe("endpoints.create by an admin-plane key", () => {
   it.each(["sync", "operator"] as const)(
     "refuses a public unrestricted endpoint over a namespace a restricted or private endpoint serves (%s scope), writing nothing",
     async (scope) => {
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(
-        true,
-      );
+      gatedSiblingQuery.mockResolvedValue(true);
 
       const failure = await endpointsImplementations
         .create(createInput(), OWNER_ID, adminPlaneActor(scope))
         .catch((e) => e);
 
       expect(failure).toMatchObject({ code: "CONFLICT", message: REFUSAL });
-      expect(
-        endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-      ).toHaveBeenCalledWith(NEW_NAMESPACE);
+      expect(gatedSiblingQuery).toHaveBeenCalledWith(NEW_NAMESPACE);
       expect(endpointsRepositoryMock.create).not.toHaveBeenCalled();
       expect(failure.message).not.toContain("namespace name");
       expect(failure.message).not.toContain(NEW_NAMESPACE);
@@ -231,9 +240,7 @@ describe("endpoints.create by an admin-plane key", () => {
   ])(
     "does not judge %s, which is not a kind a key may be created for",
     async (_label, over) => {
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(
-        true,
-      );
+      gatedSiblingQuery.mockResolvedValue(true);
       namespacesRepositoryMock.findByUuid.mockResolvedValue({
         uuid: NEW_NAMESPACE,
         name: "ns",
@@ -247,14 +254,50 @@ describe("endpoints.create by an admin-plane key", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(
-        endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-      ).not.toHaveBeenCalled();
+      expect(gatedSiblingQuery).not.toHaveBeenCalled();
     },
   );
 
+  it("judges a restricted endpoint's move out as opening its source namespace, refusing it when no other restricted endpoint stays", async () => {
+    endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
+      uuid: ENDPOINT_UUID,
+      name: "reporting",
+      namespace_uuid: OLD_NAMESPACE,
+      user_id: null,
+      restricted: true,
+    });
+
+    const failure = await endpointsImplementations
+      .update(updateInput(), OWNER_ID, adminPlaneActor("operator"))
+      .catch((e) => e);
+    expect(failure).toMatchObject({ code: "FORBIDDEN" });
+    expect(endpointsRepositoryMock.update).not.toHaveBeenCalled();
+
+    // A person keeps the right to move it, and another restricted endpoint
+    // staying over the source keeps the key's move allowed.
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput(),
+          OWNER_ID,
+          humanActor,
+        )
+      ).success,
+    ).toBe(true);
+    gateMock.sourceRestrictedSibling = true;
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput(),
+          OWNER_ID,
+          adminPlaneActor("operator"),
+        )
+      ).success,
+    ).toBe(true);
+  });
+
   it("leaves a human administrator's session unjudged by this rule, and holds it to the namespace gate", async () => {
-    endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
+    gatedSiblingQuery.mockResolvedValue(true);
 
     const result = await endpointsImplementations.create(
       createInput(),
@@ -263,11 +306,9 @@ describe("endpoints.create by an admin-plane key", () => {
     );
 
     expect(result.success).toBe(true);
-    expect(
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-    ).not.toHaveBeenCalled();
+    expect(gatedSiblingQuery).not.toHaveBeenCalled();
 
-    // A deliberate reversal (plan 1A item 2): with a restricted endpoint over
+    // A deliberate reversal (endpoint namespace gate): with a restricted endpoint over
     // the namespace, the person's unrestricted create is refused too.
     gateMock.restrictedSibling = true;
     endpointsRepositoryMock.create.mockClear();
@@ -281,7 +322,7 @@ describe("endpoints.create by an admin-plane key", () => {
 
 describe("endpoints.update by an admin-plane key", () => {
   it("refuses re-pointing a public unrestricted endpoint at a namespace a restricted or private endpoint serves, writing nothing", async () => {
-    endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
+    gatedSiblingQuery.mockResolvedValue(true);
 
     const failure = await endpointsImplementations
       .update(updateInput(), OWNER_ID, adminPlaneActor("operator"))
@@ -289,9 +330,10 @@ describe("endpoints.update by an admin-plane key", () => {
 
     expect(failure).toMatchObject({ code: "CONFLICT", message: REFUSAL });
     // The endpoint being changed does not count as one that gates the target.
-    expect(
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-    ).toHaveBeenCalledWith(NEW_NAMESPACE, ENDPOINT_UUID);
+    expect(gatedSiblingQuery).toHaveBeenCalledWith(
+      NEW_NAMESPACE,
+      ENDPOINT_UUID,
+    );
     expect(endpointsRepositoryMock.update).not.toHaveBeenCalled();
   });
 
@@ -307,7 +349,7 @@ describe("endpoints.update by an admin-plane key", () => {
   });
 
   it("does not judge an endpoint left on its namespace", async () => {
-    endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
+    gatedSiblingQuery.mockResolvedValue(true);
 
     const result = await endpointsImplementations.update(
       updateInput({ namespaceUuid: OLD_NAMESPACE }),
@@ -316,9 +358,7 @@ describe("endpoints.update by an admin-plane key", () => {
     );
 
     expect(result.success).toBe(true);
-    expect(
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-    ).not.toHaveBeenCalled();
+    expect(gatedSiblingQuery).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -327,9 +367,12 @@ describe("endpoints.update by an admin-plane key", () => {
   ])(
     "does not judge %s, which is not a kind a key may be created for",
     async (_label, row) => {
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(
-        true,
-      );
+      gatedSiblingQuery.mockResolvedValue(true);
+      // TEST-EDIT (SPEC): a restricted endpoint an admin-plane key moves out
+      // is now judged on the source side, so the namespace it leaves keeps
+      // another restricted endpoint here; the subject of this case is that
+      // the publish rule does not apply to it.
+      gateMock.sourceRestrictedSibling = true;
       endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
         uuid: ENDPOINT_UUID,
         name: "reporting",
@@ -344,14 +387,50 @@ describe("endpoints.update by an admin-plane key", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(
-        endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-      ).not.toHaveBeenCalled();
+      expect(gatedSiblingQuery).not.toHaveBeenCalled();
     },
   );
 
+  it("judges a restricted endpoint's move out as opening its source namespace, refusing it when no other restricted endpoint stays", async () => {
+    endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
+      uuid: ENDPOINT_UUID,
+      name: "reporting",
+      namespace_uuid: OLD_NAMESPACE,
+      user_id: null,
+      restricted: true,
+    });
+
+    const failure = await endpointsImplementations
+      .update(updateInput(), OWNER_ID, adminPlaneActor("operator"))
+      .catch((e) => e);
+    expect(failure).toMatchObject({ code: "FORBIDDEN" });
+    expect(endpointsRepositoryMock.update).not.toHaveBeenCalled();
+
+    // A person keeps the right to move it, and another restricted endpoint
+    // staying over the source keeps the key's move allowed.
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput(),
+          OWNER_ID,
+          humanActor,
+        )
+      ).success,
+    ).toBe(true);
+    gateMock.sourceRestrictedSibling = true;
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput(),
+          OWNER_ID,
+          adminPlaneActor("operator"),
+        )
+      ).success,
+    ).toBe(true);
+  });
+
   it("leaves a human administrator's session unjudged by this rule, and holds it to the namespace gate", async () => {
-    endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
+    gatedSiblingQuery.mockResolvedValue(true);
 
     const result = await endpointsImplementations.update(
       updateInput(),
@@ -360,11 +439,9 @@ describe("endpoints.update by an admin-plane key", () => {
     );
 
     expect(result.success).toBe(true);
-    expect(
-      endpointsRepositoryMock.hasGatedEndpointOnNamespace,
-    ).not.toHaveBeenCalled();
+    expect(gatedSiblingQuery).not.toHaveBeenCalled();
 
-    // A deliberate reversal (plan 1A item 2): moving any endpoint onto a
+    // A deliberate reversal (endpoint namespace gate): moving any endpoint onto a
     // namespace a restricted endpoint guards is refused to a person too.
     gateMock.restrictedSibling = true;
     endpointsRepositoryMock.update.mockClear();

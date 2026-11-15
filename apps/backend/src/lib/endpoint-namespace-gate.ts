@@ -20,6 +20,10 @@
  *  - un-restrict: opening an endpoint while another endpoint over its
  *    namespace stays restricted.
  *
+ * For an admin-plane key a restricted endpoint leaving its namespace is judged
+ * as opening that namespace, because the namespace loses that guard exactly as
+ * it would by un-restricting it (see the second rule below).
+ *
  * It applies to every writer: a human administrator's session, an admin-plane
  * key and the bootstrap. It is one-sided on purpose: restricting is always
  * allowed (refusing it would deadlock two open endpoints over one namespace),
@@ -35,7 +39,9 @@
  *  - un-restrict provenance: an admin-plane key may open an endpoint only to
  *    roll back a restriction it made itself in the last 24 hours, while that is
  *    still the endpoint's current restriction (endpoints.restricted_by_api_key_
- *    uuid, migration 0047). Every other un-restrict is a human's decision.
+ *    uuid, migration 0047). Every other un-restrict is a human's decision. The
+ *    same test applies to moving a restricted endpoint out of its namespace,
+ *    unless another restricted endpoint stays over that namespace.
  *
  * Every refusal is a fixed sentence naming no endpoint or namespace, answered
  * as a coded error (CONFLICT, or FORBIDDEN for the provenance rule), never as
@@ -106,6 +112,17 @@ export interface MoveFacts {
   restrictedSibling: boolean;
   /** Another endpoint over the target namespace is restricted or private. */
   gatedSibling: boolean;
+  /**
+   * Another endpoint over the SOURCE namespace is restricted, so the
+   * namespace stays guarded once this one has left. Read only for an
+   * admin-plane caller moving a restricted endpoint.
+   */
+  sourceRestrictedSibling: boolean;
+  /**
+   * The moved endpoint's current restriction was made by the acting
+   * admin-plane key less than 24 hours ago (see isOwnRecentRestriction).
+   */
+  rollbackEligible: boolean;
 }
 
 /** What opening an endpoint is judged on, read under its namespace lock. */
@@ -147,7 +164,42 @@ export function judgeEndpointMove(facts: MoveFacts): EndpointGateRule | null {
   ) {
     return "admin_plane_publish";
   }
+  // Taking a guard away from its namespace opens the namespace to an
+  // unrestricted create, so an admin-plane key may do it only where the
+  // un-restrict rule would let it open the endpoint itself.
+  if (
+    facts.adminPlane &&
+    facts.restricted &&
+    !facts.sourceRestrictedSibling &&
+    !facts.rollbackEligible
+  ) {
+    return "admin_plane_unrestrict";
+  }
   return null;
+}
+
+/**
+ * Is the endpoint's current restriction one the acting admin-plane key made
+ * itself within the rollback window? The marker (endpoints.restricted_by_api_
+ * key_uuid) is cleared by every later restriction a person repeats, by an
+ * opening and by a move, so a match means the key's restriction is still the
+ * current one. False for a person (no key) and for a missing marker.
+ */
+export function isOwnRecentRestriction(
+  endpoint: {
+    restricted: boolean;
+    restricted_by_api_key_uuid: string | null;
+    restriction_recent: boolean;
+  },
+  actorKeyUuid: string | null,
+): boolean {
+  return (
+    actorKeyUuid !== null &&
+    endpoint.restricted &&
+    endpoint.restriction_recent &&
+    endpoint.restricted_by_api_key_uuid?.toLowerCase() ===
+      actorKeyUuid.toLowerCase()
+  );
 }
 
 export function judgeEndpointUnrestrict(

@@ -8,6 +8,9 @@
  * context rule, the whitelisted audit read, and that every audit action an
  * admin-plane mutation writes has a budget class.
  */
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import {
   ADMIN_PLANE_HUMAN_ONLY_PROCEDURES,
   ADMIN_PLANE_OPERATOR_MUTATIONS,
@@ -180,12 +183,12 @@ describe("the change context of a call", () => {
     const result = await call(
       operatorCtx("operator"),
       "frontend.accessGroups.create",
-      { name: "g", reason: "  rollout step 3  ", run_id: "run-20261115.a" },
+      { name: "g", reason: "  rollout step 3  ", run_id: "run-0001.a" },
     );
     expect(result.reached).toBe(true);
     const actor = reached[0].args[1] as { reason?: string; run_id?: string };
     expect(actor.reason).toBe("rollout step 3");
-    expect(actor.run_id).toBe("run-20261115.a");
+    expect(actor.run_id).toBe("run-0001.a");
   });
 
   it("lets a sync-scope key and a person change without a reason", async () => {
@@ -280,9 +283,10 @@ describe("the change context of a call", () => {
 });
 
 describe("budget classes", () => {
-  // The audit actions each admin-plane mutation can write (read from the
-  // implementations). A mutation that starts writing a new action must add it
-  // here and to the budget's class table.
+  // The audit actions each admin-plane mutation can write, as a reviewed pin
+  // of what the scan below must find in the implementations. A mutation that
+  // starts writing a new action must add it here and to the budget's class
+  // table.
   const ACTIONS_BY_MUTATION: Record<string, string[]> = {
     "frontend.accessGroups.addEndpoint": ["group.endpoint.add"],
     "frontend.accessGroups.addMember": ["group.member.add"],
@@ -307,12 +311,93 @@ describe("budget classes", () => {
     "frontend.namespaces.updateToolStatus": ["namespace.tool_status"],
   };
 
+  // The audit actions written by procedures that are NOT operator mutations
+  // but live in an implementation file that also hosts operator mutations, so
+  // the scan sees them. They are a person's acts, outside the budget. An
+  // action found by the scan that is in neither the budget's class table nor
+  // this list fails the test, so a new action must be decided one way or the
+  // other when it is added.
+  const WRITTEN_BY_HUMAN_ONLY_PROCEDURES: readonly string[] = [
+    "apikey.delete",
+    "endpoint.delete",
+    "mcpserver.bulk_import",
+    "mcpserver.delete",
+    "namespace.delete",
+    "namespace.server_status",
+    "namespace.tool_overrides",
+  ];
+
+  /**
+   * Every audit action named in the implementation files that host the
+   * operator mutations, read from the source: the files are derived from the
+   * mutation list (router `x` is implemented in `x.impl.ts`, kebab-cased), and
+   * an action is any `action: "name"` literal outside comments.
+   */
+  const scanImplementationActions = () => {
+    const routers = [
+      ...new Set(
+        [...ADMIN_PLANE_OPERATOR_MUTATIONS].map((p) => p.split(".")[1]),
+      ),
+    ].sort();
+    const found = new Map<string, string[]>();
+    for (const router of routers) {
+      const file = `${router.replace(/([A-Z])/g, "-$1").toLowerCase()}.impl.ts`;
+      const source = readFileSync(
+        path.resolve(import.meta.dirname, file),
+        "utf8",
+      )
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+      for (const match of source.matchAll(
+        /\baction:\s*"([a-z][a-z0-9_.]*)"/g,
+      )) {
+        found.set(match[1], [...(found.get(match[1]) ?? []), file]);
+      }
+    }
+    return { routers, found };
+  };
+
   it("covers every operator mutation and gives each of its actions a class", () => {
     expect(Object.keys(ACTIONS_BY_MUTATION).sort()).toEqual(
       [...ADMIN_PLANE_OPERATOR_MUTATIONS].sort(),
     );
     for (const actions of Object.values(ACTIONS_BY_MUTATION)) {
       for (const action of actions) expect(BUDGETED_ACTIONS).toContain(action);
+    }
+  });
+
+  it("finds every audit action the operator mutations' implementations write in the budget's table or the human-only list", () => {
+    const { routers, found } = scanImplementationActions();
+    // The scan reads what it is meant to read: each router's file yields
+    // actions, so a moved or renamed file cannot make it pass by finding none.
+    expect(routers).toEqual([
+      "accessGroups",
+      "apiKeys",
+      "endpoints",
+      "mcpServers",
+      "namespaces",
+    ]);
+    expect(found.size).toBeGreaterThan(20);
+
+    const unclassified = [...found.keys()].filter(
+      (action) =>
+        !BUDGETED_ACTIONS.includes(action) &&
+        !WRITTEN_BY_HUMAN_ONLY_PROCEDURES.includes(action),
+    );
+    expect(unclassified).toEqual([]);
+  });
+
+  it("keeps the budget's table, the pin and the human-only list true to what the implementations write", () => {
+    const { found } = scanImplementationActions();
+    // Nothing is listed that no implementation writes (a stale entry would
+    // hide a removed action), and nothing is both budgeted and exempt.
+    for (const action of BUDGETED_ACTIONS) expect(found.has(action)).toBe(true);
+    for (const action of WRITTEN_BY_HUMAN_ONLY_PROCEDURES) {
+      expect(found.has(action)).toBe(true);
+      expect(BUDGETED_ACTIONS).not.toContain(action);
+    }
+    for (const actions of Object.values(ACTIONS_BY_MUTATION)) {
+      for (const action of actions) expect(found.has(action)).toBe(true);
     }
   });
 });

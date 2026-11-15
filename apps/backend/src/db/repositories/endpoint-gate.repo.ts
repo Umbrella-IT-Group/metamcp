@@ -15,6 +15,11 @@ export interface GateEndpoint {
   restricted_by_api_key_uuid: string | null;
   /** restricted_at is set and less than the rollback window old. */
   restriction_recent: boolean;
+  /**
+   * The whole row as locked, for the before-state of the update's audit row
+   * (lib/audit/before-state).
+   */
+  row: typeof endpointsTable.$inferSelect;
 }
 
 /**
@@ -43,20 +48,26 @@ export const endpointGateRepository = {
     tx: DbTransaction,
     uuid: string,
   ): Promise<GateEndpoint | null> {
-    const [row] = await tx
+    const [found] = await tx
       .select({
-        uuid: endpointsTable.uuid,
-        name: endpointsTable.name,
-        namespace_uuid: endpointsTable.namespace_uuid,
-        user_id: endpointsTable.user_id,
-        restricted: endpointsTable.restricted,
-        restricted_by_api_key_uuid: endpointsTable.restricted_by_api_key_uuid,
+        row: endpointsTable,
         restriction_recent: sql<boolean>`coalesce(${endpointsTable.restricted_at} > clock_timestamp() - make_interval(hours => ${UNRESTRICT_ROLLBACK_WINDOW_HOURS}), false)`,
       })
       .from(endpointsTable)
       .where(eq(endpointsTable.uuid, uuid))
       .for("update");
-    return row ?? null;
+    if (!found) return null;
+    const { row, restriction_recent } = found;
+    return {
+      uuid: row.uuid,
+      name: row.name,
+      namespace_uuid: row.namespace_uuid,
+      user_id: row.user_id,
+      restricted: row.restricted,
+      restricted_by_api_key_uuid: row.restricted_by_api_key_uuid,
+      restriction_recent,
+      row,
+    };
   },
 
   /** Is another endpoint over the namespace restricted? */

@@ -35,6 +35,11 @@ import {
 import { NamespacesSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { AdminAuditWriteError, withAdminAudit } from "../lib/audit/admin-write";
+import {
+  describeUpdate,
+  NAMESPACE_UPDATE_FIELDS,
+  TOOL_STATUS_UPDATE_FIELDS,
+} from "../lib/audit/before-state";
 import { clearFilterCache } from "../lib/metamcp/metamcp-middleware/filter-tools.functional";
 import {
   clearOverrideCache,
@@ -450,10 +455,10 @@ export const namespacesImplementations = {
       // For an admin-plane key the namespace rows and their audit row are one
       // transaction; for everyone else the event is emitted best-effort right
       // after the write.
-      const result = await withAdminAudit(
+      const written = await withAdminAudit(
         actor,
         (...tx) =>
-          namespacesRepository.update(
+          namespacesRepository.updateReportingPrevious(
             {
               uuid: input.uuid,
               name: input.name,
@@ -463,16 +468,30 @@ export const namespacesImplementations = {
             },
             ...tx,
           ),
-        (updated) => ({
+        ({ namespace: updated, previous, previousServerUuids }) => ({
           action: "namespace.update",
           target_type: "namespace",
           target_id: updated.uuid,
           detail: {
             name: updated.name,
             mcp_server_count: input.mcpServerUuids?.length ?? 0,
+            // The previous and new value of each field this write changed,
+            // read under the namespace's row lock; the server list is
+            // compared as a set, and only when the request carried one.
+            ...describeUpdate(
+              { ...previous, server_uuids: previousServerUuids },
+              {
+                ...updated,
+                server_uuids: input.mcpServerUuids
+                  ? [...new Set(input.mcpServerUuids)].sort()
+                  : previousServerUuids,
+              },
+              NAMESPACE_UPDATE_FIELDS,
+            ),
           },
         }),
       );
+      const result = written.namespace;
 
       // Invalidate idle MetaMCP server for this namespace since the MCP servers list may have changed
       // Run this asynchronously to avoid blocking the response
@@ -669,7 +688,7 @@ export const namespacesImplementations = {
       const updatedMapping = await withAdminAudit(
         actor,
         (...tx) =>
-          namespaceMappingsRepository.updateToolStatus(
+          namespaceMappingsRepository.updateToolStatusReportingPrevious(
             {
               namespaceUuid: input.namespaceUuid,
               toolUuid: input.toolUuid,
@@ -678,8 +697,8 @@ export const namespacesImplementations = {
             },
             ...tx,
           ),
-        (mapping) =>
-          mapping
+        (written) =>
+          written
             ? {
                 action: "namespace.tool_status",
                 target_type: "namespace",
@@ -688,6 +707,12 @@ export const namespacesImplementations = {
                   tool_uuid: input.toolUuid,
                   server_uuid: input.serverUuid,
                   status: input.status,
+                  // The status the tool had, read under the mapping's row lock.
+                  ...describeUpdate(
+                    { status: written.previousStatus },
+                    { status: written.mapping.status },
+                    TOOL_STATUS_UPDATE_FIELDS,
+                  ),
                 },
               }
             : null,

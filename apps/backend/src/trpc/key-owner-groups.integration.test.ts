@@ -231,7 +231,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
 
   beforeAll(async () => {
     fx = await createFixture(TEST_DATABASE_URL as string, "kog");
-    // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2):
+    // TEST-EDIT (endpoint namespace gate):
     // each endpoint gets a namespace of its own. The gate refuses opening an
     // endpoint while another endpoint over the same namespace stays
     // restricted, and these cases restrict and open their endpoints
@@ -645,7 +645,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
             authorization: `Bearer ${fx.operator.key}`,
             "cf-connecting-ip": "198.51.100.77",
           },
-          // TEST-EDIT (change reason, full-management plan 1A item 5): an
+          // TEST-EDIT (change reason): an
           // operator-scope key's change carries a reason, each call of a batch
           // its own.
           body: JSON.stringify({
@@ -808,8 +808,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
           },
         },
         {
-          // TEST-EDIT (leaf-only group delete, full-management plan
-          // resolution 2): an admin-plane key may delete only a group with no
+          // TEST-EDIT (leaf-only group delete): an admin-plane key may delete only a group with no
           // member and no mapping, so the audit-failure case deletes an empty
           // group; a failed audit row must bring it back.
           action: "group.delete",
@@ -970,8 +969,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
             }),
         },
         {
-          // TEST-EDIT (leaf-only group delete, full-management plan
-          // resolution 2): an admin-plane key's group delete has no cascade
+          // TEST-EDIT (leaf-only group delete): an admin-plane key's group delete has no cascade
           // any more (it is refused while the group has a member or a
           // mapping), so the failing statement is the delete of an empty
           // group itself.
@@ -1257,8 +1255,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
           endpoint_uuid: endpointUuid,
         });
         expect(await serves(memberGateway)).toBe(true);
-        // TEST-EDIT (leaf-only group delete, full-management plan resolution
-        // 2): the operator key's delete of a group that still carries a
+        // TEST-EDIT (leaf-only group delete): the operator key's delete of a group that still carries a
         // member and a mapping is refused and changes nothing; the grants go
         // first, each as its own change, and then the empty group.
         const refusedDelete = await operator("accessGroups.delete", {

@@ -44,7 +44,7 @@ vi.mock("../../db/index", () => ({
 vi.mock("../../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: txAudit.record,
 }));
-// TEST-EDIT (change budget, full-management plan 1A item 4): an admin-plane
+// TEST-EDIT (change budget): an admin-plane
 // change now opens the key's change budget inside its transaction (a lock and
 // a count statement), which this suite's stand-in transaction cannot run. The
 // budget is pinned in admin-plane-budget.test.ts and against Postgres in

@@ -55,7 +55,7 @@ vi.mock("../db/index", () => ({
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: vi.fn(async () => undefined),
 }));
-// TEST-EDIT (change budget, full-management plan 1A item 4): an admin-plane
+// TEST-EDIT (change budget): an admin-plane
 // change now opens the key's change budget inside its transaction (a lock and
 // a count statement), which this suite's stand-in transaction cannot run. The
 // budget is pinned in admin-plane-budget.test.ts and against Postgres in
@@ -125,7 +125,7 @@ const create = (ctx: object, input: unknown) =>
       (error: { code?: string; message?: string }) => error,
     );
 
-// TEST-EDIT (change reason, full-management plan 1A item 5): an
+// TEST-EDIT (change reason): an
 // operator-scope key's change carries a reason, or it is refused before the
 // schema runs; every request here carries one so the schema and the rules
 // are what answer.

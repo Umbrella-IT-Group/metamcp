@@ -58,15 +58,13 @@ const syncActor = {
 };
 
 describe("the numbers", () => {
-  it("defaults to three times the observed busiest hour per key and class", () => {
+  it("ships the reviewed default numbers per key and class, so changing one is a deliberate budget change", () => {
     expect(adminPlaneBudgetConfig()).toEqual({
       windowSeconds: 3600,
       operator: { total: 318, loosen: 33, destroy: 3 },
       sync: { total: 1056, loosen: 0, destroy: 0 },
     });
-    expect(DEFAULT_ADMIN_PLANE_BUDGET.operator.total).toBe(3 * 106);
-    expect(DEFAULT_ADMIN_PLANE_BUDGET.operator.loosen).toBe(3 * 11);
-    expect(DEFAULT_ADMIN_PLANE_BUDGET.sync.total).toBe(3 * 32 * 11);
+    expect(DEFAULT_ADMIN_PLANE_BUDGET).toEqual(adminPlaneBudgetConfig());
   });
 
   it("reads each number from the deploy environment", () => {

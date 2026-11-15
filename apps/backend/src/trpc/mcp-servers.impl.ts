@@ -28,6 +28,10 @@ import { McpServersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
 import { withAdminAudit } from "../lib/audit/admin-write";
 import { clampAuditTextList } from "../lib/audit/audit-emitter";
+import {
+  describeUpdate,
+  MCP_SERVER_UPDATE_FIELDS,
+} from "../lib/audit/before-state";
 import { closeInspectorSessionsForServer } from "../lib/metamcp/inspector-sessions";
 import { mcpServerPool } from "../lib/metamcp/mcp-server-pool";
 import { clearOverrideCache } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
@@ -642,6 +646,16 @@ export const mcpServersImplementations = {
                   detail: {
                     name: written.server.name,
                     type: written.server.type,
+                    // Which fields this write changed and the previous and
+                    // new value of each that cannot hold a credential. The
+                    // connection fields (command, args, url, env, bearer
+                    // token, headers) are named when changed and never
+                    // recorded by value.
+                    ...describeUpdate(
+                      written.previous,
+                      written.server,
+                      MCP_SERVER_UPDATE_FIELDS,
+                    ),
                   },
                 }
               : null,

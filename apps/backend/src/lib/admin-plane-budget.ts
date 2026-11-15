@@ -52,19 +52,20 @@ export interface AdminPlaneBudgetConfig {
 }
 
 /**
- * The defaults: three times the busiest hour observed for each key and class
- * between 2026-11-11 and 2026-11-15 (the measurement is in the fork README,
- * "Admin-plane change budget"). Changing them is a reviewed change to the
- * deploy environment, not a request field.
+ * The defaults: three times the peak measured on a production deployment for
+ * each key and class, so ordinary bulk work fits and a runaway loop or a
+ * hijacked key is stopped within an hour. Changing them is a reviewed change
+ * to the deploy environment, not a request field.
  *
- *  - operator total 318: the busiest hour was 106 changes (an access-group
- *    rollout: 76, 13, 2, 9 and 6 changes in five runs within 16 minutes).
- *  - operator loosen 33: 11 grants in that hour (7 members added, 4 endpoint
- *    mappings); the busiest hour of key creation was 4.
- *  - operator destroy 3: no deletion was observed, so the observed peak is
- *    taken as one, which leaves room for one leaf deletion at a time.
- *  - sync total 1056: the configuration sync re-saves every registered server
- *    (32) on each run, and the busiest hour had 11 runs (352 changes).
+ *  - operator total: a bulk access-group rollout is many changes in one run,
+ *    and several runs can land in one hour.
+ *  - operator loosen: the grants of such a rollout (members added, endpoints
+ *    mapped) and the keys created for it.
+ *  - operator destroy: deletions are rare and leaf-only. None was measured, so
+ *    the peak is taken as one and the limit is three times that; a limit of
+ *    zero would make a leaf deletion impossible for an agent.
+ *  - sync total: the configuration sync re-saves every registered server on
+ *    each run, and several runs can land in one hour.
  *  - sync loosen and destroy 0: the sync scope has no procedure in either
  *    class.
  */

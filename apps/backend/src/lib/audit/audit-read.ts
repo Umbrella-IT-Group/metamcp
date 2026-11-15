@@ -54,6 +54,7 @@ export const AUDIT_LIST_DETAIL_KEYS: ReadonlySet<string> = new Set([
   "admin_plane",
   "old_value",
   "new_value",
+  "changed_fields",
   "ip_policy",
   "members",
   "mappings",

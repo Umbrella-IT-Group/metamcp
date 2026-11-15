@@ -94,6 +94,8 @@ export async function applyBootstrapEndpoint(
         adminPlane: false,
         restrictedSibling,
         gatedSibling: false,
+        sourceRestrictedSibling: false,
+        rollbackEligible: false,
       });
       if (rule) return { status: "refused", rule };
     }

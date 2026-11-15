@@ -75,13 +75,15 @@ vi.mock("../db/repositories/access-groups.repo", () => ({
     findDetailByUuid: findDetailByUuidMock,
     findGroupsForEndpoint: findGroupsForEndpointMock,
     create: createMock,
-    update: updateMock,
+    // TEST-EDIT (SPEC): the update reads the group's previous row under its
+    // lock for the audit row's before-state, so the repository call is
+    // `updateReportingPrevious` and answers { group, previous }.
+    updateReportingPrevious: updateMock,
     deleteByUuid: deleteByUuidMock,
     addMember: addMemberMock,
     removeMember: removeMemberMock,
     addEndpoint: addEndpointMock,
     removeEndpoint: removeEndpointMock,
-    setEndpointRestricted: setEndpointRestrictedMock,
     // The gate's own query. Present because `lib/endpoint-access-control` is
     // deliberately NOT mocked in this file — the invalidation assertions below
     // drive the real cache.
@@ -103,7 +105,7 @@ vi.mock("../db/repositories/users.repo", () => ({
   },
 }));
 
-// TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2): the
+// TEST-EDIT (endpoint namespace gate): the
 // restricted switch now runs in one transaction for every actor, under the
 // endpoint's namespace lock, through the gate repository. The stand-ins re-read
 // the endpoint as the doubled endpoints repository returns it, report no other
@@ -270,7 +272,10 @@ describe("group.create", () => {
 
 describe("group.update / group.delete", () => {
   it("update emits group.update", async () => {
-    updateMock.mockResolvedValue({ ...GROUP_ROW, name: "helpdesk-tier-2" });
+    updateMock.mockResolvedValue({
+      group: { ...GROUP_ROW, name: "helpdesk-tier-2" },
+      previous: GROUP_ROW,
+    });
 
     const result = await accessGroupsImplementations.update(
       { uuid: GROUP_UUID, name: "helpdesk-tier-2" },
@@ -281,6 +286,11 @@ describe("group.update / group.delete", () => {
     expect(result.success).toBe(true);
     expect(rows.map((r) => r.action)).toEqual(["group.update"]);
     expect(rows[0].detail?.name).toBe("helpdesk-tier-2");
+    expect(rows[0].detail).toMatchObject({
+      changed_fields: ["name"],
+      old_value: { name: "helpdesk" },
+      new_value: { name: "helpdesk-tier-2" },
+    });
   });
 
   it("update on a missing group reports the miss and writes NO row", async () => {
@@ -526,7 +536,7 @@ describe("every mutation drops the middleware's decision cache", () => {
     [
       "update",
       () => {
-        updateMock.mockResolvedValue(GROUP_ROW);
+        updateMock.mockResolvedValue({ group: GROUP_ROW, previous: GROUP_ROW });
         return accessGroupsImplementations.update(
           { uuid: GROUP_UUID, name: "x" },
           ACTOR,

@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ENDPOINT_GATE_REFUSALS,
+  isOwnRecentRestriction,
   judgeEndpointCreate,
   judgeEndpointMove,
   judgeEndpointUnrestrict,
@@ -31,6 +32,8 @@ const move = (over: Partial<Parameters<typeof judgeEndpointMove>[0]>) =>
     adminPlane: false,
     restrictedSibling: false,
     gatedSibling: false,
+    sourceRestrictedSibling: false,
+    rollbackEligible: false,
     ...over,
   });
 const open = (over: Partial<Parameters<typeof judgeEndpointUnrestrict>[0]>) =>
@@ -108,7 +111,47 @@ describe("move", () => {
 
   it("allows a move onto a namespace nothing restricts", () => {
     expect(move({})).toBeNull();
-    expect(move({ restricted: true, adminPlane: true })).toBeNull();
+    // TEST-EDIT SPEC: a restricted endpoint an admin-plane key moves out must
+    // now leave another guard behind (see the next case), so this case names
+    // it. Before, a move out of the source namespace was never judged.
+    expect(
+      move({
+        restricted: true,
+        adminPlane: true,
+        sourceRestrictedSibling: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("judges an admin-plane key's move of a restricted endpoint out as opening its source namespace", () => {
+    // Refused unless another restricted endpoint stays over the source or the
+    // key's own recent restriction applies, as for opening the endpoint.
+    expect(move({ restricted: true, adminPlane: true })).toBe(
+      "admin_plane_unrestrict",
+    );
+    expect(
+      move({
+        restricted: true,
+        adminPlane: true,
+        sourceRestrictedSibling: true,
+      }),
+    ).toBeNull();
+    expect(
+      move({ restricted: true, adminPlane: true, rollbackEligible: true }),
+    ).toBeNull();
+    // A person keeps the right to move any endpoint out, and an endpoint that
+    // guards nothing may leave freely.
+    expect(move({ restricted: true })).toBeNull();
+    expect(move({ adminPlane: true })).toBeNull();
+    // The target rule still comes first.
+    expect(
+      move({
+        restricted: true,
+        adminPlane: true,
+        rollbackEligible: true,
+        restrictedSibling: true,
+      }),
+    ).toBe("namespace_restricted_move");
   });
 
   it("keeps the admin-plane publish rule for a public open endpoint", () => {
@@ -116,8 +159,15 @@ describe("move", () => {
       "admin_plane_publish",
     );
     expect(move({ gatedSibling: true })).toBeNull();
+    // TEST-EDIT SPEC: the restricted case names a remaining guard at the
+    // source for the same reason as above; the publish rule is the subject.
     expect(
-      move({ adminPlane: true, gatedSibling: true, restricted: true }),
+      move({
+        adminPlane: true,
+        gatedSibling: true,
+        restricted: true,
+        sourceRestrictedSibling: true,
+      }),
     ).toBeNull();
   });
 });
@@ -141,6 +191,36 @@ describe("opening an endpoint", () => {
     expect(open({ adminPlane: true, rollbackEligible: false })).toBe(
       "admin_plane_unrestrict",
     );
+  });
+});
+
+describe("isOwnRecentRestriction", () => {
+  const key = "11111111-1111-4111-8111-111111111111";
+  const marked = {
+    restricted: true,
+    restricted_by_api_key_uuid: key,
+    restriction_recent: true,
+  };
+
+  it("holds only for the key that made the current restriction, inside the window", () => {
+    expect(isOwnRecentRestriction(marked, key)).toBe(true);
+    expect(isOwnRecentRestriction(marked, key.toUpperCase())).toBe(true);
+    expect(
+      isOwnRecentRestriction(marked, "22222222-2222-4222-8222-222222222222"),
+    ).toBe(false);
+    expect(
+      isOwnRecentRestriction({ ...marked, restriction_recent: false }, key),
+    ).toBe(false);
+    expect(
+      isOwnRecentRestriction(
+        { ...marked, restricted_by_api_key_uuid: null },
+        key,
+      ),
+    ).toBe(false);
+    expect(isOwnRecentRestriction({ ...marked, restricted: false }, key)).toBe(
+      false,
+    );
+    expect(isOwnRecentRestriction(marked, null)).toBe(false);
   });
 });
 

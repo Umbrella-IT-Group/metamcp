@@ -133,6 +133,9 @@ describe("mcpServers.update and the stored credentials", () => {
   it("the clear flag reaches the repository", async () => {
     vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
       server: row({ bearerToken: null }),
+      // TEST-EDIT (SPEC): the locked write also reports the row as it was,
+      // for the audit row's before-state; these cases do not look at it.
+      previous: row(),
       destinationOrCredentialChanged: true,
       ownershipChanged: false,
     });
@@ -149,6 +152,7 @@ describe("mcpServers.update and the stored credentials", () => {
   it("an accepted change of destination or credential retires the pooled connections before it returns", async () => {
     vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
       server: row({ url: "http://mcp-other:3000/mcp", bearerToken: null }),
+      previous: row(),
       destinationOrCredentialChanged: true,
       ownershipChanged: false,
     });
@@ -171,6 +175,7 @@ describe("mcpServers.update and the stored credentials", () => {
   it("an accepted update that changed neither leaves live connections alone", async () => {
     vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
       server: row({ description: "Vendor tools" }),
+      previous: row(),
       destinationOrCredentialChanged: false,
       ownershipChanged: false,
     });

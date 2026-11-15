@@ -67,7 +67,7 @@ vi.mock("../db/index", () => ({
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: vi.fn(async () => undefined),
 }));
-// TEST-EDIT (change budget, full-management plan 1A item 4): an admin-plane
+// TEST-EDIT (change budget): an admin-plane
 // change now opens the key's change budget inside its transaction (a lock and
 // a count statement), which this suite's stand-in transaction cannot run. The
 // budget is pinned in admin-plane-budget.test.ts and against Postgres in
@@ -77,7 +77,7 @@ vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
   openBudget: vi.fn(async () => null),
 }));
 
-// TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2): every
+// TEST-EDIT (endpoint namespace gate): every
 // endpoint create and update now runs in one transaction for every actor and
 // asks the gate under the namespace lock (db/repositories/endpoint-gate.repo).
 // The stand-ins answer as a namespace with no other restricted or private

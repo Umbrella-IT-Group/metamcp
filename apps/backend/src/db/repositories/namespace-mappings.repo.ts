@@ -38,21 +38,40 @@ export class NamespaceMappingsRepository {
     // its audit row in the same transaction). Omitted, the pool is used.
     executor?: DbExecutor,
   ) {
-    const [updatedMapping] = await (executor ?? db)
-      .update(namespaceToolMappingsTable)
-      .set({
-        status: input.status,
-      })
-      .where(
-        and(
-          eq(namespaceToolMappingsTable.namespace_uuid, input.namespaceUuid),
-          eq(namespaceToolMappingsTable.tool_uuid, input.toolUuid),
-          eq(namespaceToolMappingsTable.mcp_server_uuid, input.serverUuid),
-        ),
-      )
-      .returning();
+    return (await this.updateToolStatusReportingPrevious(input, executor))
+      ?.mapping;
+  }
 
-    return updatedMapping;
+  /**
+   * Set a tool's status and report the status it had, read FOR UPDATE in the
+   * same transaction (a savepoint of the caller's when it holds one), so an
+   * audit row can carry the before-state of exactly the write it describes.
+   */
+  async updateToolStatusReportingPrevious(
+    input: NamespaceToolStatusUpdate,
+    executor?: DbExecutor,
+  ) {
+    return await (executor ?? db).transaction(async (tx) => {
+      const match = and(
+        eq(namespaceToolMappingsTable.namespace_uuid, input.namespaceUuid),
+        eq(namespaceToolMappingsTable.tool_uuid, input.toolUuid),
+        eq(namespaceToolMappingsTable.mcp_server_uuid, input.serverUuid),
+      );
+      const [previous] = await tx
+        .select({ status: namespaceToolMappingsTable.status })
+        .from(namespaceToolMappingsTable)
+        .where(match)
+        .for("update");
+      if (!previous) return undefined;
+      const [mapping] = await tx
+        .update(namespaceToolMappingsTable)
+        .set({ status: input.status })
+        .where(match)
+        .returning();
+      return mapping
+        ? { mapping, previousStatus: previous.status as string }
+        : undefined;
+    });
   }
 
   async updateToolOverrides(input: NamespaceToolOverridesUpdate) {

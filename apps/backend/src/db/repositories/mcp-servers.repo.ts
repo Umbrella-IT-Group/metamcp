@@ -241,6 +241,12 @@ export class McpServersRepository {
   ): Promise<
     | {
         server: DatabaseMcpServer;
+        /**
+         * The row as locked, before the write. Credentials included: it is for
+         * the before-state of the audit row (lib/audit/before-state), which
+         * records a credential field's change and never its value.
+         */
+        previous: DatabaseMcpServer;
         destinationOrCredentialChanged: boolean;
         ownershipChanged: boolean;
       }
@@ -251,13 +257,7 @@ export class McpServersRepository {
     try {
       return await (executor ?? db).transaction(async (tx) => {
         const [current] = await tx
-          .select({
-            type: mcpServersTable.type,
-            url: mcpServersTable.url,
-            bearerToken: mcpServersTable.bearerToken,
-            headers: mcpServersTable.headers,
-            user_id: mcpServersTable.user_id,
-          })
+          .select()
           .from(mcpServersTable)
           .where(eq(mcpServersTable.uuid, uuid))
           .for("update");
@@ -272,6 +272,7 @@ export class McpServersRepository {
 
         return {
           server: updatedServer,
+          previous: current,
           destinationOrCredentialChanged:
             current.type !== updatedServer.type ||
             (current.url ?? null) !== (updatedServer.url ?? null) ||
