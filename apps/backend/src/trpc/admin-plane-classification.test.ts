@@ -263,7 +263,7 @@ describe("the change context of a call", () => {
   it("records the reason and run id in the change's audit row, beside the verified actor", () => {
     const actor = auditActor({
       ...operatorCtx("operator"),
-      change: { reason: "rotate the n8n key", run_id: "r-1" },
+      change: { reason: "rotate the poller key", run_id: "r-1" },
     } as never);
     const event = buildAdminAuditEvent(actor, {
       action: "apikey.revoke",
@@ -273,7 +273,7 @@ describe("the change context of a call", () => {
     });
     expect(event.actor_type).toBe("api_key");
     expect(event.detail).toMatchObject({
-      reason: "rotate the n8n key",
+      reason: "rotate the poller key",
       run_id: "r-1",
     });
   });

@@ -998,6 +998,24 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
       }
     });
 
+    it("re-checks a new admin-plane key's owner under its row lock: a disabled administrator gets none", async () => {
+      const admin = await addUser("admin");
+      await one(`UPDATE users SET disabled = true WHERE id = $1`, [admin]);
+      try {
+        const reply = await human("apiKeys.create", {
+          name: uniq("owner-check"),
+          admin_plane: true,
+          user_id: admin,
+        });
+        expect(reply.code).toBe("FORBIDDEN");
+        expect(
+          await one(`SELECT 1 FROM api_keys WHERE user_id = $1`, [admin]),
+        ).toHaveLength(0);
+      } finally {
+        await one(`DELETE FROM users WHERE id = $1`, [admin]);
+      }
+    });
+
     it("refuses the broad key procedures to an admin-plane caller even if one reached them", async () => {
       const { apiKeysImplementations } = await import("./api-keys.impl");
       const key = await actorOf(true);
