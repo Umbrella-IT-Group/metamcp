@@ -23,11 +23,14 @@ type Translate = (
 export function OAuthClientStatusBadge({
   status,
   source,
+  approvedByPolicy,
   t,
 }: {
   status: string | null | undefined;
   /** Omit to show the status alone (the Access token list has no provenance). */
   source?: string | null;
+  /** The list's audit-backed policy-approval flag; refines "approved" only. */
+  approvedByPolicy?: boolean;
   t: Translate;
 }) {
   return (
@@ -36,7 +39,7 @@ export function OAuthClientStatusBadge({
         variant={approvalStatusVariant(status)}
         data-status={status ?? "missing"}
       >
-        {t(approvalStatusKey(status))}
+        {t(approvalStatusKey(status, approvedByPolicy === true))}
       </Badge>
       {source !== undefined ? (
         <span className="text-xs text-muted-foreground">

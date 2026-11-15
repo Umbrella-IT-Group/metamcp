@@ -20,6 +20,7 @@
  * repository was asked to store anything.
  */
 
+import { createHash } from "node:crypto";
 import type { Server } from "node:http";
 
 import express from "express";
@@ -62,6 +63,87 @@ vi.mock("../../auth", () => ({
 process.env.APP_URL = "https://gateway.example.test";
 process.env.BETTER_AUTH_SECRET = "test-secret-for-registration-policy";
 
+// Policy approval of matching registrations (./dcr-auto-approval). Set before
+// the routers load, so the policy is latched from the environment on first use
+// and the cases below need nothing from that module. Written in canonical form
+// (keys in order, networks canonical and sorted), so its SHA-256 is the
+// expected policy_version. Each describe uses its own entry, so the entries'
+// hourly budgets never interfere. Restored after the file.
+const AUTO_APPROVE_ENV = "OAUTH_DCR_AUTO_APPROVE_POLICY";
+const originalAutoApprove = process.env[AUTO_APPROVE_ENV];
+const policyEntry = (
+  id: string,
+  clientName: string,
+  host: string,
+  allowedCidrs: string[],
+  maxPerHour: number,
+) => ({
+  id,
+  client_name: clientName,
+  redirect: { host, path: "/callback", port_min: 1024, port_max: 65535 },
+  allowed_cidrs: allowedCidrs,
+  max_per_hour: maxPerHour,
+});
+const AUTO_APPROVE_POLICY = {
+  version: 1,
+  entries: [
+    policyEntry(
+      "desktop",
+      "Example Desktop Client",
+      "localhost",
+      ["127.0.0.0/16", "203.0.113.0/26"],
+      1000,
+    ),
+    policyEntry(
+      "cli",
+      "Example CLI Client",
+      "127.0.0.1",
+      ["203.0.113.0/26"],
+      1000,
+    ),
+    policyEntry(
+      "ipv6-host",
+      "Example IPv6 Client",
+      "[::1]",
+      ["203.0.113.0/26"],
+      1000,
+    ),
+    policyEntry(
+      "capped",
+      "Example Capped Client",
+      "localhost",
+      ["203.0.113.0/26"],
+      2,
+    ),
+    policyEntry(
+      "concurrent",
+      "Example Concurrent Client",
+      "localhost",
+      ["203.0.113.0/26"],
+      2,
+    ),
+    policyEntry(
+      "fragile",
+      "Example Fragile Client",
+      "localhost",
+      ["203.0.113.0/26"],
+      1,
+    ),
+    policyEntry(
+      "open-mode",
+      "Example Open Client",
+      "localhost",
+      ["203.0.113.0/26"],
+      1,
+    ),
+  ],
+};
+const AUTO_APPROVE_POLICY_TEXT = JSON.stringify(AUTO_APPROVE_POLICY);
+const AUTO_APPROVE_POLICY_VERSION = createHash("sha256")
+  .update(AUTO_APPROVE_POLICY_TEXT)
+  .digest("hex");
+process.env[AUTO_APPROVE_ENV] = AUTO_APPROVE_POLICY_TEXT;
+
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 const utils = await import("./utils");
 const dcrMode = await import("./dcr-mode");
@@ -95,6 +177,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise((resolve) => server.close(resolve));
+  if (originalAutoApprove === undefined) delete process.env[AUTO_APPROVE_ENV];
+  else process.env[AUTO_APPROVE_ENV] = originalAutoApprove;
 });
 
 function setMode(value: string | undefined) {
@@ -434,4 +518,428 @@ describe("an unrecognized OAUTH_DCR_MODE fails closed", () => {
       expect(oauthRepositoryMock.upsertClient).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("policy approval of matching registrations (OAUTH_DCR_AUTO_APPROVE_POLICY)", () => {
+  const CALLBACK = "http://localhost:53682/callback";
+  const OUTSIDE = "198.51.100.9";
+  let insideCounter = 0;
+  const insideIp = () => `203.0.113.${(++insideCounter % 60) + 1}`;
+
+  const desktopBody = (extra: Record<string, unknown> = {}) => ({
+    client_name: "Example Desktop Client",
+    redirect_uris: [CALLBACK],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    ...extra,
+  });
+
+  async function registerWith(
+    body: unknown,
+    headers: Record<string, string>,
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
+    const res = await fetch(`${baseUrl}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json()) as Record<string, unknown>;
+    await new Promise((resolve) => setImmediate(resolve));
+    return { status: res.status, body: json };
+  }
+
+  const registerRows = () =>
+    rows.filter(
+      (r) => r.action === "oauth.dcr.register" && r.outcome === "success",
+    );
+
+  it("stores a matching registration approved in its initial insert, with a time and no approver", async () => {
+    const res = await registerWith(desktopBody(), {
+      "cf-connecting-ip": insideIp(),
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.approval_status).toBe("approved");
+    const stored = storedClient();
+    expect(stored).toMatchObject({
+      registration_source: "dcr",
+      approval_status: "approved",
+      redirect_uris: [CALLBACK],
+    });
+    expect(stored.approved_at).toBeInstanceOf(Date);
+    expect(stored).not.toHaveProperty("approved_by");
+
+    const [row] = registerRows();
+    expect(row.target_id).toBe(res.body.client_id);
+    expect(row.detail).toMatchObject({
+      approval_status: "approved",
+      dcr_mode: "pending",
+      auto_approval: {
+        entry_id: "desktop",
+        policy_version: AUTO_APPROVE_POLICY_VERSION,
+      },
+    });
+    expect(Object.keys(row.detail?.auto_approval as object).sort()).toEqual([
+      "entry_id",
+      "policy_version",
+    ]);
+    expect(row.detail).not.toHaveProperty("auto_approval_skipped");
+    const text = JSON.stringify(row);
+    expect(text).not.toContain("203.0.113.0/26");
+    expect(text).not.toContain("127.0.0.0/16");
+    expect(text).not.toContain("max_per_hour");
+  });
+
+  it.each([
+    [
+      "127.0.0.1",
+      "cli",
+      "Example CLI Client",
+      "http://127.0.0.1:41000/callback",
+    ],
+    ["[::1]", "ipv6-host", "Example IPv6 Client", "http://[::1]:8080/callback"],
+  ])(
+    "approves the %s loopback host's family",
+    async (_host, entryId, name, callback) => {
+      const res = await registerWith(
+        { client_name: name, redirect_uris: [callback] },
+        { "cf-connecting-ip": insideIp() },
+      );
+      expect(res.status).toBe(201);
+      expect(res.body.approval_status).toBe("approved");
+      expect(storedClient().approval_status).toBe("approved");
+      expect(registerRows()[0].detail?.auto_approval).toEqual({
+        entry_id: entryId,
+        policy_version: AUTO_APPROVE_POLICY_VERSION,
+      });
+    },
+  );
+
+  it("matches on the shared core's defaults when grant, response and auth fields are omitted", async () => {
+    const res = await registerWith(
+      { client_name: "Example Desktop Client", redirect_uris: [CALLBACK] },
+      { "cf-connecting-ip": insideIp() },
+    );
+    expect(res.status).toBe(201);
+    expect(res.body.approval_status).toBe("approved");
+    expect(storedClient()).toMatchObject({
+      approval_status: "approved",
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      client_secret: null,
+    });
+  });
+
+  it("leaves a valid non-matching registration pending, with no policy marker", async () => {
+    const res = await registerWith(
+      desktopBody({ client_name: "Example Desktop Client " }),
+      { "cf-connecting-ip": insideIp() },
+    );
+    expect(res.status).toBe(201);
+    expect(res.body.approval_status).toBe("pending");
+    expect(storedClient()).toMatchObject({
+      approval_status: "pending",
+      approved_at: null,
+    });
+    const [row] = registerRows();
+    expect(row.detail).toMatchObject({ approval_status: "pending" });
+    expect(row.detail).not.toHaveProperty("auto_approval");
+    expect(row.detail).not.toHaveProperty("auto_approval_skipped");
+  });
+
+  it.each([
+    [
+      "an unsupported grant type",
+      { grant_types: ["password"] },
+      "invalid_request",
+    ],
+    ["no callbacks", { redirect_uris: [] }, "invalid_redirect_uri"],
+    [
+      "the gateway's internal port",
+      { redirect_uris: ["http://localhost:12009/callback"] },
+      "invalid_redirect_uri",
+    ],
+  ])(
+    "keeps %s a 400 with no row, even with a matching name and address",
+    async (_label, extra, error) => {
+      const res = await registerWith(desktopBody(extra), {
+        "cf-connecting-ip": insideIp(),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe(error);
+      expect(oauthRepositoryMock.upsertClient).not.toHaveBeenCalled();
+    },
+  );
+
+  it("gives approval, entry, source and address fields in the body no authority", async () => {
+    const claims = {
+      approval_status: "approved",
+      approved_at: "2026-01-01T00:00:00Z",
+      auto_approval: { entry_id: "desktop", policy_version: "0".repeat(64) },
+      entry_id: "desktop",
+      registration_source: "admin",
+      cf_connecting_ip: insideIp(),
+      "cf-connecting-ip": insideIp(),
+      client_ip: insideIp(),
+      actor_ip: insideIp(),
+    };
+    const otherName = await registerWith(
+      desktopBody({ client_name: "Example Other Client", ...claims }),
+      { "cf-connecting-ip": insideIp() },
+    );
+    expect(otherName.status).toBe(201);
+    expect(otherName.body.approval_status).toBe("pending");
+    expect(storedClient()).toMatchObject({
+      approval_status: "pending",
+      registration_source: "dcr",
+      approved_at: null,
+    });
+
+    oauthRepositoryMock.upsertClient.mockClear();
+    const noHeader = await registerWith(desktopBody(claims), {});
+    expect(noHeader.status).toBe(201);
+    expect(noHeader.body.approval_status).toBe("pending");
+    expect(storedClient().approval_status).toBe("pending");
+  });
+
+  it.each([
+    ["no CF-Connecting-IP (req.ip is loopback, inside the entry)", {}],
+    [
+      "no CF-Connecting-IP and an allowed X-Forwarded-For",
+      { "x-forwarded-for": "203.0.113.5" },
+    ],
+    [
+      "no CF-Connecting-IP and an allowed Forwarded",
+      { forwarded: "for=203.0.113.5;proto=https" },
+    ],
+    [
+      "no CF-Connecting-IP and an allowed X-Real-IP",
+      { "x-real-ip": "203.0.113.5" },
+    ],
+    [
+      "an outside CF-Connecting-IP with allowed forwarded headers",
+      {
+        "cf-connecting-ip": OUTSIDE,
+        "x-forwarded-for": "203.0.113.5",
+        forwarded: "for=203.0.113.5",
+        "x-real-ip": "203.0.113.5",
+      },
+    ],
+    ["an empty CF-Connecting-IP", { "cf-connecting-ip": "" }],
+    ["an unparseable CF-Connecting-IP", { "cf-connecting-ip": "203.0.113" }],
+  ])(
+    "stores a matching registration pending with %s",
+    async (_label, headers) => {
+      const res = await registerWith(desktopBody(), headers);
+      expect(res.status).toBe(201);
+      expect(res.body.approval_status).toBe("pending");
+      expect(storedClient()).toMatchObject({
+        approval_status: "pending",
+        approved_at: null,
+      });
+      expect(registerRows()[0].detail).not.toHaveProperty("auto_approval");
+    },
+  );
+
+  it("approves on an allowed CF-Connecting-IP although req.ip (loopback) is a different address", async () => {
+    const res = await registerWith(
+      desktopBody({
+        client_name: "Example CLI Client",
+        redirect_uris: ["http://127.0.0.1:41000/callback"],
+      }),
+      { "cf-connecting-ip": "203.0.113.42", "x-forwarded-for": OUTSIDE },
+    );
+    expect(res.status).toBe(201);
+    expect(res.body.approval_status).toBe("approved");
+    expect(registerRows()[0].detail?.auto_approval).toMatchObject({
+      entry_id: "cli",
+    });
+  });
+
+  it("says on GET /oauth/register that approval_status decides, without naming any policy entry", async () => {
+    const res = await getJson("/oauth/register");
+    expect(res.body.registration_mode).toBe("pending");
+    expect(String(res.body.approval)).toContain("approval_status");
+    expect(String(res.body.approval)).toContain("by policy");
+    const text = JSON.stringify(res.body);
+    for (const value of [
+      "Example Desktop Client",
+      "203.0.113.0",
+      "127.0.0.0/16",
+      "desktop",
+      "max_per_hour",
+    ]) {
+      expect(text).not.toContain(value);
+    }
+    const discovery = await getJson("/.well-known/oauth-authorization-server");
+    expect(JSON.stringify(discovery.body)).not.toContain(
+      "Example Desktop Client",
+    );
+    expect(JSON.stringify(discovery.body)).not.toContain("203.0.113.0");
+  });
+
+  describe("the hourly budget", () => {
+    it("approves up to max_per_hour and stores the next match pending, audited as held", async () => {
+      const body = desktopBody({ client_name: "Example Capped Client" });
+      const statuses: unknown[] = [];
+      for (let i = 0; i < 3; i++) {
+        const res = await registerWith(body, {
+          "cf-connecting-ip": insideIp(),
+        });
+        expect(res.status).toBe(201);
+        statuses.push(res.body.approval_status);
+      }
+      expect(statuses).toEqual(["approved", "approved", "pending"]);
+      expect(
+        oauthRepositoryMock.upsertClient.mock.calls.map(
+          ([client]) => client.approval_status,
+        ),
+      ).toEqual(["approved", "approved", "pending"]);
+      const details = registerRows().map((r) => r.detail);
+      expect(details[2]).toMatchObject({
+        approval_status: "pending",
+        auto_approval_skipped: "cap",
+      });
+      expect(details[2]).not.toHaveProperty("auto_approval");
+      expect(details[0]).not.toHaveProperty("auto_approval_skipped");
+    });
+
+    it("reserves before the write: two concurrent matches against one remaining slot", async () => {
+      const body = desktopBody({ client_name: "Example Concurrent Client" });
+      const first = await registerWith(body, {
+        "cf-connecting-ip": insideIp(),
+      });
+      expect(first.body.approval_status).toBe("approved");
+      oauthRepositoryMock.upsertClient.mockClear();
+
+      const releases: Array<() => void> = [];
+      let bothWaiting: () => void = () => {};
+      const arrived = new Promise<void>((resolve) => {
+        bothWaiting = resolve;
+      });
+      oauthRepositoryMock.upsertClient.mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            releases.push(resolve);
+            if (releases.length === 2) bothWaiting();
+          }),
+      );
+
+      const pending = [
+        registerWith(body, { "cf-connecting-ip": insideIp() }),
+        registerWith(body, { "cf-connecting-ip": insideIp() }),
+      ];
+      await arrived;
+      const stamped = oauthRepositoryMock.upsertClient.mock.calls
+        .map(([client]) => client.approval_status)
+        .sort();
+      expect(stamped).toEqual(["approved", "pending"]);
+      expect(
+        rows.filter((r) => r.action === "oauth.dcr.register"),
+      ).toHaveLength(1);
+
+      releases.forEach((release) => release());
+      const results = await Promise.all(pending);
+      expect(results.map((r) => r.status)).toEqual([201, 201]);
+      expect(results.map((r) => r.body.approval_status).sort()).toEqual([
+        "approved",
+        "pending",
+      ]);
+      const later = registerRows()
+        .slice(1)
+        .map((r) => r.detail);
+      expect(later.filter((d) => d?.auto_approval)).toHaveLength(1);
+      expect(
+        later.filter((d) => d?.auto_approval_skipped === "cap"),
+      ).toHaveLength(1);
+    });
+
+    it("spends the slot of a failed insert and records no success for it", async () => {
+      const body = desktopBody({ client_name: "Example Fragile Client" });
+      oauthRepositoryMock.upsertClient.mockRejectedValueOnce(
+        new Error("insert failed"),
+      );
+      const failed = await registerWith(body, {
+        "cf-connecting-ip": insideIp(),
+      });
+      expect(failed.status).toBe(500);
+      expect(
+        oauthRepositoryMock.upsertClient.mock.calls[0][0].approval_status,
+      ).toBe("approved");
+      expect(registerRows()).toHaveLength(0);
+
+      oauthRepositoryMock.upsertClient.mockClear();
+      const next = await registerWith(body, { "cf-connecting-ip": insideIp() });
+      expect(next.status).toBe(201);
+      expect(next.body.approval_status).toBe("pending");
+      expect(storedClient().approval_status).toBe("pending");
+      expect(registerRows()).toHaveLength(1);
+      expect(registerRows()[0].detail).toMatchObject({
+        auto_approval_skipped: "cap",
+      });
+    });
+  });
+
+  describe("modes with a matching policy", () => {
+    it("off refuses before the policy is consulted", async () => {
+      setMode("off");
+      const res = await registerWith(desktopBody(), {
+        "cf-connecting-ip": insideIp(),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("registration_disabled");
+      expect(oauthRepositoryMock.upsertClient).not.toHaveBeenCalled();
+    });
+
+    it("open approves by its own stamp, with no policy marker and no policy budget spent", async () => {
+      setMode("open");
+      const body = desktopBody({ client_name: "Example Open Client" });
+      for (let i = 0; i < 2; i++) {
+        const res = await registerWith(body, {
+          "cf-connecting-ip": insideIp(),
+        });
+        expect(res.status).toBe(201);
+        expect(res.body.approval_status).toBe("approved");
+      }
+      for (const row of registerRows()) {
+        expect(row.detail).toMatchObject({ dcr_mode: "open" });
+        expect(row.detail).not.toHaveProperty("auto_approval");
+        expect(row.detail).not.toHaveProperty("auto_approval_skipped");
+      }
+
+      setMode(undefined);
+      rows = [];
+      const res = await registerWith(body, { "cf-connecting-ip": insideIp() });
+      expect(res.body.approval_status).toBe("approved");
+      expect(registerRows()[0].detail?.auto_approval).toEqual({
+        entry_id: "open-mode",
+        policy_version: AUTO_APPROVE_POLICY_VERSION,
+      });
+    });
+  });
+
+  it("keeps every registration pending under a refused policy, and loading a policy changes no stored row", async () => {
+    const policyModule = await import("./dcr-auto-approval");
+    try {
+      policyModule.initDcrAutoApproval({
+        [AUTO_APPROVE_ENV]: AUTO_APPROVE_POLICY_TEXT.replace(
+          '"max_per_hour":1000',
+          '"max_per_hour":1000.0',
+        ),
+      });
+      const res = await registerWith(desktopBody(), {
+        "cf-connecting-ip": insideIp(),
+      });
+      expect(res.status).toBe(201);
+      expect(res.body.approval_status).toBe("pending");
+      expect(storedClient().approval_status).toBe("pending");
+      expect(Object.keys(oauthRepositoryMock)).toEqual([
+        "upsertClient",
+        "getClient",
+      ]);
+    } finally {
+      policyModule.initDcrAutoApproval();
+    }
+  });
 });

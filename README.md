@@ -152,8 +152,10 @@ across the management and OAuth surfaces:
 - **Dynamic Client Registration held for approval**: self-registration accepts only local
   (loopback) callbacks, and a new self-registered client cannot be authorized until an
   administrator approves it on the OAuth Clients page (`OAUTH_DCR_MODE`, see
-  [README-oauth.md](README-oauth.md)). Also field/size caps, a scoped body limit, a sweep of
-  unapproved registrations, and a dedicated rate-limit bucket.
+  [README-oauth.md](README-oauth.md)). A deployment can optionally approve registrations that
+  match an exact allowlist entry at creation (`OAUTH_DCR_AUTO_APPROVE_POLICY`). Also
+  field/size caps, a scoped body limit, a sweep of unapproved registrations, and a dedicated
+  rate-limit bucket.
 - **Per-caller rate limiting on password sign-in** — the credential sign-in endpoint is capped
   per client IP, which also bounds how fast the append-only audit log can be filled with failed
   logins. SSO, callbacks, session reads and sign-out are deliberately not capped. See

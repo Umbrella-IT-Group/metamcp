@@ -21,7 +21,12 @@
  *  - who may list and decide (anonymous, member, admin, admin-plane key),
  *    pending-only transitions, a concurrent approve and reject, refusal of a
  *    pending row with a hosted callback, audit attribution, and that listing
- *    returns no stored secret, salt or raw audit detail.
+ *    returns no stored secret, salt or raw audit detail;
+ *  - policy approval (OAUTH_DCR_AUTO_APPROVE_POLICY): a matching registration
+ *    from an allowed network is stored approved at creation with no approver
+ *    and mints nothing; sign-in, consent and PKCE S256 still gate its tokens;
+ *    the same registration from outside stays pending; and the list's policy
+ *    label comes only from the client's own registration audit marker.
  *
  * Opt-in via TEST_DATABASE_URL, pointed at a disposable, migrated database:
  *
@@ -919,6 +924,474 @@ describeIfDb(
         expect(await auditRows("oauthclient.approve", id, 0)).toEqual([]);
         expect(await auditRows("oauthclient.reject", id, 0)).toEqual([]);
       }
+    });
+
+    describe("policy approval of matching registrations (OAUTH_DCR_AUTO_APPROVE_POLICY)", () => {
+      const POLICY_ENV = "OAUTH_DCR_AUTO_APPROVE_POLICY";
+      const NAME = "Example Desktop Client";
+      const INSIDE_IP = "203.0.113.20";
+      const OUTSIDE_IP = "198.51.100.30";
+      let policyModule: typeof import("./dcr-auto-approval");
+      let policyVersion = "";
+
+      const listedItem = async (clientId: string) => {
+        const listed = await admin.frontend.oauthClients.list();
+        return {
+          wire: JSON.stringify(listed),
+          item: listed.clients.find(
+            (c: { client_id: string }) => c.client_id === clientId,
+          ),
+        };
+      };
+
+      beforeAll(async () => {
+        policyModule = await import("./dcr-auto-approval");
+        const policy = policyModule.initDcrAutoApproval({
+          [POLICY_ENV]: JSON.stringify({
+            version: 1,
+            entries: [
+              {
+                id: "desktop-itest",
+                client_name: NAME,
+                redirect: {
+                  host: "localhost",
+                  path: "/callback",
+                  port_min: 1024,
+                  port_max: 65535,
+                },
+                allowed_cidrs: ["203.0.113.0/26"],
+                max_per_hour: 20,
+              },
+            ],
+          }),
+        });
+        expect(policy).not.toBeNull();
+        policyVersion = policy?.hash ?? "";
+      });
+
+      afterAll(() => {
+        policyModule?.initDcrAutoApproval({});
+      });
+
+      it("approves an allowlisted registration at creation; sign-in, consent and PKCE S256 still gate every token", async () => {
+        const reg = await register(
+          { client_name: NAME, redirect_uris: [LOOPBACK] },
+          INSIDE_IP,
+        );
+        expect(reg.status).toBe(201);
+        expect(reg.body.approval_status).toBe("approved");
+        const clientId = reg.body.client_id as string;
+
+        const stored = await clientRow(clientId);
+        expect(stored).toMatchObject({
+          approval_status: "approved",
+          registration_source: "dcr",
+          approved_by: null,
+          rejected_at: null,
+        });
+        expect(stored?.approved_at).toBeInstanceOf(Date);
+        // Registration mints nothing a token flow would start from.
+        expect(await grantCounts(clientId)).toEqual({
+          codes: 0,
+          tokens: 0,
+          rotated: 0,
+        });
+
+        const [registered] = await auditRows("oauth.dcr.register", clientId);
+        expect(registered).toMatchObject({
+          outcome: "success",
+          actor_ip: INSIDE_IP,
+          target_type: "oauth_client",
+        });
+        expect(registered.detail).toMatchObject({
+          approval_status: "approved",
+          dcr_mode: "pending",
+          auto_approval: {
+            entry_id: "desktop-itest",
+            policy_version: policyVersion,
+          },
+        });
+        expect(JSON.stringify(registered.detail)).not.toContain(
+          "203.0.113.0/26",
+        );
+
+        const { wire, item } = await listedItem(clientId);
+        expect(item).toMatchObject({
+          approval_status: "approved",
+          approved_by: null,
+          approved_by_policy: true,
+          registered_from_ip: INSIDE_IP,
+        });
+        expect(wire).not.toContain('"detail"');
+        expect(wire).not.toContain("auto_approval");
+
+        // Sign-in is still required: no session, the login redirect.
+        const { verifier, challenge } = pkce();
+        const url = authorizeUrl(clientId, LOOPBACK, challenge, "policy-state");
+        const anonymousAuthorize = await fetch(url, {
+          redirect: "manual",
+          headers: { "cf-connecting-ip": nextIp() },
+        });
+        expect(anonymousAuthorize.status).toBe(302);
+        expect(anonymousAuthorize.headers.get("location")).toContain("/login");
+
+        // PKCE S256 is still required at authorize.
+        const noPkce = await authorize(
+          `${base}/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}` +
+            `&redirect_uri=${encodeURIComponent(LOOPBACK)}&state=s`,
+        );
+        expect(noPkce.status).toBe(400);
+        const plain = await authorize(
+          authorizeUrl(clientId, LOOPBACK, challenge, "s").replace(
+            "code_challenge_method=S256",
+            "code_challenge_method=plain",
+          ),
+        );
+        expect(plain.status).toBe(400);
+
+        // Consent is still required: authorize reaches consent, not a code.
+        const consent = await authorize(url);
+        expect(consent.status).toBe(302);
+        expect(consent.headers.get("location")).toContain("areq=");
+        expect(await grantCounts(clientId)).toEqual({
+          codes: 0,
+          tokens: 0,
+          rotated: 0,
+        });
+
+        const decision = await decide(consent);
+        expect(decision.status).toBe(200);
+        const code = (await decision.text()).match(
+          /mcp_code_[A-Za-z0-9_-]+/,
+        )?.[0] as string;
+        expect(code).toBeTruthy();
+
+        // The code needs its verifier: a wrong one and a missing one are refused.
+        const wrong = await token({
+          grant_type: "authorization_code",
+          code,
+          client_id: clientId,
+          redirect_uri: LOOPBACK,
+          code_verifier: pkce().verifier,
+        });
+        expect(wrong).toMatchObject({
+          status: 400,
+          body: { error: "invalid_grant" },
+        });
+        const missing = await token({
+          grant_type: "authorization_code",
+          code,
+          client_id: clientId,
+          redirect_uri: LOOPBACK,
+        });
+        expect(missing.status).toBe(400);
+        expect(await grantCounts(clientId)).toMatchObject({ tokens: 0 });
+
+        const exchanged = await token({
+          grant_type: "authorization_code",
+          code,
+          client_id: clientId,
+          redirect_uri: LOOPBACK,
+          code_verifier: verifier,
+        });
+        expect(exchanged.status).toBe(200);
+        expect(exchanged.body.access_token).toBeTruthy();
+        const refreshed = await token({
+          grant_type: "refresh_token",
+          refresh_token: exchanged.body.refresh_token as string,
+        });
+        expect(refreshed.status).toBe(200);
+      });
+
+      it("keeps the same registration from outside the networks pending, and lists it without the policy label", async () => {
+        const reg = await register(
+          { client_name: NAME, redirect_uris: [LOOPBACK] },
+          OUTSIDE_IP,
+        );
+        expect(reg.status).toBe(201);
+        expect(reg.body.approval_status).toBe("pending");
+        const clientId = reg.body.client_id as string;
+        expect(await clientRow(clientId)).toMatchObject({
+          approval_status: "pending",
+          approved_at: null,
+        });
+        const [registered] = await auditRows("oauth.dcr.register", clientId);
+        expect(registered.actor_ip).toBe(OUTSIDE_IP);
+        expect(registered.detail).not.toHaveProperty("auto_approval");
+        const { item } = await listedItem(clientId);
+        expect(item).toMatchObject({
+          approval_status: "pending",
+          approved_by_policy: false,
+        });
+      });
+
+      it("labels only a client whose own successful registration audit row carries a valid marker", async () => {
+        const marker = (overrides: Record<string, unknown> = {}) => ({
+          entry_id: "desktop-itest",
+          policy_version: "b".repeat(64),
+          ...overrides,
+        });
+        const cases: Array<{
+          label: string;
+          source: "dcr" | "admin" | "cimd" | null;
+          approvedBy?: string;
+          status?: "approved" | "pending";
+          audits: Array<{
+            detail: Record<string, unknown>;
+            outcome?: string;
+            target_type?: string;
+            offsetMs?: number;
+          }>;
+          expected: boolean;
+        }> = [
+          {
+            label: "valid",
+            source: "dcr",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: true,
+          },
+          {
+            label: "open",
+            source: "dcr",
+            audits: [
+              { detail: { approval_status: "approved", dcr_mode: "open" } },
+            ],
+            expected: false,
+          },
+          {
+            label: "open-with-marker",
+            source: "dcr",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "open",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "grandfathered",
+            source: "dcr",
+            audits: [],
+            expected: false,
+          },
+          {
+            label: "person",
+            source: "dcr",
+            approvedBy: ADMIN_ID,
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "admin",
+            source: "admin",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "cimd",
+            source: "cimd",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "legacy",
+            source: null,
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "recorded-pending",
+            source: "dcr",
+            audits: [
+              {
+                detail: {
+                  approval_status: "pending",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "bad-entry-id",
+            source: "dcr",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker({ entry_id: "Desktop" }),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "short-hash",
+            source: "dcr",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker({ policy_version: "b".repeat(63) }),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "marker-not-object",
+            source: "dcr",
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: "desktop-itest",
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "other-target-type",
+            source: "dcr",
+            audits: [
+              {
+                target_type: "oauth_token",
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "denied-row",
+            source: "dcr",
+            audits: [
+              {
+                outcome: "denied",
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+          {
+            label: "marker-on-later-row",
+            source: "dcr",
+            audits: [
+              { detail: { approval_status: "approved", dcr_mode: "open" } },
+              {
+                offsetMs: 1_000,
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(),
+                },
+              },
+            ],
+            expected: false,
+          },
+        ];
+
+        const now = Date.now();
+        for (const c of cases) {
+          const clientId = `mcp_client_itest_provenance_${c.label}_${RUN}`;
+          const status = c.status ?? "approved";
+          await db.insert(schema.oauthClientsTable).values({
+            client_id: clientId,
+            client_name: NAME,
+            redirect_uris: [LOOPBACK],
+            token_endpoint_auth_method: "none",
+            grant_types: ["authorization_code"],
+            registration_source: c.source,
+            approval_status: status,
+            approved_by: c.approvedBy ?? null,
+            approved_at: status === "approved" ? new Date(now) : null,
+          });
+          createdClients.push(clientId);
+          for (const a of c.audits) {
+            await db.insert(schema.auditLogTable).values({
+              actor_type: "anonymous",
+              actor_ip: INSIDE_IP,
+              action: "oauth.dcr.register",
+              target_type: a.target_type ?? "oauth_client",
+              target_id: clientId,
+              outcome: a.outcome ?? "success",
+              detail: a.detail,
+              occurred_at: new Date(now + (a.offsetMs ?? 0)),
+            });
+          }
+        }
+
+        const listed = await admin.frontend.oauthClients.list();
+        const flags = Object.fromEntries(
+          cases.map((c) => {
+            const clientId = `mcp_client_itest_provenance_${c.label}_${RUN}`;
+            const item = listed.clients.find(
+              (client: { client_id: string }) => client.client_id === clientId,
+            );
+            return [c.label, item?.approved_by_policy];
+          }),
+        );
+        expect(flags).toEqual(
+          Object.fromEntries(cases.map((c) => [c.label, c.expected])),
+        );
+        expect(JSON.stringify(listed)).not.toContain("auto_approval");
+      });
     });
   },
 );

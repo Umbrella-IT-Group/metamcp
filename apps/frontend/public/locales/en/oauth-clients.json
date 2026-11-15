@@ -58,6 +58,7 @@
   "columnStatus": "Status",
   "columnRegisteredFrom": "Registered from",
   "statusApproved": "Approved",
+  "statusApprovedByPolicy": "Approved by policy",
   "statusPending": "Waiting for approval",
   "statusRejected": "Rejected",
   "statusUnknown": "Not approved",
@@ -76,5 +77,5 @@
   "decisionError": "Could not record the decision",
   "decisionStale": "This client changed since the list loaded, so the list was refreshed.",
   "listLoadError": "Could not load OAuth clients",
-  "approvalExplanation": "Applications on a person's own computer, such as Claude Code, can register themselves, but they stay \"Waiting for approval\" until an administrator approves them here. Only local (loopback) callbacks can be approved this way; hosted applications such as claude.ai use a client created with Create OAuth Client. Approving a client grants no access by itself: each person still approves their own sign-in. Approve only clients you recognize, and check the address they registered from."
+  "approvalExplanation": "Applications on a person's own computer, such as Claude Code, can register themselves, but they stay \"Waiting for approval\" until an administrator approves them here. Only local (loopback) callbacks can be approved this way; hosted applications such as claude.ai use a client created with Create OAuth Client. Approving a client grants no access by itself: each person still approves their own sign-in. Approve only clients you recognize, and check the address they registered from. This gateway can also approve a matching registration by itself when a deployment policy allows it; those show as \"Approved by policy\". Plain \"Approved\" does not say who approved a client."
 }

@@ -29,6 +29,7 @@ import { authApiRelay } from "./routers/auth-relay";
 import m365Router from "./routers/m365";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
+import { initDcrAutoApproval } from "./routers/oauth/dcr-auto-approval";
 import { initOAuthDcrMode } from "./routers/oauth/dcr-mode";
 import publicEndpointsRouter from "./routers/public-metamcp";
 import trpcRouter from "./routers/trpc";
@@ -49,6 +50,16 @@ assertVerifiedCallerConfig();
 // logged as a boot warning (it resolves to off). Every registration request
 // then reads the latched value. See ./routers/oauth/dcr-mode.
 initOAuthDcrMode();
+
+// Resolve OAUTH_DCR_AUTO_APPROVE_POLICY (policy approval of matching
+// self-registrations, consulted in pending mode only) once, beside the mode
+// and before any route mounts. It never throws: a refused document turns
+// policy approval off with one boot warning naming only the reason, and every
+// registration stays pending. The boot line gives active or inactive, the
+// entry count and the policy hash, never the policy itself. Latched, so a
+// policy change means recreating the process. See
+// ./routers/oauth/dcr-auto-approval.
+initDcrAutoApproval();
 
 const app = express();
 

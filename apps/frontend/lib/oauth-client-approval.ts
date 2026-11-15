@@ -9,11 +9,22 @@
 
 export type BadgeVariant = "default" | "secondary" | "destructive" | "outline";
 
-/** Translation key for a stored approval status; anything unexpected is "unknown". */
-export function approvalStatusKey(status: string | null | undefined): string {
+/**
+ * Translation key for a stored approval status; anything unexpected is
+ * "unknown". `approvedByPolicy` (the list's audit-backed flag) only refines
+ * "approved"; without it an approved client reads as plain "Approved", never
+ * as approved by a person, because a missing flag means the provenance is
+ * unconfirmed.
+ */
+export function approvalStatusKey(
+  status: string | null | undefined,
+  approvedByPolicy = false,
+): string {
   switch (status) {
     case "approved":
-      return "oauth-clients:statusApproved";
+      return approvedByPolicy === true
+        ? "oauth-clients:statusApprovedByPolicy"
+        : "oauth-clients:statusApproved";
     case "pending":
       return "oauth-clients:statusPending";
     case "rejected":

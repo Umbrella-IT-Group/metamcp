@@ -589,6 +589,7 @@ export default function OAuthClientsPage() {
                         <OAuthClientStatusBadge
                           status={client.approval_status}
                           source={client.registration_source}
+                          approvedByPolicy={client.approved_by_policy}
                           t={t}
                         />
                       </TableCell>
