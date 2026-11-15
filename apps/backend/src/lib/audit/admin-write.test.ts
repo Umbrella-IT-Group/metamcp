@@ -2,7 +2,7 @@
  * withAdminAudit / runAuditedTransaction: who gets the audit row inside the
  * change's own transaction, and what a failing row does.
  *
- * The contract (plan, foreman decision 1): a request authenticated by an
+ * The contract: a request authenticated by an
  * admin-plane key has no person watching, so its change and its audit row are
  * one transaction and an audit failure fails the change. Every other actor
  * keeps the best-effort record, written after the change by `emit`. The

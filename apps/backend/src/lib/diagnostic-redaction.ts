@@ -29,15 +29,25 @@
 const REDACTED = "[redacted]";
 
 // scheme://[userinfo@]host[path][?query][#fragment], stopping at whitespace
-// and at characters that commonly close a URL in prose.
+// and at characters that commonly close a URL in prose. User info ends at
+// the last at sign, since a URL password can itself contain an at sign.
 const URL_PATTERN =
-  /\b([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/?#@"'<>]*@)?([^\s/?#"'<>]*)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
+  /\b([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/?#"'<>]*@)?([^\s/?#"'<>]*)([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?/gi;
 const GATEWAY_KEY_PATTERN = /\bsk_mt_[A-Za-z0-9]+/g;
+// Consume a quoted header value as a whole, including escaped quotes. A
+// Digest value contains several quoted parameters, so stopping at its first
+// quote would expose the response proof and nonce farther along the value.
+const AUTH_QUOTED_HEADER_PATTERN =
+  /["']?\b(proxy-authorization|authorization)["']?\s*[:=]\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/gi;
+// Only known single-token schemes can leave trailing diagnostic prose alone.
+// Every other scheme (Digest and OAuth included) may carry several proof
+// parameters, so discard its whole line instead of leaking the later ones.
+const AUTH_LINE_PATTERN =
+  /\b(proxy-authorization|authorization)["']?\s*[:=]\s*["']?(?:([a-z][a-z0-9_-]*)\s+)?[^\r\n]+/gi;
+const SINGLE_TOKEN_AUTH_SCHEME =
+  /^(bearer|basic|token|negotiate|ntlm|apikey|api-key|bot)$/i;
 // An Authorization header (or its proxy form), in plain or JSON-quoted form.
-// A known scheme word before the value is kept and the value goes; with no
-// known scheme the first word after the name is the value. "Token" is only a
-// scheme here, after the header name, so the word in ordinary prose is left
-// alone.
+// "Token" is only a scheme after the header name, not in ordinary prose.
 const AUTH_HEADER_PATTERN =
   /\b(proxy-authorization|authorization)(["']?\s*[:=]\s*["']?)(?:(bearer|basic|token|digest|negotiate|ntlm|apikey|api-key|oauth|bot)\s+)?[^\s",;]+/gi;
 const COOKIE_LINE_PATTERN = /\b(set-cookie|cookie)\s*:[^\r\n]*/gi;
@@ -54,7 +64,7 @@ const PEM_BLOCK_PATTERN =
 // `"name": "value"`, the value a quoted string or a run up to a delimiter. A
 // value already replaced is not matched again.
 const SECRET_PAIR_PATTERN =
-  /["']?\b(client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?(?:id|token)|private[_-]?key|set[_-]?cookie|cookie|token|password|passwd|secret)["']?\s*[:=]\s*(?!\[redacted\])(?:"[^"]*"|'[^']*'|[^\s",;&}\]]+)/gi;
+  /["']?\b(client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?(?:id|token)|private[_-]?key|set[_-]?cookie|cookie|token|password|passwd|secret)["']?\s*[:=]\s*(?!\[redacted\])(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s",;&}\]]+)/gi;
 // A hex run of 32 or more characters holding a digit and a letter (an md5,
 // sha1 or sha256 digest, or a hex-encoded secret). A dashed uuid is broken by
 // its dashes and stays readable.
@@ -68,6 +78,22 @@ const OPAQUE_RUN_PATTERN = /[A-Za-z0-9_-]{40,}/g;
 export function redactDiagnosticText(text: string): string {
   return text
     .replace(PEM_BLOCK_PATTERN, REDACTED)
+    .replace(
+      AUTH_QUOTED_HEADER_PATTERN,
+      (_match, name: string, value: string) => {
+        const scheme =
+          /^(bearer|basic|token|digest|negotiate|ntlm|apikey|api-key|oauth|bot)\s+/i.exec(
+            value.slice(1, -1),
+          )?.[1];
+        return `${name}: ${scheme ? `${scheme} ` : ""}${REDACTED}`;
+      },
+    )
+    .replace(AUTH_LINE_PATTERN, (match, name: string, scheme?: string) => {
+      if (scheme && SINGLE_TOKEN_AUTH_SCHEME.test(scheme)) return match;
+      const label =
+        scheme && /^(digest|oauth)$/i.test(scheme) ? `${scheme} ` : "";
+      return `${name}: ${label}${REDACTED}`;
+    })
     .replace(
       URL_PATTERN,
       (

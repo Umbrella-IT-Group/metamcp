@@ -948,6 +948,89 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
       expect(await spent(k.uuid)).toBe(0);
     });
 
+    it("charges IP policy widening as loosen, compares address sets, and keeps narrowing available", async () => {
+      setBudget(20, 1, 0);
+      const k = await freshOperatorKey();
+      const target = await fx.dataKey({
+        name: uniq("policy-budget"),
+        ownerId: fx.memberId,
+      });
+      await one(
+        `UPDATE api_keys SET allowed_cidrs = $2, ip_policy_mode = 'enforce' WHERE uuid = $1`,
+        [target.uuid, ["203.0.113.1/32"]],
+      );
+      const set = (allowed: string[]) =>
+        operator(
+          "apiKeys.setIpPolicy",
+          {
+            uuid: target.uuid,
+            allowed_cidrs: allowed,
+            ip_policy_mode: "enforce",
+          },
+          k.key,
+        );
+      // A mapped spelling admits the same address and uses no loosen slot.
+      expect((await set(["::ffff:203.0.113.1/128"])).status).toBe(200);
+      expect((await set(["203.0.113.0/24"])).status).toBe(200);
+      expect((await set(["203.0.113.0/24", "198.51.100.0/24"])).code).toBe(
+        "TOO_MANY_REQUESTS",
+      );
+      expect(
+        await one(`SELECT allowed_cidrs FROM api_keys WHERE uuid = $1`, [
+          target.uuid,
+        ]),
+      ).toEqual([{ allowed_cidrs: ["203.0.113.0/24"] }]);
+      expect((await set(["203.0.113.1/32"])).status).toBe(200);
+      const rows = await fx.auditNow(
+        `action = 'apikey.ip_policy.set' AND target_id = $1 AND outcome = 'success'`,
+        [target.uuid],
+      );
+      expect(
+        rows.map(
+          (row) => (row.detail as { budget_class: string }).budget_class,
+        ),
+      ).toEqual(["change", "loosen", "change"]);
+    });
+
+    it("judges a following key against the locked global policy for the loosen budget", async () => {
+      setBudget(20, 0, 0);
+      const k = await freshOperatorKey();
+      const target = await fx.dataKey({
+        name: uniq("policy-global-budget"),
+        ownerId: fx.memberId,
+      });
+      try {
+        expect(
+          (
+            await human("apiKeys.setGlobalIpPolicy", {
+              mode: "enforce",
+              allowed_cidrs: ["198.51.100.0/24"],
+            })
+          ).status,
+        ).toBe(200);
+        const reply = await operator(
+          "apiKeys.setIpPolicy",
+          {
+            uuid: target.uuid,
+            allowed_cidrs: ["203.0.113.0/24"],
+            ip_policy_mode: "enforce",
+          },
+          k.key,
+        );
+        expect(reply.code).toBe("TOO_MANY_REQUESTS");
+        expect(
+          await one(`SELECT allowed_cidrs FROM api_keys WHERE uuid = $1`, [
+            target.uuid,
+          ]),
+        ).toEqual([{ allowed_cidrs: null }]);
+      } finally {
+        await human("apiKeys.setGlobalIpPolicy", {
+          mode: "off",
+          allowed_cidrs: [],
+        });
+      }
+    });
+
     it("lets exactly one of two requests from separate connections spend the last slot", async () => {
       setBudget(1, 1, 1);
       const k = await freshOperatorKey();
@@ -964,6 +1047,39 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
         await one(`SELECT 1 FROM access_groups WHERE name = $1`, [b]),
       ).toHaveLength(0);
       expect(await spent(k.uuid)).toBe(1);
+    });
+
+    it("timestamps a budget charge after the request acquires its budget lock", async () => {
+      setBudget(1, 1, 1);
+      const k = await freshOperatorKey();
+      const lock = `SELECT pg_advisory_lock(hashtext('metamcp.admin_plane.budget'), hashtext('${k.uuid}'))`;
+      const unlock = `SELECT pg_advisory_unlock(hashtext('metamcp.admin_plane.budget'), hashtext('${k.uuid}'))`;
+      await barrier.query(lock);
+      const pending = operator(
+        "accessGroups.create",
+        { name: uniq("waited-charge") },
+        k.key,
+      );
+      let releasedAt = "";
+      try {
+        await waitForLockWaiters(1);
+        [{ released_at: releasedAt }] = await one(
+          `SELECT clock_timestamp()::text AS released_at`,
+        );
+      } finally {
+        await barrier.query(unlock);
+      }
+      expect(ok(await pending)).toBe(true);
+      // A timestamp fixed at BEGIN can already be outside the budget window
+      // when a long-queued request finally commits. The charge starts at its
+      // insert, after the lock was granted, rather than when it joined the queue.
+      expect(
+        await one(
+          `SELECT occurred_at >= $2::timestamptz AS charged_after_lock
+             FROM audit_log WHERE actor_id = $1 AND action = 'group.create'`,
+          [k.uuid, releasedAt],
+        ),
+      ).toEqual([{ charged_after_lock: true }]);
     });
   });
 

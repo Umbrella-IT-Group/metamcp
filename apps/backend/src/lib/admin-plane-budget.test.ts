@@ -122,7 +122,9 @@ describe("the class of a change", () => {
     ["group.member.remove", undefined, "tighten"],
     ["mcpserver.update", undefined, "change"],
     ["namespace.update", undefined, "change"],
-    ["apikey.ip_policy.set", undefined, "change"],
+    ["apikey.ip_policy.set", { policy_widened: false }, "change"],
+    ["apikey.ip_policy.set", { policy_widened: true }, "loosen"],
+    ["apikey.ip_policy.set", undefined, "loosen"],
   ] as const)("counts %s %j as %s", (action, detail, expected) => {
     expect(budgetClassOf(action, detail as never)).toBe(expected);
   });

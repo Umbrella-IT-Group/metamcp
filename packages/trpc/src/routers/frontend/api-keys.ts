@@ -67,7 +67,10 @@ export const createApiKeysRouter = (implementations: {
    * input schema refused it (see the middleware on `create`). Receives the raw
    * request and returns an error whose message is one fixed sentence.
    */
-  mintInputRefusal: (rawInput: unknown, actor: AuditActor) => TRPCError;
+  mintInputRefusal: (
+    rawInput: unknown,
+    actor: AuditActor,
+  ) => TRPCError | Promise<TRPCError>;
   list: (userId: string) => Promise<z.infer<typeof ListApiKeysResponseSchema>>;
   listAll: () => Promise<z.infer<typeof ListAllApiKeysResponseSchema>>;
   update: (
@@ -159,7 +162,7 @@ export const createApiKeysRouter = (implementations: {
         ) {
           return result;
         }
-        throw implementations.mintInputRefusal(
+        throw await implementations.mintInputRefusal(
           await getRawInput(),
           auditActor(ctx),
         );

@@ -3,7 +3,7 @@
  * the implementation, with the repository doubled and the transaction runner
  * real (lib/audit/admin-write.ts over a stand-in transaction).
  *
- * Rails (migration 0043 change, plan decision 2): an admin-plane key may not
+ * Self-lockout rails: an admin-plane key may not
  * leave itself an enforce policy its own request address is not inside, and may
  * not set a global enforce policy that excludes that address while it follows
  * the global policy. Both are judged with the request's trusted address and the
@@ -17,35 +17,43 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { repoMock, configServiceMock, loggerMock, txAudit, txState, emitMock } =
-  vi.hoisted(() => ({
-    repoMock: {
-      setIpPolicy: vi.fn(),
-      deactivate: vi.fn(),
-      lockPolicyTarget: vi.fn(),
-    },
-    configServiceMock: {
-      getApiKeyIpPolicy: vi.fn(),
-      setApiKeyIpPolicy: vi.fn(),
-      getApiKeyIpPolicyInTransaction: vi.fn(),
-    },
-    loggerMock: {
-      debug: vi.fn(),
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    },
-    txAudit: {
-      record: vi.fn(async (_tx: unknown, _event: unknown) => undefined),
-    },
-    // What the stand-in transaction's `select ... for share` returns: the
-    // calling key's row, for the global rail.
-    txState: {
-      callerRow: [] as Array<{ allowed_cidrs: string[] | null }>,
-      transactions: 0,
-    },
-    emitMock: vi.fn(),
-  }));
+const {
+  repoMock,
+  configServiceMock,
+  loggerMock,
+  txAudit,
+  txState,
+  emitMock,
+  denialMock,
+} = vi.hoisted(() => ({
+  repoMock: {
+    setIpPolicy: vi.fn(),
+    deactivate: vi.fn(),
+    lockPolicyTarget: vi.fn(),
+  },
+  configServiceMock: {
+    getApiKeyIpPolicy: vi.fn(),
+    setApiKeyIpPolicy: vi.fn(),
+    getApiKeyIpPolicyInTransaction: vi.fn(),
+  },
+  loggerMock: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+  txAudit: {
+    record: vi.fn(async (_tx: unknown, _event: unknown) => undefined),
+  },
+  // What the stand-in transaction's `select ... for share` returns: the
+  // calling key's row, for the global rail.
+  txState: {
+    callerRow: [] as Array<{ allowed_cidrs: string[] | null }>,
+    transactions: 0,
+  },
+  emitMock: vi.fn(),
+  denialMock: vi.fn(async (_event: unknown) => undefined),
+}));
 
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 vi.mock("../db/repositories", () => ({
@@ -78,6 +86,10 @@ vi.mock("../db/index", () => ({
 }));
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: txAudit.record,
+}));
+// TEST-EDIT: rule refusals now await a denied row after the rollback.
+vi.mock("../db/repositories/audit-log.repo", () => ({
+  auditLogRepository: { record: denialMock },
 }));
 // TEST-EDIT (change budget): an admin-plane
 // change now opens the key's change budget inside its transaction (a lock and
@@ -435,8 +447,9 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
       });
       expect(repoMock.setIpPolicy).not.toHaveBeenCalled();
       expect(txAudit.record).not.toHaveBeenCalled();
-      expect(emitMock).toHaveBeenCalledTimes(1);
-      expect(emitMock.mock.calls[0][1]).toEqual({
+      expect(emitMock).not.toHaveBeenCalled();
+      expect(denialMock).toHaveBeenCalledTimes(1);
+      expect(denialMock.mock.calls[0][0]).toMatchObject({
         action: "apikey.ip_policy.set",
         target_type: "api_key",
         target_id: OTHER_UUID,
@@ -480,8 +493,8 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
       actor(),
     ).catch(() => undefined);
 
-    expect(emitMock).toHaveBeenCalledTimes(1);
-    expect(emitMock.mock.calls[0][1]).toMatchObject({ target_id: stored });
+    expect(denialMock).toHaveBeenCalledTimes(1);
+    expect(denialMock.mock.calls[0][0]).toMatchObject({ target_id: stored });
   });
 
   it("looks the target up inside the write's transaction, by uuid", async () => {

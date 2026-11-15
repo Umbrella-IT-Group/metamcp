@@ -2,7 +2,7 @@
  * Every admin-plane mutation records its audit row in the change's own
  * transaction, against a REAL Postgres on the real /trpc stack.
  *
- * Plan, foreman decision 1: a credential with no person in front of it changes
+ * A credential with no person in front of it changes
  * the gateway with nobody watching, so for a request authenticated by an
  * admin-plane key (sync scope for what CI calls, operator scope for the rest)
  * the audit row is part of the change. For each procedure that key can reach

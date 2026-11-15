@@ -14,6 +14,12 @@ describe("redactDiagnosticText", () => {
       ["hunter2", "s3cr3t", "frag"],
     ],
     [
+      "a URL password containing an at sign",
+      "GET https://reader:private@password@vendor.example/mcp failed",
+      "GET https://vendor.example/mcp failed",
+      ["private", "password"],
+    ],
+    [
       "a gateway key",
       "presented sk_mt_abcdefghijklmnopqrstuvwxyz0123456789ABCD and was refused",
       "presented sk_mt_[redacted] and was refused",
@@ -128,6 +134,35 @@ describe("redactDiagnosticText", () => {
       "a single-quoted secret and a spaced assignment",
       "password='hunter2zz' api_key = abc123xyz",
       ["hunter2zz", "abc123xyz"],
+    ],
+    [
+      "an escaped quote inside a JSON password",
+      JSON.stringify({ password: 'prefix"private suffix', error: "refused" }),
+      ["private suffix"],
+    ],
+    [
+      "a multi-parameter Digest Authorization header",
+      'Authorization: Digest username="reader", nonce="server-nonce", response="proof-value"',
+      ["server-nonce", "proof-value"],
+    ],
+    [
+      "a JSON-quoted Digest Authorization header",
+      JSON.stringify({
+        Authorization:
+          'Digest username="reader", nonce="server-nonce", response="proof-value"',
+        error: "refused",
+      }),
+      ["server-nonce", "proof-value"],
+    ],
+    [
+      "an unrecognised Authorization scheme",
+      "Authorization: Custom-Scheme short-proof",
+      ["short-proof"],
+    ],
+    [
+      "an unrecognised scheme with several credential parameters",
+      'Authorization: Signature keyId="reader",signature="signed-proof",nonce="private-nonce"',
+      ["signed-proof", "private-nonce"],
     ],
   ])("removes %s", (_label, input, secrets) => {
     const output = redactDiagnosticText(input);

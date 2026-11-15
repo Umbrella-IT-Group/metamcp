@@ -41,7 +41,7 @@ import {
  *     IPv4 /24 or narrower and IPv6 /48 or narrower, IPv4-mapped IPv6 counted
  *     at its IPv4 width; refused while the global IP-policy kill switch is on.
  *  6. A name of the usual shape that no key of the same owner already uses,
- *     inactive keys included.
+ *     inactive keys included, and not the name of any admin-plane key.
  *
  * Every refusal is one fixed sentence with no echo of the request beyond a
  * field name, so a refusal tells a probing caller nothing about other users,
@@ -69,7 +69,8 @@ export type MintRule =
   | "ip_policy_change_shape"
   | "ip_policy_change_too_wide"
   | "name_invalid"
-  | "name_taken";
+  | "name_taken"
+  | "name_admin_plane";
 
 export const MINT_REFUSALS: Readonly<
   Record<MintRule, { code: "FORBIDDEN" | "BAD_REQUEST"; message: string }>
@@ -162,6 +163,11 @@ export const MINT_REFUSALS: Readonly<
     code: "BAD_REQUEST",
     message:
       "name is already used by a key of this owner (inactive keys count). Use a new name.",
+  },
+  name_admin_plane: {
+    code: "BAD_REQUEST",
+    message:
+      "name is used by an admin-plane API key. Use a different name, so that no key can be mistaken for one.",
   },
 };
 

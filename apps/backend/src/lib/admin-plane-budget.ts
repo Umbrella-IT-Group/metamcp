@@ -217,7 +217,11 @@ const ACTION_CLASSES: Readonly<
   // Clearing a server's ERROR status lets the gateway connect to it again;
   // it grants no caller anything.
   "mcpserver.errors.reset": "change",
-  "apikey.ip_policy.set": "change",
+  // The caller compares the effective policies under the config and key
+  // locks. Any newly admitted address is new access, even within the mint's
+  // prefix bound. Missing evidence cannot grant the less restrictive class.
+  "apikey.ip_policy.set": (detail) =>
+    detail.policy_widened === false ? "change" : "loosen",
   "config.api_key_ip_policy.set": "change",
 };
 

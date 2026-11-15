@@ -1213,7 +1213,7 @@ describeIfDb(
         // The owner is an ordinary member in no group. Oracle: OAuth reach is
         // public endpoints for any authenticated user, a private endpoint for its
         // owner only, and a restricted endpoint for administrators and group
-        // members only (plan, foreman decision 1).
+        // members only.
         const ownerOAuthReach = (e: {
           uuid: string;
           owner: string | null;
@@ -1637,7 +1637,9 @@ describeIfDb(
           expect(accepted.status).toBe(200);
           expect(
             await fx.auditNow(
-              `action = 'config.api_key_ip_policy.set' AND actor_id = $1`,
+              // TEST-EDIT: self-lockout refusals now have denied rows too;
+              // this assertion counts only the committed policy change.
+              `action = 'config.api_key_ip_policy.set' AND actor_id = $1 AND outcome = 'success'`,
               [fx.operator.uuid],
             ),
           ).toHaveLength(1);
@@ -1703,9 +1705,8 @@ describeIfDb(
       // leaves no distinct signal, while an out-of-scope call is a denial.
       //
       // Each probe is sent from an address of its own and its row is found by
-      // that address, not by a time window: a refusal's row is written detached,
-      // after the response, and a row from an earlier probe (or test) that lands
-      // after a timestamp taken now would match that window too.
+      // that address, not by a time window, so the row is tied to this
+      // request alone even when other audit writes arrive concurrently.
       const deniedFrom = (ip: string) =>
         fx.auditEventually(
           `action = 'apikey.create' AND outcome = 'denied' AND actor_id = $1 AND actor_ip = $2`,
@@ -1824,6 +1825,48 @@ describeIfDb(
           }
         },
       );
+
+      it.each([
+        [
+          "a schema refusal",
+          () => ({
+            ip_policy: { mode: "off", allowed_cidrs: ["203.0.113.0/24"] },
+          }),
+          400,
+        ],
+        ["a request rule refusal", () => ({ ip_policy: undefined }), 400],
+        [
+          "a transaction rule refusal",
+          () => ({ endpoint_uuid: epPrivateMember }),
+          403,
+        ],
+      ] as const)(
+        "waits for the denied row before answering %s",
+        async (_label, over, status) => {
+          const ip = fx.uniqueIp();
+          const release = await fx.stallAuditWrites();
+          const pending = mint(over(), { ip });
+          try {
+            expect(
+              await Promise.race([
+                pending.then(() => "responded"),
+                new Promise((resolve) => setTimeout(resolve, 100, "waiting")),
+              ]),
+            ).toBe("waiting");
+            await release();
+            expect((await pending).status).toBe(status);
+            expect(
+              await fx.auditNow(
+                `action = 'apikey.create' AND outcome = 'denied' AND actor_id = $1 AND actor_ip = $2`,
+                [fx.operator.uuid, ip],
+              ),
+            ).toHaveLength(1);
+          } finally {
+            await release();
+            await pending;
+          }
+        },
+      );
     });
 
     // -------------------------------------------------------------------------
@@ -1914,11 +1957,7 @@ describeIfDb(
       );
 
       // The row of one refusal, found by the address that request alone came
-      // from. Not by a time window: the refusals above wrote their rows
-      // detached, after their responses, and the database stamps a detached
-      // write when it starts, so one can land after a timestamp taken here and
-      // match it (a count of 4 instead of 1, or a pass on the wrong request's
-      // row, whose rule is the same).
+      // from, rather than by a time window that could match another request.
       const refusalWhere = `action = 'apikey.ip_policy.set' AND outcome = 'denied' AND target_id = $1 AND actor_ip = $2`;
       const refusalRows = (ip: string) =>
         fx.auditEventually(refusalWhere, [minted, ip]);
@@ -1941,30 +1980,22 @@ describeIfDb(
         );
       });
 
-      it("finds a refusal's row by its own address even though the write outlives the response", async () => {
-        // The case the check above must survive, made to happen every time: the
-        // response is back and the row is not, because the audit writer is
-        // detached. `auditSettled` has to wait for it, and the row is then
-        // there with no polling.
+      // TEST-EDIT: refusals now await their denied rows after rollback, so
+      // holding the audit insert must hold the response as well.
+      it("waits for the denied row before answering a policy refusal", async () => {
         const release = await fx.stallAuditWrites();
+        const ip = fx.uniqueIp();
+        const pending = setPolicy(["10.0.0.0/8"], "enforce", { ip });
         try {
-          const ip = fx.uniqueIp();
-          const reply = await setPolicy(["10.0.0.0/8"], "enforce", { ip });
-          expect(reply.status).toBe(400);
-          expect(await fx.auditNow(refusalWhere, [minted, ip])).toHaveLength(0);
-
-          const settled = fx.auditSettled().then(() => "settled");
-          // Nothing can finish while the stall is closed, so a helper that
-          // returns now is wrong; the timer only bounds how long it is watched.
           expect(
             await Promise.race([
-              settled,
+              pending.then(() => "responded"),
               new Promise((resolve) => setTimeout(resolve, 100, "waiting")),
             ]),
           ).toBe("waiting");
 
           await release();
-          await settled;
+          expect((await pending).status).toBe(400);
           const rows = await fx.auditNow(refusalWhere, [minted, ip]);
           expect(rows).toHaveLength(1);
           expect((rows[0].detail as { rule: string }).rule).toBe(
@@ -1972,6 +2003,7 @@ describeIfDb(
           );
         } finally {
           await release();
+          await pending;
         }
       });
 

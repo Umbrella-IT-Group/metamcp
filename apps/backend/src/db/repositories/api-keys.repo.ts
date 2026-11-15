@@ -344,6 +344,20 @@ export class ApiKeysRepository {
       .limit(1);
     if (sameName) throw new ApiKeyMintRefusal("name_taken");
 
+    // The same protection as rename: another owner's data-plane key must
+    // not look like the admin-plane credential a person is trying to contain.
+    const [adminPlaneName] = await tx
+      .select({ uuid: apiKeysTable.uuid })
+      .from(apiKeysTable)
+      .where(
+        and(
+          eq(apiKeysTable.admin_plane, true),
+          eq(apiKeysTable.name, request.name),
+        ),
+      )
+      .limit(1);
+    if (adminPlaneName) throw new ApiKeyMintRefusal("name_admin_plane");
+
     try {
       return await this.create(
         {

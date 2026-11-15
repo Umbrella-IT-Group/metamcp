@@ -80,6 +80,7 @@ import {
   ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
   AdminAuditWriteError,
   AdminRuleRefusal,
+  recordDenialAfterRollback,
   runAuditedTransaction,
   withAdminAudit,
 } from "../lib/audit/admin-write";
@@ -190,19 +191,18 @@ function notAnOperatorRefusal(): TRPCError {
 
 /**
  * Leave a trace of a refusal an admin-plane key ran into: one `denied` audit
- * row naming the rule and nothing of the request. Without it a key probing for
- * a credential it may not create leaves only the generic accepted-request row,
- * while an out-of-scope procedure call is recorded as a denial. Best effort,
- * like the other denial rows: a refusal has nothing to roll back, and an audit
- * outage must not turn a clean refusal into a failure.
+ * row naming the rule and nothing of the request. Wait for the row before
+ * answering, as the change rails do, so immediate read-back sees the refusal.
+ * Called before a transaction starts or after it has rolled back; a refusal
+ * inside a write uses AdminRuleRefusal instead.
  */
-function recordRefusal(
+async function recordRefusal(
   actor: AuditActor,
   action: "apikey.create" | "apikey.ip_policy.set",
   rule: MintRule,
   targetId?: string,
-): void {
-  emitAdminEvent(actor, {
+): Promise<void> {
+  await recordDenialAfterRollback(actor, {
     action,
     target_type: "api_key",
     ...(targetId !== undefined ? { target_id: targetId } : {}),
@@ -212,8 +212,11 @@ function recordRefusal(
 }
 
 /** A refusal of an agent mint as the error a caller sees, recorded as denied. */
-function mintRefusalError(actor: AuditActor, rule: MintRule): TRPCError {
-  recordRefusal(actor, "apikey.create", rule);
+async function mintRefusalError(
+  actor: AuditActor,
+  rule: MintRule,
+): Promise<TRPCError> {
+  await recordRefusal(actor, "apikey.create", rule);
   return new TRPCError({
     code: MINT_REFUSALS[rule].code,
     message: MINT_REFUSALS[rule].message,
@@ -248,7 +251,7 @@ async function createForAdminPlane(
   actor: AuditActor,
 ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> {
   if (actor.admin_plane?.scope !== "operator" || isAdmin !== true) {
-    recordRefusal(actor, "apikey.create", "caller_not_operator");
+    await recordRefusal(actor, "apikey.create", "caller_not_operator");
     throw notAnOperatorRefusal();
   }
 
@@ -256,7 +259,7 @@ async function createForAdminPlane(
   try {
     request = validateAgentMintRequest(input);
   } catch (error) {
-    throw mintFailure(error, actor);
+    throw await mintFailure(error, actor);
   }
 
   try {
@@ -287,7 +290,7 @@ async function createForAdminPlane(
     );
     return ApiKeysSerializer.serializeCreateApiKeyResponse(created);
   } catch (error) {
-    throw mintFailure(error, actor);
+    throw await mintFailure(error, actor);
   }
 }
 
@@ -298,7 +301,10 @@ async function createForAdminPlane(
  * its type: a driver error can carry statement parameters, and this path
  * handles a freshly generated credential.
  */
-function mintFailure(error: unknown, actor: AuditActor): TRPCError {
+async function mintFailure(
+  error: unknown,
+  actor: AuditActor,
+): Promise<TRPCError> {
   if (error instanceof TRPCError) return error;
   if (error instanceof ApiKeyMintRefusal) {
     return mintRefusalError(actor, error.rule);
@@ -689,7 +695,10 @@ export const apiKeysImplementations = {
    * rule names. Nothing of the request is echoed, and the refusal is recorded as
    * a denied `apikey.create` row.
    */
-  mintInputRefusal: (rawInput: unknown, actor: AuditActor): TRPCError => {
+  mintInputRefusal: async (
+    rawInput: unknown,
+    actor: AuditActor,
+  ): Promise<TRPCError> => {
     let rule: MintRule = "request_invalid";
     if (
       typeof rawInput === "object" &&
@@ -1197,6 +1206,8 @@ export const apiKeysImplementations = {
     const changesOwnPolicy =
       callerKeyUuid !== undefined && input.uuid.toLowerCase() === callerKeyUuid;
 
+    let policyWidened = false;
+
     const result = await withAdminAudit(
       actor,
       async (...tx) => {
@@ -1221,6 +1232,18 @@ export const apiKeysImplementations = {
             handle,
             input.uuid,
           );
+          if (target) {
+            // Compare actual address sets under both locks. A list within
+            // the mint's prefix bound can still widen the previous policy.
+            policyWidened = !admitsNoMoreThan(
+              admittedAddresses(
+                allowedCidrs === null
+                  ? global
+                  : { mode: input.ip_policy_mode, cidrs: allowedCidrs },
+              ),
+              admittedAddresses(currentEffectivePolicy(target, global)),
+            );
+          }
           if (target?.admin_plane) {
             // The IP rail: an admin-plane key may only NARROW an admin-plane
             // key's policy, its own included, judged against the target's
@@ -1256,15 +1279,11 @@ export const apiKeysImplementations = {
               if (error instanceof ApiKeyMintRefusal) {
                 // Lower case, the way the key's own row spells its uuid, so a
                 // query by the canonical uuid finds the denial too.
-                recordRefusal(
-                  actor,
-                  "apikey.ip_policy.set",
-                  error.rule,
-                  input.uuid.toLowerCase(),
-                );
-                throw new TRPCError({
-                  code: error.code,
-                  message: error.message,
+                throw new AdminRuleRefusal(error.code, error.message, {
+                  action: "apikey.ip_policy.set",
+                  target_type: "api_key",
+                  target_id: input.uuid.toLowerCase(),
+                  detail: { rule: error.rule },
                 });
               }
               throw error;
@@ -1283,7 +1302,12 @@ export const apiKeysImplementations = {
               allowedCidrs === null ? "globalList" : "ownList",
             );
             if (refusal) {
-              throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+              throw new AdminRuleRefusal("BAD_REQUEST", refusal, {
+                action: "apikey.ip_policy.set",
+                target_type: "api_key",
+                target_id: input.uuid.toLowerCase(),
+                detail: { rule: "ip_policy_self_lockout" },
+              });
             }
           }
         }
@@ -1307,6 +1331,9 @@ export const apiKeysImplementations = {
               target_id: input.uuid,
               detail: {
                 name: written.after.name,
+                ...(actor?.admin_plane
+                  ? { policy_widened: policyWidened }
+                  : {}),
                 old_value: written.before,
                 new_value: {
                   allowed_cidrs: written.after.allowed_cidrs,
@@ -1388,7 +1415,12 @@ export const apiKeysImplementations = {
             snapshots.after,
           );
           if (refusal) {
-            throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+            throw new AdminRuleRefusal("BAD_REQUEST", refusal, {
+              action: "config.api_key_ip_policy.set",
+              target_type: "config_key",
+              target_id: "API_KEY_IP_POLICY",
+              detail: { rule: "ip_policy_self_lockout" },
+            });
           }
         }
         return snapshots;

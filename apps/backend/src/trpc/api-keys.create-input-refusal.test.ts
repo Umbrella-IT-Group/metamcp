@@ -15,7 +15,7 @@
 import { createAppRouter } from "@repo/trpc";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { repoMock, loggerMock, emitMock } = vi.hoisted(() => ({
+const { repoMock, loggerMock, emitMock, denialMock } = vi.hoisted(() => ({
   repoMock: {
     create: vi.fn(),
     mintDataPlaneKey: vi.fn(),
@@ -23,6 +23,7 @@ const { repoMock, loggerMock, emitMock } = vi.hoisted(() => ({
   },
   loggerMock: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
   emitMock: vi.fn(),
+  denialMock: vi.fn(async (_event: unknown) => undefined),
 }));
 
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
@@ -54,6 +55,10 @@ vi.mock("../db/index", () => ({
 }));
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: vi.fn(async () => undefined),
+}));
+// TEST-EDIT: input refusals await a denied row instead of emitting it detached.
+vi.mock("../db/repositories/audit-log.repo", () => ({
+  auditLogRepository: { record: denialMock },
 }));
 // TEST-EDIT (change budget): an admin-plane
 // change now opens the key's change budget inside its transaction (a lock and
@@ -218,8 +223,9 @@ describe("a request the schema refuses, from an operator-scope admin-plane key",
       });
       expect(() => JSON.parse(failure?.message ?? "")).toThrow();
       expect(repoMock.mintDataPlaneKey).not.toHaveBeenCalled();
-      expect(emitMock).toHaveBeenCalledTimes(1);
-      expect(emitMock.mock.calls[0][1]).toEqual({
+      expect(emitMock).not.toHaveBeenCalled();
+      expect(denialMock).toHaveBeenCalledTimes(1);
+      expect(denialMock.mock.calls[0][0]).toMatchObject({
         action: "apikey.create",
         target_type: "api_key",
         outcome: "denied",
@@ -238,7 +244,7 @@ describe("a request the schema refuses, from an operator-scope admin-plane key",
       }),
     );
 
-    const seen = JSON.stringify([failure, emitMock.mock.calls]);
+    const seen = JSON.stringify([failure, denialMock.mock.calls]);
     for (const probe of ["alpha", "beta"]) expect(seen).not.toContain(probe);
   });
 

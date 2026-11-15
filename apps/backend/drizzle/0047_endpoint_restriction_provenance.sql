@@ -31,4 +31,11 @@
 -- neither reads nor writes these columns.
 
 ALTER TABLE "endpoints" ADD COLUMN "restricted_at" timestamp with time zone;--> statement-breakpoint
-ALTER TABLE "endpoints" ADD COLUMN "restricted_by_api_key_uuid" uuid;
+ALTER TABLE "endpoints" ADD COLUMN "restricted_by_api_key_uuid" uuid;--> statement-breakpoint
+
+-- The change budget counts committed audit rows in a sliding window. A
+-- transaction may wait on its budget or target lock for longer than that
+-- window, so stamping a new charge with now() (the transaction's start) can
+-- expire it before it commits. Stamp the insert's wall-clock time instead.
+-- Existing rows and the append-only guards stay intact.
+ALTER TABLE "audit_log" ALTER COLUMN "occurred_at" SET DEFAULT clock_timestamp();

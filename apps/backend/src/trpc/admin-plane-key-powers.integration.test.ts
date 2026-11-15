@@ -266,6 +266,38 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
   });
 
   // ---------------------------------------------------------------------------
+  describe("apiKeys.create names", () => {
+    it.each([true, false])(
+      "refuses an admin-plane key's name even for another owner (active: %s)",
+      async (active) => {
+        const target = await adminPlaneKey("mint-lookalike", active);
+        const name = (await keyRow(target))?.name as string;
+        const reply = await operator("apiKeys.create", {
+          name,
+          user_id: fx.memberId,
+          all_endpoints: true,
+          ip_policy: {
+            mode: "enforce",
+            allowed_cidrs: ["203.0.113.0/24"],
+          },
+        });
+        expect({ status: reply.status, code: reply.code }).toEqual({
+          status: 400,
+          code: "BAD_REQUEST",
+        });
+        expect(
+          await one(`SELECT uuid FROM api_keys WHERE name = $1`, [name]),
+        ).toEqual([{ uuid: target }]);
+        const denied = await fx.auditEventually(
+          `action = 'apikey.create' AND outcome = 'denied' AND actor_id = $1 AND detail->>'rule' = 'name_admin_plane'`,
+          [fx.operator.uuid],
+        );
+        expect(denied.length).toBeGreaterThan(0);
+      },
+    );
+  });
+
+  // ---------------------------------------------------------------------------
   describe("apiKeys.reactivate", () => {
     const reactivate = (uuid: string, key?: string) =>
       operator("apiKeys.reactivate", { uuid }, key);

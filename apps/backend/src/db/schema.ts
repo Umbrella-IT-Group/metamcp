@@ -1141,7 +1141,8 @@ export const auditLogTable = pgTable(
       .default(sql`gen_random_uuid()`),
     occurred_at: timestamp("occurred_at", { withTimezone: true })
       .notNull()
-      .defaultNow(),
+      // Budget charges begin when inserted, after any transaction lock wait.
+      .default(sql`clock_timestamp()`),
     // user | api_key | oauth_client | anonymous | system. Kept as text
     // rather than a pgEnum: a new actor class must never be able to make an
     // audit INSERT fail, and a failed audit INSERT is a silently missing
