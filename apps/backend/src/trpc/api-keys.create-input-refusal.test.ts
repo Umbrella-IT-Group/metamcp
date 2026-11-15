@@ -55,6 +55,15 @@ vi.mock("../db/index", () => ({
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: vi.fn(async () => undefined),
 }));
+// TEST-EDIT (change budget, full-management plan 1A item 4): an admin-plane
+// change now opens the key's change budget inside its transaction (a lock and
+// a count statement), which this suite's stand-in transaction cannot run. The
+// budget is pinned in admin-plane-budget.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts; here it is opened as "no budget".
+vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
+}));
 
 const { apiKeysImplementations } = await import("./api-keys.impl");
 const { ApiKeyMintRefusal, MINT_REFUSALS } = await import(
@@ -116,7 +125,12 @@ const create = (ctx: object, input: unknown) =>
       (error: { code?: string; message?: string }) => error,
     );
 
+// TEST-EDIT (change reason, full-management plan 1A item 5): an
+// operator-scope key's change carries a reason, or it is refused before the
+// schema runs; every request here carries one so the schema and the rules
+// are what answer.
 const mintInput = (over: Record<string, unknown> = {}) => ({
+  reason: "unit test",
   name: "metrics poller",
   user_id: "owner-user-1",
   endpoint_uuid: ENDPOINT_UUID,

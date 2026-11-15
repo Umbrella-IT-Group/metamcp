@@ -1,4 +1,12 @@
-import type { AuditActor } from "@repo/trpc";
+import {
+  ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+  ADMIN_PLANE_OPERATOR_MUTATIONS,
+  ADMIN_PLANE_OPERATOR_PROCEDURES,
+  type AuditActor,
+  CHANGE_REASON_MAX_LENGTH,
+  CHANGE_RUN_ID_MAX_LENGTH,
+} from "@repo/trpc";
 import {
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
@@ -9,6 +17,7 @@ import {
   GetGlobalIpPolicyResponseSchema,
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
+  OperatorCapabilitiesResponseSchema,
   SetApiKeyIpPolicyRequestSchema,
   SetApiKeyIpPolicyResponseSchema,
   SetGlobalIpPolicyRequestSchema,
@@ -30,13 +39,16 @@ import {
   usersRepository,
 } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
+import { adminPlaneBudgetConfig } from "../lib/admin-plane-budget";
 import { resolveActsAsUserId } from "../lib/api-key-identity";
 import {
   apiKeyIpPolicyDisabled,
   type IpPolicyMode,
+  isAnyIpExemption,
   normalizeCidrList,
 } from "../lib/api-key-ip-policy";
 import {
+  AdminPlaneOwnerIneligible,
   ApiKeyMintRefusal,
   assertAgentSettableIpPolicy,
   MINT_REFUSALS,
@@ -52,10 +64,16 @@ import { emitAdminEvent } from "../lib/audit/admin-event";
 import {
   ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
   AdminAuditWriteError,
+  AdminRuleRefusal,
   runAuditedTransaction,
   withAdminAudit,
 } from "../lib/audit/admin-write";
 import { configService } from "../lib/config.service";
+import {
+  admitsNoMoreThan,
+  admittedAddresses,
+  isNoWeakerPolicy,
+} from "../lib/ip-policy-compare";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -96,6 +114,55 @@ function validatedCidrs(
     });
   }
   return normalized.cidrs;
+}
+
+/**
+ * The refusal an admin-plane key gets for a change that would not narrow an
+ * admin-plane key's IP policy, and for one that would weaken the global
+ * policy. Fixed sentences, naming no key, list or address.
+ */
+export const ADMIN_PLANE_KEY_IP_POLICY_REFUSAL =
+  "An admin-plane API key can only narrow an admin-plane key's IP policy: mode enforce, with a list of its own that admits no address the current policy does not. Turning it off, to audit, to the global policy, to any address or to a wider list is done in the admin UI.";
+export const ADMIN_PLANE_GLOBAL_IP_POLICY_REFUSAL =
+  "An admin-plane API key cannot weaken the global IP policy: its mode may not fall and it may admit no address it does not admit now. Do this in the admin UI.";
+
+/**
+ * The policy an admin-plane key is under right now, from its locked row: its
+ * own list and mode, or the global policy when it has no list of its own.
+ */
+function currentEffectivePolicy(
+  target: { allowed_cidrs?: string[] | null; ip_policy_mode?: string | null },
+  global: { mode: IpPolicyMode; cidrs: readonly string[] },
+): { mode: string; cidrs: readonly string[] } {
+  if (target.allowed_cidrs === null || target.allowed_cidrs === undefined) {
+    return global;
+  }
+  return { mode: target.ip_policy_mode ?? "off", cidrs: target.allowed_cidrs };
+}
+
+/**
+ * The rule a requested change to an ADMIN-PLANE key's policy breaks, or null
+ * when it only narrows. The request must be mode enforce with a list of its
+ * own (not the any-IP exemption) that admits no address the current effective
+ * policy does not, compared as address sets (lib/ip-policy-compare).
+ */
+function adminPlaneIpPolicyChangeRule(
+  current: { mode: string; cidrs: readonly string[] },
+  requested: { mode: IpPolicyMode; cidrs: string[] | null },
+): "ip_policy_admin_plane_shape" | "ip_policy_admin_plane_wider" | null {
+  if (
+    requested.mode !== "enforce" ||
+    requested.cidrs === null ||
+    requested.cidrs.length === 0 ||
+    isAnyIpExemption(requested.cidrs)
+  ) {
+    return "ip_policy_admin_plane_shape";
+  }
+  const narrows = admitsNoMoreThan(
+    admittedAddresses({ mode: "enforce", cidrs: requested.cidrs }),
+    admittedAddresses(current),
+  );
+  return narrows ? null : "ip_policy_admin_plane_wider";
 }
 
 /** The fixed refusal for a caller that is not an operator-scope key. */
@@ -540,6 +607,16 @@ export const apiKeysImplementations = {
       if (error instanceof TRPCError) {
         throw error;
       }
+      // The owner of a new admin-plane key is re-checked under its row lock
+      // in the insert's transaction (see ApiKeysRepository.create): an owner
+      // disabled or no longer an administrator by then is refused here.
+      if (error instanceof AdminPlaneOwnerIneligible) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "An admin-plane key's owner must be an enabled administrator.",
+        });
+      }
       logger.error("Error creating API key:", describeDbError(error));
       throw new Error(
         error instanceof Error ? error.message : "Internal server error",
@@ -624,6 +701,17 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateApiKeyResponseSchema>> => {
+    // The broad update is a person's procedure: it can re-activate, rename or
+    // re-own any key for an administrator. An admin-plane key may not reach
+    // it (it is in neither admin-plane procedure set); refused here as well,
+    // so a future scope change cannot hand a key the power to re-activate or
+    // rename an admin-plane key, which the key action table keeps human.
+    if (actor?.admin_plane) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: ADMIN_PLANE_FORBIDDEN_MESSAGE,
+      });
+    }
     // Re-activation is an administrator's decision. A member may rename and
     // deactivate their own keys, but if they could also re-activate one, an
     // administrator's deactivation of it could be undone by that member, or
@@ -687,6 +775,14 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteApiKeyResponseSchema>> => {
+    // A person's procedure, like `update` above: refused to an admin-plane key
+    // here as well as by the procedure sets.
+    if (actor?.admin_plane) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: ADMIN_PLANE_FORBIDDEN_MESSAGE,
+      });
+    }
     try {
       // Admins bypass the ownership WHERE (may delete / revoke any key);
       // members stay owner-scoped.
@@ -783,6 +879,34 @@ export const apiKeysImplementations = {
     );
   },
 
+  /**
+   * What an operator-scope admin-plane key may call and the rules its changes
+   * must meet, derived from the scope sets in @repo/trpc and the budget the
+   * deploy environment configures. Nothing here is stored or caller-supplied,
+   * so the answer is the gateway's own contract, read at the moment of asking.
+   */
+  operatorCapabilities: async (
+    callerScope: "sync" | "operator" | null,
+  ): Promise<z.infer<typeof OperatorCapabilitiesResponseSchema>> => {
+    const budget = adminPlaneBudgetConfig();
+    return {
+      contract_version: ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+      caller_scope: callerScope,
+      procedures: [...ADMIN_PLANE_OPERATOR_PROCEDURES].sort(),
+      mutations: [...ADMIN_PLANE_OPERATOR_MUTATIONS].sort(),
+      reason: {
+        required_for_operator_scope: true,
+        max_length: CHANGE_REASON_MAX_LENGTH,
+        run_id_max_length: CHANGE_RUN_ID_MAX_LENGTH,
+      },
+      budget: {
+        window_seconds: budget.windowSeconds,
+        operator: { ...budget.operator },
+        sync: { ...budget.sync },
+      },
+    };
+  },
+
   // ---- IP allowlists (migration 0041), admin-only at the router ----
 
   setIpPolicy: async (
@@ -813,15 +937,7 @@ export const apiKeysImplementations = {
     const result = await withAdminAudit(
       actor,
       async (...tx) => {
-        // Second half of rule 5: an admin-plane key may leave a DATA-plane key
-        // only a narrow enforce policy of its own, so a key that was created
-        // locked cannot be unlocked or widened by a later call (a human
-        // administrator's change in the UI is not held to it). Judged against
-        // the target as locked in this transaction. The key's own row is
-        // skipped: it is an admin-plane key by definition, and taking its row
-        // lock here would run ahead of the config locks the own-policy rail
-        // below takes first.
-        if (actor?.admin_plane && !changesOwnPolicy) {
+        if (actor?.admin_plane) {
           const handle = tx[0];
           if (!handle) {
             // Unreachable: an admin-plane actor always gets a transaction.
@@ -830,11 +946,44 @@ export const apiKeysImplementations = {
               message: "Internal server error",
             });
           }
+          // Lock order (db/repositories/admin-plane-locks): the global
+          // policy's config locks, shared, BEFORE the key row, whatever the
+          // target turns out to be. setGlobalIpPolicy takes them first too, so
+          // the two cannot deadlock, and a target that follows the global
+          // policy is judged against the policy as it will be at commit.
+          const global = followedGlobalPolicy(
+            await configService.getApiKeyIpPolicyInTransaction(handle),
+          );
           const target = await apiKeysRepository.lockPolicyTarget(
             handle,
             input.uuid,
           );
-          if (target && !target.admin_plane) {
+          if (target?.admin_plane) {
+            // The IP rail: an admin-plane key may only NARROW an admin-plane
+            // key's policy, its own included, judged against the target's
+            // current effective policy as locked here. A human administrator's
+            // change in the UI is not held to it.
+            const rule = adminPlaneIpPolicyChangeRule(
+              currentEffectivePolicy(target, global),
+              { mode: input.ip_policy_mode, cidrs: allowedCidrs },
+            );
+            if (rule) {
+              throw new AdminRuleRefusal(
+                "FORBIDDEN",
+                ADMIN_PLANE_KEY_IP_POLICY_REFUSAL,
+                {
+                  action: "apikey.ip_policy.set",
+                  target_type: "api_key",
+                  target_id: input.uuid.toLowerCase(),
+                  detail: { rule },
+                },
+              );
+            }
+          } else if (target && !changesOwnPolicy) {
+            // Second half of rule 5: an admin-plane key may leave a DATA-plane
+            // key only a narrow enforce policy of its own, so a key that was
+            // created locked cannot be unlocked or widened by a later call (a
+            // human administrator's change in the UI is not held to it).
             try {
               assertAgentSettableIpPolicy({
                 mode: input.ip_policy_mode,
@@ -858,33 +1007,21 @@ export const apiKeysImplementations = {
               throw error;
             }
           }
-        }
-        if (changesOwnPolicy) {
-          const handle = tx[0];
-          if (!handle) {
-            // Unreachable: an admin-plane actor always gets a transaction.
-            throw new TRPCError({
-              code: "INTERNAL_SERVER_ERROR",
-              message: "Internal server error",
-            });
-          }
-          // Taken first, in the order setGlobalIpPolicy takes them (the config
-          // locks, then the key row), so the two cannot deadlock. A key that
-          // is about to follow the global policy is judged against the global
-          // policy as it will be when this commits.
-          const effective =
-            allowedCidrs === null
-              ? followedGlobalPolicy(
-                  await configService.getApiKeyIpPolicyInTransaction(handle),
-                )
-              : { mode: input.ip_policy_mode, cidrs: allowedCidrs };
-          const refusal = selfLockoutRefusal(
-            effective,
-            actor?.actor_ip,
-            allowedCidrs === null ? "globalList" : "ownList",
-          );
-          if (refusal) {
-            throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+          if (changesOwnPolicy) {
+            // A key that is about to follow the global policy is judged
+            // against the global policy as it will be when this commits.
+            const effective =
+              allowedCidrs === null
+                ? global
+                : { mode: input.ip_policy_mode, cidrs: allowedCidrs };
+            const refusal = selfLockoutRefusal(
+              effective,
+              actor?.actor_ip,
+              allowedCidrs === null ? "globalList" : "ownList",
+            );
+            if (refusal) {
+              throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+            }
           }
         }
         return apiKeysRepository.setIpPolicy(
@@ -963,6 +1100,23 @@ export const apiKeysImplementations = {
               code: "INTERNAL_SERVER_ERROR",
               message: "Internal server error",
             });
+          }
+          // The IP rail: an admin-plane key may not WEAKEN the global policy,
+          // in mode or in the addresses it admits, whether or not it follows
+          // the policy itself. Judged on the value this write replaced, read
+          // under the exclusive config locks it took (not a pre-read), so no
+          // concurrent writer can change what is compared.
+          if (!isNoWeakerPolicy(snapshots.before, snapshots.after)) {
+            throw new AdminRuleRefusal(
+              "FORBIDDEN",
+              ADMIN_PLANE_GLOBAL_IP_POLICY_REFUSAL,
+              {
+                action: "config.api_key_ip_policy.set",
+                target_type: "config_key",
+                target_id: "API_KEY_IP_POLICY",
+                detail: { rule: "ip_policy_global_weaker" },
+              },
+            );
           }
           const refusal = await globalPolicyRefusalForCaller(
             handle,

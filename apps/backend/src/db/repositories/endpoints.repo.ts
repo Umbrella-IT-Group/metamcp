@@ -4,7 +4,7 @@ import {
   EndpointCreateInput,
   EndpointUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNotNull, isNull, ne, or } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import { endpointsTable, namespacesTable } from "../schema";
@@ -28,6 +28,11 @@ export class EndpointsRepository {
         // Persisted here so an endpoint can be created already-restricted.
         // Independent of require_scoped_api_key.
         restricted: input.restricted ?? false,
+        // When the restriction began (migration 0047). Created restricted is
+        // not a transition an admin-plane key made, so the key half of the
+        // marker stays NULL: such a restriction is never one a key may roll
+        // back.
+        restricted_at: input.restricted ? sql`clock_timestamp()` : null,
         enable_max_rate: input.enable_max_rate ?? false,
         enable_client_max_rate: input.enable_client_max_rate ?? false,
         max_rate: input.max_rate,

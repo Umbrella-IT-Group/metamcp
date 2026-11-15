@@ -63,6 +63,15 @@ vi.mock("../db/repositories/audit-log-tx", () => ({
     txAudit.sink?.(event);
   }),
 }));
+// TEST-EDIT (change budget, full-management plan 1A item 4): an admin-plane
+// change now opens the key's change budget inside its transaction (a lock and
+// a count statement), which this suite's stand-in transaction cannot run. The
+// budget is pinned in admin-plane-budget.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts; here it is opened as "no budget".
+vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
+}));
 
 // ---------------------------------------------------------------------------
 // Repository / service doubles — the layer under the impls
@@ -91,6 +100,26 @@ const configServiceMock = {
   setMcpMaxAttempts: vi.fn(),
 };
 
+// TEST-EDIT (account rails, full-management plan 1A item 3): an account
+// change now runs in one transaction that locks the enabled administrators
+// and the target first and judges the rails on them. The stand-ins below
+// answer as the rows would for an enabled member target with two enabled
+// administrators; the rails themselves are pinned in account-rails.test.ts and
+// against Postgres in admin-plane-rails.integration.test.ts.
+vi.mock("../db/repositories/admin-plane-locks", () => ({
+  lockAdminPlaneBudget: vi.fn(async () => undefined),
+  lockEndpointNamespaces: vi.fn(async () => undefined),
+  lockAccountTarget: vi.fn(async (_tx: unknown, id: string) => ({
+    target: { id, role: "member", disabled: false },
+    enabledAdminIds: ["admin-1", "admin-2"],
+  })),
+  lockAccountForRevoke: vi.fn(async (_tx: unknown, id: string) => ({
+    id,
+    role: "member",
+    disabled: false,
+  })),
+  ownsActiveAdminPlaneKey: vi.fn(async () => false),
+}));
 vi.mock("../lib/config.service", () => ({
   configService: configServiceMock,
 }));

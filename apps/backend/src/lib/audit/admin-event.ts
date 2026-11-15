@@ -78,6 +78,16 @@ export function buildAdminAuditEvent(
   actor: AuditActor | undefined | null,
   event: AdminEventInput,
 ): AuditEvent {
+  // The caller's own account of the change, when it sent one (validated by the
+  // procedure base, @repo/trpc `changeContextOf`): why, and which run of its
+  // tooling. Context for a reader of the trail, never an identity; who acted
+  // is the actor below. Added after the event's own detail so a call site
+  // cannot be shadowed by it, and only when present so every other row keeps
+  // its shape.
+  const change = {
+    ...(typeof actor?.reason === "string" ? { reason: actor.reason } : {}),
+    ...(typeof actor?.run_id === "string" ? { run_id: actor.run_id } : {}),
+  };
   // An admin-plane API key acted. The KEY is the actor: actor_type
   // `api_key` and actor_id the key's uuid, the same shape the
   // `authn.admin_key.accepted` row that authenticated the request uses, so
@@ -100,6 +110,7 @@ export function buildAdminAuditEvent(
       request_id: actor?.request_id ?? null,
       detail: {
         ...(event.detail ?? {}),
+        ...change,
         admin_plane: {
           key_uuid: adminPlane.key_uuid,
           owner_user_id: adminPlane.owner_user_id,
@@ -130,6 +141,6 @@ export function buildAdminAuditEvent(
     target_id: event.target_id ?? null,
     outcome: event.outcome ?? "success",
     request_id: actor?.request_id ?? null,
-    detail: event.detail ?? {},
+    detail: { ...(event.detail ?? {}), ...change },
   };
 }

@@ -13,6 +13,7 @@ import {
   type IpPolicyMode,
 } from "@/lib/api-key-ip-policy";
 import {
+  AdminPlaneOwnerIneligible,
   ApiKeyMintRefusal,
   assertEndpointEligible,
   assertGatewayWideOwnerAllowed,
@@ -99,6 +100,50 @@ export class ApiKeysRepository {
    * returned object, and nothing here logs or throws with it.
    */
   async create(
+    input: ApiKeyCreateInput,
+    executor?: DbExecutor,
+  ): Promise<{
+    uuid: string;
+    name: string;
+    key: string;
+    user_id: string | null;
+    endpoint_uuid: string | null;
+    acts_as_user_id: string | null;
+    created_at: Date;
+  }> {
+    // An admin-plane key is inserted in one transaction with its owner's row
+    // locked FOR SHARE and re-checked: the owner must still be an enabled
+    // administrator. A concurrent disable of that owner takes the row FOR
+    // UPDATE (the account rails, db/repositories/admin-plane-locks), so the
+    // two are ordered and neither reads the other's half-done state: the key
+    // is never created for an owner who was disabled before it, and a disable
+    // that runs after sees the key when it asks what the owner holds.
+    if (input.admin_plane === true) {
+      return await (executor ?? db).transaction(async (tx) => {
+        const owner =
+          typeof input.user_id === "string"
+            ? (
+                await tx
+                  .select({
+                    role: usersTable.role,
+                    disabled: usersTable.disabled,
+                  })
+                  .from(usersTable)
+                  .where(eq(usersTable.id, input.user_id))
+                  .for("share")
+              )[0]
+            : undefined;
+        if (!owner || owner.role !== "admin" || owner.disabled !== false) {
+          throw new AdminPlaneOwnerIneligible();
+        }
+        return this.insertKey(input, tx);
+      });
+    }
+    return this.insertKey(input, executor);
+  }
+
+  /** The insert itself; see `create`. */
+  private async insertKey(
     input: ApiKeyCreateInput,
     executor?: DbExecutor,
   ): Promise<{
@@ -820,19 +865,29 @@ export class ApiKeysRepository {
   }
 
   /**
-   * Lock one key's row and report which plane it is on, inside the caller's
-   * transaction, for a policy change that is judged by the target's kind (an
-   * admin-plane key may only leave a DATA-plane key a narrow enforce policy).
+   * Lock one key's row and report which plane it is on and the policy it
+   * holds now, inside the caller's transaction, for a policy change that is
+   * judged by the target's kind (an admin-plane key may only leave a
+   * DATA-plane key a narrow enforce policy, and may only narrow an admin-plane
+   * key's policy, judged against the policy read here under the row lock).
    * Returns null when no key has that uuid. The plane is fixed at creation and
-   * has no setter, so the lock is for ordering with the write that follows in
-   * the same transaction, not for the flag.
+   * has no setter; the policy is what the lock protects until the write that
+   * follows in the same transaction.
    */
   async lockPolicyTarget(
     tx: DbTransaction,
     uuid: string,
-  ): Promise<{ admin_plane: boolean } | null> {
+  ): Promise<{
+    admin_plane: boolean;
+    allowed_cidrs: string[] | null;
+    ip_policy_mode: string;
+  } | null> {
     const [target] = await tx
-      .select({ admin_plane: apiKeysTable.admin_plane })
+      .select({
+        admin_plane: apiKeysTable.admin_plane,
+        allowed_cidrs: apiKeysTable.allowed_cidrs,
+        ip_policy_mode: apiKeysTable.ip_policy_mode,
+      })
       .from(apiKeysTable)
       .where(eq(apiKeysTable.uuid, uuid))
       .for("update");

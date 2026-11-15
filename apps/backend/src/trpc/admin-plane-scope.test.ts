@@ -59,7 +59,12 @@ const EXPECTED_SYNC = [
   "frontend.tools.getByMcpServerUuid",
 ];
 
+// TEST-EDIT (full-management plan 1A item 6): the operator set gains its two
+// verification reads, `audit.list` and `apiKeys.operatorCapabilities`, pinned
+// here by name (36 to 38). The sync set is unchanged.
 const EXPECTED_OPERATOR_EXTRA = [
+  "frontend.audit.list",
+  "frontend.apiKeys.operatorCapabilities",
   "frontend.accessGroups.addEndpoint",
   "frontend.accessGroups.addMember",
   "frontend.accessGroups.create",
@@ -93,47 +98,66 @@ const EXPECTED_OPERATOR = [...EXPECTED_SYNC, ...EXPECTED_OPERATOR_EXTRA];
 // A valid input for each procedure either scope may call, shaped like what the
 // tooling sends, so input validation passes and the scope check is what
 // decides.
+//
+// TEST-EDIT (change reason, full-management plan 1A item 5): every mutation
+// input carries a `reason`, as the operator's tooling now sends it: an
+// operator-scope key's change without one is refused before it runs, which
+// is pinned in admin-plane-change-context.test.ts, not here.
 const VALID_INPUTS: Record<string, unknown> = {
+  "frontend.audit.list": undefined,
+  "frontend.apiKeys.operatorCapabilities": undefined,
   "frontend.accessGroups.addEndpoint": {
+    reason: "unit test",
     group_uuid: UUID_A,
     endpoint_uuid: UUID_B,
   },
   "frontend.accessGroups.addMember": {
+    reason: "unit test",
     group_uuid: UUID_A,
     user_id: "member-user-1",
   },
-  "frontend.accessGroups.create": { name: "helpdesk" },
-  "frontend.accessGroups.delete": { uuid: UUID_A },
+  "frontend.accessGroups.create": { reason: "unit test", name: "helpdesk" },
+  "frontend.accessGroups.delete": { reason: "unit test", uuid: UUID_A },
   "frontend.accessGroups.get": { uuid: UUID_A },
   "frontend.accessGroups.getEndpointAccess": { endpoint_uuid: UUID_B },
   "frontend.accessGroups.list": undefined,
   "frontend.accessGroups.removeEndpoint": {
+    reason: "unit test",
     group_uuid: UUID_A,
     endpoint_uuid: UUID_B,
   },
   "frontend.accessGroups.removeMember": {
+    reason: "unit test",
     group_uuid: UUID_A,
     user_id: "member-user-1",
   },
   "frontend.accessGroups.setEndpointRestricted": {
+    reason: "unit test",
     endpoint_uuid: UUID_B,
     restricted: true,
   },
-  "frontend.accessGroups.update": { uuid: UUID_A, name: "helpdesk" },
+  "frontend.accessGroups.update": {
+    reason: "unit test",
+    uuid: UUID_A,
+    name: "helpdesk",
+  },
   "frontend.apiKeys.create": {
+    reason: "unit test",
     name: "agent minted",
     user_id: "member-user-1",
     endpoint_uuid: UUID_A,
     ip_policy: { mode: "enforce", allowed_cidrs: ["203.0.113.0/24"] },
   },
-  "frontend.apiKeys.deactivate": { uuid: UUID_B },
+  "frontend.apiKeys.deactivate": { reason: "unit test", uuid: UUID_B },
   "frontend.apiKeys.getGlobalIpPolicy": undefined,
   "frontend.apiKeys.listAll": undefined,
   "frontend.apiKeys.setGlobalIpPolicy": {
+    reason: "unit test",
     mode: "enforce",
     allowed_cidrs: ["203.0.113.0/24"],
   },
   "frontend.apiKeys.setIpPolicy": {
+    reason: "unit test",
     uuid: UUID_A,
     allowed_cidrs: ["198.51.100.7/32"],
     ip_policy_mode: "enforce",
@@ -141,6 +165,7 @@ const VALID_INPUTS: Record<string, unknown> = {
   "frontend.config.getMcpMaxTotalTimeout": undefined,
   "frontend.config.getMcpTimeout": undefined,
   "frontend.endpoints.create": {
+    reason: "unit test",
     name: "sync-endpoint",
     namespaceUuid: UUID_A,
     enableClientMaxRate: false,
@@ -148,6 +173,7 @@ const VALID_INPUTS: Record<string, unknown> = {
   },
   "frontend.endpoints.list": undefined,
   "frontend.endpoints.update": {
+    reason: "unit test",
     uuid: UUID_B,
     name: "sync-endpoint",
     namespaceUuid: UUID_A,
@@ -155,31 +181,40 @@ const VALID_INPUTS: Record<string, unknown> = {
     enableMaxRate: false,
   },
   "frontend.mcpServers.create": {
+    reason: "unit test",
     name: "sync-server",
     type: "STREAMABLE_HTTP",
     url: "http://backend.internal:8000/mcp",
   },
   "frontend.mcpServers.list": undefined,
   "frontend.mcpServers.update": {
+    reason: "unit test",
     uuid: UUID_C,
     name: "sync-server",
     type: "STREAMABLE_HTTP",
     url: "http://backend.internal:8000/mcp",
   },
-  "frontend.namespaces.create": { name: "sync-namespace" },
+  "frontend.namespaces.create": { reason: "unit test", name: "sync-namespace" },
   "frontend.namespaces.get": { uuid: UUID_A },
   "frontend.namespaces.getTools": { namespaceUuid: UUID_A },
   "frontend.namespaces.list": undefined,
   "frontend.namespaces.refreshTools": {
+    reason: "unit test",
     namespaceUuid: UUID_A,
     tools: [{ name: "sync-server__ping", inputSchema: { type: "object" } }],
   },
   "frontend.namespaces.setToolPolicy": {
+    reason: "unit test",
     namespaceUuid: UUID_A,
     toolPolicy: "allowlist",
   },
-  "frontend.namespaces.update": { uuid: UUID_A, name: "sync-namespace" },
+  "frontend.namespaces.update": {
+    reason: "unit test",
+    uuid: UUID_A,
+    name: "sync-namespace",
+  },
   "frontend.namespaces.updateToolStatus": {
+    reason: "unit test",
     namespaceUuid: UUID_A,
     toolUuid: UUID_B,
     serverUuid: UUID_C,
@@ -253,6 +288,9 @@ const appRouter = createAppRouter({
     config: stubRouter(),
     logs: stubRouter(),
     accessGroups: stubRouter(),
+    // TEST-EDIT (plan 1A item 6): the new audit router's stub, so the
+    // operator's audit.list read reaches it like every other allowed call.
+    audit: stubRouter(),
   } as unknown as Parameters<typeof createAppRouter>[0]["frontend"],
 });
 
@@ -314,11 +352,11 @@ describe("the two procedure sets", () => {
     expect(ADMIN_PLANE_SYNC_PROCEDURES.size).toBe(10);
   });
 
-  it("pins the operator set to exactly those 10 plus 26 more, 36 in all", () => {
+  it("pins the operator set to exactly those 10 plus 28 more, 38 in all", () => {
     expect([...ADMIN_PLANE_OPERATOR_PROCEDURES].sort()).toEqual(
       [...EXPECTED_OPERATOR].sort(),
     );
-    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(36);
+    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(38);
   });
 
   it("gives the operator the access-group and tool-policy procedures and the sync set none of them", () => {

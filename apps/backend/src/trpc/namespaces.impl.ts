@@ -20,6 +20,7 @@ import {
   UpdateNamespaceToolStatusRequestSchema,
   UpdateNamespaceToolStatusResponseSchema,
 } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import { describeDbError } from "@/lib/db-error-summary";
@@ -143,6 +144,9 @@ export const namespacesImplementations = {
         message: "Namespace created successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error creating namespace:", describeDbError(error));
       return {
         success: false as const,
@@ -515,6 +519,9 @@ export const namespacesImplementations = {
         message: "Namespace updated successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error updating namespace:", describeDbError(error));
       return {
         success: false as const,
@@ -698,6 +705,9 @@ export const namespacesImplementations = {
         message: "Tool status updated successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error updating tool status:", describeDbError(error));
       return {
         success: false as const,
@@ -867,6 +877,9 @@ export const namespacesImplementations = {
         data: NamespacesSerializer.serializeNamespace(result.namespace),
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error(
         "Error setting namespace tool policy:",
         describeDbError(error),
@@ -1219,6 +1232,9 @@ export const namespacesImplementations = {
         mappingsCreated: totalMappingsCreated,
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error refreshing namespace tools:", describeDbError(error));
       // A member can reach the reads and writes above. Normal response data
       // bypasses tRPC's error masking, so never echo a caught DB message.

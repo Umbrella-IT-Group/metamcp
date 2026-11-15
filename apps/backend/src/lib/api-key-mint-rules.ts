@@ -178,6 +178,18 @@ export class ApiKeyMintRefusal extends Error {
   }
 }
 
+/**
+ * The owner of a new ADMIN-plane key (a human administrator's mint in the UI)
+ * was not an enabled administrator when its row was locked for the insert
+ * (ApiKeysRepository.create). Carries no detail of the owner.
+ */
+export class AdminPlaneOwnerIneligible extends Error {
+  constructor() {
+    super("An admin-plane key's owner must be an enabled administrator.");
+    this.name = "AdminPlaneOwnerIneligible";
+  }
+}
+
 /** Largest number of entries a created key's policy may carry. */
 export const MINT_MAX_CIDRS = 8;
 

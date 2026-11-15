@@ -8,11 +8,20 @@
  *
  * What is judged is the kind of endpoint a key may be created for. A private or
  * restricted endpoint is not one, an endpoint left on its namespace keeps the
- * reach it had, and a human administrator's session is not held to the rule.
- * The refusal is a `success: false` answer with one fixed sentence that names
- * no endpoint and no namespace, like the rules beside it, and nothing is
- * written. Against Postgres the whole sequence is pinned in
- * api-key-mint.integration.test.ts.
+ * reach it had, and a human administrator's session is not held to THIS rule
+ * (it is held to the endpoint namespace gate beside it, which every writer
+ * is). The refusal is a coded CONFLICT with one fixed sentence that names no
+ * endpoint and no namespace, and nothing is written. Against Postgres the
+ * whole sequence is pinned in api-key-mint.integration.test.ts and
+ * admin-plane-rails.integration.test.ts.
+ *
+ * TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2): the
+ * rule is now judged inside the write's transaction, under the namespace lock,
+ * through the gate repository (doubled below so its "restricted or private
+ * sibling" question is the one this suite always asked of
+ * hasGatedEndpointOnNamespace), and a refusal is a coded CONFLICT instead of
+ * `success: false` inside an HTTP 200. The two human cases now also pin that a
+ * person's session is held to the namespace gate.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -56,6 +65,45 @@ vi.mock("../db/index", () => ({
 }));
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: vi.fn(async () => undefined),
+}));
+// The change budget's lock and count cannot run on the stand-in transaction;
+// it is pinned in admin-plane-budget.test.ts and against Postgres.
+vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
+}));
+const { gateMock } = vi.hoisted(() => ({
+  gateMock: { restrictedSibling: false },
+}));
+vi.mock("../db/repositories/endpoint-gate.repo", () => ({
+  endpointGateRepository: {
+    lockNamespaces: vi.fn(async () => undefined),
+    restrictedSiblingExists: vi.fn(async () => gateMock.restrictedSibling),
+    gatedSiblingExists: vi.fn(
+      async (_tx: unknown, namespaceUuid: string, exceptUuid?: string) =>
+        exceptUuid === undefined
+          ? endpointsRepositoryMock.hasGatedEndpointOnNamespace(namespaceUuid)
+          : endpointsRepositoryMock.hasGatedEndpointOnNamespace(
+              namespaceUuid,
+              exceptUuid,
+            ),
+    ),
+    lockEndpoint: vi.fn(async (_tx: unknown, uuid: string) => {
+      const row = await endpointsRepositoryMock.findByUuidWithNamespace(uuid);
+      return row
+        ? {
+            uuid,
+            name: row.name,
+            namespace_uuid: row.namespace_uuid,
+            user_id: row.user_id ?? null,
+            restricted: row.restricted ?? false,
+            restricted_by_api_key_uuid: null,
+            restriction_recent: false,
+          }
+        : null;
+    }),
+    clearRestrictionKey: vi.fn(async () => undefined),
+  },
 }));
 
 import { endpointsImplementations } from "./endpoints.impl";
@@ -119,6 +167,7 @@ const REFUSAL =
 
 beforeEach(() => {
   vi.clearAllMocks();
+  gateMock.restrictedSibling = false;
   endpointsRepositoryMock.findByName.mockResolvedValue(undefined);
   endpointsRepositoryMock.create.mockResolvedValue({
     uuid: ENDPOINT_UUID,
@@ -151,19 +200,17 @@ describe("endpoints.create by an admin-plane key", () => {
         true,
       );
 
-      const result = await endpointsImplementations.create(
-        createInput(),
-        OWNER_ID,
-        adminPlaneActor(scope),
-      );
+      const failure = await endpointsImplementations
+        .create(createInput(), OWNER_ID, adminPlaneActor(scope))
+        .catch((e) => e);
 
-      expect(result).toEqual({ success: false, message: REFUSAL });
+      expect(failure).toMatchObject({ code: "CONFLICT", message: REFUSAL });
       expect(
         endpointsRepositoryMock.hasGatedEndpointOnNamespace,
       ).toHaveBeenCalledWith(NEW_NAMESPACE);
       expect(endpointsRepositoryMock.create).not.toHaveBeenCalled();
-      expect(result.message).not.toContain("namespace name");
-      expect(result.message).not.toContain(NEW_NAMESPACE);
+      expect(failure.message).not.toContain("namespace name");
+      expect(failure.message).not.toContain(NEW_NAMESPACE);
     },
   );
 
@@ -206,7 +253,7 @@ describe("endpoints.create by an admin-plane key", () => {
     },
   );
 
-  it("leaves a human administrator's session unjudged", async () => {
+  it("leaves a human administrator's session unjudged by this rule, and holds it to the namespace gate", async () => {
     endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
 
     const result = await endpointsImplementations.create(
@@ -219,6 +266,16 @@ describe("endpoints.create by an admin-plane key", () => {
     expect(
       endpointsRepositoryMock.hasGatedEndpointOnNamespace,
     ).not.toHaveBeenCalled();
+
+    // A deliberate reversal (plan 1A item 2): with a restricted endpoint over
+    // the namespace, the person's unrestricted create is refused too.
+    gateMock.restrictedSibling = true;
+    endpointsRepositoryMock.create.mockClear();
+    const failure = await endpointsImplementations
+      .create(createInput(), OWNER_ID, humanActor)
+      .catch((e) => e);
+    expect(failure).toMatchObject({ code: "CONFLICT" });
+    expect(endpointsRepositoryMock.create).not.toHaveBeenCalled();
   });
 });
 
@@ -226,13 +283,11 @@ describe("endpoints.update by an admin-plane key", () => {
   it("refuses re-pointing a public unrestricted endpoint at a namespace a restricted or private endpoint serves, writing nothing", async () => {
     endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
 
-    const result = await endpointsImplementations.update(
-      updateInput(),
-      OWNER_ID,
-      adminPlaneActor("operator"),
-    );
+    const failure = await endpointsImplementations
+      .update(updateInput(), OWNER_ID, adminPlaneActor("operator"))
+      .catch((e) => e);
 
-    expect(result).toEqual({ success: false, message: REFUSAL });
+    expect(failure).toMatchObject({ code: "CONFLICT", message: REFUSAL });
     // The endpoint being changed does not count as one that gates the target.
     expect(
       endpointsRepositoryMock.hasGatedEndpointOnNamespace,
@@ -295,7 +350,7 @@ describe("endpoints.update by an admin-plane key", () => {
     },
   );
 
-  it("leaves a human administrator's session unjudged", async () => {
+  it("leaves a human administrator's session unjudged by this rule, and holds it to the namespace gate", async () => {
     endpointsRepositoryMock.hasGatedEndpointOnNamespace.mockResolvedValue(true);
 
     const result = await endpointsImplementations.update(
@@ -308,5 +363,15 @@ describe("endpoints.update by an admin-plane key", () => {
     expect(
       endpointsRepositoryMock.hasGatedEndpointOnNamespace,
     ).not.toHaveBeenCalled();
+
+    // A deliberate reversal (plan 1A item 2): moving any endpoint onto a
+    // namespace a restricted endpoint guards is refused to a person too.
+    gateMock.restrictedSibling = true;
+    endpointsRepositoryMock.update.mockClear();
+    const failure = await endpointsImplementations
+      .update(updateInput(), OWNER_ID, humanActor)
+      .catch((e) => e);
+    expect(failure).toMatchObject({ code: "CONFLICT" });
+    expect(endpointsRepositoryMock.update).not.toHaveBeenCalled();
   });
 });

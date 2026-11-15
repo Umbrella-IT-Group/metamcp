@@ -103,6 +103,47 @@ vi.mock("../db/repositories/users.repo", () => ({
   },
 }));
 
+// TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2): the
+// restricted switch now runs in one transaction for every actor, under the
+// endpoint's namespace lock, through the gate repository. The stand-ins re-read
+// the endpoint as the doubled endpoints repository returns it, report no other
+// restricted endpoint over its namespace, and hand the write to the doubled
+// access-groups write, so every assertion below keeps its oracle. The gate is
+// pinned in endpoint-namespace-gate.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts.
+vi.mock("../db/index", () => ({
+  db: {
+    transaction: async (callback: (tx: object) => Promise<unknown>) =>
+      callback({}),
+  },
+}));
+vi.mock("../db/repositories/endpoint-gate.repo", () => ({
+  endpointGateRepository: {
+    lockNamespaces: vi.fn(async () => undefined),
+    restrictedSiblingExists: vi.fn(async () => false),
+    gatedSiblingExists: vi.fn(async () => false),
+    lockEndpoint: vi.fn(async (_tx: unknown, uuid: string) => {
+      const row = await endpointFindByUuidMock(uuid);
+      return row
+        ? {
+            uuid,
+            name: row.name,
+            namespace_uuid: row.namespace_uuid,
+            user_id: row.user_id ?? null,
+            restricted: row.restricted ?? false,
+            restricted_by_api_key_uuid: null,
+            restriction_recent: false,
+          }
+        : null;
+    }),
+    setRestricted: vi.fn(
+      async (_tx: unknown, uuid: string, restricted: boolean) =>
+        setEndpointRestrictedMock(uuid, restricted),
+    ),
+    clearRestrictionKey: vi.fn(async () => undefined),
+  },
+}));
+
 const { accessGroupsImplementations } = await import("./access-groups.impl");
 const { setAuditSinkForTesting } = await import("@/lib/audit/audit-emitter");
 const {
@@ -143,6 +184,9 @@ const GROUP_ROW = {
 const ENDPOINT_ROW = {
   uuid: ENDPOINT_UUID,
   name: "autotask",
+  // TEST-EDIT (endpoint namespace gate): a stored endpoint always has a
+  // namespace (NOT NULL), and the restricted switch now locks it.
+  namespace_uuid: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
   restricted: false,
   enable_oauth: true,
   enable_api_key_auth: false,

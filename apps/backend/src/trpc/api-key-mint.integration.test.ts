@@ -37,7 +37,11 @@ import type express from "express";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { createFixture, type Fixture } from "./admin-plane-integration-fixture";
+import {
+  createFixture,
+  DEFAULT_REASON,
+  type Fixture,
+} from "./admin-plane-integration-fixture";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describeIfDb = describe.skipIf(!TEST_DATABASE_URL);
@@ -345,6 +349,9 @@ describeIfDb(
           target_type: "api_key",
           outcome: "success",
         });
+        // TEST-EDIT (change reason and budget, full-management plan 1A items
+        // 4 and 5): every admin-plane change's row now also carries the
+        // caller's reason and the budget class it was counted in.
         expect(rows[0].detail).toEqual({
           name,
           owner_user_id: fx.memberId,
@@ -354,6 +361,8 @@ describeIfDb(
           key_admin_plane: false,
           key_admin_plane_scope: "sync",
           ip_policy: { mode: "enforce", allowed_cidrs: ["203.0.113.0/24"] },
+          reason: DEFAULT_REASON,
+          budget_class: "loosen",
           admin_plane: {
             key_uuid: fx.operator.uuid,
             owner_user_id: fx.ownerId,
@@ -1556,8 +1565,25 @@ describeIfDb(
             ).status,
           ).toBe(403);
         } finally {
+          // TEST-EDIT (IP rail, full-management plan 1A item 1): an
+          // admin-plane key may now only NARROW an admin-plane key's policy,
+          // its own included, so the key's own attempt to go back to following
+          // the global policy is refused and changes nothing. The suite then
+          // restores the row through its own connection, as an administrator
+          // would in the admin UI.
           const restored = await own(null, "off");
-          expect(restored.status).toBe(200);
+          expect({ status: restored.status, code: restored.code }).toEqual({
+            status: 403,
+            code: "FORBIDDEN",
+          });
+          expect(await policyOf()).toEqual({
+            allowed_cidrs: ["203.0.113.0/24"],
+            ip_policy_mode: "enforce",
+          });
+          await fx.suiteLock.query(
+            `UPDATE api_keys SET allowed_cidrs = NULL, ip_policy_mode = 'off' WHERE uuid = $1`,
+            [fx.operator.uuid],
+          );
         }
         expect(await policyOf()).toEqual({
           allowed_cidrs: null,
@@ -1623,8 +1649,20 @@ describeIfDb(
           // (The case where the followed list excludes the caller cannot be
           // staged over HTTP, because the gateway would refuse the call itself;
           // api-keys.impl.rails.test.ts covers it.)
+          //
+          // TEST-EDIT (IP rail, full-management plan 1A item 1): following the
+          // global policy is no longer a change an admin-plane key may make to
+          // an admin-plane key's policy, even one that already follows it, so
+          // this step is now refused, with nothing written.
           const follow = await own(null, "off");
-          expect(follow.status).toBe(200);
+          expect({ status: follow.status, code: follow.code }).toEqual({
+            status: 403,
+            code: "FORBIDDEN",
+          });
+          expect(await policyOf()).toEqual({
+            allowed_cidrs: null,
+            ip_policy_mode: "off",
+          });
         } finally {
           await restoreGlobal();
         }
@@ -1766,8 +1804,13 @@ describeIfDb(
             target_id: null,
             outcome: "denied",
           });
+          // TEST-EDIT (change reason, full-management plan 1A item 5): the
+          // caller's reason now rides on its denied row too, so the trail
+          // says why a refused change was attempted. Still nothing of the
+          // request itself.
           expect(rows[0].detail).toEqual({
             rule,
+            reason: DEFAULT_REASON,
             admin_plane: {
               key_uuid: fx.operator.uuid,
               owner_user_id: fx.ownerId,
@@ -1970,28 +2013,89 @@ describeIfDb(
         });
       });
 
-      it("does not hold the policy of an admin-plane key to the bound", async () => {
-        // The CI key is locked to any address on purpose (its runners rotate).
-        const ci = await fx.trpc(
-          "frontend.apiKeys.setIpPolicy",
-          {
-            uuid: fx.sync.uuid,
-            allowed_cidrs: ["0.0.0.0/0", "::/0"],
+      // TEST-EDIT (IP rail, full-management plan 1A item 1, a deliberate
+      // reversal of part of this case): it pinned that an admin-plane key
+      // could set an admin-plane key's policy to anything, the any-IP
+      // exemption and following the global policy included. An admin-plane
+      // key may now only NARROW an admin-plane key's policy. What still holds
+      // is the first half of the name: the data-plane width bound does not
+      // apply, so a narrowing to a list wider than /24 is accepted.
+      it("does not hold the policy of an admin-plane key to the bound, and lets an admin-plane key only narrow it", async () => {
+        const policyOfCi = async () =>
+          (
+            await fx.suiteLock.query(
+              `SELECT allowed_cidrs, ip_policy_mode FROM api_keys WHERE uuid = $1`,
+              [fx.sync.uuid],
+            )
+          ).rows[0];
+        try {
+          // From following an off global policy (which admits everything) the
+          // any-IP exemption is not a narrowing: refused, nothing written.
+          const anyIp = await fx.trpc(
+            "frontend.apiKeys.setIpPolicy",
+            {
+              uuid: fx.sync.uuid,
+              allowed_cidrs: ["0.0.0.0/0", "::/0"],
+              ip_policy_mode: "enforce",
+            },
+            "mutation",
+          );
+          expect({ status: anyIp.status, code: anyIp.code }).toEqual({
+            status: 403,
+            code: "FORBIDDEN",
+          });
+          expect(await policyOfCi()).toEqual({
+            allowed_cidrs: null,
+            ip_policy_mode: "off",
+          });
+
+          // A /8 is far wider than the data-plane bound and still a narrowing.
+          const narrowed = await fx.trpc(
+            "frontend.apiKeys.setIpPolicy",
+            {
+              uuid: fx.sync.uuid,
+              allowed_cidrs: ["10.0.0.0/8"],
+              ip_policy_mode: "enforce",
+            },
+            "mutation",
+          );
+          expect(narrowed.status).toBe(200);
+          expect(await policyOfCi()).toEqual({
+            allowed_cidrs: ["10.0.0.0/8"],
             ip_policy_mode: "enforce",
-          },
-          "mutation",
-        );
-        expect(ci.status).toBe(200);
-        const { rows } = await fx.suiteLock.query(
-          `SELECT allowed_cidrs FROM api_keys WHERE uuid = $1`,
-          [fx.sync.uuid],
-        );
-        expect(rows[0].allowed_cidrs).toEqual(["0.0.0.0/0", "::/0"]);
-        await fx.trpc(
-          "frontend.apiKeys.setIpPolicy",
-          { uuid: fx.sync.uuid, allowed_cidrs: null, ip_policy_mode: "off" },
-          "mutation",
-        );
+          });
+
+          // Widening it again, or turning it off, is refused.
+          for (const [allowed, mode] of [
+            [["10.0.0.0/7"], "enforce"],
+            [["10.0.0.0/8"], "off"],
+            [null, "off"],
+          ] as const) {
+            const widened = await fx.trpc(
+              "frontend.apiKeys.setIpPolicy",
+              {
+                uuid: fx.sync.uuid,
+                allowed_cidrs: allowed,
+                ip_policy_mode: mode,
+              },
+              "mutation",
+            );
+            expect({ status: widened.status, code: widened.code }).toEqual({
+              status: 403,
+              code: "FORBIDDEN",
+            });
+          }
+          expect(await policyOfCi()).toEqual({
+            allowed_cidrs: ["10.0.0.0/8"],
+            ip_policy_mode: "enforce",
+          });
+        } finally {
+          // Restored as an administrator would, outside the key.
+          await fx.suiteLock.query(
+            `UPDATE api_keys SET allowed_cidrs = NULL, ip_policy_mode = 'off' WHERE uuid = $1`,
+            [fx.sync.uuid],
+          );
+        }
       });
 
       it("answers NOT_FOUND for a key that does not exist, whatever the policy", async () => {
@@ -2070,12 +2174,18 @@ describeIfDb(
         const name = `clone-${fx.run}`;
         const reply = await createEndpoint(name, fx.publicNamespaceUuid);
 
-        // `success: false` inside an HTTP 200, like the rules beside it.
-        expect(reply.status).toBe(200);
-        const body = reply.data as { success: boolean; message: string };
-        expect(body.success).toBe(false);
-        expect(body.message).toBe(
-          "An admin-plane API key cannot make a namespace public that a restricted or private endpoint already serves. Do this in the admin UI.",
+        // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2):
+        // the refusal is now a coded CONFLICT (HTTP 409), not `success: false`
+        // inside an HTTP 200, which a caller's tooling cannot tell from an
+        // unknown outcome. The namespace holds a restricted endpoint, so the
+        // gate's rule for every writer answers before the admin-plane publish
+        // rule would.
+        expect({ status: reply.status, code: reply.code }).toEqual({
+          status: 409,
+          code: "CONFLICT",
+        });
+        expect(reply.message).toBe(
+          "Another endpoint over this namespace is restricted, so a new endpoint over it must be restricted too. Create it with restricted on, then map its access groups.",
         );
         expect(await endpointRow(name)).toBeUndefined();
       });
@@ -2109,20 +2219,45 @@ describeIfDb(
           "mutation",
         );
 
-        expect((reply.data as { success: boolean }).success).toBe(false);
+        // TEST-EDIT (endpoint namespace gate, full-management plan 1A item
+        // 2): a coded CONFLICT, not `success: false` inside an HTTP 200.
+        expect({ status: reply.status, code: reply.code }).toEqual({
+          status: 409,
+          code: "CONFLICT",
+        });
         expect((await endpointRow(name))?.namespace_uuid).toBe(freshNamespace);
       });
 
-      it("does not hold an administrator's session to the rule", async () => {
-        const name = `human-${fx.run}`;
-        created.push(name);
-        const reply = await createEndpoint(
-          name,
+      // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2,
+      // a deliberate reversal): this case pinned that an administrator's
+      // session was not held to the rule. The gate now applies to every
+      // writer, a person's session included, because the race it closes is
+      // the admin UI's: an administrator's open endpoint over a namespace a
+      // restricted endpoint guards opens that namespace to everyone. The
+      // session is refused an unrestricted endpoint there and may create a
+      // restricted one.
+      it("refuses an administrator's session an unrestricted endpoint over a namespace a restricted endpoint serves, and allows it restricted", async () => {
+        const open = `human-${fx.run}`;
+        const refused = await createEndpoint(
+          open,
           fx.publicNamespaceUuid,
           {},
           { cookie: fx.ownerCookie },
         );
+        expect({ status: refused.status, code: refused.code }).toEqual({
+          status: 409,
+          code: "CONFLICT",
+        });
+        expect(await endpointRow(open)).toBeUndefined();
 
+        const guarded = `human-restricted-${fx.run}`;
+        created.push(guarded);
+        const reply = await createEndpoint(
+          guarded,
+          fx.publicNamespaceUuid,
+          { restricted: true },
+          { cookie: fx.ownerCookie },
+        );
         expect((reply.data as { success: boolean }).success).toBe(true);
       });
     });

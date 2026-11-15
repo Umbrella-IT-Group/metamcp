@@ -15,17 +15,45 @@ import {
   SetEndpointRestrictedRequestSchema,
   UpdateAccessGroupRequestSchema,
 } from "@repo/zod-types";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { accessGroupsRepository } from "../db/repositories/access-groups.repo";
+import { endpointGateRepository } from "../db/repositories/endpoint-gate.repo";
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
 import { usersRepository } from "../db/repositories/users.repo";
-import { withAdminAudit } from "../lib/audit/admin-write";
+import {
+  AdminRuleRefusal,
+  withAdminAudit,
+  withAdminAuditTx,
+} from "../lib/audit/admin-write";
 import { clampAuditText } from "../lib/audit/audit-emitter";
 import { invalidateEndpointAccessCache } from "../lib/endpoint-access-control";
+import {
+  ENDPOINT_GATE_REFUSALS,
+  judgeEndpointUnrestrict,
+} from "../lib/endpoint-namespace-gate";
+
+/**
+ * The refusal an admin-plane key gets for deleting a group that still has a
+ * member or a mapped endpoint. Fixed, naming no group, member or endpoint.
+ */
+export const GROUP_DELETE_NOT_EMPTY_REFUSAL =
+  "An admin-plane API key can delete an access group only once it has no members and no mapped endpoints. Remove them first, each as its own change.";
+
+/**
+ * Rethrow a coded refusal (a rule of the endpoint gate or a group rail, the
+ * change budget, a scope or audit refusal already coded) out of a
+ * catch-all, so it reaches the caller as itself and never as `success: false`
+ * inside an HTTP 200, which a caller's tooling cannot tell from an unknown
+ * outcome.
+ */
+function rethrowCoded(error: unknown): void {
+  if (error instanceof TRPCError) throw error;
+}
 
 /**
  * Admin CRUD over access groups and the per-endpoint gate they drive
@@ -238,6 +266,7 @@ export const accessGroupsImplementations = {
         },
       };
     } catch (error) {
+      rethrowCoded(error);
       logger.error("Error creating access group:", describeDbError(error));
       return {
         success: false as const,
@@ -290,6 +319,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error("Error updating access group:", describeDbError(error));
       return {
         success: false as const,
@@ -304,12 +334,44 @@ export const accessGroupsImplementations = {
     actor?: AuditActor,
   ): Promise<z.infer<typeof AccessGroupMutationResponseSchema>> => {
     try {
-      // The cascade to the group's memberships and mappings runs inside the
-      // delete statement, so for an admin-plane key a failed audit row rolls
-      // those back with the group.
+      // For an admin-plane key a group delete is LEAF-ONLY: refused while the
+      // group has any member or mapped endpoint, so every grant it carries is
+      // removed first by its own reversible, audited and budgeted change, and
+      // the delete itself takes nothing with it. The group row is locked
+      // first, so a member or mapping added concurrently (its foreign key
+      // waits on that lock) is either seen here or refused at its own insert.
+      // A human administrator's delete keeps its cascade.
+      //
+      // The cascade to memberships and mappings runs inside the delete
+      // statement, so a failed audit row rolls those back with the group.
       const deleted = await withAdminAudit(
         actor,
-        (...tx) => accessGroupsRepository.deleteByUuid(input.uuid, ...tx),
+        async (...tx) => {
+          const handle = tx[0];
+          if (actor?.admin_plane && handle) {
+            const contents = await accessGroupsRepository.lockGroupContents(
+              handle,
+              input.uuid,
+            );
+            if (contents && (contents.members > 0 || contents.mappings > 0)) {
+              throw new AdminRuleRefusal(
+                "CONFLICT",
+                GROUP_DELETE_NOT_EMPTY_REFUSAL,
+                {
+                  action: "group.delete",
+                  target_type: "access_group",
+                  target_id: input.uuid,
+                  detail: {
+                    rule: "group_not_empty",
+                    members: contents.members,
+                    mappings: contents.mappings,
+                  },
+                },
+              );
+            }
+          }
+          return accessGroupsRepository.deleteByUuid(input.uuid, ...tx);
+        },
         (group) =>
           group
             ? {
@@ -330,6 +392,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error("Error deleting access group:", describeDbError(error));
       return {
         success: false as const,
@@ -395,6 +458,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error("Error adding access group member:", describeDbError(error));
       return {
         success: false as const,
@@ -450,6 +514,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error(
         "Error removing access group member:",
         describeDbError(error),
@@ -517,6 +582,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error(
         "Error mapping endpoint to access group:",
         describeDbError(error),
@@ -572,6 +638,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error(
         "Error unmapping endpoint from access group:",
         describeDbError(error),
@@ -596,35 +663,94 @@ export const accessGroupsImplementations = {
         return { success: false as const, message: "Endpoint not found" };
       }
 
-      const updated = await withAdminAudit(
+      // One transaction for every actor. Under the endpoint's namespace lock
+      // the row is re-read FOR UPDATE and the endpoint namespace gate judges
+      // an actual opening (restricted to unrestricted) against the namespace's
+      // other endpoints and, for an admin-plane key, against the provenance of
+      // the current restriction (lib/endpoint-namespace-gate). The write keeps
+      // that provenance marker true to the current restriction.
+      const actorKeyUuid = actor?.admin_plane?.key_uuid.toLowerCase() ?? null;
+      const outcome = await withAdminAuditTx(
         actor,
-        (...tx) =>
-          accessGroupsRepository.setEndpointRestricted(
+        async (tx) => {
+          await endpointGateRepository.lockNamespaces(tx, [
+            existing.namespace_uuid,
+          ]);
+          const locked = await endpointGateRepository.lockEndpoint(
+            tx,
             input.endpoint_uuid,
+          );
+          if (
+            !locked ||
+            locked.namespace_uuid.toLowerCase() !==
+              existing.namespace_uuid.toLowerCase()
+          ) {
+            const { code, message } = ENDPOINT_GATE_REFUSALS.endpoint_changed;
+            throw new AdminRuleRefusal(code, message, {
+              action: "endpoint.restricted.set",
+              target_type: "endpoint",
+              target_id: input.endpoint_uuid.toLowerCase(),
+              detail: { rule: "endpoint_changed" },
+            });
+          }
+          if (locked.restricted && input.restricted === false) {
+            const restrictedSibling =
+              await endpointGateRepository.restrictedSiblingExists(
+                tx,
+                locked.namespace_uuid,
+                locked.uuid,
+              );
+            const rule = judgeEndpointUnrestrict({
+              adminPlane: actorKeyUuid !== null,
+              restrictedSibling,
+              rollbackEligible:
+                actorKeyUuid !== null &&
+                locked.restricted_by_api_key_uuid?.toLowerCase() ===
+                  actorKeyUuid &&
+                locked.restriction_recent === true,
+            });
+            if (rule) {
+              const { code, message } = ENDPOINT_GATE_REFUSALS[rule];
+              throw new AdminRuleRefusal(code, message, {
+                action: "endpoint.restricted.set",
+                target_type: "endpoint",
+                target_id: locked.uuid,
+                detail: { rule },
+              });
+            }
+          }
+          const endpoint = await endpointGateRepository.setRestricted(
+            tx,
+            locked.uuid,
             input.restricted,
-            ...tx,
-          ),
-        (endpoint) =>
-          endpoint
+            actorKeyUuid,
+          );
+          return endpoint ? { endpoint, previous: locked.restricted } : null;
+        },
+        (written) =>
+          written
             ? {
                 action: "endpoint.restricted.set",
                 target_type: "endpoint",
-                target_id: endpoint.uuid,
+                target_id: written.endpoint.uuid,
                 detail: {
-                  name: clampAuditText(endpoint.name, 100),
+                  name: clampAuditText(written.endpoint.name, 100),
                   // Both values, because "who turned this on" and "what was it
                   // before" are the two questions asked of this row, and a
-                  // single new value only answers the first.
-                  previous: existing.restricted,
-                  restricted: endpoint.restricted,
+                  // single new value only answers the first. The previous
+                  // value is the one read under the row lock.
+                  previous: written.previous,
+                  restricted: written.endpoint.restricted,
                   // The stored value, unchanged by this write: restricting an
                   // endpoint does not touch the scoped-key requirement, and the
                   // row records which of the two switches was on at that moment.
-                  require_scoped_api_key: endpoint.require_scoped_api_key,
+                  require_scoped_api_key:
+                    written.endpoint.require_scoped_api_key,
                 },
               }
             : null,
       );
+      const updated = outcome?.endpoint;
       if (!updated) {
         return { success: false as const, message: "Endpoint not found" };
       }
@@ -637,6 +763,7 @@ export const accessGroupsImplementations = {
 
       return { success: true as const };
     } catch (error) {
+      rethrowCoded(error);
       logger.error(
         "Error setting endpoint restriction:",
         describeDbError(error),

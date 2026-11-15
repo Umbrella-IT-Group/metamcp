@@ -11,3 +11,4 @@ export * from "./api-keys.zod";
 export * from "./config.zod";
 export * from "./users.zod";
 export * from "./endpoint-presentation.zod";
+export * from "./audit.zod";

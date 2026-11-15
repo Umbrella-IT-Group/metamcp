@@ -547,3 +547,42 @@ export type SetGlobalIpPolicyResponse = z.infer<
 export type GetGlobalIpPolicyResponse = z.infer<
   typeof GetGlobalIpPolicyResponseSchema
 >;
+
+/**
+ * `apiKeys.operatorCapabilities`: what an admin-plane key's scope may call, and
+ * the rules a change from it must meet, derived from the gateway's own scope
+ * sets and budget configuration. The operator's tooling reads it before it
+ * sends a change and refuses when the contract version or a procedure it
+ * needs is missing.
+ */
+export const OperatorCapabilitiesResponseSchema = z.object({
+  contract_version: z.number().int(),
+  /** The calling key's scope; null for an administrator's browser session. */
+  caller_scope: z.enum(["sync", "operator"]).nullable(),
+  /** Every procedure the operator scope may call, sorted. */
+  procedures: z.array(z.string()),
+  /** The subset that are changes: each needs a reason and is budgeted. */
+  mutations: z.array(z.string()),
+  reason: z.object({
+    required_for_operator_scope: z.boolean(),
+    max_length: z.number().int(),
+    run_id_max_length: z.number().int(),
+  }),
+  budget: z.object({
+    window_seconds: z.number().int(),
+    operator: z.object({
+      total: z.number().int(),
+      loosen: z.number().int(),
+      destroy: z.number().int(),
+    }),
+    sync: z.object({
+      total: z.number().int(),
+      loosen: z.number().int(),
+      destroy: z.number().int(),
+    }),
+  }),
+});
+
+export type OperatorCapabilitiesResponse = z.infer<
+  typeof OperatorCapabilitiesResponseSchema
+>;

@@ -8,7 +8,7 @@ import {
   endpointsTable,
   usersTable,
 } from "../schema";
-import type { DbExecutor } from "./db-executor";
+import type { DbExecutor, DbTransaction } from "./db-executor";
 
 /**
  * Named access groups and the grants they carry (migration 0033).
@@ -268,6 +268,34 @@ export class AccessGroupsRepository {
    * keys cascade to every membership and mapping the group held, inside the same
    * statement and so inside the caller's transaction when it passes one.
    */
+  /**
+   * Lock one group's row FOR UPDATE and count what a delete would cascade to:
+   * its members and its endpoint mappings. A member or mapping insert checks
+   * its foreign key against the group row, which waits on this lock, so the
+   * counts cannot grow before the caller's transaction ends. Returns null
+   * when no such group exists.
+   */
+  async lockGroupContents(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<{ members: number; mappings: number } | null> {
+    const [group] = await tx
+      .select({ uuid: accessGroupsTable.uuid })
+      .from(accessGroupsTable)
+      .where(eq(accessGroupsTable.uuid, uuid))
+      .for("update");
+    if (!group) return null;
+    const [members] = await tx
+      .select({ value: count() })
+      .from(accessGroupMembersTable)
+      .where(eq(accessGroupMembersTable.group_uuid, uuid));
+    const [mappings] = await tx
+      .select({ value: count() })
+      .from(accessGroupEndpointsTable)
+      .where(eq(accessGroupEndpointsTable.group_uuid, uuid));
+    return { members: members?.value ?? 0, mappings: mappings?.value ?? 0 };
+  }
+
   async deleteByUuid(uuid: string, executor?: DbExecutor) {
     const [deleted] = await (executor ?? db)
       .delete(accessGroupsTable)

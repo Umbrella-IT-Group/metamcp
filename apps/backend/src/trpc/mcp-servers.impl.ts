@@ -233,6 +233,9 @@ export const mcpServersImplementations = {
         message: "MCP server created successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error creating MCP server:", describeDbError(error));
       return {
         success: false as const,
@@ -778,6 +781,9 @@ export const mcpServersImplementations = {
         message: "MCP server updated successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error updating MCP server:", describeDbError(error));
       return {
         success: false as const,

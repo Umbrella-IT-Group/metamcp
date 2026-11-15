@@ -8,6 +8,7 @@ import {
   GetGlobalIpPolicyResponseSchema,
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
+  OperatorCapabilitiesResponseSchema,
   SetApiKeyIpPolicyRequestSchema,
   SetApiKeyIpPolicyResponseSchema,
   SetGlobalIpPolicyRequestSchema,
@@ -23,6 +24,7 @@ import { z } from "zod";
 import {
   ADMIN_PLANE_FORBIDDEN_MESSAGE,
   adminPlaneOrigin,
+  adminPlaneScopeOf,
   adminProcedure,
   type AuditActor,
   auditActor,
@@ -76,6 +78,9 @@ export const createApiKeysRouter = (implementations: {
     input: z.infer<typeof DeactivateApiKeyRequestSchema>,
     actor: AuditActor,
   ) => Promise<z.infer<typeof DeactivateApiKeyResponseSchema>>;
+  operatorCapabilities: (
+    callerScope: "sync" | "operator" | null,
+  ) => Promise<z.infer<typeof OperatorCapabilitiesResponseSchema>>;
   validate: (
     input: z.infer<typeof ValidateApiKeyRequestSchema>,
   ) => Promise<z.infer<typeof ValidateApiKeyResponseSchema>>;
@@ -206,6 +211,19 @@ export const createApiKeysRouter = (implementations: {
       .output(DeactivateApiKeyResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return implementations.deactivate(input, auditActor(ctx));
+      }),
+
+    // Admin only, and on the operator scope's set: what an operator-scope key
+    // may call and the rules its changes must meet, derived from the scope
+    // sets and the budget configuration. A read, so it carries nothing back
+    // but those rules.
+    operatorCapabilities: adminProcedure
+      .output(OperatorCapabilitiesResponseSchema)
+      .query(async ({ ctx }) => {
+        const origin = adminPlaneOrigin(ctx);
+        return implementations.operatorCapabilities(
+          origin ? adminPlaneScopeOf(origin) : null,
+        );
       }),
 
     validate: protectedProcedure

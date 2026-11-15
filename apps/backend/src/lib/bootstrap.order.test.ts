@@ -125,6 +125,14 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
   });
 
   const dbMock = {
+    // TEST-EDIT (endpoint namespace gate, full-management plan 1A item 2):
+    // each bootstrap endpoint is now written in its own transaction under the
+    // gate (lib/bootstrap-endpoint-gate). The stand-in runs the callback on
+    // this same double, so the endpoint insert lands in the same statement
+    // log and the ordering assertions below keep their meaning.
+    transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) =>
+      callback(dbMock),
+    ),
     insert: vi.fn(insertChain),
     // Logged like inserts and deletes: the config-supplied-key path REWRITES
     // an existing row's hash rather than inserting, so without this the only
@@ -199,6 +207,19 @@ const { dbMock, statementLog, readFixtures } = vi.hoisted(() => {
   return { dbMock, statementLog, readFixtures };
 });
 vi.mock("../db", () => ({ db: dbMock }));
+// The gate's lock and sibling question (db/repositories/endpoint-gate.repo)
+// need a real database; here the namespace has no restricted endpoint, so
+// every bootstrap create passes it. The gate is pinned against Postgres in
+// admin-plane-rails.integration.test.ts.
+vi.mock("../db/repositories/endpoint-gate.repo", () => ({
+  endpointGateRepository: {
+    lockNamespaces: vi.fn(async () => undefined),
+    restrictedSiblingExists: vi.fn(async () => false),
+    gatedSiblingExists: vi.fn(async () => false),
+    lockEndpoint: vi.fn(async () => null),
+    clearRestrictionKey: vi.fn(async () => undefined),
+  },
+}));
 
 /**
  * One recorded `emitAdminEvent` call. `statementsAtEmit` is the length of

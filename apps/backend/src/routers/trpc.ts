@@ -11,6 +11,7 @@ import { trpcRateLimitMiddleware } from "../middleware/trpc-rate-limit.middlewar
 import { createContext } from "../trpc";
 import { accessGroupsImplementations } from "../trpc/access-groups.impl";
 import { apiKeysImplementations } from "../trpc/api-keys.impl";
+import { auditImplementations } from "../trpc/audit.impl";
 import { configImplementations } from "../trpc/config.impl";
 import { endpointPresentationImplementations } from "../trpc/endpoint-presentation.impl";
 import { endpointsImplementations } from "../trpc/endpoints.impl";
@@ -48,6 +49,7 @@ const appRouter = createAppRouter({
     logs: logsImplementations,
     accessGroups: accessGroupsImplementations,
     endpointPresentation: endpointPresentationImplementations,
+    audit: auditImplementations,
   },
 });
 

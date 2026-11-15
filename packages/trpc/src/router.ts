@@ -29,6 +29,9 @@ export const createAppRouter = (implementations: {
       // Per-endpoint presentation (migration 0044). Human administrator only:
       // in neither admin-plane procedure set, so an admin-plane key is refused.
       endpointPresentation: frontendRouters.endpointPresentation,
+      // The audit trail, read-only: administrators and operator-scope
+      // admin-plane keys (see ADMIN_PLANE_OPERATOR_PROCEDURES).
+      audit: frontendRouters.audit,
     }),
   });
 };
