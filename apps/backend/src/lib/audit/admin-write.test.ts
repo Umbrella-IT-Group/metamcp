@@ -2,7 +2,7 @@
  * withAdminAudit / runAuditedTransaction: who gets the audit row inside the
  * change's own transaction, and what a failing row does.
  *
- * The contract (plan, foreman decision 1): a request authenticated by an
+ * The contract: a request authenticated by an
  * admin-plane key has no person watching, so its change and its audit row are
  * one transaction and an audit failure fails the change. Every other actor
  * keeps the best-effort record, written after the change by `emit`. The
@@ -43,6 +43,15 @@ vi.mock("../../db/index", () => ({
 }));
 vi.mock("../../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: txAudit.record,
+}));
+// TEST-EDIT (change budget): an admin-plane
+// change now opens the key's change budget inside its transaction (a lock and
+// a count statement), which this suite's stand-in transaction cannot run. The
+// budget is pinned in admin-plane-budget.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts; here it is opened as "no budget".
+vi.mock("../admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
 }));
 
 const {

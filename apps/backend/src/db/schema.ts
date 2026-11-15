@@ -356,6 +356,21 @@ export const endpointsTable = pgTable(
     // Default false = today's behaviour, which is what lets this ship without
     // locking any live connector out while the groups are still being drawn up.
     restricted: boolean("restricted").notNull().default(false),
+    // Provenance of the CURRENT restriction (migration 0047), the marker the
+    // admin-plane un-restrict rail reads (lib/endpoint-namespace-gate). Written
+    // only by the gate, under the endpoint's namespace lock:
+    //  - an actual false-to-true transition stamps `restricted_at` and, when an
+    //    admin-plane key made it, that key's uuid in `restricted_by_api_key_uuid`
+    //    (NULL for a human administrator or an endpoint created restricted);
+    //  - a repeated `true` never creates eligibility: by the same key it
+    //    changes nothing, by anyone else it clears the key uuid;
+    //  - un-restricting clears both, and moving the endpoint to another
+    //    namespace clears the key uuid.
+    // An admin-plane key may roll back only a restriction whose marker names
+    // it and is under 24 hours old; anything else, including every row written
+    // before this column existed, fails closed to a human's decision.
+    restricted_at: timestamp("restricted_at", { withTimezone: true }),
+    restricted_by_api_key_uuid: uuid("restricted_by_api_key_uuid"),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -1126,7 +1141,8 @@ export const auditLogTable = pgTable(
       .default(sql`gen_random_uuid()`),
     occurred_at: timestamp("occurred_at", { withTimezone: true })
       .notNull()
-      .defaultNow(),
+      // Budget charges begin when inserted, after any transaction lock wait.
+      .default(sql`clock_timestamp()`),
     // user | api_key | oauth_client | anonymous | system. Kept as text
     // rather than a pgEnum: a new actor class must never be able to make an
     // audit INSERT fail, and a failed audit INSERT is a silently missing

@@ -419,6 +419,49 @@ export const ReconnectMcpServerResponseSchema = z.object({
   error: z.string().optional(),
 });
 
+// `mcpServers.resetErrors`, the tRPC twin of the cookie-only REST route
+// `POST /metamcp/:endpoint_name/admin/reset-errors` (same body field, same
+// shared implementation). With `serverUuid`, that server's ERROR status is
+// cleared if it has one (an unknown uuid is NOT_FOUND); without it, every
+// server in ERROR is. The change `reason` is read from the raw input by the
+// procedure base, not by this schema.
+export const ResetMcpServerErrorsRequestSchema = z.object({
+  serverUuid: z.string().uuid().optional(),
+});
+
+/**
+ * Two separate answers. `reset` is what was committed: the servers whose
+ * ERROR status was cleared, in the same transaction as the change's audit
+ * row. `recovery` is what happened afterwards, when the gateway tried to
+ * reconnect those servers: it never undoes `reset`, and a recovery that is
+ * still running when the call answers is `pending` (read the server's status
+ * back with `mcpServers.list`). A server with nothing to connect (its row is
+ * gone, or a stdio server is disabled) is `skipped`, and a call whose servers
+ * were all skipped answers `skipped`, not `succeeded`. Names and uuids only,
+ * never error text.
+ */
+export const ResetMcpServerErrorsResponseSchema = z.object({
+  reset: z.array(z.object({ uuid: z.string(), name: z.string() })),
+  recovery: z.object({
+    status: z.enum(["not_needed", "succeeded", "failed", "pending", "skipped"]),
+    servers: z.array(
+      z.object({
+        uuid: z.string(),
+        name: z.string(),
+        status: z.enum(["connected", "failed", "pending", "skipped"]),
+      }),
+    ),
+  }),
+});
+
+export type ResetMcpServerErrorsRequest = z.infer<
+  typeof ResetMcpServerErrorsRequestSchema
+>;
+
+export type ResetMcpServerErrorsResponse = z.infer<
+  typeof ResetMcpServerErrorsResponseSchema
+>;
+
 export type ReconnectMcpServerRequest = z.infer<
   typeof ReconnectMcpServerRequestSchema
 >;

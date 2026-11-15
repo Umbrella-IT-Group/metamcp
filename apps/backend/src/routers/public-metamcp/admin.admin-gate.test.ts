@@ -24,7 +24,11 @@
  *    invented one, while an authenticated admin still gets a plain 404),
  *  - the mcp-servers repo, the error tracker and `lib/startup`, so the
  *    handlers' own side effects are observable and `@/db` stays out of the
- *    import graph.
+ *    import graph,
+ *  - the shared server error reset (`lib/metamcp/reset-server-errors`), which
+ *    the reset route and the tRPC `mcpServers.resetErrors` procedure both
+ *    call; its own steps are pinned in that module's test and against a real
+ *    Postgres in trpc/admin-plane-key-powers.integration.test.ts.
  *
  * `requireAdminMcpMiddleware` and `requireEnabledMcpMiddleware` are NOT
  * mocked; they are the code under test. Asserting the repositories stay
@@ -71,6 +75,7 @@ const h = vi.hoisted(() => ({
   resetAllAttempts: vi.fn(),
   getServerAttempts: vi.fn(),
   initializeIdleServers: vi.fn(),
+  resetServerErrors: vi.fn(),
 }));
 
 vi.mock("@/middleware/better-auth-mcp.middleware", () => ({
@@ -109,6 +114,14 @@ vi.mock("../../lib/metamcp/server-error-tracker", () => ({
 
 vi.mock("../../lib/startup", () => ({
   initializeIdleServers: h.initializeIdleServers,
+}));
+
+// TEST-EDIT (error reset): the reset route now calls
+// the implementation it shares with the tRPC procedure instead of resetting
+// through the error tracker itself, so that is the seam a denial must leave
+// uncalled.
+vi.mock("../../lib/metamcp/reset-server-errors", () => ({
+  resetServerErrors: h.resetServerErrors,
 }));
 
 import adminRouter from "./admin";
@@ -159,6 +172,15 @@ beforeEach(() => {
   h.resetServerErrorState.mockResolvedValue(undefined);
   h.getServerAttempts.mockReturnValue(0);
   h.initializeIdleServers.mockResolvedValue(undefined);
+  h.resetServerErrors.mockResolvedValue({
+    reset: [{ uuid: "server-1", name: "autotask-upstream" }],
+    recovery: {
+      status: "succeeded",
+      servers: [
+        { uuid: "server-1", name: "autotask-upstream", status: "connected" },
+      ],
+    },
+  });
 });
 
 const signInAs = (role: string | undefined, id = "user-1") => {
@@ -167,6 +189,7 @@ const signInAs = (role: string | undefined, id = "user-1") => {
 
 /** No handler on either route ran. */
 const expectNoEstateAccess = () => {
+  expect(h.resetServerErrors).not.toHaveBeenCalled();
   expect(h.findAll).not.toHaveBeenCalled();
   expect(h.resetServerErrorState).not.toHaveBeenCalled();
   expect(h.resetAllAttempts).not.toHaveBeenCalled();
@@ -190,7 +213,13 @@ describe("/metamcp/:endpoint_name/admin/* — the role gate", () => {
     const response = await fetch(`${baseUrl}${path}`, { method });
 
     expect(response.status).toBe(200);
-    expect(h.findAll).toHaveBeenCalledTimes(1);
+    // TEST-EDIT (key powers): the reset route reaches the shared reset, which
+    // selects the servers itself; the status route still lists them.
+    if (path === RESET_PATH) {
+      expect(h.resetServerErrors).toHaveBeenCalledTimes(1);
+    } else {
+      expect(h.findAll).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("denies a session whose user carries no role at all", async () => {
@@ -319,7 +348,11 @@ describe("/metamcp/:endpoint_name/admin/* — lookup runs behind the gate", () =
 });
 
 describe("POST reset-errors — the admin path still works", () => {
-  it("resets every errored server and triggers the idle sweep for an admin", async () => {
+  // TEST-EDIT (key powers): the route hands the request to the reset it shares
+  // with the tRPC procedure (status change and audit row in one transaction,
+  // then recovery of the reset servers only), so this asserts that hand-off
+  // and the unchanged response shape instead of the old in-route sweep.
+  it("resets every errored server through the shared reset, as the signed-in person", async () => {
     signInAs("admin");
 
     const response = await fetch(`${baseUrl}${RESET_PATH}`, {
@@ -329,15 +362,47 @@ describe("POST reset-errors — the admin path still works", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ success: true, reset: 1 });
-    expect(h.resetServerErrorState).toHaveBeenCalledWith("server-1");
-    expect(h.resetAllAttempts).toHaveBeenCalledTimes(1);
-    expect(h.initializeIdleServers).toHaveBeenCalledTimes(1);
+    expect(await response.json()).toMatchObject({
+      success: true,
+      reset: 1,
+      servers: ["autotask-upstream"],
+      recovery: { status: "succeeded" },
+    });
+    expect(h.resetServerErrors).toHaveBeenCalledTimes(1);
+    const [input, actor] = h.resetServerErrors.mock.calls[0];
+    expect(input).toEqual({ serverUuid: undefined });
+    expect(actor).toMatchObject({ actor_id: "user-1" });
+    expect(actor).not.toHaveProperty("admin_plane");
+  });
+
+  it("passes a named server through and answers an unknown one with 404", async () => {
+    signInAs("admin");
+    const { TRPCError } = await import("@trpc/server");
+    h.resetServerErrors.mockRejectedValue(
+      new TRPCError({ code: "NOT_FOUND", message: "MCP server not found" }),
+    );
+
+    const response = await fetch(`${baseUrl}${RESET_PATH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ serverUuid: "server-404" }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      success: false,
+      error: "MCP server not found",
+    });
+    expect(h.resetServerErrors.mock.calls[0][0]).toEqual({
+      serverUuid: "server-404",
+    });
   });
 
   it("answers a failure with the constant body, never the error text", async () => {
     signInAs("admin");
-    h.findAll.mockRejectedValue(
+    // TEST-EDIT (key powers): the failure now comes from the shared reset, which
+    // propagates database and audit errors instead of swallowing them.
+    h.resetServerErrors.mockRejectedValue(
       new Error('connect ECONNREFUSED postgres-internal:5432 db "metamcp"'),
     );
 

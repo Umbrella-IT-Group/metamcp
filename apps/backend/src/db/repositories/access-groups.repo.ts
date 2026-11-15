@@ -8,7 +8,7 @@ import {
   endpointsTable,
   usersTable,
 } from "../schema";
-import type { DbExecutor } from "./db-executor";
+import type { DbExecutor, DbTransaction } from "./db-executor";
 
 /**
  * Named access groups and the grants they carry (migration 0033).
@@ -254,13 +254,64 @@ export class AccessGroupsRepository {
     },
     executor?: DbExecutor,
   ) {
-    const [updated] = await (executor ?? db)
-      .update(accessGroupsTable)
-      .set({ name: input.name, description: input.description ?? null })
-      .where(eq(accessGroupsTable.uuid, input.uuid))
-      .returning();
+    return (await this.updateReportingPrevious(input, executor))?.group;
+  }
 
-    return updated;
+  /**
+   * Update a group and report the row as it was, read FOR UPDATE in the same
+   * transaction (a savepoint of the caller's when it holds one), so an audit
+   * row can carry the before-state of exactly the write it describes.
+   */
+  async updateReportingPrevious(
+    input: {
+      uuid: string;
+      name: string;
+      description?: string | null;
+    },
+    executor?: DbExecutor,
+  ) {
+    return await (executor ?? db).transaction(async (tx) => {
+      const [previous] = await tx
+        .select()
+        .from(accessGroupsTable)
+        .where(eq(accessGroupsTable.uuid, input.uuid))
+        .for("update");
+      if (!previous) return undefined;
+      const [group] = await tx
+        .update(accessGroupsTable)
+        .set({ name: input.name, description: input.description ?? null })
+        .where(eq(accessGroupsTable.uuid, input.uuid))
+        .returning();
+      return group ? { group, previous } : undefined;
+    });
+  }
+
+  /**
+   * Lock one group's row FOR UPDATE and count what a delete would cascade to:
+   * its members and its endpoint mappings. A member or mapping insert checks
+   * its foreign key against the group row, which waits on this lock, so the
+   * counts cannot grow before the caller's transaction ends. Returns null
+   * when no such group exists.
+   */
+  async lockGroupContents(
+    tx: DbTransaction,
+    uuid: string,
+  ): Promise<{ members: number; mappings: number } | null> {
+    const [group] = await tx
+      .select({ uuid: accessGroupsTable.uuid })
+      .from(accessGroupsTable)
+      .where(eq(accessGroupsTable.uuid, uuid))
+      .for("update");
+    if (!group) return null;
+    const [members] = await tx
+      .select({ value: count() })
+      .from(accessGroupMembersTable)
+      .where(eq(accessGroupMembersTable.group_uuid, uuid));
+    const [mappings] = await tx
+      .select({ value: count() })
+      .from(accessGroupEndpointsTable)
+      .where(eq(accessGroupEndpointsTable.group_uuid, uuid));
+    return { members: members?.value ?? 0, mappings: mappings?.value ?? 0 };
   }
 
   /**
@@ -348,46 +399,6 @@ export class AccessGroupsRepository {
       .returning({ endpoint_uuid: accessGroupEndpointsTable.endpoint_uuid });
 
     return deleted.length > 0;
-  }
-
-  /**
-   * Flip one endpoint's `restricted` gate.
-   *
-   * Its own statement rather than a field on `endpointsRepository.update`,
-   * because that method rewrites the whole row from an `EndpointUpdateInput`
-   * and is driven by the endpoint edit form. Turning an endpoint's
-   * authorization gate on has to be a deliberate act with its own audit event,
-   * not a value that can ride along in a rename.
-   *
-   * Returns the new row so the caller can emit the change and report the miss
-   * when no endpoint matched.
-   *
-   * Sets `restricted` and nothing else, in both directions. It used to turn
-   * `require_scoped_api_key` on with `restricted`, to keep gateway-wide keys off
-   * a restricted endpoint while groups governed OAuth sign-ins only. Groups now
-   * govern API keys by their owner (see `lib/endpoint-access-control`), so the
-   * two switches are independent: an operator who also wants gateway-wide keys
-   * refused on the endpoint turns `require_scoped_api_key` on, and neither
-   * direction of this toggle touches it. `require_scoped_api_key` stays in the
-   * returned row because the audit row and the admin panel report it.
-   */
-  async setEndpointRestricted(
-    endpointUuid: string,
-    restricted: boolean,
-    executor?: DbExecutor,
-  ) {
-    const [updated] = await (executor ?? db)
-      .update(endpointsTable)
-      .set({ restricted, updated_at: new Date() })
-      .where(eq(endpointsTable.uuid, endpointUuid))
-      .returning({
-        uuid: endpointsTable.uuid,
-        name: endpointsTable.name,
-        restricted: endpointsTable.restricted,
-        require_scoped_api_key: endpointsTable.require_scoped_api_key,
-      });
-
-    return updated;
   }
 }
 

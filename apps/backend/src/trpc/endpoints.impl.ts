@@ -20,9 +20,21 @@ import {
   mcpServersRepository,
   namespacesRepository,
 } from "../db/repositories";
+import { endpointGateRepository } from "../db/repositories/endpoint-gate.repo";
 import { EndpointsSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
-import { withAdminAudit } from "../lib/audit/admin-write";
+import { AdminRuleRefusal, withAdminAuditTx } from "../lib/audit/admin-write";
+import {
+  describeUpdate,
+  ENDPOINT_UPDATE_FIELDS,
+} from "../lib/audit/before-state";
+import {
+  ENDPOINT_GATE_REFUSALS,
+  type EndpointGateRule,
+  isOwnRecentRestriction,
+  judgeEndpointCreate,
+  judgeEndpointMove,
+} from "../lib/endpoint-namespace-gate";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -37,16 +49,24 @@ const apiKeysRepository = new ApiKeysRepository();
 const DEFAULT_ENDPOINT_MAX_RATE = 600;
 const DEFAULT_ENDPOINT_MAX_RATE_SECONDS = 60;
 
-// An admin-plane key may create an API key for a public, unrestricted endpoint
-// with no question about the owner's groups, and for a restricted one only for
-// an owner who is an explicit member of a mapped group (lib/api-key-mint-rules.ts,
-// rule 4). Without this refusal the same key could create or re-point an
-// unrestricted endpoint over the namespace a restricted or private endpoint
-// serves, then create a key for the new endpoint and any owner, and reach
-// through it what the restricted one keeps from that owner. The refusal is a
-// fixed sentence that names no endpoint or namespace.
-const ADMIN_PLANE_PUBLISH_REFUSAL =
-  "An admin-plane API key cannot make a namespace public that a restricted or private endpoint already serves. Do this in the admin UI.";
+/**
+ * A refusal of the endpoint namespace gate (lib/endpoint-namespace-gate) as
+ * the coded error the change helpers answer with, after rolling back and
+ * recording one denied row naming the rule. Fixed sentences only.
+ */
+function gateRefusal(
+  rule: EndpointGateRule,
+  action: "endpoint.create" | "endpoint.update",
+  targetId: string | null,
+): AdminRuleRefusal {
+  const { code, message } = ENDPOINT_GATE_REFUSALS[rule];
+  return new AdminRuleRefusal(code, message, {
+    action,
+    target_type: "endpoint",
+    target_id: targetId,
+    detail: { rule },
+  });
+}
 
 export const endpointsImplementations = {
   create: async (
@@ -127,23 +147,6 @@ export const endpointsImplementations = {
       const restricted = input.restricted ?? false;
       const requireScopedApiKey = input.requireScopedApiKey ?? false;
 
-      // See ADMIN_PLANE_PUBLISH_REFUSAL. Only the kind of endpoint a key may be
-      // created for without a membership check is judged: a private or
-      // restricted endpoint is not one.
-      if (
-        actor?.admin_plane &&
-        isPublicEndpoint &&
-        !restricted &&
-        (await endpointsRepository.hasGatedEndpointOnNamespace(
-          input.namespaceUuid,
-        ))
-      ) {
-        return {
-          success: false as const,
-          message: ADMIN_PLANE_PUBLISH_REFUSAL,
-        };
-      }
-
       // A new endpoint gets a per-credential tool-call ceiling by default. When
       // the flag is on but no budget was supplied, fall back to a conservative
       // default so "enabled" always means an actually-enforcing limiter: the
@@ -158,18 +161,44 @@ export const endpointsImplementations = {
 
       logger.info(input);
 
-      // For an admin-plane key the endpoint row and its audit row are one
-      // transaction (an audit failure fails the create); for everyone else the
-      // event is emitted best-effort right after the write. An endpoint is a
+      // One transaction for every actor (an admin-plane key's also carries its
+      // audit row; a human's event is emitted after commit). Inside it, under
+      // the namespace lock, the endpoint namespace gate judges the create
+      // against the namespace's endpoints as they are now, so two writers
+      // cannot each see the other's endpoint missing. An endpoint is a
       // publicly reachable MCP surface, so its creation and its auth posture
       // (API-key gate, scoped-key requirement, OAuth) are the breadcrumbs that
       // answer "when did this URL start existing, and did it ever require a
       // credential". Never the bearer token the block below may embed in the
       // companion MCP server.
-      const result = await withAdminAudit(
+      const result = await withAdminAuditTx(
         actor,
-        (...tx) =>
-          endpointsRepository.create(
+        async (tx) => {
+          await endpointGateRepository.lockNamespaces(tx, [
+            input.namespaceUuid,
+          ]);
+          const restrictedSibling =
+            await endpointGateRepository.restrictedSiblingExists(
+              tx,
+              input.namespaceUuid,
+            );
+          // Asked only when the admin-plane publish rule could apply.
+          const gatedSibling =
+            Boolean(actor?.admin_plane) && isPublicEndpoint && !restricted
+              ? await endpointGateRepository.gatedSiblingExists(
+                  tx,
+                  input.namespaceUuid,
+                )
+              : false;
+          const rule = judgeEndpointCreate({
+            restricted,
+            isPublic: isPublicEndpoint,
+            adminPlane: Boolean(actor?.admin_plane),
+            restrictedSibling,
+            gatedSibling,
+          });
+          if (rule) throw gateRefusal(rule, "endpoint.create", null);
+          return endpointsRepository.create(
             {
               name: input.name,
               description: input.description,
@@ -189,8 +218,9 @@ export const endpointsImplementations = {
               use_query_param_auth: input.useQueryParamAuth ?? false,
               user_id: effectiveUserId,
             },
-            ...tx,
-          ),
+            tx,
+          );
+        },
         (created) => ({
           action: "endpoint.create",
           target_type: "endpoint",
@@ -301,6 +331,10 @@ export const endpointsImplementations = {
         ...(mcpServerWarning ? { warning: mcpServerWarning } : {}),
       };
     } catch (error) {
+      // A coded refusal (the namespace gate, the change budget) reaches the
+      // caller as itself, never as `success: false` inside an HTTP 200, which
+      // a caller's tooling cannot tell from an unknown outcome.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error creating endpoint:", describeDbError(error));
       return {
         success: false as const,
@@ -510,25 +544,6 @@ export const endpointsImplementations = {
         }
       }
 
-      // See ADMIN_PLANE_PUBLISH_REFUSAL. Judged only when the endpoint is the
-      // kind a key may be created for and its namespace is being changed: an
-      // endpoint left where it is keeps whatever reach it already had.
-      if (
-        actor?.admin_plane &&
-        isPublicEndpoint &&
-        existingEndpoint.restricted !== true &&
-        input.namespaceUuid !== existingEndpoint.namespace_uuid &&
-        (await endpointsRepository.hasGatedEndpointOnNamespace(
-          input.namespaceUuid,
-          input.uuid,
-        ))
-      ) {
-        return {
-          success: false as const,
-          message: ADMIN_PLANE_PUBLISH_REFUSAL,
-        };
-      }
-
       // Check if another endpoint with the same name exists (excluding current one)
       const duplicateEndpoint = await endpointsRepository.findByName(
         input.name,
@@ -551,11 +566,81 @@ export const endpointsImplementations = {
       // The auth-posture fields are carried for the same reason as on create:
       // turning `enable_api_key_auth` off on a live endpoint opens it to the
       // internet, and that has to be attributable to a person and a moment.
-      // For an admin-plane key the row and its audit row are one transaction.
-      const result = await withAdminAudit(
+      // One transaction for every actor; for an admin-plane key it also holds
+      // the audit row.
+      //
+      // The namespace gate: the update always writes namespace_uuid, so it is
+      // judged as a move whenever the endpoint's namespace as locked differs
+      // from the one requested. Both namespaces are locked (sorted) before the
+      // endpoint row is re-read FOR UPDATE; an endpoint that moved since the
+      // read above is refused as changed, to be retried, rather than moved
+      // back by a write built on a stale read.
+      const fromNamespace = existingEndpoint.namespace_uuid;
+      const { updated: result } = await withAdminAuditTx(
         actor,
-        (...tx) =>
-          endpointsRepository.update(
+        async (tx) => {
+          await endpointGateRepository.lockNamespaces(tx, [
+            fromNamespace,
+            input.namespaceUuid,
+          ]);
+          const locked = await endpointGateRepository.lockEndpoint(
+            tx,
+            input.uuid,
+          );
+          if (
+            !locked ||
+            locked.namespace_uuid.toLowerCase() !== fromNamespace.toLowerCase()
+          ) {
+            throw gateRefusal(
+              "endpoint_changed",
+              "endpoint.update",
+              input.uuid,
+            );
+          }
+          const isMove =
+            locked.namespace_uuid.toLowerCase() !==
+            input.namespaceUuid.toLowerCase();
+          if (isMove) {
+            const isPublic = locked.user_id === null;
+            const restrictedSibling =
+              await endpointGateRepository.restrictedSiblingExists(
+                tx,
+                input.namespaceUuid,
+                input.uuid,
+              );
+            const gatedSibling =
+              Boolean(actor?.admin_plane) && isPublic && !locked.restricted
+                ? await endpointGateRepository.gatedSiblingExists(
+                    tx,
+                    input.namespaceUuid,
+                    input.uuid,
+                  )
+                : false;
+            // The source side, asked only when an admin-plane key moves a
+            // restricted endpoint: does the namespace it leaves stay guarded?
+            const sourceRestrictedSibling =
+              Boolean(actor?.admin_plane) && locked.restricted
+                ? await endpointGateRepository.restrictedSiblingExists(
+                    tx,
+                    locked.namespace_uuid,
+                    input.uuid,
+                  )
+                : false;
+            const rule = judgeEndpointMove({
+              restricted: locked.restricted,
+              isPublic,
+              adminPlane: Boolean(actor?.admin_plane),
+              restrictedSibling,
+              gatedSibling,
+              sourceRestrictedSibling,
+              rollbackEligible: isOwnRecentRestriction(
+                locked,
+                actor?.admin_plane?.key_uuid ?? null,
+              ),
+            });
+            if (rule) throw gateRefusal(rule, "endpoint.update", input.uuid);
+          }
+          const updated = await endpointsRepository.update(
             {
               uuid: input.uuid,
               name: input.name,
@@ -574,9 +659,16 @@ export const endpointsImplementations = {
               enable_oauth: input.enableOauth,
               use_query_param_auth: input.useQueryParamAuth,
             },
-            ...tx,
-          ),
-        (updated) => ({
+            tx,
+          );
+          // A restriction a key made over the old namespace is not one it may
+          // roll back over the new one (migration 0047).
+          if (isMove) {
+            await endpointGateRepository.clearRestrictionKey(tx, input.uuid);
+          }
+          return { updated, previous: locked.row };
+        },
+        ({ updated, previous }) => ({
           action: "endpoint.update",
           target_type: "endpoint",
           target_id: updated.uuid,
@@ -586,16 +678,21 @@ export const endpointsImplementations = {
             enable_api_key_auth: input.enableApiKeyAuth,
             require_scoped_api_key: requireScopedApiKey,
             enable_oauth: input.enableOauth,
+            // The previous and new value of every field this write changed
+            // (a move included, as `namespace_uuid`), read under the
+            // endpoint's row lock.
+            ...describeUpdate(previous, updated, ENDPOINT_UPDATE_FIELDS),
           },
         }),
       );
-
       return {
         success: true as const,
         data: EndpointsSerializer.serializeEndpoint(result),
         message: "Endpoint updated successfully",
       };
     } catch (error) {
+      // See create: a coded refusal reaches the caller as itself.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error updating endpoint:", describeDbError(error));
       return {
         success: false as const,

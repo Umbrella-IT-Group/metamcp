@@ -4,7 +4,18 @@ import {
   McpServerErrorStatusEnum,
   McpServerUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNotNull, isNull, like, not, or } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  like,
+  not,
+  or,
+} from "drizzle-orm";
 import { DatabaseError } from "pg";
 import { z } from "zod";
 
@@ -17,7 +28,7 @@ import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { mcpServersTable } from "../schema";
-import type { DbExecutor } from "./db-executor";
+import type { DbExecutor, DbTransaction } from "./db-executor";
 import {
   planServerUpdate,
   ServerCredentialRetentionError,
@@ -241,6 +252,12 @@ export class McpServersRepository {
   ): Promise<
     | {
         server: DatabaseMcpServer;
+        /**
+         * The row as locked, before the write. Credentials included: it is for
+         * the before-state of the audit row (lib/audit/before-state), which
+         * records a credential field's change and never its value.
+         */
+        previous: DatabaseMcpServer;
         destinationOrCredentialChanged: boolean;
         ownershipChanged: boolean;
       }
@@ -251,13 +268,7 @@ export class McpServersRepository {
     try {
       return await (executor ?? db).transaction(async (tx) => {
         const [current] = await tx
-          .select({
-            type: mcpServersTable.type,
-            url: mcpServersTable.url,
-            bearerToken: mcpServersTable.bearerToken,
-            headers: mcpServersTable.headers,
-            user_id: mcpServersTable.user_id,
-          })
+          .select()
           .from(mcpServersTable)
           .where(eq(mcpServersTable.uuid, uuid))
           .for("update");
@@ -272,6 +283,7 @@ export class McpServersRepository {
 
         return {
           server: updatedServer,
+          previous: current,
           destinationOrCredentialChanged:
             current.type !== updatedServer.type ||
             (current.url ?? null) !== (updatedServer.url ?? null) ||
@@ -354,6 +366,58 @@ export class McpServersRepository {
       .returning();
 
     return updatedServer;
+  }
+
+  /**
+   * Clear the ERROR status of one server, or of every server in ERROR, inside
+   * the caller's transaction: the write `mcpServers.resetErrors` and the REST
+   * reset route share (lib/metamcp/reset-server-errors), so the status change
+   * and its audit row commit or roll back together. The rows are read FOR
+   * UPDATE first, in uuid order, so two concurrent resets queue on the same
+   * row instead of locking a set in different orders. With `serverUuid` an
+   * unknown uuid is `not_found`, and a server that is not in ERROR is left
+   * alone (an empty `reset`). Returns the servers changed, by name, in a
+   * stable order; failures propagate.
+   */
+  async clearErrorStatus(
+    tx: DbTransaction,
+    selection: { serverUuid?: string },
+  ): Promise<
+    | { status: "not_found" }
+    | { status: "ok"; reset: Array<{ uuid: string; name: string }> }
+  > {
+    const ERROR = McpServerErrorStatusEnum.enum.ERROR;
+    const locked = await tx
+      .select({
+        uuid: mcpServersTable.uuid,
+        error_status: mcpServersTable.error_status,
+      })
+      .from(mcpServersTable)
+      .where(
+        selection.serverUuid !== undefined
+          ? eq(mcpServersTable.uuid, selection.serverUuid)
+          : eq(mcpServersTable.error_status, ERROR),
+      )
+      .orderBy(asc(mcpServersTable.uuid))
+      .for("update");
+    if (selection.serverUuid !== undefined && locked.length === 0) {
+      return { status: "not_found" };
+    }
+    // Judged on the rows as locked: a row another writer moved out of ERROR
+    // while this waited is left alone.
+    const inError = locked
+      .filter((row) => row.error_status === ERROR)
+      .map((row) => row.uuid);
+    if (inError.length === 0) return { status: "ok", reset: [] };
+    const reset = await tx
+      .update(mcpServersTable)
+      .set({ error_status: McpServerErrorStatusEnum.enum.NONE })
+      .where(inArray(mcpServersTable.uuid, inError))
+      .returning({ uuid: mcpServersTable.uuid, name: mcpServersTable.name });
+    reset.sort(
+      (a, b) => a.name.localeCompare(b.name) || a.uuid.localeCompare(b.uuid),
+    );
+    return { status: "ok", reset };
   }
 
   /**

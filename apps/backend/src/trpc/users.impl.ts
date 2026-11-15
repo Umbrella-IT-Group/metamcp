@@ -17,8 +17,14 @@ import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { usersRepository } from "../db/repositories";
+import {
+  lockAccountForRevoke,
+  lockAccountTarget,
+} from "../db/repositories/admin-plane-locks";
 import { UsersSerializer } from "../db/serializers";
+import { assertAccountChangeAllowed } from "../lib/account-rails";
 import { emitAdminEvent } from "../lib/audit/admin-event";
+import { withAdminAuditTx } from "../lib/audit/admin-write";
 import { clampAuditText } from "../lib/audit/audit-emitter";
 
 /**
@@ -147,13 +153,56 @@ export const usersImplementations = {
     }
 
     try {
-      const updated = await usersRepository.setDisabled(
-        input.user_id,
-        input.disabled,
-        actorUserId,
+      // One transaction for every caller: the enabled administrators and the
+      // target are locked first (lib/account-rails, lock order position 4b),
+      // the rails are judged against those rows, and only then is the account
+      // written. For an admin-plane key the audit row is in the same
+      // transaction; a person's session gets the best-effort event after
+      // commit, as before.
+      //
+      // The event is written below every early return, so a no-op against a
+      // user id that does not exist leaves no row claiming an account was
+      // locked. Two distinct actions rather than one with a boolean in
+      // `detail`: enabling an account someone else disabled is the reversal
+      // of a containment decision, and it has to be greppable on its own
+      // rather than hiding inside the same verb as the lock.
+      const outcome = await withAdminAuditTx(
+        actor,
+        async (tx) => {
+          const { target, enabledAdminIds } = await lockAccountTarget(
+            tx,
+            input.user_id,
+          );
+          if (!target) return undefined;
+          await assertAccountChangeAllowed(
+            tx,
+            actor,
+            target,
+            enabledAdminIds,
+            input.disabled ? "disable" : "enable",
+          );
+          const updated = await usersRepository.setDisabled(
+            input.user_id,
+            input.disabled,
+            actorUserId,
+            tx,
+          );
+          return updated ? { updated } : undefined;
+        },
+        (written) =>
+          written
+            ? {
+                action: input.disabled
+                  ? "user.disabled.set"
+                  : "user.enabled.set",
+                target_type: "user",
+                target_id: input.user_id,
+                detail: { disabled: written.updated.disabled },
+              }
+            : null,
       );
 
-      if (!updated) {
+      if (!outcome) {
         // Report the miss instead of a cheerful success — an operator who
         // believes they locked an attacker out who is still signing in is
         // worse off than one who sees the failure.
@@ -163,24 +212,12 @@ export const usersImplementations = {
           disabled: false,
         };
       }
+      const updated = outcome.updated;
 
       logger.info(
         `${input.disabled ? "Disabled" : "Enabled"} user ${input.user_id} ` +
           `via admin UI (actor ${actorUserId})`,
       );
-
-      // Emitted here rather than above the `if (!updated)` return, so a
-      // no-op against a user id that does not exist leaves no row claiming an
-      // account was locked. Two distinct actions rather than one with a
-      // boolean in `detail`: enabling an account someone else disabled is the
-      // reversal of a containment decision, and it has to be greppable on its
-      // own rather than hiding inside the same verb as the lock.
-      emitAdminEvent(actor, {
-        action: input.disabled ? "user.disabled.set" : "user.enabled.set",
-        target_type: "user",
-        target_id: input.user_id,
-        detail: { disabled: updated.disabled },
-      });
 
       return {
         success: true,
@@ -188,6 +225,8 @@ export const usersImplementations = {
         disabled: updated.disabled,
       };
     } catch (error) {
+      // A rail's coded refusal reaches the caller as itself.
+      if (error instanceof TRPCError) throw error;
       logger.error(
         "Error setting user disabled state:",
         describeDbError(error),
@@ -226,7 +265,53 @@ export const usersImplementations = {
         };
       }
 
-      const revoked = await usersRepository.revokeAccess(input.user_id);
+      // One transaction: the user's OAuth credential lock first (the order
+      // the revoke itself always took it in), then the account row FOR
+      // UPDATE, the account rails, and the revoke as a savepoint of the same
+      // transaction (db/repositories/admin-plane-locks, positions 4a and 4b).
+      const revokedOrNull = await withAdminAuditTx(
+        actor,
+        async (tx) => {
+          const locked = await lockAccountForRevoke(tx, input.user_id);
+          if (!locked) return null;
+          await assertAccountChangeAllowed(tx, actor, locked, null, "revoke");
+          return usersRepository.revokeAccess(input.user_id, tx);
+        },
+        // COUNTS ONLY. What this operation touches IS the credential set: it
+        // deletes session rows, OAuth access and refresh tokens and
+        // authorization codes, and resets M365 delegated tokens. None of those
+        // values may be recorded: `audit_log` is append-only with no prune
+        // path, so a token copied in here outlives the revocation that was
+        // supposed to kill it. The counts answer "how much access was cut",
+        // which is the question an after-action review actually asks; the
+        // email is clamped because it is the only free-text field in the row.
+        (revoked) =>
+          revoked
+            ? {
+                action: "user.access.revoked",
+                target_type: "user",
+                target_id: input.user_id,
+                detail: {
+                  target_email: clampAuditText(target.email, MAX_EMAIL_LENGTH),
+                  sessions_revoked: revoked.sessions_deleted,
+                  oauth_tokens_revoked: revoked.oauth_tokens_deleted,
+                  auth_codes_revoked: revoked.authorization_codes_deleted,
+                  api_keys_revoked: revoked.api_keys_deactivated,
+                  // Part of the same teardown and a real credential plane of
+                  // its own; omitting it would under-report what was cut.
+                  m365_tokens_revoked: revoked.m365_tokens_revoked,
+                },
+              }
+            : null,
+      );
+      if (!revokedOrNull) {
+        return {
+          success: false,
+          message: "User not found",
+          ...NO_REVOCATIONS,
+        };
+      }
+      const revoked = revokedOrNull;
 
       logger.info(
         `Revoked access for user ${target.email} (${input.user_id}) via admin UI: ` +
@@ -236,40 +321,14 @@ export const usersImplementations = {
           `${revoked.m365_tokens_revoked} M365 delegations reset`,
       );
 
-      // Emitted AFTER the repository's single transaction committed — a throw
-      // above means nothing was cut, and a row claiming an attacker was
-      // severed when they were not is the worst thing this table could say.
-      //
-      // COUNTS ONLY. What this operation touches IS the credential set: it
-      // deletes session rows, OAuth access and refresh tokens and
-      // authorization codes, and resets M365 delegated tokens. None of those
-      // values may be recorded — `audit_log` is append-only with no prune
-      // path, so a token copied in here outlives the revocation that was
-      // supposed to kill it. The counts answer "how much access was cut",
-      // which is the question an after-action review actually asks; the
-      // email is clamped because it is the only free-text field in the row.
-      emitAdminEvent(actor, {
-        action: "user.access.revoked",
-        target_type: "user",
-        target_id: input.user_id,
-        detail: {
-          target_email: clampAuditText(target.email, MAX_EMAIL_LENGTH),
-          sessions_revoked: revoked.sessions_deleted,
-          oauth_tokens_revoked: revoked.oauth_tokens_deleted,
-          auth_codes_revoked: revoked.authorization_codes_deleted,
-          api_keys_revoked: revoked.api_keys_deactivated,
-          // Part of the same teardown and a real credential plane of its own
-          // — omitting it would under-report what was cut.
-          m365_tokens_revoked: revoked.m365_tokens_revoked,
-        },
-      });
-
       return {
         success: true,
         message: "Access revoked",
         ...revoked,
       };
     } catch (error) {
+      // A rail's coded refusal reaches the caller as itself.
+      if (error instanceof TRPCError) throw error;
       // The repository runs its five statements in ONE transaction, so a
       // throw here means nothing was committed. Reporting failure is
       // therefore honest — the half-cut state that would make this message a
@@ -311,7 +370,31 @@ export const usersImplementations = {
       // after-action review will ask about.
       const impact = await usersRepository.previewDeleteImpact(input.user_id);
 
-      const deleted = await usersRepository.deleteById(input.user_id);
+      // One transaction for every caller: the enabled administrators and the
+      // target locked first, the rails judged (the last enabled administrator
+      // is never deleted, by anyone), then the delete. The event stays the
+      // best-effort row emitted below after commit for a person's session; an
+      // admin-plane key cannot reach this procedure (it is human-only), and
+      // would be refused by the rails if it ever did.
+      const deleted = await withAdminAuditTx(
+        actor,
+        async (tx) => {
+          const { target: locked, enabledAdminIds } = await lockAccountTarget(
+            tx,
+            input.user_id,
+          );
+          if (!locked) return false;
+          await assertAccountChangeAllowed(
+            tx,
+            actor,
+            locked,
+            enabledAdminIds,
+            "delete",
+          );
+          return usersRepository.deleteById(input.user_id, tx);
+        },
+        () => null,
+      );
 
       if (!deleted) {
         return { success: false, message: "User not found" };
@@ -360,6 +443,8 @@ export const usersImplementations = {
 
       return { success: true, message: "User deleted successfully" };
     } catch (error) {
+      // A rail's coded refusal reaches the caller as itself.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error deleting user:", describeDbError(error));
       // A fixed string, not `error.message`. A failed delete here is a driver
       // or constraint error, and the raw message carries table names and

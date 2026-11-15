@@ -3,7 +3,7 @@
  * the implementation, with the repository doubled and the transaction runner
  * real (lib/audit/admin-write.ts over a stand-in transaction).
  *
- * Rails (migration 0043 change, plan decision 2): an admin-plane key may not
+ * Self-lockout rails: an admin-plane key may not
  * leave itself an enforce policy its own request address is not inside, and may
  * not set a global enforce policy that excludes that address while it follows
  * the global policy. Both are judged with the request's trusted address and the
@@ -17,35 +17,43 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { repoMock, configServiceMock, loggerMock, txAudit, txState, emitMock } =
-  vi.hoisted(() => ({
-    repoMock: {
-      setIpPolicy: vi.fn(),
-      deactivate: vi.fn(),
-      lockPolicyTarget: vi.fn(),
-    },
-    configServiceMock: {
-      getApiKeyIpPolicy: vi.fn(),
-      setApiKeyIpPolicy: vi.fn(),
-      getApiKeyIpPolicyInTransaction: vi.fn(),
-    },
-    loggerMock: {
-      debug: vi.fn(),
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    },
-    txAudit: {
-      record: vi.fn(async (_tx: unknown, _event: unknown) => undefined),
-    },
-    // What the stand-in transaction's `select ... for share` returns: the
-    // calling key's row, for the global rail.
-    txState: {
-      callerRow: [] as Array<{ allowed_cidrs: string[] | null }>,
-      transactions: 0,
-    },
-    emitMock: vi.fn(),
-  }));
+const {
+  repoMock,
+  configServiceMock,
+  loggerMock,
+  txAudit,
+  txState,
+  emitMock,
+  denialMock,
+} = vi.hoisted(() => ({
+  repoMock: {
+    setIpPolicy: vi.fn(),
+    deactivate: vi.fn(),
+    lockPolicyTarget: vi.fn(),
+  },
+  configServiceMock: {
+    getApiKeyIpPolicy: vi.fn(),
+    setApiKeyIpPolicy: vi.fn(),
+    getApiKeyIpPolicyInTransaction: vi.fn(),
+  },
+  loggerMock: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+  txAudit: {
+    record: vi.fn(async (_tx: unknown, _event: unknown) => undefined),
+  },
+  // What the stand-in transaction's `select ... for share` returns: the
+  // calling key's row, for the global rail.
+  txState: {
+    callerRow: [] as Array<{ allowed_cidrs: string[] | null }>,
+    transactions: 0,
+  },
+  emitMock: vi.fn(),
+  denialMock: vi.fn(async (_event: unknown) => undefined),
+}));
 
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 vi.mock("../db/repositories", () => ({
@@ -78,6 +86,19 @@ vi.mock("../db/index", () => ({
 }));
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: txAudit.record,
+}));
+// TEST-EDIT: rule refusals now await a denied row after the rollback.
+vi.mock("../db/repositories/audit-log.repo", () => ({
+  auditLogRepository: { record: denialMock },
+}));
+// TEST-EDIT (change budget): an admin-plane
+// change now opens the key's change budget inside its transaction (a lock and
+// a count statement), which this suite's stand-in transaction cannot run. The
+// budget is pinned in admin-plane-budget.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts; here it is opened as "no budget".
+vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
 }));
 
 const { apiKeysImplementations } = await import("./api-keys.impl");
@@ -358,9 +379,14 @@ describe("setIpPolicy outside the rail", () => {
     await setPolicy(OTHER_UUID, ["198.51.100.0/24"], "enforce", actor());
 
     expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
+    // TEST-EDIT (IP rail): the global
+    // policy is now read under its shared config locks for EVERY admin-plane
+    // policy change, before the target's row lock, so the lock order holds
+    // whatever the target turns out to be (db/repositories/admin-plane-locks).
+    // Reading it is not judging this write: it went through.
     expect(
       configServiceMock.getApiKeyIpPolicyInTransaction,
-    ).not.toHaveBeenCalled();
+    ).toHaveBeenCalledTimes(1);
   });
 
   it("leaves a human administrator's session unchanged: no rail, no transaction, best-effort event", async () => {
@@ -421,8 +447,9 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
       });
       expect(repoMock.setIpPolicy).not.toHaveBeenCalled();
       expect(txAudit.record).not.toHaveBeenCalled();
-      expect(emitMock).toHaveBeenCalledTimes(1);
-      expect(emitMock.mock.calls[0][1]).toEqual({
+      expect(emitMock).not.toHaveBeenCalled();
+      expect(denialMock).toHaveBeenCalledTimes(1);
+      expect(denialMock.mock.calls[0][0]).toMatchObject({
         action: "apikey.ip_policy.set",
         target_type: "api_key",
         target_id: OTHER_UUID,
@@ -466,8 +493,8 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
       actor(),
     ).catch(() => undefined);
 
-    expect(emitMock).toHaveBeenCalledTimes(1);
-    expect(emitMock.mock.calls[0][1]).toMatchObject({ target_id: stored });
+    expect(denialMock).toHaveBeenCalledTimes(1);
+    expect(denialMock.mock.calls[0][0]).toMatchObject({ target_id: stored });
   });
 
   it("looks the target up inside the write's transaction, by uuid", async () => {
@@ -479,29 +506,50 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
     expect(uuid).toBe(OTHER_UUID);
   });
 
+  // TEST-EDIT (IP rail, a deliberate
+  // reversal): these cases pinned that an admin-plane key could leave an
+  // admin-plane key's policy anything at all. It may now only NARROW one:
+  // the any-IP exemption, mode off and following the global policy are
+  // refused before the write. A wide list that narrows the current policy (an
+  // off global policy admits everything) is still not held to the data-plane
+  // width bound.
   it.each([
     ["the any-IP exemption", ["0.0.0.0/0", "::/0"], "enforce"],
     ["mode off", ["203.0.113.0/24"], "off"],
-    ["a wide list", ["10.0.0.0/8"], "enforce"],
   ] as const)(
-    "leaves an admin-plane key's policy to the CLI's own judgement: %s is accepted",
+    "refuses to loosen an admin-plane key's policy: %s",
     async (_label, cidrs, mode) => {
-      // The CI key is locked to any address on purpose (its runners rotate), and
-      // the operator sets that; only data-plane keys are held to the bound.
       repoMock.lockPolicyTarget.mockResolvedValue({ admin_plane: true });
 
-      await setPolicy(OTHER_UUID, [...cidrs], mode, actor());
+      const failure = await setPolicy(
+        OTHER_UUID,
+        [...cidrs],
+        mode,
+        actor(),
+      ).catch((e) => e);
 
-      expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
+      expect(failure).toMatchObject({ code: "FORBIDDEN" });
+      expect(repoMock.setIpPolicy).not.toHaveBeenCalled();
     },
   );
 
-  it("lets a key follow the global policy when the target is an admin-plane key", async () => {
+  it("accepts a wide list that narrows an admin-plane key's policy: the data-plane bound does not apply", async () => {
     repoMock.lockPolicyTarget.mockResolvedValue({ admin_plane: true });
 
-    await setPolicy(OTHER_UUID, null, "off", actor());
+    await setPolicy(OTHER_UUID, ["10.0.0.0/8"], "enforce", actor());
 
     expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses to make an admin-plane key follow the global policy", async () => {
+    repoMock.lockPolicyTarget.mockResolvedValue({ admin_plane: true });
+
+    const failure = await setPolicy(OTHER_UUID, null, "off", actor()).catch(
+      (e) => e,
+    );
+
+    expect(failure).toMatchObject({ code: "FORBIDDEN" });
+    expect(repoMock.setIpPolicy).not.toHaveBeenCalled();
   });
 
   it("falls through to the repository's not-found for a key that does not exist", async () => {
@@ -513,10 +561,28 @@ describe("setIpPolicy by an admin-plane key on a data-plane key keeps it locked 
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
-  it("does not look up the calling key's own row, which would run ahead of the config locks", async () => {
+  // TEST-EDIT (IP rail, a deliberate
+  // reversal): the calling key's own row is now locked and read, because the
+  // rail judges its own change against its current policy. It is locked AFTER
+  // the config locks (the global policy is read first), which is the order
+  // setGlobalIpPolicy uses, so the reason this case existed still holds.
+  it("looks up the calling key's own row only after the config locks", async () => {
+    const order: string[] = [];
+    configServiceMock.getApiKeyIpPolicyInTransaction.mockImplementation(
+      async () => {
+        order.push("config");
+        return { mode: "off", cidrs: [], problems: [] };
+      },
+    );
+    repoMock.lockPolicyTarget.mockImplementation(async () => {
+      order.push("key row");
+      return { admin_plane: true, allowed_cidrs: null, ip_policy_mode: "off" };
+    });
+
     await setPolicy(CALLER_UUID, ["203.0.113.0/24"], "enforce", actor());
 
-    expect(repoMock.lockPolicyTarget).not.toHaveBeenCalled();
+    expect(order).toEqual(["config", "key row"]);
+    expect(repoMock.setIpPolicy).toHaveBeenCalledTimes(1);
   });
 
   it("leaves a human administrator's session unbounded and unqueried", async () => {

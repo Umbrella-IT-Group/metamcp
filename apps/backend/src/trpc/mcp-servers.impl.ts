@@ -10,6 +10,8 @@ import {
   McpServerTypeEnum,
   ReconnectMcpServerRequestSchema,
   ReconnectMcpServerResponseSchema,
+  ResetMcpServerErrorsRequestSchema,
+  ResetMcpServerErrorsResponseSchema,
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
@@ -26,12 +28,21 @@ import {
 import { ServerCredentialRetentionError } from "../db/repositories/mcp-server-update-plan";
 import { McpServersSerializer } from "../db/serializers";
 import { emitAdminEvent } from "../lib/audit/admin-event";
-import { withAdminAudit } from "../lib/audit/admin-write";
+import {
+  ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+  AdminAuditWriteError,
+  withAdminAudit,
+} from "../lib/audit/admin-write";
 import { clampAuditTextList } from "../lib/audit/audit-emitter";
+import {
+  describeUpdate,
+  MCP_SERVER_UPDATE_FIELDS,
+} from "../lib/audit/before-state";
 import { closeInspectorSessionsForServer } from "../lib/metamcp/inspector-sessions";
 import { mcpServerPool } from "../lib/metamcp/mcp-server-pool";
 import { clearOverrideCache } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
+import { resetServerErrors } from "../lib/metamcp/reset-server-errors";
 import { serverErrorTracker } from "../lib/metamcp/server-error-tracker";
 import {
   isStdioServerType,
@@ -233,6 +244,9 @@ export const mcpServersImplementations = {
         message: "MCP server created successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error creating MCP server:", describeDbError(error));
       return {
         success: false as const,
@@ -639,6 +653,16 @@ export const mcpServersImplementations = {
                   detail: {
                     name: written.server.name,
                     type: written.server.type,
+                    // Which fields this write changed and the previous and
+                    // new value of each that cannot hold a credential. The
+                    // connection fields (command, args, url, env, bearer
+                    // token, headers) are named when changed and never
+                    // recorded by value.
+                    ...describeUpdate(
+                      written.previous,
+                      written.server,
+                      MCP_SERVER_UPDATE_FIELDS,
+                    ),
                   },
                 }
               : null,
@@ -778,6 +802,9 @@ export const mcpServersImplementations = {
         message: "MCP server updated successfully",
       };
     } catch (error) {
+      // A coded refusal (the change budget, a rule) reaches the caller as
+      // itself, never as `success: false` inside an HTTP 200.
+      if (error instanceof TRPCError) throw error;
       logger.error("Error updating MCP server:", describeDbError(error));
       return {
         success: false as const,
@@ -916,6 +943,37 @@ export const mcpServersImplementations = {
         success: false as const,
         message: "Failed to reconnect MCP server",
       };
+    }
+  },
+
+  /**
+   * `mcpServers.resetErrors`: the implementation the cookie-only REST reset
+   * route shares (lib/metamcp/reset-server-errors). Coded errors reach the
+   * caller as themselves (NOT_FOUND, the change budget, a rule); an audit
+   * write failure is the fixed sentence every audited change answers with;
+   * anything else propagates and is masked by the error formatter. Never
+   * `success: false` inside a 200.
+   */
+  resetErrors: async (
+    input: z.infer<typeof ResetMcpServerErrorsRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof ResetMcpServerErrorsResponseSchema>> => {
+    try {
+      return await resetServerErrors(input, actor);
+    } catch (error) {
+      if (error instanceof AdminAuditWriteError) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+        });
+      }
+      if (!(error instanceof TRPCError)) {
+        logger.error(
+          "Error resetting MCP server error state:",
+          describeDbError(error),
+        );
+      }
+      throw error;
     }
   },
 };

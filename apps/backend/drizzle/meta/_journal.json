@@ -323,6 +323,13 @@
       "when": 1788393600000,
       "tag": "0046_oauth_client_metadata_documents",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1788480000000,
+      "tag": "0047_endpoint_restriction_provenance",
+      "breakpoints": true
     }
   ]
 }

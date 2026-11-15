@@ -429,7 +429,41 @@ export class NamespacesRepository {
     input: NamespaceUpdateInput,
     executor?: DbExecutor,
   ): Promise<DatabaseNamespace> {
+    return (await this.updateReportingPrevious(input, executor)).namespace;
+  }
+
+  /**
+   * Update a namespace and report what it was: the row and the uuids of its
+   * servers, read FOR UPDATE in the same transaction (a savepoint of the
+   * caller's when it holds one), so an audit row can carry the before-state of
+   * exactly the write it describes.
+   */
+  async updateReportingPrevious(
+    input: NamespaceUpdateInput,
+    executor?: DbExecutor,
+  ): Promise<{
+    namespace: DatabaseNamespace;
+    previous: DatabaseNamespace;
+    previousServerUuids: string[];
+  }> {
     return await (executor ?? db).transaction(async (tx) => {
+      const [previous] = await tx
+        .select()
+        .from(namespacesTable)
+        .where(eq(namespacesTable.uuid, input.uuid))
+        .for("update");
+      if (!previous) {
+        throw new Error("Namespace not found");
+      }
+      const previousServerUuids = (
+        await tx
+          .select({ uuid: namespaceServerMappingsTable.mcp_server_uuid })
+          .from(namespaceServerMappingsTable)
+          .where(eq(namespaceServerMappingsTable.namespace_uuid, input.uuid))
+      )
+        .map((row) => row.uuid)
+        .sort();
+
       // Update the namespace
       const [updatedNamespace] = await tx
         .update(namespacesTable)
@@ -540,7 +574,7 @@ export class NamespacesRepository {
         }
       }
 
-      return updatedNamespace;
+      return { namespace: updatedNamespace, previous, previousServerUuids };
     });
   }
 }

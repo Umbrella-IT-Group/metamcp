@@ -4,7 +4,7 @@ import {
   EndpointCreateInput,
   EndpointUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNotNull, isNull, ne, or } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import { endpointsTable, namespacesTable } from "../schema";
@@ -28,6 +28,11 @@ export class EndpointsRepository {
         // Persisted here so an endpoint can be created already-restricted.
         // Independent of require_scoped_api_key.
         restricted: input.restricted ?? false,
+        // When the restriction began (migration 0047). Created restricted is
+        // not a transition an admin-plane key made, so the key half of the
+        // marker stays NULL: such a restriction is never one a key may roll
+        // back.
+        restricted_at: input.restricted ? sql`clock_timestamp()` : null,
         enable_max_rate: input.enable_max_rate ?? false,
         enable_client_max_rate: input.enable_client_max_rate ?? false,
         max_rate: input.max_rate,
@@ -47,36 +52,6 @@ export class EndpointsRepository {
     }
 
     return createdEndpoint;
-  }
-
-  /**
-   * Does a restricted or private endpoint (one that gates who may reach the
-   * namespace's tools) serve this namespace, other than `exceptUuid`? Used to
-   * stop an admin-plane key from publishing such a namespace through a public,
-   * unrestricted endpoint, which is the kind it may create API keys for
-   * without a membership check.
-   */
-  async hasGatedEndpointOnNamespace(
-    namespaceUuid: string,
-    exceptUuid?: string,
-  ): Promise<boolean> {
-    const [gated] = await db
-      .select({ uuid: endpointsTable.uuid })
-      .from(endpointsTable)
-      .where(
-        and(
-          eq(endpointsTable.namespace_uuid, namespaceUuid),
-          or(
-            eq(endpointsTable.restricted, true),
-            isNotNull(endpointsTable.user_id),
-          ),
-          exceptUuid !== undefined
-            ? ne(endpointsTable.uuid, exceptUuid)
-            : undefined,
-        ),
-      )
-      .limit(1);
-    return gated !== undefined;
   }
 
   async findAll(): Promise<DatabaseEndpoint[]> {

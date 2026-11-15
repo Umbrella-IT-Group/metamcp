@@ -63,6 +63,15 @@ vi.mock("../db/repositories/audit-log-tx", () => ({
     txAudit.sink?.(event);
   }),
 }));
+// TEST-EDIT (change budget): an admin-plane
+// change now opens the key's change budget inside its transaction (a lock and
+// a count statement), which this suite's stand-in transaction cannot run. The
+// budget is pinned in admin-plane-budget.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts; here it is opened as "no budget".
+vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
+}));
 
 // ---------------------------------------------------------------------------
 // Repository / service doubles — the layer under the impls
@@ -91,6 +100,26 @@ const configServiceMock = {
   setMcpMaxAttempts: vi.fn(),
 };
 
+// TEST-EDIT (account rails): an account
+// change now runs in one transaction that locks the enabled administrators
+// and the target first and judges the rails on them. The stand-ins below
+// answer as the rows would for an enabled member target with two enabled
+// administrators; the rails themselves are pinned in account-rails.test.ts and
+// against Postgres in admin-plane-rails.integration.test.ts.
+vi.mock("../db/repositories/admin-plane-locks", () => ({
+  lockAdminPlaneBudget: vi.fn(async () => undefined),
+  lockEndpointNamespaces: vi.fn(async () => undefined),
+  lockAccountTarget: vi.fn(async (_tx: unknown, id: string) => ({
+    target: { id, role: "member", disabled: false },
+    enabledAdminIds: ["admin-1", "admin-2"],
+  })),
+  lockAccountForRevoke: vi.fn(async (_tx: unknown, id: string) => ({
+    id,
+    role: "member",
+    disabled: false,
+  })),
+  ownsActiveAdminPlaneKey: vi.fn(async () => false),
+}));
 vi.mock("../lib/config.service", () => ({
   configService: configServiceMock,
 }));
@@ -1015,8 +1044,18 @@ describe("mcpserver.create / .update — vendor credentials must never land", ()
     mcpServersRepositoryMock.findByUuid.mockResolvedValue(serverRow);
     // The impl writes through updateReportingChange (it reports whether the
     // update replaced a credential, which this one does).
+    // TEST-EDIT (SPEC): the repository now also reports the row as locked
+    // before the write, whose credentials differ from the rotated ones, so the
+    // case proves the audit row carries neither the old nor the new value.
+    const previousServerRow = {
+      ...serverRow,
+      env: { VENDOR_API_KEY: "previous-env-secret-do-not-log" },
+      bearerToken: "previous-vendor-bearer-do-not-log",
+      headers: { "X-Api-Key": "previous-header-secret-do-not-log" },
+    };
     mcpServersRepositoryMock.updateReportingChange.mockResolvedValue({
       server: serverRow,
+      previous: previousServerRow,
       destinationOrCredentialChanged: true,
       ownershipChanged: false,
     });
@@ -1051,6 +1090,17 @@ describe("mcpserver.create / .update — vendor credentials must never land", ()
     });
     assertNoVendorSecret();
     expect(serialized()).not.toContain("rotated-vendor-bearer-do-not-log");
+    for (const previous of [
+      "previous-env-secret-do-not-log",
+      "previous-vendor-bearer-do-not-log",
+      "previous-header-secret-do-not-log",
+    ]) {
+      expect(serialized()).not.toContain(previous);
+    }
+    // The fields that changed are named, never valued.
+    expect(rows[0].detail).toMatchObject({
+      changed_fields: ["bearer_token", "env", "headers"],
+    });
   });
 
   it("bulk_import writes NOTHING when every entry was rejected", async () => {

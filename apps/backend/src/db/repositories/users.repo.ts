@@ -390,8 +390,11 @@ export class UsersRepository {
     id: string,
     disabled: boolean,
     actorUserId: string,
+    // The caller's transaction when it holds one (the account rails lock and
+    // judge the rows in it before this write). Omitted, the pool is used.
+    executor: OAuthDbExecutor = db,
   ): Promise<{ id: string; disabled: boolean } | undefined> {
-    const [updated] = await db
+    const [updated] = await executor
       .update(usersTable)
       .set({
         disabled,
@@ -545,8 +548,11 @@ export class UsersRepository {
    * Returns false when no row matched so the caller can report "not found"
    * rather than a successful delete that deleted nothing.
    */
-  async deleteById(id: string): Promise<boolean> {
-    const deleted = await db
+  async deleteById(
+    id: string,
+    executor: OAuthDbExecutor = db,
+  ): Promise<boolean> {
+    const deleted = await executor
       .delete(usersTable)
       .where(eq(usersTable.id, id))
       .returning({ id: usersTable.id });
@@ -587,14 +593,20 @@ export class UsersRepository {
    * The UI copy states the distinction outright so nobody mistakes one for
    * another.
    */
-  async revokeAccess(id: string): Promise<{
+  async revokeAccess(
+    id: string,
+    // The caller's transaction when it holds one (the account rails judge the
+    // target in it); the work below is then a savepoint of it and commits or
+    // rolls back with the caller's audit row.
+    executor: OAuthDbExecutor = db,
+  ): Promise<{
     sessions_deleted: number;
     oauth_tokens_deleted: number;
     authorization_codes_deleted: number;
     api_keys_deactivated: number;
     m365_tokens_revoked: number;
   }> {
-    return await db.transaction(async (tx) => {
+    return await executor.transaction(async (tx) => {
       // The user's OAuth credential lock (./oauth-user-lock), taken before any
       // delete. Every refresh, code redemption and consent approval for this
       // user takes the same lock and re-reads under it, so one that was in

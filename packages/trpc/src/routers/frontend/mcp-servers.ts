@@ -8,6 +8,8 @@ import {
   ListMcpServersResponseSchema,
   ReconnectMcpServerRequestSchema,
   ReconnectMcpServerResponseSchema,
+  ResetMcpServerErrorsRequestSchema,
+  ResetMcpServerErrorsResponseSchema,
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
@@ -80,6 +82,10 @@ export const createMcpServersRouter = (
       userId: string,
       isAdmin: boolean,
     ) => Promise<z.infer<typeof ReconnectMcpServerResponseSchema>>;
+    resetErrors: (
+      input: z.infer<typeof ResetMcpServerErrorsRequestSchema>,
+      actor: AuditActor,
+    ) => Promise<z.infer<typeof ResetMcpServerErrorsResponseSchema>>;
   },
 ) => {
   return router({
@@ -169,6 +175,21 @@ export const createMcpServersRouter = (
           ctx.user.id,
           auditActor(ctx),
         );
+      }),
+
+    // Admin only, and on the operator scope's set: clear the ERROR status of
+    // one server (`serverUuid`) or of every server in ERROR. The tRPC twin of
+    // the cookie-only REST route `POST /metamcp/:endpoint_name/admin/reset-errors`,
+    // sharing its implementation (lib/metamcp/reset-server-errors): the status
+    // change and its audit row commit together, an unknown server is
+    // NOT_FOUND, and connection recovery starts only after the commit and is
+    // reported apart from it. The REST route stays session-only, so an
+    // admin-plane key reaches this action here and nowhere else.
+    resetErrors: adminProcedure
+      .input(ResetMcpServerErrorsRequestSchema)
+      .output(ResetMcpServerErrorsResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.resetErrors(input, auditActor(ctx));
       }),
 
     // Protected (deliberate): Reconnect MCP server (drop pooled upstream

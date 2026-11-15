@@ -1,0 +1,41 @@
+-- endpoints.restricted_at and endpoints.restricted_by_api_key_uuid: the
+-- provenance of an endpoint's CURRENT restriction.
+--
+-- An admin-plane API key may not open a restricted endpoint, with one
+-- exception: it may roll back a restriction it made itself, within 24 hours,
+-- while that restriction is still the current one and no other endpoint over
+-- the same namespace is restricted (lib/endpoint-namespace-gate). Answering
+-- "did this key make the current restriction, and when" needs a marker bound
+-- to the transition itself. A historical audit row cannot be that marker: a
+-- human administrator's audit row is best-effort, and an audit row says what
+-- happened then, not whether a later change has since replaced it.
+--
+-- Written only by the endpoint gate, under the endpoint's namespace lock:
+--   - an actual false-to-true transition sets restricted_at to the time of the
+--     change and restricted_by_api_key_uuid to the acting admin-plane key's
+--     uuid, or NULL when a human administrator made it;
+--   - setting true on an endpoint that is already restricted never creates
+--     eligibility: by the key the marker names it changes nothing, by anyone
+--     else it clears restricted_by_api_key_uuid;
+--   - un-restricting clears both columns; moving the endpoint to another
+--     namespace clears restricted_by_api_key_uuid.
+--
+-- Both columns are NULL on every existing row, so every restriction made
+-- before this migration reads as a human's decision: no admin-plane key can
+-- roll one back. That is the fail-closed reading. No foreign key on the key
+-- uuid: a marker naming a key that no longer exists can never match the key
+-- that is acting, so it already fails closed, and a key delete need not touch
+-- endpoint rows.
+--
+-- Rollback. Additive and harmless to leave applied; an image from before it
+-- neither reads nor writes these columns.
+
+ALTER TABLE "endpoints" ADD COLUMN "restricted_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "endpoints" ADD COLUMN "restricted_by_api_key_uuid" uuid;--> statement-breakpoint
+
+-- The change budget counts committed audit rows in a sliding window. A
+-- transaction may wait on its budget or target lock for longer than that
+-- window, so stamping a new charge with now() (the transaction's start) can
+-- expire it before it commits. Stamp the insert's wall-clock time instead.
+-- Existing rows and the append-only guards stay intact.
+ALTER TABLE "audit_log" ALTER COLUMN "occurred_at" SET DEFAULT clock_timestamp();

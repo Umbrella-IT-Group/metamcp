@@ -231,9 +231,25 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
 
   beforeAll(async () => {
     fx = await createFixture(TEST_DATABASE_URL as string, "kog");
-    epKeys = await fx.endpoint({ name: "ep-keys" });
-    epKeysOauth = await fx.endpoint({ name: "ep-keys-oauth", oauth: true });
-    epUnmapped = await fx.endpoint({ name: "ep-unmapped" });
+    // TEST-EDIT (endpoint namespace gate):
+    // each endpoint gets a namespace of its own. The gate refuses opening an
+    // endpoint while another endpoint over the same namespace stays
+    // restricted, and these cases restrict and open their endpoints
+    // independently; over one shared namespace the gate would refuse what
+    // they test.
+    epKeys = await fx.endpoint({
+      name: "ep-keys",
+      namespaceUuid: await fx.namespace("ns-keys"),
+    });
+    epKeysOauth = await fx.endpoint({
+      name: "ep-keys-oauth",
+      oauth: true,
+      namespaceUuid: await fx.namespace("ns-keys-oauth"),
+    });
+    epUnmapped = await fx.endpoint({
+      name: "ep-unmapped",
+      namespaceUuid: await fx.namespace("ns-unmapped"),
+    });
     await installDmlFaults();
   }, 90_000);
 
@@ -629,9 +645,12 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
             authorization: `Bearer ${fx.operator.key}`,
             "cf-connecting-ip": "198.51.100.77",
           },
+          // TEST-EDIT (change reason): an
+          // operator-scope key's change carries a reason, each call of a batch
+          // its own.
           body: JSON.stringify({
-            "0": { endpoint_uuid: epKeys, restricted: true },
-            "1": { user_id: fx.memberId, disabled: true },
+            "0": { endpoint_uuid: epKeys, restricted: true, reason: "itest" },
+            "1": { user_id: fx.memberId, disabled: true, reason: "itest" },
           }),
         },
       );
@@ -693,6 +712,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
       });
       const spare = await fx.group({ name: name("spare") });
       const spareName = (await groupRow(spare)).name as string;
+      const leaf = await fx.group({ name: name("leaf") });
 
       const cases: Array<{
         action: string;
@@ -788,15 +808,14 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
           },
         },
         {
-          // The cascade into the memberships and mappings runs inside the
-          // delete, so a failed audit row must bring all three back.
+          // TEST-EDIT (leaf-only group delete): an admin-plane key may delete only a group with no
+          // member and no mapping, so the audit-failure case deletes an empty
+          // group; a failed audit row must bring it back.
           action: "group.delete",
-          targetId: target,
-          call: () => operator("accessGroups.delete", { uuid: target }),
+          targetId: leaf,
+          call: () => operator("accessGroups.delete", { uuid: leaf }),
           unchanged: async () => {
-            expect(await groupRow(target)).toBeDefined();
-            expect(await memberCount(target)).toBe(1);
-            expect(await mappingCount(target)).toBe(1);
+            expect(await groupRow(leaf)).toBeDefined();
           },
         },
         {
@@ -851,7 +870,14 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
       expect(result(ok).success).toBe(true);
       expect(__endpointAccessCacheSizeForTesting()).toBe(0);
       expect(await auditCount("group.member.remove", target)).toBe(1);
-      await operator("accessGroups.delete", { uuid: target });
+      // Leaf-only: the mapping goes first, then the empty group.
+      await operator("accessGroups.removeEndpoint", {
+        group_uuid: target,
+        endpoint_uuid: epKeys,
+      });
+      expect(
+        result(await operator("accessGroups.delete", { uuid: target })).success,
+      ).toBe(true);
     });
 
     it("writes no audit row and drops no cache entry when the change itself fails, for each write, a group delete's cascade included", async () => {
@@ -862,6 +888,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
         endpoints: [epKeys],
       });
       const spare = await fx.group({ name: name("spare") });
+      const leaf = await fx.group({ name: name("leaf") });
 
       const cases: Array<{
         table: string;
@@ -942,19 +969,15 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
             }),
         },
         {
-          // The cascade fails inside the delete: the group goes with nothing.
-          table: "access_group_endpoints",
+          // TEST-EDIT (leaf-only group delete): an admin-plane key's group delete has no cascade
+          // any more (it is refused while the group has a member or a
+          // mapping), so the failing statement is the delete of an empty
+          // group itself.
+          table: "access_groups",
           op: "DELETE",
           action: "group.delete",
-          targetId: target,
-          call: () => operator("accessGroups.delete", { uuid: target }),
-        },
-        {
-          table: "access_group_members",
-          op: "DELETE",
-          action: "group.delete",
-          targetId: target,
-          call: () => operator("accessGroups.delete", { uuid: target }),
+          targetId: leaf,
+          call: () => operator("accessGroups.delete", { uuid: leaf }),
         },
         {
           table: "namespaces",
@@ -998,13 +1021,26 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
       }
       await clearDml();
 
-      // The failed deletes left the group, its member and its mapping intact.
+      // The failed writes left the groups, the member and the mapping intact.
       expect(await groupRow(target)).toBeDefined();
+      expect(await groupRow(leaf)).toBeDefined();
       expect(await memberCount(target)).toBe(1);
       expect(await mappingCount(target)).toBe(1);
       expect((await endpointFlags(epKeys)).restricted).toBe(false);
       expect(await policyOf(fx.publicNamespaceUuid)).toBe("allow_all");
-      await operator("accessGroups.delete", { uuid: target });
+      // Leaf-only: the grants go first, then the empty group, so no later
+      // case inherits this group's grant on epKeys.
+      await operator("accessGroups.removeMember", {
+        group_uuid: target,
+        user_id: fx.memberId,
+      });
+      await operator("accessGroups.removeEndpoint", {
+        group_uuid: target,
+        endpoint_uuid: epKeys,
+      });
+      expect(
+        result(await operator("accessGroups.delete", { uuid: target })).success,
+      ).toBe(true);
     });
 
     it("runs the same transaction through a direct implementation call, and keeps the best-effort path for an actor with no admin-plane origin", async () => {
@@ -1208,8 +1244,7 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
         });
         expect(await serves(memberGateway)).toBe(true);
 
-        // Unmapping the endpoint locks the member out again; deleting the group
-        // does the same through the cascade.
+        // Unmapping the endpoint locks the member out again.
         await operator("accessGroups.removeEndpoint", {
           group_uuid: group,
           endpoint_uuid: endpointUuid,
@@ -1220,7 +1255,26 @@ describeIfDb("operator access-group writes and the key owner rule", () => {
           endpoint_uuid: endpointUuid,
         });
         expect(await serves(memberGateway)).toBe(true);
-        await operator("accessGroups.delete", { uuid: group });
+        // TEST-EDIT (leaf-only group delete): the operator key's delete of a group that still carries a
+        // member and a mapping is refused and changes nothing; the grants go
+        // first, each as its own change, and then the empty group.
+        const refusedDelete = await operator("accessGroups.delete", {
+          uuid: group,
+        });
+        expect(refusedDelete.code).toBe("CONFLICT");
+        expect(await serves(memberGateway)).toBe(true);
+        await operator("accessGroups.removeMember", {
+          group_uuid: group,
+          user_id: fx.memberId,
+        });
+        await operator("accessGroups.removeEndpoint", {
+          group_uuid: group,
+          endpoint_uuid: endpointUuid,
+        });
+        expect(
+          result(await operator("accessGroups.delete", { uuid: group }))
+            .success,
+        ).toBe(true);
         expect(await status(memberGateway)).toBe(403);
 
         // Switched off, the endpoint is open to every key again.

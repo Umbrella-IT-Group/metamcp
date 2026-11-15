@@ -2,6 +2,7 @@ import {
   type AdminPlaneAuthOrigin,
   assertAdminPlaneProcedureAllowed,
   type BaseContext,
+  changeContextForCall,
 } from "@repo/trpc";
 import { initTRPC, TRPCError } from "@trpc/server";
 import type { Request, Response } from "express";
@@ -291,12 +292,16 @@ export const router = t.router;
 
 // The same admin-plane scope check the @repo/trpc builders apply, so a
 // procedure built from this instance cannot give an admin-plane key more than
-// its scope's surface either. No router is built from these today;
-// the check is here so that stays true if one ever is.
-const scopedProcedure = t.procedure.use(({ ctx, next, path, type }) => {
-  assertAdminPlaneProcedureAllowed(ctx, path, type);
-  return next();
-});
+// its scope's surface either, and the same change-context rule (an
+// operator-scope key's mutation carries a reason). No router is built from
+// these today; the checks are here so that stays true if one ever is.
+const scopedProcedure = t.procedure.use(
+  async ({ ctx, next, path, type, getRawInput }) => {
+    assertAdminPlaneProcedureAllowed(ctx, path, type);
+    const change = await changeContextForCall(ctx, type, getRawInput);
+    return change ? next({ ctx: { ...ctx, change } }) : next();
+  },
+);
 
 export const publicProcedure = scopedProcedure;
 

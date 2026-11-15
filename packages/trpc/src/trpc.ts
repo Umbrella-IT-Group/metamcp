@@ -63,6 +63,18 @@ export function adminPlaneScopeOf(
   return origin?.scope === "operator" ? "operator" : "sync";
 }
 
+/**
+ * The caller's own account of one change: why it is made and which run of the
+ * caller's tooling made it. Read from the `reason` and `run_id` fields of a
+ * mutation's input by the procedure base below (`changeContextOf`), validated
+ * there, and carried into the change's audit row by `auditActor`. Never an
+ * identity: who acted is decided from the verified credential alone.
+ */
+export interface ChangeContext {
+  reason: string | null;
+  run_id: string | null;
+}
+
 // Create context interface that can be extended by backend
 export interface BaseContext {
   // Auth data that can be added by backend implementations
@@ -71,6 +83,88 @@ export interface BaseContext {
   session?: any;
   audit?: AuditRequestContext;
   authOrigin?: AdminPlaneAuthOrigin;
+  /** Set per mutation call by the procedure base; see ChangeContext. */
+  change?: ChangeContext;
+}
+
+/** Longest `reason` a change may carry, in characters. */
+export const CHANGE_REASON_MAX_LENGTH = 500;
+/** Longest `run_id` a change may carry, in characters. */
+export const CHANGE_RUN_ID_MAX_LENGTH = 100;
+
+/** The fixed refusals of the change-context checks. */
+export const CHANGE_CONTEXT_REFUSALS = {
+  reasonRequired:
+    "An operator-scope admin-plane API key must send a reason with every change: add a reason field of 1 to 500 printable characters.",
+  reasonInvalid:
+    "reason must be a string of 1 to 500 printable characters, with no control or direction-override characters.",
+  runIdInvalid:
+    "run_id must be 1 to 100 characters: letters, numbers, dots, colons, underscores and hyphens.",
+} as const;
+
+// C0 and C1 controls, and the Unicode format characters that reorder or hide
+// text (bidirectional overrides and isolates, zero-width marks). A reason is
+// read by a person reviewing the audit trail, so it must print as it reads.
+// The control characters are matched on purpose (they are what is refused),
+// so the lint rule against control characters in a pattern does not apply.
+const NON_PRINTABLE = new RegExp(
+  // eslint-disable-next-line no-control-regex
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+);
+const RUN_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
+
+/**
+ * Read and validate `reason` and `run_id` from a mutation's raw input. Absent
+ * fields read as null; a present field that is malformed is refused with a
+ * fixed sentence (nothing of the value is echoed). Non-object inputs carry
+ * neither. Pure, and exported so the backend and the tests share it.
+ */
+export function changeContextOf(rawInput: unknown): ChangeContext {
+  if (
+    typeof rawInput !== "object" ||
+    rawInput === null ||
+    Array.isArray(rawInput)
+  ) {
+    return { reason: null, run_id: null };
+  }
+  const { reason, run_id: runId } = rawInput as Record<string, unknown>;
+  let parsedReason: string | null = null;
+  if (reason !== undefined && reason !== null) {
+    if (typeof reason !== "string") {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: CHANGE_CONTEXT_REFUSALS.reasonInvalid,
+      });
+    }
+    const trimmed = reason.trim();
+    if (
+      trimmed.length < 1 ||
+      trimmed.length > CHANGE_REASON_MAX_LENGTH ||
+      NON_PRINTABLE.test(trimmed)
+    ) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: CHANGE_CONTEXT_REFUSALS.reasonInvalid,
+      });
+    }
+    parsedReason = trimmed;
+  }
+  let parsedRunId: string | null = null;
+  if (runId !== undefined && runId !== null) {
+    if (
+      typeof runId !== "string" ||
+      runId.length < 1 ||
+      runId.length > CHANGE_RUN_ID_MAX_LENGTH ||
+      !RUN_ID_PATTERN.test(runId)
+    ) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: CHANGE_CONTEXT_REFUSALS.runIdInvalid,
+      });
+    }
+    parsedRunId = runId;
+  }
+  return { reason: parsedReason, run_id: parsedRunId };
 }
 
 /**
@@ -115,7 +209,8 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    the implementations (a key cannot lock itself out).
  *  - `apiKeys.listAll` and `apiKeys.deactivate`: inventory and containment.
  *    `deactivate` refuses the calling key and cannot re-activate, rename or
- *    delete (those stay a human administrator's act in the UI).
+ *    delete; those are the narrow lifecycle procedures below, for data-plane
+ *    keys only.
  *  - `apiKeys.create`: reaches the implementation's agent-mint branch, which
  *    only ever creates an endpoint-scoped or gateway-wide DATA-plane key for
  *    one existing enabled user, locked to a narrow IP list at creation. Every
@@ -135,12 +230,41 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    Each write is audited in the change's own transaction. A group
  *    restriction cannot cut an operator key off: these procedures are reached
  *    on /trpc and depend on no MCP endpoint.
+ *  - Two reads for the operator's own verification: `audit.list` (its audit
+ *    trail, safe fields only) and `apiKeys.operatorCapabilities` (what this
+ *    scope may call, the reason contract, the confirmations and the change
+ *    budget), which the tooling checks before it sends a change.
+ *  - The narrow key lifecycle procedures, for DATA-plane keys only:
+ *    `apiKeys.reactivate` (the owner, the endpoint and the key's own narrow
+ *    enforce policy re-checked against locked rows, by the agent mint's
+ *    rules), `apiKeys.rename` (a valid name unused by the key's owner) and
+ *    `apiKeys.remove` (leaf-only: an inactive key, confirmed by its name and
+ *    by the fingerprint `apiKeys.removalImpact` read). Each refuses an
+ *    admin-plane key, the calling key included; the broad `apiKeys.update`
+ *    and `.delete` stay human-only.
+ *  - `mcpServers.resetErrors`, the twin of the cookie-only REST reset route
+ *    and sharing its implementation: the ERROR status change and its audit
+ *    row commit together, and connection recovery starts after the commit.
+ *  - `logs.history`, the bounded (paged, at most 200 rows) diagnostic
+ *    history, with credential-shaped text redacted for an admin-plane key.
  *
- * Left out on purpose, and still a human administrator's act in the UI: user
- * disable, delete and role changes, and every OAuth client decision.
+ * Every change an operator key makes carries a `reason` (see
+ * `changeContextOf`), is counted against the key's change budget and is
+ * audited in the change's own transaction (the backend's
+ * lib/audit/admin-write). Left out on purpose, and still a human
+ * administrator's act in the UI: everything in
+ * ADMIN_PLANE_HUMAN_ONLY_PROCEDURES below.
  */
 export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
   ...ADMIN_PLANE_SYNC_PROCEDURES,
+  "frontend.audit.list",
+  "frontend.apiKeys.operatorCapabilities",
+  "frontend.apiKeys.reactivate",
+  "frontend.apiKeys.removalImpact",
+  "frontend.apiKeys.remove",
+  "frontend.apiKeys.rename",
+  "frontend.logs.history",
+  "frontend.mcpServers.resetErrors",
   "frontend.accessGroups.addEndpoint",
   "frontend.accessGroups.addMember",
   "frontend.accessGroups.create",
@@ -168,6 +292,128 @@ export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
   "frontend.oauthClients.list",
   "frontend.users.list",
 ]);
+
+/**
+ * The operator procedures that are mutations: every change an operator key
+ * can make. Each must carry a reason, is charged to the key's change budget
+ * and writes its audit row in the change's transaction. Pinned against the
+ * router's own procedure types by the backend's classification test, so a
+ * mutation added to the operator set without being listed here fails CI.
+ */
+export const ADMIN_PLANE_OPERATOR_MUTATIONS: ReadonlySet<string> = new Set([
+  "frontend.accessGroups.addEndpoint",
+  "frontend.accessGroups.addMember",
+  "frontend.accessGroups.create",
+  "frontend.accessGroups.delete",
+  "frontend.accessGroups.removeEndpoint",
+  "frontend.accessGroups.removeMember",
+  "frontend.accessGroups.setEndpointRestricted",
+  "frontend.accessGroups.update",
+  "frontend.apiKeys.create",
+  "frontend.apiKeys.deactivate",
+  "frontend.apiKeys.reactivate",
+  "frontend.apiKeys.remove",
+  "frontend.apiKeys.rename",
+  "frontend.apiKeys.setGlobalIpPolicy",
+  "frontend.apiKeys.setIpPolicy",
+  "frontend.endpoints.create",
+  "frontend.endpoints.update",
+  "frontend.mcpServers.create",
+  "frontend.mcpServers.resetErrors",
+  "frontend.mcpServers.update",
+  "frontend.namespaces.create",
+  "frontend.namespaces.refreshTools",
+  "frontend.namespaces.setToolPolicy",
+  "frontend.namespaces.update",
+  "frontend.namespaces.updateToolStatus",
+]);
+
+/**
+ * Every procedure no admin-plane key may call, of either scope: a human
+ * administrator's act in the admin UI (or, for the reads, a browser session's).
+ * Written out so that the three lists (sync, operator-only, this one) classify
+ * every procedure in the router exactly once; the backend's classification
+ * test fails when a procedure is added to the router without a decision.
+ * Moving a name from here to the operator set is a change to what a standing
+ * credential can do and needs the same review as the operator set itself.
+ */
+export const ADMIN_PLANE_HUMAN_ONLY_PROCEDURES: ReadonlySet<string> = new Set([
+  "frontend.accessGroups.listEndpoints",
+  "frontend.apiKeys.delete",
+  "frontend.apiKeys.list",
+  "frontend.apiKeys.update",
+  "frontend.apiKeys.validate",
+  "frontend.config.getAllConfigs",
+  "frontend.config.getAuthProviders",
+  "frontend.config.getBasicAuthDisabled",
+  "frontend.config.getMcpMaxAttempts",
+  "frontend.config.getMcpResetTimeoutOnProgress",
+  "frontend.config.getSessionLifetime",
+  "frontend.config.getSignupDisabled",
+  "frontend.config.getSsoSignupDisabled",
+  "frontend.config.setBasicAuthDisabled",
+  "frontend.config.setConfig",
+  "frontend.config.setMcpMaxAttempts",
+  "frontend.config.setMcpMaxTotalTimeout",
+  "frontend.config.setMcpResetTimeoutOnProgress",
+  "frontend.config.setMcpTimeout",
+  "frontend.config.setSessionLifetime",
+  "frontend.config.setSignupDisabled",
+  "frontend.config.setSsoSignupDisabled",
+  "frontend.endpointPresentation.get",
+  "frontend.endpointPresentation.set",
+  "frontend.endpoints.delete",
+  "frontend.endpoints.get",
+  "frontend.endpoints.listAll",
+  "frontend.logs.get",
+  "frontend.mcpServers.bulkImport",
+  "frontend.mcpServers.delete",
+  "frontend.mcpServers.get",
+  "frontend.mcpServers.listAll",
+  "frontend.mcpServers.reconnect",
+  "frontend.namespaces.delete",
+  "frontend.namespaces.listAll",
+  "frontend.namespaces.updateServerStatus",
+  "frontend.namespaces.updateToolOverrides",
+  "frontend.oauth.get",
+  "frontend.oauth.upsert",
+  "frontend.oauthClients.approve",
+  "frontend.oauthClients.create",
+  "frontend.oauthClients.delete",
+  "frontend.oauthClients.reject",
+  "frontend.oauthTokens.list",
+  "frontend.tools.create",
+  "frontend.tools.sync",
+  "frontend.users.delete",
+  "frontend.users.previewDelete",
+  "frontend.users.revokeAccess",
+  "frontend.users.setDisabled",
+]);
+
+/**
+ * Version of the operator contract `apiKeys.operatorCapabilities` reports.
+ * Raised whenever the operator set, the reason contract or the meaning of a
+ * refusal changes, so the operator's tooling can refuse to send a change to a
+ * gateway whose contract it does not know.
+ *
+ *  - 2: the rails, the reason field, the change budget, `audit.list`.
+ *  - 3: the key lifecycle procedures (reactivate, rename, removalImpact,
+ *    remove), `mcpServers.resetErrors`, `logs.history`, and the
+ *    `confirmations` field (ADMIN_PLANE_OPERATOR_CONFIRMATIONS).
+ */
+export const ADMIN_PLANE_OPERATOR_CONTRACT_VERSION = 3;
+
+/**
+ * The fields beyond `reason` an operator change must carry, by procedure,
+ * reported by `apiKeys.operatorCapabilities` so the tooling can build the
+ * request. A mistake guard, checked by the implementation against rows it
+ * locks; the rule behind it (for a removal, leaf-only) holds without it.
+ */
+export const ADMIN_PLANE_OPERATOR_CONFIRMATIONS: Readonly<
+  Record<string, readonly string[]>
+> = {
+  "frontend.apiKeys.remove": ["confirm_name", "impact_fingerprint"],
+};
 
 /** One constant refusal for every procedure outside the list. */
 export const ADMIN_PLANE_FORBIDDEN_MESSAGE =
@@ -319,6 +565,14 @@ export interface AuditActor {
     owner_user_id: string;
     scope?: AdminPlaneScope;
   };
+  /**
+   * The caller's reason and run id for this change, as the procedure base
+   * validated them from the request (see `changeContextOf`). Absent on a query
+   * and on a change that sent neither. Recorded in the audit row; never used
+   * to decide who acted.
+   */
+  reason?: string | null;
+  run_id?: string | null;
 }
 
 /**
@@ -353,6 +607,9 @@ export function auditActor(ctx: BaseContext): AuditActor {
             },
           }
         : {}),
+      // Added only when the request carried one, so an actor without them
+      // keeps exactly the shape it had.
+      ...changeFields(ctx),
     };
   } catch {
     // Attribution degrades to nulls, but the admin-plane PROVENANCE must not:
@@ -373,6 +630,13 @@ export function auditActor(ctx: BaseContext): AuditActor {
     } catch {
       // Left undefined; the router-level guard on `apiKeys.create` refuses.
     }
+    let change: Partial<Pick<AuditActor, "reason" | "run_id">> = {};
+    try {
+      change = changeFields(ctx);
+    } catch {
+      // Left out; the reason requirement was already judged by the procedure
+      // base before the implementation ran.
+    }
     return {
       actor_id: null,
       actor_label: null,
@@ -380,8 +644,21 @@ export function auditActor(ctx: BaseContext): AuditActor {
       actor_user_agent: null,
       request_id: null,
       ...(admin_plane ? { admin_plane } : {}),
+      ...change,
     };
   }
+}
+
+/** The reason and run id the procedure base stamped, when there are any. */
+function changeFields(
+  ctx: BaseContext,
+): Partial<Pick<AuditActor, "reason" | "run_id">> {
+  const change = ctx?.change;
+  if (!change) return {};
+  return {
+    ...(change.reason !== null ? { reason: change.reason } : {}),
+    ...(change.run_id !== null ? { run_id: change.run_id } : {}),
+  };
 }
 
 // Initialize tRPC with base context.
@@ -479,15 +756,65 @@ export function assertAdminPlaneProcedureAllowed(
 }
 
 /**
+ * The change context of one call, after the scope check: for a mutation, the
+ * validated `reason` and `run_id` of its input (see `changeContextOf`), with
+ * the reason REQUIRED when the caller is an operator-scope admin-plane key.
+ * Returns null for a query. Throws BAD_REQUEST with a fixed sentence before
+ * the procedure runs.
+ *
+ * Why the operator scope only: a person in the admin UI and the CI sync key
+ * (whose tooling predates the field) may keep sending changes without one; an
+ * operator key is the credential an agent holds, and its changes are the ones
+ * an after-action review has to be able to explain from the trail alone.
+ * Judged per call, so one call of a batch without a reason is refused while
+ * the others are judged on their own.
+ */
+export async function changeContextForCall(
+  ctx: BaseContext,
+  type: string,
+  getRawInput: () => Promise<unknown>,
+): Promise<ChangeContext | null> {
+  if (type !== "mutation") return null;
+  const rawInput = await getRawInput();
+  const change = changeContextOf(rawInput);
+  const origin = adminPlaneOrigin(ctx);
+  // Required of an input that is an object, the only shape any operator
+  // mutation's schema accepts (pinned by the backend's classification test).
+  // Anything else is refused by that schema with its own sentence before the
+  // procedure runs, so it can make no change without a reason either.
+  const isObjectInput =
+    typeof rawInput === "object" &&
+    rawInput !== null &&
+    !Array.isArray(rawInput);
+  if (
+    origin &&
+    adminPlaneScopeOf(origin) === "operator" &&
+    isObjectInput &&
+    change.reason === null
+  ) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: CHANGE_CONTEXT_REFUSALS.reasonRequired,
+    });
+  }
+  return change;
+}
+
+/**
  * The base every exported builder starts from, so no procedure in this
  * package can be built without the admin-plane scope check. It runs before
  * authentication and RBAC, and an ordinary request (anonymous or a browser
- * session) passes straight through it.
+ * session) passes straight through it. For a mutation it then reads the
+ * change context (above) and hands it to the procedure on its own context
+ * copy, so calls of one batch never share it.
  */
-const scopedProcedure = t.procedure.use(({ ctx, next, path, type }) => {
-  assertAdminPlaneProcedureAllowed(ctx, path, type);
-  return next();
-});
+const scopedProcedure = t.procedure.use(
+  async ({ ctx, next, path, type, getRawInput }) => {
+    assertAdminPlaneProcedureAllowed(ctx, path, type);
+    const change = await changeContextForCall(ctx, type, getRawInput);
+    return change ? next({ ctx: { ...ctx, change } }) : next();
+  },
+);
 
 // Export router and procedure helpers
 export const router = t.router;

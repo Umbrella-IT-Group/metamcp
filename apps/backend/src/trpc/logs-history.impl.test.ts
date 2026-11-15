@@ -355,3 +355,36 @@ describe("the input contract", () => {
     ).toThrow();
   });
 });
+
+describe("getHistory for an admin-plane caller: search", () => {
+  it("refuses a search term before it reads anything, with a fixed 400 that names no term", async () => {
+    const { HISTORY_SEARCH_REFUSAL } = await import("./logs.impl");
+
+    const failure = await logsImplementations
+      .getHistory({ search: "ZxQ-secret-99" }, { redactForAdminPlane: true })
+      .catch((error) => error);
+
+    expect(failure).toMatchObject({
+      code: "BAD_REQUEST",
+      message: HISTORY_SEARCH_REFUSAL,
+    });
+    expect(failure.message).not.toContain("ZxQ");
+    expect(listMock).not.toHaveBeenCalled();
+    expect(listServerNamesMock).not.toHaveBeenCalled();
+  });
+
+  it("still serves the other filters to an admin-plane caller, and a search to a person", async () => {
+    await logsImplementations.getHistory(
+      { category: "connection", level: "error" },
+      { redactForAdminPlane: true },
+    );
+    expect(listMock).toHaveBeenCalledTimes(1);
+    expect(listMock.mock.calls[0][0]).toMatchObject({ search: null });
+
+    await logsImplementations.getHistory(
+      { search: "hang up" },
+      { redactForAdminPlane: false },
+    );
+    expect(listMock.mock.calls[1][0]).toMatchObject({ search: "hang up" });
+  });
+});

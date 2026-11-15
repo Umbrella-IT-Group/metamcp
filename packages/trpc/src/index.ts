@@ -10,11 +10,20 @@ export {
   auditActor,
   setTrpcAuditSink,
   ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  ADMIN_PLANE_HUMAN_ONLY_PROCEDURES,
+  ADMIN_PLANE_OPERATOR_CONFIRMATIONS,
+  ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+  ADMIN_PLANE_OPERATOR_MUTATIONS,
   ADMIN_PLANE_OPERATOR_PROCEDURES,
   ADMIN_PLANE_SYNC_PROCEDURES,
   adminPlaneOrigin,
   adminPlaneScopeOf,
   assertAdminPlaneProcedureAllowed,
+  CHANGE_CONTEXT_REFUSALS,
+  CHANGE_REASON_MAX_LENGTH,
+  CHANGE_RUN_ID_MAX_LENGTH,
+  changeContextForCall,
+  changeContextOf,
 } from "./trpc";
 export type {
   AdminPlaneAuthOrigin,
@@ -22,6 +31,7 @@ export type {
   AuditActor,
   AuditRequestContext,
   BaseContext,
+  ChangeContext,
   TrpcAuditSink,
   TrpcDenialEvent,
 } from "./trpc";
@@ -36,6 +46,7 @@ export { createMcpServersRouter } from "./routers/frontend";
 export {
   createAccessGroupsRouter,
   createApiKeysRouter,
+  createAuditRouter,
   createEndpointPresentationRouter,
   createEndpointsRouter,
   createNamespacesRouter,

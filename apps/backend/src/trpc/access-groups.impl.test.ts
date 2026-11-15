@@ -75,13 +75,15 @@ vi.mock("../db/repositories/access-groups.repo", () => ({
     findDetailByUuid: findDetailByUuidMock,
     findGroupsForEndpoint: findGroupsForEndpointMock,
     create: createMock,
-    update: updateMock,
+    // TEST-EDIT (SPEC): the update reads the group's previous row under its
+    // lock for the audit row's before-state, so the repository call is
+    // `updateReportingPrevious` and answers { group, previous }.
+    updateReportingPrevious: updateMock,
     deleteByUuid: deleteByUuidMock,
     addMember: addMemberMock,
     removeMember: removeMemberMock,
     addEndpoint: addEndpointMock,
     removeEndpoint: removeEndpointMock,
-    setEndpointRestricted: setEndpointRestrictedMock,
     // The gate's own query. Present because `lib/endpoint-access-control` is
     // deliberately NOT mocked in this file — the invalidation assertions below
     // drive the real cache.
@@ -100,6 +102,47 @@ vi.mock("../db/repositories/users.repo", () => ({
   usersRepository: {
     findById: userFindByIdMock,
     findRoleById: userFindRoleByIdMock,
+  },
+}));
+
+// TEST-EDIT (endpoint namespace gate): the
+// restricted switch now runs in one transaction for every actor, under the
+// endpoint's namespace lock, through the gate repository. The stand-ins re-read
+// the endpoint as the doubled endpoints repository returns it, report no other
+// restricted endpoint over its namespace, and hand the write to the doubled
+// access-groups write, so every assertion below keeps its oracle. The gate is
+// pinned in endpoint-namespace-gate.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts.
+vi.mock("../db/index", () => ({
+  db: {
+    transaction: async (callback: (tx: object) => Promise<unknown>) =>
+      callback({}),
+  },
+}));
+vi.mock("../db/repositories/endpoint-gate.repo", () => ({
+  endpointGateRepository: {
+    lockNamespaces: vi.fn(async () => undefined),
+    restrictedSiblingExists: vi.fn(async () => false),
+    gatedSiblingExists: vi.fn(async () => false),
+    lockEndpoint: vi.fn(async (_tx: unknown, uuid: string) => {
+      const row = await endpointFindByUuidMock(uuid);
+      return row
+        ? {
+            uuid,
+            name: row.name,
+            namespace_uuid: row.namespace_uuid,
+            user_id: row.user_id ?? null,
+            restricted: row.restricted ?? false,
+            restricted_by_api_key_uuid: null,
+            restriction_recent: false,
+          }
+        : null;
+    }),
+    setRestricted: vi.fn(
+      async (_tx: unknown, uuid: string, restricted: boolean) =>
+        setEndpointRestrictedMock(uuid, restricted),
+    ),
+    clearRestrictionKey: vi.fn(async () => undefined),
   },
 }));
 
@@ -143,6 +186,9 @@ const GROUP_ROW = {
 const ENDPOINT_ROW = {
   uuid: ENDPOINT_UUID,
   name: "autotask",
+  // TEST-EDIT (endpoint namespace gate): a stored endpoint always has a
+  // namespace (NOT NULL), and the restricted switch now locks it.
+  namespace_uuid: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
   restricted: false,
   enable_oauth: true,
   enable_api_key_auth: false,
@@ -226,7 +272,10 @@ describe("group.create", () => {
 
 describe("group.update / group.delete", () => {
   it("update emits group.update", async () => {
-    updateMock.mockResolvedValue({ ...GROUP_ROW, name: "helpdesk-tier-2" });
+    updateMock.mockResolvedValue({
+      group: { ...GROUP_ROW, name: "helpdesk-tier-2" },
+      previous: GROUP_ROW,
+    });
 
     const result = await accessGroupsImplementations.update(
       { uuid: GROUP_UUID, name: "helpdesk-tier-2" },
@@ -237,6 +286,11 @@ describe("group.update / group.delete", () => {
     expect(result.success).toBe(true);
     expect(rows.map((r) => r.action)).toEqual(["group.update"]);
     expect(rows[0].detail?.name).toBe("helpdesk-tier-2");
+    expect(rows[0].detail).toMatchObject({
+      changed_fields: ["name"],
+      old_value: { name: "helpdesk" },
+      new_value: { name: "helpdesk-tier-2" },
+    });
   });
 
   it("update on a missing group reports the miss and writes NO row", async () => {
@@ -482,7 +536,7 @@ describe("every mutation drops the middleware's decision cache", () => {
     [
       "update",
       () => {
-        updateMock.mockResolvedValue(GROUP_ROW);
+        updateMock.mockResolvedValue({ group: GROUP_ROW, previous: GROUP_ROW });
         return accessGroupsImplementations.update(
           { uuid: GROUP_UUID, name: "x" },
           ACTOR,

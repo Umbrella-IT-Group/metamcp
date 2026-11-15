@@ -28,6 +28,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { INTEGRATION_DB_LOCK_KEY } from "../db/repositories/integration-db-lock";
+import { DEFAULT_REASON, withReason } from "./admin-plane-integration-fixture";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describeIfDb = describe.skipIf(!TEST_DATABASE_URL);
@@ -108,7 +109,14 @@ describeIfDb(
           "cf-connecting-ip": nextIp(),
           ...headers,
         },
-        body: kind === "mutation" ? JSON.stringify(input ?? {}) : undefined,
+        // Every change carries a reason, as the operator's tooling sends it:
+        // an operator-scope key's change without one is refused before it
+        // runs (@repo/trpc changeContextOf), which is not what these cases
+        // are about.
+        body:
+          kind === "mutation"
+            ? JSON.stringify(withReason(input, DEFAULT_REASON) ?? {})
+            : undefined,
       });
       const body = (await res.json()) as {
         result?: { data?: unknown };

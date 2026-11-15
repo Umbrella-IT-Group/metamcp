@@ -54,6 +54,13 @@ export interface Fixture {
       key?: string;
       cookie?: string;
       ip?: string | null;
+      /**
+       * The change's `reason` (see @repo/trpc `changeContextOf`). A mutation
+       * whose input is an object (or absent) carries `DEFAULT_REASON` unless
+       * the test passes its own, or null to send none: an operator-scope key's
+       * change without one is refused before it runs.
+       */
+      reason?: string | null;
     },
   ) => Promise<TrpcReply>;
   /** Rows of audit_log matching `where`, read straight away (no polling). */
@@ -105,7 +112,16 @@ export interface Fixture {
     requireScoped?: boolean;
     oauth?: boolean;
     apiKeyAuth?: boolean;
+    /** Defaults to the fixture's shared public namespace. */
+    namespaceUuid?: string;
   }) => Promise<string>;
+  /**
+   * A public namespace of its own, written straight to the table and removed
+   * with the fixture (with every endpoint over it). For a suite whose endpoints
+   * must not share a namespace: the endpoint namespace gate judges an endpoint
+   * against the other endpoints over its namespace.
+   */
+  namespace: (name: string) => Promise<string>;
   /**
    * An access group written straight to the tables (as a human administrator's
    * UI would), with members and mapped endpoints; removed with the fixture.
@@ -150,6 +166,23 @@ export interface Fixture {
 
 const APP_ORIGIN = "http://127.0.0.1:1";
 
+/** The reason every fixture mutation carries unless a test says otherwise. */
+export const DEFAULT_REASON = "integration test change";
+
+/**
+ * A mutation's body with the change reason added (see the `reason` option of
+ * `trpc`): only to an object input or an absent one, never to an array or a
+ * primitive, which a test sends on purpose.
+ */
+export function withReason(input: unknown, reason: string | null): unknown {
+  if (reason === null) return input;
+  if (input === undefined) return { reason };
+  if (typeof input === "object" && input !== null && !Array.isArray(input)) {
+    return "reason" in input ? input : { ...input, reason };
+  }
+  return input;
+}
+
 /** How long `auditSettled` waits for the audit writes in flight before it throws. */
 const AUDIT_SETTLE_TIMEOUT_MS = 5_000;
 
@@ -169,6 +202,19 @@ export async function createFixture(
   process.env.DATABASE_URL = databaseUrl;
   process.env.BETTER_AUTH_SECRET = `itest-throwaway-secret-${run}`;
   process.env.APP_URL = APP_ORIGIN;
+  // The suites make far more changes with one key than an operator does in an
+  // hour, so the per-key change budget (lib/admin-plane-budget) is raised to
+  // its ceiling here. The budget's own suite sets the numbers it tests.
+  for (const name of [
+    "ADMIN_PLANE_BUDGET_OPERATOR_TOTAL",
+    "ADMIN_PLANE_BUDGET_OPERATOR_LOOSEN",
+    "ADMIN_PLANE_BUDGET_OPERATOR_DESTROY",
+    "ADMIN_PLANE_BUDGET_SYNC_TOTAL",
+    "ADMIN_PLANE_BUDGET_SYNC_LOOSEN",
+    "ADMIN_PLANE_BUDGET_SYNC_DESTROY",
+  ]) {
+    process.env[name] = "100000";
+  }
 
   const suiteLock = new Client({ connectionString: databaseUrl });
   await suiteLock.connect();
@@ -283,7 +329,12 @@ export async function createFixture(
     procedure: string,
     input: unknown,
     kind: "query" | "mutation",
-    options: { key?: string; cookie?: string; ip?: string | null } = {},
+    options: {
+      key?: string;
+      cookie?: string;
+      ip?: string | null;
+      reason?: string | null;
+    } = {},
   ): Promise<TrpcReply> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -308,7 +359,15 @@ export async function createFixture(
     const res = await fetch(url, {
       method: kind === "query" ? "GET" : "POST",
       headers,
-      body: kind === "mutation" ? JSON.stringify(input ?? {}) : undefined,
+      body:
+        kind === "mutation"
+          ? JSON.stringify(
+              withReason(
+                input,
+                options.reason === undefined ? DEFAULT_REASON : options.reason,
+              ) ?? {},
+            )
+          : undefined,
     });
     const body = (await res.json()) as {
       result?: { data?: unknown };
@@ -369,6 +428,17 @@ export async function createFixture(
     return auditNow(where, params);
   }
 
+  const extraNamespaces: string[] = [];
+
+  async function extraNamespace(name: string) {
+    const [row] = await db
+      .insert(schema.namespacesTable)
+      .values({ name: `itest-${run}-${name}`, user_id: null })
+      .returning({ uuid: schema.namespacesTable.uuid });
+    extraNamespaces.push(row.uuid);
+    return row.uuid;
+  }
+
   async function endpoint(over: {
     name: string;
     userId?: string | null;
@@ -376,12 +446,13 @@ export async function createFixture(
     requireScoped?: boolean;
     oauth?: boolean;
     apiKeyAuth?: boolean;
+    namespaceUuid?: string;
   }) {
     const [row] = await db
       .insert(schema.endpointsTable)
       .values({
         name: `${over.name}-${run}`,
-        namespace_uuid: namespace.uuid,
+        namespace_uuid: over.namespaceUuid ?? namespace.uuid,
         user_id: over.userId ?? null,
         restricted: over.restricted ?? false,
         // Independent of `restricted`: restricting an endpoint no longer turns
@@ -623,9 +694,11 @@ export async function createFixture(
     await suiteLock.query(`DELETE FROM access_groups WHERE name LIKE $1`, [
       `%${run}`,
     ]);
-    await db
-      .delete(schema.namespacesTable)
-      .where(eq(schema.namespacesTable.uuid, namespace.uuid));
+    for (const uuid of [...extraNamespaces, namespace.uuid]) {
+      await db
+        .delete(schema.namespacesTable)
+        .where(eq(schema.namespacesTable.uuid, uuid));
+    }
     for (const email of Object.values(emails)) {
       await db
         .delete(schema.usersTable)
@@ -661,6 +734,7 @@ export async function createFixture(
     uniqueIp,
     stallAuditWrites,
     endpoint,
+    namespace: extraNamespace,
     group,
     dataKey,
     setRole,

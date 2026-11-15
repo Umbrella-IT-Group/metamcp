@@ -43,6 +43,33 @@ vi.mock("../db/repositories", () => ({
   usersRepository: usersRepoMock,
 }));
 
+// TEST-EDIT (account rails): an account
+// change now runs in one transaction that locks the enabled administrators
+// and the target first and judges the rails on them. The stand-ins below
+// answer as the rows would for an enabled member target with two enabled
+// administrators; the rails themselves are pinned in account-rails.test.ts and
+// against Postgres in admin-plane-rails.integration.test.ts.
+vi.mock("../db/repositories/admin-plane-locks", () => ({
+  lockAdminPlaneBudget: vi.fn(async () => undefined),
+  lockEndpointNamespaces: vi.fn(async () => undefined),
+  lockAccountTarget: vi.fn(async (_tx: unknown, id: string) => ({
+    target: { id, role: "member", disabled: false },
+    enabledAdminIds: ["admin-1", "admin-2"],
+  })),
+  lockAccountForRevoke: vi.fn(async (_tx: unknown, id: string) => ({
+    id,
+    role: "member",
+    disabled: false,
+  })),
+  ownsActiveAdminPlaneKey: vi.fn(async () => false),
+}));
+vi.mock("../db/index", () => ({
+  db: {
+    transaction: async (callback: (tx: object) => Promise<unknown>) =>
+      callback({ id: "tx" }),
+  },
+}));
+
 import { usersImplementations } from "./users.impl";
 
 const ADMIN_ID = "admin-1";
@@ -179,10 +206,13 @@ describe("usersImplementations.setDisabled", () => {
       ADMIN_ID,
     );
 
+    // TEST-EDIT (account rails): the write
+    // now also receives the transaction the rails ran in (the last argument).
     expect(usersRepoMock.setDisabled).toHaveBeenCalledWith(
       TARGET_ID,
       true,
       ADMIN_ID,
+      { id: "tx" },
     );
     expect(result).toEqual({
       success: true,
@@ -202,10 +232,13 @@ describe("usersImplementations.setDisabled", () => {
       ADMIN_ID,
     );
 
+    // TEST-EDIT (account rails): the write
+    // now also receives the transaction the rails ran in (the last argument).
     expect(usersRepoMock.setDisabled).toHaveBeenCalledWith(
       TARGET_ID,
       false,
       ADMIN_ID,
+      { id: "tx" },
     );
     expect(result).toEqual({
       success: true,
@@ -247,7 +280,11 @@ describe("usersImplementations.revokeAccess", () => {
       ADMIN_ID,
     );
 
-    expect(usersRepoMock.revokeAccess).toHaveBeenCalledWith(TARGET_ID);
+    // TEST-EDIT (account rails): the write
+    // now also receives the transaction the rails ran in (the last argument).
+    expect(usersRepoMock.revokeAccess).toHaveBeenCalledWith(TARGET_ID, {
+      id: "tx",
+    });
     expect(result).toEqual({
       success: true,
       message: "Access revoked",
@@ -313,7 +350,11 @@ describe("usersImplementations.delete", () => {
       ADMIN_ID,
     );
 
-    expect(usersRepoMock.deleteById).toHaveBeenCalledWith(TARGET_ID);
+    // TEST-EDIT (account rails): the write
+    // now also receives the transaction the rails ran in (the last argument).
+    expect(usersRepoMock.deleteById).toHaveBeenCalledWith(TARGET_ID, {
+      id: "tx",
+    });
     // Once the rows are gone the cascade cannot be reconstructed, so the
     // audit log line has to be built from a reading taken first.
     expect(order).toEqual(["preview", "delete"]);

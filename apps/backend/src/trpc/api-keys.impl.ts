@@ -1,5 +1,16 @@
-import type { AuditActor } from "@repo/trpc";
 import {
+  ADMIN_PLANE_FORBIDDEN_MESSAGE,
+  ADMIN_PLANE_OPERATOR_CONFIRMATIONS,
+  ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+  ADMIN_PLANE_OPERATOR_MUTATIONS,
+  ADMIN_PLANE_OPERATOR_PROCEDURES,
+  type AuditActor,
+  CHANGE_REASON_MAX_LENGTH,
+  CHANGE_RUN_ID_MAX_LENGTH,
+} from "@repo/trpc";
+import {
+  ApiKeyRemovalImpactRequestSchema,
+  ApiKeyRemovalImpactResponseSchema,
   CreateApiKeyRequestSchema,
   CreateApiKeyResponseSchema,
   DeactivateApiKeyRequestSchema,
@@ -9,6 +20,13 @@ import {
   GetGlobalIpPolicyResponseSchema,
   ListAllApiKeysResponseSchema,
   ListApiKeysResponseSchema,
+  OperatorCapabilitiesResponseSchema,
+  ReactivateApiKeyRequestSchema,
+  ReactivateApiKeyResponseSchema,
+  RemoveApiKeyRequestSchema,
+  RemoveApiKeyResponseSchema,
+  RenameApiKeyRequestSchema,
+  RenameApiKeyResponseSchema,
   SetApiKeyIpPolicyRequestSchema,
   SetApiKeyIpPolicyResponseSchema,
   SetGlobalIpPolicyRequestSchema,
@@ -30,13 +48,22 @@ import {
   usersRepository,
 } from "../db/repositories";
 import { ApiKeysSerializer } from "../db/serializers";
+import { adminPlaneBudgetConfig } from "../lib/admin-plane-budget";
 import { resolveActsAsUserId } from "../lib/api-key-identity";
 import {
   apiKeyIpPolicyDisabled,
   type IpPolicyMode,
+  isAnyIpExemption,
   normalizeCidrList,
 } from "../lib/api-key-ip-policy";
 import {
+  ApiKeyLifecycleRefusal,
+  apiKeyRemovalFingerprint,
+  apiKeySnapshot,
+  removalBlocker,
+} from "../lib/api-key-lifecycle-rules";
+import {
+  AdminPlaneOwnerIneligible,
   ApiKeyMintRefusal,
   assertAgentSettableIpPolicy,
   MINT_REFUSALS,
@@ -52,10 +79,17 @@ import { emitAdminEvent } from "../lib/audit/admin-event";
 import {
   ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
   AdminAuditWriteError,
+  AdminRuleRefusal,
+  recordDenialAfterRollback,
   runAuditedTransaction,
   withAdminAudit,
 } from "../lib/audit/admin-write";
 import { configService } from "../lib/config.service";
+import {
+  admitsNoMoreThan,
+  admittedAddresses,
+  isNoWeakerPolicy,
+} from "../lib/ip-policy-compare";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -98,6 +132,55 @@ function validatedCidrs(
   return normalized.cidrs;
 }
 
+/**
+ * The refusal an admin-plane key gets for a change that would not narrow an
+ * admin-plane key's IP policy, and for one that would weaken the global
+ * policy. Fixed sentences, naming no key, list or address.
+ */
+export const ADMIN_PLANE_KEY_IP_POLICY_REFUSAL =
+  "An admin-plane API key can only narrow an admin-plane key's IP policy: mode enforce, with a list of its own that admits no address the current policy does not. Turning it off, to audit, to the global policy, to any address or to a wider list is done in the admin UI.";
+export const ADMIN_PLANE_GLOBAL_IP_POLICY_REFUSAL =
+  "An admin-plane API key cannot weaken the global IP policy: its mode may not fall and it may admit no address it does not admit now. Do this in the admin UI.";
+
+/**
+ * The policy an admin-plane key is under right now, from its locked row: its
+ * own list and mode, or the global policy when it has no list of its own.
+ */
+function currentEffectivePolicy(
+  target: { allowed_cidrs?: string[] | null; ip_policy_mode?: string | null },
+  global: { mode: IpPolicyMode; cidrs: readonly string[] },
+): { mode: string; cidrs: readonly string[] } {
+  if (target.allowed_cidrs === null || target.allowed_cidrs === undefined) {
+    return global;
+  }
+  return { mode: target.ip_policy_mode ?? "off", cidrs: target.allowed_cidrs };
+}
+
+/**
+ * The rule a requested change to an ADMIN-PLANE key's policy breaks, or null
+ * when it only narrows. The request must be mode enforce with a list of its
+ * own (not the any-IP exemption) that admits no address the current effective
+ * policy does not, compared as address sets (lib/ip-policy-compare).
+ */
+function adminPlaneIpPolicyChangeRule(
+  current: { mode: string; cidrs: readonly string[] },
+  requested: { mode: IpPolicyMode; cidrs: string[] | null },
+): "ip_policy_admin_plane_shape" | "ip_policy_admin_plane_wider" | null {
+  if (
+    requested.mode !== "enforce" ||
+    requested.cidrs === null ||
+    requested.cidrs.length === 0 ||
+    isAnyIpExemption(requested.cidrs)
+  ) {
+    return "ip_policy_admin_plane_shape";
+  }
+  const narrows = admitsNoMoreThan(
+    admittedAddresses({ mode: "enforce", cidrs: requested.cidrs }),
+    admittedAddresses(current),
+  );
+  return narrows ? null : "ip_policy_admin_plane_wider";
+}
+
 /** The fixed refusal for a caller that is not an operator-scope key. */
 function notAnOperatorRefusal(): TRPCError {
   return new TRPCError({
@@ -108,19 +191,18 @@ function notAnOperatorRefusal(): TRPCError {
 
 /**
  * Leave a trace of a refusal an admin-plane key ran into: one `denied` audit
- * row naming the rule and nothing of the request. Without it a key probing for
- * a credential it may not create leaves only the generic accepted-request row,
- * while an out-of-scope procedure call is recorded as a denial. Best effort,
- * like the other denial rows: a refusal has nothing to roll back, and an audit
- * outage must not turn a clean refusal into a failure.
+ * row naming the rule and nothing of the request. Wait for the row before
+ * answering, as the change rails do, so immediate read-back sees the refusal.
+ * Called before a transaction starts or after it has rolled back; a refusal
+ * inside a write uses AdminRuleRefusal instead.
  */
-function recordRefusal(
+async function recordRefusal(
   actor: AuditActor,
   action: "apikey.create" | "apikey.ip_policy.set",
   rule: MintRule,
   targetId?: string,
-): void {
-  emitAdminEvent(actor, {
+): Promise<void> {
+  await recordDenialAfterRollback(actor, {
     action,
     target_type: "api_key",
     ...(targetId !== undefined ? { target_id: targetId } : {}),
@@ -130,8 +212,11 @@ function recordRefusal(
 }
 
 /** A refusal of an agent mint as the error a caller sees, recorded as denied. */
-function mintRefusalError(actor: AuditActor, rule: MintRule): TRPCError {
-  recordRefusal(actor, "apikey.create", rule);
+async function mintRefusalError(
+  actor: AuditActor,
+  rule: MintRule,
+): Promise<TRPCError> {
+  await recordRefusal(actor, "apikey.create", rule);
   return new TRPCError({
     code: MINT_REFUSALS[rule].code,
     message: MINT_REFUSALS[rule].message,
@@ -166,7 +251,7 @@ async function createForAdminPlane(
   actor: AuditActor,
 ): Promise<z.infer<typeof CreateApiKeyResponseSchema>> {
   if (actor.admin_plane?.scope !== "operator" || isAdmin !== true) {
-    recordRefusal(actor, "apikey.create", "caller_not_operator");
+    await recordRefusal(actor, "apikey.create", "caller_not_operator");
     throw notAnOperatorRefusal();
   }
 
@@ -174,7 +259,7 @@ async function createForAdminPlane(
   try {
     request = validateAgentMintRequest(input);
   } catch (error) {
-    throw mintFailure(error, actor);
+    throw await mintFailure(error, actor);
   }
 
   try {
@@ -205,7 +290,7 @@ async function createForAdminPlane(
     );
     return ApiKeysSerializer.serializeCreateApiKeyResponse(created);
   } catch (error) {
-    throw mintFailure(error, actor);
+    throw await mintFailure(error, actor);
   }
 }
 
@@ -216,7 +301,10 @@ async function createForAdminPlane(
  * its type: a driver error can carry statement parameters, and this path
  * handles a freshly generated credential.
  */
-function mintFailure(error: unknown, actor: AuditActor): TRPCError {
+async function mintFailure(
+  error: unknown,
+  actor: AuditActor,
+): Promise<TRPCError> {
   if (error instanceof TRPCError) return error;
   if (error instanceof ApiKeyMintRefusal) {
     return mintRefusalError(actor, error.rule);
@@ -235,6 +323,45 @@ function mintFailure(error: unknown, actor: AuditActor): TRPCError {
     message: "The API key could not be created.",
   });
 }
+
+/**
+ * Run a key lifecycle repository call inside a change's write, turning a rule
+ * refusal into the `AdminRuleRefusal` the audited transaction understands: it
+ * rolls the transaction back, records a `denied` row for `action` naming the
+ * rule after the rollback, and answers with the rule's code and sentence.
+ */
+async function lifecycleWrite<T>(
+  action: "apikey.reactivate" | "apikey.update" | "apikey.delete",
+  uuid: string,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (error) {
+    if (error instanceof ApiKeyLifecycleRefusal) {
+      throw new AdminRuleRefusal(error.code, error.message, {
+        action,
+        target_type: "api_key",
+        target_id: uuid,
+        detail: { rule: error.rule },
+      });
+    }
+    throw error;
+  }
+}
+
+/** An audit write failure as the fixed error every key write answers with. */
+function auditFailureAsTrpc(error: unknown): unknown {
+  if (error instanceof AdminAuditWriteError) {
+    return new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: ADMIN_AUDIT_WRITE_FAILED_MESSAGE,
+    });
+  }
+  return error;
+}
+
+const API_KEY_NOT_FOUND = "API key not found";
 
 export const apiKeysImplementations = {
   create: async (
@@ -540,6 +667,16 @@ export const apiKeysImplementations = {
       if (error instanceof TRPCError) {
         throw error;
       }
+      // The owner of a new admin-plane key is re-checked under its row lock
+      // in the insert's transaction (see ApiKeysRepository.create): an owner
+      // disabled or no longer an administrator by then is refused here.
+      if (error instanceof AdminPlaneOwnerIneligible) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "An admin-plane key's owner must be an enabled administrator.",
+        });
+      }
       logger.error("Error creating API key:", describeDbError(error));
       throw new Error(
         error instanceof Error ? error.message : "Internal server error",
@@ -558,7 +695,10 @@ export const apiKeysImplementations = {
    * rule names. Nothing of the request is echoed, and the refusal is recorded as
    * a denied `apikey.create` row.
    */
-  mintInputRefusal: (rawInput: unknown, actor: AuditActor): TRPCError => {
+  mintInputRefusal: async (
+    rawInput: unknown,
+    actor: AuditActor,
+  ): Promise<TRPCError> => {
     let rule: MintRule = "request_invalid";
     if (
       typeof rawInput === "object" &&
@@ -624,6 +764,17 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof UpdateApiKeyResponseSchema>> => {
+    // The broad update is a person's procedure: it can re-activate, rename or
+    // re-own any key for an administrator. An admin-plane key may not reach
+    // it (it is in neither admin-plane procedure set); refused here as well,
+    // so a future scope change cannot hand a key the power to re-activate or
+    // rename an admin-plane key, which the key action table keeps human.
+    if (actor?.admin_plane) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: ADMIN_PLANE_FORBIDDEN_MESSAGE,
+      });
+    }
     // Re-activation is an administrator's decision. A member may rename and
     // deactivate their own keys, but if they could also re-activate one, an
     // administrator's deactivation of it could be undone by that member, or
@@ -687,6 +838,14 @@ export const apiKeysImplementations = {
     isAdmin: boolean,
     actor?: AuditActor,
   ): Promise<z.infer<typeof DeleteApiKeyResponseSchema>> => {
+    // A person's procedure, like `update` above: refused to an admin-plane key
+    // here as well as by the procedure sets.
+    if (actor?.admin_plane) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: ADMIN_PLANE_FORBIDDEN_MESSAGE,
+      });
+    }
     try {
       // Admins bypass the ownership WHERE (may delete / revoke any key);
       // members stay owner-scoped.
@@ -726,8 +885,9 @@ export const apiKeysImplementations = {
    * The calling key is refused (the uuid is compared lowercased, since
    * Postgres reads a uuid case-insensitively and an upper-case spelling of the
    * caller's own uuid must not slip past): a key that locks itself out is not
-   * containment. Re-activation stays an administrator's act in the UI, so what
-   * an agent deactivates only a human can undo.
+   * containment. Re-activation is `reactivate` below, which only takes back a
+   * DATA-plane key the agent mint could create today; an admin-plane key a
+   * key deactivates is re-activated by a person in the UI.
    *
    * The state change and its `apikey.revoke` audit row (the verb the UI's
    * deactivation writes, with `detail.via = "deactivate"`) are one transaction
@@ -783,6 +943,242 @@ export const apiKeysImplementations = {
     );
   },
 
+  /**
+   * Re-activate one inactive DATA-plane key (`apiKeys.reactivate`). The rules
+   * are lib/api-key-lifecycle-rules, judged against the owner, endpoint and
+   * key rows the repository locks in this transaction, for every caller: never
+   * an admin-plane key or a key that acts as a user; an existing, enabled
+   * owner; an endpoint (or gateway-wide reach) the agent mint would allow that
+   * owner; and the key's own policy already a narrow enforce list. The policy
+   * is not touched. The state change and its `apikey.reactivate` row (the
+   * verb the UI's re-activation writes, with `detail.via = "reactivate"`) are
+   * one transaction, charged to an admin-plane caller's budget as `loosen`. An
+   * already-active key answers `changed: false` and records nothing.
+   */
+  reactivate: async (
+    input: z.infer<typeof ReactivateApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof ReactivateApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    let outcome: Awaited<
+      ReturnType<typeof apiKeysRepository.reactivateDataPlaneKey>
+    >;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) =>
+          lifecycleWrite("apikey.reactivate", uuid, () =>
+            apiKeysRepository.reactivateDataPlaneKey(tx, uuid),
+          ),
+        (written) =>
+          written.status === "reactivated"
+            ? {
+                action: "apikey.reactivate",
+                target_type: "api_key",
+                target_id: written.key.uuid,
+                detail: {
+                  name: written.key.name,
+                  owner_user_id: written.key.user_id,
+                  endpoint_uuid: written.key.endpoint_uuid,
+                  all_endpoints: written.key.endpoint_uuid === null,
+                  is_active: true,
+                  via: "reactivate",
+                  ip_policy: {
+                    mode: written.key.ip_policy_mode,
+                    allowed_cidrs: written.key.allowed_cidrs,
+                  },
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      throw auditFailureAsTrpc(error);
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    return ApiKeysSerializer.serializeDeactivatedApiKey(
+      outcome.key,
+      outcome.status === "reactivated",
+    );
+  },
+
+  /**
+   * Rename one DATA-plane key (`apiKeys.rename`): a name of the mint's shape,
+   * unused by the key's owner. The rename and its `apikey.update` row
+   * (`detail.via = "rename"`, with the old and new names) are one
+   * transaction. The current name answers `changed: false` and records
+   * nothing.
+   */
+  rename: async (
+    input: z.infer<typeof RenameApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof RenameApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    let outcome: Awaited<
+      ReturnType<typeof apiKeysRepository.renameDataPlaneKey>
+    >;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) =>
+          lifecycleWrite("apikey.update", uuid, () =>
+            apiKeysRepository.renameDataPlaneKey(tx, uuid, input.name),
+          ),
+        (written) =>
+          written.status === "renamed"
+            ? {
+                action: "apikey.update",
+                target_type: "api_key",
+                target_id: written.after.uuid,
+                detail: {
+                  via: "rename",
+                  previous_name: written.before.name,
+                  name: written.after.name,
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      throw auditFailureAsTrpc(error);
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    return {
+      uuid: outcome.after.uuid,
+      name: outcome.after.name,
+      previous_name: outcome.before.name,
+      key_prefix: ApiKeysSerializer.keyPrefix(outcome.after.last4),
+      is_active: outcome.after.is_active,
+      changed: outcome.status === "renamed",
+    };
+  },
+
+  /**
+   * The read a removal is prepared from: whether `apiKeys.remove` would accept
+   * this key now (and the rule that stops it when not), its snapshot and the
+   * fingerprint of its current state. Nothing here is credential material.
+   */
+  removalImpact: async (
+    input: z.infer<typeof ApiKeyRemovalImpactRequestSchema>,
+  ): Promise<z.infer<typeof ApiKeyRemovalImpactResponseSchema>> => {
+    let key;
+    try {
+      key = await apiKeysRepository.readLifecycleTarget(
+        input.uuid.toLowerCase(),
+      );
+    } catch (error) {
+      logger.error("Error reading an API key:", describeDbError(error));
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Internal server error",
+      });
+    }
+    if (!key) {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    const blockedBy = removalBlocker(key);
+    return {
+      uuid: key.uuid,
+      name: key.name,
+      removable: blockedBy === null,
+      blocked_by: blockedBy,
+      impact_fingerprint: apiKeyRemovalFingerprint(key),
+      snapshot: apiKeySnapshot(key),
+    };
+  },
+
+  /**
+   * Remove one key (`apiKeys.remove`), leaf-only: an inactive DATA-plane key,
+   * confirmed by its current name and by the fingerprint `removalImpact` read,
+   * both judged against the row locked in this transaction. The delete and
+   * its `apikey.delete` row (`detail.via = "remove"`, with the snapshot and
+   * the fingerprint) are one transaction, charged to an admin-plane caller's
+   * budget as `destroy`.
+   */
+  remove: async (
+    input: z.infer<typeof RemoveApiKeyRequestSchema>,
+    actor?: AuditActor,
+  ): Promise<z.infer<typeof RemoveApiKeyResponseSchema>> => {
+    const uuid = input.uuid.toLowerCase();
+    let outcome: Awaited<
+      ReturnType<typeof apiKeysRepository.removeDataPlaneKey>
+    >;
+    try {
+      outcome = await runAuditedTransaction(
+        actor,
+        (tx) =>
+          lifecycleWrite("apikey.delete", uuid, () =>
+            apiKeysRepository.removeDataPlaneKey(
+              tx,
+              uuid,
+              input.confirm_name,
+              input.impact_fingerprint,
+            ),
+          ),
+        (written) =>
+          written.status === "removed"
+            ? {
+                action: "apikey.delete",
+                target_type: "api_key",
+                target_id: written.key.uuid,
+                detail: {
+                  via: "remove",
+                  name: written.key.name,
+                  impact_fingerprint: input.impact_fingerprint,
+                  snapshot: apiKeySnapshot(written.key),
+                },
+              }
+            : null,
+      );
+    } catch (error) {
+      throw auditFailureAsTrpc(error);
+    }
+    if (outcome.status === "not_found") {
+      throw new TRPCError({ code: "NOT_FOUND", message: API_KEY_NOT_FOUND });
+    }
+    return {
+      uuid: outcome.key.uuid,
+      name: outcome.key.name,
+      removed: true as const,
+      snapshot: apiKeySnapshot(outcome.key),
+    };
+  },
+
+  /**
+   * What an operator-scope admin-plane key may call and the rules its changes
+   * must meet, derived from the scope sets in @repo/trpc and the budget the
+   * deploy environment configures. Nothing here is stored or caller-supplied,
+   * so the answer is the gateway's own contract, read at the moment of asking.
+   */
+  operatorCapabilities: async (
+    callerScope: "sync" | "operator" | null,
+  ): Promise<z.infer<typeof OperatorCapabilitiesResponseSchema>> => {
+    const budget = adminPlaneBudgetConfig();
+    return {
+      contract_version: ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+      caller_scope: callerScope,
+      procedures: [...ADMIN_PLANE_OPERATOR_PROCEDURES].sort(),
+      mutations: [...ADMIN_PLANE_OPERATOR_MUTATIONS].sort(),
+      reason: {
+        required_for_operator_scope: true,
+        max_length: CHANGE_REASON_MAX_LENGTH,
+        run_id_max_length: CHANGE_RUN_ID_MAX_LENGTH,
+      },
+      confirmations: Object.fromEntries(
+        Object.entries(ADMIN_PLANE_OPERATOR_CONFIRMATIONS).map(
+          ([procedure, fields]) => [procedure, [...fields]],
+        ),
+      ),
+      budget: {
+        window_seconds: budget.windowSeconds,
+        operator: { ...budget.operator },
+        sync: { ...budget.sync },
+      },
+    };
+  },
+
   // ---- IP allowlists (migration 0041), admin-only at the router ----
 
   setIpPolicy: async (
@@ -810,18 +1206,12 @@ export const apiKeysImplementations = {
     const changesOwnPolicy =
       callerKeyUuid !== undefined && input.uuid.toLowerCase() === callerKeyUuid;
 
+    let policyWidened = false;
+
     const result = await withAdminAudit(
       actor,
       async (...tx) => {
-        // Second half of rule 5: an admin-plane key may leave a DATA-plane key
-        // only a narrow enforce policy of its own, so a key that was created
-        // locked cannot be unlocked or widened by a later call (a human
-        // administrator's change in the UI is not held to it). Judged against
-        // the target as locked in this transaction. The key's own row is
-        // skipped: it is an admin-plane key by definition, and taking its row
-        // lock here would run ahead of the config locks the own-policy rail
-        // below takes first.
-        if (actor?.admin_plane && !changesOwnPolicy) {
+        if (actor?.admin_plane) {
           const handle = tx[0];
           if (!handle) {
             // Unreachable: an admin-plane actor always gets a transaction.
@@ -830,11 +1220,56 @@ export const apiKeysImplementations = {
               message: "Internal server error",
             });
           }
+          // Lock order (db/repositories/admin-plane-locks): the global
+          // policy's config locks, shared, BEFORE the key row, whatever the
+          // target turns out to be. setGlobalIpPolicy takes them first too, so
+          // the two cannot deadlock, and a target that follows the global
+          // policy is judged against the policy as it will be at commit.
+          const global = followedGlobalPolicy(
+            await configService.getApiKeyIpPolicyInTransaction(handle),
+          );
           const target = await apiKeysRepository.lockPolicyTarget(
             handle,
             input.uuid,
           );
-          if (target && !target.admin_plane) {
+          if (target) {
+            // Compare actual address sets under both locks. A list within
+            // the mint's prefix bound can still widen the previous policy.
+            policyWidened = !admitsNoMoreThan(
+              admittedAddresses(
+                allowedCidrs === null
+                  ? global
+                  : { mode: input.ip_policy_mode, cidrs: allowedCidrs },
+              ),
+              admittedAddresses(currentEffectivePolicy(target, global)),
+            );
+          }
+          if (target?.admin_plane) {
+            // The IP rail: an admin-plane key may only NARROW an admin-plane
+            // key's policy, its own included, judged against the target's
+            // current effective policy as locked here. A human administrator's
+            // change in the UI is not held to it.
+            const rule = adminPlaneIpPolicyChangeRule(
+              currentEffectivePolicy(target, global),
+              { mode: input.ip_policy_mode, cidrs: allowedCidrs },
+            );
+            if (rule) {
+              throw new AdminRuleRefusal(
+                "FORBIDDEN",
+                ADMIN_PLANE_KEY_IP_POLICY_REFUSAL,
+                {
+                  action: "apikey.ip_policy.set",
+                  target_type: "api_key",
+                  target_id: input.uuid.toLowerCase(),
+                  detail: { rule },
+                },
+              );
+            }
+          } else if (target && !changesOwnPolicy) {
+            // Second half of rule 5: an admin-plane key may leave a DATA-plane
+            // key only a narrow enforce policy of its own, so a key that was
+            // created locked cannot be unlocked or widened by a later call (a
+            // human administrator's change in the UI is not held to it).
             try {
               assertAgentSettableIpPolicy({
                 mode: input.ip_policy_mode,
@@ -844,47 +1279,36 @@ export const apiKeysImplementations = {
               if (error instanceof ApiKeyMintRefusal) {
                 // Lower case, the way the key's own row spells its uuid, so a
                 // query by the canonical uuid finds the denial too.
-                recordRefusal(
-                  actor,
-                  "apikey.ip_policy.set",
-                  error.rule,
-                  input.uuid.toLowerCase(),
-                );
-                throw new TRPCError({
-                  code: error.code,
-                  message: error.message,
+                throw new AdminRuleRefusal(error.code, error.message, {
+                  action: "apikey.ip_policy.set",
+                  target_type: "api_key",
+                  target_id: input.uuid.toLowerCase(),
+                  detail: { rule: error.rule },
                 });
               }
               throw error;
             }
           }
-        }
-        if (changesOwnPolicy) {
-          const handle = tx[0];
-          if (!handle) {
-            // Unreachable: an admin-plane actor always gets a transaction.
-            throw new TRPCError({
-              code: "INTERNAL_SERVER_ERROR",
-              message: "Internal server error",
-            });
-          }
-          // Taken first, in the order setGlobalIpPolicy takes them (the config
-          // locks, then the key row), so the two cannot deadlock. A key that
-          // is about to follow the global policy is judged against the global
-          // policy as it will be when this commits.
-          const effective =
-            allowedCidrs === null
-              ? followedGlobalPolicy(
-                  await configService.getApiKeyIpPolicyInTransaction(handle),
-                )
-              : { mode: input.ip_policy_mode, cidrs: allowedCidrs };
-          const refusal = selfLockoutRefusal(
-            effective,
-            actor?.actor_ip,
-            allowedCidrs === null ? "globalList" : "ownList",
-          );
-          if (refusal) {
-            throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+          if (changesOwnPolicy) {
+            // A key that is about to follow the global policy is judged
+            // against the global policy as it will be when this commits.
+            const effective =
+              allowedCidrs === null
+                ? global
+                : { mode: input.ip_policy_mode, cidrs: allowedCidrs };
+            const refusal = selfLockoutRefusal(
+              effective,
+              actor?.actor_ip,
+              allowedCidrs === null ? "globalList" : "ownList",
+            );
+            if (refusal) {
+              throw new AdminRuleRefusal("BAD_REQUEST", refusal, {
+                action: "apikey.ip_policy.set",
+                target_type: "api_key",
+                target_id: input.uuid.toLowerCase(),
+                detail: { rule: "ip_policy_self_lockout" },
+              });
+            }
           }
         }
         return apiKeysRepository.setIpPolicy(
@@ -907,6 +1331,9 @@ export const apiKeysImplementations = {
               target_id: input.uuid,
               detail: {
                 name: written.after.name,
+                ...(actor?.admin_plane
+                  ? { policy_widened: policyWidened }
+                  : {}),
                 old_value: written.before,
                 new_value: {
                   allowed_cidrs: written.after.allowed_cidrs,
@@ -964,6 +1391,23 @@ export const apiKeysImplementations = {
               message: "Internal server error",
             });
           }
+          // The IP rail: an admin-plane key may not WEAKEN the global policy,
+          // in mode or in the addresses it admits, whether or not it follows
+          // the policy itself. Judged on the value this write replaced, read
+          // under the exclusive config locks it took (not a pre-read), so no
+          // concurrent writer can change what is compared.
+          if (!isNoWeakerPolicy(snapshots.before, snapshots.after)) {
+            throw new AdminRuleRefusal(
+              "FORBIDDEN",
+              ADMIN_PLANE_GLOBAL_IP_POLICY_REFUSAL,
+              {
+                action: "config.api_key_ip_policy.set",
+                target_type: "config_key",
+                target_id: "API_KEY_IP_POLICY",
+                detail: { rule: "ip_policy_global_weaker" },
+              },
+            );
+          }
           const refusal = await globalPolicyRefusalForCaller(
             handle,
             callerKeyUuid,
@@ -971,7 +1415,12 @@ export const apiKeysImplementations = {
             snapshots.after,
           );
           if (refusal) {
-            throw new TRPCError({ code: "BAD_REQUEST", message: refusal });
+            throw new AdminRuleRefusal("BAD_REQUEST", refusal, {
+              action: "config.api_key_ip_policy.set",
+              target_type: "config_key",
+              target_id: "API_KEY_IP_POLICY",
+              detail: { rule: "ip_policy_self_lockout" },
+            });
           }
         }
         return snapshots;

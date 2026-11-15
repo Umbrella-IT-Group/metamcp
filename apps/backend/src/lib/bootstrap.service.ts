@@ -16,8 +16,10 @@ import {
 } from "../db/schema";
 import { apiKeyLast4, hashApiKey } from "./api-key-hash";
 import { emitAdminEvent } from "./audit/admin-event";
+import { applyBootstrapEndpoint } from "./bootstrap-endpoint-gate";
 import { setBootstrapSignupAllowed } from "./bootstrap-signup-override";
 import { describeDbError } from "./db-error-summary";
+import { ENDPOINT_GATE_REFUSALS } from "./endpoint-namespace-gate";
 import {
   MIN_BOOTSTRAP_PASSWORD_LENGTH,
   SHIPPED_PLACEHOLDER_AUTH_SECRET,
@@ -1600,30 +1602,37 @@ async function bootstrapEndpoints(
         updated_at: new Date(),
       };
 
-      if (!existing) {
-        await db.insert(endpointsTable).values(values);
+      if (existing && !shouldUpdate) {
+        console.log(`✓ Endpoint "${name}" already exists (no update)`);
+        continue;
+      }
+
+      // Written under the endpoint namespace gate, in its own transaction and
+      // locks (lib/bootstrap-endpoint-gate): a create or move that would open
+      // a namespace a restricted endpoint guards is refused and reported, and
+      // nothing of it is written.
+      const outcome = await applyBootstrapEndpoint(
+        values,
+        existing ? existing.uuid : null,
+      );
+      if (outcome.status === "refused") {
+        console.warn(
+          `⚠️ Skipping endpoint "${name}": refused by the endpoint namespace gate (${outcome.rule}). ${ENDPOINT_GATE_REFUSALS[outcome.rule].message}`,
+        );
+        continue;
+      }
+      const namespaceInfo = namespaceName
+        ? ` in namespace "${namespaceName}"`
+        : "";
+      if (outcome.status === "created") {
         const ownerInfo = ownerUserId
           ? `for user ${ownerEmail ?? Array.from(userMap.keys())[0]}`
           : "(public)";
-        const namespaceInfo = namespaceName
-          ? ` in namespace "${namespaceName}"`
-          : "";
         console.log(
           `✓ Created ${isPublic ? "public" : "private"} endpoint "${name}" ${ownerInfo}${namespaceInfo}`,
         );
       } else {
-        if (shouldUpdate) {
-          await db
-            .update(endpointsTable)
-            .set(values)
-            .where(eq(endpointsTable.uuid, existing.uuid));
-          const namespaceInfo = namespaceName
-            ? ` in namespace "${namespaceName}"`
-            : "";
-          console.log(`✓ Updated endpoint "${name}"${namespaceInfo}`);
-        } else {
-          console.log(`✓ Endpoint "${name}" already exists (no update)`);
-        }
+        console.log(`✓ Updated endpoint "${name}"${namespaceInfo}`);
       }
     } catch (err) {
       console.warn(

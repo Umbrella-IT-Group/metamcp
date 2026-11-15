@@ -7,9 +7,9 @@
  * must always name one existing enabled owner and exactly one scope; must be
  * locked to a short network list that cannot reach more than an IPv4 /24 by any
  * spelling; and a refusal must say one fixed sentence that echoes nothing of
- * the request. The oracle for every expected value is the mint amendment's
- * rules 1 to 6 (private plan, admin-plane-mint, "What agents may mint") and its
- * foreman decision 1; the CIDR cases are checked against node:net BlockList,
+ * the request. The expected values follow the six
+ * mint rules documented in api-key-mint-rules.ts; the CIDR cases are
+ * checked against node:net BlockList,
  * the code that evaluates a stored list at request time.
  */
 
@@ -177,6 +177,10 @@ describe("rule 6: a name of the usual shape", () => {
     ["101 characters", "a".repeat(101)],
     ["with a slash", "bad/name"],
     ["with a dot", "bad.name"],
+    ["with a newline", "line1\nline2"],
+    ["with a tab", "tab\there"],
+    ["with a no-break space", "no-break\u00a0space"],
+    ["with a line separator", "line\u2028separator"],
     ["a number", 7],
   ])("refuses a name that is %s", (_label, value) => {
     expect(refusalOf({ ...valid(), name: value })).toBe("name_invalid");

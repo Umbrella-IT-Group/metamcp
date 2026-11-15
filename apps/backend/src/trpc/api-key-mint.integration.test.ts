@@ -37,7 +37,11 @@ import type express from "express";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { createFixture, type Fixture } from "./admin-plane-integration-fixture";
+import {
+  createFixture,
+  DEFAULT_REASON,
+  type Fixture,
+} from "./admin-plane-integration-fixture";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const describeIfDb = describe.skipIf(!TEST_DATABASE_URL);
@@ -345,6 +349,8 @@ describeIfDb(
           target_type: "api_key",
           outcome: "success",
         });
+        // TEST-EDIT (change reason and budget): every admin-plane change's row now also carries the
+        // caller's reason and the budget class it was counted in.
         expect(rows[0].detail).toEqual({
           name,
           owner_user_id: fx.memberId,
@@ -354,6 +360,8 @@ describeIfDb(
           key_admin_plane: false,
           key_admin_plane_scope: "sync",
           ip_policy: { mode: "enforce", allowed_cidrs: ["203.0.113.0/24"] },
+          reason: DEFAULT_REASON,
+          budget_class: "loosen",
           admin_plane: {
             key_uuid: fx.operator.uuid,
             owner_user_id: fx.ownerId,
@@ -1205,7 +1213,7 @@ describeIfDb(
         // The owner is an ordinary member in no group. Oracle: OAuth reach is
         // public endpoints for any authenticated user, a private endpoint for its
         // owner only, and a restricted endpoint for administrators and group
-        // members only (plan, foreman decision 1).
+        // members only.
         const ownerOAuthReach = (e: {
           uuid: string;
           owner: string | null;
@@ -1556,8 +1564,25 @@ describeIfDb(
             ).status,
           ).toBe(403);
         } finally {
+          // TEST-EDIT (IP rail): an
+          // admin-plane key may now only NARROW an admin-plane key's policy,
+          // its own included, so the key's own attempt to go back to following
+          // the global policy is refused and changes nothing. The suite then
+          // restores the row through its own connection, as an administrator
+          // would in the admin UI.
           const restored = await own(null, "off");
-          expect(restored.status).toBe(200);
+          expect({ status: restored.status, code: restored.code }).toEqual({
+            status: 403,
+            code: "FORBIDDEN",
+          });
+          expect(await policyOf()).toEqual({
+            allowed_cidrs: ["203.0.113.0/24"],
+            ip_policy_mode: "enforce",
+          });
+          await fx.suiteLock.query(
+            `UPDATE api_keys SET allowed_cidrs = NULL, ip_policy_mode = 'off' WHERE uuid = $1`,
+            [fx.operator.uuid],
+          );
         }
         expect(await policyOf()).toEqual({
           allowed_cidrs: null,
@@ -1612,7 +1637,9 @@ describeIfDb(
           expect(accepted.status).toBe(200);
           expect(
             await fx.auditNow(
-              `action = 'config.api_key_ip_policy.set' AND actor_id = $1`,
+              // TEST-EDIT: self-lockout refusals now have denied rows too;
+              // this assertion counts only the committed policy change.
+              `action = 'config.api_key_ip_policy.set' AND actor_id = $1 AND outcome = 'success'`,
               [fx.operator.uuid],
             ),
           ).toHaveLength(1);
@@ -1623,8 +1650,20 @@ describeIfDb(
           // (The case where the followed list excludes the caller cannot be
           // staged over HTTP, because the gateway would refuse the call itself;
           // api-keys.impl.rails.test.ts covers it.)
+          //
+          // TEST-EDIT (IP rail): following the
+          // global policy is no longer a change an admin-plane key may make to
+          // an admin-plane key's policy, even one that already follows it, so
+          // this step is now refused, with nothing written.
           const follow = await own(null, "off");
-          expect(follow.status).toBe(200);
+          expect({ status: follow.status, code: follow.code }).toEqual({
+            status: 403,
+            code: "FORBIDDEN",
+          });
+          expect(await policyOf()).toEqual({
+            allowed_cidrs: null,
+            ip_policy_mode: "off",
+          });
         } finally {
           await restoreGlobal();
         }
@@ -1666,9 +1705,8 @@ describeIfDb(
       // leaves no distinct signal, while an out-of-scope call is a denial.
       //
       // Each probe is sent from an address of its own and its row is found by
-      // that address, not by a time window: a refusal's row is written detached,
-      // after the response, and a row from an earlier probe (or test) that lands
-      // after a timestamp taken now would match that window too.
+      // that address, not by a time window, so the row is tied to this
+      // request alone even when other audit writes arrive concurrently.
       const deniedFrom = (ip: string) =>
         fx.auditEventually(
           `action = 'apikey.create' AND outcome = 'denied' AND actor_id = $1 AND actor_ip = $2`,
@@ -1766,8 +1804,13 @@ describeIfDb(
             target_id: null,
             outcome: "denied",
           });
+          // TEST-EDIT (change reason): the
+          // caller's reason now rides on its denied row too, so the trail
+          // says why a refused change was attempted. Still nothing of the
+          // request itself.
           expect(rows[0].detail).toEqual({
             rule,
+            reason: DEFAULT_REASON,
             admin_plane: {
               key_uuid: fx.operator.uuid,
               owner_user_id: fx.ownerId,
@@ -1779,6 +1822,48 @@ describeIfDb(
           const text = JSON.stringify(rows);
           for (const value of [fx.memberId, epPrivateMember, "0.0.0.0/0"]) {
             expect(text).not.toContain(value);
+          }
+        },
+      );
+
+      it.each([
+        [
+          "a schema refusal",
+          () => ({
+            ip_policy: { mode: "off", allowed_cidrs: ["203.0.113.0/24"] },
+          }),
+          400,
+        ],
+        ["a request rule refusal", () => ({ ip_policy: undefined }), 400],
+        [
+          "a transaction rule refusal",
+          () => ({ endpoint_uuid: epPrivateMember }),
+          403,
+        ],
+      ] as const)(
+        "waits for the denied row before answering %s",
+        async (_label, over, status) => {
+          const ip = fx.uniqueIp();
+          const release = await fx.stallAuditWrites();
+          const pending = mint(over(), { ip });
+          try {
+            expect(
+              await Promise.race([
+                pending.then(() => "responded"),
+                new Promise((resolve) => setTimeout(resolve, 100, "waiting")),
+              ]),
+            ).toBe("waiting");
+            await release();
+            expect((await pending).status).toBe(status);
+            expect(
+              await fx.auditNow(
+                `action = 'apikey.create' AND outcome = 'denied' AND actor_id = $1 AND actor_ip = $2`,
+                [fx.operator.uuid, ip],
+              ),
+            ).toHaveLength(1);
+          } finally {
+            await release();
+            await pending;
           }
         },
       );
@@ -1872,11 +1957,7 @@ describeIfDb(
       );
 
       // The row of one refusal, found by the address that request alone came
-      // from. Not by a time window: the refusals above wrote their rows
-      // detached, after their responses, and the database stamps a detached
-      // write when it starts, so one can land after a timestamp taken here and
-      // match it (a count of 4 instead of 1, or a pass on the wrong request's
-      // row, whose rule is the same).
+      // from, rather than by a time window that could match another request.
       const refusalWhere = `action = 'apikey.ip_policy.set' AND outcome = 'denied' AND target_id = $1 AND actor_ip = $2`;
       const refusalRows = (ip: string) =>
         fx.auditEventually(refusalWhere, [minted, ip]);
@@ -1899,30 +1980,22 @@ describeIfDb(
         );
       });
 
-      it("finds a refusal's row by its own address even though the write outlives the response", async () => {
-        // The case the check above must survive, made to happen every time: the
-        // response is back and the row is not, because the audit writer is
-        // detached. `auditSettled` has to wait for it, and the row is then
-        // there with no polling.
+      // TEST-EDIT: refusals now await their denied rows after rollback, so
+      // holding the audit insert must hold the response as well.
+      it("waits for the denied row before answering a policy refusal", async () => {
         const release = await fx.stallAuditWrites();
+        const ip = fx.uniqueIp();
+        const pending = setPolicy(["10.0.0.0/8"], "enforce", { ip });
         try {
-          const ip = fx.uniqueIp();
-          const reply = await setPolicy(["10.0.0.0/8"], "enforce", { ip });
-          expect(reply.status).toBe(400);
-          expect(await fx.auditNow(refusalWhere, [minted, ip])).toHaveLength(0);
-
-          const settled = fx.auditSettled().then(() => "settled");
-          // Nothing can finish while the stall is closed, so a helper that
-          // returns now is wrong; the timer only bounds how long it is watched.
           expect(
             await Promise.race([
-              settled,
+              pending.then(() => "responded"),
               new Promise((resolve) => setTimeout(resolve, 100, "waiting")),
             ]),
           ).toBe("waiting");
 
           await release();
-          await settled;
+          expect((await pending).status).toBe(400);
           const rows = await fx.auditNow(refusalWhere, [minted, ip]);
           expect(rows).toHaveLength(1);
           expect((rows[0].detail as { rule: string }).rule).toBe(
@@ -1930,6 +2003,7 @@ describeIfDb(
           );
         } finally {
           await release();
+          await pending;
         }
       });
 
@@ -1970,28 +2044,89 @@ describeIfDb(
         });
       });
 
-      it("does not hold the policy of an admin-plane key to the bound", async () => {
-        // The CI key is locked to any address on purpose (its runners rotate).
-        const ci = await fx.trpc(
-          "frontend.apiKeys.setIpPolicy",
-          {
-            uuid: fx.sync.uuid,
-            allowed_cidrs: ["0.0.0.0/0", "::/0"],
+      // TEST-EDIT (IP rail, a deliberate
+      // reversal of part of this case): it pinned that an admin-plane key
+      // could set an admin-plane key's policy to anything, the any-IP
+      // exemption and following the global policy included. An admin-plane
+      // key may now only NARROW an admin-plane key's policy. What still holds
+      // is the first half of the name: the data-plane width bound does not
+      // apply, so a narrowing to a list wider than /24 is accepted.
+      it("does not hold the policy of an admin-plane key to the bound, and lets an admin-plane key only narrow it", async () => {
+        const policyOfCi = async () =>
+          (
+            await fx.suiteLock.query(
+              `SELECT allowed_cidrs, ip_policy_mode FROM api_keys WHERE uuid = $1`,
+              [fx.sync.uuid],
+            )
+          ).rows[0];
+        try {
+          // From following an off global policy (which admits everything) the
+          // any-IP exemption is not a narrowing: refused, nothing written.
+          const anyIp = await fx.trpc(
+            "frontend.apiKeys.setIpPolicy",
+            {
+              uuid: fx.sync.uuid,
+              allowed_cidrs: ["0.0.0.0/0", "::/0"],
+              ip_policy_mode: "enforce",
+            },
+            "mutation",
+          );
+          expect({ status: anyIp.status, code: anyIp.code }).toEqual({
+            status: 403,
+            code: "FORBIDDEN",
+          });
+          expect(await policyOfCi()).toEqual({
+            allowed_cidrs: null,
+            ip_policy_mode: "off",
+          });
+
+          // A /8 is far wider than the data-plane bound and still a narrowing.
+          const narrowed = await fx.trpc(
+            "frontend.apiKeys.setIpPolicy",
+            {
+              uuid: fx.sync.uuid,
+              allowed_cidrs: ["10.0.0.0/8"],
+              ip_policy_mode: "enforce",
+            },
+            "mutation",
+          );
+          expect(narrowed.status).toBe(200);
+          expect(await policyOfCi()).toEqual({
+            allowed_cidrs: ["10.0.0.0/8"],
             ip_policy_mode: "enforce",
-          },
-          "mutation",
-        );
-        expect(ci.status).toBe(200);
-        const { rows } = await fx.suiteLock.query(
-          `SELECT allowed_cidrs FROM api_keys WHERE uuid = $1`,
-          [fx.sync.uuid],
-        );
-        expect(rows[0].allowed_cidrs).toEqual(["0.0.0.0/0", "::/0"]);
-        await fx.trpc(
-          "frontend.apiKeys.setIpPolicy",
-          { uuid: fx.sync.uuid, allowed_cidrs: null, ip_policy_mode: "off" },
-          "mutation",
-        );
+          });
+
+          // Widening it again, or turning it off, is refused.
+          for (const [allowed, mode] of [
+            [["10.0.0.0/7"], "enforce"],
+            [["10.0.0.0/8"], "off"],
+            [null, "off"],
+          ] as const) {
+            const widened = await fx.trpc(
+              "frontend.apiKeys.setIpPolicy",
+              {
+                uuid: fx.sync.uuid,
+                allowed_cidrs: allowed,
+                ip_policy_mode: mode,
+              },
+              "mutation",
+            );
+            expect({ status: widened.status, code: widened.code }).toEqual({
+              status: 403,
+              code: "FORBIDDEN",
+            });
+          }
+          expect(await policyOfCi()).toEqual({
+            allowed_cidrs: ["10.0.0.0/8"],
+            ip_policy_mode: "enforce",
+          });
+        } finally {
+          // Restored as an administrator would, outside the key.
+          await fx.suiteLock.query(
+            `UPDATE api_keys SET allowed_cidrs = NULL, ip_policy_mode = 'off' WHERE uuid = $1`,
+            [fx.sync.uuid],
+          );
+        }
       });
 
       it("answers NOT_FOUND for a key that does not exist, whatever the policy", async () => {
@@ -2070,12 +2205,18 @@ describeIfDb(
         const name = `clone-${fx.run}`;
         const reply = await createEndpoint(name, fx.publicNamespaceUuid);
 
-        // `success: false` inside an HTTP 200, like the rules beside it.
-        expect(reply.status).toBe(200);
-        const body = reply.data as { success: boolean; message: string };
-        expect(body.success).toBe(false);
-        expect(body.message).toBe(
-          "An admin-plane API key cannot make a namespace public that a restricted or private endpoint already serves. Do this in the admin UI.",
+        // TEST-EDIT (endpoint namespace gate):
+        // the refusal is now a coded CONFLICT (HTTP 409), not `success: false`
+        // inside an HTTP 200, which a caller's tooling cannot tell from an
+        // unknown outcome. The namespace holds a restricted endpoint, so the
+        // gate's rule for every writer answers before the admin-plane publish
+        // rule would.
+        expect({ status: reply.status, code: reply.code }).toEqual({
+          status: 409,
+          code: "CONFLICT",
+        });
+        expect(reply.message).toBe(
+          "Another endpoint over this namespace is restricted, so a new endpoint over it must be restricted too. Create it with restricted on, then map its access groups.",
         );
         expect(await endpointRow(name)).toBeUndefined();
       });
@@ -2109,20 +2250,44 @@ describeIfDb(
           "mutation",
         );
 
-        expect((reply.data as { success: boolean }).success).toBe(false);
+        // TEST-EDIT (endpoint namespace gate): a coded CONFLICT, not `success: false` inside an HTTP 200.
+        expect({ status: reply.status, code: reply.code }).toEqual({
+          status: 409,
+          code: "CONFLICT",
+        });
         expect((await endpointRow(name))?.namespace_uuid).toBe(freshNamespace);
       });
 
-      it("does not hold an administrator's session to the rule", async () => {
-        const name = `human-${fx.run}`;
-        created.push(name);
-        const reply = await createEndpoint(
-          name,
+      // TEST-EDIT (endpoint namespace gate,
+      // a deliberate reversal): this case pinned that an administrator's
+      // session was not held to the rule. The gate now applies to every
+      // writer, a person's session included, because the race it closes is
+      // the admin UI's: an administrator's open endpoint over a namespace a
+      // restricted endpoint guards opens that namespace to everyone. The
+      // session is refused an unrestricted endpoint there and may create a
+      // restricted one.
+      it("refuses an administrator's session an unrestricted endpoint over a namespace a restricted endpoint serves, and allows it restricted", async () => {
+        const open = `human-${fx.run}`;
+        const refused = await createEndpoint(
+          open,
           fx.publicNamespaceUuid,
           {},
           { cookie: fx.ownerCookie },
         );
+        expect({ status: refused.status, code: refused.code }).toEqual({
+          status: 409,
+          code: "CONFLICT",
+        });
+        expect(await endpointRow(open)).toBeUndefined();
 
+        const guarded = `human-restricted-${fx.run}`;
+        created.push(guarded);
+        const reply = await createEndpoint(
+          guarded,
+          fx.publicNamespaceUuid,
+          { restricted: true },
+          { cookie: fx.ownerCookie },
+        );
         expect((reply.data as { success: boolean }).success).toBe(true);
       });
     });

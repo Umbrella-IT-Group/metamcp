@@ -29,8 +29,8 @@ import {
 } from "@repo/zod-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { repoMock, loggerMock, txAudit, runnerMock, emitMock } = vi.hoisted(
-  () => ({
+const { repoMock, loggerMock, txAudit, runnerMock, emitMock, denialMock } =
+  vi.hoisted(() => ({
     repoMock: {
       create: vi.fn(),
       mintDataPlaneKey: vi.fn(),
@@ -47,8 +47,8 @@ const { repoMock, loggerMock, txAudit, runnerMock, emitMock } = vi.hoisted(
     },
     runnerMock: { transactions: 0, handles: [] as unknown[] },
     emitMock: vi.fn(),
-  }),
-);
+    denialMock: vi.fn(async (_event: unknown) => undefined),
+  }));
 
 vi.mock("@/utils/logger", () => ({ default: loggerMock }));
 vi.mock("../db/repositories", () => ({
@@ -85,6 +85,20 @@ vi.mock("../db/index", () => ({
 }));
 vi.mock("../db/repositories/audit-log-tx", () => ({
   recordAuditInTransaction: txAudit.record,
+}));
+// TEST-EDIT: denied rows are now awaited through the audit repository after
+// rollback, while successful human changes keep their detached emitter.
+vi.mock("../db/repositories/audit-log.repo", () => ({
+  auditLogRepository: { record: denialMock },
+}));
+// TEST-EDIT (change budget): an admin-plane
+// change now opens the key's change budget inside its transaction (a lock and
+// a count statement), which this suite's stand-in transaction cannot run. The
+// budget is pinned in admin-plane-budget.test.ts and against Postgres in
+// admin-plane-rails.integration.test.ts; here it is opened as "no budget".
+vi.mock("../lib/admin-plane-budget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/admin-plane-budget")>()),
+  openBudget: vi.fn(async () => null),
 }));
 
 const { apiKeysImplementations } = await import("./api-keys.impl");
@@ -140,6 +154,7 @@ const everything = () =>
     repoMock.create.mock.calls,
     txAudit.record.mock.calls,
     emitMock.mock.calls,
+    denialMock.mock.calls,
     loggerMock.debug.mock.calls,
     loggerMock.info.mock.calls,
     loggerMock.warn.mock.calls,
@@ -152,16 +167,17 @@ const everything = () =>
  */
 const expectOnlyDenial = (rule: string) => {
   expect(txAudit.record).not.toHaveBeenCalled();
-  expect(emitMock).toHaveBeenCalledTimes(1);
-  const [actor, event] = emitMock.mock.calls[0];
-  expect(event).toEqual({
+  expect(emitMock).not.toHaveBeenCalled();
+  expect(denialMock).toHaveBeenCalledTimes(1);
+  const [event] = denialMock.mock.calls[0];
+  expect(event).toMatchObject({
     action: "apikey.create",
     target_type: "api_key",
     outcome: "denied",
-    detail: { rule },
-  });
-  expect(actor).toMatchObject({
-    admin_plane: { key_uuid: OPERATOR_KEY_UUID, scope: "operator" },
+    detail: {
+      rule,
+      admin_plane: { key_uuid: OPERATOR_KEY_UUID, scope: "operator" },
+    },
   });
 };
 
@@ -321,8 +337,8 @@ describe("every rule refuses before anything is written", () => {
     ] as const) {
       vi.clearAllMocks();
       await call(mintInput(), actor, admin).catch(() => undefined);
-      expect(emitMock).toHaveBeenCalledTimes(1);
-      expect(emitMock.mock.calls[0][1]).toMatchObject({
+      expect(denialMock).toHaveBeenCalledTimes(1);
+      expect(denialMock.mock.calls[0][0]).toMatchObject({
         action: "apikey.create",
         outcome: "denied",
         detail: { rule: "caller_not_operator" },
@@ -340,7 +356,7 @@ describe("every rule refuses before anything is written", () => {
       }),
     ).catch(() => undefined);
 
-    const written = JSON.stringify(emitMock.mock.calls);
+    const written = JSON.stringify(denialMock.mock.calls);
     for (const probe of ["probe/name", "gamma", "delta", "10.1.2.0"]) {
       expect(written).not.toContain(probe);
     }
@@ -415,8 +431,8 @@ describe("a create request the input schema refused", () => {
 
   it.each(cases)(
     "answers %s with the rule's own sentence",
-    (_label, raw, rule) => {
-      const refusal = apiKeysImplementations.mintInputRefusal(
+    async (_label, raw, rule) => {
+      const refusal = await apiKeysImplementations.mintInputRefusal(
         raw,
         operatorActor as never,
       );
@@ -436,8 +452,8 @@ describe("a create request the input schema refused", () => {
     ["null", null],
     ["an array", []],
     ["a request every rule accepts", mintInput()],
-  ])("answers %s with the generic sentence", (_label, raw) => {
-    const refusal = apiKeysImplementations.mintInputRefusal(
+  ])("answers %s with the generic sentence", async (_label, raw) => {
+    const refusal = await apiKeysImplementations.mintInputRefusal(
       raw,
       operatorActor as never,
     );

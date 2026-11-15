@@ -58,6 +58,16 @@ type Schema = typeof import("../schema");
 let db: Db;
 let schema: Schema;
 let repo: (typeof import("./access-groups.repo"))["accessGroupsRepository"];
+let gate: (typeof import("./endpoint-gate.repo"))["endpointGateRepository"];
+
+// TEST-EDIT (REFACTOR): the restricted switch has one writer, the endpoint
+// gate repository's setRestricted (the repository's own unguarded writer was
+// removed as dead code), so the cases below drive it, in a transaction as it
+// is always called, with a person as the actor (no key).
+const setRestricted = (endpointUuid: string, restricted: boolean) =>
+  db.transaction((tx) =>
+    gate.setRestricted(tx, endpointUuid, restricted, null),
+  );
 
 beforeAll(async () => {
   if (!TEST_DATABASE_URL) return;
@@ -69,6 +79,7 @@ beforeAll(async () => {
   ({ db } = await import("../index"));
   schema = await import("../schema");
   ({ accessGroupsRepository: repo } = await import("./access-groups.repo"));
+  ({ endpointGateRepository: gate } = await import("./endpoint-gate.repo"));
 
   // Serialize against every other TEST_DATABASE_URL suite before touching a
   // shared table — vitest runs test FILES in parallel workers and this one
@@ -381,8 +392,8 @@ describeIfDb("read shapes the admin UI depends on", () => {
     ]);
   });
 
-  it("setEndpointRestricted flips the gate and reports the new state", async () => {
-    const updated = await repo.setEndpointRestricted(ENDPOINT_A, true);
+  it("setRestricted flips the gate and reports the new state", async () => {
+    const updated = await setRestricted(ENDPOINT_A, true);
     expect(updated?.restricted).toBe(true);
 
     const [row] = await db
@@ -394,19 +405,19 @@ describeIfDb("read shapes the admin UI depends on", () => {
     // Restricting did not turn the scoped-key requirement on, and turning the
     // gate off leaves it as it was: the two are independent switches.
     expect(updated?.require_scoped_api_key).toBe(false);
-    const off = await repo.setEndpointRestricted(ENDPOINT_A, false);
+    const off = await setRestricted(ENDPOINT_A, false);
     expect(off?.restricted).toBe(false);
     expect(off?.require_scoped_api_key).toBe(false);
     await db
       .update(schema.endpointsTable)
       .set({ require_scoped_api_key: true })
       .where(eq(schema.endpointsTable.uuid, ENDPOINT_A));
-    const on = await repo.setEndpointRestricted(ENDPOINT_A, true);
+    const on = await setRestricted(ENDPOINT_A, true);
     expect(on?.restricted).toBe(true);
     expect(on?.require_scoped_api_key).toBe(true);
-    const back = await repo.setEndpointRestricted(ENDPOINT_A, false);
+    const back = await setRestricted(ENDPOINT_A, false);
     expect(back?.require_scoped_api_key).toBe(true);
-    await repo.setEndpointRestricted(ENDPOINT_A, true);
+    await setRestricted(ENDPOINT_A, true);
 
     // And the sibling endpoint was not swept along with it.
     const untouched = await db
@@ -441,9 +452,9 @@ describeIfDb("read shapes the admin UI depends on", () => {
     expect(await repo.hasEndpointGrant(MEMBER_ID, ENDPOINT_A)).toBe(false);
   });
 
-  it("setEndpointRestricted on an unknown endpoint returns undefined", async () => {
+  it("setRestricted on an unknown endpoint returns undefined", async () => {
     await expect(
-      repo.setEndpointRestricted("30000000-0000-4000-8000-000000000099", true),
+      setRestricted("30000000-0000-4000-8000-000000000099", true),
     ).resolves.toBeUndefined();
   });
 });

@@ -59,6 +59,50 @@ vi.mock("../lib/audit/admin-event", () => ({
   emitAdminEvent: vi.fn(),
 }));
 
+// TEST-EDIT (endpoint namespace gate): every
+// endpoint create and update now runs in one transaction for every actor and
+// asks the gate under the namespace lock (db/repositories/endpoint-gate.repo).
+// The stand-ins answer as a namespace with no other restricted or private
+// endpoint would, and re-read the endpoint as the doubled repository returns
+// it; the gate itself is pinned in endpoint-namespace-gate.test.ts and against
+// Postgres in admin-plane-rails.integration.test.ts.
+vi.mock("../db/repositories/endpoint-gate.repo", () => ({
+  endpointGateRepository: {
+    lockNamespaces: vi.fn(async () => undefined),
+    restrictedSiblingExists: vi.fn(async () => false),
+    gatedSiblingExists: vi.fn(async () => false),
+    lockEndpoint: vi.fn(async (_tx: unknown, uuid: string) => {
+      const row = (await endpointsRepositoryMock.findByUuidWithNamespace?.(
+        uuid,
+      )) as
+        | {
+            namespace_uuid: string;
+            user_id: string | null;
+            restricted?: boolean;
+          }
+        | undefined;
+      return row
+        ? {
+            uuid,
+            name: "reporting",
+            namespace_uuid: row.namespace_uuid,
+            user_id: row.user_id ?? null,
+            restricted: row.restricted ?? false,
+            restricted_by_api_key_uuid: null,
+            restriction_recent: false,
+          }
+        : null;
+    }),
+    clearRestrictionKey: vi.fn(async () => undefined),
+  },
+}));
+vi.mock("../db/index", () => ({
+  db: {
+    transaction: async (callback: (tx: object) => Promise<unknown>) =>
+      callback({}),
+  },
+}));
+
 import { CreateEndpointRequestSchema } from "@repo/zod-types";
 
 import { endpointsImplementations } from "./endpoints.impl";

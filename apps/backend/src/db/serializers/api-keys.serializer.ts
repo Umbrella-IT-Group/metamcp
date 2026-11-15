@@ -18,7 +18,10 @@ export class ApiKeysSerializer {
   // characters are the key's tail, not its head — a trailing marker would
   // read as "the key starts like this", which is no longer true and would
   // send someone hunting for a prefix that does not exist.
-  private static keyPrefix(last4: string) {
+  //
+  // Public so the snapshot a key removal records (lib/api-key-lifecycle-rules)
+  // renders the same identifier from the same rule, rather than a copy of it.
+  static keyPrefix(last4: string) {
     return `sk_mt_…${last4}`;
   }
 
