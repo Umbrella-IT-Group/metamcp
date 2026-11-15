@@ -873,10 +873,12 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
 
     it("orders a removal and a reactivation of one key by its row lock, in both orders, across two callers", async () => {
       // Two operator keys (each with its own change budget) so nothing but
-      // the key row orders them. The audit write of whichever goes first is
-      // stalled until the second is queued, so it still holds the key row; the
-      // second then waits on it (with the row lock) or reads the row as it was
-      // (without), and removes a key the first has just made active.
+      // the key row orders them. Whichever goes first is held at its own audit
+      // write, after its change and before its commit, so it still holds the
+      // key row; the second is then sent. With the row lock the second waits
+      // for the first and judges the key as the first left it; without it the
+      // second reads the row as it was and removes a key the first has just
+      // made active (or reactivates a key the first has just removed).
       const reactivator = await freshOperatorKey();
       const remover = await freshOperatorKey();
       const prepare = async (stem: string) => {
@@ -898,42 +900,57 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
           },
           remover.key,
         );
-      const stalled = async (
+      // Only these two success rows wait; the request-acceptance rows and
+      // every other audit write pass, so what is waiting is the change's own
+      // audit write inside its transaction.
+      const gate = "hashtext('itest.key.lifecycle.audit')";
+      await one(`CREATE OR REPLACE FUNCTION itest_hold_key_audit() RETURNS trigger AS $$
+        BEGIN
+          IF NEW.outcome = 'success'
+             AND NEW.action IN ('apikey.reactivate', 'apikey.delete') THEN
+            PERFORM pg_advisory_lock_shared(${gate});
+            PERFORM pg_advisory_unlock_shared(${gate});
+          END IF;
+          RETURN NEW;
+        END $$ LANGUAGE plpgsql`);
+      await one(`DROP TRIGGER IF EXISTS itest_hold_key_audit_trg ON audit_log`);
+      await one(`CREATE TRIGGER itest_hold_key_audit_trg BEFORE INSERT ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION itest_hold_key_audit()`);
+      const hold = (
         first: () => Promise<Reply>,
         second: () => Promise<Reply>,
-      ): Promise<[Reply, Reply]> => {
-        const release = await fx.stallAuditWrites();
-        try {
-          const a = first();
-          await waitForLockWaiters(1);
-          const b = second();
-          await waitForLockWaiters(2);
-          await release();
-          return [await a, await b];
-        } catch (error) {
-          await release();
-          throw error;
-        }
-      };
+      ) =>
+        raceBehind(
+          `SELECT pg_advisory_lock(${gate})`,
+          `SELECT pg_advisory_unlock(${gate})`,
+          first,
+          second,
+        );
+      try {
+        // The reactivation first: the key is active when the removal looks, so
+        // the removal is refused and the key stays.
+        const a = await prepare("race-react-first");
+        const [reactivated, refused] = await hold(
+          () => reactivate(a.uuid),
+          () => removeKey(a),
+        );
+        expect([reactivated.status, refused.code]).toEqual([200, "CONFLICT"]);
+        expect((await keyRow(a.uuid))?.is_active).toBe(true);
 
-      // The reactivation first: the key is active when the removal looks, so
-      // the removal is refused and the key stays.
-      const a = await prepare("race-react-first");
-      const [reactivated, refused] = await stalled(
-        () => reactivate(a.uuid),
-        () => removeKey(a),
-      );
-      expect([reactivated.status, refused.code]).toEqual([200, "CONFLICT"]);
-      expect((await keyRow(a.uuid))?.is_active).toBe(true);
-
-      // The removal first: the reactivation finds no key.
-      const b = await prepare("race-remove-first");
-      const [removed, gone] = await stalled(
-        () => removeKey(b),
-        () => reactivate(b.uuid),
-      );
-      expect([removed.status, gone.code]).toEqual([200, "NOT_FOUND"]);
-      expect(await keyRow(b.uuid)).toBeUndefined();
+        // The removal first: the reactivation finds no key.
+        const b = await prepare("race-remove-first");
+        const [removed, gone] = await hold(
+          () => removeKey(b),
+          () => reactivate(b.uuid),
+        );
+        expect([removed.status, gone.code]).toEqual([200, "NOT_FOUND"]);
+        expect(await keyRow(b.uuid)).toBeUndefined();
+      } finally {
+        await one(
+          `DROP TRIGGER IF EXISTS itest_hold_key_audit_trg ON audit_log`,
+        );
+        await one(`DROP FUNCTION IF EXISTS itest_hold_key_audit()`);
+      }
     });
 
     it("never removes an admin-plane key, even an inactive one", async () => {
