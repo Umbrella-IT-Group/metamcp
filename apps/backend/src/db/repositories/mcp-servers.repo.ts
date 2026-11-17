@@ -84,9 +84,11 @@ function handleDatabaseError(
       pgError.code === "23505" &&
       pgError.constraint === "mcp_servers_name_user_unique_idx"
     ) {
-      throw new Error(
-        `Server name "${serverName}" already exists. Server names must be unique within your scope.`,
-      );
+      // An owner-scoped bulk import can commit after the advisory-locked
+      // preflight saw no holder. The unique index is the final authority in
+      // that race, and must produce the same coded refusal and denied audit
+      // row as the preflight, without naming a server or owner.
+      throw new ServerNameTakenError();
     }
 
     // Handle regex constraint violation for server name

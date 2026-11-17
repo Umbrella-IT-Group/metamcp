@@ -628,6 +628,30 @@ describeIfDb("admin-plane reply shape and rails (real Postgres)", () => {
       expect((await serverRow(server.uuid)).name).toBe(renamed);
     });
 
+    it.each(["operator", "sync", "person"] as const)(
+      "keeps an error-gated stdio row unchanged except for its name on a metadata-only update by %s",
+      async (caller) => {
+        const server = await seedServer();
+        await one(
+          `UPDATE mcp_servers SET type = 'STDIO', error_status = 'ERROR' WHERE uuid = $1`,
+          [server.uuid],
+        );
+        const before = await serverRow(server.uuid);
+        const name = uniq("rs-stdio-renamed");
+        const update =
+          caller === "person" ? human : caller === "sync" ? sync : operator;
+
+        const reply = await update("mcpServers.update", {
+          uuid: server.uuid,
+          metadata_only: true,
+          name,
+        });
+
+        expect(ok(reply)).toBe(true);
+        expect(await serverRow(server.uuid)).toEqual({ ...before, name });
+      },
+    );
+
     it.each([
       ["a URL", { url: NEXT_URL }],
       ["a type", { type: "SSE" }],
@@ -902,6 +926,73 @@ describeIfDb("admin-plane reply shape and rails (real Postgres)", () => {
           [action, actorUuid],
         )
       ).map((row) => (row.detail as Record<string, unknown>).rule);
+
+    it.each(["create", "full update", "metadata-only update"] as const)(
+      "keeps the coded conflict and denied row when an owner-scoped import wins during a %s",
+      async (variant) => {
+        const key = await freshKey(
+          variant === "metadata-only update" ? "operator" : "sync",
+        );
+        const targetName = uniq("rs-import-race");
+        const source = await seedServer({ userId: fx.ownerId });
+        const before = await serverRow(source.uuid);
+        const holder = new Client({ connectionString: TEST_DATABASE_URL });
+        await holder.connect();
+        let pending: Promise<Reply>;
+        try {
+          // bulkCreate inserts without the advisory name lock. Its uncommitted
+          // row is invisible to the name preflight, but the database's unique
+          // index makes the competing write wait for its commit.
+          await holder.query("BEGIN");
+          const inserted = await holder.query(
+            `INSERT INTO mcp_servers (name, type, url, user_id)
+             VALUES ($1, 'STREAMABLE_HTTP', $2, $3) RETURNING uuid`,
+            [targetName, NEXT_URL, fx.ownerId],
+          );
+          serverUuids.push(inserted.rows[0].uuid as string);
+          pending =
+            variant === "create"
+              ? sync(
+                  "mcpServers.create",
+                  {
+                    name: targetName,
+                    type: "STREAMABLE_HTTP",
+                    url: NEXT_URL,
+                    user_id: fx.ownerId,
+                  },
+                  key.key,
+                )
+              : operator(
+                  "mcpServers.update",
+                  {
+                    uuid: source.uuid,
+                    name: targetName,
+                    ...(variant === "metadata-only update"
+                      ? { metadata_only: true }
+                      : { type: "STREAMABLE_HTTP", url: CANARY_URL }),
+                  },
+                  key.key,
+                );
+          await waitForLockWaiters(1);
+          await holder.query("COMMIT");
+        } catch (error) {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        } finally {
+          await holder.end();
+        }
+
+        expect(refusedAs(await pending)).toEqual(conflict);
+        expect(await serverRow(source.uuid)).toEqual(before);
+        expect(await countNamed(targetName, fx.ownerId)).toBe(1);
+        expect(
+          await deniedFor(
+            key.uuid,
+            variant === "create" ? "mcpserver.create" : "mcpserver.update",
+          ),
+        ).toEqual(["server_name_taken"]);
+      },
+    );
 
     it("refuses a create that would give a second public server a name, with a coded conflict and a denied row", async () => {
       const k = await freshKey("sync");

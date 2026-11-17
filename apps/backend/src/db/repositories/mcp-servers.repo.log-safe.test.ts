@@ -176,9 +176,13 @@ describe("McpServersRepository write failures", () => {
       failedWrite("23505", "mcp_servers_name_user_unique_idx"),
     );
 
-    await expect(mcpServersRepository.create(server)).rejects.toThrow(
-      'Server name "vendor" already exists.',
-    );
+    // TEST-EDIT (SPEC): the database's final unique check has the same fixed
+    // refusal as the name preflight, including when an import wins a race.
+    await expect(mcpServersRepository.create(server)).rejects.toMatchObject({
+      name: "ServerNameTakenError",
+      message:
+        "A server with that name already exists. Server names must be unique within an owner scope. Choose a different name.",
+    });
 
     const logged = loggedText();
     expectLogIsFree(logged);

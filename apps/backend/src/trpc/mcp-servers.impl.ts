@@ -882,12 +882,20 @@ export const mcpServersImplementations = {
         };
       }
       const updatedServer = result.server;
+      // A metadata-only write cannot change a stdio connection or recover its
+      // error gate. Only a full update keeps the stdio recovery side effects;
+      // a rename or description must leave error status and Inspector sessions
+      // alone, just as it does for an HTTP server.
+      const fullStdioUpdate =
+        !isMetadataOnly(input) &&
+        updatedServer.type === McpServerTypeEnum.enum.STDIO;
 
       // Inspector sessions opened from this row (and any still opening on it)
       // hold a transport built from the row as it was. Close them, first and
       // whatever the pooled invalidation below does, when the write changed
-      // where the gateway connects or what it presents there; when the row is
-      // a stdio row, whose command, args and env that report does not cover;
+      // where the gateway connects or what it presents there; when a full
+      // update writes a stdio row, whose command, args and env that report
+      // does not cover;
       // or when the locked write changed the owner, who decides who may see
       // the row. A re-save that changed none of this (the sync's routine one,
       // made for every row on every run) leaves them open, as the pool does.
@@ -895,7 +903,7 @@ export const mcpServersImplementations = {
       // failure.
       if (
         result.destinationOrCredentialChanged ||
-        updatedServer.type === McpServerTypeEnum.enum.STDIO ||
+        fullStdioUpdate ||
         result.ownershipChanged
       ) {
         await closeInspectorSessionsForServer(updatedServer.uuid);
@@ -915,8 +923,8 @@ export const mcpServersImplementations = {
         );
       }
 
-      // Reset error status for stdio servers when they are updated
-      if (updatedServer.type === McpServerTypeEnum.enum.STDIO) {
+      // Reset error status for full stdio updates only.
+      if (fullStdioUpdate) {
         try {
           await serverErrorTracker.resetServerErrorState(updatedServer.uuid);
           logger.info(

@@ -18,7 +18,7 @@
  * stand-in database transport (a transaction that records begin, commit and
  * rollback, and an audit table that records the rows it is given).
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { order, deniedRows, auditRows } = vi.hoisted(() => ({
   order: [] as string[],
@@ -105,6 +105,9 @@ vi.mock("../lib/metamcp/metamcp-middleware/tool-overrides.functional", () => ({
 vi.mock("../lib/metamcp/server-error-tracker", () => ({
   serverErrorTracker: { resetServerErrorState: vi.fn(async () => undefined) },
 }));
+vi.mock("../lib/metamcp/inspector-sessions", () => ({
+  closeInspectorSessionsForServer: vi.fn(async () => undefined),
+}));
 vi.mock("../lib/metamcp/utils", () => ({
   convertDbServerToParams: vi.fn(async () => undefined),
 }));
@@ -114,6 +117,8 @@ import {
   SERVER_NAME_TAKEN_MESSAGE,
   ServerNameTakenError,
 } from "../db/repositories/mcp-server-name-rule";
+import { closeInspectorSessionsForServer } from "../lib/metamcp/inspector-sessions";
+import { serverErrorTracker } from "../lib/metamcp/server-error-tracker";
 import { mcpServersImplementations } from "./mcp-servers.impl";
 import { OPERATOR_SERVER_REFUSALS } from "./mcp-servers.impl";
 
@@ -200,6 +205,8 @@ beforeEach(() => {
     previous: row(),
   });
 });
+
+afterEach(() => vi.unstubAllEnvs());
 
 describe("an operator-scope key and server create", () => {
   it("is refused with its rule, a denied row, and no write", async () => {
@@ -353,6 +360,64 @@ describe("an operator-scope key and the full update", () => {
 });
 
 describe("the metadata-only update", () => {
+  it.each(["operator", "sync", null] as const)(
+    "does not recover an error-gated stdio server or close its Inspector sessions for a %s actor",
+    async (scope) => {
+      // Renaming remains available with stdio disabled, but must leave the
+      // error gate intact. Recovery is a separate, explicitly audited act.
+      vi.stubEnv("ALLOW_STDIO_SERVERS", "false");
+      const previous = row({ type: "STDIO", error_status: "ERROR" });
+      vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(previous);
+      vi.mocked(
+        mcpServersRepository.updateMetadataReportingChange,
+      ).mockResolvedValue({
+        kind: "updated",
+        previous,
+        server: row({
+          type: "STDIO",
+          error_status: "ERROR",
+          name: "vendor-renamed",
+        }),
+      });
+
+      const result = await mcpServersImplementations.update(
+        metadataUpdate,
+        "owner-1",
+        actorOf(scope),
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data).toMatchObject({
+        name: "vendor-renamed",
+        error_status: "ERROR",
+      });
+      expect(serverErrorTracker.resetServerErrorState).not.toHaveBeenCalled();
+      expect(closeInspectorSessionsForServer).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps recovery and Inspector invalidation for a full stdio update", async () => {
+    vi.stubEnv("ALLOW_STDIO_SERVERS", "true");
+    const previous = row({ type: "STDIO", error_status: "ERROR" });
+    vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue(previous);
+    vi.mocked(mcpServersRepository.updateReportingChange).mockResolvedValue({
+      server: previous,
+      previous,
+      destinationOrCredentialChanged: false,
+      ownershipChanged: false,
+    });
+
+    const result = await mcpServersImplementations.update(
+      { uuid: UUID, name: "vendor", type: "STDIO", command: "test-command" },
+      "owner-1",
+      actorOf("sync"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(serverErrorTracker.resetServerErrorState).toHaveBeenCalledWith(UUID);
+    expect(closeInspectorSessionsForServer).toHaveBeenCalledWith(UUID);
+  });
+
   it.each(["operator", "sync"] as const)(
     "reaches only the metadata write for a %s-scope key, and the reply carries names only",
     async (scope) => {
