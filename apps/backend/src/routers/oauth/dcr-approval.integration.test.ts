@@ -1271,6 +1271,34 @@ describeIfDb(
             ],
             expected: false,
           },
+          // ->> stringifies scalars; Postgres expands 1e63 to 64 digits, so
+          // even the hash regex cannot establish that its value was a string.
+          ...(
+            [
+              ["numeric-entry-id", { entry_id: 123 }, false],
+              ["boolean-entry-id", { entry_id: true }, false],
+              ["numeric-policy-version", { policy_version: 1e63 }, false],
+              ["numeric-string-entry-id", { entry_id: "123" }, true],
+              [
+                "numeric-string-policy-version",
+                { policy_version: "1" + "0".repeat(63) },
+                true,
+              ],
+            ] as const
+          ).map(([label, fields, expected]) => ({
+            label,
+            source: "dcr" as const,
+            audits: [
+              {
+                detail: {
+                  approval_status: "approved",
+                  dcr_mode: "pending",
+                  auto_approval: marker(fields),
+                },
+              },
+            ],
+            expected,
+          })),
           {
             label: "short-hash",
             source: "dcr",

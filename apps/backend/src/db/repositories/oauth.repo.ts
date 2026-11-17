@@ -121,11 +121,15 @@ export class OAuthRepository {
       .selectDistinctOn([auditLogTable.target_id], {
         client_id: auditLogTable.target_id,
         actor_ip: auditLogTable.actor_ip,
+        // ->> stringifies other JSON scalars too. Check types before text so
+        // numeric/boolean ids and numeric hashes cannot claim provenance.
         policy_marker: sql<boolean>`coalesce((
           ${auditLogTable.target_type} = 'oauth_client'
           and ${auditLogTable.detail} ->> 'approval_status' = 'approved'
           and ${auditLogTable.detail} ->> 'dcr_mode' = 'pending'
           and jsonb_typeof(${auditLogTable.detail} -> 'auto_approval') = 'object'
+          and jsonb_typeof(${auditLogTable.detail} -> 'auto_approval' -> 'entry_id') = 'string'
+          and jsonb_typeof(${auditLogTable.detail} -> 'auto_approval' -> 'policy_version') = 'string'
           and (${auditLogTable.detail} -> 'auto_approval' ->> 'entry_id') ~ '^[a-z0-9][a-z0-9_-]{0,63}$'
           and (${auditLogTable.detail} -> 'auto_approval' ->> 'policy_version') ~ '^[0-9a-f]{64}$'
         ), false)`.as("policy_marker"),
