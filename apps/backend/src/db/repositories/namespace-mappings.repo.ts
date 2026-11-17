@@ -13,6 +13,7 @@ import {
   namespaceToolMappingsTable,
 } from "../schema";
 import type { DbExecutor } from "./db-executor";
+import type { WriteCaller } from "./write-caller";
 
 export class NamespaceMappingsRepository {
   async updateServerStatus(input: NamespaceServerStatusUpdate) {
@@ -180,8 +181,16 @@ export class NamespaceMappingsRepository {
    * serialize: the write never applies one policy's rule after the other
    * policy has taken effect.
    *
-   * @returns the upserted rows and the policy the write followed (undefined
-   *   when nothing was written)
+   * `caller` is who the refresh is made for. For an admin-plane key the policy
+   * table above is cut down to its second half under BOTH policies: a row that
+   * already exists is never touched (each keeps its status, however the
+   * refresh was asked), and only rows that did not exist are
+   * inserted, with the status the policy gives a new row. The result then
+   * holds exactly the rows this call created. For a person nothing changes.
+   *
+   * @returns the written rows (a person: every upserted row; an admin-plane
+   *   key: only the rows it inserted) and the policy the write followed
+   *   (undefined when nothing was written)
    */
   async bulkUpsertNamespaceToolMappings(
     input: {
@@ -192,6 +201,7 @@ export class NamespaceMappingsRepository {
         status?: "ACTIVE" | "INACTIVE";
       }>;
     },
+    caller: WriteCaller,
     // The caller's transaction when it holds one; the inner transaction is then
     // a savepoint of it and the share lock on the namespace row is held until
     // the outer transaction ends.
@@ -228,24 +238,31 @@ export class NamespaceMappingsRepository {
           : ("INACTIVE" as const),
       }));
 
-      // Upsert the mappings: insert new ones; on an existing row, update the
-      // status only under allow_all (see the policy table above).
-      const mappings = await tx
+      const target = [
+        namespaceToolMappingsTable.namespace_uuid,
+        namespaceToolMappingsTable.tool_uuid,
+      ];
+      const insert = tx
         .insert(namespaceToolMappingsTable)
-        .values(mappingsToInsert)
-        .onConflictDoUpdate({
-          target: [
-            namespaceToolMappingsTable.namespace_uuid,
-            namespaceToolMappingsTable.tool_uuid,
-          ],
-          set: allowAll
-            ? {
-                status: sql`excluded.status`,
-                mcp_server_uuid: sql`excluded.mcp_server_uuid`,
-              }
-            : { mcp_server_uuid: sql`excluded.mcp_server_uuid` },
-        })
-        .returning();
+        .values(mappingsToInsert);
+
+      // An admin-plane key only inserts rows that are not there; a person's
+      // refresh upserts: insert new ones and, on an existing row, update the
+      // status only under allow_all (see the policy table above).
+      const mappings =
+        caller === "admin_plane"
+          ? await insert.onConflictDoNothing({ target }).returning()
+          : await insert
+              .onConflictDoUpdate({
+                target,
+                set: allowAll
+                  ? {
+                      status: sql`excluded.status`,
+                      mcp_server_uuid: sql`excluded.mcp_server_uuid`,
+                    }
+                  : { mcp_server_uuid: sql`excluded.mcp_server_uuid` },
+              })
+              .returning();
 
       return { mappings, toolPolicy: namespace.tool_policy };
     });

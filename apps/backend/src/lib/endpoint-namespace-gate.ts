@@ -43,6 +43,14 @@
  *    same test applies to moving a restricted endpoint out of its namespace,
  *    unless another restricted endpoint stays over that namespace.
  *
+ * ONE MORE RULE FOR ADMIN-PLANE KEYS, on the auth posture rather than the
+ * namespace (`admin_plane_auth_off`): a create or an update by an admin-plane
+ * key may not leave an endpoint with both `enable_api_key_auth` and
+ * `enable_oauth` off, a posture that asks its caller for no credential.
+ * Judged on the values the write leaves, so an update that leaves a flag alone
+ * is judged on the stored one. One flag on is enough, and a person is
+ * unaffected.
+ *
  * Every refusal is a fixed sentence naming no endpoint or namespace, answered
  * as a coded error (CONFLICT, or FORBIDDEN for the provenance rule), never as
  * `success: false`. Pure: no database, no logger.
@@ -54,6 +62,7 @@ export type EndpointGateRule =
   | "namespace_restricted_unrestrict"
   | "admin_plane_publish"
   | "admin_plane_unrestrict"
+  | "admin_plane_auth_off"
   | "endpoint_changed";
 
 export const ENDPOINT_GATE_REFUSALS: Readonly<
@@ -83,6 +92,11 @@ export const ENDPOINT_GATE_REFUSALS: Readonly<
     code: "FORBIDDEN",
     message:
       "An admin-plane API key can open an endpoint only to roll back a restriction it made itself in the last 24 hours. Do this in the admin UI.",
+  },
+  admin_plane_auth_off: {
+    code: "FORBIDDEN",
+    message:
+      "An admin-plane API key cannot leave an endpoint with both API-key authentication and OAuth off. Turn at least one of them on.",
   },
   endpoint_changed: {
     code: "CONFLICT",
@@ -135,6 +149,26 @@ export interface UnrestrictFacts {
    * less than 24 hours ago (always false for a human, who does not need it).
    */
   rollbackEligible: boolean;
+}
+
+/** What the auth posture is judged on: the values the write leaves. */
+export interface AuthPostureFacts {
+  adminPlane: boolean;
+  enableApiKeyAuth: boolean;
+  enableOauth: boolean;
+}
+
+/**
+ * The admin-plane auth rule (see the header): refused when an admin-plane key
+ * leaves both authentication modes off. Pure.
+ */
+export function judgeEndpointAuthPosture(
+  facts: AuthPostureFacts,
+): EndpointGateRule | null {
+  if (facts.adminPlane && !facts.enableApiKeyAuth && !facts.enableOauth) {
+    return "admin_plane_auth_off";
+  }
+  return null;
 }
 
 export function judgeEndpointCreate(

@@ -6,9 +6,9 @@ import logger from "@/utils/logger";
 import { recordAuditInTransaction } from "../../db/repositories/audit-log-tx";
 import type { DbTransaction } from "../../db/repositories/db-executor";
 import {
-  ADMIN_PLANE_BUDGET_REFUSAL,
   AdminPlaneBudgetExceeded,
   budgetClassOf,
+  isGrantChange,
   judgeBudgetClass,
   openBudget,
 } from "../admin-plane-budget";
@@ -154,7 +154,7 @@ async function refusalAfterRollback(
     });
     return new TRPCError({
       code: "TOO_MANY_REQUESTS",
-      message: ADMIN_PLANE_BUDGET_REFUSAL,
+      message: error.message,
     });
   }
   if (error instanceof AdminRuleRefusal) {
@@ -180,8 +180,9 @@ async function refusalAfterRollback(
  * For an admin-plane actor the change is also charged to the key's change
  * budget (lib/admin-plane-budget), inside this transaction: the budget lock
  * and the total are judged first, before `write` runs; the change's class,
- * which its own event names, is judged before its audit row is written; and
- * the row carries `detail.budget_class`, which is what the next count reads.
+ * which its own event names (and, for a grant, the grant limit), is judged
+ * before its audit row is written; and the row carries `detail.budget_class`,
+ * which is what the next count reads.
  * Over budget, and any `AdminRuleRefusal` the write throws, rolls back, leaves
  * a `denied` row written after the rollback, and reaches the caller as a coded
  * TRPCError (TOO_MANY_REQUESTS for the budget).
@@ -213,7 +214,12 @@ export async function runAuditedTransaction<T>(
           const budgetClass = budgetClassOf(event.action, event.detail);
           // Outside the try below: an over-budget change is a refusal, not
           // an audit failure.
-          judgeBudgetClass(actor, opened, budgetClass);
+          judgeBudgetClass(
+            actor,
+            opened,
+            budgetClass,
+            isGrantChange(event.action, budgetClass),
+          );
           event = {
             ...event,
             detail: { ...(event.detail ?? {}), budget_class: budgetClass },

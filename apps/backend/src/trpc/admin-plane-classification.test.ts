@@ -380,6 +380,40 @@ describe("budget classes", () => {
     return { routers, found };
   };
 
+  // The classes the reply-shape change gives the topology writes. Each
+  // operator mutation that can put a tool in front of callers with no status
+  // write is `loosen` unless its own audit event proves otherwise, and the
+  // table must still classify every action the implementations write (the
+  // scan below).
+  it("classes the topology writes by what they can put in front of callers, in both directions", () => {
+    expect(budgetClassOf("mcpserver.create", {})).toBe("loosen");
+    expect(budgetClassOf("namespace.create", {})).toBe("loosen");
+    expect(budgetClassOf("namespace.update", { mounts_added: 1 })).toBe(
+      "loosen",
+    );
+    expect(budgetClassOf("namespace.update", { mounts_added: 0 })).toBe(
+      "change",
+    );
+    expect(
+      budgetClassOf("namespace.refresh_tools", { active_rows_written: 1 }),
+    ).toBe("loosen");
+    expect(
+      budgetClassOf("namespace.refresh_tools", { active_rows_written: 0 }),
+    ).toBe("change");
+    expect(budgetClassOf("namespace.tool_status", { status: "ACTIVE" })).toBe(
+      "loosen",
+    );
+    expect(budgetClassOf("namespace.tool_status", { status: "INACTIVE" })).toBe(
+      "tighten",
+    );
+    expect(budgetClassOf("endpoint.create", { restricted: false })).toBe(
+      "loosen",
+    );
+    expect(budgetClassOf("endpoint.create", { restricted: true })).toBe(
+      "change",
+    );
+  });
+
   it("counts a reactivation as loosen, a removal as destroy, and a rename or error reset as an ordinary change", () => {
     expect(budgetClassOf("apikey.reactivate", {})).toBe("loosen");
     expect(budgetClassOf("apikey.delete", {})).toBe("destroy");
@@ -463,6 +497,20 @@ describe("the audit read", () => {
       server_uuids: ["11111111-1111-4111-8111-111111111111"],
       server_names: ["alpha"],
       reset_count: 1,
+    });
+    expect(omitted).toBe(0);
+  });
+
+  it("returns the evidence a topology write is budgeted by: the mounts an update added and the ACTIVE rows a refresh wrote", () => {
+    const { detail, omitted } = projectAuditDetail({
+      mounts_added: 2,
+      active_rows_written: 5,
+      budget_class: "loosen",
+    });
+    expect(detail).toEqual({
+      mounts_added: 2,
+      active_rows_written: 5,
+      budget_class: "loosen",
     });
     expect(omitted).toBe(0);
   });

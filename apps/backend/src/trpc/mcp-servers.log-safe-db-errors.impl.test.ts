@@ -273,10 +273,12 @@ describe("mcpServers.get when the read fails", () => {
       failedWrite(statement),
     );
 
+    // TEST-EDIT (SPEC): `get` takes the detail level the router decided, not
+    // an admin flag; a person signed in as an administrator is "full".
     const result = await mcpServersImplementations.get(
       { uuid: UUID } as never,
       "admin-1",
-      true,
+      "full",
     );
 
     expect(result.success).toBe(false);

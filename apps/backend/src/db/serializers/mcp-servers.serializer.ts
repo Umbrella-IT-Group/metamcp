@@ -1,7 +1,10 @@
+import type { ServerDetailLevel } from "@repo/trpc";
 import { DatabaseMcpServer, McpServer } from "@repo/zod-types";
 
+import { serverConnectionView } from "./server-connection-view";
+
 /**
- * `includeSecrets` is a REQUIRED parameter, not an option with a default.
+ * `detail` is a REQUIRED parameter, not an option with a default.
  *
  * Every call site has to state which side of the RBAC line it is on, and a
  * new one cannot inherit "full passthrough" by omission — which is how the
@@ -12,6 +15,12 @@ import { DatabaseMcpServer, McpServer } from "@repo/zod-types";
  * network map) alongside `env`, `bearerToken`, `headers`, `command` and
  * `args`, which routinely carry API credentials.
  *
+ * The level has three values (see ServerDetailLevel in @repo/trpc): `full`
+ * for a person signed in as an administrator, `names_only` for an admin-plane
+ * API key (the `env` and `headers` names with empty values, no command,
+ * arguments or URL), and `redacted` for everyone else. The router decides it
+ * from the verified request context.
+ *
  * Members keep the fields the dashboard is built on — uuid, name,
  * description, type, error_status, created_at, user_id — so nothing in the
  * member-facing UI loses its identity; only the reachability and credential
@@ -20,21 +29,18 @@ import { DatabaseMcpServer, McpServer } from "@repo/zod-types";
 export class McpServersSerializer {
   static serializeMcpServer(
     dbServer: DatabaseMcpServer,
-    includeSecrets: boolean,
+    detail: ServerDetailLevel,
   ): McpServer {
     return {
       uuid: dbServer.uuid,
       name: dbServer.name,
       description: dbServer.description,
       type: dbServer.type,
-      // Redacted to the schema's own empty/null values rather than to a
-      // "REDACTED" sentinel: McpServerSchema already allows null command/url
-      // and empty env/headers, so a member client parses the response
-      // unchanged instead of rendering a fake credential.
-      command: includeSecrets ? dbServer.command : null,
-      args: includeSecrets ? dbServer.args : [],
-      env: includeSecrets ? dbServer.env : {},
-      url: includeSecrets ? dbServer.url : null,
+      // The connection fields are redacted to the schema's own empty/null
+      // values rather than to a "REDACTED" sentinel: McpServerSchema already
+      // allows null command/url and empty env/headers, so a client parses the
+      // response unchanged instead of rendering a fake credential.
+      ...serverConnectionView(dbServer, detail),
       error_status: dbServer.error_status,
       created_at: dbServer.created_at.toISOString(),
       // NEVER returned, on either side of the RBAC line.
@@ -44,21 +50,20 @@ export class McpServersSerializer {
       // header. Same posture as api_keys and the OAuth token views: presence is
       // not exposed here, the value is simply gone.
       bearerToken: null,
-      headers: includeSecrets ? dbServer.headers : {},
       user_id: dbServer.user_id,
     };
   }
 
   static serializeMcpServerList(
     dbServers: DatabaseMcpServer[],
-    includeSecrets: boolean,
+    detail: ServerDetailLevel,
   ): McpServer[] {
     // Explicit arrow, NOT `.map(this.serializeMcpServer)`: Array.map passes
-    // the element INDEX as the second argument, which would have made
-    // includeSecrets false for the first server and truthy for every one
-    // after it — a redaction that silently applies to exactly one row.
+    // the element INDEX as the second argument, which a level that is read
+    // loosely would take for a value, so one row would be treated differently
+    // from the rest.
     return dbServers.map((dbServer) =>
-      this.serializeMcpServer(dbServer, includeSecrets),
+      this.serializeMcpServer(dbServer, detail),
     );
   }
 }

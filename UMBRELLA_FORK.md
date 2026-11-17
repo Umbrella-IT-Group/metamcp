@@ -334,6 +334,44 @@ change, or it fails with FORBIDDEN. Admin events from the key record
 `detail.admin_plane`; each such change writes its audit row in its own
 transaction.
 
+Reply shape and server rails (admin-plane, no new power). An admin-plane key of
+either scope never receives a stored server connection: every server object a
+key reads or receives back (`mcpServers.list`, the `create` and `update`
+replies, the servers embedded in `namespaces.get`) keeps its `env` and
+`headers` names with empty values and carries no command, arguments or URL,
+and `bearerToken` is `null` in every reply for everyone. The router decides the
+level from the verified origin (`serverDetailLevelOf`), and the serializers
+take it as a required argument. An operator-scope key cannot create a server
+(`operator_server_create`) or send the full `mcpServers.update`
+(`operator_server_connection_change`): each is a coded `403` with a `denied`
+row. It renames through the strict `metadata_only` request variant, which
+sets only a name and a description. The sync scope keeps create and the full
+update, since the reviewed servers file applied by CI is the declared path for
+a server's address. `apiKeys.operatorCapabilities` reports `markers`
+(`server-reads-redacted-v1`, `server-update-metadata-only-v1`); the procedure
+sets and the contract version (3) are unchanged. An admin-plane unmount keeps
+the server's tool rows (a remount then leaves them as they are), an
+admin-plane tool refresh never changes an existing row, and an admin-plane
+endpoint create or update may not leave both authentication modes off
+(`admin_plane_auth_off`). The topology writes that can put tools in front of
+callers (server create, namespace create, a mount added, a tool switched on, a
+refresh that inserted an ACTIVE row, an open endpoint create) count as `loosen`
+in the change budget, and the budget defaults are set from observed usage at
+three times the per-class peak: operator 318 total, 102 loosen, 33 grant and 3
+destroy; sync 1089 total, 48 loosen, 0 grant and 0 destroy (see the README's
+"Change budget" and `DEFAULT_ADMIN_PLANE_BUDGET`). `grant` is a sub-limit
+inside `loosen`: a change that grants access (create or re-activate a key,
+widen an IP policy, add a group member or endpoint mapping, un-restrict an
+endpoint, switch a namespace's tool policy to `allow_all`) counts against both, so the larger `loosen` pool does not enlarge
+the number of grants. `apiKeys.operatorCapabilities` reports `grant` in each
+scope's budget; the contract version stays 3.
+Server names are unique within an owner scope for every caller: a create, the
+full update and the metadata-only update refuse (`409`, a fixed sentence, and a
+`denied` row for a key) a write that would give a second server the name
+another server holds in the same scope, a NULL owner counting as one scope,
+under a lock on the name taken before the row lock. A duplicate that already
+exists is not repaired.
+
 Rollback at any step: leave `DISABLE_BASIC_AUTH` false so humans keep password
 login, and deactivate the admin-plane key to revoke it instantly.
 `ADMIN_PLANE_TOKEN_AUTH_DISABLED=true` disables the bearer path process-wide
