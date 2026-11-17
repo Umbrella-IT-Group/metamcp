@@ -11,8 +11,9 @@ export class OAuthClientsSerializer {
   //
   // Built field by field (never a spread of the row), so a column added to
   // oauth_clients later does not reach the browser until someone decides it
-  // should. `registered_from_ip` is the one value read from the audit log, and
-  // only that value: never the audit row's detail.
+  // should. `registered_from_ip` and `approved_by_policy` are the only values
+  // derived from the audit log (an address and one boolean computed in the
+  // repository): never the audit row's detail.
   static serializeOAuthClientList(
     dbClients: Array<{
       client_id: string;
@@ -32,6 +33,7 @@ export class OAuthClientsSerializer {
       approved_at?: Date | null;
       rejected_at?: Date | null;
       registered_from_ip?: string | null;
+      approved_by_policy?: boolean;
       created_at: Date;
       // OAuthClientSchema types this optional even though the column is NOT
       // NULL with a default, so accept both shapes and normalize below —
@@ -54,6 +56,7 @@ export class OAuthClientsSerializer {
       approved_at: client.approved_at ?? null,
       rejected_at: client.rejected_at ?? null,
       registered_from_ip: client.registered_from_ip ?? null,
+      approved_by_policy: client.approved_by_policy === true,
       created_at: client.created_at,
       updated_at: client.updated_at ?? null,
     }));

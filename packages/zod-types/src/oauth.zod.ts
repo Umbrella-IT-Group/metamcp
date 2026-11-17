@@ -432,6 +432,12 @@ export const OAuthClientListItemSchema = z.object({
   // authenticated person and not evidence the client is safe. Null for admin
   // and legacy rows, and when the audit write did not land.
   registered_from_ip: z.string().nullable(),
+  // True only when the client's successful registration audit row carries a
+  // policy-approval marker and the row is still an approved self-registration
+  // with no approving person. False means unconfirmed provenance, not
+  // "approved by a person". Read-only display data: never stored, never
+  // accepted as input, and never used to authorize.
+  approved_by_policy: z.boolean(),
   created_at: z.date(),
   updated_at: z.date().nullable(),
 });

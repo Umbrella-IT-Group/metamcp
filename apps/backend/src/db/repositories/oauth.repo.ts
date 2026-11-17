@@ -10,6 +10,7 @@ import {
 import { and, desc, eq, gt, gte, isNull, lt, or, sql } from "drizzle-orm";
 
 import { apiKeyLast4, hashApiKey } from "@/lib/api-key-hash";
+import { isApprovedByPolicy } from "@/routers/oauth/dcr-auto-approval";
 import { hashClientSecret } from "@/routers/oauth/utils";
 
 import { db } from "../index";
@@ -100,13 +101,38 @@ export class OAuthRepository {
   // quadratic as anonymous registrations accumulate. NULL for admin and legacy
   // rows (they have no such audit row) and when the detached audit write did
   // not land.
+  //
+  // `approved_by_policy` comes from the same deduplicated row, as one boolean
+  // computed in the database: does that registration event (target type
+  // `oauth_client`) carry a well-formed `auto_approval` marker and record an
+  // approval in pending mode? Combined with the client row's current state by
+  // isApprovedByPolicy. No audit detail is returned, nothing is matched
+  // against today's policy, and a missing or late audit row only loses the
+  // label; the flag never controls authorization.
   async listClients(): Promise<
-    Array<OAuthClient & { registered_from_ip: string | null }>
+    Array<
+      OAuthClient & {
+        registered_from_ip: string | null;
+        approved_by_policy: boolean;
+      }
+    >
   > {
     const registrations = db
       .selectDistinctOn([auditLogTable.target_id], {
         client_id: auditLogTable.target_id,
         actor_ip: auditLogTable.actor_ip,
+        // ->> stringifies other JSON scalars too. Check types before text so
+        // numeric/boolean ids and numeric hashes cannot claim provenance.
+        policy_marker: sql<boolean>`coalesce((
+          ${auditLogTable.target_type} = 'oauth_client'
+          and ${auditLogTable.detail} ->> 'approval_status' = 'approved'
+          and ${auditLogTable.detail} ->> 'dcr_mode' = 'pending'
+          and jsonb_typeof(${auditLogTable.detail} -> 'auto_approval') = 'object'
+          and jsonb_typeof(${auditLogTable.detail} -> 'auto_approval' -> 'entry_id') = 'string'
+          and jsonb_typeof(${auditLogTable.detail} -> 'auto_approval' -> 'policy_version') = 'string'
+          and (${auditLogTable.detail} -> 'auto_approval' ->> 'entry_id') ~ '^[a-z0-9][a-z0-9_-]{0,63}$'
+          and (${auditLogTable.detail} -> 'auto_approval' ->> 'policy_version') ~ '^[0-9a-f]{64}$'
+        ), false)`.as("policy_marker"),
       })
       .from(auditLogTable)
       .where(
@@ -122,6 +148,7 @@ export class OAuthRepository {
       .select({
         client: oauthClientsTable,
         registered_from_ip: registrations.actor_ip,
+        policy_marker: registrations.policy_marker,
       })
       .from(oauthClientsTable)
       .leftJoin(
@@ -133,6 +160,10 @@ export class OAuthRepository {
     return rows.map((row) => ({
       ...row.client,
       registered_from_ip: row.registered_from_ip ?? null,
+      approved_by_policy: isApprovedByPolicy(
+        row.client,
+        row.policy_marker === true,
+      ),
     }));
   }
 

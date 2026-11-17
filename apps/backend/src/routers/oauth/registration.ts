@@ -6,11 +6,16 @@ import {
   clampAuditTextList,
   emit,
 } from "@/lib/audit/audit-emitter";
+import { resolveClientIp } from "@/lib/client-ip";
 import { describeDbError } from "@/lib/db-error-summary";
 import logger from "@/utils/logger";
 
 import { oauthRepository } from "../../db/repositories";
 import { buildClientRegistration } from "./client-registration";
+import {
+  type DcrAutoApprovalDecision,
+  decideDcrAutoApproval,
+} from "./dcr-auto-approval";
 import {
   getOAuthDcrMode,
   type OAuthDcrMode,
@@ -150,15 +155,41 @@ registrationRouter.post(
         return res.status(400).json(NON_LOOPBACK_REGISTRATION_BODY);
       }
 
+      // Policy approval of matching registrations (./dcr-auto-approval), in
+      // `pending` mode only: `open` keeps its own stamp and spends no budget.
+      // Decided after every shared and loopback check above, on the client the
+      // shared core produced (effective defaults, never the raw body), and
+      // synchronously, before the first await below, so an entry's hourly
+      // budget slot is reserved before anything is stored and two concurrent
+      // requests cannot both take its last slot. A failed insert keeps the
+      // slot spent. The caller address is CF-Connecting-IP through
+      // resolveClientIp: never req.ip, another forwarded header or a body
+      // field.
+      const policyDecision: DcrAutoApprovalDecision =
+        mode === "pending"
+          ? decideDcrAutoApproval(
+              registration.client,
+              resolveClientIp(req.headers),
+            )
+          : { outcome: "none" };
+      if (policyDecision.outcome === "cap") {
+        logger.warn(
+          `[oauth] policy approval held by the hourly limit for entry ${policyDecision.entryId}; the registration stays pending`,
+        );
+      }
+
       // `registration_source: "dcr"` and the approval status are stamped HERE
       // rather than inside the shared core, because this is the door — the
       // core serves both and never reads either from its input, so a body that
       // asks for "approved" gets what this door decides. "dcr" is what makes
       // the row eligible for the retention sweep (./client-retention.ts);
       // "pending" is what keeps it from being authorized until an
-      // administrator approves it. Only the local-development `open` mode
-      // writes "approved", and then with the time but no approving person.
-      const approvedNow = mode === "open";
+      // administrator approves it. "approved" is written, with the time but no
+      // approving person, only by the local-development `open` mode or by a
+      // policy match above, and always in this initial insert, never by a
+      // later update.
+      const approvedNow =
+        mode === "open" || policyDecision.outcome === "approved";
       const clientRegistration = {
         ...registration.client,
         registration_source: "dcr" as const,
@@ -236,6 +267,22 @@ registrationRouter.post(
           has_client_secret: Boolean(clientSecret),
           approval_status: clientRegistration.approval_status,
           dcr_mode: mode,
+          // Policy provenance: the matched entry id (the only policy text
+          // recorded) and the policy hash, only on a policy approval; or the
+          // fact that a match was held by its entry's hourly budget. The
+          // client list's "approved by policy" label is read from this marker,
+          // never inferred from a null approver.
+          ...(policyDecision.outcome === "approved"
+            ? {
+                auto_approval: {
+                  entry_id: policyDecision.entryId,
+                  policy_version: policyDecision.policyVersion,
+                },
+              }
+            : {}),
+          ...(policyDecision.outcome === "cap"
+            ? { auto_approval_skipped: "cap" }
+            : {}),
         },
       });
 
@@ -258,8 +305,8 @@ registrationRouter.post(
         scope: clientRegistration.scope,
 
         // Not an RFC 7591 field; clients ignore unknown members. Present so a
-        // person reading the response knows the client cannot be used until
-        // an administrator approves it.
+        // person reading the response knows whether the client can be used
+        // now ("approved") or must wait for an administrator ("pending").
         approval_status: clientRegistration.approval_status,
 
         // OAuth 2.1 Security Information
@@ -348,7 +395,7 @@ registrationRouter.get("/oauth/register", async (req, res) => {
       approval:
         mode === "open"
           ? "New registrations are approved automatically (local development only)."
-          : "A new registration cannot be used until an administrator approves it. Quote the returned client_id to your administrator.",
+          : 'The approval_status in the registration response says whether an administrator is needed. "pending": the client cannot be used until an administrator approves it; quote the returned client_id to your administrator. "approved": the client can be used now. A deployment may approve some registrations by policy.',
 
       required_parameters: {
         redirect_uris:
@@ -402,7 +449,7 @@ registrationRouter.get("/oauth/register", async (req, res) => {
         ...(mode === "open"
           ? []
           : [
-              "Ask an administrator to approve the client, quoting its client_id; until then the authorization page says it is waiting",
+              "If the returned approval_status is pending, ask an administrator to approve the client, quoting its client_id; until then the authorization page says it is waiting",
             ]),
         "Use PKCE in your authorization requests",
         "Include code_challenge and code_challenge_method=S256",

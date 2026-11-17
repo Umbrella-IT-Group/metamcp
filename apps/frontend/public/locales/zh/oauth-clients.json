@@ -58,6 +58,7 @@
   "columnStatus": "状态",
   "columnRegisteredFrom": "注册来源",
   "statusApproved": "已批准",
+  "statusApprovedByPolicy": "已按策略批准",
   "statusPending": "等待批准",
   "statusRejected": "已拒绝",
   "statusUnknown": "未批准",
@@ -76,5 +77,5 @@
   "decisionError": "无法记录该决定",
   "decisionStale": "列表加载后此客户端已发生变化，列表已刷新。",
   "listLoadError": "无法加载 OAuth 客户端",
-  "approvalExplanation": "在用户自己电脑上运行的应用（例如 Claude Code）可以自助注册，但在管理员于此处批准之前会保持“等待批准”状态。只有本地（回环）回调可以通过这种方式批准；claude.ai 等托管应用使用通过“创建 OAuth 客户端”创建的客户端。批准客户端本身不会授予任何访问权限：每个人仍需自行批准自己的登录。请只批准您认识的客户端，并检查其注册来源地址。"
+  "approvalExplanation": "在用户自己电脑上运行的应用（例如 Claude Code）可以自助注册，但在管理员于此处批准之前会保持“等待批准”状态。只有本地（回环）回调可以通过这种方式批准；claude.ai 等托管应用使用通过“创建 OAuth 客户端”创建的客户端。批准客户端本身不会授予任何访问权限：每个人仍需自行批准自己的登录。请只批准您认识的客户端，并检查其注册来源地址。如果部署策略允许，此网关也可以自行批准匹配的注册；这类客户端显示为“已按策略批准”。仅显示“已批准”时，并不说明是谁批准的。"
 }

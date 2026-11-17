@@ -75,6 +75,10 @@ export const AUDIT_LIST_DETAIL_KEYS: ReadonlySet<string> = new Set([
   "server_uuids",
   "server_names",
   "reset_count",
+  // Policy approval of a self-registration: the matched entry id and policy
+  // hash, or that the entry's hourly budget held the match.
+  "auto_approval",
+  "auto_approval_skipped",
 ]);
 
 /** Safe fields of before/after objects, independent of the write-side spec. */
@@ -115,6 +119,7 @@ const NESTED_DETAIL_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
   old_value: UPDATE_DETAIL_KEYS,
   new_value: UPDATE_DETAIL_KEYS,
   ip_policy: new Set(["mode", "allowed_cidrs"]),
+  auto_approval: new Set(["entry_id", "policy_version"]),
   snapshot: new Set([
     "name",
     "key_prefix",

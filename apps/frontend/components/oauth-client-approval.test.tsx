@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getTranslation, type Translations } from "@/lib/i18n";
 import {
+  approvalStatusKey,
   decisionCallbacks,
   isDecidableClient,
   refreshClientInventories,
@@ -99,6 +100,59 @@ describe("client status", () => {
       React.createElement(OAuthClientStatusBadge, { status: "pending", t }),
     );
     expect(html).not.toContain("Self-registered");
+  });
+});
+
+describe("policy approval label", () => {
+  it("labels an approved client with the list's policy flag as approved by policy", () => {
+    const html = render(
+      React.createElement(OAuthClientStatusBadge, {
+        status: "approved",
+        source: "dcr",
+        approvedByPolicy: true,
+        t,
+      }),
+    );
+    expect(html).toContain("Approved by policy");
+  });
+
+  it.each([false, undefined])(
+    "labels an approved client with flag %j as plain Approved, never as approved by a person",
+    (approvedByPolicy) => {
+      const html = render(
+        React.createElement(OAuthClientStatusBadge, {
+          status: "approved",
+          source: "dcr",
+          approvedByPolicy,
+          t,
+        }),
+      );
+      expect(html).toContain(">Approved<");
+      expect(html).not.toContain("policy");
+      expect(html).not.toContain("person");
+    },
+  );
+
+  it.each(["pending", "rejected", null])(
+    "lets the flag refine only approved, not %j",
+    (status) => {
+      expect(approvalStatusKey(status, true)).toBe(approvalStatusKey(status));
+      const html = render(
+        React.createElement(OAuthClientStatusBadge, {
+          status,
+          approvedByPolicy: true,
+          t,
+        }),
+      );
+      expect(html).not.toContain("by policy");
+    },
+  );
+
+  it.each(LOCALES)("has a distinct %s translation", (locale) => {
+    const translate = translatorFor(locale);
+    const label = translate("oauth-clients:statusApprovedByPolicy");
+    expect(label).not.toBe("oauth-clients:statusApprovedByPolicy");
+    expect(label).not.toBe(translate("oauth-clients:statusApproved"));
   });
 });
 

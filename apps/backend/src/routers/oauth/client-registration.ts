@@ -112,6 +112,13 @@ export const MAX_CONTACT_LENGTH = 255;
 export const MAX_SOFTWARE_ID_LENGTH = 255;
 export const MAX_SOFTWARE_VERSION_LENGTH = 64;
 
+/**
+ * The name a registration without one is stored under. Exported because the
+ * registration policy (./dcr-auto-approval) refuses it as an entry name: an
+ * omitted name must never match.
+ */
+export const DEFAULT_CLIENT_NAME = "Unnamed MCP Client";
+
 type RegistrationRejection = Extract<ClientRegistrationResult, { ok: false }>;
 
 /**
@@ -355,7 +362,7 @@ export function buildClientRegistration(
     client: {
       client_id: clientId,
       client_secret: clientSecret,
-      client_name: (client_name as string) || "Unnamed MCP Client",
+      client_name: (client_name as string) || DEFAULT_CLIENT_NAME,
       redirect_uris: redirect_uris as string[],
       grant_types: clientGrantTypes as string[],
       response_types: clientResponseTypes as string[],

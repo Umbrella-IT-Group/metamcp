@@ -488,3 +488,67 @@ describe("oauth-clients router list with a client metadata document row", () => 
     ]);
   });
 });
+
+describe("oauth-clients router list: policy approval provenance", () => {
+  // The repository decides `approved_by_policy` from the registration's audit
+  // marker (oauth.repo listClients). This pins that the boolean survives the
+  // serializer, the shared output schema and the router, and that nothing
+  // from the audit row rides along with it.
+  const admin = createOAuthClientsRouter(
+    oauthClientsImplementations,
+  ).createCaller({
+    user: { id: "u-admin", role: "admin" },
+    session: { id: "s1" },
+  });
+
+  const row = (overrides: Record<string, unknown>) => ({
+    client_id: "mcp_client_abc",
+    client_secret: "mcp_secret_DO_NOT_LIST",
+    client_secret_salt: "salt-DO-NOT-LIST",
+    client_name: "Example Desktop Client",
+    redirect_uris: ["http://localhost:53682/callback"],
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    scope: "mcp",
+    approval_status: "approved",
+    registration_source: "dcr",
+    approved_by: null,
+    approved_at: new Date("2026-01-01T00:00:00Z"),
+    registered_from_ip: "203.0.113.7",
+    created_at: new Date("2026-01-01T00:00:00Z"),
+    updated_at: new Date("2026-01-02T00:00:00Z"),
+    ...overrides,
+  });
+
+  it("carries the repository's boolean to the wire, false when absent, and nothing else from the audit row", async () => {
+    oauthRepoMock.listClients.mockResolvedValue([
+      row({ client_id: "mcp_client_policy", approved_by_policy: true }),
+      row({ client_id: "mcp_client_unconfirmed", approved_by_policy: false }),
+      row({ client_id: "mcp_client_older_repo" }),
+      row({
+        client_id: "mcp_client_with_audit_junk",
+        approved_by_policy: true,
+        detail: { auto_approval: { entry_id: "desktop" } },
+        policy_marker: true,
+      }),
+    ]);
+
+    const listed = await admin.list();
+
+    expect(
+      listed.clients.map((c) => [c.client_id, c.approved_by_policy]),
+    ).toEqual([
+      ["mcp_client_policy", true],
+      ["mcp_client_unconfirmed", false],
+      ["mcp_client_older_repo", false],
+      ["mcp_client_with_audit_junk", true],
+    ]);
+    const wire = JSON.stringify(listed);
+    expect(wire).not.toContain("DO_NOT_LIST");
+    expect(wire).not.toContain("DO-NOT-LIST");
+    expect(wire).not.toContain('"detail"');
+    expect(wire).not.toContain("auto_approval");
+    expect(wire).not.toContain("policy_marker");
+  });
+});

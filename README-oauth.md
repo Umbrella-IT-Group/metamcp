@@ -100,6 +100,117 @@ Self-registered clients still pending after `DCR_CLIENT_RETENTION_DAYS` (default
 deleted by the 5-minute cleanup, and rejected ones a day after rejection. Approved,
 administrator-created and older clients are never deleted by that sweep.
 
+#### Policy approval of matching registrations (optional)
+
+A deployment can let the gateway approve some self-registrations itself, at the moment they
+are stored, so that a known installed client used from a known network does not wait for an
+administrator. It is off unless `OAUTH_DCR_AUTO_APPROVE_POLICY` is set, and it is consulted
+only in `pending` mode: `off` still refuses first, and `open` keeps its own behaviour (it
+records no policy provenance and spends no policy budget). The registration response's
+`approval_status` says whether an administrator is still needed; `GET /oauth/register` says
+so without naming any policy entry, name or network.
+
+The value is one JSON document:
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "desktop",
+      "client_name": "Example Desktop Client",
+      "redirect": {
+        "host": "localhost",
+        "path": "/callback",
+        "port_min": 1024,
+        "port_max": 65535
+      },
+      "allowed_cidrs": ["203.0.113.0/24", "2001:db8:1234::/48"],
+      "max_per_hour": 20
+    }
+  ]
+}
+```
+
+A registration is approved by an entry only when all of these hold, compared exactly:
+
+- `client_name`, after Unicode NFC normalisation, equals the entry's name (no trimming or case
+  folding; an omitted name, stored as "Unnamed MCP Client", never matches);
+- it has exactly one callback, and that callback's raw text is exactly
+  `http://<host>:<port><path>` with the entry's host (`localhost`, `127.0.0.1` or `[::1]`),
+  the entry's path, and a port written in plain decimal inside `port_min`..`port_max`. The
+  raw text is compared, not only the parsed URL, because a URL parser maps `LOCALHOST`,
+  numeric IPv4 forms, escaped hostnames, embedded tabs and dot segments onto the same parts,
+  and gives a bare `?` or `#` an empty query or fragment. Every rule of the ordinary
+  registration check (including the refusal of the gateway's internal port) still runs first;
+- it is a public PKCE client: `token_endpoint_auth_method` `none` and no secret, grant types a
+  non-empty, duplicate-free subset of `authorization_code` and `refresh_token` that includes
+  `authorization_code`, and response types exactly `["code"]` (the defaults for omitted
+  fields count);
+- the caller address, `CF-Connecting-IP` as the API-key IP policy reads it, is inside one of
+  the entry's networks. A missing or unparseable address never matches, and `X-Forwarded-For`,
+  `Forwarded`, `X-Real-IP`, the socket address and anything in the body are never read.
+
+The first matching entry in document order wins. A match is stored `approved`, with
+`approved_at` and no approving person, in the same insert that creates the client; nothing
+else changes, and existing pending or rejected clients are never promoted.
+
+Each entry has an hourly budget (`max_per_hour`, 1 to 1000). When a matching entry's budget
+is spent, the registration is stored pending as usual (it does not fall through to a later
+entry). The budget is counted in the backend process: it resets when the process restarts,
+and each backend process keeps its own, so run one backend process when this is enabled. It
+is a brake on volume, not a durable quota.
+
+The document is validated as a whole, without coercion, and refused as a whole on any fault:
+more than 64 KiB, malformed JSON, a number written with a fraction or exponent, a key repeated
+in one object, a `version` other than the integer 1, an unknown or missing field at any
+level, more than 20 entries, an id not matching `[a-z0-9][a-z0-9_-]{0,63}` or repeated, a
+name of 0 or more than 255 UTF-16 units after NFC (or whitespace only, the default name, or
+not well-formed Unicode), a host other than the three above, a path that is not a plain
+canonical path (letters, digits and `-._~!$&'()*+,;=:@` in non-empty segments; no `%`, `?`,
+`#`, `\`, spaces, controls or `.`/`..` segments), a port outside 1024-65535 or `port_min` above
+`port_max`, a callback that would exceed 512 characters, 0 or more than 20 networks, or a
+network that is malformed, has host bits set, carries a zone id, is repeated, or is wider
+than an IPv4 /16 or an IPv6 /32. An IPv6 network that admits IPv4 callers through the
+IPv4-mapped range counts by the IPv4 it admits, so `::/32`, `::/48` and `::ffff:0:0/96` are
+refused and `::ffff:203.0.0.0/112` is the widest mapped network allowed. A refused document
+turns policy approval off and logs one warning naming only the reason and the field position
+(never a value from the document); registration keeps working as `pending`.
+
+The policy is read once at startup. The boot log says whether it is active, how many entries
+it has, and its `policy_version`: the SHA-256 (64 lowercase hex characters) of the canonical
+policy, which is the effective entries in document order with names in NFC and networks in
+canonical form and sorted, serialised as compact JSON with keys in the order shown above.
+Reordering keys, respelling a network or reordering networks does not change it; reordering
+entries does, because order decides which entry wins. Changing the policy means recreating
+the backend process.
+
+A policy approval is recorded on the existing `oauth.dcr.register` audit row as
+`auto_approval: {entry_id, policy_version}`; a match held by its budget is recorded as
+`auto_approval_skipped: "cap"`. The entry id is the only policy text recorded. The OAuth
+Clients page labels a client "Approved by policy" only when that client's own successful
+registration row carries the marker and the client is still an approved self-registration
+with no approving person; anything else that is approved reads "Approved", which does not say
+who approved it. The label is display only and never decides access; a lost audit row only
+loses the label.
+
+What a policy approval does and does not mean: the gateway recognised a network and the name
+and callback a caller claimed. It did not authenticate a program, and anyone able to send
+requests from an allowed network can register a client with an allowed name and callback.
+Approval mints no code or token; each person still signs in, consents, and proves PKCE S256.
+The address is only as trustworthy as the ingress: it relies on the edge overwriting
+`CF-Connecting-IP` and on no other path reaching the backend.
+
+Rollback and limits: unsetting the variable or removing an entry, then recreating the process,
+stops future policy approvals only. It revokes nothing: clients already approved, their
+authorizations and their tokens stay until an administrator deletes the client. Approved
+clients are never removed by the retention sweep, used or not. An image older than this
+change ignores the variable.
+
+The fork ships neutral conformance vectors for these rules in
+`apps/backend/src/routers/oauth/dcr-auto-approval.vectors.json`, so a deployment-side validator
+can check a policy the same way before it is deployed.
+
 What this does not cover: approval applies to a client record, not to each use of it. A
 public client has no credential of its own and its ID appears in authorization URLs, so
 approval does not establish which program is using an approved client. Each person's consent

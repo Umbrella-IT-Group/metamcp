@@ -1,0 +1,3443 @@
+{
+  "description": "Conformance vectors for policy approval of matching OAuth self-registrations (OAUTH_DCR_AUTO_APPROVE_POLICY). Neutral placeholder names and documentation addresses only. Consumed by dcr-auto-approval.test.ts; a second implementation (for example a deploy-side validator) can replay them.",
+  "format": 1,
+  "rules": {
+    "documents": "Each item gives the raw policy text in 'document', or 'document_padded': the 'base' text followed by ASCII spaces up to exactly 'pad_to_bytes' UTF-8 bytes. 'expect' is accept or reject. For accept, 'entries' is the effective policy (client_name NFC, allowed_cidrs canonical and sorted) and 'policy_version' is the lowercase hex SHA-256 of the UTF-8 bytes of the compact JSON of {version:1, entries:[{id, client_name, redirect:{host, path, port_min, port_max}, allowed_cidrs, max_per_hour}]} with keys in exactly that order, no whitespace, non-ASCII characters unescaped. For reject, 'reason' (and 'at', where present) is what the fork reports; a second implementation must reject but need not use the same reason.",
+    "numbers": "Every number must be written as a plain integer literal: a fraction or exponent ('1.0', '2e1') refuses the document, as does NaN or Infinity. A key repeated within one object (compared after unescaping) refuses the document.",
+    "lengths": "client_name length is counted in UTF-16 code units after NFC normalisation (1 to 255). Whitespace-only means made only of U+0009-U+000D, U+0020, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and U+FEFF. A name containing a lone surrogate is refused.",
+    "cidrs": "Canonical spelling is lowercase RFC 5952 compression with IPv4-mapped addresses written dotted (::ffff:198.51.100.0), an explicit prefix, and a bare address read as /32 or /128. Surrounding whitespace, a zone id or host bits refuse the entry.",
+    "matches": "'registration' is the effective client after the fork's shared registration core has applied its defaults and its own checks (the core separately refuses the gateway's internal port and non-loopback callbacks before matching). 'policy' names an entry in 'policies'. 'expect' is the matched entry id or null. The hourly budget is not part of these stateless cases."
+  },
+  "policies": {
+    "two_families": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20},{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.200/32\",\"::ffff:198.51.100.0/121\"],\"max_per_hour\":20}]}",
+    "three_hosts": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20},{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.200/32\",\"::ffff:198.51.100.0/121\"],\"max_per_hour\":20},{\"id\":\"ipv6-client\",\"client_name\":\"Example IPv6 Client\",\"redirect\":{\"host\":\"[::1]\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+    "accented_name": "{\"version\":1,\"entries\":[{\"id\":\"accented\",\"client_name\":\"Café Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+    "mapped_slash16": "{\"version\":1,\"entries\":[{\"id\":\"mapped-16\",\"client_name\":\"Example Mapped Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::ffff:203.0.0.0/112\"],\"max_per_hour\":20}]}",
+    "overlap_first_wins": "{\"version\":1,\"entries\":[{\"id\":\"first\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"second\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/25\"],\"max_per_hour\":20}]}",
+    "overlap_later_entry": "{\"version\":1,\"entries\":[{\"id\":\"elsewhere\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.0/24\"],\"max_per_hour\":20},{\"id\":\"first\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+    "empty": "{\"version\":1,\"entries\":[]}"
+  },
+  "documents": [
+    {
+      "name": "two entries",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20},{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.200/32\",\"::ffff:198.51.100.0/121\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "cli",
+          "client_name": "Example CLI Client",
+          "redirect": {
+            "host": "127.0.0.1",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["198.51.100.200/32", "::ffff:198.51.100.0/121"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "6a47e03293167d6f3309065620c0ef8c0d55db1b3fd1e4dc7cda12123264bcdb"
+    },
+    {
+      "name": "same policy, keys reordered, CIDRs respelled and reordered",
+      "document": "{\"entries\":[{\"max_per_hour\":20,\"allowed_cidrs\":[\"2001:DB8:1234:0::/48\",\"203.0.113.64/26\"],\"redirect\":{\"port_max\":65535,\"port_min\":1024,\"path\":\"/callback\",\"host\":\"localhost\"},\"client_name\":\"Example Desktop Client\",\"id\":\"desktop\"},{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::FFFF:C633:6400/121\",\"198.51.100.200\"],\"max_per_hour\":20}],\"version\":1}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "cli",
+          "client_name": "Example CLI Client",
+          "redirect": {
+            "host": "127.0.0.1",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["198.51.100.200/32", "::ffff:198.51.100.0/121"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "6a47e03293167d6f3309065620c0ef8c0d55db1b3fd1e4dc7cda12123264bcdb",
+      "note": "hashes the same as 'two entries'"
+    },
+    {
+      "name": "same entries in the other order",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.200/32\",\"::ffff:198.51.100.0/121\"],\"max_per_hour\":20},{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "cli",
+          "client_name": "Example CLI Client",
+          "redirect": {
+            "host": "127.0.0.1",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["198.51.100.200/32", "::ffff:198.51.100.0/121"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "7797b9096f925274b4757138a8a3798efdcd27196e8da58a19d85cdbb8c5d944",
+      "note": "precedence changed, so the hash differs from 'two entries'"
+    },
+    {
+      "name": "empty entries (valid, inactive)",
+      "document": "{\"version\":1,\"entries\":[]}",
+      "expect": "accept",
+      "entries": [],
+      "policy_version": "8bcae181d21321b79e1cee4976a6c9759a0f03769dde64b6f821ab5d22a33921"
+    },
+    {
+      "name": "three loopback hosts",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20},{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.200/32\",\"::ffff:198.51.100.0/121\"],\"max_per_hour\":20},{\"id\":\"ipv6-client\",\"client_name\":\"Example IPv6 Client\",\"redirect\":{\"host\":\"[::1]\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "cli",
+          "client_name": "Example CLI Client",
+          "redirect": {
+            "host": "127.0.0.1",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["198.51.100.200/32", "::ffff:198.51.100.0/121"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "ipv6-client",
+          "client_name": "Example IPv6 Client",
+          "redirect": {
+            "host": "[::1]",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "e428cf1544305a5f24db0fd6c90f3e51ea68abc08d6856ff46a099dc5623dfa7"
+    },
+    {
+      "name": "decomposed name is stored NFC",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"accented\",\"client_name\":\"Café Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "accented",
+          "client_name": "Café Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "3a62d6729710a608a2f2f8142e92899f8dcef162218711e5ac5f6f3da2cf7e93"
+    },
+    {
+      "name": "name keeps surrounding spaces (no trimming)",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\" Example Desktop Client \",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": " Example Desktop Client ",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "304194ef6b001a97882919eea2b93b54ef4d6c64e91c0d33f09634c4a6b07448"
+    },
+    {
+      "name": "name of 255 UTF-16 code units",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "7af7db639cd79bcd81107bff0d9ff02403bba1b622c9c7815bb71c3173d5342d"
+    },
+    {
+      "name": "name of 127 astral characters (254 code units)",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "012f1effe7cd016c3a33733df8caa79626f24ab7e23425822233ae599abdb3ee"
+    },
+    {
+      "name": "port range of one port at each bound",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"low\",\"client_name\":\"Low Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":1024},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"high\",\"client_name\":\"High Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":65535,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "low",
+          "client_name": "Low Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 1024
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "high",
+          "client_name": "High Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 65535,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "26472ee970a20b8c197f0ab82004834db8f50a6605e57bba4979ae624c9f1b92"
+    },
+    {
+      "name": "max_per_hour at 1 and 1000",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"one\",\"client_name\":\"One Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":1},{\"id\":\"thousand\",\"client_name\":\"Thousand Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":1000}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "one",
+          "client_name": "One Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 1
+        },
+        {
+          "id": "thousand",
+          "client_name": "Thousand Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 1000
+        }
+      ],
+      "policy_version": "738af8fc46e174a6cac8fa956820abfec19c027c27058a9e572861c101c001c0"
+    },
+    {
+      "name": "widest permitted networks: IPv4 /16, IPv6 /32, mapped /112",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.0.0/16\",\"2001:db8::/32\",\"::ffff:203.0.0.0/112\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": [
+            "198.51.0.0/16",
+            "2001:db8::/32",
+            "::ffff:203.0.0.0/112"
+          ],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "4b2f8a917bc04635c390a1904fccbe5d55ac6645e2f830a04767a4a4c9b4a926"
+    },
+    {
+      "name": "bare addresses become single-host networks",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.9\",\"2001:db8::9\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8::9/128", "203.0.113.9/32"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "ecdaef360013447361e785e01f6d84fed3f534a5cacb74117378d55f1dd0313d"
+    },
+    {
+      "name": "zero-padded prefix length is canonicalised",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/024\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "6ac9a66091609185f439d8961a2d69a292778f708829ee90436008c89e2a66ca"
+    },
+    {
+      "name": "20 entries",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"e00\",\"client_name\":\"Client 00\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e01\",\"client_name\":\"Client 01\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e02\",\"client_name\":\"Client 02\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e03\",\"client_name\":\"Client 03\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e04\",\"client_name\":\"Client 04\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e05\",\"client_name\":\"Client 05\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e06\",\"client_name\":\"Client 06\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e07\",\"client_name\":\"Client 07\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e08\",\"client_name\":\"Client 08\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e09\",\"client_name\":\"Client 09\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e10\",\"client_name\":\"Client 10\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e11\",\"client_name\":\"Client 11\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e12\",\"client_name\":\"Client 12\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e13\",\"client_name\":\"Client 13\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e14\",\"client_name\":\"Client 14\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e15\",\"client_name\":\"Client 15\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e16\",\"client_name\":\"Client 16\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e17\",\"client_name\":\"Client 17\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e18\",\"client_name\":\"Client 18\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e19\",\"client_name\":\"Client 19\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "e00",
+          "client_name": "Client 00",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e01",
+          "client_name": "Client 01",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e02",
+          "client_name": "Client 02",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e03",
+          "client_name": "Client 03",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e04",
+          "client_name": "Client 04",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e05",
+          "client_name": "Client 05",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e06",
+          "client_name": "Client 06",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e07",
+          "client_name": "Client 07",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e08",
+          "client_name": "Client 08",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e09",
+          "client_name": "Client 09",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e10",
+          "client_name": "Client 10",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e11",
+          "client_name": "Client 11",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e12",
+          "client_name": "Client 12",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e13",
+          "client_name": "Client 13",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e14",
+          "client_name": "Client 14",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e15",
+          "client_name": "Client 15",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e16",
+          "client_name": "Client 16",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e17",
+          "client_name": "Client 17",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e18",
+          "client_name": "Client 18",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        },
+        {
+          "id": "e19",
+          "client_name": "Client 19",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["203.0.113.0/24"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "8b1c57eaa229ff2b019ab2fdf764b5c8013a9808edaf4130abfee304c3f06cbb"
+    },
+    {
+      "name": "20 networks in one entry",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/32\",\"203.0.113.1/32\",\"203.0.113.2/32\",\"203.0.113.3/32\",\"203.0.113.4/32\",\"203.0.113.5/32\",\"203.0.113.6/32\",\"203.0.113.7/32\",\"203.0.113.8/32\",\"203.0.113.9/32\",\"203.0.113.10/32\",\"203.0.113.11/32\",\"203.0.113.12/32\",\"203.0.113.13/32\",\"203.0.113.14/32\",\"203.0.113.15/32\",\"203.0.113.16/32\",\"203.0.113.17/32\",\"203.0.113.18/32\",\"203.0.113.19/32\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": [
+            "203.0.113.0/32",
+            "203.0.113.1/32",
+            "203.0.113.10/32",
+            "203.0.113.11/32",
+            "203.0.113.12/32",
+            "203.0.113.13/32",
+            "203.0.113.14/32",
+            "203.0.113.15/32",
+            "203.0.113.16/32",
+            "203.0.113.17/32",
+            "203.0.113.18/32",
+            "203.0.113.19/32",
+            "203.0.113.2/32",
+            "203.0.113.3/32",
+            "203.0.113.4/32",
+            "203.0.113.5/32",
+            "203.0.113.6/32",
+            "203.0.113.7/32",
+            "203.0.113.8/32",
+            "203.0.113.9/32"
+          ],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "b9c45082ae9b6f7f6faa8577bea1b36622d98a43224a46da86945db5c4a215a1"
+    },
+    {
+      "name": "path '/'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "db63c16c7e64f22c0869081fb22e026e089f4aaf4adc2a1c4fb34dde8b983a62"
+    },
+    {
+      "name": "path '/a/b/'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/a/b/\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/a/b/",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "0da920708fd5b37497afc3f33ca040cbd8a0b38b2626ac3a3d669848250980c2"
+    },
+    {
+      "name": "path '/cb;v=1'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb;v=1\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/cb;v=1",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "bfa53bc4eaa2f3c2aa8e57abb96604b549bcecc3cbae20513711f228d4a9c600"
+    },
+    {
+      "name": "path '/~user/cb'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/~user/cb\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/~user/cb",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "68371053d4f917ffe086593d87d3afa594c260e16226fd17bb4fb5154e19282d"
+    },
+    {
+      "name": "path '/a.b/c-d_e'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/a.b/c-d_e\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/a.b/c-d_e",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "70eb37cba2c4d0060d5d431f74a3c1c45e844cb847e7bf5d5aff3b14110b8b9d"
+    },
+    {
+      "name": "path '/...'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/...\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/...",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "8ea4a8ad227dd3ba516b4db0b549fccfb101b9b4b5fc212cf325620c53503673"
+    },
+    {
+      "name": "path '/a@b:c'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/a@b:c\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/a@b:c",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "c25bb45f9af30f78c7f675debe342ab1dcf8477a5358ac3ea6d6f3d3810eb857"
+    },
+    {
+      "name": "constructed callback of exactly 512 characters",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "03ebed33494048008fed3b990c0c21acb23a3cca1ee0a80d87676f8f0d519705"
+    },
+    {
+      "name": "document of exactly 65536 bytes",
+      "document_padded": {
+        "base": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+        "pad_to_bytes": 65536
+      },
+      "expect": "accept",
+      "entries": [
+        {
+          "id": "desktop",
+          "client_name": "Example Desktop Client",
+          "redirect": {
+            "host": "localhost",
+            "path": "/callback",
+            "port_min": 1024,
+            "port_max": 65535
+          },
+          "allowed_cidrs": ["2001:db8:1234::/48", "203.0.113.64/26"],
+          "max_per_hour": 20
+        }
+      ],
+      "policy_version": "75c268f4f31119e74664d7351ae96de08d6e1fedd05e0ff37e4977a0b5c628fe"
+    },
+    {
+      "name": "document of 65537 bytes",
+      "document_padded": {
+        "base": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+        "pad_to_bytes": 65537
+      },
+      "expect": "reject",
+      "reason": "too_large"
+    },
+    {
+      "name": "not JSON: ''",
+      "document": "",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: ' '",
+      "document": " ",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: '{'",
+      "document": "{",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: '[1,]'",
+      "document": "[1,]",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: \"{'version':1}\"",
+      "document": "{'version':1}",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: '{\"version\":1,\"entries\":[]} x'",
+      "document": "{\"version\":1,\"entries\":[]} x",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: 'NaN'",
+      "document": "NaN",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: '{\"version\":NaN,\"entries\":[]}'",
+      "document": "{\"version\":NaN,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: '{\"version\":Infinity,\"entries\":'",
+      "document": "{\"version\":Infinity,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "not JSON: '\\ufeff{\"version\":1,\"entries\":[]}'",
+      "document": "﻿{\"version\":1,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "not_json"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":1.0,\"entries\":[]}",
+      "document": "{\"version\":1.0,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":1e0,\"entries\":[]}",
+      "document": "{\"version\":1e0,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":1E0,\"entries\":[]}",
+      "document": "{\"version\":1E0,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":10e-1,\"entries\":[]}",
+      "document": "{\"version\":10e-1,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Examp",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024.0,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Examp",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20.0}]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "non-integer number literal: {\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Examp",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20.5}]}",
+      "expect": "reject",
+      "reason": "non_integer_number"
+    },
+    {
+      "name": "repeated root key",
+      "document": "{\"version\":1,\"version\":1,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "duplicate_key"
+    },
+    {
+      "name": "repeated key spelled with an escape",
+      "document": "{\"version\":1,\"entries\":[],\"\\u0076ersion\":1}",
+      "expect": "reject",
+      "reason": "duplicate_key"
+    },
+    {
+      "name": "repeated entry key",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"a\",\"id\":\"b\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "duplicate_key"
+    },
+    {
+      "name": "repeated redirect key",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"a\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "duplicate_key"
+    },
+    {
+      "name": "root is an array",
+      "document": "[]",
+      "expect": "reject",
+      "reason": "not_object"
+    },
+    {
+      "name": "root is null",
+      "document": "null",
+      "expect": "reject",
+      "reason": "not_object"
+    },
+    {
+      "name": "root is a string",
+      "document": "\"policy\"",
+      "expect": "reject",
+      "reason": "not_object"
+    },
+    {
+      "name": "entry is a string",
+      "document": "{\"version\":1,\"entries\":[\"desktop\"]}",
+      "expect": "reject",
+      "reason": "not_object",
+      "at": "entries[0]"
+    },
+    {
+      "name": "entry is null",
+      "document": "{\"version\":1,\"entries\":[null]}",
+      "expect": "reject",
+      "reason": "not_object",
+      "at": "entries[0]"
+    },
+    {
+      "name": "unknown root field",
+      "document": "{\"version\":1,\"entries\":[],\"comment\":\"x\"}",
+      "expect": "reject",
+      "reason": "unknown_field"
+    },
+    {
+      "name": "__proto__ root field",
+      "document": "{\"version\":1,\"entries\":[],\"__proto__\":{\"x\":1}}",
+      "expect": "reject",
+      "reason": "unknown_field"
+    },
+    {
+      "name": "unknown entry field",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20,\"note\":\"x\"}]}",
+      "expect": "reject",
+      "reason": "unknown_field",
+      "at": "entries[0]"
+    },
+    {
+      "name": "unknown redirect field",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535,\"query\":\"\"},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "unknown_field",
+      "at": "entries[0].redirect"
+    },
+    {
+      "name": "missing entries",
+      "document": "{\"version\":1}",
+      "expect": "reject",
+      "reason": "missing_field",
+      "at": "entries"
+    },
+    {
+      "name": "missing version",
+      "document": "{\"entries\":[]}",
+      "expect": "reject",
+      "reason": "missing_field",
+      "at": "version"
+    },
+    {
+      "name": "missing max_per_hour",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"]}]}",
+      "expect": "reject",
+      "reason": "missing_field",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "missing redirect path",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "missing_field",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "version 2",
+      "document": "{\"version\":2,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "bad_version",
+      "at": "version"
+    },
+    {
+      "name": "version \"1\"",
+      "document": "{\"version\":\"1\",\"entries\":[]}",
+      "expect": "reject",
+      "reason": "bad_version",
+      "at": "version"
+    },
+    {
+      "name": "version true",
+      "document": "{\"version\":true,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "bad_version",
+      "at": "version"
+    },
+    {
+      "name": "version 0",
+      "document": "{\"version\":0,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "bad_version",
+      "at": "version"
+    },
+    {
+      "name": "version -1",
+      "document": "{\"version\":-1,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "bad_version",
+      "at": "version"
+    },
+    {
+      "name": "version null",
+      "document": "{\"version\":null,\"entries\":[]}",
+      "expect": "reject",
+      "reason": "bad_version",
+      "at": "version"
+    },
+    {
+      "name": "entries {}",
+      "document": "{\"version\":1,\"entries\":{}}",
+      "expect": "reject",
+      "reason": "bad_entries",
+      "at": "entries"
+    },
+    {
+      "name": "entries null",
+      "document": "{\"version\":1,\"entries\":null}",
+      "expect": "reject",
+      "reason": "bad_entries",
+      "at": "entries"
+    },
+    {
+      "name": "entries \"x\"",
+      "document": "{\"version\":1,\"entries\":\"x\"}",
+      "expect": "reject",
+      "reason": "bad_entries",
+      "at": "entries"
+    },
+    {
+      "name": "entries 1",
+      "document": "{\"version\":1,\"entries\":1}",
+      "expect": "reject",
+      "reason": "bad_entries",
+      "at": "entries"
+    },
+    {
+      "name": "21 entries",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"e00\",\"client_name\":\"Client 00\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e01\",\"client_name\":\"Client 01\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e02\",\"client_name\":\"Client 02\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e03\",\"client_name\":\"Client 03\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e04\",\"client_name\":\"Client 04\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e05\",\"client_name\":\"Client 05\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e06\",\"client_name\":\"Client 06\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e07\",\"client_name\":\"Client 07\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e08\",\"client_name\":\"Client 08\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e09\",\"client_name\":\"Client 09\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e10\",\"client_name\":\"Client 10\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e11\",\"client_name\":\"Client 11\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e12\",\"client_name\":\"Client 12\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e13\",\"client_name\":\"Client 13\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e14\",\"client_name\":\"Client 14\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e15\",\"client_name\":\"Client 15\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e16\",\"client_name\":\"Client 16\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e17\",\"client_name\":\"Client 17\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e18\",\"client_name\":\"Client 18\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e19\",\"client_name\":\"Client 19\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20},{\"id\":\"e20\",\"client_name\":\"Client 20\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "too_many_entries",
+      "at": "entries"
+    },
+    {
+      "name": "entry id ''",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id 'Desktop'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"Desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id '-desktop'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"-desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id '_desktop'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"_desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id 'a b'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"a b\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id 'a.b'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"a.b\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id 7",
+      "document": "{\"version\":1,\"entries\":[{\"id\":7,\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":null,\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "entry id 'désk'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"désk\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_id",
+      "at": "entries[0].id"
+    },
+    {
+      "name": "duplicate entry id",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20},{\"id\":\"desktop\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.51.100.200/32\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "duplicate_id",
+      "at": "entries[1].id"
+    },
+    {
+      "name": "client_name ''",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name '   '",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"   \",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name '\\t'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"\\t\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name '\\xa0'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\" \",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name '\\ufeff'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"﻿\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name '\\u3000\\u2028'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"　 \",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name 'Unnamed MCP Client'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Unnamed MCP Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name 'nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name '😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name 'क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़क़\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name 7",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":7,\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":null,\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name ['Example Desktop Client']",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":[\"Example Desktop Client\"],\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "client_name with a lone surrogate",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example \\ud800 Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_client_name",
+      "at": "entries[0].client_name"
+    },
+    {
+      "name": "redirect \"localhost\"",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":\"localhost\",\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_redirect",
+      "at": "entries[0].redirect"
+    },
+    {
+      "name": "redirect null",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":null,\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_redirect",
+      "at": "entries[0].redirect"
+    },
+    {
+      "name": "redirect [\"localhost\"]",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":[\"localhost\"],\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_redirect",
+      "at": "entries[0].redirect"
+    },
+    {
+      "name": "host 'LOCALHOST'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"LOCALHOST\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host 'localhost.'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost.\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host '::1'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"::1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host '127.0.0.2'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"127.0.0.2\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host '[::ffff:127.0.0.1]'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"[::ffff:127.0.0.1]\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host '0x7f.1'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"0x7f.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host '127.1'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"127.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host ''",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host ' localhost'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\" localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host 1",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":1,\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "host None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":null,\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_host",
+      "at": "entries[0].redirect.host"
+    },
+    {
+      "name": "path 'callback'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path ''",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/call back'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/call back\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb?x=1'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb?x=1\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb?'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb?\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb#x'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb#x\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/a/../b'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/a/../b\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/./cb'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/./cb\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/..'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/..\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/.'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/.\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/a//b'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/a//b\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '//cb'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"//cb\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb%2F'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb%2F\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/%2e/cb'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/%2e/cb\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/c\\\\b'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/c\\\\b\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/café'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/café\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb\\x00'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb\\u0000\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb\\t'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb\\t\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/\"cb\"'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/\\\"cb\\\"\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb<x>'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb<x>\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/{cb}'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/{cb}\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb|x'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb|x\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/cb^'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/cb^\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path '/`cb`'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/`cb`\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path 1",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":1,\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "path None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":null,\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_path",
+      "at": "entries[0].redirect.path"
+    },
+    {
+      "name": "port_min 1023",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1023,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_min"
+    },
+    {
+      "name": "port_min 0",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":0,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_min"
+    },
+    {
+      "name": "port_min -1",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":-1,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_min"
+    },
+    {
+      "name": "port_min '8080'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":\"8080\",\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_min"
+    },
+    {
+      "name": "port_min True",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":true,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_min"
+    },
+    {
+      "name": "port_min None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":null,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_min"
+    },
+    {
+      "name": "port_max 1023",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":1023},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_max 65536",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65536},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_max 0",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":0},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_max -1",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":-1},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_max '8080'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":\"8080\"},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_max True",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":true},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_max None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":null},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port",
+      "at": "entries[0].redirect.port_max"
+    },
+    {
+      "name": "port_min above port_max",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":9000,\"port_max\":8000},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_port_range",
+      "at": "entries[0].redirect"
+    },
+    {
+      "name": "constructed callback of 513 characters",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "callback_too_long",
+      "at": "entries[0].redirect"
+    },
+    {
+      "name": "allowed_cidrs []",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidrs",
+      "at": "entries[0].allowed_cidrs"
+    },
+    {
+      "name": "allowed_cidrs 203.0.113.0/24",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":\"203.0.113.0/24\",\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidrs",
+      "at": "entries[0].allowed_cidrs"
+    },
+    {
+      "name": "allowed_cidrs None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":null,\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidrs",
+      "at": "entries[0].allowed_cidrs"
+    },
+    {
+      "name": "allowed_cidrs ['203.0.113.0/32', '203.0.113.",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/32\",\"203.0.113.1/32\",\"203.0.113.2/32\",\"203.0.113.3/32\",\"203.0.113.4/32\",\"203.0.113.5/32\",\"203.0.113.6/32\",\"203.0.113.7/32\",\"203.0.113.8/32\",\"203.0.113.9/32\",\"203.0.113.10/32\",\"203.0.113.11/32\",\"203.0.113.12/32\",\"203.0.113.13/32\",\"203.0.113.14/32\",\"203.0.113.15/32\",\"203.0.113.16/32\",\"203.0.113.17/32\",\"203.0.113.18/32\",\"203.0.113.19/32\",\"203.0.113.20/32\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidrs",
+      "at": "entries[0].allowed_cidrs"
+    },
+    {
+      "name": "network '203.0.113.5/24'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.5/24\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '2001:db8::1/32'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"2001:db8::1/32\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network 'fe80::/64%eth0'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"fe80::/64%eth0\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network 'fe80::1%eth0'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"fe80::1%eth0\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network ' 203.0.113.0/24'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\" 203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '203.0.113.0/24 '",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24 \"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '203.0.113.0/33'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/33\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '203.0.113.0/'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '203.0.113.05/32'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.05/32\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '203.0.113.0/24/1'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24/1\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network '2001:db8::/129'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"2001:db8::/129\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network 'example.test'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"example.test\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network ''",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network 7",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[7],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[null],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "bad_cidr",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide 198.50.0.0/15",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.50.0.0/15\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide 0.0.0.0/0",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"0.0.0.0/0\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide 2001:db8::/31",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"2001:db8::/31\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide ::/0",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::/0\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide ::/32",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::/32\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide ::/48",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::/48\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide ::ffff:0:0/96",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::ffff:0:0/96\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "network too wide ::ffff:203.0.0.0/111",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"::ffff:203.0.0.0/111\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "any-address pair",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"0.0.0.0/0\",\"::/0\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[0].allowed_cidrs[0]"
+    },
+    {
+      "name": "repeated network",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.0/24\",\"203.0.113.0/24\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "duplicate_cidr",
+      "at": "entries[0].allowed_cidrs[1]"
+    },
+    {
+      "name": "repeated network in another spelling",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"2001:db8::/32\",\"2001:DB8:0::/32\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "duplicate_cidr",
+      "at": "entries[0].allowed_cidrs[1]"
+    },
+    {
+      "name": "max_per_hour 0",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":0}]}",
+      "expect": "reject",
+      "reason": "bad_max_per_hour",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "max_per_hour 1001",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":1001}]}",
+      "expect": "reject",
+      "reason": "bad_max_per_hour",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "max_per_hour '20'",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":\"20\"}]}",
+      "expect": "reject",
+      "reason": "bad_max_per_hour",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "max_per_hour None",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":null}]}",
+      "expect": "reject",
+      "reason": "bad_max_per_hour",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "max_per_hour True",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":true}]}",
+      "expect": "reject",
+      "reason": "bad_max_per_hour",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "max_per_hour -5",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":-5}]}",
+      "expect": "reject",
+      "reason": "bad_max_per_hour",
+      "at": "entries[0].max_per_hour"
+    },
+    {
+      "name": "one good entry beside a bad one",
+      "document": "{\"version\":1,\"entries\":[{\"id\":\"desktop\",\"client_name\":\"Example Desktop Client\",\"redirect\":{\"host\":\"localhost\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"203.0.113.64/26\",\"2001:db8:1234::/48\"],\"max_per_hour\":20},{\"id\":\"cli\",\"client_name\":\"Example CLI Client\",\"redirect\":{\"host\":\"127.0.0.1\",\"path\":\"/callback\",\"port_min\":1024,\"port_max\":65535},\"allowed_cidrs\":[\"198.0.0.0/8\"],\"max_per_hour\":20}]}",
+      "expect": "reject",
+      "reason": "cidr_too_wide",
+      "at": "entries[1].allowed_cidrs[0]"
+    }
+  ],
+  "matches": [
+    {
+      "name": "desktop family from an allowed IPv4 network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "desktop"
+    },
+    {
+      "name": "authorization_code alone",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "desktop"
+    },
+    {
+      "name": "grant order does not matter",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["refresh_token", "authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "desktop"
+    },
+    {
+      "name": "cli family from its single host",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.0.0.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": "cli"
+    },
+    {
+      "name": "ipv6 loopback host",
+      "policy": "three_hosts",
+      "registration": {
+        "client_name": "Example IPv6 Client",
+        "redirect_uris": ["http://[::1]:8080/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "2001:db8:1234::1",
+      "expect": "ipv6-client"
+    },
+    {
+      "name": "NFD-equivalent name",
+      "policy": "accented_name",
+      "registration": {
+        "client_name": "Café Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "accented"
+    },
+    {
+      "name": "NFC name",
+      "policy": "accented_name",
+      "registration": {
+        "client_name": "Café Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "accented"
+    },
+    {
+      "name": "lowest port",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:1024/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "desktop"
+    },
+    {
+      "name": "highest port",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:65535/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": "desktop"
+    },
+    {
+      "name": "empty policy matches nothing",
+      "policy": "empty",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name 'example desktop client'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "example desktop client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name 'Example Desktop Client '",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client ",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name ' Example Desktop Client'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": " Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name 'Example Desktop Client\\u200b'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client​",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name 'Еxample Desktop Client'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Еxample Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name 'Example  Desktop Client'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example  Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "name 'Unnamed MCP Client'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Unnamed MCP Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "two callbacks, both of the right shape",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": [
+          "http://localhost:53682/callback",
+          "http://localhost:53683/callback"
+        ],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "no callbacks",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": [],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'https://localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["https://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'HTTP://localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["HTTP://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://LOCALHOST:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://LOCALHOST:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://Localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://Localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost.:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost.:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://local%68ost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://local%68ost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://127.0.0.1:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://127.0.0.1:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://[::1]:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://[::1]:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callbackx'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callbackx"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback/'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback/"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback/x'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback/x"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/x/../callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/x/../callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/./callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/./callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/%2e/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/%2e/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callbac%6b'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callbac%6b"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682\\\\callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682\\callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/call\\tback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/call\tback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/call\\nback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/call\nback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback ' http://localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": [" http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback '",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback "],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback?x=1'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback?x=1"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback?'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback?"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback#x'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback#x"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:53682/callback#'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback#"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:80/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:80/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:0/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:0/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:1023/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:1023/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:65536/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:65536/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:053682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:053682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:01024/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:01024/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:+5368/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:+5368/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://localhost:abc/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:abc/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://user@localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://user@localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://@localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://@localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http://user:pass@localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://user:pass@localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http:/localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http:/localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "callback 'http:localhost:53682/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http:localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://127.1:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://2130706433:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://2130706433:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://0x7f000001:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://0x7f000001:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://0177.0.0.1:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://0177.0.0.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://127.0.0.01:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.0.0.01:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://[::ffff:127.0.0.1]:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://[::ffff:127.0.0.1]:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "cli callback 'http://localhost:41000/callback'",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://localhost:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.200",
+      "expect": null
+    },
+    {
+      "name": "confidential client with a secret",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_post",
+        "client_secret": "mcp_secret_example"
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "basic auth client with a secret",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_basic",
+        "client_secret": "mcp_secret_example"
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "auth method none but a secret present",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": "mcp_secret_example"
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "auth method missing",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": null,
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "empty grant types",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": [],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "refresh_token alone",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "duplicate authorization_code",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "extra grant type",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "client_credentials"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "grant types not a list",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": "authorization_code",
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "empty response types",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": [],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "duplicate response type",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code", "code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "other response type",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["token"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "extra response type",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code", "token"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "missing caller address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": null,
+      "expect": null
+    },
+    {
+      "name": "empty caller address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "",
+      "expect": null
+    },
+    {
+      "name": "unparseable caller address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "not-an-address",
+      "expect": null
+    },
+    {
+      "name": "zoned caller address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "2001:db8:1234::1%eth0",
+      "expect": null
+    },
+    {
+      "name": "caller just below the network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.63",
+      "expect": null
+    },
+    {
+      "name": "caller just above the network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.128",
+      "expect": null
+    },
+    {
+      "name": "caller at the network's first address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.64",
+      "expect": "desktop"
+    },
+    {
+      "name": "caller at the network's last address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.127",
+      "expect": "desktop"
+    },
+    {
+      "name": "native IPv6 caller inside",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "2001:db8:1234:ffff::1",
+      "expect": "desktop"
+    },
+    {
+      "name": "native IPv6 caller outside",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "2001:db8:1235::1",
+      "expect": null
+    },
+    {
+      "name": "IPv4-mapped caller against an IPv4 network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "::ffff:203.0.113.70",
+      "expect": "desktop"
+    },
+    {
+      "name": "IPv4-mapped caller in hex form against an IPv4 network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "::ffff:cb00:7146",
+      "expect": "desktop"
+    },
+    {
+      "name": "IPv4-mapped caller outside an IPv4 network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "::ffff:203.0.113.10",
+      "expect": null
+    },
+    {
+      "name": "IPv4 caller against a mapped network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.0.0.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.20",
+      "expect": "cli"
+    },
+    {
+      "name": "IPv4 caller at a mapped network's last address",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.0.0.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.127",
+      "expect": "cli"
+    },
+    {
+      "name": "IPv4 caller just outside a mapped network",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.0.0.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.128",
+      "expect": null
+    },
+    {
+      "name": "IPv4 caller against an IPv6-only entry",
+      "policy": "three_hosts",
+      "registration": {
+        "client_name": "Example IPv6 Client",
+        "redirect_uris": ["http://[::1]:8080/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.70",
+      "expect": null
+    },
+    {
+      "name": "native IPv6 caller against an IPv4-only list",
+      "policy": "two_families",
+      "registration": {
+        "client_name": "Example CLI Client",
+        "redirect_uris": ["http://127.0.0.1:41000/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "2001:db8:1234::1",
+      "expect": null
+    },
+    {
+      "name": "mapped /112 admits its IPv4 /16",
+      "policy": "mapped_slash16",
+      "registration": {
+        "client_name": "Example Mapped Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.255.255",
+      "expect": "mapped-16"
+    },
+    {
+      "name": "mapped /112 first address",
+      "policy": "mapped_slash16",
+      "registration": {
+        "client_name": "Example Mapped Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.0.0",
+      "expect": "mapped-16"
+    },
+    {
+      "name": "mapped /112 refuses the next /16",
+      "policy": "mapped_slash16",
+      "registration": {
+        "client_name": "Example Mapped Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.1.0.0",
+      "expect": null
+    },
+    {
+      "name": "mapped /112 refuses the previous /16",
+      "policy": "mapped_slash16",
+      "registration": {
+        "client_name": "Example Mapped Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "202.255.255.255",
+      "expect": null
+    },
+    {
+      "name": "mapped /112 with a mapped caller",
+      "policy": "mapped_slash16",
+      "registration": {
+        "client_name": "Example Mapped Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "::ffff:203.0.4.5",
+      "expect": "mapped-16"
+    },
+    {
+      "name": "first matching entry wins",
+      "policy": "overlap_first_wins",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.10",
+      "expect": "first"
+    },
+    {
+      "name": "a later entry matches when an earlier one does not",
+      "policy": "overlap_later_entry",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.10",
+      "expect": "first"
+    },
+    {
+      "name": "the later overlapping entry alone",
+      "policy": "overlap_first_wins",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "203.0.113.200",
+      "expect": "first"
+    },
+    {
+      "name": "the earlier entry when both match",
+      "policy": "overlap_later_entry",
+      "registration": {
+        "client_name": "Example Desktop Client",
+        "redirect_uris": ["http://localhost:53682/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_secret": null
+      },
+      "caller_ip": "198.51.100.10",
+      "expect": "elsewhere"
+    }
+  ]
+}
