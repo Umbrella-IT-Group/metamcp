@@ -118,29 +118,34 @@ const buildNamespacesRouter = () => {
   return { router: createNamespacesRouter(impls), impls };
 };
 
-describe("mcpServers.list — isAdmin reaches the implementation", () => {
-  it("passes false for a member", async () => {
+// TEST-EDIT (SPEC): the router now hands the implementation a detail level
+// decided from the verified caller ("full" for a person signed in as an
+// administrator, "redacted" for a member or a session with no role) in place of
+// the admin flag. The derivation is pinned exactly as before; the admin-plane
+// case is in server-reply-detail.test.ts.
+describe("mcpServers.list — the detail level reaches the implementation", () => {
+  it("passes redacted for a member", async () => {
     const { router, impls } = buildMcpServersRouter();
 
     await router.createCaller(memberCtx).list();
 
-    expect(impls.list).toHaveBeenCalledWith("member-1", false);
+    expect(impls.list).toHaveBeenCalledWith("member-1", "redacted");
   });
 
-  it("passes true for an admin", async () => {
+  it("passes full for an admin", async () => {
     const { router, impls } = buildMcpServersRouter();
 
     await router.createCaller(adminCtx).list();
 
-    expect(impls.list).toHaveBeenCalledWith("admin-1", true);
+    expect(impls.list).toHaveBeenCalledWith("admin-1", "full");
   });
 
-  it("passes false when the session carries no role", async () => {
+  it("passes redacted when the session carries no role", async () => {
     const { router, impls } = buildMcpServersRouter();
 
     await router.createCaller(rolelessCtx).list();
 
-    expect(impls.list).toHaveBeenCalledWith("ghost-1", false);
+    expect(impls.list).toHaveBeenCalledWith("ghost-1", "redacted");
   });
 
   it("stays reachable by members — this is redaction, not an RBAC gate", async () => {
@@ -153,22 +158,22 @@ describe("mcpServers.list — isAdmin reaches the implementation", () => {
   });
 });
 
-describe("mcpServers.get — isAdmin reaches the implementation", () => {
-  it("passes the flag after the user id, not in place of it", async () => {
+describe("mcpServers.get — the detail level reaches the implementation", () => {
+  it("passes the level after the user id, not in place of it", async () => {
     const { router, impls } = buildMcpServersRouter();
 
     await router.createCaller(memberCtx).get({ uuid: SERVER_UUID });
     expect(impls.get).toHaveBeenCalledWith(
       { uuid: SERVER_UUID },
       "member-1",
-      false,
+      "redacted",
     );
 
     await router.createCaller(adminCtx).get({ uuid: SERVER_UUID });
     expect(impls.get).toHaveBeenLastCalledWith(
       { uuid: SERVER_UUID },
       "admin-1",
-      true,
+      "full",
     );
   });
 });
@@ -250,22 +255,22 @@ describe("tools.getByMcpServerUuid — the caller id reaches the implementation"
   });
 });
 
-describe("namespaces.get — isAdmin reaches the implementation", () => {
-  it("passes false for a member and true for an admin", async () => {
+describe("namespaces.get — the detail level reaches the implementation", () => {
+  it("passes redacted for a member and full for an admin", async () => {
     const { router, impls } = buildNamespacesRouter();
 
     await router.createCaller(memberCtx).get({ uuid: NAMESPACE_UUID });
     expect(impls.get).toHaveBeenCalledWith(
       { uuid: NAMESPACE_UUID },
       "member-1",
-      false,
+      "redacted",
     );
 
     await router.createCaller(adminCtx).get({ uuid: NAMESPACE_UUID });
     expect(impls.get).toHaveBeenLastCalledWith(
       { uuid: NAMESPACE_UUID },
       "admin-1",
-      true,
+      "full",
     );
   });
 });

@@ -415,6 +415,63 @@ export const ADMIN_PLANE_OPERATOR_CONFIRMATIONS: Readonly<
   "frontend.apiKeys.remove": ["confirm_name", "impact_fingerprint"],
 };
 
+/**
+ * Behaviours of this gateway that `apiKeys.operatorCapabilities` reports by
+ * name, beyond the contract version, so a consumer that depends on one can
+ * refuse to send its request to a gateway that lacks it. Sorted. Added only
+ * for behaviour a consumer has to detect; the contract version stays what it
+ * was.
+ *
+ *  - `server-reads-redacted-v1`: every server object an admin-plane key reads
+ *    or receives back (`mcpServers.list`, `listAll`, `get`, `create` and
+ *    `update` replies, and the servers embedded in `namespaces.get`) keeps its
+ *    `env` and `headers` names with empty values, and carries no command,
+ *    arguments or URL (see ServerDetailLevel).
+ *  - `server-update-metadata-only-v1`: `mcpServers.update` accepts the strict
+ *    `metadata_only` request (a rename and/or a description) and an
+ *    operator-scope key may send nothing else.
+ */
+export const ADMIN_PLANE_OPERATOR_MARKERS: readonly string[] = [
+  "server-reads-redacted-v1",
+  "server-update-metadata-only-v1",
+];
+
+/**
+ * How much of a stored server's connection a reply may carry, decided by the
+ * router from the verified caller and handed to the implementation and the
+ * serializers explicitly (there is no default, and an unrecognised value reads
+ * as the least):
+ *
+ *  - `full`: a person signed in as an administrator, who edits the connection
+ *    in the admin UI: command, arguments, environment, URL and headers as
+ *    stored. The stored bearer token is never returned at any level.
+ *  - `names_only`: an admin-plane API key of either scope. `env` and `headers`
+ *    keep their names and every value is the empty string; the command, the
+ *    arguments and the URL (a path, query or fragment can carry a credential
+ *    too) are withheld as the schema's own null and empty values. What the
+ *    tooling needs is the name and the uuid.
+ *  - `redacted`: everyone else (a member): nothing of the connection.
+ */
+export type ServerDetailLevel = "full" | "names_only" | "redacted";
+
+/**
+ * The detail level a caller's server replies carry, from the verified request
+ * context alone: an admin-plane origin (set only by the backend's context
+ * builder from a key row it has verified, never from anything the request
+ * sends) is `names_only` whatever its owner's role; otherwise the session
+ * role decides. Never throws: a context it cannot read gets `redacted`.
+ */
+export function serverDetailLevelOf(
+  ctx: BaseContext | undefined | null,
+): ServerDetailLevel {
+  try {
+    if (adminPlaneOrigin(ctx)) return "names_only";
+    return ctx?.user?.role === "admin" ? "full" : "redacted";
+  } catch {
+    return "redacted";
+  }
+}
+
 /** One constant refusal for every procedure outside the list. */
 export const ADMIN_PLANE_FORBIDDEN_MESSAGE =
   "This procedure is not available to an admin-plane API key.";

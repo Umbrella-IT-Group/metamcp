@@ -1421,19 +1421,27 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
       });
     });
 
+    // TEST-EDIT (SPEC): the full server update is the sync scope's (an
+    // operator-scope key renames through the metadata-only variant), so the two
+    // cases below send it with the sync key and read the row back with the
+    // operator's, as before.
     it("names a changed server credential field and stores no credential value, old or new, in the row or its read-back", async () => {
       const server = await newServer();
-      const reply = await operator("mcpServers.update", {
-        uuid: server.uuid,
-        name: server.name,
-        description: "a described server",
-        type: "STREAMABLE_HTTP",
-        url: `https://${CREDENTIALS.urlNew}/mcp`,
-        args: [CREDENTIALS.argNew],
-        env: { TOKEN: CREDENTIALS.envNew },
-        headers: { Authorization: `Bearer ${CREDENTIALS.headerNew}` },
-        bearerToken: CREDENTIALS.bearerNew,
-      });
+      const reply = await operator(
+        "mcpServers.update",
+        {
+          uuid: server.uuid,
+          name: server.name,
+          description: "a described server",
+          type: "STREAMABLE_HTTP",
+          url: `https://${CREDENTIALS.urlNew}/mcp`,
+          args: [CREDENTIALS.argNew],
+          env: { TOKEN: CREDENTIALS.envNew },
+          headers: { Authorization: `Bearer ${CREDENTIALS.headerNew}` },
+          bearerToken: CREDENTIALS.bearerNew,
+        },
+        fx.sync.key,
+      );
       expect(ok(reply)).toBe(true);
 
       const detail = await rowThroughAuditList("mcpserver.update", server.uuid);
@@ -1470,13 +1478,17 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
 
     it("records a credential field cleared as changed and an untouched credential as not", async () => {
       const server = await newServer();
-      const reply = await operator("mcpServers.update", {
-        uuid: server.uuid,
-        name: server.name,
-        type: "STREAMABLE_HTTP",
-        url: `https://${CREDENTIALS.urlOld}/mcp`,
-        clearBearerToken: true,
-      });
+      const reply = await operator(
+        "mcpServers.update",
+        {
+          uuid: server.uuid,
+          name: server.name,
+          type: "STREAMABLE_HTTP",
+          url: `https://${CREDENTIALS.urlOld}/mcp`,
+          clearBearerToken: true,
+        },
+        fx.sync.key,
+      );
       expect(ok(reply)).toBe(true);
       const detail = await rowThroughAuditList("mcpserver.update", server.uuid);
       expect(detail.changed_fields).toEqual(["bearer_token"]);

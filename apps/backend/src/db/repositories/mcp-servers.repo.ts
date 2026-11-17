@@ -15,6 +15,7 @@ import {
   like,
   not,
   or,
+  sql,
 } from "drizzle-orm";
 import { DatabaseError } from "pg";
 import { z } from "zod";
@@ -28,7 +29,9 @@ import logger from "@/utils/logger";
 
 import { db } from "../index";
 import { mcpServersTable } from "../schema";
+import { lockMcpServerName } from "./admin-plane-locks";
 import type { DbExecutor, DbTransaction } from "./db-executor";
+import { ServerNameTakenError } from "./mcp-server-name-rule";
 import {
   planServerUpdate,
   ServerCredentialRetentionError,
@@ -81,9 +84,11 @@ function handleDatabaseError(
       pgError.code === "23505" &&
       pgError.constraint === "mcp_servers_name_user_unique_idx"
     ) {
-      throw new Error(
-        `Server name "${serverName}" already exists. Server names must be unique within your scope.`,
-      );
+      // An owner-scoped bulk import can commit after the advisory-locked
+      // preflight saw no holder. The unique index is the final authority in
+      // that race, and must produce the same coded refusal and denied audit
+      // row as the preflight, without naming a server or owner.
+      throw new ServerNameTakenError();
     }
 
     // Handle regex constraint violation for server name
@@ -103,7 +108,50 @@ function handleDatabaseError(
   );
 }
 
+/**
+ * Refuse a name that another server already holds in the owner scope the write
+ * leaves. A NULL owner is one scope (IS NOT DISTINCT FROM), which the
+ * database's unique rule on (name, owner) does not enforce. Called under the
+ * name's lock (`lockMcpServerName`), so a writer queued behind another of the
+ * same name judges the rows the first committed. Only a write that puts a
+ * server under a name or owner scope it was not under is judged, so the server
+ * being written never collides with itself.
+ */
+async function refuseTakenName(
+  tx: DbTransaction,
+  next: { name: string; owner: string | null },
+): Promise<void> {
+  const [holder] = await tx
+    .select({ uuid: mcpServersTable.uuid })
+    .from(mcpServersTable)
+    .where(
+      and(
+        eq(mcpServersTable.name, next.name),
+        sql`${mcpServersTable.user_id} IS NOT DISTINCT FROM ${next.owner}::text`,
+      ),
+    )
+    .limit(1);
+  if (holder) throw new ServerNameTakenError();
+}
+
+/** A server's name as stored right now, read without a lock. */
+async function serverNameOf(
+  tx: DbTransaction,
+  uuid: string,
+): Promise<string | undefined> {
+  const [row] = await tx
+    .select({ name: mcpServersTable.name })
+    .from(mcpServersTable)
+    .where(eq(mcpServersTable.uuid, uuid));
+  return row?.name;
+}
+
 export class McpServersRepository {
+  /**
+   * Create a server. The name is judged under its lock against every server in
+   * the owner scope (NULL is one scope) before the insert, and a name another
+   * server holds there throws ServerNameTakenError and writes nothing.
+   */
   async create(
     input: McpServerCreateInput,
     // The caller's transaction when it holds one (an admin-plane write records
@@ -111,13 +159,21 @@ export class McpServersRepository {
     executor?: DbExecutor,
   ): Promise<DatabaseMcpServer> {
     try {
-      const [createdServer] = await (executor ?? db)
-        .insert(mcpServersTable)
-        .values(withEncryptedBearerToken(input))
-        .returning();
+      return await (executor ?? db).transaction(async (tx) => {
+        await lockMcpServerName(tx, input.name);
+        await refuseTakenName(tx, {
+          name: input.name,
+          owner: input.user_id ?? null,
+        });
+        const [createdServer] = await tx
+          .insert(mcpServersTable)
+          .values(withEncryptedBearerToken(input))
+          .returning();
 
-      return createdServer;
+        return createdServer;
+      });
     } catch (error: unknown) {
+      if (error instanceof ServerNameTakenError) throw error;
       handleDatabaseError(error, "create", input.name);
     }
   }
@@ -242,6 +298,16 @@ export class McpServersRepository {
    * of this one, so comparing with that read could miss a change. The caller
    * closes the row's Inspector sessions on it, since the owner decides who
    * may see the row.
+   *
+   * THE NAME RULE. The write takes the lock of the name it can put the row
+   * under before the row's own lock, and when it would put the row under a
+   * name or an owner scope it was not under, refuses (ServerNameTakenError,
+   * nothing written) if another server holds that name in that scope. A write
+   * that leaves both as they are (the sync's routine re-save) is never judged,
+   * so a duplicate that already exists is not repaired and does not block the
+   * re-save of either row. A write that names no new name but moves the row to
+   * another owner is judged under the row's own name, read before the lock is
+   * taken and checked again once the row is locked.
    */
   async updateReportingChange(
     input: McpServerUpdateInput,
@@ -267,16 +333,46 @@ export class McpServersRepository {
 
     try {
       return await (executor ?? db).transaction(async (tx) => {
+        // The name this write can put the row under: the one it sets, or, for
+        // a write that only moves the row to another owner, the one the row
+        // has (read here to take its lock first, and checked once locked).
+        const lockedName =
+          input.name ??
+          (input.user_id !== undefined
+            ? await serverNameOf(tx, uuid)
+            : undefined);
+        if (lockedName !== undefined) await lockMcpServerName(tx, lockedName);
         const [current] = await tx
           .select()
           .from(mcpServersTable)
           .where(eq(mcpServersTable.uuid, uuid))
           .for("update");
         if (!current) return undefined;
+        if (
+          input.name === undefined &&
+          lockedName !== undefined &&
+          lockedName !== current.name
+        ) {
+          throw new Error("The server was renamed while this write waited");
+        }
+
+        const planned = planServerUpdate(current, updateData);
+        const nextName = input.name ?? current.name;
+        const nextOwner =
+          planned.user_id !== undefined ? planned.user_id : current.user_id;
+        if (
+          nextName !== current.name ||
+          (nextOwner ?? null) !== (current.user_id ?? null)
+        ) {
+          await refuseTakenName(tx, {
+            name: nextName,
+            owner: nextOwner ?? null,
+          });
+        }
 
         const [updatedServer] = await tx
           .update(mcpServersTable)
-          .set(planServerUpdate(current, updateData))
+          .set(planned)
           .where(eq(mcpServersTable.uuid, uuid))
           .returning();
         if (!updatedServer) return undefined;
@@ -296,7 +392,84 @@ export class McpServersRepository {
         };
       });
     } catch (error: unknown) {
-      if (error instanceof ServerCredentialRetentionError) throw error;
+      if (
+        error instanceof ServerCredentialRetentionError ||
+        error instanceof ServerNameTakenError
+      ) {
+        throw error;
+      }
+      handleDatabaseError(error, "update", input.name);
+    }
+  }
+
+  /**
+   * Rename a server and/or change its description, and nothing else: the
+   * write behind the metadata-only variant of `mcpServers.update`. The SET
+   * holds only the fields given, so no connection field (type, URL, command,
+   * arguments, environment, bearer token, headers, owner) can change here and
+   * none is read from the request.
+   *
+   * The row is locked (FOR UPDATE) first and the owner rule is judged on the
+   * locked row, in the same transaction as the write (a savepoint of the
+   * caller's when it holds one): a server owned by someone else is refused,
+   * judged against the owner as it is now, not as an earlier read saw it. The
+   * previous row is returned (credentials included, for the audit row's
+   * before-state, which records a credential field's change and never its
+   * value); nothing in it reaches a reply.
+   *
+   * A rename takes the new name's lock before the row's and refuses
+   * (ServerNameTakenError, nothing written) when another server holds that
+   * name in the row's owner scope, as locked (a NULL owner is one scope). A
+   * description-only write, or a rename to the name the row already has, is
+   * never judged.
+   */
+  async updateMetadataReportingChange(
+    input: { uuid: string; name?: string; description?: string },
+    callerUserId: string,
+    executor?: DbExecutor,
+  ): Promise<
+    | { kind: "not_found" }
+    | { kind: "not_owner" }
+    | {
+        kind: "updated";
+        server: DatabaseMcpServer;
+        previous: DatabaseMcpServer;
+      }
+  > {
+    try {
+      return await (executor ?? db).transaction(async (tx) => {
+        if (input.name !== undefined) await lockMcpServerName(tx, input.name);
+        const [current] = await tx
+          .select()
+          .from(mcpServersTable)
+          .where(eq(mcpServersTable.uuid, input.uuid))
+          .for("update");
+        if (!current) return { kind: "not_found" as const };
+        if (current.user_id && current.user_id !== callerUserId) {
+          return { kind: "not_owner" as const };
+        }
+        if (input.name !== undefined && input.name !== current.name) {
+          await refuseTakenName(tx, {
+            name: input.name,
+            owner: current.user_id,
+          });
+        }
+
+        const [server] = await tx
+          .update(mcpServersTable)
+          .set({
+            ...(input.name !== undefined ? { name: input.name } : {}),
+            ...(input.description !== undefined
+              ? { description: input.description }
+              : {}),
+          })
+          .where(eq(mcpServersTable.uuid, input.uuid))
+          .returning();
+        if (!server) return { kind: "not_found" as const };
+        return { kind: "updated" as const, server, previous: current };
+      });
+    } catch (error: unknown) {
+      if (error instanceof ServerNameTakenError) throw error;
       handleDatabaseError(error, "update", input.name);
     }
   }

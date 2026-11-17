@@ -350,6 +350,12 @@ export const UpdateMcpServerRequestSchema = z
     clearBearerToken: z.boolean().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     user_id: z.string().nullable().optional(),
+    // The marker of the metadata-only variant below. Declared here as a key
+    // that may never be present, so a request carrying it is judged by the
+    // strict variant alone: this schema drops unknown keys, and without the
+    // declaration a metadata-only request that also names a connection field
+    // would parse as a full update with the marker silently stripped.
+    metadata_only: z.never().optional(),
   })
   .refine((data) => !(data.clearBearerToken === true && data.bearerToken), {
     message:
@@ -388,6 +394,54 @@ export const UpdateMcpServerResponseSchema = z.object({
   error: z.string().optional(),
 });
 
+/**
+ * The metadata-only variant of `mcpServers.update`: a rename and/or a new
+ * description, and nothing else. It exists so a caller that is not allowed to
+ * set a server's connection (and is never shown the stored one) can still
+ * rename a server without resending a type, URL or command: the full variant
+ * above requires them.
+ *
+ * Strict on purpose: any other key (a connection field, an owner, an unknown
+ * name) rejects the whole request, it is never dropped. `reason` and `run_id`
+ * are the change-context fields the procedure base reads from the raw input
+ * (see @repo/trpc `changeContextOf`); they are listed so a strict parse
+ * accepts them, and are validated there.
+ */
+export const UpdateMcpServerMetadataRequestSchema = z
+  .strictObject({
+    uuid: z.string().uuid(),
+    metadata_only: z.literal(true),
+    name: z
+      .string()
+      .min(1, "Name is required")
+      .regex(
+        /^[a-zA-Z0-9_-]+$/,
+        "Server name must only contain letters, numbers, underscores, and hyphens",
+      )
+      .refine(
+        (value) => !/_{2,}/.test(value),
+        "Server name cannot contain consecutive underscores",
+      )
+      .optional(),
+    description: z.string().optional(),
+    reason: z.string().nullish(),
+    run_id: z.string().nullish(),
+  })
+  .refine((data) => data.name !== undefined || data.description !== undefined, {
+    message: "A metadata-only update must carry a name or a description",
+    path: ["name"],
+  });
+
+/**
+ * What `mcpServers.update` accepts: the metadata-only variant, or the full
+ * variant it has always taken. The two cannot be confused (the full variant
+ * refuses the `metadata_only` key, the other requires it).
+ */
+export const UpdateMcpServerAnyRequestSchema = z.union([
+  UpdateMcpServerMetadataRequestSchema,
+  UpdateMcpServerRequestSchema,
+]);
+
 export type DeleteMcpServerRequest = z.infer<
   typeof DeleteMcpServerRequestSchema
 >;
@@ -398,6 +452,12 @@ export type DeleteMcpServerResponse = z.infer<
 
 export type UpdateMcpServerRequest = z.infer<
   typeof UpdateMcpServerRequestSchema
+>;
+export type UpdateMcpServerMetadataRequest = z.infer<
+  typeof UpdateMcpServerMetadataRequestSchema
+>;
+export type UpdateMcpServerAnyRequest = z.infer<
+  typeof UpdateMcpServerAnyRequestSchema
 >;
 
 export type UpdateMcpServerResponse = z.infer<

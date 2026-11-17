@@ -13,6 +13,7 @@ export {
   ADMIN_PLANE_HUMAN_ONLY_PROCEDURES,
   ADMIN_PLANE_OPERATOR_CONFIRMATIONS,
   ADMIN_PLANE_OPERATOR_CONTRACT_VERSION,
+  ADMIN_PLANE_OPERATOR_MARKERS,
   ADMIN_PLANE_OPERATOR_MUTATIONS,
   ADMIN_PLANE_OPERATOR_PROCEDURES,
   ADMIN_PLANE_SYNC_PROCEDURES,
@@ -24,6 +25,7 @@ export {
   CHANGE_RUN_ID_MAX_LENGTH,
   changeContextForCall,
   changeContextOf,
+  serverDetailLevelOf,
 } from "./trpc";
 export type {
   AdminPlaneAuthOrigin,
@@ -32,6 +34,7 @@ export type {
   AuditRequestContext,
   BaseContext,
   ChangeContext,
+  ServerDetailLevel,
   TrpcAuditSink,
   TrpcDenialEvent,
 } from "./trpc";

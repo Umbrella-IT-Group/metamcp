@@ -65,6 +65,11 @@ export const AUDIT_LIST_DETAIL_KEYS: ReadonlySet<string> = new Set([
   "previous_name",
   "impact_fingerprint",
   "snapshot",
+  // What a topology change did, as the change budget classes it: the servers a
+  // namespace update mounted that it did not have, and the ACTIVE rows a tool
+  // refresh wrote.
+  "mounts_added",
+  "active_rows_written",
   // A server error reset: which servers, by uuid and name, and how many.
   "selection",
   "server_uuids",

@@ -270,6 +270,11 @@ describeIfDb(
       }
 
       // Writes the sync tooling performs, read back the way it reads them.
+      // TEST-EDIT (SPEC): an operator-scope key no longer creates a server or
+      // sends the full update (it renames through the metadata-only variant);
+      // the server is declared and registered by the sync scope's key, as the
+      // sync tooling does. The namespace writes below stay the operator's.
+      const ciHeaders = { authorization: `Bearer ${ciKey}` };
       const srv = await trpc(
         "frontend.mcpServers.create",
         {
@@ -278,6 +283,7 @@ describeIfDb(
           url: "http://127.0.0.1:9/mcp",
         },
         "mutation",
+        ciHeaders,
       );
       expect(srv.status).toBe(200);
       expect(srv.data).toMatchObject({ success: true });
@@ -294,6 +300,7 @@ describeIfDb(
               description: "synced",
             },
             "mutation",
+            ciHeaders,
           )
         ).status,
       ).toBe(200);
@@ -680,10 +687,15 @@ describeIfDb(
         // The API requires `type`, so an omitted type never reaches the
         // policy (input validation refuses it first); STDIO is the case.
         for (const input of [{ name, type: "STDIO", command: "/bin/true" }]) {
+          // TEST-EDIT (SPEC): the sync key, the scope that creates servers; an
+          // operator-scope key is refused before the policy is reached.
           const reply = await trpc(
             "frontend.mcpServers.create",
             input,
             "mutation",
+            {
+              authorization: `Bearer ${ciKey}`,
+            },
           );
           // The policy's own message, so an input-validation 400 cannot pass.
           expect({

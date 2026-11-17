@@ -10,7 +10,7 @@ import {
   ReconnectMcpServerResponseSchema,
   ResetMcpServerErrorsRequestSchema,
   ResetMcpServerErrorsResponseSchema,
-  UpdateMcpServerRequestSchema,
+  UpdateMcpServerAnyRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
 import { z } from "zod";
@@ -21,6 +21,8 @@ import {
   auditActor,
   protectedProcedure,
   router,
+  type ServerDetailLevel,
+  serverDetailLevelOf,
 } from "../../trpc";
 
 // Define the MCP servers router with procedure definitions
@@ -33,19 +35,22 @@ export const createMcpServersRouter = (
       userId: string,
       actor: AuditActor,
     ) => Promise<z.infer<typeof CreateMcpServerResponseSchema>>;
-    // `isAdmin` decides whether the serialized servers keep their connection
-    // URL and credential fields (env / bearerToken / headers / command /
-    // args) or come back redacted. It is threaded from `ctx.user.role` at
-    // the call site below rather than re-derived in the impl, so the RBAC
-    // source of truth stays the session role that `adminProcedure` uses.
+    // `detail` decides how much of each server's stored connection the reply
+    // carries (full for a person signed in as an administrator, names only for
+    // an admin-plane key, nothing for a member). It is decided here, from the
+    // verified request context (`serverDetailLevelOf`), and passed on as a
+    // required argument: the implementation and the serializers have no
+    // default, so a reply cannot carry a connection by omission. `create` and
+    // `update` take the same decision from the actor they are given.
     list: (
       userId: string,
-      isAdmin: boolean,
+      detail: ServerDetailLevel,
     ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
-    // Every server regardless of owner; the caller id preserves credential
-    // redaction on another owner's private rows even in this admin inventory.
+    // Every server regardless of owner; the caller id keeps another owner's
+    // private rows redacted whatever the level, even in this admin inventory.
     listAll: (
       userId: string,
+      detail: ServerDetailLevel,
     ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
     bulkImport: (
       input: z.infer<typeof BulkImportMcpServersRequestSchema>,
@@ -57,7 +62,7 @@ export const createMcpServersRouter = (
         uuid: string;
       },
       userId: string,
-      isAdmin: boolean,
+      detail: ServerDetailLevel,
     ) => Promise<z.infer<typeof GetMcpServerResponseSchema>>;
     delete: (
       input: {
@@ -67,7 +72,7 @@ export const createMcpServersRouter = (
       actor: AuditActor,
     ) => Promise<z.infer<typeof DeleteMcpServerResponseSchema>>;
     update: (
-      input: z.infer<typeof UpdateMcpServerRequestSchema>,
+      input: z.infer<typeof UpdateMcpServerAnyRequestSchema>,
       userId: string,
       actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateMcpServerResponseSchema>>;
@@ -91,14 +96,14 @@ export const createMcpServersRouter = (
   return router({
     // Protected (deliberate): members legitimately see the server inventory
     // in their dashboard, so this stays protectedProcedure. The disclosure
-    // fix is redaction inside the serializer, driven by the flag below —
+    // fix is redaction inside the serializer, driven by the level below —
     // admin-gating the whole list would blank the member UI instead.
     list: protectedProcedure
       .output(ListMcpServersResponseSchema)
       .query(async ({ ctx }) => {
         return await implementations.list(
           ctx.user.id,
-          ctx.user.role === "admin",
+          serverDetailLevelOf(ctx),
         );
       }),
 
@@ -111,7 +116,10 @@ export const createMcpServersRouter = (
     listAll: adminProcedure
       .output(ListMcpServersResponseSchema)
       .query(async ({ ctx }) => {
-        return await implementations.listAll(ctx.user.id);
+        return await implementations.listAll(
+          ctx.user.id,
+          serverDetailLevelOf(ctx),
+        );
       }),
 
     // Protected: Get single MCP server by UUID — same contract as `list`.
@@ -122,7 +130,7 @@ export const createMcpServersRouter = (
         return await implementations.get(
           input,
           ctx.user.id,
-          ctx.user.role === "admin",
+          serverDetailLevelOf(ctx),
         );
       }),
 
@@ -165,9 +173,14 @@ export const createMcpServersRouter = (
         );
       }),
 
-    // Admin only: Update MCP server
+    // Admin only: Update MCP server. Two request variants: the full one every
+    // caller has always used (type plus a URL or command, and the rest), and a
+    // strict metadata-only one (`metadata_only: true` with a name and/or a
+    // description) that carries no connection field at all. An operator-scope
+    // admin-plane key may send only the second; the implementation refuses the
+    // first from it.
     update: adminProcedure
-      .input(UpdateMcpServerRequestSchema)
+      .input(UpdateMcpServerAnyRequestSchema)
       .output(UpdateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.update(

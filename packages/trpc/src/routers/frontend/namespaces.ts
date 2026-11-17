@@ -27,6 +27,8 @@ import {
   auditActor,
   protectedProcedure,
   router,
+  type ServerDetailLevel,
+  serverDetailLevelOf,
 } from "../../trpc";
 
 // Define the namespaces router with procedure definitions
@@ -45,15 +47,16 @@ export const createNamespacesRouter = (
     // Every namespace regardless of owner; reached only through the
     // admin-gated `listAll` procedure below.
     listAll: () => Promise<z.infer<typeof ListNamespacesResponseSchema>>;
-    // `isAdmin`: the namespace response embeds full server objects, so it
-    // carries the same connection-URL / credential redaction contract as the
-    // mcpServers router. Threaded from `ctx.user.role` at the call site.
+    // `detail`: the namespace response embeds server objects, so it carries
+    // the same connection redaction contract as the mcpServers router, decided
+    // the same way (`serverDetailLevelOf`, from the verified request context)
+    // and required.
     get: (
       input: {
         uuid: string;
       },
       userId: string,
-      isAdmin: boolean,
+      detail: ServerDetailLevel,
     ) => Promise<z.infer<typeof GetNamespaceResponseSchema>>;
     getTools: (
       input: z.infer<typeof GetNamespaceToolsRequestSchema>,
@@ -131,7 +134,7 @@ export const createNamespacesRouter = (
         return await implementations.get(
           input,
           ctx.user.id,
-          ctx.user.role === "admin",
+          serverDetailLevelOf(ctx),
         );
       }),
 

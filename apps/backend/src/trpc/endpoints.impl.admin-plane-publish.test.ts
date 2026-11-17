@@ -452,3 +452,154 @@ describe("endpoints.update by an admin-plane key", () => {
     expect(endpointsRepositoryMock.update).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The auth posture rule (`admin_plane_auth_off`): an admin-plane key's create
+ * or update may not leave an endpoint with both API-key authentication and
+ * OAuth off. A refusal is a coded FORBIDDEN, nothing is written, one flag on
+ * is enough, and a person's session is not held to it. Pinned against
+ * Postgres in admin-plane-reply-shape.integration.test.ts.
+ */
+describe("an admin-plane key and an endpoint with both authentication modes off", () => {
+  const BOTH_OFF = { enableApiKeyAuth: false, enableOauth: false };
+
+  it.each(["sync", "operator"] as const)(
+    "refuses a create that leaves both off (%s scope), writing nothing",
+    async (scope) => {
+      const failure = await endpointsImplementations
+        .create(createInput(BOTH_OFF), OWNER_ID, adminPlaneActor(scope))
+        .catch((e) => e);
+
+      expect(failure).toMatchObject({ code: "FORBIDDEN" });
+      expect(failure.message).toContain(
+        "both API-key authentication and OAuth",
+      );
+      expect(endpointsRepositoryMock.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("judges a create that omits the flags on the stored defaults, which are on", async () => {
+    const result = await endpointsImplementations.create(
+      createInput({
+        enableApiKeyAuth: undefined,
+        enableOauth: undefined,
+      }),
+      OWNER_ID,
+      adminPlaneActor("operator"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(endpointsRepositoryMock.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enable_api_key_auth: true,
+        enable_oauth: true,
+      }),
+      expect.anything(),
+    );
+  });
+
+  it.each([
+    [
+      "API-key authentication only",
+      { enableApiKeyAuth: true, enableOauth: false },
+    ],
+    ["OAuth only", { enableApiKeyAuth: false, enableOauth: true }],
+  ])("allows a create with %s on", async (_label, flags) => {
+    const result = await endpointsImplementations.create(
+      createInput(flags),
+      OWNER_ID,
+      adminPlaneActor("operator"),
+    );
+
+    expect(result.success).toBe(true);
+  });
+
+  it("refuses an update that leaves both off, whether it sets them or leaves them to the stored row", async () => {
+    const failure = await endpointsImplementations
+      .update(updateInput(BOTH_OFF), OWNER_ID, adminPlaneActor("operator"))
+      .catch((e) => e);
+    expect(failure).toMatchObject({ code: "FORBIDDEN" });
+
+    // A flag the request leaves out keeps the stored value: both stored off
+    // and both omitted leaves both off.
+    endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
+      uuid: ENDPOINT_UUID,
+      name: "reporting",
+      namespace_uuid: NEW_NAMESPACE,
+      user_id: null,
+      restricted: false,
+      enable_api_key_auth: false,
+      enable_oauth: false,
+    });
+    const omitted = await endpointsImplementations
+      .update(
+        updateInput({ enableApiKeyAuth: undefined, enableOauth: undefined }),
+        OWNER_ID,
+        adminPlaneActor("sync"),
+      )
+      .catch((e) => e);
+    expect(omitted).toMatchObject({ code: "FORBIDDEN" });
+    expect(endpointsRepositoryMock.update).not.toHaveBeenCalled();
+  });
+
+  it("allows an update that turns one mode on, or leaves one stored on", async () => {
+    endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
+      uuid: ENDPOINT_UUID,
+      name: "reporting",
+      namespace_uuid: NEW_NAMESPACE,
+      user_id: null,
+      restricted: false,
+      enable_api_key_auth: false,
+      enable_oauth: false,
+    });
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput({ enableApiKeyAuth: true, enableOauth: false }),
+          OWNER_ID,
+          adminPlaneActor("operator"),
+        )
+      ).success,
+    ).toBe(true);
+
+    endpointsRepositoryMock.findByUuidWithNamespace.mockResolvedValue({
+      uuid: ENDPOINT_UUID,
+      name: "reporting",
+      namespace_uuid: NEW_NAMESPACE,
+      user_id: null,
+      restricted: false,
+      enable_api_key_auth: true,
+      enable_oauth: false,
+    });
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput({ enableApiKeyAuth: undefined, enableOauth: false }),
+          OWNER_ID,
+          adminPlaneActor("operator"),
+        )
+      ).success,
+    ).toBe(true);
+  });
+
+  it("does not hold a person's session to the rule", async () => {
+    expect(
+      (
+        await endpointsImplementations.create(
+          createInput(BOTH_OFF),
+          OWNER_ID,
+          humanActor,
+        )
+      ).success,
+    ).toBe(true);
+    expect(
+      (
+        await endpointsImplementations.update(
+          updateInput(BOTH_OFF),
+          OWNER_ID,
+          humanActor,
+        )
+      ).success,
+    ).toBe(true);
+  });
+});

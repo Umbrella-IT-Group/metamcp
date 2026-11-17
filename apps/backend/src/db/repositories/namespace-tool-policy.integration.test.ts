@@ -415,15 +415,20 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
 
   describe("refresh (bulkUpsertNamespaceToolMappings)", () => {
     const refreshA = () =>
-      namespaceMappingsRepository.bulkUpsertNamespaceToolMappings({
-        namespaceUuid: NS_A,
-        // What refreshTools sends: every tool it saw, asked ACTIVE.
-        toolMappings: ["read", "delete_repo", "brand_new"].map((name) => ({
-          toolUuid: toolA(name),
-          serverUuid: GITHUB_A,
-          status: "ACTIVE" as const,
-        })),
-      });
+      // TEST-EDIT (SPEC: the repository write takes the caller kind, a
+      // required argument; these are the person's behaviour, unchanged).
+      namespaceMappingsRepository.bulkUpsertNamespaceToolMappings(
+        {
+          namespaceUuid: NS_A,
+          // What refreshTools sends: every tool it saw, asked ACTIVE.
+          toolMappings: ["read", "delete_repo", "brand_new"].map((name) => ({
+            toolUuid: toolA(name),
+            serverUuid: GITHUB_A,
+            status: "ACTIVE" as const,
+          })),
+        },
+        "person",
+      );
 
     it("allow_all: unchanged, new rows ACTIVE and an INACTIVE row switched back on", async () => {
       const result = await refreshA();
@@ -504,12 +509,16 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
 
   describe("re-saving a namespace's servers (namespacesRepository.update)", () => {
     const resave = () =>
-      namespacesRepository.update({
-        uuid: NS_A,
-        name: "policy-a",
-        user_id: USER_A,
-        mcpServerUuids: [GITHUB_A],
-      });
+      // TEST-EDIT (SPEC): the update takes the caller kind; a person here.
+      namespacesRepository.update(
+        {
+          uuid: NS_A,
+          name: "policy-a",
+          user_id: USER_A,
+          mcpServerUuids: [GITHUB_A],
+        },
+        "person",
+      );
 
     it("allow_all: unchanged, an unreviewed tool gets an ACTIVE row", async () => {
       await resave();
@@ -713,12 +722,15 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
       "%s: a server added by the save gets rows by policy and the others keep theirs",
       async (policy) => {
         await setPolicyDirect(NS_A, policy);
-        await namespacesRepository.update({
-          uuid: NS_A,
-          name: "policy-a",
-          user_id: USER_A,
-          mcpServerUuids: [GITHUB_A, GITHUB_B],
-        });
+        await namespacesRepository.update(
+          {
+            uuid: NS_A,
+            name: "policy-a",
+            user_id: USER_A,
+            mcpServerUuids: [GITHUB_A, GITHUB_B],
+          },
+          "person",
+        );
         const rows =
           await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A);
         const byServer = (server: string) =>
@@ -745,12 +757,15 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
     );
 
     it("a server listed twice does not fail the save", async () => {
-      await namespacesRepository.update({
-        uuid: NS_A,
-        name: "policy-a",
-        user_id: USER_A,
-        mcpServerUuids: [GITHUB_A, GITHUB_A],
-      });
+      await namespacesRepository.update(
+        {
+          uuid: NS_A,
+          name: "policy-a",
+          user_id: USER_A,
+          mcpServerUuids: [GITHUB_A, GITHUB_A],
+        },
+        "person",
+      );
       expect(await statuses(NS_A)).toEqual({
         read: "ACTIVE",
         delete_repo: "INACTIVE",
@@ -774,12 +789,15 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
       "%s: removes only the deselected server's rows, and clears everything for an empty list",
       async (policy) => {
         await setPolicyDirect(NS_A, policy);
-        await namespacesRepository.update({
-          uuid: NS_A,
-          name: "policy-a",
-          user_id: USER_A,
-          mcpServerUuids: [GITHUB_A, GITHUB_B],
-        });
+        await namespacesRepository.update(
+          {
+            uuid: NS_A,
+            name: "policy-a",
+            user_id: USER_A,
+            mcpServerUuids: [GITHUB_A, GITHUB_B],
+          },
+          "person",
+        );
         const withB =
           await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A);
         await resave();
@@ -796,12 +814,15 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
           withB.filter((row) => row.mcp_server_uuid === GITHUB_A),
         );
 
-        await namespacesRepository.update({
-          uuid: NS_A,
-          name: "policy-a",
-          user_id: USER_A,
-          mcpServerUuids: [],
-        });
+        await namespacesRepository.update(
+          {
+            uuid: NS_A,
+            name: "policy-a",
+            user_id: USER_A,
+            mcpServerUuids: [],
+          },
+          "person",
+        );
         expect(
           await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A),
         ).toEqual([]);
@@ -814,11 +835,14 @@ describeIfDb("namespaces.tool_policy against a REAL postgres", () => {
     it("an update without mcpServerUuids leaves every mapping alone", async () => {
       const before =
         await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A);
-      await namespacesRepository.update({
-        uuid: NS_A,
-        name: "policy-a-renamed",
-        user_id: USER_A,
-      });
+      await namespacesRepository.update(
+        {
+          uuid: NS_A,
+          name: "policy-a-renamed",
+          user_id: USER_A,
+        },
+        "person",
+      );
       expect(
         await namespaceMappingsRepository.findToolMappingsByNamespace(NS_A),
       ).toEqual(before);

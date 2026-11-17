@@ -32,6 +32,7 @@ import {
   ENDPOINT_GATE_REFUSALS,
   type EndpointGateRule,
   isOwnRecentRestriction,
+  judgeEndpointAuthPosture,
   judgeEndpointCreate,
   judgeEndpointMove,
 } from "../lib/endpoint-namespace-gate";
@@ -171,12 +172,21 @@ export const endpointsImplementations = {
       // answer "when did this URL start existing, and did it ever require a
       // credential". Never the bearer token the block below may embed in the
       // companion MCP server.
+      const enableApiKeyAuth = input.enableApiKeyAuth ?? true;
+      const enableOauth = input.enableOauth ?? true;
       const result = await withAdminAuditTx(
         actor,
         async (tx) => {
           await endpointGateRepository.lockNamespaces(tx, [
             input.namespaceUuid,
           ]);
+          // The admin-plane auth rule, on the posture this create stores.
+          const authRule = judgeEndpointAuthPosture({
+            adminPlane: Boolean(actor?.admin_plane),
+            enableApiKeyAuth,
+            enableOauth,
+          });
+          if (authRule) throw gateRefusal(authRule, "endpoint.create", null);
           const restrictedSibling =
             await endpointGateRepository.restrictedSiblingExists(
               tx,
@@ -203,7 +213,7 @@ export const endpointsImplementations = {
               name: input.name,
               description: input.description,
               namespace_uuid: input.namespaceUuid,
-              enable_api_key_auth: input.enableApiKeyAuth ?? true,
+              enable_api_key_auth: enableApiKeyAuth,
               require_scoped_api_key: requireScopedApiKey,
               restricted,
               enable_max_rate: enableMaxRate,
@@ -214,7 +224,7 @@ export const endpointsImplementations = {
               client_max_rate_seconds: input.clientMaxRateSeconds,
               client_max_rate_strategy: input.clientMaxRateStrategy,
               client_max_rate_strategy_key: input.clientMaxRateStrategyKey,
-              enable_oauth: input.enableOauth ?? true,
+              enable_oauth: enableOauth,
               use_query_param_auth: input.useQueryParamAuth ?? false,
               user_id: effectiveUserId,
             },
@@ -596,6 +606,18 @@ export const endpointsImplementations = {
               "endpoint.update",
               input.uuid,
             );
+          }
+          // The admin-plane auth rule, on the posture the write leaves: a flag
+          // the request does not carry keeps the value stored on the locked
+          // row, so an update that leaves both off is refused too.
+          const authRule = judgeEndpointAuthPosture({
+            adminPlane: Boolean(actor?.admin_plane),
+            enableApiKeyAuth:
+              input.enableApiKeyAuth ?? locked.row.enable_api_key_auth,
+            enableOauth: input.enableOauth ?? locked.row.enable_oauth,
+          });
+          if (authRule) {
+            throw gateRefusal(authRule, "endpoint.update", input.uuid);
           }
           const isMove =
             locked.namespace_uuid.toLowerCase() !==

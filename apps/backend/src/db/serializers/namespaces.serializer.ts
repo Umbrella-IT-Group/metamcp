@@ -1,3 +1,4 @@
+import type { ServerDetailLevel } from "@repo/trpc";
 import {
   DatabaseNamespace,
   DatabaseNamespaceTool,
@@ -6,6 +7,8 @@ import {
   NamespaceTool,
   NamespaceWithServers,
 } from "@repo/zod-types";
+
+import { serverConnectionView } from "./server-connection-view";
 
 export class NamespacesSerializer {
   static serializeNamespace(dbNamespace: DatabaseNamespace): Namespace {
@@ -27,23 +30,25 @@ export class NamespacesSerializer {
   }
 
   /**
-   * `includeSecrets` carries the same contract as
+   * `detail` carries the same contract as
    * McpServersSerializer.serializeMcpServer — required, no default — because
    * the embedded server objects are the SAME disclosure surface by another
    * route. `namespaces.get` is protectedProcedure, so redacting only the
    * mcpServers router would have left `env`, `bearerToken`, `headers`,
    * `command`, `args` and the internal `url` reachable to any member who
-   * asked for the namespace that contains the server.
+   * asked for the namespace that contains the server, and to an admin-plane
+   * key that asked for the connection it was never to be shown.
    *
    * The embed is hand-rolled here (rather than delegating to
    * McpServersSerializer) because NamespaceServer adds the per-namespace
    * `status` field and coalesces nullable columns; that predates this change
-   * and is left alone. The redaction set is kept identical to the sibling
-   * serializer's on purpose — if one grows a field, so must the other.
+   * and is left alone. The connection fields come from the one shared
+   * function (serverConnectionView), so the redaction set is identical to the
+   * sibling serializer's by construction.
    */
   static serializeNamespaceWithServers(
     dbNamespace: DatabaseNamespaceWithServers,
-    includeSecrets: boolean,
+    detail: ServerDetailLevel,
   ): NamespaceWithServers {
     return {
       uuid: dbNamespace.uuid,
@@ -58,16 +63,12 @@ export class NamespacesSerializer {
         name: server.name,
         description: server.description,
         type: server.type,
-        command: includeSecrets ? server.command : null,
-        args: includeSecrets ? server.args || [] : [],
-        url: includeSecrets ? server.url : null,
-        env: includeSecrets ? server.env || {} : {},
+        ...serverConnectionView(server, detail),
         // NEVER returned: the stored value is an
         // `enc:v1:` ciphertext read only server-side to build the upstream
         // header, so no response echoes it, same posture as
         // McpServersSerializer.
         bearerToken: null,
-        headers: includeSecrets ? server.headers || {} : {},
         error_status: server.error_status,
         created_at: server.created_at.toISOString(),
         user_id: server.user_id,

@@ -17,6 +17,7 @@ import {
   toolsTable,
 } from "../schema";
 import type { DbExecutor } from "./db-executor";
+import type { WriteCaller } from "./write-caller";
 
 export class NamespacesRepository {
   // `executor` is the caller's transaction when it holds one (an admin-plane
@@ -421,15 +422,26 @@ export class NamespacesRepository {
    * before or after the other, and the policy read from RETURNING is the one in
    * force for the whole write.
    */
+  //
+  // `caller` is who the write is made for. An unmount by an admin-plane key
+  // removes the server's mount and keeps that server's tool rows in this
+  // namespace; a person's unmount deletes them as it always did. The rows
+  // hold each tool's status (INACTIVE withholds it), so keeping them means a
+  // remount finds every tool in the state it was left in. A remount leaves a
+  // retained row as it is (ON CONFLICT DO NOTHING below), so the kept rows
+  // are reused unchanged.
+  //
   // `executor` is the caller's transaction when it holds one (an admin-plane
   // write records its audit row in the same transaction), and the inner
   // transaction is then a savepoint of it. Omitted, the pool is used and
   // nothing changes.
   async update(
     input: NamespaceUpdateInput,
+    caller: WriteCaller,
     executor?: DbExecutor,
   ): Promise<DatabaseNamespace> {
-    return (await this.updateReportingPrevious(input, executor)).namespace;
+    return (await this.updateReportingPrevious(input, caller, executor))
+      .namespace;
   }
 
   /**
@@ -440,6 +452,7 @@ export class NamespacesRepository {
    */
   async updateReportingPrevious(
     input: NamespaceUpdateInput,
+    caller: WriteCaller,
     executor?: DbExecutor,
   ): Promise<{
     namespace: DatabaseNamespace;
@@ -500,14 +513,17 @@ export class NamespacesRepository {
               )
             : undefined;
 
-        await tx
-          .delete(namespaceToolMappingsTable)
-          .where(
-            and(
-              eq(namespaceToolMappingsTable.namespace_uuid, input.uuid),
-              removedTools,
-            ),
-          );
+        // An admin-plane key's unmount keeps the tool rows (see `update`).
+        if (caller !== "admin_plane") {
+          await tx
+            .delete(namespaceToolMappingsTable)
+            .where(
+              and(
+                eq(namespaceToolMappingsTable.namespace_uuid, input.uuid),
+                removedTools,
+              ),
+            );
+        }
         await tx
           .delete(namespaceServerMappingsTable)
           .where(

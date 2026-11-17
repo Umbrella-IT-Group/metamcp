@@ -678,16 +678,28 @@ export const OperatorCapabilitiesResponseSchema = z.object({
    * `impact_fingerprint` read from `apiKeys.removalImpact`.
    */
   confirmations: z.record(z.string(), z.array(z.string())),
+  /**
+   * Behaviours this gateway has beyond what the contract version says, by
+   * name: a consumer that depends on one checks for it and refuses to send
+   * the request when it is absent. An older gateway has no such field, so a
+   * consumer reads absence as no markers.
+   */
+  markers: z.array(z.string()),
   budget: z.object({
     window_seconds: z.number().int(),
+    // `grant` is a sub-limit inside `loosen`: a change that grants access
+    // counts against both. Added to each scope; consumers that read only the
+    // other three are unaffected.
     operator: z.object({
       total: z.number().int(),
       loosen: z.number().int(),
+      grant: z.number().int(),
       destroy: z.number().int(),
     }),
     sync: z.object({
       total: z.number().int(),
       loosen: z.number().int(),
+      grant: z.number().int(),
       destroy: z.number().int(),
     }),
   }),
