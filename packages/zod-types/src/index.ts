@@ -12,3 +12,4 @@ export * from "./config.zod";
 export * from "./users.zod";
 export * from "./endpoint-presentation.zod";
 export * from "./audit.zod";
+export * from "./topology-removal.zod";

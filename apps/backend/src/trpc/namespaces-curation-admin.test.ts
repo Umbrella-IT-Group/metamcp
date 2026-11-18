@@ -42,6 +42,10 @@ const buildRouter = (
     updateToolOverrides: okImpl({ success: true, message: "updated" }),
     setToolPolicy: okImpl({ success: true, message: "set" }),
     refreshTools: okImpl({ success: true, message: "refreshed" }),
+    // TEST-EDIT (REFACTOR, topology removal): the router's new leaf-only
+    // removal implementations, stubbed like their siblings.
+    removalImpact: okImpl({} as never),
+    remove: okImpl({} as never),
     ...overrides,
   });
 

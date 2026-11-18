@@ -247,6 +247,15 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    row commit together, and connection recovery starts after the commit.
  *  - `logs.history`, the bounded (paged, at most 200 rows) diagnostic
  *    history, with credential-shaped text redacted for an admin-plane key.
+ *  - The leaf-only topology removals (contract 4): `endpoints.remove`,
+ *    `namespaces.remove` and `mcpServers.remove`, each with its
+ *    `removalImpact` read. One public row nothing depends on (an endpoint with
+ *    no API key, active or inactive, and no access-group mapping; a namespace
+ *    with no endpoint; a server no namespace mounts or holds a tool row for),
+ *    confirmed by its name and by the fingerprint the read returned, judged
+ *    on rows locked in the removal's transaction and audited with a snapshot.
+ *    The broad `.delete` of each stays human-only: each cascades through
+ *    everything that depends on the row.
  *
  * Every change an operator key makes carries a `reason` (see
  * `changeContextOf`), is counted against the key's change budget and is
@@ -283,9 +292,15 @@ export const ADMIN_PLANE_OPERATOR_PROCEDURES: ReadonlySet<string> = new Set([
   "frontend.apiKeys.setGlobalIpPolicy",
   "frontend.apiKeys.setIpPolicy",
   "frontend.endpoints.create",
+  "frontend.endpoints.removalImpact",
+  "frontend.endpoints.remove",
   "frontend.endpoints.update",
+  "frontend.mcpServers.removalImpact",
+  "frontend.mcpServers.remove",
   "frontend.namespaces.create",
   "frontend.namespaces.refreshTools",
+  "frontend.namespaces.removalImpact",
+  "frontend.namespaces.remove",
   "frontend.namespaces.setToolPolicy",
   "frontend.namespaces.update",
   "frontend.namespaces.updateToolStatus",
@@ -317,12 +332,15 @@ export const ADMIN_PLANE_OPERATOR_MUTATIONS: ReadonlySet<string> = new Set([
   "frontend.apiKeys.setGlobalIpPolicy",
   "frontend.apiKeys.setIpPolicy",
   "frontend.endpoints.create",
+  "frontend.endpoints.remove",
   "frontend.endpoints.update",
   "frontend.mcpServers.create",
+  "frontend.mcpServers.remove",
   "frontend.mcpServers.resetErrors",
   "frontend.mcpServers.update",
   "frontend.namespaces.create",
   "frontend.namespaces.refreshTools",
+  "frontend.namespaces.remove",
   "frontend.namespaces.setToolPolicy",
   "frontend.namespaces.update",
   "frontend.namespaces.updateToolStatus",
@@ -400,8 +418,10 @@ export const ADMIN_PLANE_HUMAN_ONLY_PROCEDURES: ReadonlySet<string> = new Set([
  *  - 3: the key lifecycle procedures (reactivate, rename, removalImpact,
  *    remove), `mcpServers.resetErrors`, `logs.history`, and the
  *    `confirmations` field (ADMIN_PLANE_OPERATOR_CONFIRMATIONS).
+ *  - 4: the leaf-only topology removals (`endpoints`, `namespaces` and
+ *    `mcpServers` `.removalImpact` and `.remove`) and their confirmations.
  */
-export const ADMIN_PLANE_OPERATOR_CONTRACT_VERSION = 3;
+export const ADMIN_PLANE_OPERATOR_CONTRACT_VERSION = 4;
 
 /**
  * The fields beyond `reason` an operator change must carry, by procedure,
@@ -413,6 +433,9 @@ export const ADMIN_PLANE_OPERATOR_CONFIRMATIONS: Readonly<
   Record<string, readonly string[]>
 > = {
   "frontend.apiKeys.remove": ["confirm_name", "impact_fingerprint"],
+  "frontend.endpoints.remove": ["confirm_name", "impact_fingerprint"],
+  "frontend.mcpServers.remove": ["confirm_name", "impact_fingerprint"],
+  "frontend.namespaces.remove": ["confirm_name", "impact_fingerprint"],
 };
 
 /**

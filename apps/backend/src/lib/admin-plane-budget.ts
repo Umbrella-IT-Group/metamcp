@@ -277,6 +277,12 @@ const ACTION_CLASSES: Readonly<
   "apikey.update": "change",
   // A removal (apiKeys.remove, leaf-only) cannot be undone.
   "apikey.delete": "destroy",
+  // The leaf-only topology removals (endpoints, namespaces and mcpServers
+  // `.remove`) cannot be undone either. Named here rather than left to the
+  // unknown-action default, so the class is a decision, not a fallback.
+  "endpoint.delete": "destroy",
+  "namespace.delete": "destroy",
+  "mcpserver.delete": "destroy",
   // Clearing a server's ERROR status lets the gateway connect to it again;
   // it grants no caller anything.
   "mcpserver.errors.reset": "change",

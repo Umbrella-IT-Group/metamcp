@@ -36,6 +36,7 @@ import {
   judgeEndpointCreate,
   judgeEndpointMove,
 } from "../lib/endpoint-namespace-gate";
+import { topologyRemovalImplementations } from "./topology-removal.impl";
 
 const apiKeysRepository = new ApiKeysRepository();
 
@@ -70,6 +71,8 @@ function gateRefusal(
 }
 
 export const endpointsImplementations = {
+  // removalImpact and remove: the leaf-only removal (topology-removal.impl).
+  ...topologyRemovalImplementations("endpoint"),
   create: async (
     input: z.infer<typeof CreateEndpointRequestSchema>,
     userId: string,

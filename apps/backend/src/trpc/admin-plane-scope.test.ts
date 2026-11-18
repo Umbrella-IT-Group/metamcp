@@ -104,6 +104,13 @@ const EXPECTED_OPERATOR_EXTRA = [
   "frontend.namespaces.updateToolStatus",
   "frontend.oauthClients.list",
   "frontend.users.list",
+  // TEST-EDIT (SPEC, topology removal, contract 4): the leaf-only removals.
+  "frontend.endpoints.removalImpact",
+  "frontend.endpoints.remove",
+  "frontend.mcpServers.removalImpact",
+  "frontend.mcpServers.remove",
+  "frontend.namespaces.removalImpact",
+  "frontend.namespaces.remove",
 ];
 
 const EXPECTED_OPERATOR = [...EXPECTED_SYNC, ...EXPECTED_OPERATOR_EXTRA];
@@ -136,6 +143,28 @@ const VALID_INPUTS: Record<string, unknown> = {
     impact_fingerprint: `sha256:${"a".repeat(64)}`,
   },
   "frontend.apiKeys.removalImpact": { uuid: UUID_B },
+  // TEST-EDIT (SPEC, topology removal): valid inputs for the six removals.
+  "frontend.endpoints.removalImpact": { uuid: UUID_B },
+  "frontend.endpoints.remove": {
+    reason: "unit test",
+    uuid: UUID_B,
+    confirm_name: "row",
+    impact_fingerprint: `sha256:${"a".repeat(64)}`,
+  },
+  "frontend.mcpServers.removalImpact": { uuid: UUID_B },
+  "frontend.mcpServers.remove": {
+    reason: "unit test",
+    uuid: UUID_B,
+    confirm_name: "row",
+    impact_fingerprint: `sha256:${"a".repeat(64)}`,
+  },
+  "frontend.namespaces.removalImpact": { uuid: UUID_B },
+  "frontend.namespaces.remove": {
+    reason: "unit test",
+    uuid: UUID_B,
+    confirm_name: "row",
+    impact_fingerprint: `sha256:${"a".repeat(64)}`,
+  },
   "frontend.mcpServers.resetErrors": {
     reason: "unit test",
     serverUuid: UUID_C,
@@ -388,11 +417,12 @@ describe("the two procedure sets", () => {
   });
 
   // TEST-EDIT (key powers): 28 to 34 more, 38 to 44 in all.
-  it("pins the operator set to exactly those 10 plus 34 more, 44 in all", () => {
+  // TEST-EDIT (SPEC, topology removal): 34 to 40 more, 44 to 50 in all.
+  it("pins the operator set to exactly those 10 plus 40 more, 50 in all", () => {
     expect([...ADMIN_PLANE_OPERATOR_PROCEDURES].sort()).toEqual(
       [...EXPECTED_OPERATOR].sort(),
     );
-    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(44);
+    expect(ADMIN_PLANE_OPERATOR_PROCEDURES.size).toBe(50);
   });
 
   it("gives the operator the access-group and tool-policy procedures and the sync set none of them", () => {

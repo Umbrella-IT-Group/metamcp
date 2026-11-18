@@ -24,6 +24,10 @@ import {
   type ServerDetailLevel,
   serverDetailLevelOf,
 } from "../../trpc";
+import {
+  type TopologyRemovalImplementations,
+  topologyRemovalProcedures,
+} from "./topology-removal";
 
 // Define the MCP servers router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -91,9 +95,13 @@ export const createMcpServersRouter = (
       input: z.infer<typeof ResetMcpServerErrorsRequestSchema>,
       actor: AuditActor,
     ) => Promise<z.infer<typeof ResetMcpServerErrorsResponseSchema>>;
-  },
+  } & TopologyRemovalImplementations,
 ) => {
   return router({
+    // Leaf-only removal by an admin or the operator key (see
+    // ./topology-removal); the broad `delete` below stays human-only.
+    ...topologyRemovalProcedures(implementations),
+
     // Protected (deliberate): members legitimately see the server inventory
     // in their dashboard, so this stays protectedProcedure. The disclosure
     // fix is redaction inside the serializer, driven by the level below —

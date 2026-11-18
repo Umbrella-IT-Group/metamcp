@@ -1380,7 +1380,7 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
 
   // ---------------------------------------------------------------------------
   describe("the operator contract", () => {
-    it("reports contract 3, the procedure set and the confirmations remove needs", async () => {
+    it("reports contract 4, the procedure set and the confirmations the removals need", async () => {
       const reply = await operatorRead(
         "apiKeys.operatorCapabilities",
         undefined,
@@ -1392,7 +1392,9 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
         mutations: string[];
         confirmations: Record<string, string[]>;
       };
-      expect(caps.contract_version).toBe(3);
+      // TEST-EDIT (SPEC, topology removal): contract 4, 50 procedures (28
+      // mutations), and the three removals' confirmations beside the key's.
+      expect(caps.contract_version).toBe(4);
       expect(caps.procedures).toEqual(
         expect.arrayContaining([
           "frontend.apiKeys.reactivate",
@@ -1403,11 +1405,20 @@ describeIfDb("admin-plane key powers (real Postgres)", () => {
           "frontend.logs.history",
         ]),
       );
-      expect(caps.procedures).toHaveLength(44);
-      expect(caps.mutations).toHaveLength(25);
+      expect(caps.procedures).toHaveLength(50);
+      expect(caps.mutations).toHaveLength(28);
       expect(caps.mutations).not.toContain("frontend.apiKeys.removalImpact");
+      for (const kind of ["endpoints", "namespaces", "mcpServers"]) {
+        expect(caps.procedures).toContain(`frontend.${kind}.removalImpact`);
+        expect(caps.mutations).toContain(`frontend.${kind}.remove`);
+        expect(caps.mutations).not.toContain(`frontend.${kind}.removalImpact`);
+        expect(caps.mutations).not.toContain(`frontend.${kind}.delete`);
+      }
       expect(caps.confirmations).toEqual({
         "frontend.apiKeys.remove": ["confirm_name", "impact_fingerprint"],
+        "frontend.endpoints.remove": ["confirm_name", "impact_fingerprint"],
+        "frontend.mcpServers.remove": ["confirm_name", "impact_fingerprint"],
+        "frontend.namespaces.remove": ["confirm_name", "impact_fingerprint"],
       });
     });
 

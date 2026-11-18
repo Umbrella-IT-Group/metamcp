@@ -59,6 +59,7 @@ import {
 } from "../lib/metamcp/stdio-policy";
 import { convertDbServerToParams } from "../lib/metamcp/utils";
 import { isVerifiedCallerHeaderName } from "../lib/metamcp/verified-caller";
+import { topologyRemovalImplementations } from "./topology-removal.impl";
 
 /**
  * The stdio policy gate for `create` and `update` (see
@@ -307,6 +308,8 @@ function serverUpdateEvent(written: {
 }
 
 export const mcpServersImplementations = {
+  // removalImpact and remove: the leaf-only removal (topology-removal.impl).
+  ...topologyRemovalImplementations("mcp_server"),
   create: async (
     input: z.infer<typeof CreateMcpServerRequestSchema>,
     userId: string,

@@ -87,6 +87,10 @@ const buildMcpServersRouter = () => {
       reset: [],
       recovery: { status: "not_needed", servers: [] },
     } as never),
+    // TEST-EDIT (REFACTOR, topology removal): the router's new leaf-only
+    // removal implementations, stubbed like their siblings.
+    removalImpact: okImpl({} as never),
+    remove: okImpl({} as never),
   };
   return { router: createMcpServersRouter(impls), impls };
 };
@@ -114,6 +118,10 @@ const buildNamespacesRouter = () => {
     updateToolOverrides: okImpl({ success: true, message: "updated" }),
     setToolPolicy: okImpl({ success: true, message: "set" }),
     refreshTools: okImpl({ success: true, message: "refreshed" }),
+    // TEST-EDIT (REFACTOR, topology removal): the router's new leaf-only
+    // removal implementations, stubbed like their siblings.
+    removalImpact: okImpl({} as never),
+    remove: okImpl({} as never),
   };
   return { router: createNamespacesRouter(impls), impls };
 };
