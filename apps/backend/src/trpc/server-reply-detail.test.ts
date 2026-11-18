@@ -181,11 +181,13 @@ describe("serverDetailLevelOf", () => {
 });
 
 describe("the capabilities markers and contract", () => {
-  it("lists exactly the two markers 2A adds, sorted, and leaves the contract at 3", () => {
+  // TEST-EDIT (SPEC, topology removal): the operator set grew, so the contract
+  // is 4; the markers are unchanged.
+  it("lists exactly the two markers 2A adds, sorted, and reports contract 4", () => {
     expect([...ADMIN_PLANE_OPERATOR_MARKERS]).toEqual([
       "server-reads-redacted-v1",
       "server-update-metadata-only-v1",
     ]);
-    expect(ADMIN_PLANE_OPERATOR_CONTRACT_VERSION).toBe(3);
+    expect(ADMIN_PLANE_OPERATOR_CONTRACT_VERSION).toBe(4);
   });
 });

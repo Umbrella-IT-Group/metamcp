@@ -1761,10 +1761,11 @@ describeIfDb("admin-plane rails (real Postgres)", () => {
       };
       // TEST-EDIT (key powers): the key powers raise the contract to 3 and the
       // operator set from 38 procedures (21 mutations) to 44 (25).
-      expect(caps.contract_version).toBe(3);
+      // TEST-EDIT (SPEC, topology removal): contract 4, 50 procedures (28).
+      expect(caps.contract_version).toBe(4);
       expect(caps.caller_scope).toBe("operator");
-      expect(caps.procedures).toHaveLength(44);
-      expect(caps.mutations).toHaveLength(25);
+      expect(caps.procedures).toHaveLength(50);
+      expect(caps.mutations).toHaveLength(28);
       expect(caps.reason.required_for_operator_scope).toBe(true);
       expect(
         (

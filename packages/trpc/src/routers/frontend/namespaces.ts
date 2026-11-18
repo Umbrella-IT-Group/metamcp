@@ -30,6 +30,10 @@ import {
   type ServerDetailLevel,
   serverDetailLevelOf,
 } from "../../trpc";
+import {
+  type TopologyRemovalImplementations,
+  topologyRemovalProcedures,
+} from "./topology-removal";
 
 // Define the namespaces router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -103,9 +107,13 @@ export const createNamespacesRouter = (
       isAdmin: boolean,
       actor: AuditActor,
     ) => Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>>;
-  },
+  } & TopologyRemovalImplementations,
 ) => {
   return router({
+    // Leaf-only removal by an admin or the operator key (see
+    // ./topology-removal); the broad `delete` below stays human-only.
+    ...topologyRemovalProcedures(implementations),
+
     // Protected: List all namespaces
     list: protectedProcedure
       .output(ListNamespacesResponseSchema)

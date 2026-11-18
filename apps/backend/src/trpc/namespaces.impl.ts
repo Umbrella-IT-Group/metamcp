@@ -48,6 +48,7 @@ import {
 } from "../lib/metamcp/metamcp-middleware/tool-overrides.functional";
 import { metaMcpServerPool } from "../lib/metamcp/metamcp-server-pool";
 import { notifyNamespaceMountChange } from "../lib/metamcp/namespace-mount-events";
+import { topologyRemovalImplementations } from "./topology-removal.impl";
 
 /**
  * How many servers a namespace update mounts that the namespace did not have,
@@ -68,6 +69,8 @@ function mountsAdded(
 }
 
 export const namespacesImplementations = {
+  // removalImpact and remove: the leaf-only removal (topology-removal.impl).
+  ...topologyRemovalImplementations("namespace"),
   create: async (
     input: z.infer<typeof CreateNamespaceRequestSchema>,
     userId: string,

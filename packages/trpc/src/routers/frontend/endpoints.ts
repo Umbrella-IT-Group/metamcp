@@ -16,6 +16,10 @@ import {
   protectedProcedure,
   router,
 } from "../../trpc";
+import {
+  type TopologyRemovalImplementations,
+  topologyRemovalProcedures,
+} from "./topology-removal";
 
 // Define the endpoints router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -51,9 +55,13 @@ export const createEndpointsRouter = (
       userId: string,
       actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateEndpointResponseSchema>>;
-  },
+  } & TopologyRemovalImplementations,
 ) => {
   return router({
+    // Leaf-only removal by an admin or the operator key (see
+    // ./topology-removal); the broad `delete` below stays human-only.
+    ...topologyRemovalProcedures(implementations),
+
     // Protected: List all endpoints
     list: protectedProcedure
       .output(ListEndpointsResponseSchema)

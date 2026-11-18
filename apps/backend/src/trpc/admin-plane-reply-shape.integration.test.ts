@@ -2476,7 +2476,7 @@ describeIfDb("admin-plane reply shape and rails (real Postgres)", () => {
 
   // ---------------------------------------------------------------------------
   describe("the capabilities", () => {
-    it("reports the two markers, keeps the contract at 3, and leaves the procedure sets as they were", async () => {
+    it("reports the two markers, contract 4, and the procedure sets", async () => {
       const reply = await read("apiKeys.operatorCapabilities", undefined);
 
       expect(reply.status).toBe(200);
@@ -2486,18 +2486,20 @@ describeIfDb("admin-plane reply shape and rails (real Postgres)", () => {
         procedures: string[];
         mutations: string[];
       };
-      expect(caps.contract_version).toBe(3);
+      // TEST-EDIT (SPEC, topology removal): contract 4; the operator set
+      // grows to 50 procedures (28 mutations); the markers are unchanged.
+      expect(caps.contract_version).toBe(4);
       expect(caps.markers).toEqual([
         "server-reads-redacted-v1",
         "server-update-metadata-only-v1",
       ]);
-      expect(caps.procedures).toHaveLength(44);
-      expect(caps.mutations).toHaveLength(25);
+      expect(caps.procedures).toHaveLength(50);
+      expect(caps.mutations).toHaveLength(28);
       expect(caps.procedures).toContain("frontend.mcpServers.create");
       expect(caps.procedures).toContain("frontend.mcpServers.update");
     });
 
-    it("reports the grant limit in each scope's budget, beside total, loosen and destroy, and keeps the contract at 3", async () => {
+    it("reports the grant limit in each scope's budget, beside total, loosen and destroy, at contract 4", async () => {
       process.env.ADMIN_PLANE_BUDGET_OPERATOR_GRANT = "7";
       process.env.ADMIN_PLANE_BUDGET_SYNC_GRANT = "2";
       try {
@@ -2511,7 +2513,8 @@ describeIfDb("admin-plane reply shape and rails (real Postgres)", () => {
             sync: Record<string, number>;
           };
         };
-        expect(caps.contract_version).toBe(3);
+        // TEST-EDIT (SPEC, topology removal): contract 4.
+        expect(caps.contract_version).toBe(4);
         expect(Object.keys(caps.budget.operator).sort()).toEqual([
           "destroy",
           "grant",

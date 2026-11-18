@@ -142,7 +142,9 @@ describe("classification", () => {
     );
     // TEST-EDIT (key powers): five procedures added (apiKeys.reactivate, rename,
     // remove and removalImpact, mcpServers.resetErrors), 89 to 94.
-    expect(ALL).toHaveLength(94);
+    // TEST-EDIT (SPEC, topology removal): six added (removalImpact and remove
+    // of endpoints, namespaces and mcpServers), 94 to 100.
+    expect(ALL).toHaveLength(100);
   });
 
   it("lists as operator mutations exactly the operator procedures that are mutations", () => {
@@ -151,7 +153,8 @@ describe("classification", () => {
       .sort();
     expect([...ADMIN_PLANE_OPERATOR_MUTATIONS].sort()).toEqual(fromRouter);
     // TEST-EDIT (key powers): four operator mutations added, 21 to 25.
-    expect(fromRouter).toHaveLength(25);
+    // TEST-EDIT (SPEC, topology removal): three removals added, 25 to 28.
+    expect(fromRouter).toHaveLength(28);
   });
 
   it.each([...ADMIN_PLANE_OPERATOR_MUTATIONS])(
@@ -319,6 +322,10 @@ describe("budget classes", () => {
     "frontend.namespaces.setToolPolicy": ["namespace.tool_policy"],
     "frontend.namespaces.update": ["namespace.update"],
     "frontend.namespaces.updateToolStatus": ["namespace.tool_status"],
+    // TEST-EDIT (SPEC, topology removal): the actions the three removals write.
+    "frontend.endpoints.remove": ["endpoint.delete"],
+    "frontend.mcpServers.remove": ["mcpserver.delete"],
+    "frontend.namespaces.remove": ["namespace.delete"],
   };
 
   // The audit actions written by procedures that are NOT operator mutations
@@ -327,11 +334,12 @@ describe("budget classes", () => {
   // action found by the scan that is in neither the budget's class table nor
   // this list fails the test, so a new action must be decided one way or the
   // other when it is added.
+  // TEST-EDIT (SPEC, topology removal): endpoint.delete, mcpserver.delete and
+  // namespace.delete moved to the budget's table. The broad human deletes
+  // write them too (a person has no budget), as apikey.delete is shared by
+  // apiKeys.delete and apiKeys.remove.
   const WRITTEN_BY_HUMAN_ONLY_PROCEDURES: readonly string[] = [
-    "endpoint.delete",
     "mcpserver.bulk_import",
-    "mcpserver.delete",
-    "namespace.delete",
     "namespace.server_status",
     "namespace.tool_overrides",
   ];
@@ -341,7 +349,11 @@ describe("budget classes", () => {
   // shared module that writes an operator mutation's audit row must be listed
   // here (the budget table check below fails when an action it classifies is
   // no longer found).
-  const SHARED_IMPLEMENTATION_FILES = ["../lib/metamcp/reset-server-errors.ts"];
+  // TEST-EDIT (SPEC, topology removal): the removals' shared implementation.
+  const SHARED_IMPLEMENTATION_FILES = [
+    "../lib/metamcp/reset-server-errors.ts",
+    "./topology-removal.impl.ts",
+  ];
 
   /**
    * Every audit action named in the implementation files that host the
@@ -419,6 +431,17 @@ describe("budget classes", () => {
     expect(budgetClassOf("apikey.delete", {})).toBe("destroy");
     expect(budgetClassOf("apikey.update", {})).toBe("change");
     expect(budgetClassOf("mcpserver.errors.reset", {})).toBe("change");
+  });
+
+  it("counts each leaf-only topology removal as destroy, by a named entry", () => {
+    for (const action of [
+      "endpoint.delete",
+      "namespace.delete",
+      "mcpserver.delete",
+    ]) {
+      expect(BUDGETED_ACTIONS).toContain(action);
+      expect(budgetClassOf(action, {})).toBe("destroy");
+    }
   });
 
   it("covers every operator mutation and gives each of its actions a class", () => {
