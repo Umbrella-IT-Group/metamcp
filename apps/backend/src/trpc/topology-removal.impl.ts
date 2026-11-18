@@ -174,14 +174,14 @@ export function topologyRemovalImplementations(kind: TopologyRemovalKind) {
     removalImpact: async (
       input: TopologyRemovalImpactRequest,
       userId: string,
+      actor: AuditActor,
     ): Promise<TopologyRemovalImpactResponse> => {
       let state;
       try {
-        state = await topologyRemovalRepository.readImpact(
-          kind,
-          input.uuid,
+        state = await topologyRemovalRepository.readImpact(kind, input.uuid, {
           userId,
-        );
+          adminPlaneKeyUuid: actor.admin_plane?.key_uuid ?? null,
+        });
       } catch (error) {
         throw readFailure(error);
       }
@@ -221,7 +221,10 @@ export function topologyRemovalImplementations(kind: TopologyRemovalKind) {
                 tx,
                 kind,
                 uuid,
-                userId,
+                {
+                  userId,
+                  adminPlaneKeyUuid: actor?.admin_plane?.key_uuid ?? null,
+                },
                 input.confirm_name,
                 input.impact_fingerprint,
               ),

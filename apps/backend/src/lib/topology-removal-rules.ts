@@ -9,6 +9,8 @@ import type {
   TopologyRemovalSnapshot,
 } from "@repo/zod-types";
 
+import { ENDPOINT_GATE_REFUSALS } from "./endpoint-namespace-gate";
+
 /**
  * The rules of the leaf-only topology removals: `endpoints.remove`,
  * `namespaces.remove` and `mcpServers.remove`, with the `removalImpact` reads
@@ -26,7 +28,8 @@ import type {
  *    act in the UI.
  *  - endpoint: no API key scoped to it, active or inactive (a key is removed
  *    as its own audited change, never as a side effect), and no access-group
- *    mapping.
+ *    mapping. An operator removing the last restricted endpoint must also
+ *    qualify for the namespace gate's rollback of its own restriction.
  *  - namespace: no endpoint over it.
  *  - server: no namespace mounts it, and no namespace has a tool row for it,
  *    whether the row names the server directly or names one of its tools (the
@@ -74,6 +77,7 @@ export const TOPOLOGY_REMOVAL_REFUSALS: Readonly<
     message:
       "An endpoint can be removed only once no access group is mapped to it. Unmap each group first, each as its own change.",
   },
+  admin_plane_unrestrict: ENDPOINT_GATE_REFUSALS.admin_plane_unrestrict,
   namespace_has_endpoints: {
     code: "CONFLICT",
     message:
@@ -109,6 +113,7 @@ const RULE_ORDER: readonly TopologyRemovalRule[] = [
   "target_private",
   "endpoint_has_keys",
   "endpoint_has_groups",
+  "admin_plane_unrestrict",
   "namespace_has_endpoints",
   "server_mounted",
   "server_tools_mapped",
@@ -169,6 +174,8 @@ export interface TopologyRemovalState {
   version: string;
   /** The columns the rules judge and the snapshot records, by name. */
   fields: Readonly<Record<string, TopologyField>>;
+  /** Only an endpoint can be the last restricted route over a namespace. */
+  unrestrict_refused?: boolean;
   blockers: readonly TopologyBlocker[];
   cascades: readonly TopologyCascadeRow[];
   live_sessions: number | null;
@@ -176,16 +183,23 @@ export interface TopologyRemovalState {
 
 /** Every rule that refuses this target now, in the reported order. */
 export function removalBlockers(
-  state: Pick<TopologyRemovalState, "user_id" | "blockers">,
+  state: Pick<
+    TopologyRemovalState,
+    "user_id" | "blockers" | "unrestrict_refused"
+  >,
 ): TopologyRemovalRule[] {
   const found = new Set<TopologyRemovalRule>(state.blockers.map((b) => b.rule));
   if (state.user_id !== null) found.add("target_private");
+  if (state.unrestrict_refused) found.add("admin_plane_unrestrict");
   return RULE_ORDER.filter((rule) => found.has(rule));
 }
 
 /** The first rule that refuses this target, or null when it may be removed. */
 export function firstRemovalBlocker(
-  state: Pick<TopologyRemovalState, "user_id" | "blockers">,
+  state: Pick<
+    TopologyRemovalState,
+    "user_id" | "blockers" | "unrestrict_refused"
+  >,
 ): TopologyRemovalRule | null {
   return removalBlockers(state)[0] ?? null;
 }
@@ -219,6 +233,7 @@ export function topologyRemovalFingerprint(
     state.name,
     state.user_id,
     state.version,
+    state.unrestrict_refused ?? false,
     sortedFields(state.fields),
     state.blockers
       .map((b) => [b.rule, b.kind, b.key])

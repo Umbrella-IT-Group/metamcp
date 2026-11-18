@@ -27,6 +27,7 @@ export interface TopologyRemovalImplementations {
   removalImpact: (
     input: z.infer<typeof TopologyRemovalImpactRequestSchema>,
     userId: string,
+    actor: AuditActor,
   ) => Promise<z.infer<typeof TopologyRemovalImpactResponseSchema>>;
   remove: (
     input: z.infer<typeof RemoveTopologyRequestSchema>,
@@ -43,7 +44,11 @@ export function topologyRemovalProcedures(
       .input(TopologyRemovalImpactRequestSchema)
       .output(TopologyRemovalImpactResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.removalImpact(input, ctx.user.id);
+        return await implementations.removalImpact(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     remove: adminProcedure

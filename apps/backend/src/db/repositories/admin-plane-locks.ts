@@ -31,12 +31,13 @@ import type { DbTransaction } from "./db-executor";
  *        the target account FOR UPDATE (`lockAccountTarget`); a key mint and
  *        a key re-activation take the key owner's row FOR SHARE.
  *  5. Endpoint rows (FOR UPDATE for a write, FOR SHARE for a key mint or a
- *     key re-activation), then an endpoint's presentation row FOR UPDATE for
- *     a removal (db/repositories/topology-removal.repo).
+ *     key re-activation). A removal can then share-lock a remaining restricted
+ *     sibling (under the same namespace gate), then lock its own presentation
+ *     row FOR UPDATE (db/repositories/topology-removal.repo).
  *     5a. Namespace rows (FOR UPDATE for a tool policy change or a removal),
  *     then, for a removal, the namespace's own mounts and tool rows FOR
- *     UPDATE in uuid order. A child insert's foreign-key check takes FOR KEY
- *     SHARE on these rows after the writer's own endpoint row.
+ *     UPDATE in uuid order. An endpoint insert or move takes FOR KEY SHARE
+ *     on the namespace through its foreign-key check.
  *  6. Access group rows (FOR UPDATE for a group delete).
  *  7. API key name locks (`lockApiKeyName`, advisory, `metamcp.api_key.name`,
  *     one per owner and name): a rename takes the lock of the name it is
@@ -57,6 +58,8 @@ import type { DbTransaction } from "./db-executor";
  *        removal). No transaction that holds one takes a lock listed above it.
  *     c. A server's tool catalog rows (FOR UPDATE in uuid order, for a
  *        removal, after its server row).
+ *     d. A server's upstream OAuth session (FOR KEY SHARE for a removal,
+ *        after its catalog).
  * 10. The audit row insert, last, in the same transaction.
  *
  * Every lock here is transaction-scoped (released at COMMIT or ROLLBACK, never

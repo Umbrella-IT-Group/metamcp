@@ -32,6 +32,7 @@ import {
   vi,
 } from "vitest";
 
+import { ENDPOINT_NAMESPACE_LOCK_NAMESPACE } from "../db/repositories/admin-plane-locks";
 import { createFixture, type Fixture } from "./admin-plane-integration-fixture";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -421,6 +422,40 @@ describeIfDb("leaf-only topology removals (real Postgres)", () => {
         `%${fx.run}`,
       ]);
     });
+
+    it("preserves the last restricted endpoint when the operator did not set its restriction", async () => {
+      const ns = await fx.namespace(uniq("ep-guard-ns"));
+      const ep = await fx.endpoint({
+        name: uniq("ep-guard"),
+        namespaceUuid: ns,
+        restricted: true,
+      });
+      const { impact } = await impactOf("endpoints", ep);
+      const reply = await remove(
+        "endpoints",
+        ep,
+        impact.name,
+        impact.impact_fingerprint,
+      );
+      expect(reply.code).toBe("FORBIDDEN");
+      expect(impact.removable).toBe(false);
+      expect(impact.blocked_by).toEqual(["admin_plane_unrestrict"]);
+      expect(await exists("endpoints", ep)).toBe(true);
+      expect(await deniedRules("endpoints", ep)).toEqual([
+        "admin_plane_unrestrict",
+      ]);
+    });
+
+    it("lets a key remove a last guard that it restricted within the rollback window", async () => {
+      const { ep } = await lonelyEndpoint("ep-guard-owned");
+      await one(
+        `UPDATE endpoints SET restricted = true, restricted_by_api_key_uuid = $2,
+          restricted_at = clock_timestamp() WHERE uuid = $1`,
+        [ep, fx.operator.uuid],
+      );
+      expect((await removeAsRead("endpoints", ep)).status).toBe(200);
+      expect(await exists("endpoints", ep)).toBe(false);
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -596,6 +631,20 @@ describeIfDb("leaf-only topology removals (real Postgres)", () => {
 
   // ---------------------------------------------------------------------------
   describe("the confirmation", () => {
+    it("accepts the exact name of a leaf created with a name longer than 100 characters", async () => {
+      const { ep } = await lonelyEndpoint(`long-${"a".repeat(101)}`);
+      const { impact } = await impactOf("endpoints", ep);
+      expect(impact.name.length).toBeGreaterThan(100);
+      const reply = await remove(
+        "endpoints",
+        ep,
+        impact.name,
+        impact.impact_fingerprint,
+      );
+      expect(reply.status).toBe(200);
+      expect(await exists("endpoints", ep)).toBe(false);
+    });
+
     it("refuses a wrong name with the current fingerprint", async () => {
       const s = await server("cf-name");
       const { impact } = await impactOf("mcpServers", s);
@@ -841,6 +890,110 @@ describeIfDb("leaf-only topology removals (real Postgres)", () => {
 
   // ---------------------------------------------------------------------------
   describe("concurrency", () => {
+    it("refuses when a sibling guard was deleted while the endpoint removal waited", async () => {
+      const ns = await fx.namespace(uniq("cc-guard-ns"));
+      const ep = await fx.endpoint({
+        name: uniq("cc-guard"),
+        namespaceUuid: ns,
+        restricted: true,
+      });
+      const sibling = await fx.endpoint({
+        name: uniq("cc-sibling-guard"),
+        namespaceUuid: ns,
+        restricted: true,
+      });
+      const { impact } = await impactOf("endpoints", ep);
+      expect(impact.removable).toBe(true);
+      await barrier.query("BEGIN");
+      let committed = false;
+      try {
+        await barrier.query("DELETE FROM endpoints WHERE uuid = $1", [sibling]);
+        const pending = remove(
+          "endpoints",
+          ep,
+          impact.name,
+          impact.impact_fingerprint,
+        );
+        // A broad delete by a person takes the sibling row lock directly.
+        await waitForLockWaiters(1);
+        await barrier.query("COMMIT");
+        committed = true;
+        expect((await pending).code).toBe("FORBIDDEN");
+      } finally {
+        if (!committed) await barrier.query("ROLLBACK");
+      }
+      expect(await exists("endpoints", ep)).toBe(true);
+      expect(await deniedRules("endpoints", ep)).toEqual([
+        "admin_plane_unrestrict",
+      ]);
+    });
+
+    it("answers NOT_FOUND if a moved endpoint becomes private while removal waits for its gate", async () => {
+      const { ns, ep } = await lonelyEndpoint("cc-private-move");
+      const destination = await fx.namespace(uniq("cc-destination"));
+      const { impact } = await impactOf("endpoints", ep);
+      await barrier.query("BEGIN");
+      let committed = false;
+      try {
+        await barrier.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+          [ENDPOINT_NAMESPACE_LOCK_NAMESPACE, ns],
+        );
+        const pending = remove(
+          "endpoints",
+          ep,
+          impact.name,
+          impact.impact_fingerprint,
+        );
+        await waitForLockWaiters(1);
+        await barrier.query(
+          "UPDATE endpoints SET namespace_uuid = $2, user_id = $3 WHERE uuid = $1",
+          [ep, destination, fx.memberId],
+        );
+        await barrier.query("COMMIT");
+        committed = true;
+        expect(await pending).toMatchObject({
+          status: 404,
+          code: "NOT_FOUND",
+          message: "Endpoint not found",
+        });
+      } finally {
+        if (!committed) await barrier.query("ROLLBACK");
+      }
+      expect(await exists("endpoints", ep)).toBe(true);
+      expect(await successRows("endpoints", ep)).toHaveLength(0);
+    });
+
+    it("refuses after an OAuth session deletion that commits while the server removal waits", async () => {
+      const s = await server("cc-oauth");
+      await one(`INSERT INTO oauth_sessions (mcp_server_uuid) VALUES ($1)`, [
+        s,
+      ]);
+      const { impact } = await impactOf("mcpServers", s);
+      await barrier.query("BEGIN");
+      let committed = false;
+      try {
+        await barrier.query(
+          "DELETE FROM oauth_sessions WHERE mcp_server_uuid = $1",
+          [s],
+        );
+        const pending = remove(
+          "mcpServers",
+          s,
+          impact.name,
+          impact.impact_fingerprint,
+        );
+        await waitForLockWaiters(1);
+        await barrier.query("COMMIT");
+        committed = true;
+        expect((await pending).code).toBe("CONFLICT");
+      } finally {
+        if (!committed) await barrier.query("ROLLBACK");
+      }
+      expect(await exists("mcp_servers", s)).toBe(true);
+      expect(await deniedRules("mcpServers", s)).toEqual(["impact_changed"]);
+    });
+
     it("sees a key that committed while the removal waited for the endpoint row", async () => {
       const { ep } = await lonelyEndpoint("cc-key-first");
       const { impact } = await impactOf("endpoints", ep);

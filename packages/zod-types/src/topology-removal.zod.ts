@@ -19,6 +19,7 @@ export const TopologyRemovalRuleSchema = z.enum([
   "target_private",
   "endpoint_has_keys",
   "endpoint_has_groups",
+  "admin_plane_unrestrict",
   "namespace_has_endpoints",
   "server_mounted",
   "server_tools_mapped",
@@ -92,7 +93,8 @@ export const TopologyRemovalImpactResponseSchema = z.object({
 
 export const RemoveTopologyRequestSchema = z.object({
   uuid: z.string().uuid(),
-  confirm_name: z.string().min(1).max(100),
+  // Creation does not cap topology names. Existing rows need an exact match.
+  confirm_name: z.string().min(1),
   impact_fingerprint: TopologyImpactFingerprintSchema,
 });
 

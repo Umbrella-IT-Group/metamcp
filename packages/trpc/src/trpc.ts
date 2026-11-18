@@ -254,6 +254,8 @@ export const ADMIN_PLANE_SYNC_PROCEDURES: ReadonlySet<string> = new Set([
  *    with no endpoint; a server no namespace mounts or holds a tool row for),
  *    confirmed by its name and by the fingerprint the read returned, judged
  *    on rows locked in the removal's transaction and audited with a snapshot.
+ *    Removing the last restricted endpoint obeys the namespace gate's rule
+ *    for rollback of the acting key's own restriction.
  *    The broad `.delete` of each stays human-only: each cascades through
  *    everything that depends on the row.
  *
