@@ -5,6 +5,7 @@ import {
   cascadeCounts,
   firstRemovalBlocker,
   hiddenDependents,
+  isRolledBackConflict,
   removalBlockers,
   TOPOLOGY_REMOVAL_REFUSALS,
   type TopologyBlocker,
@@ -250,5 +251,32 @@ describe("assertTopologyRemovalConfirmed", () => {
       expect(message).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}/);
       expect(message.length).toBeGreaterThan(20);
     }
+  });
+});
+
+describe("isRolledBackConflict", () => {
+  it("reads a deadlock or serialization abort on the error or its cause", () => {
+    expect(isRolledBackConflict({ code: "40P01" })).toBe(true);
+    expect(isRolledBackConflict({ code: "40001" })).toBe(true);
+    expect(
+      isRolledBackConflict(
+        Object.assign(new Error("x"), { cause: { code: "40P01" } }),
+      ),
+    ).toBe(true);
+  });
+
+  it("leaves every other failure an unknown outcome", () => {
+    for (const error of [
+      { code: "23503" },
+      { code: "57014" },
+      new Error("boom"),
+      null,
+      "40P01",
+    ]) {
+      expect(isRolledBackConflict(error)).toBe(false);
+    }
+    const loop: { cause?: unknown } = {};
+    loop.cause = loop;
+    expect(isRolledBackConflict(loop)).toBe(false);
   });
 });

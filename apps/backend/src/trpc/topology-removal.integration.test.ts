@@ -484,7 +484,7 @@ describeIfDb("leaf-only topology removals (real Postgres)", () => {
         impact.impact_fingerprint,
       );
       expect(reply.status).toBe(200);
-      expect(reply.data).toMatchObject({ removed: true, cleanup: "ok" });
+      expect(reply.data).toMatchObject({ removed: true, cleanup: "attempted" });
       expect(await exists("namespaces", ns)).toBe(false);
       expect(await exists("mcp_servers", s)).toBe(true);
       expect(await exists("tools", t)).toBe(true);
@@ -570,7 +570,7 @@ describeIfDb("leaf-only topology removals (real Postgres)", () => {
         impact.impact_fingerprint,
       );
       expect(reply.status).toBe(200);
-      expect(reply.data).toMatchObject({ removed: true, cleanup: "ok" });
+      expect(reply.data).toMatchObject({ removed: true, cleanup: "attempted" });
       expect(await exists("mcp_servers", s)).toBe(false);
       expect(await exists("tools", t)).toBe(false);
       expect(cleanup.cleanupIdleSession).toHaveBeenCalledWith(s);

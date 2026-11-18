@@ -105,8 +105,10 @@ export const RemoveTopologyResponseSchema = z.object({
   removed: z.literal(true),
   snapshot: TopologyRemovalSnapshotSchema,
   // The in-memory cleanup after the commit (idle pools, caches, Inspector
-  // sessions). "failed" never means the removal did not commit.
-  cleanup: z.enum(["ok", "failed", "not_needed"]),
+  // sessions). "attempted": every step ran without throwing (the helpers log
+  // their own failures). "failed": a step threw. Neither ever means the
+  // removal did not commit.
+  cleanup: z.enum(["attempted", "failed", "not_needed"]),
 });
 
 export type TopologyRemovalKind = z.infer<typeof TopologyRemovalKindSchema>;

@@ -133,6 +133,26 @@ export class TopologyRemovalRefusal extends Error {
   }
 }
 
+/**
+ * Did PostgreSQL abort the removal's transaction to break a lock cycle or a
+ * serialization conflict (SQLSTATE 40P01 or 40001)? The transaction rolled back
+ * whole, so the removal did not happen: the caller answers it as the coded
+ * `target_changed` refusal, never as an unknown outcome. A catalog sync that
+ * locks a tool row before its server's key lock can meet a server removal
+ * that takes them the other way round (the server, then its catalog).
+ */
+export function isRolledBackConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (code === "40P01" || code === "40001") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 /** A value a snapshot or a judged field may hold. */
 export type TopologyField = string | number | boolean | null;
 

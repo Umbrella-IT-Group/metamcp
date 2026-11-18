@@ -21,6 +21,7 @@ import {
 import {
   cascadeCounts,
   hiddenDependents,
+  isRolledBackConflict,
   removalBlockers,
   topologyRemovalFingerprint,
   TopologyRemovalRefusal,
@@ -70,23 +71,34 @@ async function refusalWrite<T>(
   try {
     return await write();
   } catch (error) {
-    if (error instanceof TopologyRemovalRefusal) {
-      throw new AdminRuleRefusal(error.code, error.message, {
+    const refusal =
+      error instanceof TopologyRemovalRefusal
+        ? error
+        : isRolledBackConflict(error)
+          ? new TopologyRemovalRefusal("target_changed")
+          : null;
+    if (refusal) {
+      throw new AdminRuleRefusal(refusal.code, refusal.message, {
         action: AUDIT[kind].action,
         target_type: kind,
         target_id: uuid,
-        detail: { via: "remove", rule: error.rule },
+        detail: { via: "remove", rule: refusal.rule },
       });
     }
     throw error;
   }
 }
 
-/** The in-memory cleanup after a committed removal; never throws. */
+/**
+ * The in-memory cleanup after a committed removal; never throws. "attempted"
+ * means every step ran without throwing. It is not a promise that each
+ * succeeded: the pool and Inspector helpers log their own failures and resolve.
+ * "failed" means a step threw.
+ */
 async function cleanupAfterCommit(
   kind: TopologyRemovalKind,
   uuid: string,
-): Promise<"ok" | "failed" | "not_needed"> {
+): Promise<"attempted" | "failed" | "not_needed"> {
   if (kind === "endpoint") return "not_needed";
   // Lazy: the connection pools load the server repository and its database
   // pool, and the routers that host these procedures are imported by suites
@@ -132,7 +144,7 @@ async function cleanupAfterCommit(
         describeDbError(error),
       );
     }
-    return failed ? "failed" : "ok";
+    return failed ? "failed" : "attempted";
   }
   try {
     await mcpServerPool.cleanupIdleSession(uuid);
@@ -153,7 +165,7 @@ async function cleanupAfterCommit(
       describeDbError(error),
     );
   }
-  return failed ? "failed" : "ok";
+  return failed ? "failed" : "attempted";
 }
 
 function readFailure(error: unknown): TRPCError {
