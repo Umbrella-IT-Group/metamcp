@@ -17,15 +17,34 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
-const { requestMock } = vi.hoisted(() => ({ requestMock: vi.fn() }));
+const { requestMock, auditRepoImports } = vi.hoisted(() => ({
+  requestMock: vi.fn(),
+  auditRepoImports: { count: 0 },
+}));
 
 vi.mock("@/utils/logger", () => ({
   default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
 vi.mock("../../../db/index", () => ({ db: {}, pool: {} }));
+// Nothing in this file should import the real audit repository: it needs the
+// database mocked away above. The audit sink is pinned in beforeEach so the
+// lazy import never starts, and the afterAll below fails the file if anything
+// started it anyway.
+vi.mock("../../../db/repositories/tool-call-audit.repo", () => {
+  auditRepoImports.count += 1;
+  return { toolCallAuditRepository: { record: vi.fn() } };
+});
 
 vi.mock(
   "../../../lib/metamcp/metamcp-middleware/filter-tools.functional",
@@ -125,6 +144,14 @@ const run = async (toolName: string, args: Record<string, unknown> = {}) => {
 };
 
 beforeEach(() => {
+  // Pin the audit sink before the FIRST test, not only after each one. The
+  // module starts with no sink chosen (undefined), and the first audited call
+  // then starts a lazy import of the real repository; when that import
+  // finishes it REPLACES whatever sink is installed at that moment, which can
+  // be the recorder the "without a verified listing" test installed (#237,
+  // #242). With a sink pinned from the first test on, the import never starts.
+  // A test that wants rows installs its own recorder after this.
+  setAuditRecorderForTesting(null);
   requestMock.mockReset();
   dir = mkdtempSync(path.join(tmpdir(), "retired-bridge-"));
   const file = path.join(dir, "retired-tools.json");
@@ -150,6 +177,13 @@ afterEach(() => {
   setRetiredToolsRegistryForTesting(undefined);
   setAuditRecorderForTesting(null);
   rmSync(dir, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  expect(
+    auditRepoImports.count,
+    "the real audit repository was imported: a test ran with no audit sink pinned, and that lazy import can replace a later test's recorder mid-test (#237, #242)",
+  ).toBe(0);
 });
 
 describe("OpenAPI bridge: retired names", () => {

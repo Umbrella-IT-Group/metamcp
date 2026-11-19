@@ -15,7 +15,15 @@
  * convention as bootstrap.order.test.ts); `vi.resetModules()` re-imports
  * the resolver per test so its module-level caches start empty.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 const { dbMock, fixtures } = vi.hoisted(() => {
   const fixtures = {
@@ -88,6 +96,18 @@ async function freshResolver() {
   const mod = await import("./consumer-identity-resolver");
   return mod.resolveClientIdentity;
 }
+
+// Pay the cold import (transform plus drizzle-orm and the schema) once, before
+// any test's clock starts. Without it the first test carried that cost inside
+// its 5 s default timeout and failed 3 of 27 runs under 3x concurrent load
+// (#242). The tests keep the default 5 s: every one after the warm-up finishes
+// in milliseconds, so a longer limit there would only hide a real hang. The
+// warm-up alone gets 60 s because it is the one step whose cost scales with
+// machine load: under three concurrent full-suite runs it took over the 10 s
+// default hook limit in 1 of 12 runs.
+beforeAll(async () => {
+  await freshResolver();
+}, 60_000);
 
 beforeEach(() => {
   vi.clearAllMocks();
