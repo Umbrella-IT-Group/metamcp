@@ -381,10 +381,14 @@ async function filterActiveTools(
     return lookup;
   };
 
-  const activeTools: Tool[] = [];
+  // Which input tools are served, by position. Appending to the output as
+  // lookups finished made the listing's order the order the database answered,
+  // which changes from call to call (issue #278); the output is filtered from
+  // the input afterwards, so it keeps the input order.
+  const served = new Array<boolean>(tools.length).fill(false);
 
   await Promise.allSettled(
-    tools.map(async (tool) => {
+    tools.map(async (tool, index) => {
       try {
         const parsed = parseToolName(tool.name);
         if (!parsed) {
@@ -392,7 +396,7 @@ async function filterActiveTools(
           // it. `allow_all` includes it unchanged, as before; `allowlist`
           // reads "no row" as INACTIVE, so it is excluded.
           if (policy === "allow_all") {
-            activeTools.push(tool);
+            served[index] = true;
           }
           return;
         }
@@ -411,7 +415,7 @@ async function filterActiveTools(
         );
 
         if (verdict.served) {
-          activeTools.push(tool);
+          served[index] = true;
         }
       } catch (error) {
         logger.error(
@@ -425,7 +429,7 @@ async function filterActiveTools(
     }),
   );
 
-  return activeTools;
+  return tools.filter((_, index) => served[index]);
 }
 
 /**

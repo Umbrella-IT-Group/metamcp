@@ -75,6 +75,7 @@ import {
   progressPassthroughEnabled,
 } from "../../../lib/metamcp/tool-call-extra";
 import { routeUnmappedToolCall } from "../../../lib/metamcp/tool-call-routing";
+import { sortToolsByName } from "../../../lib/metamcp/tool-order";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
 async function readOpenApiRequestOptions(
@@ -157,7 +158,12 @@ export const createOriginalListToolsHandler = (
         );
       }
     };
-    const allTools: Tool[] = [];
+    // Each server's tools, filed under its uuid when ITS listing finishes. The
+    // flat list is built from this in mount order after the fan-out, never
+    // appended in completion order: openapi.json is a different byte string on
+    // every read otherwise, and a client that diffs it sees tools change
+    // (issue #278).
+    const toolsByServer = new Map<string, Tool[]>();
     // Mirrors metamcp-proxy.ts's PR #28 tripwire: every backend that
     // contributes zero tools because of a failure (not because it has
     // no tools capability) is recorded here so the namespace-level
@@ -316,7 +322,7 @@ export const createOriginalListToolsHandler = (
             };
           });
 
-          allTools.push(...toolsWithSource);
+          toolsByServer.set(mcpServerUuid, toolsWithSource);
         } catch (error) {
           reportFailure(
             `Error fetching tools from: ${serverName}`,
@@ -349,6 +355,16 @@ export const createOriginalListToolsHandler = (
       );
       failedServers.push(name);
     }
+
+    // The one order every listing leaves in: byte-wise on the tool name
+    // (tool-order.ts), the same as the MCP listing, so the two surfaces agree.
+    // Stable sort over mount-order input, so equal names (this bridge has no
+    // collision guard and lists both) also come out the same every time.
+    const allTools = sortToolsByName(
+      allServerEntries.flatMap(
+        ([mcpServerUuid]) => toolsByServer.get(mcpServerUuid) ?? [],
+      ),
+    );
 
     if (audit) {
       // Worded without the words the log-based panels count as failures.

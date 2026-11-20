@@ -354,24 +354,23 @@ async function applyToolOverrides(
   }
 
   const generation = toolOverridesCache.getGeneration();
-  const overriddenTools: Tool[] = [];
-  // Every tool leaves through here, so the sink (ListingOriginsContext) hears
-  // of each one exactly once, under the name the listing shows it by.
-  const emit = (listed: Tool, originalName?: string): void => {
-    overriddenTools.push(listed);
-    if (originalName === undefined) return;
-    const known = origins?.get(listed.name);
-    if (known) known.push(originalName);
-    else origins?.set(listed.name, [originalName]);
+  // One slot per input tool, filled when ITS lookup finishes. The output is
+  // built from the slots in input order afterwards: appending as lookups
+  // finished made the listing's order the order the database answered, which
+  // changes from call to call (issue #278).
+  const slots: Array<{ listed: Tool; originalName?: string } | undefined> =
+    new Array(tools.length);
+  const emit = (index: number, listed: Tool, originalName?: string): void => {
+    slots[index] = { listed, originalName };
   };
 
   await Promise.allSettled(
-    tools.map(async (tool) => {
+    tools.map(async (tool, index) => {
       try {
         const parsed = parseToolName(tool.name);
         if (!parsed) {
           // If tool name doesn't follow expected format, include as-is
-          emit(tool, tool.name);
+          emit(index, tool, tool.name);
           return;
         }
 
@@ -386,7 +385,7 @@ async function applyToolOverrides(
         if (!override) {
           // Failed lookups keep the direct listing's fallback, but cannot
           // establish effective hints for the read-only lean call tool.
-          emit(tool, override === undefined ? undefined : tool.name);
+          emit(index, tool, override === undefined ? undefined : tool.name);
           return;
         }
 
@@ -453,18 +452,30 @@ async function applyToolOverrides(
           );
         }
 
-        emit(overriddenTool, tool.name);
+        emit(index, overriddenTool, tool.name);
       } catch (error) {
         logger.error(
           `Error applying overrides for tool ${tool.name}:`,
           describeDbError(error),
         );
         // Preserve the ordinary listing, without a read-only identity proof.
-        emit(tool);
+        emit(index, tool);
       }
     }),
   );
 
+  // Every tool leaves through here, in input order, so the sink
+  // (ListingOriginsContext) hears of each one exactly once, under the name the
+  // listing shows it by, and its per-name origin lists are in input order too.
+  const overriddenTools: Tool[] = [];
+  for (const slot of slots) {
+    if (!slot) continue;
+    overriddenTools.push(slot.listed);
+    if (slot.originalName === undefined) continue;
+    const known = origins?.get(slot.listed.name);
+    if (known) known.push(slot.originalName);
+    else origins?.set(slot.listed.name, [slot.originalName]);
+  }
   return overriddenTools;
 }
 
