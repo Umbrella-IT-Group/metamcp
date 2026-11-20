@@ -284,8 +284,11 @@ describe("the audit listing", () => {
         },
         CallToolResultSchema,
       );
-      await vi.waitFor(() =>
-        expect(auditInputs.current.length).toBeGreaterThan(0),
+      // An explicit timeout: the default 1000 ms timed out once under heavy load
+      // (load average about 58); the backend delays alone reach 125 ms.
+      await vi.waitFor(
+        () => expect(auditInputs.current.length).toBeGreaterThan(0),
+        { timeout: 5000 },
       );
       expect(auditInputs.current.at(-1)).toEqual(oracleOrder);
     }
