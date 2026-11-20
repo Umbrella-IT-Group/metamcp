@@ -58,6 +58,14 @@ export const NO_SESSION_CAUSE =
   "the pool returned no session (server gated, at the connection cap, or backend unreachable)";
 export const SEPARATOR_CAUSE =
   "the server name contains the tool-name separator";
+// A mounted server whose mcp_servers.error_status is set. A listing never
+// connects to it, so it is absent from every listing until the gate is reset
+// (by the pool's half-open probe or an operator). The row stores no time and
+// no reason for the gate, so the line cannot say "since when" or why. Worded
+// without the words the panels count: the status name is `error_status`, never
+// the bare word, and "gated" carries the meaning (#239).
+export const ERROR_GATED_CAUSE =
+  "the server is gated (mcp_servers.error_status is set); left out of listings until its gate is reset";
 // Only for a listing that knows its session had already closed when it asked
 // the pool for a backend session (metamcp-proxy.ts).
 export const CLOSED_BEFORE_ACQUIRE_CAUSE =

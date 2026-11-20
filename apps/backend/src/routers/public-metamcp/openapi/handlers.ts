@@ -17,6 +17,7 @@ import { ConnectedClient } from "../../../lib/metamcp";
 import {
   describeListingFailure,
   describeListingLabel,
+  ERROR_GATED_CAUSE,
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "../../../lib/metamcp/audit-listing-log";
@@ -26,7 +27,10 @@ import {
   classifyBackendAuthRejection,
 } from "../../../lib/metamcp/backend-auth-rejection";
 import { CallerContext } from "../../../lib/metamcp/caller-context";
-import { getMcpServers } from "../../../lib/metamcp/fetch-metamcp";
+import {
+  getMcpServers,
+  getNamespaceListingServers,
+} from "../../../lib/metamcp/fetch-metamcp";
 import { mcpServerPool } from "../../../lib/metamcp/mcp-server-pool";
 import { createAuditingMiddleware } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
@@ -120,10 +124,29 @@ export const createOriginalListToolsHandler = (
     if (!audit) logger.error(...line);
   };
   return async (request, context) => {
-    const serverParams = await getMcpServers(
-      context.namespaceUuid,
-      includeInactiveServers,
-    );
+    // A served listing keeps `getMcpServers`: it leaves an error-gated server
+    // out, which is what an openapi.json reader has always been served. An
+    // audit listing also needs to know which servers were left out that way,
+    // to say why each is absent (#239), so it reads `getNamespaceListingServers`
+    // (the routable set is the same one, the gated servers come apart from it).
+    // That read throws on a database error where `getMcpServers` answered `{}`:
+    // the audit refresher reports the throw and keeps the count-only args_shape,
+    // which is better than an empty snapshot replacing the real one.
+    let serverParams: Awaited<ReturnType<typeof getMcpServers>>;
+    let errorGated: Awaited<ReturnType<typeof getMcpServers>> = {};
+    if (audit) {
+      const listing = await getNamespaceListingServers(
+        context.namespaceUuid,
+        includeInactiveServers,
+      );
+      serverParams = listing.routable;
+      errorGated = listing.errorGated;
+    } else {
+      serverParams = await getMcpServers(
+        context.namespaceUuid,
+        includeInactiveServers,
+      );
+    }
     // An audit listing's cause for each server it could not list, one INFO
     // line each (audit-listing-log.ts). The WARN below names the servers;
     // this says why. The cause is a function so a client-facing listing, which
@@ -156,6 +179,19 @@ export const createOriginalListToolsHandler = (
           uuid,
           params.name ? sanitizeName(params.name) : undefined,
         );
+      }
+      // An error-gated server is never connected to, so it lists nothing and
+      // is absent from the snapshot like any other unlisted server. One cause
+      // line each (the separator when its name cannot round-trip, the gate
+      // otherwise), and counted in failedServers so the WARN's "could not
+      // list N" matches the cause lines (#239). A served listing is unchanged.
+      for (const [uuid, params] of Object.entries(errorGated)) {
+        const separator =
+          params.name && sanitizeName(params.name).includes("__");
+        noteAuditSkip(params.name || uuid, () =>
+          separator ? SEPARATOR_CAUSE : ERROR_GATED_CAUSE,
+        );
+        failedServers.push(params.name || uuid);
       }
     }
 

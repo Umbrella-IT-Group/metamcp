@@ -56,6 +56,11 @@ vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn(async () => ({
     "server-autotask": { name: "autotask" },
   })),
+  // An audit listing reads this one (it also needs the error-gated servers).
+  getNamespaceListingServers: vi.fn(async () => ({
+    routable: { "server-autotask": { name: "autotask" } },
+    errorGated: {},
+  })),
 }));
 vi.mock("../../../lib/metamcp/mcp-server-pool", () => ({
   mcpServerPool: {
