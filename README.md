@@ -468,6 +468,8 @@ The in-band rule inspects the TOP LEVEL only. `error` absent, `null`, `false`, a
 
 The Live Logs line for an in-band refusal is `<tool> refused in-band: <detail> (<ms>ms)` at level `warn`, deliberately worded without the words that log-based error panels count.
 
+A failed `tool_call_audit` insert loses the row and leaves the tool response alone. The gateway counts every lost row since startup and logs at most one WARN a minute. The line reads `[tool-call-audit] write failed, <n> audit row(s) lost since startup (tool call unaffected): server=<server> tool=<tool> cause=<database error summary>`. The summary includes the error class, safe database identifiers such as SQLSTATE, and any exact allowlisted driver diagnostic. Call arguments, row values and SQL stay out of the line. Each warning names the call that opened the window and gives the cumulative count at that point. Further losses may raise the count before another warning is written. The call itself is still in Live Logs and stdout.
+
 #### Retired-tool redirect
 
 A client that cached an old tool list, or an automation node that still names a removed tool, calls a name nobody serves and gets a bare `Unknown tool`. When `RETIRED_TOOLS_FILE` points at a map file, the gateway answers such a call with what replaced the tool instead:
