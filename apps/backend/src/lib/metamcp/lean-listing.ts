@@ -4,6 +4,8 @@ import type {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 
+import { compareToolNames } from "./tool-order";
+
 /**
  * The lean tool listing: four meta tools that stand in for the whole catalog
  * on an endpoint whose consumers would otherwise load every tool definition up
@@ -511,7 +513,9 @@ export interface RankedTool {
  */
 export function rankTools(tools: readonly Tool[], query: string): RankedTool[] {
   if (query.trim() === "") {
-    return [...tools].sort(compareByName).map((tool) => ({ tool, score: 0 }));
+    return [...tools]
+      .sort(compareToolNames)
+      .map((tool) => ({ tool, score: 0 }));
   }
   const documents = tools.map(buildDocument);
   const terms = tokenizeQuery(query);
@@ -547,12 +551,8 @@ export function rankTools(tools: readonly Tool[], query: string): RankedTool[] {
     if (score > 0) ranked.push({ tool: document.tool, score });
   }
   return ranked.sort(
-    (a, b) => b.score - a.score || compareByName(a.tool, b.tool),
+    (a, b) => b.score - a.score || compareToolNames(a.tool, b.tool),
   );
-}
-
-function compareByName(a: Tool, b: Tool): number {
-  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

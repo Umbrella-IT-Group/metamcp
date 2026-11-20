@@ -133,6 +133,7 @@ import {
   registerToolRoute,
   ToolRouteOwner,
 } from "./tool-name-parser";
+import { sortToolsByName } from "./tool-order";
 import { createProgressRelay } from "./tool-progress-relay";
 import {
   renotifyMaxRounds,
@@ -593,7 +594,11 @@ export const createServer = async (
         }
       }
     }
-    const allTools: Tool[] = [];
+    // Each server's tools, filed under its uuid when ITS listing finishes. The
+    // flat list is built from this in mount order after the fan-out, never
+    // appended in completion order (issue #278: that made the aggregated
+    // listing a different byte string on every call).
+    const toolsByServer = new Map<string, Tool[]>();
 
     // Servers that should have contributed but didn't — used for the
     // degraded-response tripwire after the fan-out completes. A failure
@@ -978,7 +983,7 @@ export const createServer = async (
             });
           }
 
-          allTools.push(...toolsWithSource);
+          toolsByServer.set(mcpServerUuid, toolsWithSource);
         } catch (error) {
           // NO special case for a typed M365 broker error, on purpose. The
           // injected fetch mints no token for a listing (m365/injected-fetch.ts,
@@ -1028,6 +1033,16 @@ export const createServer = async (
       settledServerUuids.delete(mcpServerUuid);
       unreachableServers.set(mcpServerUuid, params);
     }
+
+    // The one order every listing leaves in: byte-wise on the tool name
+    // (tool-order.ts). The sort is stable and the input is in mount order, so
+    // even equal names (an audit listing keeps both) come out the same way
+    // every time. Routes are keyed by name, so nothing else depends on order.
+    const allTools = sortToolsByName(
+      allServerEntries.flatMap(
+        ([mcpServerUuid]) => toolsByServer.get(mcpServerUuid) ?? [],
+      ),
+    );
 
     // Mounted means routable or error-gated: a gated server's watch stays.
     const mountedServerUuids = new Set([
