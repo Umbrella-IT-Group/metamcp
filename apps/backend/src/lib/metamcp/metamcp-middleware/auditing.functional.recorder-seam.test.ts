@@ -8,24 +8,15 @@
  * lands mid-import win. These cases hold the import open with an async mock
  * factory, so the race is deterministic rather than a load flake.
  *
- * Each case imports a fresh copy of the middleware (`vi.resetModules()`), so
- * every case gets its own first, still-pending import.
+ * Each case resets the middleware and registers a fresh repository mock.
+ * Vitest's module reset preserves the mock cache.
  */
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { MetaMCPHandlerContext } from "./functional-middleware";
 
-const gate = vi.hoisted(() => ({
-  // Resolved by the case when the import may settle.
-  open: null as Promise<void> | null,
-  realRecord: vi.fn(),
-}));
-
-vi.mock("../../../db/repositories/tool-call-audit.repo", async () => {
-  await gate.open;
-  return { toolCallAuditRepository: { record: gate.realRecord } };
-});
+const realRecord = vi.fn();
 
 const context: MetaMCPHandlerContext = {
   namespaceUuid: "ns-123",
@@ -38,96 +29,117 @@ const request = {
   params: { name: "autotask__search", arguments: { q: 1 } },
 } as CallToolRequest;
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-let releaseImport: () => void;
+let releaseImport: (() => void) | undefined;
 
 async function freshAuditing() {
   vi.resetModules();
-  gate.open = new Promise<void>((resolve) => {
+  let markImportStarted: () => void;
+  const importStarted = new Promise<void>((resolve) => {
+    markImportStarted = resolve;
+  });
+  const importReleased = new Promise<void>((resolve) => {
     releaseImport = resolve;
   });
-  return import("./auditing.functional");
+  vi.doMock("../../../db/repositories/tool-call-audit.repo", async () => {
+    markImportStarted();
+    await importReleased;
+    return { toolCallAuditRepository: { record: realRecord } };
+  });
+  return { ...(await import("./auditing.functional")), importStarted };
 }
 
 beforeEach(() => {
-  gate.realRecord.mockReset().mockResolvedValue(undefined);
+  realRecord.mockReset().mockResolvedValue(undefined);
 });
 
-afterEach(() => {
+afterEach(async () => {
   releaseImport?.();
+  await vi.dynamicImportSettled();
 });
 
 describe("setAuditRecorderForTesting during the lazy repository import", () => {
   it("keeps the recorder a test installed while the import was pending", async () => {
-    const { createAuditingMiddleware, setAuditRecorderForTesting } =
-      await freshAuditing();
+    const {
+      createAuditingMiddleware,
+      setAuditRecorderForTesting,
+      importStarted,
+    } = await freshAuditing();
     const wrapped = createAuditingMiddleware()(
       vi.fn().mockResolvedValue({ content: [] }),
     );
 
     // Starts resolveRecorder(), which now waits on the held import.
     await wrapped(request, context);
+    await importStarted;
     const mine = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(mine);
-    releaseImport();
-    await flush();
+    releaseImport?.();
+    await vi.dynamicImportSettled();
 
     expect(mine).toHaveBeenCalledTimes(1);
-    expect(gate.realRecord).not.toHaveBeenCalled();
+    expect(realRecord).not.toHaveBeenCalled();
 
     // The pin also holds for the NEXT call: the late import did not replace it.
     await wrapped(request, context);
-    await flush();
+    await vi.dynamicImportSettled();
     expect(mine).toHaveBeenCalledTimes(2);
-    expect(gate.realRecord).not.toHaveBeenCalled();
+    expect(realRecord).not.toHaveBeenCalled();
   });
 
   it("keeps a pinned null (no sink) while the import was pending", async () => {
-    const { createAuditingMiddleware, setAuditRecorderForTesting } =
-      await freshAuditing();
+    const {
+      createAuditingMiddleware,
+      setAuditRecorderForTesting,
+      importStarted,
+    } = await freshAuditing();
     const wrapped = createAuditingMiddleware()(
       vi.fn().mockResolvedValue({ content: [] }),
     );
 
     await wrapped(request, context);
+    await importStarted;
     setAuditRecorderForTesting(null);
-    releaseImport();
-    await flush();
+    releaseImport?.();
+    await vi.dynamicImportSettled();
     await wrapped(request, context);
-    await flush();
+    await vi.dynamicImportSettled();
 
-    expect(gate.realRecord).not.toHaveBeenCalled();
+    expect(realRecord).not.toHaveBeenCalled();
   });
 
   it("resolves afresh when the seam is reset to undefined mid-import", async () => {
-    const { createAuditingMiddleware, setAuditRecorderForTesting } =
-      await freshAuditing();
+    const {
+      createAuditingMiddleware,
+      setAuditRecorderForTesting,
+      importStarted,
+    } = await freshAuditing();
     const wrapped = createAuditingMiddleware()(
       vi.fn().mockResolvedValue({ content: [] }),
     );
 
     await wrapped(request, context);
+    await importStarted;
     setAuditRecorderForTesting(undefined);
-    releaseImport();
-    await flush();
+    releaseImport?.();
+    await vi.dynamicImportSettled();
 
     // `undefined` means "resolve again", so the row reaches the repository.
-    expect(gate.realRecord).toHaveBeenCalledTimes(1);
+    expect(realRecord).toHaveBeenCalledTimes(1);
   });
 
   it("still installs the repository recorder when nothing touched the seam", async () => {
-    const { createAuditingMiddleware } = await freshAuditing();
+    const { createAuditingMiddleware, importStarted } = await freshAuditing();
     const wrapped = createAuditingMiddleware()(
       vi.fn().mockResolvedValue({ content: [] }),
     );
 
     await wrapped(request, context);
-    releaseImport();
-    await flush();
+    await importStarted;
+    releaseImport?.();
+    await vi.dynamicImportSettled();
     await wrapped(request, context);
-    await flush();
+    await vi.dynamicImportSettled();
 
-    expect(gate.realRecord).toHaveBeenCalledTimes(2);
+    expect(realRecord).toHaveBeenCalledTimes(2);
   });
 });

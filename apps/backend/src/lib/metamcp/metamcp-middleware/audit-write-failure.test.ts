@@ -7,8 +7,8 @@
  * the recorder to fail and read the log and the counter, never the code.
  *
  * Transport-level fake: the recorder is the repository's `record`, the only
- * thing the middleware hands the row to. Date is faked (not the timers) so the
- * one-line-a-minute window is driven without a real wait.
+ * thing the middleware hands the row to. Both clocks are faked so the
+ * one-line-a-minute window and wall-clock corrections need no real wait.
  */
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -86,9 +86,9 @@ let warn: ReturnType<typeof vi.spyOn>;
 const warned = () => JSON.stringify(warn.mock.calls);
 
 beforeEach(() => {
-  // Date only: the flush above needs real timers. The reporter throttles to one
-  // line a minute PROCESS-WIDE, so each case starts from a fresh window.
-  vi.useFakeTimers({ toFake: ["Date"] });
+  // Leave timers real for flush(). Each case starts from a fresh process-wide
+  // throttle window.
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   vi.setSystemTime(new Date("2026-11-19T12:00:00Z"));
   resetToolCallAuditFailureReportingForTesting();
   warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
@@ -202,11 +202,11 @@ describe("a burst of failures is counted in full and logged once a minute", () =
     expect(toolCallAuditFailureCount()).toBe(25);
     expect(warn).toHaveBeenCalledTimes(1);
 
-    vi.setSystemTime(new Date("2026-11-19T12:00:59Z"));
+    vi.advanceTimersByTime(59_999);
     await callOnce();
     expect(warn).toHaveBeenCalledTimes(1);
 
-    vi.setSystemTime(new Date("2026-11-19T12:01:00Z"));
+    vi.advanceTimersByTime(1);
     await callOnce();
     expect(warn).toHaveBeenCalledTimes(2);
     // A running total since startup, not a per-window delta.
@@ -215,13 +215,30 @@ describe("a burst of failures is counted in full and logged once a minute", () =
     );
   });
 
-  it("does not let the very first failure vanish when the clock reads the epoch", async () => {
+  it("starts a single warning window when the clocks read zero", async () => {
     vi.setSystemTime(new Date(0));
     setAuditRecorderForTesting(vi.fn().mockRejectedValue(insertFailure()));
 
     await callOnce();
-
     expect(warn).toHaveBeenCalledTimes(1);
+    await callOnce();
+    expect(toolCallAuditFailureCount()).toBe(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores wall-clock jumps in both directions", async () => {
+    setAuditRecorderForTesting(vi.fn().mockRejectedValue(insertFailure()));
+    await callOnce();
+
+    vi.setSystemTime(new Date("2026-11-19T13:00:00Z"));
+    vi.advanceTimersByTime(59_999);
+    await callOnce();
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(new Date("2026-11-19T11:00:00Z"));
+    vi.advanceTimersByTime(1);
+    await callOnce();
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -262,15 +279,15 @@ describe("the report itself can never break the audit path", () => {
     expect(String(warn.mock.calls[0][0])).toContain("summary unavailable");
   });
 
-  it("bounds and cleans a caller-supplied tool name so it cannot forge a log line", async () => {
+  it("bounds, cleans and quotes a name that could be read as another log field", async () => {
     setAuditRecorderForTesting(vi.fn().mockRejectedValue(insertFailure()));
 
-    await callOnce(`autotask__bad\n[forged] ${"x".repeat(400)}`);
+    await callOnce(`autotask__bad\n cause="spoofed" ${"x".repeat(400)}`);
 
     expect(warn).toHaveBeenCalledTimes(1);
     const line = String(warn.mock.calls[0][0]);
     expect(line).not.toContain("\n");
-    expect(line).toContain("tool=bad?[forged] xxx");
+    expect(line).toContain('tool="bad? cause=\\"spoofed\\" xxx');
     expect(line.length).toBeLessThan(600);
   });
 });

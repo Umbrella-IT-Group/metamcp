@@ -21,9 +21,9 @@ import logger from "@/utils/logger";
  *
  * WHAT THE LINE CARRIES: the server and tool names, the number of rows lost,
  * and `describeDbError(error)` (class, SQLSTATE or errno code, constraint,
- * table, column). NEVER the arguments, the bound row values, the query text or
- * an error message: a Drizzle query error's message holds the failed row,
- * which holds `params_hash`, caller identity and `args_shape`.
+ * table, column, and any exact allowlisted driver diagnostic). A Drizzle query
+ * error's message holds bound values such as the params hash, caller identity
+ * and args_shape. The summary keeps those values and the query text out.
  *
  * ponytail: one process-wide throttle window, so the line names only the call
  * that opened the window and the final total of a burst is readable only
@@ -31,23 +31,22 @@ import logger from "@/utils/logger";
  * flush if an operator ever needs the closing number in the log.
  */
 
-/** How long one reported failure suppresses the next report. */
+/** How long one report attempt suppresses the next. */
 const TOOL_CALL_AUDIT_FAILURE_REPORT_INTERVAL_MS = 60 * 1000;
 
 /**
- * Longest server or tool name a line carries. Names come from the caller's
- * request (an unknown tool name is whatever the client sent), so the bound is
- * applied here rather than trusted.
+ * Bound the server and tool names from the request before escaping them.
+ * An unknown tool name can be arbitrary caller-supplied text.
  */
 const NAME_MAX = 128;
 
 let toolCallAuditFailuresTotal = 0;
-let lastToolCallAuditFailureReportAt = 0;
+let nextToolCallAuditFailureReportAt = 0;
 
 /** Test seam: forget the counter and the throttle window. */
 export function resetToolCallAuditFailureReportingForTesting(): void {
   toolCallAuditFailuresTotal = 0;
-  lastToolCallAuditFailureReportAt = 0;
+  nextToolCallAuditFailureReportAt = 0;
 }
 
 /** Current lost-row count since startup, for assertions and diagnostics. */
@@ -56,12 +55,13 @@ export function toolCallAuditFailureCount(): number {
 }
 
 /**
- * Printable ASCII only, bounded: a name with a newline or control character
- * must not be able to forge a second log line.
+ * Replace control characters to keep the warning on one line. Quote names
+ * outside the identifier alphabet to keep their text within one field.
  */
 function loggableName(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) return "unknown";
-  return value.slice(0, NAME_MAX).replace(/[^\x20-\x7e]/g, "?");
+  const name = value.slice(0, NAME_MAX).replace(/[^\x20-\x7e]/g, "?");
+  return /^[\w.-]+$/.test(name) ? name : JSON.stringify(name);
 }
 
 /**
@@ -77,17 +77,11 @@ export function reportToolCallAuditDrop(
 ): void {
   toolCallAuditFailuresTotal += 1;
   try {
-    const now = Date.now();
-    // The `!== 0` half matters under a mocked clock: a suite that pins Date to
-    // the epoch would otherwise have its very first failure swallowed.
-    if (
-      lastToolCallAuditFailureReportAt !== 0 &&
-      now - lastToolCallAuditFailureReportAt <
-        TOOL_CALL_AUDIT_FAILURE_REPORT_INTERVAL_MS
-    ) {
-      return;
-    }
-    lastToolCallAuditFailureReportAt = now;
+    // Wall-clock corrections must leave the rate limit intact.
+    const now = performance.now();
+    if (now < nextToolCallAuditFailureReportAt) return;
+    nextToolCallAuditFailureReportAt =
+      now + TOOL_CALL_AUDIT_FAILURE_REPORT_INTERVAL_MS;
     logger.warn(
       `[tool-call-audit] write failed, ${toolCallAuditFailuresTotal} audit row(s) lost since startup (tool call unaffected): server=${loggableName(entry.server_name)} tool=${loggableName(entry.tool_name)} cause=${describeDbError(error)}`,
     );
