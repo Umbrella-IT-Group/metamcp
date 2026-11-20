@@ -43,6 +43,12 @@ vi.mock("../../../lib/config.service", () => ({
 }));
 vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn(async () => mounted.current),
+  // An audit listing reads the routable and error-gated servers through this one
+  // (#239, fork PR #282); none of these fixtures is error-gated.
+  getNamespaceListingServers: vi.fn(async () => ({
+    routable: mounted.current,
+    errorGated: {},
+  })),
 }));
 vi.mock("../../../lib/metamcp/mcp-server-pool", () => ({
   mcpServerPool: {
