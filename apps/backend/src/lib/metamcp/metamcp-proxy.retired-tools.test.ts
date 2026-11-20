@@ -209,7 +209,11 @@ vi.mock("./tool-call-warmup", () => ({
 
 import logger from "@/utils/logger";
 
-import { describeListingFailure } from "./audit-listing-log";
+import {
+  describeListingFailure,
+  ERROR_GATED_CAUSE,
+  SEPARATOR_CAUSE,
+} from "./audit-listing-log";
 import { getMcpServers, getNamespaceListingServers } from "./fetch-metamcp";
 import { setAuditRecorderForTesting } from "./metamcp-middleware/auditing.functional";
 import { createServer } from "./metamcp-proxy";
@@ -1270,6 +1274,124 @@ describe("argument schemas for a caller that never lists on its proxy", () => {
     } finally {
       servers.mockResolvedValue({ "server-ninja": { name: "ninja" } } as never);
     }
+  });
+
+  describe("an audit listing explains an error-gated server (#239)", () => {
+    // A server whose mcp_servers.error_status is set is mounted but never
+    // connected to, so it is absent from the snapshot. The audit lines
+    // explained every other absent server; this one read as unexplained. The
+    // fake is the namespace read (getNamespaceListingServers): the transport
+    // below it is real in-memory MCP.
+    const original = listings.getMockImplementation();
+    const gating = (gated: Record<string, { name?: string }>) =>
+      listings.mockImplementation((async () => ({
+        routable: await getMcpServers("ns-1", false),
+        errorGated: gated,
+      })) as never);
+    const auditLines = () =>
+      causesOf(vi.mocked(logger.info).mock.calls.map(([l]) => String(l)));
+    const auditWarnings = () =>
+      vi
+        .mocked(logger.warn)
+        .mock.calls.map(([line]) => String(line))
+        .filter((line) => line.startsWith("Audit listing for session"));
+
+    async function auditedCall() {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      const ninja = await backend();
+      getSessionMock.mockResolvedValue(ninja.session);
+      vi.mocked(logger.info).mockClear();
+      vi.mocked(logger.warn).mockClear();
+      await call(await connectConsumer(), REAL_TOOL, { mode: "list" });
+      await rowsAfter(recorder, 1);
+      return { recorder };
+    }
+
+    afterEach(() => {
+      if (original) listings.mockImplementation(original);
+    });
+
+    it("logs exactly one cause line for the gated server and none for the listed one", async () => {
+      gating({ "server-axcient": { name: "axcient" } });
+
+      await auditedCall();
+
+      expect(auditLines()).toEqual([
+        `Audit listing for session sess-1 in namespace ns-1 did not list server axcient: ${ERROR_GATED_CAUSE}`,
+      ]);
+      // Never connected to: the pool is not asked for the gated server.
+      expect(getSessionMock).not.toHaveBeenCalledWith(
+        expect.anything(),
+        "server-axcient",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it("counts the gated server in the one WARN so the count matches the cause lines", async () => {
+      gating({ "server-axcient": { name: "axcient" } });
+
+      const { recorder } = await auditedCall();
+
+      expect(auditWarnings()).toEqual([
+        "Audit listing for session sess-1 in namespace ns-1 could not list 1 server(s) (axcient); calls to their tools keep the count-only args_shape",
+      ]);
+      // The audit listing still shapes the call's row from the server it did list.
+      expect(recorder.mock.calls[0][0].args_shape).toEqual({
+        keys: ["mode"],
+        sel: { mode: "list" },
+      });
+    });
+
+    it("keeps the cause line clear of the words the log panels count", async () => {
+      gating({ "server-axcient": { name: "axcient" } });
+
+      await auditedCall();
+
+      expect(auditLines()).toHaveLength(1);
+      expect(auditLines()[0]).not.toMatch(PANEL_WORDS);
+      expect(ERROR_GATED_CAUSE).not.toMatch(PANEL_WORDS);
+    });
+
+    it("names the separator, not the gate, for a gated server whose name cannot round-trip", async () => {
+      gating({ "server-bad": { name: "bad__name" } });
+
+      await auditedCall();
+
+      expect(auditLines()).toEqual([
+        `Audit listing for session sess-1 in namespace ns-1 did not list server bad__name: ${SEPARATOR_CAUSE}`,
+      ]);
+    });
+
+    it("logs one line per gated server, and none for this proxy's own instance", async () => {
+      gating({
+        "server-axcient": { name: "axcient" },
+        "server-dropsuite": { name: "dropsuite" },
+        "server-self": { name: "metamcp-unified-ns-1" },
+      });
+
+      await auditedCall();
+
+      expect(auditLines()).toEqual([
+        `Audit listing for session sess-1 in namespace ns-1 did not list server axcient: ${ERROR_GATED_CAUSE}`,
+        `Audit listing for session sess-1 in namespace ns-1 did not list server dropsuite: ${ERROR_GATED_CAUSE}`,
+      ]);
+      expect(auditWarnings()).toEqual([
+        expect.stringContaining(
+          "could not list 2 server(s) (axcient, dropsuite)",
+        ),
+      ]);
+    });
+
+    it("says nothing about gating when no server is gated", async () => {
+      gating({});
+
+      await auditedCall();
+
+      expect(auditLines()).toEqual([]);
+      expect(auditWarnings()).toEqual([]);
+    });
   });
 
   it("an audit listing names a nameless server whose reported name holds the separator", async () => {

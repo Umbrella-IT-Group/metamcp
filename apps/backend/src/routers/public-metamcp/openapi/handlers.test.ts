@@ -61,8 +61,16 @@ const fakeServerParams: Record<string, { name?: string }> = {
   "server-autotask": { name: "autotask" },
 };
 
+// Servers mounted but error-gated: only an audit listing reads them
+// (getNamespaceListingServers), to say why each is absent (#239).
+const fakeErrorGatedParams: Record<string, { name?: string }> = {};
+
 vi.mock("../../../lib/metamcp/fetch-metamcp", () => ({
   getMcpServers: vi.fn().mockImplementation(async () => fakeServerParams),
+  getNamespaceListingServers: vi.fn().mockImplementation(async () => ({
+    routable: fakeServerParams,
+    errorGated: fakeErrorGatedParams,
+  })),
 }));
 
 const {
@@ -123,7 +131,11 @@ vi.mock(
 // directly, so the middleware composition isn't exercised here.
 
 import { configService } from "../../../lib/config.service";
-import { describeListingFailure } from "../../../lib/metamcp/audit-listing-log";
+import {
+  describeListingFailure,
+  ERROR_GATED_CAUSE,
+  SEPARATOR_CAUSE,
+} from "../../../lib/metamcp/audit-listing-log";
 import { setAuditRecorderForTesting } from "../../../lib/metamcp/metamcp-middleware/auditing.functional";
 import {
   createMiddlewareEnabledHandlers,
@@ -822,5 +834,115 @@ describe("OpenAPI bridge: argument shape for callers that never list (n8n)", () 
       ).length;
     expect(listingsOn(first)).toBe(1);
     expect(listingsOn(second)).toBe(1);
+  });
+});
+
+describe("OpenAPI bridge: an audit listing explains an error-gated server (#239)", () => {
+  // A server whose mcp_servers.error_status is set is never connected to, so
+  // it is absent from the snapshot. The audit lines explain every other absent
+  // server; this one case read as unexplained. Transport-level fake: the pool
+  // session and the fetch-metamcp read are the only seams.
+  const healthy = () =>
+    makeFakeSession(
+      vi.fn().mockResolvedValue({
+        tools: [{ name: "resolve_id", description: "d", inputSchema: {} }],
+      }),
+    );
+  const auditList = () =>
+    createOriginalListToolsHandler(false, { audit: true })(
+      { method: "tools/list", params: {} },
+      { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+    );
+  const causes = () =>
+    loggerInfoMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((line) => line.includes("audit listing for namespace"));
+  const PANEL_WORDS = /\b(error|fatal|panic|exception)\b/i;
+
+  beforeEach(() => {
+    getSessionMock.mockReset();
+    getSessionMock.mockResolvedValue(healthy());
+    loggerErrorMock.mockReset();
+    loggerWarnMock.mockReset();
+    loggerInfoMock.mockReset();
+  });
+  afterEach(() => {
+    for (const key of Object.keys(fakeErrorGatedParams)) {
+      delete fakeErrorGatedParams[key];
+    }
+  });
+
+  it("logs exactly one cause line for the gated server and none for the listed one", async () => {
+    fakeErrorGatedParams["server-ninja"] = { name: "ninja" };
+
+    const result = await auditList();
+
+    expect(result.tools.map((t) => t.name)).toEqual(["autotask__resolve_id"]);
+    expect(causes()).toEqual([
+      `OpenAPI bridge: audit listing for namespace ns-1 did not list server ninja: ${ERROR_GATED_CAUSE}`,
+    ]);
+    // Never connected to: the pool is asked for the routable server only.
+    expect(getSessionMock).toHaveBeenCalledTimes(1);
+    expect(getSessionMock.mock.calls[0][1]).toBe("server-autotask");
+  });
+
+  it("counts the gated server in the one WARN, so the count matches the cause lines", async () => {
+    fakeErrorGatedParams["server-ninja"] = { name: "ninja" };
+
+    await auditList();
+
+    expect(loggerWarnMock).toHaveBeenCalledExactlyOnceWith(
+      "OpenAPI bridge: audit listing for namespace ns-1 could not list 1 server(s) (ninja); calls to their tools keep the count-only args_shape",
+    );
+    expect(loggerErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the cause line clear of the words the log panels count", () => {
+    expect(ERROR_GATED_CAUSE).not.toMatch(PANEL_WORDS);
+  });
+
+  it("names the separator, not the gate, for a gated server whose name cannot round-trip", async () => {
+    fakeErrorGatedParams["server-bad"] = { name: "a__b" };
+
+    await auditList();
+
+    expect(causes()).toEqual([
+      `OpenAPI bridge: audit listing for namespace ns-1 did not list server a__b: ${SEPARATOR_CAUSE}`,
+    ]);
+  });
+
+  it("logs one line per gated server when several are gated", async () => {
+    fakeErrorGatedParams["server-ninja"] = { name: "ninja" };
+    fakeErrorGatedParams["server-axcient"] = { name: "axcient" };
+
+    await auditList();
+
+    expect(causes()).toHaveLength(2);
+    expect(causes().join("\n")).toContain("did not list server ninja:");
+    expect(causes().join("\n")).toContain("did not list server axcient:");
+    expect(loggerWarnMock).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("could not list 2 server(s) (ninja, axcient)"),
+    );
+  });
+
+  it("says nothing about gating when no server is gated", async () => {
+    await auditList();
+
+    expect(causes()).toEqual([]);
+    expect(loggerWarnMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves the listing an openapi.json reader is served as it was", async () => {
+    fakeErrorGatedParams["server-ninja"] = { name: "ninja" };
+
+    const result = await createOriginalListToolsHandler()(
+      { method: "tools/list", params: {} },
+      { namespaceUuid: "ns-1", sessionId: "openapi_ns-1" },
+    );
+
+    expect(result.tools.map((t) => t.name)).toEqual(["autotask__resolve_id"]);
+    expect(loggerInfoMock).not.toHaveBeenCalled();
+    expect(loggerErrorMock).not.toHaveBeenCalled();
+    expect(loggerWarnMock).not.toHaveBeenCalled();
   });
 });

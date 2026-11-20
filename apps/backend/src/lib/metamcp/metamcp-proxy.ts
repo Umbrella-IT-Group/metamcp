@@ -32,6 +32,7 @@ import {
   CLOSED_BEFORE_ACQUIRE_CAUSE,
   describeListingFailure,
   describeListingLabel,
+  ERROR_GATED_CAUSE,
   NO_SESSION_CAUSE,
   SEPARATOR_CAUSE,
 } from "./audit-listing-log";
@@ -617,9 +618,28 @@ export const createServer = async (
     // A misconfigured name stays excluded exactly as below, since resetting
     // the gate would not make it listable. An audit listing skips this
     // bookkeeping: it owes nothing and reports no degradation to a client.
-    for (const [mcpServerUuid, params] of audit
-      ? []
-      : Object.entries(listing.errorGated)) {
+    // It still explains the absence (below): a gated server is missing from
+    // the listing like any other unlisted one, and its call rows keep the
+    // count-only args_shape for the same reason.
+    for (const [mcpServerUuid, params] of Object.entries(listing.errorGated)) {
+      if (audit) {
+        // Same exclusions as the served path below, same one cause line per
+        // absent server: none for this proxy's own instance (it is not
+        // missing, the routable path skips it silently too), the separator
+        // for a name that cannot round-trip (resetting the gate would not
+        // fix it), the gate otherwise. Counted in failedServers so the WARN's
+        // "could not list N" matches the cause lines. Nothing is owed and
+        // nothing is logged at ERROR: no client was served this listing.
+        if (!isSameServerInstance(params, mcpServerUuid)) {
+          const separator =
+            params.name && sanitizeName(params.name).includes("__");
+          noteAuditSkip(params.name || mcpServerUuid, () =>
+            separator ? SEPARATOR_CAUSE : ERROR_GATED_CAUSE,
+          );
+          failedServers.push(params.name || mcpServerUuid);
+        }
+        continue;
+      }
       if (isSameServerInstance(params, mcpServerUuid)) {
         settledServerUuids.add(mcpServerUuid);
         continue;
