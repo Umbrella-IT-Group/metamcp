@@ -28,6 +28,7 @@ import {
   snapshotArgsForShape,
 } from "./audit-args-shape";
 import { CallVerdict, classifyCallResult } from "./audit-classify";
+import { reportToolCallAuditDrop } from "./audit-write-failure";
 import {
   CallToolMiddleware,
   MetaMCPHandlerContext,
@@ -138,18 +139,34 @@ function selectCaller(context: MetaMCPHandlerContext): CallerContext {
 
 let auditRecorder: AuditRecorder | null | undefined;
 
+/**
+ * Bumped by every test-seam write. `resolveRecorder` assigns its result after
+ * an await (the lazy import of the repository), and without this a seam call
+ * made while that import was in flight was overwritten when it settled: the
+ * test's recorder replaced by the real one, or a pinned `null` replaced by a
+ * live database sink (#242, the sink swap behind #237). Production never
+ * writes the seam, so there the counter stays at zero and nothing changes.
+ */
+let recorderGeneration = 0;
+
 async function resolveRecorder(): Promise<AuditRecorder | null> {
   if (auditRecorder !== undefined) return auditRecorder;
+  const generation = recorderGeneration;
+  let resolved: AuditRecorder | null;
   try {
     const { toolCallAuditRepository } = await import(
       "../../../db/repositories/tool-call-audit.repo"
     );
-    auditRecorder = (entry) => toolCallAuditRepository.record(entry);
+    resolved = (entry) => toolCallAuditRepository.record(entry);
   } catch {
     // No database in this process (unit tests, tooling) — disable for the
     // process lifetime rather than re-attempting the import per call.
-    auditRecorder = null;
+    resolved = null;
   }
+  // The seam moved while the import ran: what it set (or its `undefined`,
+  // meaning resolve afresh) wins over this stale result.
+  if (generation !== recorderGeneration) return resolveRecorder();
+  auditRecorder = resolved;
   return auditRecorder;
 }
 
@@ -157,6 +174,7 @@ async function resolveRecorder(): Promise<AuditRecorder | null> {
 export function setAuditRecorderForTesting(
   recorder: AuditRecorder | null | undefined,
 ): void {
+  recorderGeneration += 1;
   auditRecorder = recorder;
 }
 
@@ -379,9 +397,13 @@ function persist(
         called_at: calledAt,
       });
     })
-    .catch(() => {
+    .catch((error) => {
       // Best-effort by design: an audit-write failure must never surface
-      // into the tool call. Live Logs + stdout already carry the event.
+      // into the tool call, but it must not be silent either. Live Logs and
+      // stdout carry the CALL; only this line carries the lost ROW, and
+      // without it a gap in tool_call_audit reads as "nobody called this".
+      // Counted and rate-limited, no arguments (audit-write-failure.ts).
+      reportToolCallAuditDrop(entry, error);
     });
 }
 
