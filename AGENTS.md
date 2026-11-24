@@ -4,7 +4,7 @@ Guidance for coding agents working in this repo. Facts here come from [`UMBRELLA
 
 ## What this repo is
 
-A maintained downstream fork of [`metatool-ai/metamcp`](https://github.com/metatool-ai/metamcp), the MCP gateway Umbrella runs. Upstream has been effectively unmaintained since 2026-02-08, so this fork carries community PRs upstream is not reviewing plus Umbrella's own fixes.
+A maintained downstream fork of [`metatool-ai/metamcp`](https://github.com/metatool-ai/metamcp), the MCP gateway Umbrella runs. Upstream's `main` has been frozen since 2026-02-08; upstream revived in June 2026 on a new default branch, `ai-dev` (`UMBRELLA_FORK.md`, Upstream revival). This fork stays on frozen `main` and carries community fixes plus Umbrella's own.
 
 - `umbrella` is the default branch and the deployable line. It is what builds into `ghcr.io/umbrella-it-group/metamcp:latest`. Branch off it and open pull requests against it (squash merge).
 - `main` mirrors upstream `metatool-ai/metamcp:main` and never carries our changes. Never push to it.
@@ -31,7 +31,7 @@ Alex Ivantsov owns the architecture of this repo. Before writing code for a new 
 
 Not for this repo (non-goals), from `UMBRELLA_FORK.md` and `CONTRIBUTING.md`:
 - Fork-specific changes on `main`, or any direct push to it. `main` only tracks upstream.
-- Rebasing `umbrella` onto upstream's `ai-dev` branch. Operator decision of 2026-07-21: stay on frozen `main`, and take individual community fixes on their own merits.
+- Rebasing `umbrella` onto upstream's `ai-dev` branch (upstream's live line since June 2026). Operator decision of 2026-07-21: stay on frozen `main`, and take individual community fixes on their own merits.
 - Keeping a general fix to ourselves. A patch that is not Umbrella-specific is a candidate for upstream: branch it off `main` and open the pull request against `metatool-ai/metamcp` (`UMBRELLA_FORK.md`, Upstreaming our work). Carrying it here meanwhile is fine.
 - Public issues for security vulnerabilities. Follow `SECURITY.md` (private advisory or email).
 - Hand deploys. The gateway changes only through the bump pull request in `Umbrella-MCP-Server`; there is no manual `docker compose up` on the host.
