@@ -745,6 +745,34 @@ describe("createGuardedFetch — the connection is pinned to the validated addre
     }
   });
 
+  it("rejects the fetch, without an unhandled socket 'error', when every pinned address fails synchronously", async () => {
+    // In Docker without IPv6, connect() to an AAAA answer fails with
+    // ENETUNREACH inside the syscall. A pinned lookup that answered
+    // synchronously let `tls.connect` destroy its socket before returning,
+    // so `setServername` threw on a null handle, undici never got the socket
+    // to attach an 'error' listener, and the socket's queued AggregateError
+    // killed the process. TCP connect to a multicast address fails
+    // synchronously on Linux and macOS alike, standing in for the
+    // unreachable IPv6 route. Vitest fails the run on an uncaught error.
+    const { fetch: undiciFetch } = await import("undici");
+    const uncaught = vi.fn();
+    process.on("uncaughtException", uncaught);
+
+    const agent = createPinnedAgent(["ff02::1", "224.0.0.1"]);
+    try {
+      await expect(
+        undiciFetch("https://this-name-cannot-resolve.invalid/", {
+          dispatcher: agent,
+        }),
+      ).rejects.toThrow("fetch failed");
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(uncaught).not.toHaveBeenCalled();
+    } finally {
+      process.off("uncaughtException", uncaught);
+      await agent.close();
+    }
+  });
+
   it("hands the transport a dispatcher built from the validated answer", async () => {
     // A resolver that turns hostile immediately after validation. It must be
     // consulted exactly once: everything after that rides the pin.

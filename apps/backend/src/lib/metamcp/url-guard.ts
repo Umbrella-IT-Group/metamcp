@@ -956,6 +956,13 @@ export const assertPublicMcpUrl = async (
  * socket, so the hostname it is handed is ignored entirely and the connection
  * cannot land anywhere the check above did not clear. Everything else about
  * the request still derives from the URL, `Host` and the TLS SNI included.
+ *
+ * The callback MUST be asynchronous, like the real `dns.lookup`. Answered
+ * synchronously, a connect() that fails inside the syscall (ENETUNREACH to an
+ * AAAA answer in a container without IPv6) destroys the socket before
+ * `tls.connect` returns: `setServername` then throws on the null handle,
+ * undici never receives the socket to attach its 'error' listener, and the
+ * socket's queued error crashes the process.
  */
 const pinnedLookup =
   (addresses: string[]) =>
@@ -972,11 +979,13 @@ const pinnedLookup =
       address,
       family: address.includes(":") ? 6 : 4,
     }));
-    if (options?.all) {
-      callback(null, entries);
-      return;
-    }
-    callback(null, entries[0].address, entries[0].family);
+    process.nextTick(() => {
+      if (options?.all) {
+        callback(null, entries);
+        return;
+      }
+      callback(null, entries[0].address, entries[0].family);
+    });
   };
 
 /** Undici dispatcher timeouts, applied to the pinned Agent. */
